@@ -1,0 +1,32 @@
+# Simple runtime image using pre-built binary
+FROM debian:bookworm-slim
+
+WORKDIR /app
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy pre-built binary from local machine
+COPY target/release/clob-service /app/clob-service
+
+# Make it executable
+RUN chmod +x /app/clob-service
+
+# Create non-root user
+RUN useradd -m -u 1000 clob && chown -R clob:clob /app
+USER clob
+
+# Expose ports
+EXPOSE 8080
+EXPOSE 9090
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+# Run the service
+CMD ["/app/clob-service"]

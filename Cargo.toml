@@ -1,0 +1,69 @@
+[package]
+name = "clob-service"
+version = "0.1.0"
+edition = "2021"
+authors = ["Predifi Team"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = "0.7"
+
+# Web framework
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower = { version = "0.4", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Redis client with TLS via native-tls (OpenSSL) for better compatibility on Cloud Run
+# Enable tokio-native-tls compatibility to provide the async TLS connector required by redis when using tokio runtime.
+redis = { version = "0.26.1", features = ["aio", "tokio-comp", "connection-manager", "tls-native-tls", "tokio-native-tls-comp"] }
+
+# WebSocket
+futures-util = "0.3"
+
+# UUID and Time
+uuid = { version = "1.10", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Decimal arithmetic (critical for financial calculations)
+rust_decimal = { version = "1.35", features = ["serde-float"] }
+rust_decimal_macros = "1.35"
+
+# Ethereum integration
+ethers = { version = "2.0", features = ["rustls", "ws"] }
+hex = "0.4"
+
+# Metrics and observability
+prometheus = "0.13"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Configuration
+dotenvy = "0.15"
+config = "0.14"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Explicitly include tokio-native-tls to satisfy linker/type expectations when using redis tls-native-tls on tokio
+tokio-native-tls = "0.3"
+
+# Utilities
+dashmap = "6.0"
+parking_lot = "0.12"
+bytes = "1.7"
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1.5"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
