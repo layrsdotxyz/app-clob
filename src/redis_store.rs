@@ -30,11 +30,11 @@ impl RedisStore {
         let key = format!("{}{}", ORDER_PREFIX, order.id);
         let json = serde_json::to_string(order).unwrap();
         
-        conn.set(&key, json).await?;
+        conn.set::<_, _, ()>(&key, json).await?;
         
         // Add to user's order set
         let user_key = format!("{}{}", USER_ORDERS_PREFIX, order.user_id);
-        conn.sadd(&user_key, order.id.to_string()).await?;
+        conn.sadd::<_, _, ()>(&user_key, order.id.to_string()).await?;
         
         Ok(())
     }
@@ -51,11 +51,11 @@ impl RedisStore {
         let mut conn = self.conn.clone();
         let key = format!("{}{}", ORDER_PREFIX, order_id);
         
-        conn.del(&key).await?;
+        conn.del::<_, ()>(&key).await?;
         
         // Remove from user's order set
         let user_key = format!("{}{}", USER_ORDERS_PREFIX, user_id);
-        conn.srem(&user_key, order_id.to_string()).await?;
+        conn.srem::<_, _, ()>(&user_key, order_id.to_string()).await?;
         
         Ok(())
     }
@@ -101,7 +101,7 @@ impl RedisStore {
         // Store order_id:size:timestamp as member
         let member = format!("{}:{}:{}", order.id, order.remaining, order.created_at.timestamp_nanos_opt().unwrap_or(0));
         
-        conn.zadd(&key, &member, score).await?;
+        conn.zadd::<_, _, _, ()>(&key, &member, score).await?;
         
         Ok(())
     }
@@ -124,7 +124,7 @@ impl RedisStore {
         
         for member in members {
             if member.starts_with(&format!("{}:", order_id)) {
-                conn.zrem(&key, &member).await?;
+                conn.zrem::<_, _, ()>(&key, &member).await?;
             }
         }
         
@@ -227,18 +227,18 @@ impl RedisStore {
         // Save trade object
         let key = format!("trade:{}", trade.id);
         let json = serde_json::to_string(trade).unwrap();
-        conn.set(&key, &json).await?;
+        conn.set::<_, _, ()>(&key, &json).await?;
         
         // Add to market trades sorted set (by timestamp)
         let market_key = format!("{}{}", MARKET_TRADES_PREFIX, trade.market_id);
         let score = trade.timestamp.timestamp() as f64;
-        conn.zadd(&market_key, trade.id.to_string(), score).await?;
+        conn.zadd::<_, _, _, ()>(&market_key, trade.id.to_string(), score).await?;
         
         // Add to user trades
         let maker_key = format!("{}{}", USER_TRADES_PREFIX, trade.maker_user_id);
         let taker_key = format!("{}{}", USER_TRADES_PREFIX, trade.taker_user_id);
-        conn.zadd(&maker_key, trade.id.to_string(), score).await?;
-        conn.zadd(&taker_key, trade.id.to_string(), score).await?;
+        conn.zadd::<_, _, _, ()>(&maker_key, trade.id.to_string(), score).await?;
+        conn.zadd::<_, _, _, ()>(&taker_key, trade.id.to_string(), score).await?;
         
         Ok(())
     }
@@ -278,7 +278,7 @@ impl RedisStore {
             local timestamp = tonumber(ARGV[3])
             
             redis.call('HSET', key, 'last_price', price)
-            redis.call('HINCRBY', key, 'volume_24h', size)
+            redis.call('HINCRBYFLOAT', key, 'volume_24h', size)
             
             local high = redis.call('HGET', key, 'high_24h')
             if not high or tonumber(high) < price then

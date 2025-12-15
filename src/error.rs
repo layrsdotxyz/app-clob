@@ -65,7 +65,10 @@ impl IntoResponse for ClobError {
             ClobError::MarketClosed => (StatusCode::BAD_REQUEST, "MARKET_CLOSED", self.to_string()),
             ClobError::RateLimitExceeded => (StatusCode::TOO_MANY_REQUESTS, "RATE_LIMIT_EXCEEDED", self.to_string()),
             ClobError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "UNAUTHORIZED", self.to_string()),
-            ClobError::Redis(_) => (StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR", "Database error".to_string()),
+            ClobError::Redis(_) => {
+                tracing::error!(error = %self, "Redis error occurred");
+                (StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR", "Database error".to_string())
+            },
             ClobError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "Internal error".to_string()),
         };
 
