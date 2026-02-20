@@ -9,7 +9,7 @@ cd "${SCRIPT_DIR}"
 # Usage: ./deploy-cloudrun.sh [region] [service_name]
 
 REGION="${1:-us-east1}"
-SERVICE_NAME="${2:-predifi-clob-app}"
+SERVICE_NAME="${2:-predifi-clob-demo}"
 PROJECT_ID="${GOOGLE_CLOUD_PROJECT:-zoopx-0xperps}"
 IMAGE_NAME="gcr.io/${PROJECT_ID}/${SERVICE_NAME}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
