@@ -2,17 +2,23 @@
 // Layrs - Market Oracle Service
 //
 // Every hour (aligned to UTC :00 boundaries) this service:
-//   1. Fetches the just-completed hour's BTC-USD close price from Pyth Hermes.
-//   2. Creates a new hourly binary prediction market on Horizen EVM:
-//        "Will BTC be above $X at <next_hour> UTC?"
-//   3. Resolves the market that expired at this hour boundary.
+//   1. For each tracked asset (BTC, ETH, SOL):
+//      a. Fetches the just-completed hour's close price from Pyth Hermes.
+//      b. Resolves the pending market (created last hour) for that asset.
+//      c. Creates a new hourly binary prediction market on Horizen EVM:
+//             "Will <ASSET> be above $X at <next_hour> UTC?"
 //
-// Pyth is the single source of truth for both map streaming and market resolution.
+// Pyth is the single source of truth for both market creation and resolution.
 // Feed IDs: BTC e62df..., ETH ff614..., SOL ef0d8..., ZEN d183f...
+//
+// questionHash encoding: keccak256(asset_name_bytes ++ abi.encode(expiry_ts))
+//   e.g. keccak256(b"BTC" ++ abi.encode(1700000000))
 //
 // Environment variables consumed:
 //   MARKET_ORACLE_ENABLED          – set to "true" to activate (default: false)
 //   MARKET_FACTORY_ADDRESS         – EVM hex address of MarketFactory contract
+//   MARKET_RESOLVER_ADDRESS        – EVM hex address of MarketResolver contract
+//   MARKET_REGISTRY_ADDRESS        – EVM hex address of MarketRegistry contract
 //   HORIZEN_RPC_URL                – Horizen EVM JSON-RPC endpoint
 //   EVM_OPERATOR_PRIVATE_KEY       – operator private key (hex)
 //   EVM_CHAIN_ID                   – chain ID (default: 2651420)
@@ -35,15 +41,23 @@ use crate::{
     redis_store::RedisStore,
 };
 use rust_decimal::Decimal;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
+
+/// Assets for which hourly markets are created and resolved each tick.
+const ORACLE_ASSETS: &[&str] = &["BTC", "ETH", "SOL"];
 
 // ─── Service ─────────────────────────────────────────────────────────────────
 
 pub struct MarketOracleService {
     /// EVM address of the deployed MarketFactory contract.
     factory_address: Address,
+    /// EVM address of the deployed MarketResolver contract.
+    resolver_address: Address,
+    /// EVM address of the deployed MarketRegistry contract.
+    registry_address: Address,
     /// EVM signing client for submitting transactions.
     relayer: Arc<EvmRelayer>,
     /// Read-only provider for view calls.
@@ -54,10 +68,11 @@ pub struct MarketOracleService {
     oracle: Arc<PythOracle>,
     /// Oracle resolution and dispute policy.
     policy: OraclePolicy,
-    /// Count of markets created on-chain.  Synced from the contract at startup.
+    /// Next market ID to be assigned (mirrors MarketRegistry.nextMarketId).
     market_id_counter: u64,
-    /// The market created last tick that still needs resolving.
-    pending_market_id: Option<u64>,
+    /// Per-asset pending market IDs that need resolving on the next tick.
+    /// key = asset (e.g. "BTC"), value = on-chain marketId created last tick.
+    pending_markets: HashMap<String, u64>,
 }
 
 impl MarketOracleService {
@@ -65,6 +80,8 @@ impl MarketOracleService {
 
     pub fn new(
         factory_address: Address,
+        resolver_address: Address,
+        registry_address: Address,
         relayer: Arc<EvmRelayer>,
         provider: Arc<Provider<Http>>,
         store: Arc<RedisStore>,
@@ -73,13 +90,15 @@ impl MarketOracleService {
     ) -> Self {
         Self {
             factory_address,
+            resolver_address,
+            registry_address,
             relayer,
             provider,
             store,
             oracle,
             policy,
             market_id_counter: 0,
-            pending_market_id: None,
+            pending_markets: HashMap::new(),
         }
     }
 
@@ -92,6 +111,12 @@ impl MarketOracleService {
         }
         let factory_address: Address = factory_address_str.parse().ok()?;
 
+        let resolver_address_str = std::env::var("MARKET_RESOLVER_ADDRESS").ok()?;
+        let resolver_address: Address = resolver_address_str.parse().ok()?;
+
+        let registry_address_str = std::env::var("MARKET_REGISTRY_ADDRESS").ok()?;
+        let registry_address: Address = registry_address_str.parse().ok()?;
+
         let relayer = EvmRelayer::from_env()?;
         let rpc_url = relayer.config.rpc_url.clone();
         let provider = Arc::new(Provider::<Http>::try_from(rpc_url.as_str()).ok()?);
@@ -99,15 +124,18 @@ impl MarketOracleService {
         let oracle = Arc::new(PythOracle::new());
         let policy = OraclePolicy::from_env();
 
-        Some(Self::new(factory_address, Arc::new(relayer), provider, store, oracle, policy))
+        Some(Self::new(factory_address, resolver_address, registry_address, Arc::new(relayer), provider, store, oracle, policy))
     }
 
     // ─── Main loop ───────────────────────────────────────────────────────────
 
     /// Run the oracle loop forever.  The first tick fires at the next UTC :00
-    /// boundary plus a grace period so Coinbase candle data is always available.
+    /// boundary plus a 30-second grace period so Pyth data is always finalized.
     pub async fn start(mut self) -> ClobResult<()> {
-        info!("Market oracle service starting — waiting for next hour boundary");
+        info!(
+            assets = ?ORACLE_ASSETS,
+            "Market oracle service starting — waiting for next hour boundary"
+        );
 
         let initial_wait = secs_until_next_hour();
         if initial_wait > 0 {
@@ -115,18 +143,15 @@ impl MarketOracleService {
             sleep(Duration::from_secs(initial_wait)).await;
         }
 
-        // Grace period: Coinbase candle data may not be finalized immediately at
-        // :00.  30 seconds ensures the completed hour's candle is available.
         const GRACE_SECS: u64 = 30;
-        info!(secs = GRACE_SECS, "Applying grace period for Coinbase API finality");
+        info!(secs = GRACE_SECS, "Applying grace period for Pyth data finality");
         sleep(Duration::from_secs(GRACE_SECS)).await;
 
-        // Sync on-chain market count and any unresolved pending market before the
-        // first tick.  Safe after restarts: no markets are ever abandoned.
+        // Sync on-chain market count before the first tick.
         if let Err(e) = self.sync_from_chain().await {
             error!(
                 error = %e,
-                "Failed to sync state from chain at startup — beginning from local zero state"
+                "Failed to sync state from chain — beginning from local zero state"
             );
         }
 
@@ -136,22 +161,30 @@ impl MarketOracleService {
             let next_hour_ts    = now_ts + 3600;
 
             info!(
-                hour = now_ts,
+                assets = ?ORACLE_ASSETS,
                 prev_hour_start,
                 next_hour_ts,
-                pending_market = ?self.pending_market_id,
-                "Oracle tick: fetching BTC close price"
+                pending_markets = ?self.pending_markets,
+                "Oracle tick starting"
             );
 
-            let pending = self.pending_market_id;
-            match self.tick(prev_hour_start, now_ts, next_hour_ts, pending).await {
-                Ok(new_market_id) => {
-                    info!(market_id = new_market_id, "Oracle tick succeeded — awaiting next hour");
-                    self.pending_market_id = Some(new_market_id);
-                }
-                Err(e) => {
-                    error!(error = %e, "Oracle tick failed — will retry next hour");
-                    // pending_market_id intentionally preserved: retry resolve next tick.
+            // Run a tick for each asset sequentially.
+            // Each successful create increments market_id_counter by 1.
+            for asset in ORACLE_ASSETS {
+                let pending = self.pending_markets.get(*asset).copied();
+                match self.tick_asset(asset, prev_hour_start, now_ts, next_hour_ts, pending).await {
+                    Ok(new_market_id) => {
+                        info!(
+                            asset,
+                            market_id = new_market_id,
+                            "Oracle tick succeeded — market created"
+                        );
+                        self.pending_markets.insert(asset.to_string(), new_market_id);
+                    }
+                    Err(e) => {
+                        error!(asset, error = %e, "Oracle asset tick failed — will retry next hour");
+                        // pending entry intentionally preserved so resolve is retried next tick.
+                    }
                 }
             }
 
@@ -161,21 +194,16 @@ impl MarketOracleService {
         }
     }
 
-    /// Query `PredictionMarket.sol` to initialise `market_id_counter` and
-    /// detect any unresolved market left by a previous process restart.
+    /// Read `MarketRegistry.nextMarketId()` to initialise `market_id_counter`.
+    /// Per-asset pending state is not restored on restart — any unresolved
+    /// markets from before restart will simply remain open until they expire.
     async fn sync_from_chain(&mut self) -> ClobResult<()> {
         info!("Syncing market oracle state from Horizen EVM");
 
-        // Call `marketCount()` — selector = keccak256("marketCount()")[:4]
-        let selector = &keccak256(b"marketCount()")[..4];
-        let result = self.provider.call(
-            &ethers::types::transaction::eip2718::TypedTransaction::Legacy(
-                ethers::types::TransactionRequest::new()
-                    .to(self.factory_address)
-                    .data(Bytes::from(selector.to_vec()))
-            ),
-            None,
-        ).await.map_err(|e| ClobError::Internal(format!("marketCount() call failed: {e}")))?;
+        let selector = &keccak256(b"nextMarketId()")[..4];
+        let result = self.call_view_registry(
+            Bytes::from(selector.to_vec()),
+        ).await.map_err(|e| ClobError::Internal(format!("nextMarketId() call failed: {e}")))?;
 
         let count = if result.len() >= 32 {
             U256::from_big_endian(&result[..32]).as_u64()
@@ -183,68 +211,65 @@ impl MarketOracleService {
             0u64
         };
         self.market_id_counter = count;
-        info!(on_chain_count = count, "On-chain market count read");
-
-        if count == 0 {
-            self.pending_market_id = None;
-            return Ok(());
-        }
-
-        let last_id = count - 1;
-        let resolved = self.is_market_resolved(last_id).await.unwrap_or(false);
-
-        if !resolved {
-            info!(market_id = last_id, "Unresolved market detected — will resolve at next tick");
-            self.pending_market_id = Some(last_id);
-        } else {
-            self.pending_market_id = None;
-        }
-
+        info!(
+            on_chain_count = count,
+            "On-chain market count read from registry — oracle counter initialised"
+        );
         Ok(())
     }
 
-    // ─── Single tick ─────────────────────────────────────────────────────────
+    // ─── Per-asset tick ───────────────────────────────────────────────────────
 
-    async fn tick(
+    /// Execute one hour boundary tick for a single asset:
+    ///   1. Fetch Pyth strike price for the just-completed hour.
+    ///   2. Resolve the pending market (from last tick) if one exists.
+    ///   3. Create a new market for the upcoming hour.
+    ///
+    /// Returns the on-chain marketId of the newly created market.
+    async fn tick_asset(
         &mut self,
+        asset: &str,
         prev_hour_start: u64,
         now_ts: u64,
         next_hour_ts: u64,
         pending_market_id: Option<u64>,
     ) -> ClobResult<u64> {
-        let create_market_close = self
-            .fetch_pyth_price("BTC", prev_hour_start)
+        // 1. Strike price = Pyth close price at the start of the just-completed hour.
+        let close_price = self
+            .fetch_pyth_price(asset, prev_hour_start)
             .await
-            .map_err(|e| ClobError::Internal(format!("Pyth fetch failed: {e}")))?;
-        let strike_price = decimal_price_to_u128(create_market_close).ok_or_else(|| {
+            .map_err(|e| ClobError::Internal(format!("Pyth fetch failed for {asset}: {e}")))?;
+
+        let strike_price = decimal_price_to_u128(close_price).ok_or_else(|| {
             ClobError::Internal(format!(
-                "Pyth returned invalid strike price value: {}",
-                create_market_close
+                "Pyth returned invalid strike price for {asset}: {}",
+                close_price
             ))
         })?;
 
-        // 2. Resolve the previous market if there is one.
+        // 2. Resolve the previous market for this asset, if any.
         if let Some(prev_id) = pending_market_id {
-            match self.resolve_pending_market(prev_id, prev_hour_start, now_ts).await {
-                Ok(Some(tx)) => info!(market_id = prev_id, tx_hash = %tx, "Market resolved on-chain"),
-                Ok(None) => info!(market_id = prev_id, "Market resolution deferred under oracle policy"),
-                Err(e) => warn!(market_id = prev_id, error = %e, "Failed to resolve market"),
+            match self.resolve_pending_market(asset, prev_id, prev_hour_start, now_ts).await {
+                Ok(Some(tx)) => info!(asset, market_id = prev_id, tx_hash = %tx, "Market resolved on-chain"),
+                Ok(None)    => info!(asset, market_id = prev_id, "Market resolution deferred under oracle policy"),
+                Err(e)      => warn!(asset, market_id = prev_id, error = %e, "Failed to resolve market — will retry next tick"),
             }
         }
 
-        // 3. Create a new market for the upcoming hour.
-        //    questionHash = keccak256(abi.encode(next_hour_ts)) — front-ends reconstruct:
-        //    "Will BTC close above $strike at Unix {expiry_ts}?"
-        let market_id = self.market_id_counter;
-        let question_hash: [u8; 32] = keccak256(
-            &encode(&[Token::Uint(U256::from(next_hour_ts))])
-        );
+        // 3. Create a new market for the next hour.
+        //    questionHash = keccak256(asset_name_bytes ++ abi.encode(expiry_ts))
+        //    Front-ends reconstruct: "Will <ASSET> close above $strike at Unix {expiry_ts}?"
+        let expected_id = self.market_id_counter;
+        let question_hash = make_question_hash(asset, next_hour_ts);
 
-        let tx_hash = self.create_market(question_hash, strike_price, next_hour_ts).await
-            .map_err(|e| ClobError::Internal(format!("createMarket failed: {e}")))?;
+        let tx_hash = self
+            .create_market(question_hash, strike_price, next_hour_ts)
+            .await
+            .map_err(|e| ClobError::Internal(format!("createBinaryMarket failed for {asset}: {e}")))?;
 
         info!(
-            market_id,
+            asset,
+            market_id = expected_id,
             strike_price,
             expiry_ts = next_hour_ts,
             tx_hash = %tx_hash,
@@ -252,20 +277,20 @@ impl MarketOracleService {
         );
 
         self.market_id_counter += 1;
-        Ok(market_id)
+        Ok(expected_id)
     }
 
     // ─── EVM contract helpers ─────────────────────────────────────────────────
 
-    /// Call `createMarket(bytes32 questionHash, uint128 strikePrice, uint64 expiryTs)`.
+    /// Call `createBinaryMarket(bytes32 questionHash, uint128 strikePrice, uint64 expiryTs)`.
     async fn create_market(
         &self,
         question_hash: [u8; 32],
         strike_price: u128,
         expiry_ts: u64,
     ) -> ClobResult<String> {
-        // selector: keccak256("createMarket(bytes32,uint128,uint64)")[..4]
-        let selector = &keccak256(b"createMarket(bytes32,uint128,uint64)")[..4];
+        // selector: keccak256("createBinaryMarket(bytes32,uint128,uint64)")[..4]
+        let selector = &keccak256(b"createBinaryMarket(bytes32,uint128,uint64)")[..4];
         let tokens = vec![
             Token::FixedBytes(question_hash.to_vec()),
             Token::Uint(U256::from(strike_price)),
@@ -275,27 +300,28 @@ impl MarketOracleService {
         self.relayer.send_tx(self.factory_address, data).await
     }
 
-    /// Call `resolveMarket(uint64 marketId, uint128 finalPrice)`.
+    /// Call `resolveBinaryMarket(uint64 marketId, uint128 finalPrice)` on the MarketResolver.
     async fn resolve_market(&self, market_id: u64, final_price: u128) -> ClobResult<String> {
-        let selector = &keccak256(b"resolveMarket(uint64,uint128)")[..4];
+        let selector = &keccak256(b"resolveBinaryMarket(uint64,uint128)")[..4];
         let tokens = vec![
             Token::Uint(U256::from(market_id)),
             Token::Uint(U256::from(final_price)),
         ];
         let data = Bytes::from([selector, encode(&tokens).as_slice()].concat());
-        self.relayer.send_tx(self.factory_address, data).await
+        self.relayer.send_tx(self.resolver_address, data).await
     }
 
     async fn resolve_pending_market(
         &self,
+        asset: &str,
         market_id: u64,
         expiry_ts: u64,
         now_ts: u64,
     ) -> ClobResult<Option<String>> {
-        let market_key = market_id.to_string();
+        let market_key = format!("{asset}-{market_id}");
         let strike_price = self.get_market_strike_price(market_id).await?;
         let strike_decimal = scaled_u128_to_decimal(strike_price);
-        let primary_price = self.fetch_pyth_price("BTC", expiry_ts).await.ok();
+        let primary_price = self.fetch_pyth_price(asset, expiry_ts).await.ok();
         let age_secs = now_ts.saturating_sub(expiry_ts);
         let attempts = self.next_attempt_count(&market_key).await?;
 
@@ -393,58 +419,72 @@ impl MarketOracleService {
     }
 
     async fn get_market_strike_price(&self, market_id: u64) -> ClobResult<u128> {
-        // getMarket(uint64) returns the full Market struct; strikePrice is the second field (u128).
-        // Simpler: call the individual public getter — markets(uint64) returns the struct.
-        // We call `getMarket(uint64)` and decode strikePrice from offset 32 (second 32-byte slot).
-        let selector = &keccak256(b"getMarket(uint64)")[..4];
+        // getBinaryMarket(uint64) returns BinaryMarket struct.
+        // ABI layout: questionHash(bytes32) at slot 0, strikePrice(uint128) at slot 1 (bytes 32..64).
+        let selector = &keccak256(b"getBinaryMarket(uint64)")[..4];
         let data = Bytes::from([
             selector,
             encode(&[Token::Uint(U256::from(market_id))]).as_slice(),
         ].concat());
-        let result = self.call_view(data).await?;
+        let result = self.call_view_resolver(data).await?;
         if result.len() < 64 {
             return Ok(0);
         }
-        // Market struct ABI layout: questionHash(bytes32), strikePrice(uint128), ...
+        // BinaryMarket struct ABI layout: questionHash(bytes32), strikePrice(uint128), ...
         // strikePrice occupies slot 1 (bytes 32..64).
         Ok(U256::from_big_endian(&result[32..64]).as_u128())
     }
 
     async fn is_market_resolved(&self, market_id: u64) -> ClobResult<bool> {
-        // `isResolved(uint64 marketId) returns (bool)`
+        // `isResolved(uint64 marketId) returns (bool)` — on MarketResolver
         let selector = &keccak256(b"isResolved(uint64)")[..4];
         let data = Bytes::from([
             selector,
             encode(&[Token::Uint(U256::from(market_id))]).as_slice(),
         ].concat());
-        let result = self.call_view(data).await?;
+        let result = self.call_view_resolver(data).await?;
         Ok(result.last().copied().unwrap_or(0) != 0)
     }
 
     async fn is_market_invalidated(&self, market_id: u64) -> ClobResult<bool> {
-        // `isInvalidated(uint64 marketId) returns (bool)`
+        // `isInvalidated(uint64 marketId) returns (bool)` — on MarketResolver
         let selector = &keccak256(b"isInvalidated(uint64)")[..4];
         let data = Bytes::from([
             selector,
             encode(&[Token::Uint(U256::from(market_id))]).as_slice(),
         ].concat());
-        let result = self.call_view(data).await?;
+        let result = self.call_view_resolver(data).await?;
         Ok(result.last().copied().unwrap_or(0) != 0)
     }
 
-    /// Low-level eth_call to the PredictionMarket contract.
-    async fn call_view(&self, data: Bytes) -> ClobResult<ethers::types::Bytes> {
+    /// Low-level eth_call to the MarketResolver contract.
+    async fn call_view_resolver(&self, data: Bytes) -> ClobResult<ethers::types::Bytes> {
         self.provider
             .call(
                 &ethers::types::transaction::eip2718::TypedTransaction::Legacy(
                     ethers::types::TransactionRequest::new()
-                        .to(self.factory_address)
+                        .to(self.resolver_address)
                         .data(data)
                 ),
                 None,
             )
             .await
-            .map_err(|e| ClobError::Internal(format!("eth_call failed: {e}")))
+            .map_err(|e| ClobError::Internal(format!("eth_call (resolver) failed: {e}")))
+    }
+
+    /// Low-level eth_call to the MarketRegistry contract.
+    async fn call_view_registry(&self, data: Bytes) -> ClobResult<ethers::types::Bytes> {
+        self.provider
+            .call(
+                &ethers::types::transaction::eip2718::TypedTransaction::Legacy(
+                    ethers::types::TransactionRequest::new()
+                        .to(self.registry_address)
+                        .data(data)
+                ),
+                None,
+            )
+            .await
+            .map_err(|e| ClobError::Internal(format!("eth_call (registry) failed: {e}")))
     }
 
     // ─── Pyth price helper ───────────────────────────────────────────────────
@@ -478,6 +518,19 @@ impl MarketOracleService {
 }
 
 // ─── Free helpers ────────────────────────────────────────────────────────────
+
+/// Build the on-chain questionHash for a binary market.
+///
+/// Encoding: keccak256(asset_name_bytes ++ abi.encode(expiry_ts))
+///   e.g. keccak256(b"BTC" ++ abi.encode(1700000000))
+///
+/// Front-ends reconstruct the question text as:
+///   "Will <ASSET> close above $<strike> at Unix <expiry_ts>?"
+fn make_question_hash(asset: &str, expiry_ts: u64) -> [u8; 32] {
+    let mut data = asset.as_bytes().to_vec();
+    data.extend_from_slice(&encode(&[Token::Uint(U256::from(expiry_ts))]));
+    keccak256(&data)
+}
 
 /// Current UNIX timestamp in seconds.
 fn unix_now() -> u64 {
