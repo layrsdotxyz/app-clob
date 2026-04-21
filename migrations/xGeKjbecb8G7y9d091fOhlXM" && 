@@ -1,0 +1,20 @@
+              List of relations
+ Schema |        Name         | Type  | Owner 
+--------+---------------------+-------+-------
+ public | balances            | table | layrs
+ public | commitment_roots    | table | layrs
+ public | deposit_checkpoints | table | layrs
+ public | deposits            | table | layrs
+ public | markets             | table | layrs
+ public | orders              | table | layrs
+ public | positions           | table | layrs
+ public | private_notes       | table | layrs
+ public | private_nullifiers  | table | layrs
+ public | private_transitions | table | layrs
+ public | processed_deposits  | table | layrs
+ public | prover_jobs         | table | layrs
+ public | user_nonces         | table | layrs
+ public | users               | table | layrs
+ public | withdrawals         | table | layrs
+(15 rows)
+

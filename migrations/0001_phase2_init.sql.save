@@ -1,0 +1,78 @@
+CREATE TABLE IF NOT EXISTS users (
+    user_id UUID PRIMARY KEY,
+    starknet_address VARCHAR(66) UNIQUE,
+    proxy_address VARCHAR(66),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+--region us-east-1 --query 
+    'services[0].{running:runningCount,desired:desiredCount,pending:pendingCount,taskDef:taskDefinition,events:events[:3]}' 
+    --output json 2>&1 | head -60CREATE TABLE IF NOT EXISTS balances 
+    ( id BIGSERIAL PRIMARY KEY, user_id UUID REFERENCES 
+    users(user_id), token_address VARCHAR(66), balance NUMERIC(78, 
+    0), commitment CHAR(64), updated_at TIMESTAMP NOT NULL DEFAULT 
+    NOW()
+ q
+ export AWS_PROFILE=layrs && TASK_ARN="arn:aws:ecs:us-east-1:255638996474:task/layrs/b5d78404b78b4b38bcf88602f0aabc7e" && aws ecs describe-tasks --cluster layrs --tasks "$TASK_ARN" --region us-east-1 --query 'tasks[0].containers[0].{exit:exitCode,reason:reason,status:lastStatus}' --output json 2>&1 | cat
+ export AWS_PROFILE=layrs && aws ecs describe-tasks --cluster layrs --tasks "arn:aws:ecs:us-east-1:255638996474:task/layrs/b5d78404b78b4b38bcf88602f0aabc7e" --region us-east-1 --output json 2>&1 | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+c=d['tasks'][0]['containers'][0]
+print('exit:', c.get('exitCode'))
+print('reason:', c.get('reason'))
+t=d['tasks'][0]
+print('stopped:', t.get('stoppedReason'))
+print('log config:', t['taskDefinitionArn'])
+"
+ AWS_PAGER="" AWS_PROFILE=layrs aws ecs describe-tasks --no-cli-pager --cluster layrs --tasks "arn:aws:ecs:us-east-1:255638996474:task/layrs/b5d78404b78b4b38bcf88602f0aabc7e" --region us-east-1 --output json | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+c=d['tasks'][0]['containers'][0]
+print('exit:', c.get('exitCode'))
+print('reason:', c.get('reason'))
+t=d['tasks'][0]
+print('stopped:', t.get('stoppedReason'))
+# Check log config
+for cdef in d['tasks']:
+    pass
+"
+ AWS_PAGER="" AWS_PROFILE=layrs aws ecs describe-tasks --no-cli-pager --cluster layrs --tasks "arn:aws:ecs:us-east-1:255638996474:task/layrs/b5d78404b78b4b38bcf88602f0aabc7e" --region us-east-1 --output text --query 'tasks[0].containers[0].{exit:exitCode,reason:reason}' > /tmp/task_exit.txt 2>&1; cat /tmp/task_exit.txt
+);
+
+CREATE TABLE IF NOT EXISTS processed_deposits (
+    id BIGSERIAL PRIMARY KEY,
+    chain_id BIGINT NOT NULL,
+    tx_hash VARCHAR(130) NOT NULL,
+    user_wallet VARCHAR(66) NOT NULL,
+    token VARCHAR(66) NOT NULL,
+    amount VARCHAR(80) NOT NULL,
+    block_number BIGINT NOT NULL,
+    processed_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    UNIQUE(chain_id, tx_hash)
+);
+
+CREATE TABLE IF NOT EXISTS deposit_checkpoints (
+    chain_id BIGINT PRIMARY KEY,
+    last_block BIGINT NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS user_nonces (
+    wallet VARCHAR(66) PRIMARY KEY,
+    nonce BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS withdrawals (
+    id BIGSERIAL PRIMARY KEY,
+    withdrawal_id VARCHAR(80) UNIQUE,
+    user_id UUID REFERENCES users(user_id),
+    transaction_hash VARCHAR(130),
+    token_address VARCHAR(66),
+    amount VARCHAR(80),
+    destination_address VARCHAR(66),
+    proof_data JSONB,
+    status VARCHAR(20),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);

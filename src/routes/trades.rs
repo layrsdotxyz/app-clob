@@ -68,13 +68,18 @@ pub async fn get_trade_history(
 }
 
 pub async fn get_user_trades(
-    State(_state): State<Arc<AppState>>,
-    Path(_user_id): Path<String>,
-    Query(_query): Query<TradesQuery>,
+    State(state): State<Arc<AppState>>,
+    Path(user_id): Path<String>,
+    Query(query): Query<TradesQuery>,
 ) -> ClobResult<impl IntoResponse> {
-    // TODO: Implement user trades lookup
+    let trades = state
+        .orderbook_manager
+        .store
+        .get_user_trades(&user_id, query.limit)
+        .await?;
+
     Ok(Json(serde_json::json!({
-        "trades": [],
-        "message": "User trades endpoint not yet implemented"
+        "trades": trades,
+        "count": trades.len(),
     })))
 }

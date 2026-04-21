@@ -10,7 +10,7 @@ Production-grade Central Limit Order Book (CLOB) matching engine built in Rust.
 - **WebSocket Server**: Real-time broadcasts for order book updates, trade executions, and user-specific order status
 - **Settlement Engine**: Balance verification, position limits, and fee calculation
 - **Prometheus Metrics**: Full observability with order latency, match rate, book depth, and WebSocket metrics
-- **Cloud Run Ready**: Docker multi-stage build with health checks and graceful shutdown
+- **ECS Ready**: Docker multi-stage build with health checks and graceful shutdown
 
 ## Architecture
 
@@ -135,10 +135,10 @@ cargo bench
 
 ## Deployment
 
-### Cloud Run
+### AWS ECS
 ```bash
-chmod +x deploy-cloudrun.sh
-./deploy-cloudrun.sh us-east1 predifi-clob
+# Run from layrs-backend/
+AWS_PROFILE=layrs bash deploy-clob.sh
 ```
 
 ### Configuration

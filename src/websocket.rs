@@ -1,4 +1,4 @@
-use crate::{models::*, orderbook::OrderBookManager};
+use crate::{models::{PublicTrade, Trade, Order, OrderBook, WsMessage, WsClientMessage}, orderbook::OrderBookManager};
 use axum::extract::ws::{Message, WebSocket};
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -154,13 +154,13 @@ impl WebSocketManager {
         }
     }
 
-    /// Broadcast trade
+    /// Broadcast an anonymous trade tick — no user IDs or settlement hash.
     pub fn broadcast_trade(&self, trade: &Trade) {
         let channel_key = format!("trades:{}", trade.market_id);
         
         if let Some(tx) = self.channels.get(&channel_key) {
             let msg = WsMessage::Trade {
-                trade: trade.clone(),
+                trade: PublicTrade::from(trade),
             };
             
             let _ = tx.send(msg);
@@ -189,23 +189,13 @@ impl WebSocketManager {
     }
 }
 
-/// Background task to broadcast order book snapshots
+/// Background task — kept for future use (e.g. market stats heartbeat).
+/// Orderbook snapshots are intentionally NOT broadcast: revealing per-level sizes
+/// would leak position concentration, violating the hidden-orderbook guarantee.
 pub async fn broadcast_task(
-    ws_manager: Arc<WebSocketManager>,
-    orderbook_manager: Arc<OrderBookManager>,
+    _ws_manager: Arc<WebSocketManager>,
+    _orderbook_manager: Arc<OrderBookManager>,
 ) {
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
-    
-    loop {
-        interval.tick().await;
-        
-        // Get active markets
-        let markets = orderbook_manager.get_active_markets();
-        
-        for market_id in markets {
-            if let Ok(orderbook) = orderbook_manager.get_orderbook(&market_id, 20).await {
-                ws_manager.broadcast_orderbook_update(&orderbook);
-            }
-        }
-    }
+    // Parked — no public channel broadcasts at this time.
+    std::future::pending::<()>().await;
 }

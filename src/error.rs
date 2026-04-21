@@ -46,6 +46,21 @@ pub enum ClobError {
     
     #[error("Redis error: {0}")]
     Redis(#[from] redis::RedisError),
+
+    #[error("Serialization error: {0}")]
+    SerdeJson(#[from] serde_json::Error),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Other error: {0}")]
+    Other(String),
+
+    #[error("Proof generation failed: {0}")]
+    ProofGenerationFailed(String),
+
+    #[error("Invalid hex: {0}")]
+    InvalidHex(String),
     
     #[error("Internal error: {0}")]
     Internal(String),
@@ -69,6 +84,11 @@ impl IntoResponse for ClobError {
                 tracing::error!(error = %self, "Redis error occurred");
                 (StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR", "Database error".to_string())
             },
+            ClobError::SerdeJson(_) => (StatusCode::BAD_REQUEST, "INVALID_JSON", self.to_string()),
+            ClobError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "IO_ERROR", self.to_string()),
+            ClobError::Other(_) => (StatusCode::INTERNAL_SERVER_ERROR, "OTHER_ERROR", self.to_string()),
+            ClobError::ProofGenerationFailed(_) => (StatusCode::INTERNAL_SERVER_ERROR, "PROOF_GENERATION_FAILED", self.to_string()),
+            ClobError::InvalidHex(_) => (StatusCode::BAD_REQUEST, "INVALID_HEX", self.to_string()),
             ClobError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "Internal error".to_string()),
         };
 

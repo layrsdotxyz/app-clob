@@ -26,6 +26,23 @@ pub struct Config {
     #[serde(default = "default_min_order_size")]
     pub min_order_size: rust_decimal::Decimal,
     
+    // Optional PostgreSQL database URL
+    pub database_url: Option<String>,
+
+    // Prediction market vault address for EVM relayer
+    pub prediction_market_vault_address: Option<String>,
+
+    // Additional contract addresses used for runtime validation
+    pub zen_vault_address: Option<String>,
+    pub zen_token_address: Option<String>,
+    pub market_factory_address: Option<String>,
+
+    #[serde(default)]
+    pub market_oracle_enabled: bool,
+
+    #[serde(default)]
+    pub market_lifecycle_enabled: bool,
+
     // Smart contract integration
     #[serde(default)]
     pub enable_settlement: bool,
@@ -99,14 +116,33 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or_else(default_min_order_size),
+            database_url: std::env::var("DATABASE_URL").ok(),
+            prediction_market_vault_address: std::env::var("PREDICTION_MARKET_VAULT_ADDRESS")
+                .or_else(|_| std::env::var("PM_VAULT_ADDRESS"))
+                .ok(),
+            zen_vault_address: std::env::var("ZEN_VAULT_ADDRESS").ok(),
+            zen_token_address: std::env::var("ZEN_TOKEN_ADDRESS").ok(),
+            market_factory_address: std::env::var("MARKET_FACTORY_ADDRESS").ok(),
+            market_oracle_enabled: std::env::var("MARKET_ORACLE_ENABLED")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(false),
+            market_lifecycle_enabled: std::env::var("MARKET_LIFECYCLE_ENABLED")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(false),
             enable_settlement: std::env::var("ENABLE_SETTLEMENT")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(false),
-            rpc_url: std::env::var("RPC_URL").ok(),
+            rpc_url: std::env::var("RPC_URL")
+                .or_else(|_| std::env::var("HORIZEN_RPC_URL"))
+                .or_else(|_| std::env::var("EVM_RPC_URL"))
+                .ok(),
             settlement_contract: std::env::var("SETTLEMENT_CONTRACT").ok(),
             settlement_private_key: std::env::var("SETTLEMENT_PRIVATE_KEY").ok(),
             chain_id: std::env::var("CHAIN_ID")
+                .or_else(|_| std::env::var("EVM_CHAIN_ID"))
                 .ok()
                 .and_then(|v| v.parse().ok()),
             settlement_batch_size: std::env::var("SETTLEMENT_BATCH_SIZE")
@@ -118,8 +154,79 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3),
         };
-        
+
+        config.validate()?;
+
         Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_optional_address(
+            "PREDICTION_MARKET_VAULT_ADDRESS/PM_VAULT_ADDRESS",
+            self.prediction_market_vault_address.as_deref(),
+        )?;
+        validate_optional_address("ZEN_VAULT_ADDRESS", self.zen_vault_address.as_deref())?;
+        validate_optional_address("ZEN_TOKEN_ADDRESS", self.zen_token_address.as_deref())?;
+        validate_optional_address(
+            "MARKET_FACTORY_ADDRESS",
+            self.market_factory_address.as_deref(),
+        )?;
+
+        if let Some(chain_id) = self.chain_id {
+            if chain_id != 2_651_420 {
+                anyhow::bail!(
+                    "Milestone 1 is pinned to Horizen testnet chain_id 2651420, got {}",
+                    chain_id
+                );
+            }
+        }
+
+        if self.market_oracle_enabled && self.market_lifecycle_enabled {
+            anyhow::bail!(
+                "MARKET_ORACLE_ENABLED and MARKET_LIFECYCLE_ENABLED cannot both be true"
+            );
+        }
+
+        if let (Some(pm_vault), Some(zen_vault)) = (
+            self.prediction_market_vault_address.as_ref(),
+            self.zen_vault_address.as_ref(),
+        ) {
+            if pm_vault.eq_ignore_ascii_case(zen_vault) {
+                anyhow::bail!(
+                    "PREDICTION_MARKET_VAULT_ADDRESS and ZEN_VAULT_ADDRESS must refer to different vaults"
+                );
+            }
+        }
+
+        if self.market_oracle_enabled {
+            if self.market_factory_address.is_none() {
+                anyhow::bail!(
+                    "MARKET_FACTORY_ADDRESS must be set when MARKET_ORACLE_ENABLED=true"
+                );
+            }
+
+            if self
+                .rpc_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+            {
+                anyhow::bail!(
+                    "RPC_URL, HORIZEN_RPC_URL, or EVM_RPC_URL must be set when MARKET_ORACLE_ENABLED=true"
+                );
+            }
+
+            if env_var_is_missing("EVM_OPERATOR_PRIVATE_KEY")
+                && env_var_is_missing("OPERATOR_PRIVATE_KEY")
+            {
+                anyhow::bail!(
+                    "EVM_OPERATOR_PRIVATE_KEY or OPERATOR_PRIVATE_KEY must be set when MARKET_ORACLE_ENABLED=true"
+                );
+            }
+        }
+
+        Ok(())
     }
     
     pub fn settlement_contract_address(&self) -> Result<ethers::types::Address> {
@@ -130,4 +237,19 @@ impl Config {
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid settlement contract address: {}", e))
     }
+}
+
+fn validate_optional_address(label: &str, value: Option<&str>) -> Result<()> {
+    if let Some(raw) = value.map(str::trim).filter(|raw| !raw.is_empty()) {
+        raw.parse::<ethers::types::Address>()
+            .map_err(|e| anyhow::anyhow!("{} is not a valid EVM address: {}", label, e))?;
+    }
+
+    Ok(())
+}
+
+fn env_var_is_missing(key: &str) -> bool {
+    std::env::var(key)
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true)
 }

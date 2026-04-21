@@ -39,3 +39,15 @@ pub async fn get_market_stats(
     
     Ok(Json(stats))
 }
+
+pub async fn get_market_resolution_audit(
+    Path(market_id): Path<String>,
+) -> ClobResult<impl IntoResponse> {
+    // Placeholder endpoint to keep API compatibility while resolution audit
+    // persistence is being wired through the route layer.
+    Ok(Json(serde_json::json!({
+        "market_id": market_id,
+        "audit": null,
+        "message": "resolution audit not available"
+    })))
+}

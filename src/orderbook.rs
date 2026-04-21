@@ -185,4 +185,15 @@ impl OrderBookManager {
             .map(|entry| entry.key().clone())
             .collect()
     }
+
+    /// Compatibility helper used by epoch service.
+    pub async fn list_markets(&self) -> ClobResult<Vec<String>> {
+        Ok(self.get_active_markets())
+    }
+
+    /// Compatibility helper used by epoch service.
+    /// Current implementation returns recent trades for the market.
+    pub async fn get_epoch_trades(&self, market_id: &str, _epoch_id: u64) -> ClobResult<Vec<Trade>> {
+        self.store.get_recent_trades(market_id, 10_000).await
+    }
 }

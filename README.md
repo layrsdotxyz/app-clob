@@ -55,7 +55,7 @@ The CLOB service is a standalone microservice that provides:
 - **Order Book Storage**: Redis 7 (sorted sets, pub/sub)
 - **Trade Persistence**: PostgreSQL 15 (historical trades, order ledger)
 - **Metrics**: prom-client (Prometheus)
-- **Deployment**: Google Cloud Run with Redis Cloud
+- **Deployment**: AWS ECS (Fargate) on cluster `layrs`
 - **Testing**: Vitest with integration test suite
 
 ## Order Types
@@ -102,14 +102,11 @@ socket.on('order:status', { orderId, status, filledSize, remainingSize })
 ## Deployment
 
 ```bash
-# Build Docker image
-docker build -t gcr.io/zoopx-0xperps/clob-service:latest .
-
-# Deploy to Cloud Run
-./ops/deploy-cloudrun.sh us-east1 clob-service
+# Run from layrs-backend/ — builds image, pushes to ECR, deploys to ECS
+AWS_PROFILE=layrs bash deploy-clob.sh
 
 # Service URL
-https://clob-service-cfnfwrmdrq-ue.a.run.app
+https://clob.layrs.xyz
 ```
 
 ## Environment Variables

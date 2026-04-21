@@ -23,6 +23,104 @@ impl RedisStore {
         Self { conn }
     }
 
+    // ==================== Generic KV Operations ====================
+
+    pub async fn get(&self, key: &str) -> ClobResult<String> {
+        let mut conn = self.conn.clone();
+        let value: Option<String> = conn.get(key).await?;
+        Ok(value.unwrap_or_default())
+    }
+
+    pub async fn set(&self, key: &str, value: &str) -> ClobResult<()> {
+        let mut conn = self.conn.clone();
+        conn.set::<_, _, ()>(key, value).await?;
+        Ok(())
+    }
+
+    pub async fn get_optional(&self, key: &str) -> ClobResult<Option<String>> {
+        let mut conn = self.conn.clone();
+        let value: Option<String> = conn.get(key).await?;
+        Ok(value)
+    }
+
+    pub async fn append_json_array_value(&self, key: &str, value: &str) -> ClobResult<()> {
+        let mut conn = self.conn.clone();
+        let existing: Option<String> = conn.get(key).await?;
+        let mut values: Vec<String> = existing
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+            .unwrap_or_default();
+
+        if !values.iter().any(|v| v == value) {
+            values.push(value.to_string());
+        }
+
+        let payload = serde_json::to_string(&values)?;
+        conn.set::<_, _, ()>(key, payload).await?;
+        Ok(())
+    }
+
+    pub async fn get_json_array_values(&self, key: &str, limit: usize) -> ClobResult<Vec<String>> {
+        let mut conn = self.conn.clone();
+        let existing: Option<String> = conn.get(key).await?;
+        let values: Vec<String> = existing
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+            .unwrap_or_default();
+
+        if values.len() <= limit {
+            return Ok(values);
+        }
+
+        Ok(values.into_iter().rev().take(limit).collect())
+    }
+
+    pub async fn push_queue(&self, queue_key: &str, value: &str) -> ClobResult<()> {
+        let mut conn = self.conn.clone();
+        conn.rpush::<_, _, ()>(queue_key, value).await?;
+        Ok(())
+    }
+
+    pub async fn pop_queue(&self, queue_key: &str) -> ClobResult<Option<String>> {
+        let mut conn = self.conn.clone();
+        let value: Option<String> = conn.lpop(queue_key, None).await?;
+        Ok(value)
+    }
+
+    pub async fn queue_depth(&self, queue_key: &str) -> ClobResult<i64> {
+        let mut conn = self.conn.clone();
+        let depth: i64 = conn.llen(queue_key).await?;
+        Ok(depth)
+    }
+
+    pub async fn ping(&self) -> ClobResult<()> {
+        let mut conn = self.conn.clone();
+        let _: String = redis::cmd("PING").query_async(&mut conn).await?;
+        Ok(())
+    }
+
+    pub async fn store_proof_data(&self, key: &str, value: &str) -> ClobResult<()> {
+        self.set(key, value).await
+    }
+
+    pub async fn retrieve_proof_data(&self, key: &str) -> ClobResult<Option<String>> {
+        self.get_optional(key).await
+    }
+
+    pub async fn get_orders_by_side(&self, market_id: &str, side: OrderSide) -> ClobResult<Vec<Order>> {
+        let levels = self
+            .get_orderbook_levels(market_id, side, 10_000)
+            .await?;
+
+        let mut orders = Vec::new();
+        for level in levels {
+            let at_price = self.get_orders_at_price(market_id, &side, level.price).await?;
+            orders.extend(at_price);
+        }
+
+        Ok(orders)
+    }
+
     // ==================== Order Operations ====================
     
     pub async fn save_order(&self, order: &Order) -> ClobResult<()> {
@@ -261,6 +359,71 @@ impl RedisStore {
             }
         }
         
+        Ok(trades)
+    }
+
+    pub async fn scan_keys(&self, pattern: &str) -> ClobResult<Vec<String>> {
+        let mut conn = self.conn.clone();
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg(pattern)
+            .query_async(&mut conn)
+            .await?;
+        Ok(keys)
+    }
+
+    // ==================== Note-Lock Operations ====================
+
+    /// Persist a note-lock record under `pm:note_lock:<user_id>:<order_commitment_low>`.
+    pub async fn save_note_lock(&self, record: &crate::models::NoteLockRecord) -> ClobResult<()> {
+        let key = format!("pm:note_lock:{}:{}", record.user_id, record.order_commitment_low);
+        let json = serde_json::to_string(record)?;
+        self.set(&key, &json).await
+    }
+
+    /// Delete a note-lock record (e.g. after it has been fully spent and confirmed).
+    pub async fn delete_note_lock(&self, user_id: &str, order_commitment_low: &str) -> ClobResult<()> {
+        let mut conn = self.conn.clone();
+        let key = format!("pm:note_lock:{}:{}", user_id, order_commitment_low);
+        conn.del::<_, ()>(&key).await?;
+        Ok(())
+    }
+
+    /// Retrieve all note-lock records for a user (scans `pm:note_lock:<user_id>:*`).
+    pub async fn get_note_locks_for_user(
+        &self,
+        user_id: &str,
+    ) -> ClobResult<Vec<crate::models::NoteLockRecord>> {
+        let pattern = format!("pm:note_lock:{}:*", user_id);
+        let keys = self.scan_keys(&pattern).await?;
+        let mut records = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(json) = self.get_optional(&key).await? {
+                if let Ok(record) = serde_json::from_str::<crate::models::NoteLockRecord>(&json) {
+                    records.push(record);
+                }
+            }
+        }
+        Ok(records)
+    }
+
+    pub async fn get_user_trades(&self, user_id: &str, limit: usize) -> ClobResult<Vec<Trade>> {
+        let mut conn = self.conn.clone();
+        let key = format!("{}{}", USER_TRADES_PREFIX, user_id);
+
+        let trade_ids: Vec<String> = conn.zrevrange(&key, 0, limit as isize - 1).await?;
+
+        let mut trades = Vec::new();
+        for trade_id_str in trade_ids {
+            if let Ok(trade_id) = Uuid::parse_str(&trade_id_str) {
+                let trade_key = format!("trade:{}", trade_id);
+                if let Some(json) = conn.get::<_, Option<String>>(&trade_key).await? {
+                    if let Ok(trade) = serde_json::from_str(&json) {
+                        trades.push(trade);
+                    }
+                }
+            }
+        }
+
         Ok(trades)
     }
 

@@ -1,3 +1,4 @@
+mod auth;
 mod config;
 mod database;
 mod error;
@@ -87,7 +88,7 @@ async fn async_main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer().json())
         .init();
 
-    // Bind listener ASAP using raw env to satisfy Cloud Run startup probe even before full config loads
+    // Bind listener ASAP so the ECS health check probe succeeds even before full config loads
     let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8080);
     let addr = format!("{}:{}", host, port);
@@ -136,9 +137,9 @@ async fn async_main() -> Result<()> {
             return Err(e);
         }
     };
-    tracing::info!(maker_fee_ppm=config.maker_fee_ppm, taker_fee_ppm=config.taker_fee_ppm, "Starting CLOB service");
+    tracing::info!(maker_fee_bps=config.maker_fee_bps, taker_fee_bps=config.taker_fee_bps, "Starting CLOB service");
 
-    // Initialize Valkey/Redis client (GCP Memorystore standalone, no TLS, no auth)
+    // Initialize Valkey/Redis client (AWS ElastiCache standalone, no TLS, no auth)
     let redis_client = redis::Client::open(config.redis_url.clone())
         .map_err(|e| anyhow::anyhow!("Invalid REDIS_URL: {}", e))?;
     let redis_conn = {
@@ -170,15 +171,16 @@ async fn async_main() -> Result<()> {
         match Database::connect(&database_url).await {
             Ok(db) => {
                 if let Err(e) = db.migrate().await {
-                    tracing::error!(error = %e, "Database migration failed");
-                    return Err(anyhow::anyhow!(e.to_string()));
+                    tracing::warn!(error = %e, "Database migration failed; running without PostgreSQL persistence layer");
+                    None
+                } else {
+                    tracing::info!("PostgreSQL database initialized");
+                    Some(Arc::new(db))
                 }
-                tracing::info!("PostgreSQL database initialized");
-                Some(Arc::new(db))
             }
             Err(e) => {
-                tracing::error!(error = %e, "Database connection failed");
-                return Err(anyhow::anyhow!(e.to_string()));
+                tracing::warn!(error = %e, "Database connection failed; running without PostgreSQL persistence layer");
+                None
             }
         }
     } else {
@@ -209,10 +211,8 @@ async fn async_main() -> Result<()> {
     };
     let settlement_engine = Arc::new(SettlementEngine::new(
         redis_store.clone(),
-        balance_service.clone(),
-        prediction_market_relayer.clone(),
-        config.maker_fee_ppm,
-        config.taker_fee_ppm,
+        config.maker_fee_bps,
+        config.taker_fee_bps,
     ));
     let matching_engine = Arc::new(MatchingEngine::new(
         orderbook_manager.clone(),
@@ -261,60 +261,60 @@ async fn async_main() -> Result<()> {
 
     // Build router
     let app = Router::new()
-        // Health check
+        // Health check (always public)
         .route("/health", get(routes::health::health_check))
         .route("/ready", get(routes::health::readiness_check))
         
-        // Balance endpoints (test/demo)
+        // Balance endpoints (test/demo — public for now)
         .route("/v1/balance/deposit", post(routes::balance::deposit_balance))
         .route("/v1/balance/:user_id/:market_id", get(routes::balance::get_balance))
 
-        // Wallet endpoints
-        .route("/v1/wallet/register", post(routes::wallet::register_wallet))
-        .route("/v1/wallet/deploy", post(routes::wallet::deploy_smart_account))
-        .route("/v1/wallet/:user_id", get(routes::wallet::get_wallet_info))
-
-        // Prediction market vault relay endpoints
-        .route("/v1/pm/lock-collateral", post(routes::pm::lock_collateral))
-        .route("/v1/pm/unlock-collateral", post(routes::pm::unlock_collateral))
-        .route("/v1/pm/settle-fill", post(routes::pm::settle_fill))
-        .route("/v1/pm/claim-winnings", post(routes::pm::claim_winnings))
-        .route("/v1/pm/claims", post(routes::pm::submit_claim))
-        .route("/v1/pm/claims/:job_id", get(routes::pm::get_claim_status))
-        .route("/v1/pm/private-index/:user_id", get(routes::pm::get_private_index))
-        .route("/v1/pm/deposit-note", post(routes::pm::deposit_note))
-        
-        // Order endpoints
-        .route("/v1/orders", post(routes::orders::create_order))
-        .route("/v1/orders/:order_id", delete(routes::orders::cancel_order))
-        .route("/v1/orders/:order_id", get(routes::orders::get_order))
-        .route("/v1/orders/user/:user_id", get(routes::orders::get_user_orders))
-        
-        // Order book endpoints
-        // NOTE: /v1/orderbook/:market_id and /v1/orderbook/:market_id/depth are intentionally
-        // NOT exposed publicly. Revealing per-level sizes would allow observers to infer
-        // position concentration, violating the hidden-orderbook privacy guarantee.
-        // The matching engine reads order state internally only.
-        
-        // Trades endpoints
-        // NOTE: aggregate market trades (/v1/trades/:market_id, /v1/trades/:market_id/history)
-        // are intentionally NOT exposed publicly — fill sizes/prices reveal position info.
-        // Users may only query their own fills.
-        .route("/v1/trades/user/:user_id", get(routes::trades::get_user_trades))
-        
-        // Markets endpoints
+        // Markets endpoints (public)
         .route("/v1/markets", get(routes::markets::list_markets))
         .route("/v1/markets/:market_id/stats", get(routes::markets::get_market_stats))
         .route(
             "/v1/markets/:market_id/resolution-audit",
             get(routes::markets::get_market_resolution_audit),
         )
-        
-        // WebSocket
+
+        // WebSocket (auth is optional — public channels get anonymous trade ticks,
+        // private user channel requires a valid token via ?token= query param)
         .route("/v1/ws", get(routes::websocket::ws_handler))
-        
+
         // Metrics
         .route("/metrics", get(routes::metrics::metrics_handler))
+
+        // ----------------------------------------------------------------
+        // Protected routes — require valid Dynamic.xyz JWT
+        // ----------------------------------------------------------------
+        .merge(
+            Router::new()
+                // Wallet endpoints
+                .route("/v1/wallet/register", post(routes::wallet::register_wallet))
+                .route("/v1/wallet/deploy", post(routes::wallet::deploy_smart_account))
+                .route("/v1/wallet/:user_id", get(routes::wallet::get_wallet_info))
+
+                // Prediction market vault relay endpoints
+                .route("/v1/pm/lock-collateral", post(routes::pm::lock_collateral))
+                .route("/v1/pm/unlock-collateral", post(routes::pm::unlock_collateral))
+                .route("/v1/pm/settle-fill", post(routes::pm::settle_fill))
+                .route("/v1/pm/claim-winnings", post(routes::pm::claim_winnings))
+                .route("/v1/pm/claims", post(routes::pm::submit_claim))
+                .route("/v1/pm/claims/:job_id", get(routes::pm::get_claim_status))
+                .route("/v1/pm/private-index/:user_id", get(routes::pm::get_private_index))
+                .route("/v1/pm/deposit-note", post(routes::pm::deposit_note))
+
+                // Order endpoints
+                .route("/v1/orders", post(routes::orders::create_order))
+                .route("/v1/orders/:order_id", delete(routes::orders::cancel_order))
+                .route("/v1/orders/:order_id", get(routes::orders::get_order))
+                .route("/v1/orders/user/:user_id", get(routes::orders::get_user_orders))
+
+                // Trades endpoints (user-scoped only — aggregate market trades are intentionally hidden)
+                .route("/v1/trades/user/:user_id", get(routes::trades::get_user_trades))
+
+                .route_layer(axum::middleware::from_fn(auth::require_auth))
+        )
         
         // Apply middleware (outermost → innermost in application order)
         // Rate limiter middleware reads RateLimiter from request extensions;

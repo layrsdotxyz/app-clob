@@ -1,4 +1,7 @@
 pub mod health;
+pub mod balance;
+pub mod wallet;
+pub mod pm;
 pub mod orders;
 pub mod orderbook;
 pub mod trades;

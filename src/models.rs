@@ -204,6 +204,30 @@ pub struct MarketStats {
     pub open_interest: Decimal,
 }
 
+/// A trade tick safe for public broadcast — no user IDs, no settlement hash.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicTrade {
+    pub id: Uuid,
+    pub market_id: String,
+    pub side: OrderSide,
+    pub price: Decimal,
+    pub size: Decimal,
+    pub timestamp: DateTime<Utc>,
+}
+
+impl From<&Trade> for PublicTrade {
+    fn from(t: &Trade) -> Self {
+        Self {
+            id: t.id,
+            market_id: t.market_id.clone(),
+            side: t.side,
+            price: t.price,
+            size: t.size,
+            timestamp: t.timestamp,
+        }
+    }
+}
+
 // WebSocket message types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -215,7 +239,7 @@ pub enum WsMessage {
         timestamp: DateTime<Utc>,
     },
     Trade {
-        trade: Trade,
+        trade: PublicTrade,
     },
     OrderUpdate {
         order: Order,
@@ -244,4 +268,41 @@ pub enum WsClientMessage {
         channel: String,
         market_id: Option<String>,
     },
+}
+
+/// Status of a PM note-lock (collateral locked on-chain for an order).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteLockStatus {
+    /// `lock_collateral` tx broadcast, awaiting fill.
+    Locked,
+    /// `unlock_collateral` tx broadcast (cancelled/expired).
+    Unlocked,
+    /// `settle_fill` tx broadcast (order matched and settled).
+    Settled,
+}
+
+/// Tracks a single collateral note-lock on-chain.
+/// Written to Redis by `POST /v1/pm/lock-collateral` and updated by
+/// `unlock-collateral` / `settle-fill`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteLockRecord {
+    /// Unique key: order_commitment_low (identifies the lock on-chain).
+    pub order_commitment_low: String,
+    pub order_commitment_high: String,
+    /// Nullifier emitted by the unlock/settle circuit (set after unlock/settle).
+    pub note_nullifier_low: Option<String>,
+    pub note_nullifier_high: Option<String>,
+    /// The user who owns this lock (EVM address or user_id).
+    pub user_id: String,
+    pub market_id: String,
+    pub side: String,
+    pub required_amount_low: String,
+    pub lock_expiry_ts: u64,
+    pub commitment_expiry_ts: i64,
+    pub status: NoteLockStatus,
+    pub lock_tx_hash: String,
+    pub settle_tx_hash: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
