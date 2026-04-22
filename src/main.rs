@@ -499,10 +499,10 @@ async fn async_main() -> Result<()> {
     // Start market oracle service (if MARKET_ORACLE_ENABLED=true)
     let market_oracle_task: Option<tokio::task::JoinHandle<()>> =
         if std::env::var("MARKET_ORACLE_ENABLED").unwrap_or_default() == "true" {
-            match market_oracle_service::MarketOracleService::from_env(redis_store.clone(), database.clone()) {
+            match market_oracle_service::MarketOracleService::from_env(redis_store.clone(), database.clone(), orderbook_manager.clone()) {
                 Some(svc) => {
                     tracing::info!(
-                        "Market oracle service enabled — hourly BTC markets will be created on Horizen EVM"
+                        "Market oracle service enabled — 15-min BTC/ETH/SOL markets will be created on Horizen EVM"
                     );
                     Some(tokio::spawn(async move {
                         if let Err(e) = svc.start().await {
