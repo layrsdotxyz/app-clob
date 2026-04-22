@@ -221,6 +221,12 @@ impl OrderBookManager {
         self.store.get_user_orders(user_id).await
     }
 
+    /// Register a market as active. Used for startup seeding.
+    pub fn seed_market(&self, market_id: &str) {
+        self.active_markets.insert(market_id.to_string(), true);
+        tracing::info!(market_id = %market_id, "Seeded active market on startup");
+    }
+
     /// Get active markets
     pub fn get_active_markets(&self) -> Vec<String> {
         self.active_markets

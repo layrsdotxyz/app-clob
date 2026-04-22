@@ -5,6 +5,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::str::FromStr;
+use tempfile::tempdir;
 
 use crate::{auth::AuthenticatedUser, AppState};
 
@@ -170,11 +171,60 @@ pub struct BalanceProofResponse {
     pub status: String,
 }
 
+/// Cryptographically verify a UltraHonk balance proof using `bb verify`.
+///
+/// Requires env vars:
+///   BALANCE_PROOF_BB_VK_DIR — path to directory containing the `vk` file
+///                             produced by `bb write_vk` for pm_balance_proof.
+///   BB_BIN                  — path to the `bb` binary (default: "bb").
+///
+/// The proof bytes (binary) are decoded from the 0x-prefixed hex sent by the
+/// client and written to a temp file. `bb verify` embeds public inputs inside
+/// the UltraHonk proof binary, so no separate public inputs file is needed.
+async fn verify_honk_balance_proof(honk_proof_hex: &str) -> Result<(), String> {
+    let vk_dir = std::env::var("BALANCE_PROOF_BB_VK_DIR")
+        .map_err(|_| "BALANCE_PROOF_BB_VK_DIR not configured".to_string())?;
+    let bb_bin = std::env::var("BB_BIN").unwrap_or_else(|_| "bb".to_string());
+
+    let proof_hex = honk_proof_hex.trim_start_matches("0x");
+    let proof_bytes = hex::decode(proof_hex)
+        .map_err(|e| format!("invalid proof hex: {e}"))?;
+
+    let tmp = tempdir().map_err(|e| format!("tempdir: {e}"))?;
+    let proof_path = tmp.path().join("proof");
+    std::fs::write(&proof_path, &proof_bytes)
+        .map_err(|e| format!("write proof: {e}"))?;
+
+    let vk_path  = format!("{}/vk", vk_dir);
+    let proof_str = proof_path.to_str().unwrap().to_owned();
+
+    let result = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(&bb_bin)
+            .arg("verify")
+            .arg("--scheme").arg("ultra_honk")
+            .arg("-k").arg(&vk_path)
+            .arg("-p").arg(&proof_str)
+            .output()
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {e}"))?
+    .map_err(|e| format!("bb verify exec: {e}"))?;
+
+    // tmp dir (and proof file) are dropped here after bb exits.
+    drop(tmp);
+
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        return Err(format!("proof cryptographically invalid: {stderr}"));
+    }
+
+    Ok(())
+}
+
 /// POST /v1/balance/proof
 ///
-/// Validates the UltraHonk proof format and nullifier freshness, then records a
-/// 5-minute soft-lock so the accounting layer knows this balance note is committed.
-/// The proof is NOT verified on-chain here — that happens during settlement.
+/// Validates UltraHonk proof structure, runs `bb verify` for cryptographic
+/// correctness, checks nullifier freshness, then records a 5-minute soft-lock.
 pub async fn submit_balance_proof(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<AuthenticatedUser>,
@@ -193,14 +243,20 @@ pub async fn submit_balance_proof(
         return Err(reject("all fields are required"));
     }
 
-    // Validate UltraHonk proof structure without executing the prover.
+    // Structural parse — catches obviously malformed payloads before bb verify.
     let proof_json = serde_json::json!({
         "proof_format": "ultra_honk",
         "proof_hex": req.honk_proof_hex,
         "public_inputs": req.public_inputs,
     });
     crate::proof_generation::parse_honk_proof_from_output(&proof_json.to_string())
-        .map_err(|e| reject(&format!("invalid proof: {e}")))?;
+        .map_err(|e| reject(&format!("invalid proof structure: {e}")))?;
+
+    // Cryptographic verification — rejects fake/invalid proofs before they can
+    // enter the matching engine and cause stuck settlements.
+    verify_honk_balance_proof(&req.honk_proof_hex)
+        .await
+        .map_err(|e| reject(&format!("proof verification failed: {e}")))?;
 
     // Double-spend check.
     let spent = state
@@ -215,7 +271,7 @@ pub async fn submit_balance_proof(
         )));
     }
 
-    // Record a soft-lock so the same note cannot be submitted twice simultaneously.
+    // Record a 5-minute soft-lock keyed on the nullifier hash.
     let balance_proof_id = Uuid::new_v4().to_string();
     let now = Utc::now().timestamp();
     let soft_lock = serde_json::json!({
@@ -228,8 +284,6 @@ pub async fn submit_balance_proof(
         "expires_at": now + BALANCE_PROOF_TTL_SECS as i64,
     });
     let lock_key = format!("balance_proof:{}", req.note_nullifier_hash);
-    // Ignore errors here — the soft-lock is advisory; the hard constraint is
-    // nullifier registration at reveal time.
     let _ = state
         .redis_store
         .set_with_expiry(&lock_key, &soft_lock.to_string(), BALANCE_PROOF_TTL_SECS)

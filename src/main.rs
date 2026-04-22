@@ -205,6 +205,19 @@ async fn async_main() -> Result<()> {
     // Spawn the DB persistence worker so balance writes are durably flushed with retries.
     let persist_task = balance_service.start_persistence_worker();
     let orderbook_manager = Arc::new(OrderBookManager::new(redis_store.clone(), metrics.clone(), database.clone()));
+
+    // Seed active markets on startup so /v1/markets always returns them regardless of order activity.
+    // Override via SEED_MARKETS env var (comma-separated list of market IDs).
+    let seed_market_ids: Vec<String> = std::env::var("SEED_MARKETS")
+        .unwrap_or_else(|_| "BTC-USDC,ETH-USDC,SOL-USDC".to_string())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    for mid in &seed_market_ids {
+        orderbook_manager.seed_market(mid);
+    }
+
     let prediction_market_relayer = match PredictionMarketRelayer::from_env(
         config.prediction_market_vault_address.clone(),
     ) {
