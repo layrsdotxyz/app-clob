@@ -19,9 +19,10 @@ RUN apt-get update && apt-get install -y \
 # Copy manifests (from clob-service/ sub-directory relative to build context)
 COPY clob-service/Cargo.toml clob-service/Cargo.lock ./
 
-# Create dummy main to cache dependencies
+# Create dummy main + lib to cache dependencies
 RUN mkdir src && \
     echo "fn main() {}" > src/main.rs && \
+    echo "" > src/lib.rs && \
     cargo build --release && \
     rm -rf src
 
@@ -33,7 +34,7 @@ COPY clob-service/src ./src
 
 # Touch source files so their mtime is newer than the cached dummy binary,
 # forcing cargo to detect the change and recompile the real binary.
-RUN touch src/main.rs
+RUN touch src/main.rs src/lib.rs
 
 # Build release binary with full optimizations
 RUN cargo build --release
