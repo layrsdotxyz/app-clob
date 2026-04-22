@@ -1,5 +1,6 @@
 pub mod health;
 pub mod balance;
+pub mod claims;
 pub mod wallet;
 pub mod pm;
 pub mod orders;
@@ -8,3 +9,5 @@ pub mod trades;
 pub mod markets;
 pub mod websocket;
 pub mod metrics;
+pub mod settlements;
+pub mod stealth;

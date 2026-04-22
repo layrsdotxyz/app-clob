@@ -16,7 +16,10 @@ use ethers::{
 };
 use tracing::{error, info, warn};
 
-use crate::error::{ClobError, ClobResult};
+use crate::{
+    error::{ClobError, ClobResult},
+    proof_generation::{parse_honk_proof_from_output, HonkProof},
+};
 
 pub type EvmClient = SignerMiddleware<Provider<Http>, LocalWallet>;
 
@@ -31,8 +34,10 @@ pub struct EvmRelayerConfig {
     pub private_key: String,
     /// Deployed `PredictionMarket.sol` address.
     pub prediction_market_address: Option<String>,
-    /// Deployed `PredictionMarketVault.sol` address.
+    /// Deployed `PredictionMarketVault.sol` (WETH) address.
     pub vault_address: Option<String>,
+    /// Deployed ZEN `PrivacyVault` address.
+    pub zen_vault_address: Option<String>,
 }
 
 impl EvmRelayerConfig {
@@ -56,6 +61,7 @@ impl EvmRelayerConfig {
             vault_address: std::env::var("PREDICTION_MARKET_VAULT_ADDRESS")
                 .or_else(|_| std::env::var("PM_VAULT_ADDRESS"))
                 .ok(),
+            zen_vault_address: std::env::var("ZEN_VAULT_ADDRESS").ok(),
         })
     }
 }
@@ -125,4 +131,99 @@ impl EvmRelayer {
     pub fn pm_address(&self) -> Option<Address> {
         self.config.prediction_market_address.as_deref()?.parse().ok()
     }
+
+    /// Resolve the PrivacyVault contract address by token symbol.
+    /// Falls back to PREDICTION_MARKET_VAULT_ADDRESS for unknown symbols.
+    pub fn vault_address_for_token(&self, token: &str) -> Option<String> {
+        match token.to_uppercase().as_str() {
+            "WETH" | "ETH" => self.config.vault_address.clone(),
+            "ZEN" => self.config.zen_vault_address.clone(),
+            _ => self.config.vault_address.clone(),
+        }
+    }
+
+    /// Submit a `withdrawWithProof` transaction to the PrivacyVault contract.
+    ///
+    /// `vault_address_hex` — the deployed PrivacyVault/PredictionMarketVault address.
+    /// `proof_output_json` — prover worker output with `proof_format: "ultra_honk"`,
+    ///   `proof_hex`, and `public_inputs` (10 entries for vault_spend circuit).
+    ///
+    /// Public inputs layout (vault_spend circuit, UltraHonk):
+    ///   [0] root, [1] nullifierHash, [2] sharesPublic, [3] sharePrice,
+    ///   [4] amount, [5] vaultId, [6] recipient, [7] relayer, [8] fee, [9] extDataHash
+    pub async fn submit_withdraw_with_proof(
+        &self,
+        vault_address_hex: &str,
+        proof_output_json: &str,
+    ) -> ClobResult<String> {
+        let honk = parse_honk_proof_from_output(proof_output_json)?;
+
+        if honk.public_inputs.len() != 10 {
+            return Err(ClobError::Internal(format!(
+                "expected 10 public inputs for vault_spend, got {}",
+                honk.public_inputs.len()
+            )));
+        }
+
+        let vault_addr: Address = vault_address_hex
+            .parse()
+            .map_err(|e| ClobError::Internal(format!("invalid vault address: {e}")))?;
+
+        // selector: keccak256("withdrawWithProof(bytes,bytes32[10])")
+        let selector = &ethers::utils::keccak256(b"withdrawWithProof(bytes,bytes32[10])")[..4];
+
+        let proof_bytes = hex::decode(
+            honk.proof_hex
+                .strip_prefix("0x")
+                .or_else(|| honk.proof_hex.strip_prefix("0X"))
+                .ok_or_else(|| ClobError::Internal("proof_hex not 0x-prefixed".into()))?,
+        )
+        .map_err(|e| ClobError::Internal(format!("decode proof_hex: {e}")))?;
+
+        let input_tokens: ClobResult<Vec<Token>> = honk
+            .public_inputs
+            .iter()
+            .enumerate()
+            .map(|(i, s): (usize, &String)| {
+                let hex_body = s
+                    .strip_prefix("0x")
+                    .or_else(|| s.strip_prefix("0X"))
+                    .ok_or_else(|| {
+                        ClobError::Internal(format!("public_inputs[{i}] not 0x-prefixed"))
+                    })?;
+                let bytes = hex::decode(hex_body)
+                    .map_err(|e| ClobError::Internal(format!("decode input[{i}]: {e}")))?;
+                if bytes.len() != 32 {
+                    return Err(ClobError::Internal(format!(
+                        "public_inputs[{i}] must be 32 bytes, got {}",
+                        bytes.len()
+                    )));
+                }
+                Ok(Token::FixedBytes(bytes))
+            })
+            .collect();
+
+        let tokens = vec![
+            Token::Bytes(proof_bytes),
+            Token::FixedArray(input_tokens?),
+        ];
+
+        use ethers::abi::encode;
+        let calldata: Bytes = [selector, encode(&tokens).as_slice()].concat().into();
+
+        let tx = TransactionRequest::new()
+            .to(vault_addr)
+            .data(calldata);
+
+        let pending = self
+            .client
+            .send_transaction(tx, None)
+            .await
+            .map_err(|e| ClobError::Internal(format!("withdrawWithProof tx failed: {e}")))?;
+
+        let tx_hash = format!("{:#x}", pending.tx_hash());
+        info!(tx_hash = %tx_hash, vault = %vault_address_hex, "withdrawWithProof submitted on Horizen");
+        Ok(tx_hash)
+    }
 }
+

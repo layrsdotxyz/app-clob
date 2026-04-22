@@ -11,7 +11,7 @@ use crate::{
     error::{ClobError, ClobResult},
     prediction_market_relayer::PredictionMarketRelayer,
     prediction_market_settlement::{PredictionMarketSettlementJob, PM_SETTLEMENT_JOB_PREFIX, PM_SETTLEMENT_QUEUE},
-    proof_generation::{ProverJobStatus, ProverJobType, ProverPipeline, parse_evm_proof_from_output, low_high_hex_to_bytes32, parse_u128_hex},
+    proof_generation::{ProverJobStatus, ProverJobType, ProverPipeline, parse_honk_proof_from_output, low_high_hex_to_bytes32, parse_u128_hex},
     redis_store::RedisStore,
 };
 
@@ -85,7 +85,7 @@ impl PredictionMarketSettlementWorker {
                         .prover_pipeline
                         .submit_job(
                             ProverJobType::PrivateTransferSettlement,
-                            "private_transfer_settlement",
+                            "pm_settlement",
                             &proof_input,
                         )
                         .await
@@ -153,7 +153,7 @@ impl PredictionMarketSettlementWorker {
                 .prover_pipeline
                 .submit_job(
                     ProverJobType::PrivateTransferSettlement,
-                    "private_transfer_settlement",
+                    "pm_settlement",
                     &payload,
                 )
                 .await
@@ -266,7 +266,7 @@ impl PredictionMarketSettlementWorker {
             )));
         };
 
-        let proof = parse_evm_proof_from_output(&output)?;
+        let proof = parse_honk_proof_from_output(&output)?;
         let leg = job.legs[leg_index].clone();
         let vault_override: Option<&str> = if leg.vault_address.trim().is_empty() {
             None
@@ -354,8 +354,8 @@ impl PredictionMarketSettlementWorker {
             ));
         }
 
-        // Parse a single EvmGroth16Proof from the prover output (shared across all legs).
-        let proof = parse_evm_proof_from_output(&output)?;
+        // Parse a single HonkProof from the prover output (shared across all legs).
+        let proof = parse_honk_proof_from_output(&output)?;
 
         // Use the vault_address from the settlement job for the non-leg path.
         let job_vault_override: Option<&str> = if job.vault_address.trim().is_empty() {
@@ -419,7 +419,7 @@ impl PredictionMarketSettlementWorker {
 }
 
 /// Parsed from the prover output JSON — public signals only.
-/// The proof itself is parsed by `parse_evm_proof_from_output`.
+/// The proof itself is parsed by `parse_honk_proof_from_output`.
 #[derive(Debug, Deserialize)]
 struct SettlementProofOutput {
     #[serde(default)]

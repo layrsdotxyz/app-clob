@@ -17,6 +17,12 @@ use crate::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProverMode {
+    /// Barretenberg UltraHonk: `bb execute` + `bb prove --scheme ultra_honk`.
+    /// Output: `proof.bin` (raw proof bytes) + `public_inputs` (hex bytes32 values).
+    /// Env vars required: `*_CIRCUIT_JSON` (Noir compiled .json), `*_VK` (bb VK dir).
+    /// Binary env var: `BB_BIN` (default: "bb").
+    Barretenberg,
+    /// Legacy snarkjs Groth16 path (kept for backward compat / phased migration).
     Snarkjs,
     Mock,
 }
@@ -24,12 +30,13 @@ enum ProverMode {
 impl ProverMode {
     fn from_env() -> Self {
         match std::env::var("PRIVATE_PROVER_MODE")
-            .unwrap_or_else(|_| "snarkjs".to_string())
+            .unwrap_or_else(|_| "barretenberg".to_string())
             .to_lowercase()
             .as_str()
         {
-            "mock" => Self::Mock,
-            _ => Self::Snarkjs,
+            "mock"                       => Self::Mock,
+            "snarkjs"                    => Self::Snarkjs,
+            "barretenberg" | "honk" | _ => Self::Barretenberg,
         }
     }
 }
@@ -102,6 +109,11 @@ impl ProverWorker {
             warn!("⚠️  ALLOW_INSECURE_MOCK_PROVER=true — ZK proofs are SIMULATED. DO NOT use in production.");
         }
 
+        // Sanity warn for Snarkjs mode (legacy, should be migrated to Barretenberg)
+        if self.mode == ProverMode::Snarkjs {
+            warn!("ProverMode::Snarkjs is legacy — consider migrating to ProverMode::Barretenberg (UltraHonk).");
+        }
+
         let mut ticker = interval(self.poll_interval);
 
         loop {
@@ -159,25 +171,44 @@ impl ProverWorker {
 
                 if matches!(job.job_type, ProverJobType::PrivateWithdraw) {
                     if proof_generated {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&input) {
-                            if let Some(commitment) = v.get("commitment").and_then(|x| x.as_str()) {
-                                let _ = self.privacy_state.mark_note_spent(commitment).await;
-                            }
-                        }
-
-                        // Execute on-chain withdrawal now that the ZK proof is verified
                         if let Some(ws) = &self.withdrawal_service {
-                            let ws_clone = Arc::clone(ws);
-                            let input_clone = input.clone();
-                            let output_clone = output.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = ws_clone
-                                    .execute_after_attestation(&input_clone, &output_clone)
-                                    .await
-                                {
-                                    warn!(error = %e, "execute_after_attestation failed");
+                            // Await on-chain withdrawal inline — NOT fire-and-forget.
+                            // The note is only marked spent AFTER on-chain confirmation so
+                            // that a failed or incomplete tx leaves the note intact and retryable.
+                            match ws.execute_after_attestation(&input, &output).await {
+                                Ok(()) => {
+                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&input) {
+                                        if let Some(commitment) = v.get("commitment").and_then(|x| x.as_str()) {
+                                            if let Err(e) = self.privacy_state.mark_note_spent(commitment).await {
+                                                tracing::error!(
+                                                    job_id = %job.job_id,
+                                                    error = %e,
+                                                    "On-chain withdrawal succeeded but failed to mark note spent — note may be double-spendable"
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
-                            });
+                                Err(e) => {
+                                    // Note is intentionally NOT marked spent — the proof job succeeded
+                                    // and the transition is Attested, but the chain tx failed.
+                                    // The user can re-submit the withdrawal to retry.
+                                    tracing::error!(
+                                        job_id = %job.job_id,
+                                        error = %e,
+                                        "execute_after_attestation failed — on-chain withdrawal did not execute. \
+                                         Note has NOT been marked spent; re-submit withdrawal to retry."
+                                    );
+                                }
+                            }
+                        } else {
+                            // No withdrawal service configured — mark note spent immediately
+                            // (local/dev mode with no on-chain step).
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&input) {
+                                if let Some(commitment) = v.get("commitment").and_then(|x| x.as_str()) {
+                                    let _ = self.privacy_state.mark_note_spent(commitment).await;
+                                }
+                            }
                         }
                     }
                 }
@@ -244,8 +275,149 @@ impl ProverWorker {
 
                 serde_json::to_string(&output).map_err(|e| e.to_string())
             }
+            ProverMode::Barretenberg => self.generate_barretenberg_output(job, &input_value).await,
             ProverMode::Snarkjs => self.generate_snarkjs_output(job, &input_value).await,
         }
+    }
+
+    /// Generate a UltraHonk proof using the Barretenberg CLI (`bb`).
+    ///
+    /// Flow:
+    ///   1. Write input TOML to a temp dir (format: `key = value` per Noir Prover.toml)
+    ///   2. `bb execute -b <circuit.json> -i <input.toml> -o <witness_dir>` → witness.gz
+    ///   3. `bb prove --scheme ultra_honk -b <circuit.json> -w <witness_dir>/witness.gz -o <out_dir>`
+    ///      → <out_dir>/proof (binary), <out_dir>/public_inputs (hex bytes32 per line)
+    ///   4. Optionally verify: `bb verify --scheme ultra_honk -k <vk_dir>/vk -p <proof> -i <public_inputs>`
+    ///   5. Return JSON with proof_format="ultra_honk", proof_hex, public_inputs (hex bytes32 string[])
+    async fn generate_barretenberg_output(
+        &self,
+        job: &ProverJob,
+        input_value: &serde_json::Value,
+    ) -> Result<String, String> {
+        let circuit_json = self.circuit_json_path(job)?;
+        let vk_dir       = self.bb_vk_dir(job)?;
+        let dir          = tempdir().map_err(|e| e.to_string())?;
+
+        let bb_bin = std::env::var("BB_BIN").unwrap_or_else(|_| "bb".to_string());
+
+        // ─ 1. Write Prover.toml ──────────────────────────────────────────────
+        let toml_path = dir.path().join("Prover.toml");
+        let toml_str  = json_to_prover_toml(input_value)
+            .map_err(|e| format!("failed to build Prover.toml: {}", e))?;
+        std::fs::write(&toml_path, &toml_str).map_err(|e| e.to_string())?;
+
+        // ─ 2. Execute circuit → witness ──────────────────────────────────────
+        let witness_dir = dir.path().join("witness");
+        std::fs::create_dir_all(&witness_dir).map_err(|e| e.to_string())?;
+
+        let exec_out = std::process::Command::new(&bb_bin)
+            .arg("execute")
+            .arg("-b").arg(&circuit_json)
+            .arg("-i").arg(&toml_path)
+            .arg("-o").arg(&witness_dir)
+            .output()
+            .map_err(|e| format!("failed to run bb execute ({}): {}", bb_bin, e))?;
+
+        if !exec_out.status.success() {
+            return Err(format!(
+                "bb execute failed for circuit '{}': {}",
+                job.circuit_name,
+                String::from_utf8_lossy(&exec_out.stderr)
+            ));
+        }
+
+        let witness_path = witness_dir.join("witness.gz");
+        if !witness_path.exists() {
+            return Err(format!(
+                "bb execute did not produce witness.gz for circuit '{}'",
+                job.circuit_name
+            ));
+        }
+
+        // ─ 3. Prove ──────────────────────────────────────────────────────────
+        let proof_dir = dir.path().join("proof_out");
+        std::fs::create_dir_all(&proof_dir).map_err(|e| e.to_string())?;
+
+        let prove_out = std::process::Command::new(&bb_bin)
+            .arg("prove")
+            .arg("--scheme").arg("ultra_honk")
+            .arg("-b").arg(&circuit_json)
+            .arg("-w").arg(&witness_path)
+            .arg("-o").arg(&proof_dir)
+            .output()
+            .map_err(|e| format!("failed to run bb prove ({}): {}", bb_bin, e))?;
+
+        if !prove_out.status.success() {
+            return Err(format!(
+                "bb prove failed for circuit '{}': {}",
+                job.circuit_name,
+                String::from_utf8_lossy(&prove_out.stderr)
+            ));
+        }
+
+        // ─ 4. Read proof bytes ───────────────────────────────────────────────
+        let proof_bytes = std::fs::read(proof_dir.join("proof"))
+            .map_err(|e| format!("failed to read proof file: {}", e))?;
+        let proof_hex = hex::encode(&proof_bytes);
+
+        // ─ 5. Read public inputs ─────────────────────────────────────────────
+        // bb outputs one hex-encoded bytes32 per line in `public_inputs`
+        let pi_text = std::fs::read_to_string(proof_dir.join("public_inputs"))
+            .map_err(|e| format!("failed to read public_inputs file: {}", e))?;
+        let public_inputs: Vec<String> = pi_text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                let s = l.trim();
+                // Normalise to 0x-prefixed lowercase 32-byte hex
+                let hex_part = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+                format!("0x{:0>64}", hex_part.to_lowercase())
+            })
+            .collect();
+
+        // ─ 6. Server-side verify ─────────────────────────────────────────────
+        let vk_path = std::path::Path::new(&vk_dir).join("vk");
+        if vk_path.exists() {
+            let verify_out = std::process::Command::new(&bb_bin)
+                .arg("verify")
+                .arg("--scheme").arg("ultra_honk")
+                .arg("-k").arg(&vk_path)
+                .arg("-p").arg(proof_dir.join("proof"))
+                .output()
+                .map_err(|e| format!("failed to run bb verify: {}", e))?;
+
+            if !verify_out.status.success() {
+                return Err(format!(
+                    "bb verify failed for circuit '{}' — proof is invalid: {}",
+                    job.circuit_name,
+                    String::from_utf8_lossy(&verify_out.stderr)
+                ));
+            }
+            info!(
+                job_id   = %job.job_id,
+                circuit  = %job.circuit_name,
+                "UltraHonk server-side proof verification passed"
+            );
+        } else {
+            warn!(
+                circuit = %job.circuit_name,
+                vk_dir  = %vk_dir,
+                "VK not found at {:?} — skipping server-side verify. Run build_honk_verifiers.sh.",
+                vk_path
+            );
+        }
+
+        let output = json!({
+            "proof_format": "ultra_honk",
+            "job_id":        job.job_id,
+            "job_type":      job.job_type,
+            "circuit":       job.circuit_name,
+            "generated_at":  chrono::Utc::now(),
+            "proof_hex":     proof_hex,
+            "public_inputs": public_inputs,
+        });
+
+        serde_json::to_string(&output).map_err(|e| e.to_string())
     }
 
     async fn generate_snarkjs_output(
@@ -378,6 +550,108 @@ impl ProverWorker {
 
         Ok(vk)
     }
+
+    /// Return the path to the compiled Noir circuit JSON for Barretenberg.
+    /// Env vars: `PRIVATE_DEPOSIT_CIRCUIT_JSON`, `PRIVATE_TRANSFER_SETTLEMENT_CIRCUIT_JSON`, etc.
+    fn circuit_json_path(&self, job: &ProverJob) -> Result<String, String> {
+        let key = match job.job_type {
+            ProverJobType::PrivateDeposit             => "PRIVATE_DEPOSIT_CIRCUIT_JSON",
+            ProverJobType::PrivateOrderCommitment     => "PRIVATE_ORDER_COMMITMENT_CIRCUIT_JSON",
+            ProverJobType::PrivateTransferSettlement  => "PRIVATE_TRANSFER_SETTLEMENT_CIRCUIT_JSON",
+            ProverJobType::PrivateMarketClaim         => "PRIVATE_MARKET_CLAIM_CIRCUIT_JSON",
+            ProverJobType::PrivateWithdraw            => "PRIVATE_WITHDRAW_CIRCUIT_JSON",
+            ProverJobType::PrivateYieldDistribution   => "PRIVATE_YIELD_DISTRIBUTION_CIRCUIT_JSON",
+        };
+        let path = std::env::var(key)
+            .map_err(|_| format!("{} is required for Barretenberg prover mode", key))?;
+        if !std::path::Path::new(&path).exists() {
+            return Err(format!("circuit JSON not found: {}", path));
+        }
+        Ok(path)
+    }
+
+    /// Return the directory containing the UltraHonk VK file (`vk`) for each circuit.
+    /// Env vars: `PRIVATE_DEPOSIT_BB_VK_DIR`, etc.
+    /// Returns an empty string if the env var is unset — caller skips server-side verify.
+    fn bb_vk_dir(&self, job: &ProverJob) -> Result<String, String> {
+        let key = match job.job_type {
+            ProverJobType::PrivateDeposit             => "PRIVATE_DEPOSIT_BB_VK_DIR",
+            ProverJobType::PrivateOrderCommitment     => "PRIVATE_ORDER_COMMITMENT_BB_VK_DIR",
+            ProverJobType::PrivateTransferSettlement  => "PRIVATE_TRANSFER_SETTLEMENT_BB_VK_DIR",
+            ProverJobType::PrivateMarketClaim         => "PRIVATE_MARKET_CLAIM_BB_VK_DIR",
+            ProverJobType::PrivateWithdraw            => "PRIVATE_WITHDRAW_BB_VK_DIR",
+            ProverJobType::PrivateYieldDistribution   => "PRIVATE_YIELD_DISTRIBUTION_BB_VK_DIR",
+        };
+        Ok(std::env::var(key).unwrap_or_default())
+    }
+}
+
+/// Convert a JSON object (serde_json::Value) into a Noir `Prover.toml` string.
+///
+/// Supported conversions:
+/// - Strings and numbers → `key = "value"`
+/// - Booleans           → `key = "true"` / `key = "false"`
+/// - Arrays             → `key = ["v0", "v1", ...]`
+/// - Nested objects     → `[key]\nfield = "value"` (TOML table)
+fn json_to_prover_toml(v: &serde_json::Value) -> Result<String, String> {
+    let obj = v
+        .as_object()
+        .ok_or_else(|| "prover input must be a JSON object".to_string())?;
+
+    let mut lines = Vec::new();
+
+    for (key, val) in obj {
+        match val {
+            serde_json::Value::String(s) => {
+                lines.push(format!("{} = {:?}", key, s));
+            }
+            serde_json::Value::Number(n) => {
+                lines.push(format!("{} = {:?}", key, n.to_string()));
+            }
+            serde_json::Value::Bool(b) => {
+                lines.push(format!("{} = {:?}", key, b.to_string()));
+            }
+            serde_json::Value::Array(arr) => {
+                let elems: Result<Vec<String>, String> = arr
+                    .iter()
+                    .map(|item| match item {
+                        serde_json::Value::String(s) => Ok(format!("{:?}", s)),
+                        serde_json::Value::Number(n) => Ok(format!("{:?}", n.to_string())),
+                        serde_json::Value::Bool(b) => Ok(format!("{:?}", b.to_string())),
+                        other => Err(format!(
+                            "unsupported array element type for key {}: {:?}",
+                            key, other
+                        )),
+                    })
+                    .collect();
+                lines.push(format!("{} = [{}]", key, elems?.join(", ")));
+            }
+            serde_json::Value::Object(inner) => {
+                lines.push(format!("[{}]", key));
+                for (ikey, ival) in inner {
+                    match ival {
+                        serde_json::Value::String(s) => {
+                            lines.push(format!("{} = {:?}", ikey, s));
+                        }
+                        serde_json::Value::Number(n) => {
+                            lines.push(format!("{} = {:?}", ikey, n.to_string()));
+                        }
+                        other => {
+                            return Err(format!(
+                                "unsupported nested value type for {}.{}: {:?}",
+                                key, ikey, other
+                            ))
+                        }
+                    }
+                }
+            }
+            serde_json::Value::Null => {
+                // skip null values
+            }
+        }
+    }
+
+    Ok(lines.join("\n"))
 }
 
 #[cfg(test)]

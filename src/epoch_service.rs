@@ -210,7 +210,7 @@ mod tests {
     async fn test_epoch_service_creation() {
         let (redis, _shutdown) = make_redis().await;
         let metrics = Metrics::test_instance();
-        let orderbook = Arc::new(OrderBookManager::new(redis.clone(), metrics.clone()));
+        let orderbook = Arc::new(OrderBookManager::new(redis.clone(), metrics.clone(), None));
         let prover = Arc::new(OrderMatchProver::new(redis.clone()));
 
         let service = EpochService::new(

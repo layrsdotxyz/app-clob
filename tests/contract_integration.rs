@@ -62,7 +62,7 @@ fn test_low_high_round_trip_arbitrary() {
 /// The EVM ABI-encodes uint256 as big-endian 32 bytes.
 #[test]
 fn test_u256_big_endian_encoding() {
-    let value: u64 = 0xdeadbeef;
+    let value: u32 = 0xdeadbeef;
     let mut buf = [0u8; 32];
     buf[28..32].copy_from_slice(&value.to_be_bytes());
     assert_eq!(buf[28], 0xde);

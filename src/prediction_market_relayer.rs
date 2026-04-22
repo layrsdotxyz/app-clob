@@ -1,7 +1,7 @@
 /// Prediction market on-chain relayer — EVM edition.
 ///
 /// Encodes and submits calls to `PredictionMarketVault.sol` on Horizen EVM.
-/// Proof format: standard Groth16 pA/pB/pC/pubSignals (snarkjs JSON).
+/// Proof format: UltraHonk flat `bytes` proof + `bytes32[]` public inputs.
 use std::sync::Arc;
 
 use ethers::{
@@ -13,7 +13,7 @@ use tracing::info;
 use crate::{
     error::{ClobError, ClobResult},
     evm_relayer::EvmRelayer,
-    proof_generation::EvmGroth16Proof,
+    proof_generation::HonkProof,
 };
 
 pub struct PredictionMarketRelayer {
@@ -53,11 +53,7 @@ impl PredictionMarketRelayer {
 
     // ─── lockCollateral(bytes32 orderCommitment, uint256 requiredAmount,
     //                   uint64 lockExpiryTs,
-    //                   uint256[2] pA, uint256[2][2] pB, uint256[2] pC,
-    //                   uint256[6] pubSignals)
-    //
-    // selector: keccak256("lockCollateral(bytes32,uint256,uint64,(uint256[2],uint256[2][2],uint256[2]),uint256[6])")
-    //   — we use manual abi::encode here to avoid generating full bindings.
+    //                   bytes proof, bytes32[6] inputs)
     //
     // `vault_address_override`: if non-empty, route to this vault instead of the
     // default one from env. Pass `None` or `Some("")` to use the default.
@@ -66,15 +62,15 @@ impl PredictionMarketRelayer {
         order_commitment: [u8; 32],
         required_amount: U256,
         lock_expiry_ts: u64,
-        proof: &EvmGroth16Proof,
+        proof: &HonkProof,
         vault_address_override: Option<&str>,
     ) -> ClobResult<String> {
         let vault = self.effective_vault(vault_address_override)?;
         let selector = &ethers::utils::keccak256(
-            b"lockCollateral(bytes32,uint256,uint64,uint256[2],uint256[2][2],uint256[2],uint256[6])",
+            b"lockCollateral(bytes32,uint256,uint64,bytes,bytes32[6])",
         )[..4];
 
-        let tokens = encode_lock_collateral(order_commitment, required_amount, lock_expiry_ts, proof);
+        let tokens = encode_lock_collateral(order_commitment, required_amount, lock_expiry_ts, proof)?;
         let data = Bytes::from([selector, &encode(&tokens)].concat());
         info!(vault = ?vault, "lockCollateral → sending tx");
         self.relayer.send_tx(vault, data).await
@@ -103,8 +99,7 @@ impl PredictionMarketRelayer {
     // ─── settleFill(uint64 marketId, bool positionSide, bytes32 spentNullifier,
     //               uint128 potContribution, uint128 positionPayoutUnits,
     //               uint128 tradeFeeAmount,
-    //               uint256[2] pA, uint256[2][2] pB, uint256[2] pC,
-    //               uint256[5] pubSignals)
+    //               bytes proof, bytes32[4] inputs)
     //
     // `vault_address_override`: read from the order's `vault_address` field.
     // Falls back to PM_VAULT_ADDRESS if empty.
@@ -116,12 +111,12 @@ impl PredictionMarketRelayer {
         pot_contribution: u128,
         position_payout_units: u128,
         trade_fee_amount: u128,
-        proof: &EvmGroth16Proof,
+        proof: &HonkProof,
         vault_address_override: Option<&str>,
     ) -> ClobResult<String> {
         let vault = self.effective_vault(vault_address_override)?;
         let selector = &ethers::utils::keccak256(
-            b"settleFill(uint64,bool,bytes32,uint128,uint128,uint128,uint256[2],uint256[2][2],uint256[2],uint256[5])",
+            b"settleFill(uint64,bool,bytes32,uint128,uint128,uint128,bytes,bytes32[4])",
         )[..4];
 
         let tokens = encode_settle_fill(
@@ -132,7 +127,7 @@ impl PredictionMarketRelayer {
             position_payout_units,
             trade_fee_amount,
             proof,
-        );
+        )?;
         let data = Bytes::from([selector, &encode(&tokens)].concat());
         info!(
             vault = ?vault,
@@ -144,23 +139,22 @@ impl PredictionMarketRelayer {
     }
 
     // ─── claimWinnings(address recipient,
-    //                   uint256[2] pA, uint256[2][2] pB, uint256[2] pC,
-    //                   uint256[8] pubSignals)
+    //                   bytes proof, bytes32[7] inputs)
     //
     // `vault_address_override`: read from the claim request body.
     // Falls back to PM_VAULT_ADDRESS if empty.
     pub async fn claim_winnings(
         &self,
         recipient: Address,
-        proof: &EvmGroth16Proof,
+        proof: &HonkProof,
         vault_address_override: Option<&str>,
     ) -> ClobResult<String> {
         let vault = self.effective_vault(vault_address_override)?;
         let selector = &ethers::utils::keccak256(
-            b"claimWinnings(address,uint256[2],uint256[2][2],uint256[2],uint256[8])",
+            b"claimWinnings(address,bytes,bytes32[7])",
         )[..4];
 
-        let tokens = encode_claim_winnings(recipient, proof);
+        let tokens = encode_claim_winnings(recipient, proof)?;
         let data = Bytes::from([selector, &encode(&tokens)].concat());
         info!(vault = ?vault, %recipient, "claimWinnings → sending tx");
         self.relayer.send_tx(vault, data).await
@@ -169,52 +163,68 @@ impl PredictionMarketRelayer {
 
 // ─── ABI encoding helpers ──────────────────────────────────────────────────
 
-fn groth16_tokens(proof: &EvmGroth16Proof) -> Vec<Token> {
-    // pA: uint256[2]
-    let pa = Token::FixedArray(vec![
-        Token::Uint(U256::from_str_radix(&proof.pa[0], 10).unwrap_or_default()),
-        Token::Uint(U256::from_str_radix(&proof.pa[1], 10).unwrap_or_default()),
-    ]);
-    // pB: uint256[2][2]
-    let pb = Token::FixedArray(vec![
-        Token::FixedArray(vec![
-            Token::Uint(U256::from_str_radix(&proof.pb[0][0], 10).unwrap_or_default()),
-            Token::Uint(U256::from_str_radix(&proof.pb[0][1], 10).unwrap_or_default()),
-        ]),
-        Token::FixedArray(vec![
-            Token::Uint(U256::from_str_radix(&proof.pb[1][0], 10).unwrap_or_default()),
-            Token::Uint(U256::from_str_radix(&proof.pb[1][1], 10).unwrap_or_default()),
-        ]),
-    ]);
-    // pC: uint256[2]
-    let pc = Token::FixedArray(vec![
-        Token::Uint(U256::from_str_radix(&proof.pc[0], 10).unwrap_or_default()),
-        Token::Uint(U256::from_str_radix(&proof.pc[1], 10).unwrap_or_default()),
-    ]);
-    // pubSignals: uint256[N]
-    let pub_signals = Token::FixedArray(
-        proof
-            .pub_signals
-            .iter()
-            .map(|s| Token::Uint(U256::from_str_radix(s, 10).unwrap_or_default()))
-            .collect(),
-    );
-    vec![pa, pb, pc, pub_signals]
+/// Decode a `0x`-prefixed hex proof string into raw bytes.
+fn decode_proof_hex(hex: &str) -> ClobResult<Vec<u8>> {
+    let stripped = hex
+        .strip_prefix("0x")
+        .or_else(|| hex.strip_prefix("0X"))
+        .ok_or_else(|| ClobError::Internal("proof_hex must be 0x-prefixed".to_string()))?;
+    hex::decode(stripped)
+        .map_err(|e| ClobError::Internal(format!("invalid proof_hex: {}", e)))
+}
+
+/// Decode a `0x`-prefixed 32-byte hex string into `[u8; 32]`.
+fn decode_bytes32(s: &str, label: &str) -> ClobResult<[u8; 32]> {
+    let stripped = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .ok_or_else(|| ClobError::Internal(format!("{label} must be 0x-prefixed")))?;
+    let bytes = hex::decode(stripped)
+        .map_err(|e| ClobError::Internal(format!("{label} invalid hex: {e}")))?;
+    if bytes.len() != 32 {
+        return Err(ClobError::Internal(format!(
+            "{label} must be 32 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Ok(arr)
+}
+
+/// Encode a `HonkProof` as `(bytes proof, bytes32[N] inputs)` ABI tokens.
+/// The fixed-array size N must match the number of public inputs in the proof.
+fn honk_tokens(proof: &HonkProof) -> ClobResult<(Token, Token)> {
+    let proof_bytes = decode_proof_hex(&proof.proof_hex)?;
+    let input_tokens: ClobResult<Vec<Token>> = proof
+        .public_inputs
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let b32 = decode_bytes32(s, &format!("public_inputs[{}]", i))?;
+            Ok(Token::FixedBytes(b32.to_vec()))
+        })
+        .collect();
+    Ok((
+        Token::Bytes(proof_bytes),
+        Token::FixedArray(input_tokens?),
+    ))
 }
 
 fn encode_lock_collateral(
     order_commitment: [u8; 32],
     required_amount: U256,
     lock_expiry_ts: u64,
-    proof: &EvmGroth16Proof,
-) -> Vec<Token> {
-    let mut tokens = vec![
+    proof: &HonkProof,
+) -> ClobResult<Vec<Token>> {
+    let (proof_token, inputs_token) = honk_tokens(proof)?;
+    Ok(vec![
         Token::FixedBytes(order_commitment.to_vec()),
         Token::Uint(required_amount),
         Token::Uint(U256::from(lock_expiry_ts)),
-    ];
-    tokens.extend(groth16_tokens(proof));
-    tokens
+        proof_token,
+        inputs_token,
+    ])
 }
 
 fn encode_settle_fill(
@@ -224,22 +234,26 @@ fn encode_settle_fill(
     pot_contribution: u128,
     position_payout_units: u128,
     trade_fee_amount: u128,
-    proof: &EvmGroth16Proof,
-) -> Vec<Token> {
-    let mut tokens = vec![
+    proof: &HonkProof,
+) -> ClobResult<Vec<Token>> {
+    let (proof_token, inputs_token) = honk_tokens(proof)?;
+    Ok(vec![
         Token::Uint(U256::from(market_id)),
         Token::Bool(position_side),
         Token::FixedBytes(spent_nullifier.to_vec()),
         Token::Uint(U256::from(pot_contribution)),
         Token::Uint(U256::from(position_payout_units)),
         Token::Uint(U256::from(trade_fee_amount)),
-    ];
-    tokens.extend(groth16_tokens(proof));
-    tokens
+        proof_token,
+        inputs_token,
+    ])
 }
 
-fn encode_claim_winnings(recipient: Address, proof: &EvmGroth16Proof) -> Vec<Token> {
-    let mut tokens = vec![Token::Address(recipient)];
-    tokens.extend(groth16_tokens(proof));
-    tokens
+fn encode_claim_winnings(recipient: Address, proof: &HonkProof) -> ClobResult<Vec<Token>> {
+    let (proof_token, inputs_token) = honk_tokens(proof)?;
+    Ok(vec![
+        Token::Address(recipient),
+        proof_token,
+        inputs_token,
+    ])
 }

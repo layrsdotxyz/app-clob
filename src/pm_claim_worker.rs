@@ -11,7 +11,7 @@ use crate::{
     error::{ClobError, ClobResult},
     prediction_market_claims::{PredictionMarketClaimJob, PM_CLAIM_JOB_PREFIX, PM_CLAIM_QUEUE},
     prediction_market_relayer::PredictionMarketRelayer,
-    proof_generation::{ProverJobStatus, ProverJobType, ProverPipeline, parse_evm_proof_from_output},
+    proof_generation::{ProverJobStatus, ProverJobType, ProverPipeline, parse_honk_proof_from_output},
     redis_store::RedisStore,
 };
 
@@ -77,7 +77,7 @@ impl PredictionMarketClaimWorker {
 
             match self
                 .prover_pipeline
-                .submit_job(ProverJobType::PrivateMarketClaim, "private_market_claim", &input_payload)
+                .submit_job(ProverJobType::PrivateMarketClaim, "pm_claim", &input_payload)
                 .await
             {
                 Ok(prover_job) => {
@@ -156,7 +156,7 @@ impl PredictionMarketClaimWorker {
             .get_output(prover_job_id)
             .await?
             .ok_or_else(|| ClobError::ProofGenerationFailed(format!("proof output missing for {}", prover_job_id)))?;
-        let proof = parse_evm_proof_from_output(&output)?;
+        let proof = parse_honk_proof_from_output(&output)?;;
 
         let vault_override: Option<&str> = if job.vault_address.trim().is_empty() {
             None
@@ -207,4 +207,64 @@ fn parse_recipient(recipient: &str) -> ClobResult<Address> {
     recipient
         .parse::<Address>()
         .map_err(|e| ClobError::InvalidHex(format!("invalid recipient address '{}': {}", recipient, e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── claim_input_key ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_claim_input_key_format() {
+        let key = claim_input_key("job-abc-123");
+        assert_eq!(key, "pm:claim:input:job-abc-123");
+    }
+
+    #[test]
+    fn test_claim_input_key_empty_job_id() {
+        let key = claim_input_key("");
+        assert_eq!(key, "pm:claim:input:");
+    }
+
+    #[test]
+    fn test_claim_input_key_uuid_format() {
+        let job_id = "550e8400-e29b-41d4-a716-446655440000";
+        let key = claim_input_key(job_id);
+        assert_eq!(key, format!("pm:claim:input:{}", job_id));
+    }
+
+    // ─── parse_recipient ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_recipient_valid_with_0x() {
+        let result = parse_recipient("0x742d35Cc6634C0532925a3b844Bc454e4438f44e");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_recipient_zero_address() {
+        let result = parse_recipient("0x0000000000000000000000000000000000000000");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_recipient_garbage_string() {
+        let result = parse_recipient("not-an-address");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("invalid recipient address"), "{msg}");
+    }
+
+    #[test]
+    fn test_parse_recipient_too_short() {
+        let result = parse_recipient("0x1234");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_recipient_empty_string() {
+        let result = parse_recipient("");
+        assert!(result.is_err());
+    }
 }

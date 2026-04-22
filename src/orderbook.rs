@@ -1,4 +1,5 @@
 use crate::{
+    database::Database,
     error::{ClobError, ClobResult},
     metrics::Metrics,
     models::*,
@@ -12,15 +13,21 @@ use uuid::Uuid;
 pub struct OrderBookManager {
     pub store: Arc<RedisStore>,
     pub metrics: Arc<Metrics>,
+    database: Option<Arc<Database>>,
     // In-memory cache for hot path lookups
     active_markets: DashMap<String, bool>,
 }
 
 impl OrderBookManager {
-    pub fn new(store: Arc<RedisStore>, metrics: Arc<Metrics>) -> Self {
+    pub fn new(
+        store: Arc<RedisStore>,
+        metrics: Arc<Metrics>,
+        database: Option<Arc<Database>>,
+    ) -> Self {
         Self {
             store,
             metrics,
+            database,
             active_markets: DashMap::new(),
         }
     }
@@ -32,10 +39,20 @@ impl OrderBookManager {
         
         // Add to order book sorted set
         self.store.add_to_orderbook(&order.market_id, order).await?;
+
+        // Track open interest
+        self.store.increment_open_interest(&order.market_id, order.remaining).await?;
         
         // Mark market as active
         self.active_markets.insert(order.market_id.clone(), true);
         
+        // Persist to PostgreSQL (write-behind; log failure, don't abort)
+        if let Some(db) = &self.database {
+            if let Err(e) = db.upsert_order(order).await {
+                tracing::error!(order_id = %order.id, error = %e, "Failed to persist order to DB");
+            }
+        }
+
         // Update metrics
         self.metrics.record_order_added(&order.market_id, &order.side);
         
@@ -62,10 +79,23 @@ impl OrderBookManager {
         self.store
             .remove_from_orderbook(&order.market_id, order_id, order.side.clone())
             .await?;
+
+        // Reduce open interest by the unfilled amount
+        self.store.decrement_open_interest(&order.market_id, order.remaining).await?;
         
-        // Delete order
+        // Delete order from Redis
         self.store.delete_order(order_id, &order.user_id).await?;
-        
+
+        // Persist cancellation to DB
+        if let Some(db) = &self.database {
+            if let Err(e) = db
+                .update_order_status(order_id, &OrderStatus::Cancelled, order.filled, Decimal::ZERO)
+                .await
+            {
+                tracing::error!(order_id = %order_id, error = %e, "Failed to persist order cancellation to DB");
+            }
+        }
+
         // Update metrics
         self.metrics.record_order_removed(&order.market_id, &order.side);
         
@@ -141,6 +171,9 @@ impl OrderBookManager {
         order.remaining -= filled_size;
         order.updated_at = chrono::Utc::now();
         order.fills.push(fill);
+
+        // Reduce open interest by the filled amount
+        self.store.decrement_open_interest(&order.market_id, filled_size).await?;
         
         if order.remaining <= Decimal::ZERO {
             order.status = OrderStatus::Filled;
@@ -161,6 +194,16 @@ impl OrderBookManager {
         
         // Save updated order
         self.store.save_order(&order).await?;
+
+        // Persist updated status to DB (write-behind)
+        if let Some(db) = &self.database {
+            if let Err(e) = db
+                .update_order_status(order_id, &order.status, order.filled, order.remaining)
+                .await
+            {
+                tracing::error!(order_id = %order_id, error = %e, "Failed to persist order status update to DB");
+            }
+        }
         
         tracing::debug!(
             order_id = %order_id,

@@ -2,12 +2,16 @@ mod order_match_prover;
 mod evm_proof_calldata;
 mod prover_pipeline;
 pub mod groth16_verifier;
+pub mod prover_worker;
 
 pub use order_match_prover::OrderMatchProver;
+pub use prover_worker::ProverWorker;
 pub use evm_proof_calldata::{
     EvmGroth16Proof,
+    HonkProof,
     parse_snarkjs_proof,
     parse_evm_proof_from_output,
+    parse_honk_proof_from_output,
     low_high_hex_to_bytes32,
     parse_u128_hex,
 };

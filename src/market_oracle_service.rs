@@ -31,6 +31,7 @@ use ethers::{
 };
 
 use crate::{
+    database::Database,
     error::{ClobError, ClobResult},
     evm_relayer::EvmRelayer,
     market_resolution_policy::{
@@ -64,6 +65,8 @@ pub struct MarketOracleService {
     provider: Arc<Provider<Http>>,
     /// Redis persistence for auditable oracle records.
     store: Arc<RedisStore>,
+    /// PostgreSQL database for durable market records.
+    database: Option<Arc<Database>>,
     /// Pyth oracle — single source of truth for price data.
     oracle: Arc<PythOracle>,
     /// Oracle resolution and dispute policy.
@@ -85,6 +88,7 @@ impl MarketOracleService {
         relayer: Arc<EvmRelayer>,
         provider: Arc<Provider<Http>>,
         store: Arc<RedisStore>,
+        database: Option<Arc<Database>>,
         oracle: Arc<PythOracle>,
         policy: OraclePolicy,
     ) -> Self {
@@ -95,6 +99,7 @@ impl MarketOracleService {
             relayer,
             provider,
             store,
+            database,
             oracle,
             policy,
             market_id_counter: 0,
@@ -104,7 +109,7 @@ impl MarketOracleService {
 
     /// Build from environment variables.  Returns `None` when required vars are
     /// missing (so callers can treat the service as optional).
-    pub fn from_env(store: Arc<RedisStore>) -> Option<Self> {
+    pub fn from_env(store: Arc<RedisStore>, database: Option<Arc<Database>>) -> Option<Self> {
         let factory_address_str = std::env::var("MARKET_FACTORY_ADDRESS").ok()?;
         if factory_address_str.is_empty() {
             return None;
@@ -124,7 +129,7 @@ impl MarketOracleService {
         let oracle = Arc::new(PythOracle::new());
         let policy = OraclePolicy::from_env();
 
-        Some(Self::new(factory_address, resolver_address, registry_address, Arc::new(relayer), provider, store, oracle, policy))
+        Some(Self::new(factory_address, resolver_address, registry_address, Arc::new(relayer), provider, store, database, oracle, policy))
     }
 
     // ─── Main loop ───────────────────────────────────────────────────────────
@@ -250,7 +255,19 @@ impl MarketOracleService {
         // 2. Resolve the previous market for this asset, if any.
         if let Some(prev_id) = pending_market_id {
             match self.resolve_pending_market(asset, prev_id, prev_hour_start, now_ts).await {
-                Ok(Some(tx)) => info!(asset, market_id = prev_id, tx_hash = %tx, "Market resolved on-chain"),
+                Ok(Some(ref tx)) => {
+                    info!(asset, market_id = prev_id, tx_hash = %tx, "Market resolved on-chain");
+                    // Persist resolution to DB
+                    if let Some(db) = &self.database {
+                        let market_key = format!("{asset}-{prev_id}");
+                        let price_decimal = scaled_u128_to_decimal(
+                            decimal_price_to_u128(close_price).unwrap_or(0),
+                        );
+                        if let Err(e) = db.update_market_resolution(&market_key, price_decimal, "resolved").await {
+                            warn!(asset, market_id = prev_id, error = %e, "Failed to persist market resolution to DB");
+                        }
+                    }
+                }
                 Ok(None)    => info!(asset, market_id = prev_id, "Market resolution deferred under oracle policy"),
                 Err(e)      => warn!(asset, market_id = prev_id, error = %e, "Failed to resolve market — will retry next tick"),
             }
@@ -275,6 +292,27 @@ impl MarketOracleService {
             tx_hash = %tx_hash,
             "New prediction market created on-chain"
         );
+
+        // Persist new market to DB
+        if let Some(db) = &self.database {
+            let market_key = format!("{asset}-{expected_id}");
+            let description = format!("Will {asset} close above ${close_price} at Unix {next_hour_ts}?");
+            let strike_decimal = scaled_u128_to_decimal(strike_price);
+            if let Err(e) = db.upsert_market(
+                &market_key,
+                &description,
+                next_hour_ts,
+                "active",
+                None,
+                Some(strike_decimal),
+                None,
+                None,
+                Some("pyth"),
+                Some(expected_id as i64),
+            ).await {
+                warn!(asset, market_id = expected_id, error = %e, "Failed to persist new market to DB");
+            }
+        }
 
         self.market_id_counter += 1;
         Ok(expected_id)

@@ -84,6 +84,20 @@ pub struct Order {
     pub nonce: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub market_id_uint: Option<ethers::types::U256>,
+
+    /// ZK privacy: Poseidon commitment to the user's USDC note backing this order.
+    /// When present the matching engine locks this note on submit, unlocks on cancel,
+    /// and marks it spent on fill (G1, G2, G3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note_commitment: Option<String>,
+
+    /// ZK privacy: full circuit witness for private_transfer_settlement.
+    /// Clients that want server-side proof generation submit the snarkjs-format
+    /// input object here (ownerKeyHash, inputAmount, inputBlind, inputNonce,
+    /// assetDomain, Merkle siblings/pathIndices, receiver + change params).
+    /// Never echoed back in API responses (skip_serializing).
+    #[serde(default, skip_serializing, skip_serializing_if = "Option::is_none")]
+    pub note_witness: Option<serde_json::Value>,
 }
 
 impl Order {
@@ -116,6 +130,8 @@ impl Order {
             signature: None,
             nonce: None,
             market_id_uint: None,
+            note_commitment: None,
+            note_witness: None,
         }
     }
 
@@ -158,7 +174,12 @@ pub struct Trade {
     pub market_id: String,
     pub maker_order_id: Uuid,
     pub taker_order_id: Uuid,
+    /// Internal only — never serialized to Redis or API responses (privacy G3/G14/G16).
+    /// Used in-memory by SettlementEngine for balance debit/credit and user-trade index keys.
+    /// PostgreSQL retains the full record for operator-side auditing.
+    #[serde(default, skip_serializing)]
     pub maker_user_id: String,
+    #[serde(default, skip_serializing)]
     pub taker_user_id: String,
     pub side: OrderSide, // Side of the taker
     pub price: Decimal,

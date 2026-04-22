@@ -207,7 +207,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Redis cluster support (mini-redis v0.4 does not implement cluster commands)"]
+    #[ignore = "requires RPUSH/LPOP — mini-redis 0.4.1 only implements GET/SET/PING (no list commands)"]
     async fn test_job_lifecycle_success() {
         let (pipeline, shutdown) = setup_pipeline(3).await;
 
@@ -238,7 +238,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Redis cluster support (mini-redis v0.4 does not implement cluster commands)"]
+    #[ignore = "requires RPUSH/LPOP — mini-redis 0.4.1 only implements GET/SET/PING (no list commands)"]
     async fn test_job_retries_and_terminal_failure() {
         let (pipeline, shutdown) = setup_pipeline(2).await;
 

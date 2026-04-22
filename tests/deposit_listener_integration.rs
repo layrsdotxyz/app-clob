@@ -44,7 +44,7 @@ fn test_block_range_hex_encoding() {
     let from: u64 = 1_000_000;
     let to: u64   = 1_001_000;
     assert_eq!(format!("0x{:x}", from), "0xf4240");
-    assert_eq!(format!("0x{:x}", to),   "0xf45e8");
+    assert_eq!(format!("0x{:x}", to),   "0xf4628");
 }
 
 /// ABI-encoded uint256 in event data: big-endian, left-zero-padded to 32 bytes.

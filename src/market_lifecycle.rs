@@ -1,5 +1,6 @@
 use crate::{
     balance_service::BalanceService,
+    database::Database,
     error::{ClobError, ClobResult},
     market_resolution_policy::{
         create_audit_record, evaluate_resolution_candidates, OraclePolicy,
@@ -133,6 +134,7 @@ pub fn load_market_series() -> Vec<MarketSeriesConfig> {
 pub struct MarketLifecycleManager {
     oracle: Arc<PythOracle>,
     store: Arc<RedisStore>,
+    database: Option<Arc<Database>>,
     balance_service: Arc<BalanceService>,
     policy: OraclePolicy,
     check_interval: Duration,
@@ -144,10 +146,12 @@ impl MarketLifecycleManager {
         oracle: Arc<PythOracle>,
         store: Arc<RedisStore>,
         balance_service: Arc<BalanceService>,
+        database: Option<Arc<Database>>,
     ) -> Self {
         Self {
             oracle,
             store,
+            database,
             balance_service,
             policy: OraclePolicy::from_env(),
             check_interval: Duration::from_secs(60),
@@ -293,6 +297,24 @@ impl MarketLifecycleManager {
             .set(&format!("market:{}:status", market_id), "ACTIVE")
             .await?;
 
+        // Persist to PostgreSQL
+        if let Some(db) = &self.database {
+            if let Err(e) = db.upsert_market(
+                market_id,
+                &question,
+                expiry_ts,
+                "active",
+                None,
+                Some(threshold),
+                Some(&cfg.currency),
+                Some(&cfg.vault_address),
+                Some("pyth"),
+                None,
+            ).await {
+                warn!(market_id, error = %e, "Failed to persist new market to DB");
+            }
+        }
+
         info!(
             market_id,
             asset = %cfg.oracle_asset,
@@ -433,6 +455,13 @@ impl MarketLifecycleManager {
         audit.final_price = Some(settlement_price.to_string());
         audit.reason = Some("finalized via Pyth oracle".to_string());
         self.persist_audit(&audit).await?;
+
+        // Persist resolution to PostgreSQL
+        if let Some(db) = &self.database {
+            if let Err(e) = db.update_market_resolution(market_id, settlement_price, "resolved").await {
+                warn!(market_id, error = %e, "Failed to persist market resolution to DB");
+            }
+        }
 
         self.distribute_payouts(market_id, outcome).await?;
         self.enqueue_resolution_proof(market_id, outcome, settlement_price, threshold)

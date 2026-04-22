@@ -62,9 +62,9 @@ impl CoinbaseOracle {
     /// * `Decimal` - Close price of the hourly candle ending at this timestamp
     /// 
     /// # Example
-    /// ```
-    /// let oracle = CoinbaseOracle::new();
-    /// let price = oracle.get_hourly_close(1738368000).await?; // 3:00 PM close
+    /// ```no_run
+    /// // let oracle = CoinbaseOracle::new();
+    /// // let price = oracle.get_hourly_close(1738368000).await?; // 3:00 PM close
     /// ```
     pub async fn get_hourly_close(&self, timestamp: u64) -> ClobResult<Decimal> {
         let resolution = self.resolve_market_at_timestamp(timestamp).await?;

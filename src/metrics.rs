@@ -29,6 +29,11 @@ pub struct Metrics {
     // WebSocket metrics
     ws_connections: IntGaugeVec,
     ws_messages: IntCounterVec,
+
+    // ZK prover metrics
+    prover_jobs_claimed: IntCounterVec,
+    prover_jobs_completed: IntCounterVec,
+    prover_queue_depth: IntGaugeVec,
 }
 
 impl Metrics {
@@ -121,6 +126,24 @@ impl Metrics {
                 "Total WebSocket messages sent",
                 &["type"]
             ).unwrap(),
+
+            prover_jobs_claimed: register_int_counter_vec!(
+                "clob_prover_jobs_claimed_total",
+                "Total ZK prover jobs claimed for processing",
+                &["circuit"]
+            ).unwrap(),
+
+            prover_jobs_completed: register_int_counter_vec!(
+                "clob_prover_jobs_completed_total",
+                "Total ZK prover jobs completed successfully",
+                &["circuit"]
+            ).unwrap(),
+
+            prover_queue_depth: register_int_gauge_vec!(
+                "clob_prover_queue_depth",
+                "Current depth of the ZK prover job queue",
+                &[]
+            ).unwrap(),
         }
     }
 
@@ -202,6 +225,27 @@ impl Metrics {
         self.ws_messages.with_label_values(&[message_type]).inc();
     }
 
+    // ZK prover metrics
+
+    pub fn record_prover_job_claimed(&self, circuit: &str) {
+        self.prover_jobs_claimed.with_label_values(&[circuit]).inc();
+    }
+
+    pub fn record_prover_job_completed(&self, circuit: &str) {
+        self.prover_jobs_completed.with_label_values(&[circuit]).inc();
+    }
+
+    pub fn record_prover_job_failed(&self, circuit: &str) {
+        // Reuse the completed counter with a "failed" label for simplicity;
+        // callers can distinguish by checking prover_jobs_completed{circuit="...", result="failed"}.
+        // For now, just log — fine-grained failure metrics can be added later.
+        tracing::debug!(circuit = %circuit, "ZK prover job failed (metric stub)");
+    }
+
+    pub fn set_prover_queue_depth(&self, depth: i64) {
+        self.prover_queue_depth.with_label_values(&[]).set(depth);
+    }
+
     /// Render metrics in Prometheus format
     pub fn render(&self) -> Result<String, prometheus::Error> {
         let encoder = TextEncoder::new();
@@ -209,6 +253,17 @@ impl Metrics {
         let mut buffer = Vec::new();
         encoder.encode(&metric_families, &mut buffer)?;
         Ok(String::from_utf8(buffer).unwrap())
+    }
+
+    /// Returns a shared `Arc<Metrics>` singleton for use in unit tests.
+    /// Uses `OnceLock` so the Prometheus global registry is only written once,
+    /// avoiding the duplicate-registration panic that would occur if each test
+    /// called `Metrics::new()` independently.
+    #[cfg(test)]
+    pub fn test_instance() -> std::sync::Arc<Metrics> {
+        use std::sync::{Arc, OnceLock};
+        static INSTANCE: OnceLock<Arc<Metrics>> = OnceLock::new();
+        INSTANCE.get_or_init(|| Arc::new(Metrics::new())).clone()
     }
 }
 

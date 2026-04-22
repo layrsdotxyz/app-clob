@@ -1,35 +1,43 @@
 mod auth;
+mod balance_service;
+mod chain_types;
+mod circuit_breaker;
 mod config;
 mod database;
+mod eip712;
+mod epoch_service;
 mod error;
+mod error_recovery;
+mod evm_relayer;
+mod market_lifecycle;
+mod market_oracle_service;
+mod market_resolution_policy;
 mod matching;
+mod metrics;
 mod models;
+mod monitoring;
+mod oracle;
 mod orderbook;
+mod pm_claim_worker;
+mod pm_settlement_worker;
+mod poseidon2;
+mod poseidon_bn254;
+mod prediction_market_claims;
+mod prediction_market_relayer;
+mod prediction_market_settlement;
+mod privacy;
+mod proof_batcher;
+mod proof_generation;
+mod rate_limiter;
 mod redis_store;
 mod routes;
 mod settlement;
-mod balance_service;
-mod oracle;
-mod market_resolution_policy;
-mod market_lifecycle;
-mod proof_batcher;
-mod websocket;
-mod metrics;
-mod chain_types;
-mod epoch_service;
-mod proof_generation;
-mod monitoring;
-mod error_recovery;
-mod rate_limiter;
+mod state;
 mod user_rate_limiter;
-mod poseidon_bn254;
-mod evm_relayer;
-mod market_oracle_service;
-mod pm_claim_worker;
-mod pm_settlement_worker;
-mod prediction_market_relayer;
-mod prediction_market_claims;
-mod prediction_market_settlement;
+mod websocket;
+mod withdrawal_service;
+
+use crate::state::AppState;
 
 use anyhow::Result;
 use axum::{
@@ -50,6 +58,7 @@ use crate::{
     database::Database,
     matching::MatchingEngine,
     orderbook::OrderBookManager,
+    privacy::PrivacyStateService,
     redis_store::RedisStore,
     settlement::SettlementEngine,
     balance_service::BalanceService,
@@ -190,8 +199,12 @@ async fn async_main() -> Result<()> {
 
     // Initialize core components
     let metrics = Arc::new(Metrics::new());
-    let balance_service = Arc::new(BalanceService::new());
-    let orderbook_manager = Arc::new(OrderBookManager::new(redis_store.clone(), metrics.clone()));
+    let balance_service = Arc::new(BalanceService::new(database.clone()));
+    // Load persisted balances from DB into the in-memory service (best-effort on startup).
+    balance_service.load_from_db().await;
+    // Spawn the DB persistence worker so balance writes are durably flushed with retries.
+    let persist_task = balance_service.start_persistence_worker();
+    let orderbook_manager = Arc::new(OrderBookManager::new(redis_store.clone(), metrics.clone(), database.clone()));
     let prediction_market_relayer = match PredictionMarketRelayer::from_env(
         config.prediction_market_vault_address.clone(),
     ) {
@@ -211,16 +224,19 @@ async fn async_main() -> Result<()> {
     };
     let settlement_engine = Arc::new(SettlementEngine::new(
         redis_store.clone(),
+        database.clone(),
         config.maker_fee_bps,
         config.taker_fee_bps,
+        balance_service.clone(),
     ));
+    let ws_manager = Arc::new(WebSocketManager::new());
+    let prover_pipeline = Arc::new(ProverPipeline::new(redis_store.clone(), 3));
+    let privacy_state = Arc::new(PrivacyStateService::new(redis_store.clone()));
     let matching_engine = Arc::new(MatchingEngine::new(
         orderbook_manager.clone(),
         settlement_engine.clone(),
         metrics.clone(),
-    ));
-    let ws_manager = Arc::new(WebSocketManager::new());
-    let prover_pipeline = Arc::new(ProverPipeline::new(redis_store.clone(), 3));
+    ).with_privacy_state(privacy_state.clone()));
 
     // Initialize Pyth oracle and market lifecycle manager (BTC/ETH/SOL × USDC/ZEN)
     let oracle = Arc::new(PythOracle::new());
@@ -228,6 +244,7 @@ async fn async_main() -> Result<()> {
         oracle.clone(),
         redis_store.clone(),
         balance_service.clone(),
+        database.clone(),
     ));
 
 
@@ -253,9 +270,10 @@ async fn async_main() -> Result<()> {
         balance_service: balance_service.clone(),
         ws_manager: ws_manager.clone(),
         metrics: metrics.clone(),
-        database,
+        database: database.clone(),
         redis_store: redis_store.clone(),
         prover_pipeline: prover_pipeline.clone(),
+        privacy_state: privacy_state.clone(),
         prediction_market_relayer: prediction_market_relayer.clone(),
     });
 
@@ -265,10 +283,6 @@ async fn async_main() -> Result<()> {
         .route("/health", get(routes::health::health_check))
         .route("/ready", get(routes::health::readiness_check))
         
-        // Balance endpoints (test/demo — public for now)
-        .route("/v1/balance/deposit", post(routes::balance::deposit_balance))
-        .route("/v1/balance/:user_id/:market_id", get(routes::balance::get_balance))
-
         // Markets endpoints (public)
         .route("/v1/markets", get(routes::markets::list_markets))
         .route("/v1/markets/:market_id/stats", get(routes::markets::get_market_stats))
@@ -277,8 +291,18 @@ async fn async_main() -> Result<()> {
             get(routes::markets::get_market_resolution_audit),
         )
 
+        // G10: Permissionless claim endpoint — proof is the authorisation, no JWT needed.
+        .route("/v1/claims", post(routes::claims::submit_public_claim))
+
+        // G13: Public orderbook — aggregated price levels only, no user or address data.
+        .route("/v1/orderbook/:market_id", get(routes::orderbook::get_orderbook))
+        .route("/v1/orderbook/:market_id/depth", get(routes::orderbook::get_depth))
+
+        // G15: Public scan endpoint — no auth required; recipients scan locally.
+        .route("/v1/stealth/announcements", get(routes::stealth::list_announcements))
+
         // WebSocket (auth is optional — public channels get anonymous trade ticks,
-        // private user channel requires a valid token via ?token= query param)
+        // private user channel requires wallet address via ?address= query param)
         .route("/v1/ws", get(routes::websocket::ws_handler))
 
         // Metrics
@@ -306,12 +330,30 @@ async fn async_main() -> Result<()> {
 
                 // Order endpoints
                 .route("/v1/orders", post(routes::orders::create_order))
+                .route("/v1/orders/commit", post(routes::orders::commit_order))
+                .route("/v1/orders/reveal", post(routes::orders::reveal_order))
                 .route("/v1/orders/:order_id", delete(routes::orders::cancel_order))
                 .route("/v1/orders/:order_id", get(routes::orders::get_order))
                 .route("/v1/orders/user/:user_id", get(routes::orders::get_user_orders))
 
                 // Trades endpoints (user-scoped only — aggregate market trades are intentionally hidden)
                 .route("/v1/trades/user/:user_id", get(routes::trades::get_user_trades))
+
+                // Balance endpoints: deposit is operator-only (X-Operator-Key), get is self-scoped
+                .route("/v1/balance/deposit", post(routes::balance::deposit_balance))
+                .route("/v1/balance/proof", post(routes::balance::submit_balance_proof))
+                .route("/v1/balance/:user_id/:market_id", get(routes::balance::get_balance))
+
+                // Settlement endpoints
+                .route("/v1/settlements/:job_id", get(routes::settlements::get_settlement_job))
+                .route(
+                    "/v1/settlements/:job_id/legs/:leg_role/witness",
+                    post(routes::settlements::submit_leg_witness),
+                )
+
+                // G15: Auth-gated announce — operator or authenticated payer writes a
+                // stealth announcement; the ephemeral key is stored with no recipient data.
+                .route("/v1/stealth/announce", post(routes::stealth::create_announcement))
 
                 .route_layer(axum::middleware::from_fn(auth::require_auth))
         )
@@ -371,35 +413,61 @@ async fn async_main() -> Result<()> {
     };
 
     let pm_settlement_task = prediction_market_relayer.clone().map(|relayer| {
-        let worker = PredictionMarketSettlementWorker::new(
-            redis_store.clone(),
-            prover_pipeline.clone(),
-            relayer,
-            std::env::var("PM_SETTLEMENT_WORKER_POLL_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(2),
-        );
+        let rs = redis_store.clone();
+        let pp = prover_pipeline.clone();
+        let poll_secs = std::env::var("PM_SETTLEMENT_WORKER_POLL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(2);
         tokio::spawn(async move {
-            if let Err(e) = worker.start().await {
-                tracing::error!(error = %e, "Prediction market settlement worker failed");
+            let mut backoff = 1u64;
+            loop {
+                let worker = PredictionMarketSettlementWorker::new(
+                    rs.clone(),
+                    pp.clone(),
+                    relayer.clone(),
+                    poll_secs,
+                );
+                match worker.start().await {
+                    Ok(()) => {
+                        tracing::warn!(backoff, "PM settlement worker exited cleanly, restarting");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, backoff, "PM settlement worker failed, restarting");
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(60);
             }
         })
     });
 
     let pm_claim_task = prediction_market_relayer.clone().map(|relayer| {
-        let worker = PredictionMarketClaimWorker::new(
-            redis_store.clone(),
-            prover_pipeline.clone(),
-            relayer,
-            std::env::var("PM_CLAIM_WORKER_POLL_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(2),
-        );
+        let rs = redis_store.clone();
+        let pp = prover_pipeline.clone();
+        let poll_secs = std::env::var("PM_CLAIM_WORKER_POLL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(2);
         tokio::spawn(async move {
-            if let Err(e) = worker.start().await {
-                tracing::error!(error = %e, "Prediction market claim worker failed");
+            let mut backoff = 1u64;
+            loop {
+                let worker = PredictionMarketClaimWorker::new(
+                    rs.clone(),
+                    pp.clone(),
+                    relayer.clone(),
+                    poll_secs,
+                );
+                match worker.start().await {
+                    Ok(()) => {
+                        tracing::warn!(backoff, "PM claim worker exited cleanly, restarting");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, backoff, "PM claim worker failed, restarting");
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(60);
             }
         })
     });
@@ -418,7 +486,7 @@ async fn async_main() -> Result<()> {
     // Start market oracle service (if MARKET_ORACLE_ENABLED=true)
     let market_oracle_task: Option<tokio::task::JoinHandle<()>> =
         if std::env::var("MARKET_ORACLE_ENABLED").unwrap_or_default() == "true" {
-            match market_oracle_service::MarketOracleService::from_env(redis_store.clone()) {
+            match market_oracle_service::MarketOracleService::from_env(redis_store.clone(), database.clone()) {
                 Some(svc) => {
                     tracing::info!(
                         "Market oracle service enabled — hourly BTC markets will be created on Horizen EVM"
@@ -450,7 +518,7 @@ async fn async_main() -> Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
-    // Wait for background tasks
+    // Abort background tasks on shutdown.
     ws_task.abort();
     metrics_task.abort();
     if let Some(task) = epoch_task {
@@ -471,23 +539,13 @@ async fn async_main() -> Result<()> {
     if let Some(task) = market_oracle_task {
         task.abort();
     }
+    // Give the balance persistence worker a brief window to flush any queued DB writes
+    // that arrived during graceful request draining, then abort.
+    if let Some(task) = persist_task {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+    }
 
     Ok(())
-}
-
-#[derive(Clone)]
-pub struct AppState {
-    pub config: Config,
-    pub matching_engine: Arc<MatchingEngine>,
-    pub orderbook_manager: Arc<OrderBookManager>,
-    pub settlement_engine: Arc<SettlementEngine>,
-    pub balance_service: Arc<BalanceService>,
-    pub ws_manager: Arc<WebSocketManager>,
-    pub metrics: Arc<Metrics>,
-    pub database: Option<Arc<Database>>,
-    pub redis_store: Arc<RedisStore>,
-    pub prover_pipeline: Arc<ProverPipeline>,
-    pub prediction_market_relayer: Option<Arc<PredictionMarketRelayer>>,
 }
 
 async fn shutdown_signal() {

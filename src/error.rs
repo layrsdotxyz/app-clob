@@ -56,6 +56,14 @@ pub enum ClobError {
     #[error("Other error: {0}")]
     Other(String),
 
+    /// 409 Conflict — e.g. duplicate nullifier spend attempt.
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
+    /// 503 Service Unavailable — e.g. required external service not configured.
+    #[error("Service unavailable: {0}")]
+    ServiceUnavailable(String),
+
     #[error("Proof generation failed: {0}")]
     ProofGenerationFailed(String),
 
@@ -87,6 +95,8 @@ impl IntoResponse for ClobError {
             ClobError::SerdeJson(_) => (StatusCode::BAD_REQUEST, "INVALID_JSON", self.to_string()),
             ClobError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "IO_ERROR", self.to_string()),
             ClobError::Other(_) => (StatusCode::INTERNAL_SERVER_ERROR, "OTHER_ERROR", self.to_string()),
+            ClobError::Conflict(_) => (StatusCode::CONFLICT, "CONFLICT", self.to_string()),
+            ClobError::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE", self.to_string()),
             ClobError::ProofGenerationFailed(_) => (StatusCode::INTERNAL_SERVER_ERROR, "PROOF_GENERATION_FAILED", self.to_string()),
             ClobError::InvalidHex(_) => (StatusCode::BAD_REQUEST, "INVALID_HEX", self.to_string()),
             ClobError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "Internal error".to_string()),

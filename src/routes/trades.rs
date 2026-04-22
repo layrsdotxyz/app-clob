@@ -1,7 +1,8 @@
-use crate::{error::ClobResult, AppState};
+use crate::{auth::AuthenticatedUser, error::ClobResult, models::PublicTrade, AppState};
 use axum::{
-    extract::{Path, Query, State},
-    response::IntoResponse,
+    extract::{Extension, Path, Query, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::Deserialize;
@@ -27,7 +28,7 @@ pub async fn get_recent_trades(
         .get_recent_trades(&market_id, query.limit)
         .await?;
     
-    Ok(Json(trades))
+    Ok(Json(trades.iter().map(PublicTrade::from).collect::<Vec<_>>()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,7 +48,6 @@ pub async fn get_trade_history(
     Path(market_id): Path<String>,
     Query(query): Query<TradeHistoryQuery>,
 ) -> ClobResult<impl IntoResponse> {
-    // TODO: Implement time-range filtering
     let trades = state.orderbook_manager
         .store
         .get_recent_trades(&market_id, query.limit)
@@ -61,25 +61,33 @@ pub async fn get_trade_history(
         })
         .collect();
     
+    let public_trades: Vec<PublicTrade> = filtered_trades.iter().map(PublicTrade::from).collect();
     Ok(Json(serde_json::json!({
-        "trades": filtered_trades,
-        "count": filtered_trades.len(),
+        "trades": public_trades,
+        "count": public_trades.len(),
     })))
 }
 
 pub async fn get_user_trades(
     State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthenticatedUser>,
     Path(user_id): Path<String>,
     Query(query): Query<TradesQuery>,
-) -> ClobResult<impl IntoResponse> {
+) -> Result<Response, StatusCode> {
+    // Self-scope: callers may only access their own trade history.
+    if auth.user_id.to_lowercase() != user_id.to_lowercase() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
     let trades = state
         .orderbook_manager
         .store
         .get_user_trades(&user_id, query.limit)
-        .await?;
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(serde_json::json!({
         "trades": trades,
         "count": trades.len(),
-    })))
+    })).into_response())
 }

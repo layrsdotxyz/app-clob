@@ -18,26 +18,25 @@ use crate::{
     models::{NoteLockRecord, NoteLockStatus, Order, Trade},
     pm_claim_worker::claim_input_key,
     prediction_market_claims::{PredictionMarketClaimJob, PM_CLAIM_QUEUE},
-    proof_generation::{EvmGroth16Proof, low_high_hex_to_bytes32, parse_u128_hex},
+    proof_generation::{HonkProof, low_high_hex_to_bytes32, parse_u128_hex},
     AppState,
 };
 
 const PM_PRIVATE_CLAIMS_BY_RECIPIENT_PREFIX: &str = "pm:claim:recipient:";
 const PM_PRIVATE_CLAIM_DEDUP_PREFIX: &str = "pm:claim:dedup:";
 
-/// EVM Groth16 proof as submitted by the frontend/relayer.
-/// Fields are decimal strings (snarkjs-compatible format).
+/// UltraHonk proof payload as submitted by the frontend/relayer.
+/// `proof_hex` is a `0x`-prefixed hex string of the raw proof bytes.
+/// `public_inputs` is an ordered array of `0x`-prefixed `bytes32` hex strings.
 #[derive(Debug, Deserialize)]
 pub struct ProofPayload {
-    pub pa: [String; 2],
-    pub pb: [[String; 2]; 2],
-    pub pc: [String; 2],
-    pub pub_signals: Vec<String>,
+    pub proof_hex: String,
+    pub public_inputs: Vec<String>,
 }
 
-impl From<ProofPayload> for EvmGroth16Proof {
+impl From<ProofPayload> for HonkProof {
     fn from(p: ProofPayload) -> Self {
-        Self { pa: p.pa, pb: p.pb, pc: p.pc, pub_signals: p.pub_signals }
+        Self { proof_hex: p.proof_hex, public_inputs: p.public_inputs }
     }
 }
 
@@ -179,7 +178,7 @@ pub async fn lock_collateral(
     }
 
     let relayer = get_relayer(&state)?;
-    let proof: EvmGroth16Proof = req.proof.into();
+    let proof: HonkProof = req.proof.into();
     let vault_override = vault_override_opt(&req.vault_address);
     let tx_hash = relayer
         .lock_collateral(
@@ -249,7 +248,7 @@ pub async fn settle_fill(
     Json(req): Json<SettleFillRequest>,
 ) -> ClobResult<impl IntoResponse> {
     let relayer = get_relayer(&state)?;
-    let proof: EvmGroth16Proof = req.proof.into();
+    let proof: HonkProof = req.proof.into();
     let vault_override = vault_override_opt(&req.vault_address);
     let tx_hash = relayer
         .settle_fill(
@@ -287,7 +286,7 @@ pub async fn claim_winnings(
     let relayer = get_relayer(&state)?;
     let recipient: Address = req.recipient.parse()
         .map_err(|e| ClobError::InvalidOrder(format!("invalid recipient address: {e}")))?;
-    let proof: EvmGroth16Proof = req.proof.into();
+    let proof: HonkProof = req.proof.into();
     let vault_override = vault_override_opt(&req.vault_address);
     let tx_hash = relayer
         .claim_winnings(recipient, &proof, vault_override)
