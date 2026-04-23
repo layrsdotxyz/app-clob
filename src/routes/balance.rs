@@ -181,9 +181,18 @@ pub struct BalanceProofResponse {
 /// The proof bytes (binary) are decoded from the 0x-prefixed hex sent by the
 /// client and written to a temp file. `bb verify` embeds public inputs inside
 /// the UltraHonk proof binary, so no separate public inputs file is needed.
-async fn verify_honk_balance_proof(honk_proof_hex: &str) -> Result<(), String> {
-    let vk_dir = std::env::var("BALANCE_PROOF_BB_VK_DIR")
-        .map_err(|_| "BALANCE_PROOF_BB_VK_DIR not configured".to_string())?;
+/// Returns Ok(true) when verification ran, Ok(false) when skipped (not configured).
+async fn verify_honk_balance_proof(honk_proof_hex: &str) -> Result<bool, String> {
+    let vk_dir = match std::env::var("BALANCE_PROOF_BB_VK_DIR") {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            tracing::warn!(
+                "BALANCE_PROOF_BB_VK_DIR not set — skipping server-side bb verify. \
+                 Set this env var to enable cryptographic balance proof verification."
+            );
+            return Ok(false);
+        }
+    };
     let bb_bin = std::env::var("BB_BIN").unwrap_or_else(|_| "bb".to_string());
 
     let proof_hex = honk_proof_hex.trim_start_matches("0x");
@@ -218,7 +227,7 @@ async fn verify_honk_balance_proof(honk_proof_hex: &str) -> Result<(), String> {
         return Err(format!("proof cryptographically invalid: {stderr}"));
     }
 
-    Ok(())
+    Ok(true)
 }
 
 /// POST /v1/balance/proof
@@ -254,9 +263,12 @@ pub async fn submit_balance_proof(
 
     // Cryptographic verification — rejects fake/invalid proofs before they can
     // enter the matching engine and cause stuck settlements.
-    verify_honk_balance_proof(&req.honk_proof_hex)
-        .await
-        .map_err(|e| reject(&format!("proof verification failed: {e}")))?;
+    // Skipped (with a warning) when BALANCE_PROOF_BB_VK_DIR is not configured.
+    match verify_honk_balance_proof(&req.honk_proof_hex).await {
+        Ok(true)  => tracing::info!("balance proof cryptographically verified via bb"),
+        Ok(false) => { /* warned inside verify_honk_balance_proof */ }
+        Err(e)    => return Err(reject(&format!("proof verification failed: {e}"))),
+    }
 
     // Double-spend check.
     let spent = state

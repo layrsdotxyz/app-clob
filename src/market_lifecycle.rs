@@ -100,7 +100,10 @@ pub fn load_market_series() -> Vec<MarketSeriesConfig> {
             question_template: format!(
                 "Will {{asset}} close above ${{price}} at {{time}}?"
             ),
-            interval_secs: 3600,
+            interval_secs: std::env::var("MARKET_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(900), // default: 15 minutes
             enabled: is_enabled(&usdc_key),
         });
 
@@ -111,7 +114,10 @@ pub fn load_market_series() -> Vec<MarketSeriesConfig> {
             question_template: format!(
                 "Will {{asset}} close above ${{price}} at {{time}}?"
             ),
-            interval_secs: 3600,
+            interval_secs: std::env::var("MARKET_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(900), // default: 15 minutes
             enabled: is_enabled(&zen_key),
         });
     }
@@ -180,13 +186,15 @@ impl MarketLifecycleManager {
         }
     }
 
-    /// Process all enabled series.  Only acts during minute 1-3 of each hour.
+    /// Process all enabled series.  Only acts during the first 3 minutes of each interval window.
     async fn process_all_series(&self) -> ClobResult<()> {
         let now = chrono::Utc::now().timestamp() as u64;
-        let current_minute = (now / 60) % 60;
+        let interval_secs = self.series.first().map(|s| s.interval_secs).unwrap_or(900);
+        let secs_into_interval = now % interval_secs;
+        let mins_into_interval = secs_into_interval / 60;
 
-        // Guard: only act once per hour (minutes 1-3 to allow Pyth data to settle).
-        if current_minute < 1 || current_minute > 3 {
+        // Guard: only act once per interval window (minutes 1-3 to allow Pyth data to settle).
+        if mins_into_interval < 1 || mins_into_interval > 3 {
             return Ok(());
         }
 

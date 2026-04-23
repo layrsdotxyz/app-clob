@@ -39,6 +39,7 @@ use crate::{
         OracleResolutionAuditRecord, OracleResolutionDecision, OracleResolutionStatus,
     },
     oracle::PythOracle,
+    orderbook::OrderBookManager,
     redis_store::RedisStore,
 };
 use rust_decimal::Decimal;
@@ -76,6 +77,8 @@ pub struct MarketOracleService {
     /// Per-asset pending market IDs that need resolving on the next tick.
     /// key = asset (e.g. "BTC"), value = on-chain marketId created last tick.
     pending_markets: HashMap<String, u64>,
+    /// Shared orderbook manager — new markets are seeded here on creation.
+    orderbook_manager: Arc<OrderBookManager>,
 }
 
 impl MarketOracleService {
@@ -91,6 +94,7 @@ impl MarketOracleService {
         database: Option<Arc<Database>>,
         oracle: Arc<PythOracle>,
         policy: OraclePolicy,
+        orderbook_manager: Arc<OrderBookManager>,
     ) -> Self {
         Self {
             factory_address,
@@ -104,12 +108,13 @@ impl MarketOracleService {
             policy,
             market_id_counter: 0,
             pending_markets: HashMap::new(),
+            orderbook_manager,
         }
     }
 
     /// Build from environment variables.  Returns `None` when required vars are
     /// missing (so callers can treat the service as optional).
-    pub fn from_env(store: Arc<RedisStore>, database: Option<Arc<Database>>) -> Option<Self> {
+    pub fn from_env(store: Arc<RedisStore>, database: Option<Arc<Database>>, orderbook_manager: Arc<OrderBookManager>) -> Option<Self> {
         let factory_address_str = std::env::var("MARKET_FACTORY_ADDRESS").ok()?;
         if factory_address_str.is_empty() {
             return None;
@@ -129,7 +134,7 @@ impl MarketOracleService {
         let oracle = Arc::new(PythOracle::new());
         let policy = OraclePolicy::from_env();
 
-        Some(Self::new(factory_address, resolver_address, registry_address, Arc::new(relayer), provider, store, database, oracle, policy))
+        Some(Self::new(factory_address, resolver_address, registry_address, Arc::new(relayer), provider, store, database, oracle, policy, orderbook_manager))
     }
 
     // ─── Main loop ───────────────────────────────────────────────────────────
@@ -137,14 +142,20 @@ impl MarketOracleService {
     /// Run the oracle loop forever.  The first tick fires at the next UTC :00
     /// boundary plus a 30-second grace period so Pyth data is always finalized.
     pub async fn start(mut self) -> ClobResult<()> {
+        let interval_secs: u64 = std::env::var("MARKET_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(900); // default: 15 minutes
+
         info!(
             assets = ?ORACLE_ASSETS,
-            "Market oracle service starting — waiting for next hour boundary"
+            interval_secs,
+            "Market oracle service starting — waiting for next interval boundary"
         );
 
-        let initial_wait = secs_until_next_hour();
+        let initial_wait = secs_until_next_interval(interval_secs);
         if initial_wait > 0 {
-            info!(secs = initial_wait, "Sleeping until next hour boundary");
+            info!(secs = initial_wait, "Sleeping until next interval boundary");
             sleep(Duration::from_secs(initial_wait)).await;
         }
 
@@ -162,13 +173,13 @@ impl MarketOracleService {
 
         loop {
             let now_ts = unix_now();
-            let prev_hour_start = now_ts.saturating_sub(3600);
-            let next_hour_ts    = now_ts + 3600;
+            let prev_interval_start = now_ts.saturating_sub(interval_secs);
+            let next_interval_ts    = now_ts + interval_secs;
 
             info!(
                 assets = ?ORACLE_ASSETS,
-                prev_hour_start,
-                next_hour_ts,
+                prev_interval_start,
+                next_interval_ts,
                 pending_markets = ?self.pending_markets,
                 "Oracle tick starting"
             );
@@ -177,7 +188,7 @@ impl MarketOracleService {
             // Each successful create increments market_id_counter by 1.
             for asset in ORACLE_ASSETS {
                 let pending = self.pending_markets.get(*asset).copied();
-                match self.tick_asset(asset, prev_hour_start, now_ts, next_hour_ts, pending).await {
+                match self.tick_asset(asset, prev_interval_start, now_ts, next_interval_ts, pending).await {
                     Ok(new_market_id) => {
                         info!(
                             asset,
@@ -193,8 +204,8 @@ impl MarketOracleService {
                 }
             }
 
-            // Sleep until the next hour boundary plus the grace period.
-            let wait = secs_until_next_hour();
+            // Sleep until the next interval boundary plus the grace period.
+            let wait = secs_until_next_interval(interval_secs);
             sleep(Duration::from_secs(wait.max(1) + GRACE_SECS)).await;
         }
     }
@@ -313,6 +324,11 @@ impl MarketOracleService {
                 warn!(asset, market_id = expected_id, error = %e, "Failed to persist new market to DB");
             }
         }
+
+        // Register the new market in the CLOB's active_markets so orders are accepted.
+        let market_key = format!("{asset}-{expected_id}");
+        self.orderbook_manager.seed_market(&market_key);
+        info!(asset, market_id = expected_id, clob_market_key = %market_key, "Market seeded into CLOB active_markets");
 
         self.market_id_counter += 1;
         Ok(expected_id)
@@ -578,14 +594,14 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-/// Seconds until the next whole-hour UTC boundary.
-fn secs_until_next_hour() -> u64 {
+/// Seconds until the next UTC boundary aligned to `interval_secs`.
+fn secs_until_next_interval(interval_secs: u64) -> u64 {
     let now = unix_now();
-    let secs_past_hour = now % 3600;
-    if secs_past_hour == 0 {
+    let secs_past = now % interval_secs;
+    if secs_past == 0 {
         0
     } else {
-        3600 - secs_past_hour
+        interval_secs - secs_past
     }
 }
 
