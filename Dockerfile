@@ -113,8 +113,8 @@ COPY circuits/noir/vault_spend/target/vk/vk /app/circuits/noir/vault_spend/targe
 # Copy binary from builder
 COPY --from=builder /build/target/release/clob-service /app/clob-service
 
-# Create non-root user
-RUN useradd -m -u 1000 clob && chown -R clob:clob /app
+# Create non-root user (UID 1001 to avoid collision with ubuntu's default UID 1000)
+RUN useradd -m -u 1001 clob && chown -R clob:clob /app
 USER clob
 
 # Expose ports
