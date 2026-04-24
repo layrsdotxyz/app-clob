@@ -69,7 +69,7 @@ use crate::{
     pm_claim_worker::PredictionMarketClaimWorker,
     pm_settlement_worker::PredictionMarketSettlementWorker,
     epoch_service::EpochService,
-    proof_generation::{OrderMatchProver, ProverPipeline},
+    proof_generation::{OrderMatchProver, ProverPipeline, ProverWorker},
     prediction_market_relayer::PredictionMarketRelayer,
 };
 
@@ -219,7 +219,7 @@ async fn async_main() -> Result<()> {
     }
 
     let prediction_market_relayer = match PredictionMarketRelayer::from_env(
-        config.prediction_market_vault_address.clone(),
+        config.pm_usdc_vault_address.clone(),
     ) {
         Some(relayer) => {
             tracing::info!(
@@ -230,7 +230,7 @@ async fn async_main() -> Result<()> {
         }
         None => {
             tracing::warn!(
-                "Prediction market relayer disabled (set PREDICTION_MARKET_VAULT_ADDRESS/PM_VAULT_ADDRESS, HORIZEN_RPC_URL, and EVM_OPERATOR_PRIVATE_KEY to enable)"
+                "Prediction market relayer disabled (set PM_USDC_VAULT_ADDRESS or PREDICTION_MARKET_VAULT_ADDRESS, plus HORIZEN_RPC_URL and EVM_OPERATOR_PRIVATE_KEY, to enable)"
             );
             None
         }
@@ -396,7 +396,10 @@ async fn async_main() -> Result<()> {
 
     // Start epoch service (if PROOF_GENERATION_ENABLED=true)
     let epoch_task = if std::env::var("PROOF_GENERATION_ENABLED").unwrap_or_default() == "true" {
-        tracing::info!("Proof generation enabled, starting epoch service");
+        tracing::warn!(
+            reason = %crate::proof_generation::ORDER_MATCH_UNSUPPORTED_MESSAGE,
+            "Proof generation enabled, but the deprecated ORDER_MATCH prover is unavailable in this build"
+        );
         
         let prover = Arc::new(OrderMatchProver::new(
             redis_store.clone(),
@@ -423,6 +426,35 @@ async fn async_main() -> Result<()> {
     } else {
         tracing::info!("Proof generation disabled (set PROOF_GENERATION_ENABLED=true to enable)");
         None
+    };
+
+    // Start ProverWorker — consumes pm_deposit/settlement/claim jobs from the Redis prover queue.
+    // Required for pm_settlement_worker and pm_claim_worker to generate on-chain proofs.
+    let prover_worker_task = {
+        let pp = prover_pipeline.clone();
+        let ps = privacy_state.clone();
+        let pw_metrics = metrics.clone();
+        let poll_secs = std::env::var("PROVER_WORKER_POLL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1);
+        tokio::spawn(async move {
+            let mut backoff = 1u64;
+            loop {
+                let worker = ProverWorker::new(pp.clone(), ps.clone(), poll_secs)
+                    .with_metrics(pw_metrics.clone());
+                match worker.start().await {
+                    Ok(()) => {
+                        tracing::warn!(backoff, "ProverWorker exited cleanly, restarting");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, backoff, "ProverWorker failed, restarting");
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(60);
+            }
+        })
     };
 
     let pm_settlement_task = prediction_market_relayer.clone().map(|relayer| {
@@ -534,6 +566,7 @@ async fn async_main() -> Result<()> {
     // Abort background tasks on shutdown.
     ws_task.abort();
     metrics_task.abort();
+    prover_worker_task.abort();
     if let Some(task) = epoch_task {
         task.abort();
     }
