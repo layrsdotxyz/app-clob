@@ -1,19 +1,18 @@
 // Wallet registration for Layrs EVM users.
 //
 // Auth flow:
-//   1. User authenticates via Privy (email / social / external wallet).
-//   2. Privy returns a user_id (DID) and an embedded-wallet EVM address.
-//   3. ZeroDev wraps that address as an ERC-4337 smart account on Horizen EVM.
-//   4. The smart account address is registered here as the user's on-chain identity.
+//   1. User connects via Dynamic.xyz (isConnected state — no JWT session required).
+//   2. Dynamic exposes primaryWallet.address — the user's EVM address.
+//   3. The frontend sends that address as both X-Wallet-Address header and user_id.
+//   4. The CLOB uses the EVM address as the canonical user identity throughout.
+//
+// This endpoint is used by operator tooling / future AA upgrades. The frontend
+// does not call it — orders are placed directly with the EVM address as user_id.
 //
 // Deposits:
 //   Users deposit ETH / USDC / ZEN directly to the relevant PredictionMarketVault
-//   contract on Horizen EVM from their ZeroDev smart account.
-//   The CLOB backend generates ZK deposit proofs server-side using snarkjs.
-//
-// Session keys:
-//   ZeroDev session keys let the Layrs operator call lockCollateral / settleFill /
-//   claimWinnings on behalf of the user without per-tx signing — enabling seamless UX.
+//   contract on Horizen EVM from their connected wallet.
+//   ZK deposit proofs are generated client-side (browser) or by the vault-service.
 
 use axum::{
     extract::{Path, State},
@@ -29,10 +28,9 @@ use crate::{
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterWalletRequest {
-    /// Internal user ID from Privy (DID string, e.g. "did:privy:abc123").
+    /// User ID — in practice the EVM wallet address (Dynamic isConnected flow).
     pub user_id: String,
-    /// User's EVM address — either the Privy embedded wallet address or the
-    /// ZeroDev ERC-4337 smart account address (checksummed, 0x-prefixed, 42 chars).
+    /// User's EVM address (checksummed, 0x-prefixed, 42 chars).
     pub evm_address: String,
     /// Auth provider: "email" | "google" | "twitter" | "discord" | "wallet" | etc.
     pub auth_provider: Option<String>,
