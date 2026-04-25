@@ -61,9 +61,9 @@ pub struct DepositInstruction {
     pub message: String,
     /// EVM address of the PredictionMarketVault for USDC (on Horizen).
     pub usdc_vault: String,
-    /// EVM address of the PredictionMarketVault for ETH/WETH (on Horizen).
+    /// EVM address of PrivacyVaultWeth (on Horizen).
     pub eth_vault: String,
-    /// EVM address of the PredictionMarketVault for ZEN (on Horizen).
+    /// EVM address of the active ZEN vault (on Horizen).
     pub zen_vault: String,
     /// Chain ID to deposit on.
     pub chain_id: u64,
@@ -154,16 +154,31 @@ pub async fn register_wallet(
 }
 
 fn build_deposit_instruction() -> DepositInstruction {
-    let usdc_vault = std::env::var("USDC_VAULT_ADDRESS").unwrap_or_else(|_| "0x (not deployed)".into());
-    let eth_vault = std::env::var("ETH_VAULT_ADDRESS").unwrap_or_else(|_| "0x (not deployed)".into());
-    let zen_vault = std::env::var("ZEN_VAULT_ADDRESS").unwrap_or_else(|_| "0x (not deployed)".into());
+    let usdc_vault = first_env(&[
+        "PM_USDC_VAULT_ADDRESS",
+        "USDC_VAULT_ADDRESS",
+        "PREDICTION_MARKET_VAULT_ADDRESS",
+        "PM_VAULT_ADDRESS",
+    ]);
+    let eth_vault = first_env(&[
+        "PRIVACY_WETH_VAULT_ADDRESS",
+        "WETH_VAULT_ADDRESS",
+        "ETH_VAULT_ADDRESS",
+        "LP_VAULT_ADDRESS",
+    ]);
+    let zen_vault = first_env(&[
+        "PRIVACY_ZEN_VAULT_ADDRESS",
+        "PM_ZEN_VAULT_ADDRESS",
+        "ZEN_PM_VAULT_ADDRESS",
+        "ZEN_VAULT_ADDRESS",
+    ]);
     let chain_id: u64 = std::env::var("EVM_CHAIN_ID")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1663);
 
     DepositInstruction {
-        message: "Deposit ETH, USDC, or ZEN to the corresponding vault contract on Horizen. \
+        message: "Deposit USDC and ZEN to the configured market/privacy vaults, and deposit WETH only to PrivacyVaultWeth on Horizen. \
                   The Layrs backend will generate your ZK deposit proof automatically."
             .into(),
         usdc_vault,
@@ -172,6 +187,14 @@ fn build_deposit_instruction() -> DepositInstruction {
         chain_id,
         chain_name: if chain_id == 1663 { "Horizen Gobi Testnet".into() } else { "Horizen EON".into() },
     }
+}
+
+fn first_env(names: &[&str]) -> String {
+    names
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "0x (not deployed)".into())
 }
 
 /// Deploy ZeroDev smart account — returns the counterfactual smart account address.

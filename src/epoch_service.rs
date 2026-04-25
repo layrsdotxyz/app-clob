@@ -3,7 +3,9 @@
 use crate::{
     error::ClobResult,
     orderbook::OrderBookManager,
-    proof_generation::{OrderMatchProver, ProverJobType, ProverPipeline},
+    proof_generation::{
+        OrderMatchProver, ProverJobType, ProverPipeline, ORDER_MATCH_UNSUPPORTED_MESSAGE,
+    },
     redis_store::RedisStore,
     metrics::Metrics,
 };
@@ -63,7 +65,7 @@ impl EpochService {
 
             info!(
                 epoch_id = self.current_epoch,
-                "Epoch boundary reached, triggering proof generation"
+                "Epoch boundary reached, checking deprecated ORDER_MATCH proof path"
             );
 
             match self.process_epoch().await {
@@ -131,21 +133,33 @@ impl EpochService {
             epoch_id = self.current_epoch,
             market_id = %market_id,
             num_trades = trades.len(),
-            "Generating ORDER_MATCH proof"
+            reason = ORDER_MATCH_UNSUPPORTED_MESSAGE,
+            "ORDER_MATCH proof requested in deprecated build path"
         );
 
-        // Generate proof
-        let proof_data = self.prover.generate_order_match_proof(
+        let proof_data = match self.prover.generate_order_match_proof(
             self.current_epoch,
             market_id,
             &trades,
-        ).await?;
+        ).await {
+            Ok(proof_data) => proof_data,
+            Err(error) => {
+                warn!(
+                    epoch_id = self.current_epoch,
+                    market_id = %market_id,
+                    error = %error,
+                    reason = ORDER_MATCH_UNSUPPORTED_MESSAGE,
+                    "ORDER_MATCH proof generation is intentionally unavailable"
+                );
+                return Err(error);
+            }
+        };
 
         info!(
             epoch_id = self.current_epoch,
             market_id = %market_id,
             proof_id = ?proof_data.proof_id,
-            "ORDER_MATCH proof generated and submitted"
+            "ORDER_MATCH proof generated"
         );
 
         // Trigger PrivateYieldDistribution job if the privacy prover pipeline is wired

@@ -18,7 +18,7 @@ use crate::{
 
 pub struct PredictionMarketRelayer {
     relayer: Arc<EvmRelayer>,
-    /// Default vault address (from PM_VAULT_ADDRESS / PREDICTION_MARKET_VAULT_ADDRESS).
+    /// Default PM USDC vault address.
     vault_addr: Address,
 }
 

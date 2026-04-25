@@ -29,11 +29,16 @@ pub struct Config {
     // Optional PostgreSQL database URL
     pub database_url: Option<String>,
 
-    // Prediction market vault address for EVM relayer
+    // Explicit vault addresses for the current PM/privacy split
+    pub pm_usdc_vault_address: Option<String>,
+    pub pm_zen_vault_address: Option<String>,
+    pub privacy_weth_vault_address: Option<String>,
+
+    // Compatibility aliases for older config consumers
     pub prediction_market_vault_address: Option<String>,
+    pub zen_vault_address: Option<String>,
 
     // Additional contract addresses used for runtime validation
-    pub zen_vault_address: Option<String>,
     pub zen_token_address: Option<String>,
     pub market_factory_address: Option<String>,
 
@@ -84,9 +89,34 @@ fn default_min_order_size() -> rust_decimal::Decimal {
     rust_decimal::Decimal::from(1)
 }
 
+fn first_env(names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .filter(|value| !value.trim().is_empty())
+}
+
 impl Config {
     pub fn from_env() -> Result<Self> {
         dotenvy::dotenv().ok();
+
+        let pm_usdc_vault_address = first_env(&[
+            "PM_USDC_VAULT_ADDRESS",
+            "PREDICTION_MARKET_VAULT_ADDRESS",
+            "PM_VAULT_ADDRESS",
+            "USDC_VAULT_ADDRESS",
+        ]);
+        let pm_zen_vault_address = first_env(&[
+            "PM_ZEN_VAULT_ADDRESS",
+            "ZEN_PM_VAULT_ADDRESS",
+            "ZEN_VAULT_ADDRESS",
+        ]);
+        let privacy_weth_vault_address = first_env(&[
+            "PRIVACY_WETH_VAULT_ADDRESS",
+            "WETH_VAULT_ADDRESS",
+            "ETH_VAULT_ADDRESS",
+            "LP_VAULT_ADDRESS",
+        ]);
         
         let config = Self {
             host: std::env::var("HOST").unwrap_or_else(|_| default_host()),
@@ -117,10 +147,11 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or_else(default_min_order_size),
             database_url: std::env::var("DATABASE_URL").ok(),
-            prediction_market_vault_address: std::env::var("PREDICTION_MARKET_VAULT_ADDRESS")
-                .or_else(|_| std::env::var("PM_VAULT_ADDRESS"))
-                .ok(),
-            zen_vault_address: std::env::var("ZEN_VAULT_ADDRESS").ok(),
+            pm_usdc_vault_address: pm_usdc_vault_address.clone(),
+            pm_zen_vault_address: pm_zen_vault_address.clone(),
+            privacy_weth_vault_address: privacy_weth_vault_address,
+            prediction_market_vault_address: pm_usdc_vault_address,
+            zen_vault_address: pm_zen_vault_address,
             zen_token_address: std::env::var("ZEN_TOKEN_ADDRESS").ok(),
             market_factory_address: std::env::var("MARKET_FACTORY_ADDRESS").ok(),
             market_oracle_enabled: std::env::var("MARKET_ORACLE_ENABLED")
@@ -162,10 +193,17 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         validate_optional_address(
-            "PREDICTION_MARKET_VAULT_ADDRESS/PM_VAULT_ADDRESS",
-            self.prediction_market_vault_address.as_deref(),
+            "PM_USDC_VAULT_ADDRESS/PREDICTION_MARKET_VAULT_ADDRESS/PM_VAULT_ADDRESS",
+            self.pm_usdc_vault_address.as_deref(),
         )?;
-        validate_optional_address("ZEN_VAULT_ADDRESS", self.zen_vault_address.as_deref())?;
+        validate_optional_address(
+            "PM_ZEN_VAULT_ADDRESS/ZEN_VAULT_ADDRESS",
+            self.pm_zen_vault_address.as_deref(),
+        )?;
+        validate_optional_address(
+            "PRIVACY_WETH_VAULT_ADDRESS/WETH_VAULT_ADDRESS/LP_VAULT_ADDRESS",
+            self.privacy_weth_vault_address.as_deref(),
+        )?;
         validate_optional_address("ZEN_TOKEN_ADDRESS", self.zen_token_address.as_deref())?;
         validate_optional_address(
             "MARKET_FACTORY_ADDRESS",
@@ -187,13 +225,35 @@ impl Config {
             );
         }
 
-        if let (Some(pm_vault), Some(zen_vault)) = (
-            self.prediction_market_vault_address.as_ref(),
-            self.zen_vault_address.as_ref(),
+        if let (Some(pm_usdc_vault), Some(pm_zen_vault)) = (
+            self.pm_usdc_vault_address.as_ref(),
+            self.pm_zen_vault_address.as_ref(),
         ) {
-            if pm_vault.eq_ignore_ascii_case(zen_vault) {
+            if pm_usdc_vault.eq_ignore_ascii_case(pm_zen_vault) {
                 anyhow::bail!(
-                    "PREDICTION_MARKET_VAULT_ADDRESS and ZEN_VAULT_ADDRESS must refer to different vaults"
+                    "PM_USDC_VAULT_ADDRESS and PM_ZEN_VAULT_ADDRESS must refer to different vaults"
+                );
+            }
+        }
+
+        if let (Some(pm_usdc_vault), Some(privacy_weth_vault)) = (
+            self.pm_usdc_vault_address.as_ref(),
+            self.privacy_weth_vault_address.as_ref(),
+        ) {
+            if pm_usdc_vault.eq_ignore_ascii_case(privacy_weth_vault) {
+                anyhow::bail!(
+                    "PM_USDC_VAULT_ADDRESS and PRIVACY_WETH_VAULT_ADDRESS must refer to different vaults"
+                );
+            }
+        }
+
+        if let (Some(pm_zen_vault), Some(privacy_weth_vault)) = (
+            self.pm_zen_vault_address.as_ref(),
+            self.privacy_weth_vault_address.as_ref(),
+        ) {
+            if pm_zen_vault.eq_ignore_ascii_case(privacy_weth_vault) {
+                anyhow::bail!(
+                    "PM_ZEN_VAULT_ADDRESS and PRIVACY_WETH_VAULT_ADDRESS must refer to different vaults"
                 );
             }
         }

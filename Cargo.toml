@@ -55,7 +55,6 @@ sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "macro
 tiny-keccak = { version = "2.0", features = ["keccak"] }
 ark-bn254 = "0.4"
 ark-ff = "0.4"
-ark-groth16 = "0.4"
 light-poseidon = "0.2"
 num-bigint = "0.4"
 num-traits = "0.2"

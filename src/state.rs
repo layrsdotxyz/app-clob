@@ -35,22 +35,22 @@ pub struct AppState {
     pub prediction_market_relayer: Option<Arc<PredictionMarketRelayer>>,
 }
 
-#[cfg(any(test, feature = "test-helpers"))]
 /// Lazily-initialised shared `Metrics` instance for test environments.
 ///
 /// Prometheus's default registry panics (`AlreadyReg`) if the same metric name
 /// is registered twice in the same process. Using a `OnceLock` ensures every
 /// `AppState::for_test` call reuses the single already-registered `Metrics`.
+#[allow(dead_code)]
 fn once_test_metrics() -> Arc<Metrics> {
     static METRICS: std::sync::OnceLock<Arc<Metrics>> = std::sync::OnceLock::new();
     METRICS.get_or_init(|| Arc::new(Metrics::new())).clone()
 }
 
-#[cfg(any(test, feature = "test-helpers"))]
 impl AppState {
     /// Minimal test constructor — only populates the fields that the claims handler
     /// (`submit_public_claim`) and the trades handler (`get_recent_trades`) need.
     /// All other fields receive lightweight no-op stubs.
+    #[allow(dead_code)]
     pub async fn for_test(
         redis_store: Arc<RedisStore>,
         privacy_state: Arc<PrivacyStateService>,
@@ -93,6 +93,9 @@ impl AppState {
             taker_fee_bps: 0,
             min_order_size: Decimal::from(1),
             database_url: None,
+            pm_usdc_vault_address: None,
+            pm_zen_vault_address: None,
+            privacy_weth_vault_address: None,
             prediction_market_vault_address: None,
             zen_vault_address: None,
             zen_token_address: None,

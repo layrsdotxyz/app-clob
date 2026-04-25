@@ -39,20 +39,6 @@ RUN touch src/main.rs src/lib.rs
 # Build release binary with full optimizations
 RUN cargo build --release
 
-# --- Node.js circuit builder stage ------------------------------------------
-# Install snarkjs so it is available at a known absolute path in production.
-FROM node:20-bookworm-slim AS node-builder
-
-WORKDIR /circuits
-
-# Copy only the circuits directory (wasm + zkey artifacts)
-COPY circuits ./
-
-# Install snarkjs locally -- we only need the CLI
-RUN npm install snarkjs && npm cache clean --force
-
-# (bb binary is staged into circuits/bb/bb by deploy-clob.sh before docker build)
-
 # --- Production image --------------------------------------------------------
 # ubuntu:24.04 provides GLIBC 2.39, required by the bb binary.
 FROM ubuntu:24.04
@@ -66,28 +52,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy Node.js runtime from official image (needed to run snarkjs)
-COPY --from=node:20-bookworm-slim /usr/local/bin/node /usr/local/bin/node
-COPY --from=node:20-bookworm-slim /usr/local/lib/node_modules /usr/local/lib/node_modules
-
-# Copy snarkjs and its node_modules
-COPY --from=node-builder /circuits/node_modules /app/node_modules
-
-# Copy ZK circuit artifacts (wasm + zkey for each circuit)
-COPY --from=node-builder /circuits/private_deposit/circuit_js/circuit.wasm /app/circuits/private_deposit/circuit_js/circuit.wasm
-COPY --from=node-builder /circuits/private_deposit/circuit_final.zkey /app/circuits/private_deposit/circuit_final.zkey
-COPY --from=node-builder /circuits/private_withdraw/circuit_js/circuit.wasm /app/circuits/private_withdraw/circuit_js/circuit.wasm
-COPY --from=node-builder /circuits/private_withdraw/circuit_final.zkey /app/circuits/private_withdraw/circuit_final.zkey
-COPY --from=node-builder /circuits/private_order_commitment/circuit_js/circuit.wasm /app/circuits/private_order_commitment/circuit_js/circuit.wasm
-COPY --from=node-builder /circuits/private_order_commitment/circuit_final.zkey /app/circuits/private_order_commitment/circuit_final.zkey
-COPY --from=node-builder /circuits/private_transfer_settlement/circuit_js/circuit.wasm /app/circuits/private_transfer_settlement/circuit_js/circuit.wasm
-COPY --from=node-builder /circuits/private_transfer_settlement/circuit_final.zkey /app/circuits/private_transfer_settlement/circuit_final.zkey
-COPY --from=node-builder /circuits/private_market_claim/circuit_js/circuit.wasm /app/circuits/private_market_claim/circuit_js/circuit.wasm
-COPY --from=node-builder /circuits/private_market_claim/circuit_final.zkey /app/circuits/private_market_claim/circuit_final.zkey
-COPY --from=node-builder /circuits/private_yield_distribution/circuit_js/circuit.wasm /app/circuits/private_yield_distribution/circuit_js/circuit.wasm
-COPY --from=node-builder /circuits/private_yield_distribution/circuit_final.zkey /app/circuits/private_yield_distribution/circuit_final.zkey
-
-# Copy bb binary (staged by deploy-clob.sh from the host's ~/.bb/bb)
+# Copy bb binary (staged by deploy-clob.sh into the Docker build context)
 COPY circuits/bb/bb /app/bb
 
 # Copy Noir circuit ACIR JSON files (used by bb prove at runtime)
@@ -118,12 +83,11 @@ RUN useradd -m -u 1001 clob && chown -R clob:clob /app
 USER clob
 
 # Expose ports
-EXPOSE 8080
+EXPOSE 8081
 EXPOSE 9090
 
-# Health check (use PORT env var which defaults to 8081)
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD curl -sf http://localhost:${PORT:-8081}/health || exit 1
+    CMD curl -sf http://localhost:8081/health || exit 1
 
 # Run the service
 CMD ["/app/clob-service"]

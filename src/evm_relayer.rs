@@ -23,6 +23,13 @@ use crate::{
 
 pub type EvmClient = SignerMiddleware<Provider<Http>, LocalWallet>;
 
+fn first_env(names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .filter(|value| !value.trim().is_empty())
+}
+
 /// Config loaded from environment variables.
 #[derive(Debug, Clone)]
 pub struct EvmRelayerConfig {
@@ -32,12 +39,12 @@ pub struct EvmRelayerConfig {
     pub chain_id: u64,
     /// Operator/relayer private key (hex, with or without 0x prefix).
     pub private_key: String,
-    /// Deployed `PredictionMarket.sol` address.
-    pub prediction_market_address: Option<String>,
-    /// Deployed `PredictionMarketVault.sol` (WETH) address.
-    pub vault_address: Option<String>,
-    /// Deployed ZEN `PrivacyVault` address.
-    pub zen_vault_address: Option<String>,
+    /// PM USDC vault address.
+    pub pm_usdc_vault_address: Option<String>,
+    /// PM ZEN vault address.
+    pub pm_zen_vault_address: Option<String>,
+    /// PrivacyVaultWeth address.
+    pub privacy_weth_vault_address: Option<String>,
 }
 
 impl EvmRelayerConfig {
@@ -57,11 +64,21 @@ impl EvmRelayerConfig {
             rpc_url,
             chain_id,
             private_key,
-            prediction_market_address: std::env::var("PREDICTION_MARKET_ADDRESS").ok(),
-            vault_address: std::env::var("PREDICTION_MARKET_VAULT_ADDRESS")
-                .or_else(|_| std::env::var("PM_VAULT_ADDRESS"))
-                .ok(),
-            zen_vault_address: std::env::var("ZEN_VAULT_ADDRESS").ok(),
+            pm_usdc_vault_address: first_env(&[
+                "PM_USDC_VAULT_ADDRESS",
+                "PREDICTION_MARKET_VAULT_ADDRESS",
+                "PM_VAULT_ADDRESS",
+            ]),
+            pm_zen_vault_address: first_env(&[
+                "PM_ZEN_VAULT_ADDRESS",
+                "ZEN_PM_VAULT_ADDRESS",
+                "ZEN_VAULT_ADDRESS",
+            ]),
+            privacy_weth_vault_address: first_env(&[
+                "PRIVACY_WETH_VAULT_ADDRESS",
+                "WETH_VAULT_ADDRESS",
+                "LP_VAULT_ADDRESS",
+            ]),
         })
     }
 }
@@ -125,20 +142,17 @@ impl EvmRelayer {
     }
 
     pub fn vault_address(&self) -> Option<Address> {
-        self.config.vault_address.as_deref()?.parse().ok()
+        self.config.pm_usdc_vault_address.as_deref()?.parse().ok()
     }
 
-    pub fn pm_address(&self) -> Option<Address> {
-        self.config.prediction_market_address.as_deref()?.parse().ok()
-    }
-
-    /// Resolve the PrivacyVault contract address by token symbol.
-    /// Falls back to PREDICTION_MARKET_VAULT_ADDRESS for unknown symbols.
+    /// Resolve the vault address by token symbol.
+    /// PM is restricted to USDC and ZEN; WETH resolves only through PrivacyVaultWeth.
     pub fn vault_address_for_token(&self, token: &str) -> Option<String> {
         match token.to_uppercase().as_str() {
-            "WETH" | "ETH" => self.config.vault_address.clone(),
-            "ZEN" => self.config.zen_vault_address.clone(),
-            _ => self.config.vault_address.clone(),
+            "USDC" => self.config.pm_usdc_vault_address.clone(),
+            "ZEN" => self.config.pm_zen_vault_address.clone(),
+            "WETH" | "ETH" => self.config.privacy_weth_vault_address.clone(),
+            _ => None,
         }
     }
 

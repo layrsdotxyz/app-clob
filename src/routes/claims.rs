@@ -98,7 +98,7 @@ pub async fn submit_public_claim(
 
     // 5. Ensure relayer is configured.
     let relayer = state.prediction_market_relayer.as_ref().ok_or_else(|| {
-        ClobError::ServiceUnavailable("PM relayer not configured — set PREDICTION_MARKET_VAULT_ADDRESS, HORIZEN_RPC_URL, and EVM_OPERATOR_PRIVATE_KEY".to_string())
+        ClobError::ServiceUnavailable("PM relayer not configured — set PM_USDC_VAULT_ADDRESS or PREDICTION_MARKET_VAULT_ADDRESS, plus HORIZEN_RPC_URL and EVM_OPERATOR_PRIVATE_KEY".to_string())
     })?;
 
     let vault_override = if req.vault_address.trim().is_empty() {

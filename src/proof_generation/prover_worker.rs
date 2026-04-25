@@ -8,35 +8,31 @@ use crate::{
     error::{ClobError, ClobResult},
     metrics::Metrics,
     privacy::{PrivacyStateService, TransitionStatus},
-    proof_generation::{
-        groth16_verifier::verify_snarkjs_proof,
-        parse_snarkjs_proof, ProverJob, ProverJobStatus, ProverJobType, ProverPipeline,
-    },
+    proof_generation::{ProverJob, ProverJobStatus, ProverJobType, ProverPipeline},
     withdrawal_service::WithdrawalService,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ProverMode {
     /// Barretenberg UltraHonk: `bb execute` + `bb prove --scheme ultra_honk`.
     /// Output: `proof.bin` (raw proof bytes) + `public_inputs` (hex bytes32 values).
     /// Env vars required: `*_CIRCUIT_JSON` (Noir compiled .json), `*_VK` (bb VK dir).
     /// Binary env var: `BB_BIN` (default: "bb").
     Barretenberg,
-    /// Legacy snarkjs Groth16 path (kept for backward compat / phased migration).
-    Snarkjs,
     Mock,
+    Unsupported(String),
 }
 
 impl ProverMode {
     fn from_env() -> Self {
-        match std::env::var("PRIVATE_PROVER_MODE")
+        let configured = std::env::var("PRIVATE_PROVER_MODE")
             .unwrap_or_else(|_| "barretenberg".to_string())
-            .to_lowercase()
-            .as_str()
-        {
-            "mock"                       => Self::Mock,
-            "snarkjs"                    => Self::Snarkjs,
-            "barretenberg" | "honk" | _ => Self::Barretenberg,
+            .to_lowercase();
+
+        match configured.as_str() {
+            "mock" => Self::Mock,
+            "barretenberg" | "honk" => Self::Barretenberg,
+            other => Self::Unsupported(other.to_string()),
         }
     }
 }
@@ -109,9 +105,11 @@ impl ProverWorker {
             warn!("⚠️  ALLOW_INSECURE_MOCK_PROVER=true — ZK proofs are SIMULATED. DO NOT use in production.");
         }
 
-        // Sanity warn for Snarkjs mode (legacy, should be migrated to Barretenberg)
-        if self.mode == ProverMode::Snarkjs {
-            warn!("ProverMode::Snarkjs is legacy — consider migrating to ProverMode::Barretenberg (UltraHonk).");
+        if let ProverMode::Unsupported(mode) = &self.mode {
+            return Err(ClobError::Internal(format!(
+                "PRIVATE_PROVER_MODE='{}' is no longer supported. Use 'barretenberg' for the Noir/UltraHonk prover or 'mock' for local development. The legacy snarkjs/Groth16 backend path has been removed.",
+                mode
+            )));
         }
 
         let mut ticker = interval(self.poll_interval);
@@ -253,7 +251,7 @@ impl ProverWorker {
             return Err("missing circuit name".to_string());
         }
 
-        match self.mode {
+        match &self.mode {
             ProverMode::Mock => {
                 let allow = std::env::var("ALLOW_INSECURE_MOCK_PROVER")
                     .unwrap_or_else(|_| "false".to_string())
@@ -276,7 +274,10 @@ impl ProverWorker {
                 serde_json::to_string(&output).map_err(|e| e.to_string())
             }
             ProverMode::Barretenberg => self.generate_barretenberg_output(job, &input_value).await,
-            ProverMode::Snarkjs => self.generate_snarkjs_output(job, &input_value).await,
+            ProverMode::Unsupported(mode) => Err(format!(
+                "unsupported prover mode '{}': only 'barretenberg' and 'mock' are accepted",
+                mode
+            )),
         }
     }
 
@@ -418,137 +419,6 @@ impl ProverWorker {
         });
 
         serde_json::to_string(&output).map_err(|e| e.to_string())
-    }
-
-    async fn generate_snarkjs_output(
-        &self,
-        job: &ProverJob,
-        input_value: &serde_json::Value,
-    ) -> Result<String, String> {
-        let (wasm_path, zkey_path) = self.artifact_paths(job)?;
-        let vk_path = self.vk_path(job)?;
-        let dir = tempdir().map_err(|e| e.to_string())?;
-
-        let input_path = dir.path().join("input.json");
-        let proof_path = dir.path().join("proof.json");
-        let public_path = dir.path().join("public.json");
-
-        std::fs::write(
-            &input_path,
-            serde_json::to_string_pretty(input_value).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-
-        let snarkjs_bin = std::env::var("SNARKJS_BIN")
-            .unwrap_or_else(|_| "snarkjs".to_string());
-
-        let output = std::process::Command::new(&snarkjs_bin)
-            .arg("groth16")
-            .arg("fullprove")
-            .arg(&input_path)
-            .arg(&wasm_path)
-            .arg(&zkey_path)
-            .arg(&proof_path)
-            .arg(&public_path)
-            .output()
-            .map_err(|e| format!("failed to execute snarkjs ({}): {}", snarkjs_bin, e))?;
-
-        if !output.status.success() {
-            return Err(format!(
-                "snarkjs fullprove failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-
-        let evm_proof = parse_snarkjs_proof(&proof_path, &public_path)
-            .map_err(|e| e.to_string())?;
-
-        // Server-side proof verification: re-verify with arkworks before accepting.
-        // This ensures invalid proofs are rejected at the service boundary rather
-        // than propagating to the chain or being stored as valid transitions.
-        verify_snarkjs_proof(&vk_path, &evm_proof).map_err(|e| {
-            format!("groth16 server-side verification failed for circuit '{}': {}", job.circuit_name, e)
-        })?;
-
-        info!(
-            job_id = %job.job_id,
-            circuit = %job.circuit_name,
-            "groth16 server-side proof verification passed"
-        );
-
-        let proof_json = std::fs::read_to_string(&proof_path).map_err(|e| e.to_string())?;
-
-        let output = json!({
-            "proof_format": "groth16",
-            "job_id": job.job_id,
-            "job_type": job.job_type,
-            "circuit": job.circuit_name,
-            "generated_at": chrono::Utc::now(),
-            "proof": serde_json::from_str::<serde_json::Value>(&proof_json).unwrap_or_default(),
-            "public_signals": evm_proof.pub_signals,
-            "pa": evm_proof.pa,
-            "pb": evm_proof.pb,
-            "pc": evm_proof.pc,
-        });
-
-        serde_json::to_string(&output).map_err(|e| e.to_string())
-    }
-
-    fn artifact_paths(&self, job: &ProverJob) -> Result<(String, String), String> {
-        let (wasm_key, zkey_key) = match job.job_type {
-            ProverJobType::PrivateDeposit => ("PRIVATE_DEPOSIT_WASM", "PRIVATE_DEPOSIT_ZKEY"),
-            ProverJobType::PrivateOrderCommitment => (
-                "PRIVATE_ORDER_COMMITMENT_WASM",
-                "PRIVATE_ORDER_COMMITMENT_ZKEY",
-            ),
-            ProverJobType::PrivateTransferSettlement => (
-                "PRIVATE_TRANSFER_SETTLEMENT_WASM",
-                "PRIVATE_TRANSFER_SETTLEMENT_ZKEY",
-            ),
-            ProverJobType::PrivateMarketClaim => (
-                "PRIVATE_MARKET_CLAIM_WASM",
-                "PRIVATE_MARKET_CLAIM_ZKEY",
-            ),
-            ProverJobType::PrivateWithdraw => ("PRIVATE_WITHDRAW_WASM", "PRIVATE_WITHDRAW_ZKEY"),
-            ProverJobType::PrivateYieldDistribution => (
-                "PRIVATE_YIELD_DISTRIBUTION_WASM",
-                "PRIVATE_YIELD_DISTRIBUTION_ZKEY",
-            ),
-        };
-
-        let wasm = std::env::var(wasm_key)
-            .map_err(|_| format!("{} is required for snarkjs prover mode", wasm_key))?;
-        let zkey = std::env::var(zkey_key)
-            .map_err(|_| format!("{} is required for snarkjs prover mode", zkey_key))?;
-
-        if !std::path::Path::new(&wasm).exists() {
-            return Err(format!("wasm artifact not found: {}", wasm));
-        }
-        if !std::path::Path::new(&zkey).exists() {
-            return Err(format!("zkey artifact not found: {}", zkey));
-        }
-
-        Ok((wasm, zkey))
-    }
-
-    fn vk_path(&self, job: &ProverJob) -> Result<String, String> {
-        let vk_key = match job.job_type {
-            ProverJobType::PrivateDeposit => "PRIVATE_DEPOSIT_VK",
-            ProverJobType::PrivateOrderCommitment => "PRIVATE_ORDER_COMMITMENT_VK",
-            ProverJobType::PrivateTransferSettlement => "PRIVATE_TRANSFER_SETTLEMENT_VK",
-            ProverJobType::PrivateMarketClaim => "PRIVATE_MARKET_CLAIM_VK",
-            ProverJobType::PrivateWithdraw => "PRIVATE_WITHDRAW_VK",
-            ProverJobType::PrivateYieldDistribution => "PRIVATE_YIELD_DISTRIBUTION_VK",
-        };
-
-        let vk = std::env::var(vk_key)
-            .map_err(|_| format!("{} is required for groth16 calldata generation", vk_key))?;
-
-        if !std::path::Path::new(&vk).exists() {
-            return Err(format!("vk artifact not found: {}", vk));
-        }
-
-        Ok(vk)
     }
 
     /// Return the path to the compiled Noir circuit JSON for Barretenberg.
@@ -712,7 +582,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_artifact_path_validation() {
+    async fn test_circuit_json_path_validation() {
         let (worker, shutdown) = setup_worker().await;
         let job = ProverJob {
             job_id: "j2".to_string(),
@@ -726,10 +596,9 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
 
-        std::env::remove_var("PRIVATE_WITHDRAW_WASM");
-        std::env::remove_var("PRIVATE_WITHDRAW_ZKEY");
-        let err = worker.artifact_paths(&job).unwrap_err();
-        assert!(err.contains("PRIVATE_WITHDRAW_WASM"));
+        std::env::remove_var("PRIVATE_WITHDRAW_CIRCUIT_JSON");
+        let err = worker.circuit_json_path(&job).unwrap_err();
+        assert!(err.contains("PRIVATE_WITHDRAW_CIRCUIT_JSON"));
 
         let _ = shutdown.send(());
     }

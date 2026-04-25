@@ -72,12 +72,16 @@ impl MarketSeriesConfig {
 ///   MARKET_SERIES_ETH_ZEN_ENABLED=false
 ///   MARKET_SERIES_SOL_ZEN_ENABLED=false
 pub fn load_market_series() -> Vec<MarketSeriesConfig> {
-    let usdc_vault = std::env::var("USDC_VAULT_ADDRESS")
+    let usdc_vault = std::env::var("PM_USDC_VAULT_ADDRESS")
+        .or_else(|_| std::env::var("USDC_VAULT_ADDRESS"))
         .or_else(|_| std::env::var("PM_VAULT_ADDRESS"))
         .or_else(|_| std::env::var("PREDICTION_MARKET_VAULT_ADDRESS"))
         .unwrap_or_default();
 
-    let zen_vault = std::env::var("ZEN_VAULT_ADDRESS").unwrap_or_default();
+    let zen_vault = std::env::var("PM_ZEN_VAULT_ADDRESS")
+        .or_else(|_| std::env::var("ZEN_PM_VAULT_ADDRESS"))
+        .or_else(|_| std::env::var("ZEN_VAULT_ADDRESS"))
+        .unwrap_or_default();
 
     fn is_enabled(key: &str) -> bool {
         std::env::var(key)
