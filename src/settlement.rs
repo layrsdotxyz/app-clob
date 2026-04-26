@@ -346,26 +346,26 @@ impl SettlementEngine {
 
     // ==================== Balance Management ====================
 
-    async fn get_user_balance(&self, user_id: &str, market_id: &str) -> ClobResult<Decimal> {
-        Ok(self.balance_service.get_available_balance(user_id, market_id))
+    async fn get_user_balance(&self, user_id: &str, _market_id: &str) -> ClobResult<Decimal> {
+        Ok(self.balance_service.get_available_balance(user_id, "USDC"))
     }
 
     async fn reserve_balance(
         &self,
         user_id: &str,
-        market_id: &str,
+        _market_id: &str,
         amount: Decimal,
     ) -> ClobResult<()> {
-        self.balance_service.reserve_balance(user_id, market_id, amount)
+        self.balance_service.reserve_balance(user_id, "USDC", amount)
     }
 
     async fn release_balance(
         &self,
         user_id: &str,
-        market_id: &str,
+        _market_id: &str,
         amount: Decimal,
     ) -> ClobResult<()> {
-        self.balance_service.release_balance(user_id, market_id, amount)
+        self.balance_service.release_balance(user_id, "USDC", amount)
     }
 
     async fn update_balances_for_trade(
@@ -377,11 +377,11 @@ impl SettlementEngine {
         // Maker: release reserved (the order commitment), then debit the fill cost.
         // The reserved amount was size*price+fee; debit the actual fill cost+fee.
         let maker_cost = maker_fill.size * maker_fill.price + maker_fill.fee;
-        self.balance_service.debit(&trade.maker_user_id, &trade.market_id, maker_cost)?;
+        self.balance_service.debit(&trade.maker_user_id, "USDC", maker_cost)?;
 
         // Taker: debit cost+fee (their reservation covers this).
         let taker_cost = taker_fill.size * taker_fill.price + taker_fill.fee;
-        self.balance_service.debit(&trade.taker_user_id, &trade.market_id, taker_cost)?;
+        self.balance_service.debit(&trade.taker_user_id, "USDC", taker_cost)?;
 
         tracing::debug!(
             trade_id = %trade.id,
