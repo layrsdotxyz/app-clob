@@ -31,7 +31,7 @@ use ethers::{
 };
 
 use crate::{
-    database::Database,
+    database::{Database, PersistedOracleMarket},
     error::{ClobError, ClobResult},
     evm_relayer::EvmRelayer,
     market_resolution_policy::{
@@ -43,13 +43,34 @@ use crate::{
     redis_store::RedisStore,
 };
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 
 /// Assets for which hourly markets are created and resolved each tick.
 const ORACLE_ASSETS: &[&str] = &["BTC", "ETH", "SOL"];
+
+fn merge_recovery_backlog(
+    persisted: Vec<PersistedOracleMarket>,
+    cached_pending: Option<PersistedOracleMarket>,
+) -> Vec<PersistedOracleMarket> {
+    let mut seen_market_ids = HashSet::new();
+    let mut merged = Vec::with_capacity(persisted.len() + usize::from(cached_pending.is_some()));
+
+    for market in persisted {
+        seen_market_ids.insert(market.on_chain_market_id);
+        merged.push(market);
+    }
+
+    if let Some(market) = cached_pending {
+        if !seen_market_ids.contains(&market.on_chain_market_id) {
+            merged.push(market);
+        }
+    }
+
+    merged
+}
 
 // ─── Service ─────────────────────────────────────────────────────────────────
 
@@ -211,8 +232,8 @@ impl MarketOracleService {
     }
 
     /// Read `MarketRegistry.nextMarketId()` to initialise `market_id_counter`.
-    /// Per-asset pending state is not restored on restart — any unresolved
-    /// markets from before restart will simply remain open until they expire.
+    /// Per-asset pending state is still cached in memory, but expired unresolved
+    /// markets are now recovered from the DB on each tick when persistence exists.
     async fn sync_from_chain(&mut self) -> ClobResult<()> {
         info!("Syncing market oracle state from Horizen EVM");
 
@@ -263,24 +284,71 @@ impl MarketOracleService {
             ))
         })?;
 
-        // 2. Resolve the previous market for this asset, if any.
-        if let Some(prev_id) = pending_market_id {
-            match self.resolve_pending_market(asset, prev_id, prev_hour_start, now_ts).await {
+        // 2. Resolve any expired unresolved markets for this asset.
+        let mut persisted_backlog: Vec<PersistedOracleMarket> = Vec::new();
+
+        if let Some(db) = &self.database {
+            match db.get_expired_active_pyth_markets(asset, now_ts).await {
+                Ok(backlog) => {
+                    persisted_backlog = backlog;
+                }
+                Err(error) => {
+                    warn!(asset, error = %error, "Failed to load expired oracle backlog from DB — falling back to in-memory pending state");
+                }
+            }
+        }
+
+        let markets_to_resolve = merge_recovery_backlog(
+            persisted_backlog,
+            pending_market_id.map(|prev_id| PersistedOracleMarket {
+                market_id: format!("{asset}-{prev_id}"),
+                on_chain_market_id: prev_id,
+                expiry_ts: prev_hour_start,
+            }),
+        );
+
+        let price_decimal = scaled_u128_to_decimal(
+            decimal_price_to_u128(close_price).unwrap_or(0),
+        );
+
+        for pending_market in markets_to_resolve {
+            let prev_id = pending_market.on_chain_market_id;
+            match self
+                .resolve_pending_market(asset, prev_id, pending_market.expiry_ts, now_ts)
+                .await
+            {
                 Ok(Some(ref tx)) => {
-                    info!(asset, market_id = prev_id, tx_hash = %tx, "Market resolved on-chain");
-                    // Persist resolution to DB
+                    info!(
+                        asset,
+                        market_id = prev_id,
+                        tx_hash = %tx,
+                        "Market resolved on-chain"
+                    );
                     if let Some(db) = &self.database {
-                        let market_key = format!("{asset}-{prev_id}");
-                        let price_decimal = scaled_u128_to_decimal(
-                            decimal_price_to_u128(close_price).unwrap_or(0),
-                        );
-                        if let Err(e) = db.update_market_resolution(&market_key, price_decimal, "resolved").await {
-                            warn!(asset, market_id = prev_id, error = %e, "Failed to persist market resolution to DB");
+                        if let Err(error) = db
+                            .update_market_resolution(&pending_market.market_id, price_decimal, "resolved")
+                            .await
+                        {
+                            warn!(
+                                asset,
+                                market_id = prev_id,
+                                error = %error,
+                                "Failed to persist market resolution to DB"
+                            );
                         }
                     }
                 }
-                Ok(None)    => info!(asset, market_id = prev_id, "Market resolution deferred under oracle policy"),
-                Err(e)      => warn!(asset, market_id = prev_id, error = %e, "Failed to resolve market — will retry next tick"),
+                Ok(None) => info!(
+                    asset,
+                    market_id = prev_id,
+                    "Market resolution deferred under oracle policy"
+                ),
+                Err(error) => warn!(
+                    asset,
+                    market_id = prev_id,
+                    error = %error,
+                    "Failed to resolve market — will retry next tick"
+                ),
             }
         }
 
@@ -333,6 +401,8 @@ impl MarketOracleService {
         self.market_id_counter += 1;
         Ok(expected_id)
     }
+
+    
 
     // ─── EVM contract helpers ─────────────────────────────────────────────────
 
@@ -568,6 +638,46 @@ impl MarketOracleService {
         }
 
         Err(last_err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_recovery_backlog;
+    use crate::database::PersistedOracleMarket;
+
+    #[test]
+    fn merge_recovery_backlog_dedupes_cached_pending_when_db_has_same_market() {
+        let merged = merge_recovery_backlog(
+            vec![PersistedOracleMarket {
+                market_id: "BTC-160".to_string(),
+                on_chain_market_id: 160,
+                expiry_ts: 1_714_148_100,
+            }],
+            Some(PersistedOracleMarket {
+                market_id: "BTC-160".to_string(),
+                on_chain_market_id: 160,
+                expiry_ts: 1_714_148_100,
+            }),
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].on_chain_market_id, 160);
+    }
+
+    #[test]
+    fn merge_recovery_backlog_keeps_cached_pending_when_db_is_empty() {
+        let merged = merge_recovery_backlog(
+            Vec::new(),
+            Some(PersistedOracleMarket {
+                market_id: "ETH-161".to_string(),
+                on_chain_market_id: 161,
+                expiry_ts: 1_714_148_100,
+            }),
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].market_id, "ETH-161");
     }
 }
 

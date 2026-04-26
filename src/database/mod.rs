@@ -1,11 +1,143 @@
 use crate::{
     error::{ClobError, ClobResult},
-    models::{Fill, Order, OrderStatus, Trade},
+    models::{Fill, Order, OrderStatus, PublicMarketMetadata, Trade},
 };
 use rust_decimal::Decimal;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::time::Duration;
 use uuid::Uuid;
+
+fn slugify_fragment(input: &str) -> String {
+    let mut slug = String::with_capacity(input.len());
+    let mut last_was_dash = false;
+
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash && !slug.is_empty() {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+
+    if slug.is_empty() {
+        "market".to_string()
+    } else {
+        slug
+    }
+}
+
+fn market_asset_symbol(market_id: &str) -> Option<String> {
+    market_id
+        .split('-')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| segment.to_ascii_uppercase())
+}
+
+fn market_metadata_from_row(row: &sqlx::postgres::PgRow) -> PublicMarketMetadata {
+    let market_id = row.get::<String, _>("market_id");
+    let description = row
+        .try_get::<Option<String>, _>("description")
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| market_id.clone());
+    let on_chain_market_id = row.try_get::<Option<i64>, _>("on_chain_market_id").ok().flatten();
+    let slug = row
+        .try_get::<Option<String>, _>("slug")
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| generate_market_slug(&description, &market_id, on_chain_market_id));
+    let expiry_ts = row
+        .try_get::<Option<chrono::NaiveDateTime>, _>("expiry")
+        .ok()
+        .flatten()
+        .map(|value| value.and_utc().timestamp().max(0) as u64);
+    let status = row
+        .try_get::<Option<String>, _>("status")
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "open".to_string());
+    let source = row.try_get::<Option<String>, _>("source").ok().flatten();
+
+    PublicMarketMetadata {
+        market_id: market_id.clone(),
+        slug,
+        question: description,
+        expiry_ts,
+        status,
+        source,
+        on_chain_market_id,
+        asset_symbol: market_asset_symbol(&market_id),
+    }
+}
+
+pub fn generate_market_slug(
+    description: &str,
+    market_id: &str,
+    on_chain_market_id: Option<i64>,
+) -> String {
+    let base_input = if description.trim().is_empty() {
+        market_id
+    } else {
+        description
+    };
+    let mut base = slugify_fragment(base_input);
+    if base.len() > 96 {
+        base.truncate(96);
+        while base.ends_with('-') {
+            base.pop();
+        }
+    }
+
+    let suffix = on_chain_market_id
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| slugify_fragment(market_id));
+
+    if base == suffix {
+        base
+    } else {
+        format!("{base}-{suffix}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generate_market_slug;
+
+    #[test]
+    fn market_slug_uses_human_readable_question_with_unique_suffix() {
+        let slug = generate_market_slug(
+            "Will BTC close above $95,000 at Unix 1714148100?",
+            "BTC-160",
+            Some(160),
+        );
+
+        assert_eq!(slug, "will-btc-close-above-95-000-at-unix-1714148100-160");
+    }
+
+    #[test]
+    fn market_slug_falls_back_to_market_id_without_duplicate_suffix() {
+        let slug = generate_market_slug("", "BTC-160", None);
+
+        assert_eq!(slug, "btc-160");
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PersistedOracleMarket {
+    pub market_id: String,
+    pub on_chain_market_id: u64,
+    pub expiry_ts: u64,
+}
 
 #[derive(Clone)]
 pub struct Database {
@@ -358,13 +490,15 @@ impl Database {
         let expiry_dt = chrono::DateTime::from_timestamp(expiry_ts as i64, 0)
             .unwrap_or_else(chrono::Utc::now)
             .naive_utc();
+        let slug = generate_market_slug(description, market_id, on_chain_market_id);
 
         sqlx::query(
             "INSERT INTO markets
                 (market_id, description, expiry, oracle_address, status,
                  strike_price, currency, vault_address, source, on_chain_market_id,
+                 slug,
                  created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
              ON CONFLICT (market_id)
              DO UPDATE SET
                  description        = EXCLUDED.description,
@@ -375,6 +509,7 @@ impl Database {
                  vault_address      = COALESCE(EXCLUDED.vault_address, markets.vault_address),
                  source             = COALESCE(EXCLUDED.source, markets.source),
                  on_chain_market_id = COALESCE(EXCLUDED.on_chain_market_id, markets.on_chain_market_id),
+                 slug               = COALESCE(markets.slug, EXCLUDED.slug),
                  updated_at         = NOW()",
         )
         .bind(market_id)
@@ -387,6 +522,7 @@ impl Database {
         .bind(vault_address)
         .bind(source)
         .bind(on_chain_market_id)
+        .bind(slug)
         .execute(&self.pool)
         .await
         .map_err(|e| ClobError::Internal(format!("upsert_market failed: {}", e)))?;
@@ -414,6 +550,108 @@ impl Database {
         .map_err(|e| ClobError::Internal(format!("update_market_resolution failed: {}", e)))?;
 
         Ok(())
+    }
+
+    pub async fn get_public_market_metadata(
+        &self,
+        market_id: &str,
+    ) -> ClobResult<Option<PublicMarketMetadata>> {
+        let row = sqlx::query(
+            "SELECT market_id, slug, description, expiry, status, source, on_chain_market_id
+             FROM markets
+             WHERE market_id = $1",
+        )
+        .bind(market_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| ClobError::Internal(format!("get_public_market_metadata failed: {}", e)))?;
+
+        Ok(row.as_ref().map(market_metadata_from_row))
+    }
+
+    pub async fn get_public_market_metadata_by_slug(
+        &self,
+        slug: &str,
+    ) -> ClobResult<Option<PublicMarketMetadata>> {
+        let row = sqlx::query(
+            "SELECT market_id, slug, description, expiry, status, source, on_chain_market_id
+             FROM markets
+             WHERE slug = $1",
+        )
+        .bind(slug)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| ClobError::Internal(format!("get_public_market_metadata_by_slug failed: {}", e)))?;
+
+        Ok(row.as_ref().map(market_metadata_from_row))
+    }
+
+    pub async fn get_expired_active_pyth_markets(
+        &self,
+        asset: &str,
+        now_ts: u64,
+    ) -> ClobResult<Vec<PersistedOracleMarket>> {
+        let expiry_cutoff = chrono::DateTime::from_timestamp(now_ts as i64, 0)
+            .unwrap_or_else(chrono::Utc::now)
+            .naive_utc();
+        let asset_prefix = format!("{asset}-%");
+
+        let rows = sqlx::query(
+            "SELECT market_id, on_chain_market_id, expiry
+             FROM markets
+             WHERE source = 'pyth'
+               AND status = 'active'
+               AND expiry IS NOT NULL
+               AND expiry <= $1
+               AND market_id LIKE $2
+             ORDER BY expiry ASC, market_id ASC",
+        )
+        .bind(expiry_cutoff)
+        .bind(asset_prefix)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ClobError::Internal(format!("get_expired_active_pyth_markets failed: {}", e)))?;
+
+        let mut persisted = Vec::with_capacity(rows.len());
+        for row in rows {
+            let market_id = row.get::<String, _>("market_id");
+            let on_chain_market_id = row
+                .try_get::<Option<i64>, _>("on_chain_market_id")
+                .ok()
+                .flatten()
+                .and_then(|value| u64::try_from(value).ok())
+                .or_else(|| {
+                    market_id
+                        .rsplit('-')
+                        .next()
+                        .and_then(|value| value.parse::<u64>().ok())
+                })
+                .ok_or_else(|| {
+                    ClobError::Internal(format!(
+                        "active pyth market {} is missing a usable on_chain_market_id",
+                        market_id
+                    ))
+                })?;
+            let expiry_ts = row
+                .try_get::<Option<chrono::NaiveDateTime>, _>("expiry")
+                .ok()
+                .flatten()
+                .map(|value| value.and_utc().timestamp().max(0) as u64)
+                .ok_or_else(|| {
+                    ClobError::Internal(format!(
+                        "active pyth market {} is missing expiry",
+                        market_id
+                    ))
+                })?;
+
+            persisted.push(PersistedOracleMarket {
+                market_id,
+                on_chain_market_id,
+                expiry_ts,
+            });
+        }
+
+        Ok(persisted)
     }
 
     // ==================== Balance persistence ====================

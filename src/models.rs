@@ -225,6 +225,18 @@ pub struct MarketStats {
     pub open_interest: Decimal,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicMarketMetadata {
+    pub market_id: String,
+    pub slug: String,
+    pub question: String,
+    pub expiry_ts: Option<u64>,
+    pub status: String,
+    pub source: Option<String>,
+    pub on_chain_market_id: Option<i64>,
+    pub asset_symbol: Option<String>,
+}
+
 /// A trade tick safe for public broadcast — no user IDs, no settlement hash.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublicTrade {

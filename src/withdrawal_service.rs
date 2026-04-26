@@ -319,8 +319,9 @@ mod tests {
                 chain_id: 1337,
                 private_key: "0x0000000000000000000000000000000000000000000000000000000000000001"
                     .to_string(),
-                vault_address: None,
-                zen_vault_address: None,
+                pm_usdc_vault_address: None,
+                pm_zen_vault_address: None,
+                privacy_weth_vault_address: None,
             },
         });
 
