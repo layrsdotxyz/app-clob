@@ -87,7 +87,7 @@ EXPOSE 8081
 EXPOSE 9090
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD curl -sf http://localhost:8081/health || exit 1
+    CMD curl -sf http://localhost:8081/ready || exit 1
 
 # Run the service
 CMD ["/app/clob-service"]
