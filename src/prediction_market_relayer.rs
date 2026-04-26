@@ -174,6 +174,10 @@ fn decode_proof_hex(hex: &str) -> ClobResult<Vec<u8>> {
 }
 
 /// Decode a `0x`-prefixed 32-byte hex string into `[u8; 32]`.
+pub fn decode_bytes32_pub(s: &str, label: &str) -> ClobResult<[u8; 32]> {
+    decode_bytes32(s, label)
+}
+
 fn decode_bytes32(s: &str, label: &str) -> ClobResult<[u8; 32]> {
     let stripped = s
         .strip_prefix("0x")

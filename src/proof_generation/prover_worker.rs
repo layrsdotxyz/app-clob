@@ -297,111 +297,131 @@ impl ProverWorker {
     ) -> Result<String, String> {
         let circuit_json = self.circuit_json_path(job)?;
         let vk_dir       = self.bb_vk_dir(job)?;
-        let dir          = tempdir().map_err(|e| e.to_string())?;
-
         let bb_bin = std::env::var("BB_BIN").unwrap_or_else(|_| "bb".to_string());
+        let circuit_name = job.circuit_name.clone();
+        let job_id = job.job_id.clone();
+        let job_type = job.job_type.clone();
+        let input_value = input_value.clone();
+        let circuit_name_for_blocking = circuit_name.clone();
+        let vk_dir_for_blocking = vk_dir.clone();
 
-        // ─ 1. Write Prover.toml ──────────────────────────────────────────────
-        let toml_path = dir.path().join("Prover.toml");
-        let toml_str  = json_to_prover_toml(input_value)
-            .map_err(|e| format!("failed to build Prover.toml: {}", e))?;
-        std::fs::write(&toml_path, &toml_str).map_err(|e| e.to_string())?;
+        // Barretenberg proof generation shells out to external binaries and performs
+        // synchronous filesystem work. Keep that off the Tokio worker threads so
+        // health checks are not starved while proofs are running.
+        let (proof_hex, public_inputs, verified_vk) = tokio::task::spawn_blocking(move || -> Result<(String, Vec<String>, bool), String> {
+            let dir = tempdir().map_err(|e| e.to_string())?;
 
-        // ─ 2. Execute circuit → witness ──────────────────────────────────────
-        let witness_dir = dir.path().join("witness");
-        std::fs::create_dir_all(&witness_dir).map_err(|e| e.to_string())?;
+            // ─ 1. Write Prover.toml ──────────────────────────────────────────
+            let toml_path = dir.path().join("Prover.toml");
+            let toml_str = json_to_prover_toml(&input_value)
+                .map_err(|e| format!("failed to build Prover.toml: {}", e))?;
+            std::fs::write(&toml_path, &toml_str).map_err(|e| e.to_string())?;
 
-        let exec_out = std::process::Command::new(&bb_bin)
-            .arg("execute")
-            .arg("-b").arg(&circuit_json)
-            .arg("-i").arg(&toml_path)
-            .arg("-o").arg(&witness_dir)
-            .output()
-            .map_err(|e| format!("failed to run bb execute ({}): {}", bb_bin, e))?;
+            // ─ 2. Execute circuit → witness ──────────────────────────────────
+            let witness_dir = dir.path().join("witness");
+            std::fs::create_dir_all(&witness_dir).map_err(|e| e.to_string())?;
 
-        if !exec_out.status.success() {
-            return Err(format!(
-                "bb execute failed for circuit '{}': {}",
-                job.circuit_name,
-                String::from_utf8_lossy(&exec_out.stderr)
-            ));
-        }
-
-        let witness_path = witness_dir.join("witness.gz");
-        if !witness_path.exists() {
-            return Err(format!(
-                "bb execute did not produce witness.gz for circuit '{}'",
-                job.circuit_name
-            ));
-        }
-
-        // ─ 3. Prove ──────────────────────────────────────────────────────────
-        let proof_dir = dir.path().join("proof_out");
-        std::fs::create_dir_all(&proof_dir).map_err(|e| e.to_string())?;
-
-        let prove_out = std::process::Command::new(&bb_bin)
-            .arg("prove")
-            .arg("--scheme").arg("ultra_honk")
-            .arg("-b").arg(&circuit_json)
-            .arg("-w").arg(&witness_path)
-            .arg("-o").arg(&proof_dir)
-            .output()
-            .map_err(|e| format!("failed to run bb prove ({}): {}", bb_bin, e))?;
-
-        if !prove_out.status.success() {
-            return Err(format!(
-                "bb prove failed for circuit '{}': {}",
-                job.circuit_name,
-                String::from_utf8_lossy(&prove_out.stderr)
-            ));
-        }
-
-        // ─ 4. Read proof bytes ───────────────────────────────────────────────
-        let proof_bytes = std::fs::read(proof_dir.join("proof"))
-            .map_err(|e| format!("failed to read proof file: {}", e))?;
-        let proof_hex = hex::encode(&proof_bytes);
-
-        // ─ 5. Read public inputs ─────────────────────────────────────────────
-        // bb outputs one hex-encoded bytes32 per line in `public_inputs`
-        let pi_text = std::fs::read_to_string(proof_dir.join("public_inputs"))
-            .map_err(|e| format!("failed to read public_inputs file: {}", e))?;
-        let public_inputs: Vec<String> = pi_text
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| {
-                let s = l.trim();
-                // Normalise to 0x-prefixed lowercase 32-byte hex
-                let hex_part = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
-                format!("0x{:0>64}", hex_part.to_lowercase())
-            })
-            .collect();
-
-        // ─ 6. Server-side verify ─────────────────────────────────────────────
-        let vk_path = std::path::Path::new(&vk_dir).join("vk");
-        if vk_path.exists() {
-            let verify_out = std::process::Command::new(&bb_bin)
-                .arg("verify")
-                .arg("--scheme").arg("ultra_honk")
-                .arg("-k").arg(&vk_path)
-                .arg("-p").arg(proof_dir.join("proof"))
+            let exec_out = std::process::Command::new(&bb_bin)
+                .arg("execute")
+                .arg("-b").arg(&circuit_json)
+                .arg("-i").arg(&toml_path)
+                .arg("-o").arg(&witness_dir)
                 .output()
-                .map_err(|e| format!("failed to run bb verify: {}", e))?;
+                .map_err(|e| format!("failed to run bb execute ({}): {}", bb_bin, e))?;
 
-            if !verify_out.status.success() {
+            if !exec_out.status.success() {
                 return Err(format!(
-                    "bb verify failed for circuit '{}' — proof is invalid: {}",
-                    job.circuit_name,
-                    String::from_utf8_lossy(&verify_out.stderr)
+                    "bb execute failed for circuit '{}': {}",
+                    circuit_name_for_blocking,
+                    String::from_utf8_lossy(&exec_out.stderr)
                 ));
             }
+
+            let witness_path = witness_dir.join("witness.gz");
+            if !witness_path.exists() {
+                return Err(format!(
+                    "bb execute did not produce witness.gz for circuit '{}'",
+                    circuit_name_for_blocking
+                ));
+            }
+
+            // ─ 3. Prove ──────────────────────────────────────────────────────
+            let proof_dir = dir.path().join("proof_out");
+            std::fs::create_dir_all(&proof_dir).map_err(|e| e.to_string())?;
+
+            let prove_out = std::process::Command::new(&bb_bin)
+                .arg("prove")
+                .arg("--scheme").arg("ultra_honk")
+                .arg("-b").arg(&circuit_json)
+                .arg("-w").arg(&witness_path)
+                .arg("-o").arg(&proof_dir)
+                .output()
+                .map_err(|e| format!("failed to run bb prove ({}): {}", bb_bin, e))?;
+
+            if !prove_out.status.success() {
+                return Err(format!(
+                    "bb prove failed for circuit '{}': {}",
+                    circuit_name_for_blocking,
+                    String::from_utf8_lossy(&prove_out.stderr)
+                ));
+            }
+
+            // ─ 4. Read proof bytes ───────────────────────────────────────────
+            let proof_bytes = std::fs::read(proof_dir.join("proof"))
+                .map_err(|e| format!("failed to read proof file: {}", e))?;
+            let proof_hex = hex::encode(&proof_bytes);
+
+            // ─ 5. Read public inputs ─────────────────────────────────────────
+            let pi_text = std::fs::read_to_string(proof_dir.join("public_inputs"))
+                .map_err(|e| format!("failed to read public_inputs file: {}", e))?;
+            let public_inputs: Vec<String> = pi_text
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| {
+                    let s = l.trim();
+                    let hex_part = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+                    format!("0x{:0>64}", hex_part.to_lowercase())
+                })
+                .collect();
+
+            // ─ 6. Server-side verify ─────────────────────────────────────────
+            let vk_path = std::path::Path::new(&vk_dir_for_blocking).join("vk");
+            let verified_vk = if vk_path.exists() {
+                let verify_out = std::process::Command::new(&bb_bin)
+                    .arg("verify")
+                    .arg("--scheme").arg("ultra_honk")
+                    .arg("-k").arg(&vk_path)
+                    .arg("-p").arg(proof_dir.join("proof"))
+                    .output()
+                    .map_err(|e| format!("failed to run bb verify: {}", e))?;
+
+                if !verify_out.status.success() {
+                    return Err(format!(
+                        "bb verify failed for circuit '{}' — proof is invalid: {}",
+                        circuit_name_for_blocking,
+                        String::from_utf8_lossy(&verify_out.stderr)
+                    ));
+                }
+                true
+            } else {
+                false
+            };
+
+            Ok((proof_hex, public_inputs, verified_vk))
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking: {e}"))??;
+
+        if verified_vk {
             info!(
-                job_id   = %job.job_id,
-                circuit  = %job.circuit_name,
+                job_id   = %job_id,
+                circuit  = %circuit_name,
                 "UltraHonk server-side proof verification passed"
             );
         } else {
+            let vk_path = std::path::Path::new(&vk_dir).join("vk");
             warn!(
-                circuit = %job.circuit_name,
+                circuit = %circuit_name,
                 vk_dir  = %vk_dir,
                 "VK not found at {:?} — skipping server-side verify. Run build_honk_verifiers.sh.",
                 vk_path
@@ -410,9 +430,9 @@ impl ProverWorker {
 
         let output = json!({
             "proof_format": "ultra_honk",
-            "job_id":        job.job_id,
-            "job_type":      job.job_type,
-            "circuit":       job.circuit_name,
+            "job_id":        job_id,
+            "job_type":      job_type,
+            "circuit":       circuit_name,
             "generated_at":  chrono::Utc::now(),
             "proof_hex":     proof_hex,
             "public_inputs": public_inputs,

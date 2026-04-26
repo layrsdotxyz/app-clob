@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::str::FromStr;
 use tempfile::tempdir;
+use ethers::types::U256;
 
-use crate::{auth::AuthenticatedUser, AppState};
+use crate::{auth::AuthenticatedUser, proof_generation::HonkProof, AppState};
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -230,6 +231,11 @@ async fn verify_honk_balance_proof(honk_proof_hex: &str) -> Result<bool, String>
     Ok(true)
 }
 
+fn parse_u256_from_hex(s: &str) -> Result<U256, String> {
+    let stripped = s.trim_start_matches("0x").trim_start_matches("0X");
+    U256::from_str_radix(stripped, 16).map_err(|e| format!("invalid U256 hex '{s}': {e}"))
+}
+
 /// POST /v1/balance/proof
 ///
 /// Validates UltraHonk proof structure, runs `bb verify` for cryptographic
@@ -286,6 +292,7 @@ pub async fn submit_balance_proof(
     // Record a 5-minute soft-lock keyed on the nullifier hash.
     let balance_proof_id = Uuid::new_v4().to_string();
     let now = Utc::now().timestamp();
+    let lock_expiry_ts = (now + BALANCE_PROOF_TTL_SECS as i64) as u64;
     let soft_lock = serde_json::json!({
         "balance_proof_id": balance_proof_id,
         "user_id": auth.user_id,
@@ -293,13 +300,43 @@ pub async fn submit_balance_proof(
         "market_id": req.market_id,
         "balance_proof_digest": req.balance_proof_digest,
         "created_at": now,
-        "expires_at": now + BALANCE_PROOF_TTL_SECS as i64,
+        "expires_at": lock_expiry_ts,
     });
     let lock_key = format!("balance_proof:{}", req.note_nullifier_hash);
     let _ = state
         .redis_store
         .set_with_expiry(&lock_key, &soft_lock.to_string(), BALANCE_PROOF_TTL_SECS)
         .await;
+
+    // Fire-and-forget on-chain lockCollateral — settleFill requires noteLockExpiry != 0.
+    // required_amount is public_inputs[2] per pm_balance_proof.nr circuit layout.
+    if let Some(relayer) = state.prediction_market_relayer.clone() {
+        let order_commitment_hex = req.order_commitment.clone();
+        let proof = HonkProof {
+            proof_hex: req.honk_proof_hex.clone(),
+            public_inputs: req.public_inputs.clone(),
+        };
+        let required_amount_hex = req.public_inputs.get(2).cloned().unwrap_or_default();
+        tokio::spawn(async move {
+            let order_commitment = match crate::prediction_market_relayer::decode_bytes32_pub(
+                &order_commitment_hex, "order_commitment"
+            ) {
+                Ok(v) => v,
+                Err(e) => { tracing::warn!("lockCollateral: bad order_commitment: {e}"); return; }
+            };
+            let required_amount = match parse_u256_from_hex(&required_amount_hex) {
+                Ok(v) => v,
+                Err(e) => { tracing::warn!("lockCollateral: bad required_amount: {e}"); return; }
+            };
+            if let Err(e) = relayer.lock_collateral(
+                order_commitment, required_amount, lock_expiry_ts, &proof, None
+            ).await {
+                tracing::warn!("lockCollateral on-chain failed: {e}");
+            } else {
+                tracing::info!("lockCollateral on-chain succeeded for commitment {order_commitment_hex}");
+            }
+        });
+    }
 
     Ok(Json(BalanceProofResponse {
         balance_proof_id,
