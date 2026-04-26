@@ -10,13 +10,35 @@ use axum::{
     Json,
 };
 use serde::Serialize;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 #[derive(Debug, Serialize)]
 struct MarketsListResponse {
     markets: Vec<String>,
     count: usize,
     market_details: Vec<PublicMarketMetadata>,
+}
+
+fn merge_public_market_listing(
+    prioritized_markets: Vec<PublicMarketMetadata>,
+    additional_markets: Vec<PublicMarketMetadata>,
+) -> MarketsListResponse {
+    let mut seen_market_ids = HashSet::new();
+    let mut markets = Vec::with_capacity(prioritized_markets.len() + additional_markets.len());
+    let mut market_details = Vec::with_capacity(prioritized_markets.len() + additional_markets.len());
+
+    for metadata in prioritized_markets.into_iter().chain(additional_markets) {
+        if seen_market_ids.insert(metadata.market_id.clone()) {
+            markets.push(metadata.market_id.clone());
+            market_details.push(metadata);
+        }
+    }
+
+    MarketsListResponse {
+        count: markets.len(),
+        markets,
+        market_details,
+    }
 }
 
 fn legacy_market_metadata(market_id: &str) -> PublicMarketMetadata {
@@ -39,26 +61,33 @@ fn legacy_market_metadata(market_id: &str) -> PublicMarketMetadata {
 pub async fn list_markets(
     State(state): State<Arc<AppState>>,
 ) -> ClobResult<impl IntoResponse> {
-    let markets = state.orderbook_manager.get_active_markets();
-    let mut market_details = Vec::with_capacity(markets.len());
+    let mut orderbook_markets = state.orderbook_manager.get_active_markets();
+    orderbook_markets.sort();
 
     if let Some(database) = state.database.as_ref() {
-        for market_id in &markets {
+        let prioritized_markets = database.list_active_prediction_market_metadata().await?;
+        let mut additional_markets = Vec::with_capacity(orderbook_markets.len());
+
+        for market_id in &orderbook_markets {
             if let Some(metadata) = database.get_public_market_metadata(market_id).await? {
-                market_details.push(metadata);
+                additional_markets.push(metadata);
             } else {
-                market_details.push(legacy_market_metadata(market_id));
+                additional_markets.push(legacy_market_metadata(market_id));
             }
         }
-    } else {
-        market_details.extend(markets.iter().map(|market_id| legacy_market_metadata(market_id)));
-    }
 
-    Ok(Json(MarketsListResponse {
-        count: markets.len(),
-        markets,
-        market_details,
-    }))
+        return Ok(Json(merge_public_market_listing(
+            prioritized_markets,
+            additional_markets,
+        )));
+    } else {
+        let additional_markets = orderbook_markets
+            .iter()
+            .map(|market_id| legacy_market_metadata(market_id))
+            .collect();
+
+        return Ok(Json(merge_public_market_listing(Vec::new(), additional_markets)));
+    }
 }
 
 pub async fn get_market_by_slug(
@@ -110,4 +139,40 @@ pub async fn get_market_resolution_audit(
         "audit": null,
         "message": "resolution audit not available"
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{legacy_market_metadata, merge_public_market_listing};
+    use crate::models::PublicMarketMetadata;
+
+    fn prediction_market(market_id: &str, slug: &str) -> PublicMarketMetadata {
+        PublicMarketMetadata {
+            market_id: market_id.to_string(),
+            slug: slug.to_string(),
+            question: format!("Question for {market_id}"),
+            expiry_ts: Some(1),
+            status: "active".to_string(),
+            source: Some("pyth".to_string()),
+            on_chain_market_id: market_id.rsplit('-').next().and_then(|value| value.parse().ok()),
+            asset_symbol: market_id.split('-').next().map(|value| value.to_string()),
+        }
+    }
+
+    #[test]
+    fn merge_public_market_listing_prioritizes_predictions_and_dedupes() {
+        let merged = merge_public_market_listing(
+            vec![prediction_market("BTC-160", "btc-160"), prediction_market("ETH-161", "eth-161")],
+            vec![
+                legacy_market_metadata("BTC-USDC"),
+                prediction_market("BTC-160", "btc-160"),
+                legacy_market_metadata("SOL-USDC"),
+            ],
+        );
+
+        assert_eq!(merged.markets, vec!["BTC-160", "ETH-161", "BTC-USDC", "SOL-USDC"]);
+        assert_eq!(merged.count, 4);
+        assert_eq!(merged.market_details[0].slug, "btc-160");
+        assert_eq!(merged.market_details[1].slug, "eth-161");
+    }
 }

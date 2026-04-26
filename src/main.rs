@@ -217,6 +217,20 @@ async fn async_main() -> Result<()> {
     for mid in &seed_market_ids {
         orderbook_manager.seed_market(mid);
     }
+    if let Some(db) = database.as_ref() {
+        match db.list_active_prediction_market_metadata().await {
+            Ok(markets) => {
+                let seeded = markets.len();
+                for market in markets {
+                    orderbook_manager.seed_market(&market.market_id);
+                }
+                tracing::info!(count = seeded, "Seeded DB-backed prediction markets on startup");
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "Failed to seed DB-backed prediction markets on startup");
+            }
+        }
+    }
 
     let prediction_market_relayer = match PredictionMarketRelayer::from_env(
         config.pm_usdc_vault_address.clone(),

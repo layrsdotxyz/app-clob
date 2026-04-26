@@ -586,6 +586,23 @@ impl Database {
         Ok(row.as_ref().map(market_metadata_from_row))
     }
 
+    pub async fn list_active_prediction_market_metadata(
+        &self,
+    ) -> ClobResult<Vec<PublicMarketMetadata>> {
+        let rows = sqlx::query(
+            "SELECT market_id, slug, description, expiry, status, source, on_chain_market_id
+             FROM markets
+             WHERE status = 'active'
+               AND on_chain_market_id IS NOT NULL
+             ORDER BY expiry ASC NULLS LAST, on_chain_market_id ASC, market_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ClobError::Internal(format!("list_active_prediction_market_metadata failed: {}", e)))?;
+
+        Ok(rows.iter().map(market_metadata_from_row).collect())
+    }
+
     pub async fn get_expired_active_pyth_markets(
         &self,
         asset: &str,
