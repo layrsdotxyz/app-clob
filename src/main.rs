@@ -175,26 +175,51 @@ async fn async_main() -> Result<()> {
     };
     let redis_store = Arc::new(RedisStore::new(redis_conn));
 
-    // Optional PostgreSQL initialization for production persistence.
+    let allow_in_memory_only = std::env::var("ALLOW_IN_MEMORY_ONLY_CLOB")
+        .unwrap_or_else(|_| "false".to_string())
+        .eq_ignore_ascii_case("true");
+
+    // PostgreSQL initialization for production persistence. Local/dev bypass is
+    // explicit so CLOB cannot silently run Redis-only in normal environments.
     let database = if let Some(database_url) = config.database_url.clone() {
         match Database::connect(&database_url).await {
             Ok(db) => {
                 if let Err(e) = db.migrate().await {
-                    tracing::warn!(error = %e, "Database migration failed; running without PostgreSQL persistence layer");
-                    None
+                    if allow_in_memory_only {
+                        tracing::warn!(error = %e, "Database migration failed; ALLOW_IN_MEMORY_ONLY_CLOB=true so running without PostgreSQL persistence layer");
+                        None
+                    } else {
+                        return Err(anyhow::anyhow!(
+                            "Database migration failed and CLOB durability is required: {}",
+                            e
+                        ));
+                    }
                 } else {
                     tracing::info!("PostgreSQL database initialized");
                     Some(Arc::new(db))
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Database connection failed; running without PostgreSQL persistence layer");
-                None
+                if allow_in_memory_only {
+                    tracing::warn!(error = %e, "Database connection failed; ALLOW_IN_MEMORY_ONLY_CLOB=true so running without PostgreSQL persistence layer");
+                    None
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "Database connection failed and CLOB durability is required: {}",
+                        e
+                    ));
+                }
             }
         }
     } else {
-        tracing::warn!("DATABASE_URL not set; running without PostgreSQL persistence layer");
-        None
+        if allow_in_memory_only {
+            tracing::warn!("DATABASE_URL not set; ALLOW_IN_MEMORY_ONLY_CLOB=true so running without PostgreSQL persistence layer");
+            None
+        } else {
+            return Err(anyhow::anyhow!(
+                "DATABASE_URL must be set for clob-service durability; set ALLOW_IN_MEMORY_ONLY_CLOB=true only for local/dev bypass"
+            ));
+        }
     };
 
     // Initialize core components
@@ -233,18 +258,18 @@ async fn async_main() -> Result<()> {
     }
 
     let prediction_market_relayer = match PredictionMarketRelayer::from_env(
-        config.pm_usdc_vault_address.clone(),
+        config.pm_usdc_treasury_address.clone(),
     ) {
         Some(relayer) => {
             tracing::info!(
-                vault = %relayer.vault_address(),
+                treasury = %relayer.treasury_address(),
                 "Prediction market relayer enabled"
             );
             Some(Arc::new(relayer))
         }
         None => {
             tracing::warn!(
-                "Prediction market relayer disabled (set PM_USDC_VAULT_ADDRESS or PREDICTION_MARKET_VAULT_ADDRESS, plus HORIZEN_RPC_URL and EVM_OPERATOR_PRIVATE_KEY, to enable)"
+                "Prediction market relayer disabled (set PM_USDC_TREASURY_ADDRESS or PREDICTION_MARKET_TREASURY_ADDRESS, plus HORIZEN_RPC_URL and EVM_OPERATOR_PRIVATE_KEY, to enable; vault aliases still work)"
             );
             None
         }
@@ -256,6 +281,7 @@ async fn async_main() -> Result<()> {
         config.taker_fee_bps,
         balance_service.clone(),
     ));
+    let trade_persist_task = settlement_engine.clone().start_trade_persistence_worker();
     let ws_manager = Arc::new(WebSocketManager::new());
     let prover_pipeline = Arc::new(ProverPipeline::new(redis_store.clone(), 3));
     let privacy_state = Arc::new(PrivacyStateService::new(redis_store.clone()));
@@ -346,7 +372,7 @@ async fn async_main() -> Result<()> {
                 .route("/v1/wallet/deploy", post(routes::wallet::deploy_smart_account))
                 .route("/v1/wallet/:user_id", get(routes::wallet::get_wallet_info))
 
-                // Prediction market vault relay endpoints
+                // Prediction market treasury relay endpoints
                 .route("/v1/pm/lock-collateral", post(routes::pm::lock_collateral))
                 .route("/v1/pm/unlock-collateral", post(routes::pm::unlock_collateral))
                 .route("/v1/pm/settle-fill", post(routes::pm::settle_fill))
@@ -598,6 +624,9 @@ async fn async_main() -> Result<()> {
         task.abort();
     }
     if let Some(task) = market_oracle_task {
+        task.abort();
+    }
+    if let Some(task) = trade_persist_task {
         task.abort();
     }
     // Give the balance persistence worker a brief window to flush any queued DB writes

@@ -24,7 +24,7 @@ pub struct MarketSeriesConfig {
     pub oracle_asset: String,
     /// Collateral currency: "USDC" | "ZEN"
     pub currency: String,
-    /// EVM vault contract address for this series.
+    /// EVM treasury contract address for this series.
     pub vault_address: String,
     /// Market question template. Placeholders: {asset}, {price}, {time}.
     pub question_template: String,
@@ -72,13 +72,19 @@ impl MarketSeriesConfig {
 ///   MARKET_SERIES_ETH_ZEN_ENABLED=false
 ///   MARKET_SERIES_SOL_ZEN_ENABLED=false
 pub fn load_market_series() -> Vec<MarketSeriesConfig> {
-    let usdc_vault = std::env::var("PM_USDC_VAULT_ADDRESS")
+    let usdc_vault = std::env::var("PM_USDC_TREASURY_ADDRESS")
+        .or_else(|_| std::env::var("PREDICTION_MARKET_TREASURY_ADDRESS"))
+        .or_else(|_| std::env::var("PM_TREASURY_ADDRESS"))
+        .or_else(|_| std::env::var("PM_USDC_VAULT_ADDRESS"))
         .or_else(|_| std::env::var("USDC_VAULT_ADDRESS"))
         .or_else(|_| std::env::var("PM_VAULT_ADDRESS"))
         .or_else(|_| std::env::var("PREDICTION_MARKET_VAULT_ADDRESS"))
         .unwrap_or_default();
 
-    let zen_vault = std::env::var("PM_ZEN_VAULT_ADDRESS")
+    let zen_vault = std::env::var("PM_ZEN_TREASURY_ADDRESS")
+        .or_else(|_| std::env::var("ZEN_PM_TREASURY_ADDRESS"))
+        .or_else(|_| std::env::var("ZEN_TREASURY_ADDRESS"))
+        .or_else(|_| std::env::var("PM_ZEN_VAULT_ADDRESS"))
         .or_else(|_| std::env::var("ZEN_PM_VAULT_ADDRESS"))
         .or_else(|_| std::env::var("ZEN_VAULT_ADDRESS"))
         .unwrap_or_default();

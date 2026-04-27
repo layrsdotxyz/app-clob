@@ -10,7 +10,7 @@
 // does not call it — orders are placed directly with the EVM address as user_id.
 //
 // Deposits:
-//   Users deposit ETH / USDC / ZEN directly to the relevant PredictionMarketVault
+//   Users deposit ETH / USDC / ZEN directly to the relevant PredictionMarketTreasury
 //   contract on Horizen EVM from their connected wallet.
 //   ZK deposit proofs are generated client-side (browser) or by the vault-service.
 
@@ -50,14 +50,14 @@ pub struct RegisterWalletResponse {
     /// The effective on-chain address for deposits and positions.
     /// This is the ZeroDev smart account if AA is used, otherwise evm_address.
     pub account_address: String,
-    /// The vault deposit instruction for this user.
+    /// The treasury deposit instruction for this user.
     pub deposit_instruction: DepositInstruction,
 }
 
 #[derive(Debug, Serialize)]
 pub struct DepositInstruction {
     pub message: String,
-    /// EVM address of the PredictionMarketVault for USDC (on Horizen).
+    /// EVM address of the PredictionMarketTreasury for USDC (on Horizen).
     pub usdc_vault: String,
     /// EVM address of PrivacyVaultWeth (on Horizen).
     pub eth_vault: String,
@@ -153,6 +153,9 @@ pub async fn register_wallet(
 
 fn build_deposit_instruction() -> DepositInstruction {
     let usdc_vault = first_env(&[
+        "PM_USDC_TREASURY_ADDRESS",
+        "PREDICTION_MARKET_TREASURY_ADDRESS",
+        "PM_TREASURY_ADDRESS",
         "PM_USDC_VAULT_ADDRESS",
         "USDC_VAULT_ADDRESS",
         "PREDICTION_MARKET_VAULT_ADDRESS",
@@ -166,6 +169,9 @@ fn build_deposit_instruction() -> DepositInstruction {
     ]);
     let zen_vault = first_env(&[
         "PRIVACY_ZEN_VAULT_ADDRESS",
+        "PM_ZEN_TREASURY_ADDRESS",
+        "ZEN_PM_TREASURY_ADDRESS",
+        "ZEN_TREASURY_ADDRESS",
         "PM_ZEN_VAULT_ADDRESS",
         "ZEN_PM_VAULT_ADDRESS",
         "ZEN_VAULT_ADDRESS",

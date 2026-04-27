@@ -156,7 +156,7 @@ impl PredictionMarketClaimWorker {
             .get_output(prover_job_id)
             .await?
             .ok_or_else(|| ClobError::ProofGenerationFailed(format!("proof output missing for {}", prover_job_id)))?;
-        let proof = parse_honk_proof_from_output(&output)?;;
+        let proof = parse_honk_proof_from_output(&output)?;
 
         let vault_override: Option<&str> = if job.vault_address.trim().is_empty() {
             None
@@ -212,6 +212,13 @@ fn parse_recipient(recipient: &str) -> ClobResult<Address> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        prediction_market_relayer::PredictionMarketRelayer,
+        proof_generation::ProverPipeline,
+    };
+    use mini_redis::server;
+    use std::sync::Arc;
+    use tokio::sync::oneshot;
 
     // ─── claim_input_key ──────────────────────────────────────────────────────
 
@@ -266,5 +273,171 @@ mod tests {
     fn test_parse_recipient_empty_string() {
         let result = parse_recipient("");
         assert!(result.is_err());
+    }
+
+    async fn setup_claim_worker(
+    ) -> (
+        PredictionMarketClaimWorker,
+        Arc<RedisStore>,
+        Arc<ProverPipeline>,
+        oneshot::Sender<()>,
+    ) {
+        std::env::set_var("REDIS_COMPAT_DISABLE_LISTS", "true");
+        std::env::set_var("HORIZEN_RPC_URL", "http://127.0.0.1:1");
+        std::env::set_var(
+            "EVM_OPERATOR_PRIVATE_KEY",
+            "0x0000000000000000000000000000000000000000000000000000000000000001",
+        );
+        std::env::set_var(
+            "PM_USDC_TREASURY_ADDRESS",
+            "0x1111111111111111111111111111111111111111",
+        );
+        std::env::set_var("EVM_CHAIN_ID", "1337");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let _ = server::run(listener, async { let _ = rx.await; }).await;
+        });
+
+        let client = redis::Client::open(format!("redis://{}/", addr)).unwrap();
+        let conn = redis::aio::ConnectionManager::new(client).await.unwrap();
+        let store = Arc::new(RedisStore::new(conn));
+        let prover_pipeline = Arc::new(ProverPipeline::new(store.clone(), 1));
+        let relayer = Arc::new(PredictionMarketRelayer::from_env(None).unwrap());
+        let worker = PredictionMarketClaimWorker::new(
+            store.clone(),
+            prover_pipeline.clone(),
+            relayer,
+            1,
+        );
+
+        (worker, store, prover_pipeline, tx)
+    }
+
+    fn make_claim_job(status: &str, prover_job_id: Option<String>) -> PredictionMarketClaimJob {
+        let now = Utc::now();
+        PredictionMarketClaimJob {
+            job_id: "claim-job-1".to_string(),
+            recipient: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+            market_id: "42".to_string(),
+            outcome: 1,
+            amount: "25".to_string(),
+            status: status.to_string(),
+            prover_job_id,
+            claim_tx_hash: None,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+            vault_address: String::new(),
+        }
+    }
+
+    fn valid_honk_output() -> String {
+        let inputs = vec![format!("0x{}", "11".repeat(32)); 7];
+        serde_json::json!({
+            "proof_format": "ultra_honk",
+            "proof_hex": "0xdeadbeef",
+            "public_inputs": inputs,
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_claim_job_submission_enters_proof_pending() {
+        let (worker, store, prover_pipeline, shutdown) = setup_claim_worker().await;
+        let job = make_claim_job("pending_proof_generation", None);
+
+        store
+            .set(&job.redis_key(), &serde_json::to_string(&job).unwrap())
+            .await
+            .unwrap();
+        store
+            .set(
+                &claim_input_key(&job.job_id),
+                &serde_json::json!({
+                    "market_id": job.market_id,
+                    "outcome": job.outcome,
+                    "amount": job.amount,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        store.push_queue(PM_CLAIM_QUEUE, &job.job_id).await.unwrap();
+
+        worker.claim_new_jobs().await.unwrap();
+
+        let saved: PredictionMarketClaimJob = serde_json::from_str(
+            &store.get(&job.redis_key()).await.unwrap(),
+        )
+        .unwrap();
+        let prover_job_id = saved.prover_job_id.clone().expect("prover job should exist");
+        let prover_job = prover_pipeline
+            .get_job(&prover_job_id)
+            .await
+            .unwrap()
+            .expect("queued prover job should exist");
+
+        assert_eq!(saved.status, "proof_pending");
+        assert_eq!(prover_job.job_type, ProverJobType::PrivateMarketClaim);
+        assert_eq!(prover_job.circuit_name, "pm_claim");
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_claim_job_failed_proof_marks_job_failed() {
+        let (worker, _store, prover_pipeline, shutdown) = setup_claim_worker().await;
+        let prover_job = prover_pipeline
+            .submit_job(
+                ProverJobType::PrivateMarketClaim,
+                "pm_claim",
+                &serde_json::json!({"claim": "payload"}),
+            )
+            .await
+            .unwrap();
+        let _ = prover_pipeline.claim_next_job().await.unwrap().unwrap();
+        prover_pipeline
+            .mark_failed(&prover_job.job_id, "proof exploded")
+            .await
+            .unwrap();
+
+        let mut job = make_claim_job("proof_pending", Some(prover_job.job_id.clone()));
+        worker.handle_proof_pending(&mut job).await.unwrap();
+
+        assert_eq!(job.status, "proof_failed");
+        assert_eq!(job.last_error.as_deref(), Some("proof exploded"));
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_claim_job_relay_failure_enters_retry_pending() {
+        let (worker, _store, prover_pipeline, shutdown) = setup_claim_worker().await;
+        let prover_job = prover_pipeline
+            .submit_job(
+                ProverJobType::PrivateMarketClaim,
+                "pm_claim",
+                &serde_json::json!({"claim": "payload"}),
+            )
+            .await
+            .unwrap();
+        let _ = prover_pipeline.claim_next_job().await.unwrap().unwrap();
+        prover_pipeline
+            .mark_completed(&prover_job.job_id, &valid_honk_output())
+            .await
+            .unwrap();
+
+        let mut job = make_claim_job("proof_pending", Some(prover_job.job_id.clone()));
+        worker.handle_proof_pending(&mut job).await.unwrap();
+
+        assert_eq!(job.status, "relay_retry_pending");
+        assert!(job.claim_tx_hash.is_none());
+        assert!(job.last_error.is_some());
+
+        let _ = shutdown.send(());
     }
 }

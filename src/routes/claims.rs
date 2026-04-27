@@ -16,7 +16,6 @@ use std::sync::Arc;
 
 use axum::{
     extract::State,
-    http::StatusCode,
     response::IntoResponse,
     Json,
 };
@@ -39,7 +38,7 @@ pub struct PermissionlessClaimRequest {
     /// Ordered `0x`-prefixed `bytes32` public inputs from the pm_claim circuit.
     /// Must contain at least 7 elements; element at index 5 is the nullifier.
     pub public_inputs: Vec<String>,
-    /// Optional EVM vault address override; falls back to `PM_VAULT_ADDRESS` env var.
+    /// Optional EVM treasury address override; falls back to the configured PM treasury env vars.
     #[serde(default)]
     pub vault_address: String,
 }
@@ -98,7 +97,7 @@ pub async fn submit_public_claim(
 
     // 5. Ensure relayer is configured.
     let relayer = state.prediction_market_relayer.as_ref().ok_or_else(|| {
-        ClobError::ServiceUnavailable("PM relayer not configured — set PM_USDC_VAULT_ADDRESS or PREDICTION_MARKET_VAULT_ADDRESS, plus HORIZEN_RPC_URL and EVM_OPERATOR_PRIVATE_KEY".to_string())
+        ClobError::ServiceUnavailable("PM relayer not configured — set PM_USDC_TREASURY_ADDRESS or PREDICTION_MARKET_TREASURY_ADDRESS, plus HORIZEN_RPC_URL and EVM_OPERATOR_PRIVATE_KEY (vault aliases still work)".to_string())
     })?;
 
     let vault_override = if req.vault_address.trim().is_empty() {
@@ -135,4 +134,98 @@ pub async fn submit_public_claim(
 
     // 8. Return tx hash.
     Ok(Json(PermissionlessClaimResponse { tx_hash, nullifier }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{privacy::PrivacyStateService, redis_store::RedisStore, AppState};
+    use axum::{extract::State, Json};
+    use mini_redis::server;
+    use std::sync::Arc;
+    use tokio::sync::oneshot;
+
+    async fn setup_claim_state(
+    ) -> (
+        Arc<AppState>,
+        Arc<PrivacyStateService>,
+        oneshot::Sender<()>,
+    ) {
+        std::env::set_var("REDIS_COMPAT_DISABLE_SET_NX", "true");
+        std::env::set_var("REDIS_COMPAT_DISABLE_EXISTS", "true");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let _ = server::run(listener, async { let _ = rx.await; }).await;
+        });
+
+        let client = redis::Client::open(format!("redis://{}/", addr)).unwrap();
+        let conn = redis::aio::ConnectionManager::new(client).await.unwrap();
+        let store = Arc::new(RedisStore::new(conn));
+        let privacy_state = Arc::new(PrivacyStateService::new(store.clone()));
+        let state = AppState::for_test(store, privacy_state.clone(), None).await;
+
+        (state, privacy_state, tx)
+    }
+
+    fn bytes32(seed: &str) -> String {
+        format!("0x{:0>64}", seed)
+    }
+
+    fn make_claim_request(nullifier: String) -> PermissionlessClaimRequest {
+        PermissionlessClaimRequest {
+            recipient: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+            proof_hex: "0xdeadbeef".to_string(),
+            public_inputs: vec![
+                bytes32("1"),
+                bytes32("2"),
+                bytes32("3"),
+                bytes32("4"),
+                bytes32("5"),
+                nullifier,
+                bytes32("7"),
+            ],
+            vault_address: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_public_claim_rejects_spent_nullifier() {
+        let (state, privacy_state, shutdown) = setup_claim_state().await;
+        let nullifier = bytes32("99");
+        privacy_state
+            .register_nullifier(nullifier.clone(), String::new(), "tx-ref".to_string())
+            .await
+            .unwrap();
+
+        match submit_public_claim(State(state), Json(make_claim_request(nullifier.clone()))).await {
+            Err(ClobError::Conflict(message)) => {
+                assert!(message.contains(&nullifier));
+            }
+            Err(other) => panic!("expected nullifier replay rejection, got {other:?}"),
+            Ok(_) => panic!("expected nullifier replay rejection"),
+        }
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_public_claim_without_relayer_keeps_nullifier_unspent() {
+        let (state, privacy_state, shutdown) = setup_claim_state().await;
+        let nullifier = bytes32("123");
+
+        match submit_public_claim(State(state), Json(make_claim_request(nullifier.clone()))).await {
+            Err(ClobError::ServiceUnavailable(message)) => {
+                assert!(message.contains("PM relayer not configured"));
+            }
+            Err(other) => panic!("expected relayer configuration error, got {other:?}"),
+            Ok(_) => panic!("expected relayer configuration error"),
+        }
+        assert!(!privacy_state.nullifier_exists(&nullifier).await.unwrap());
+
+        let _ = shutdown.send(());
+    }
 }

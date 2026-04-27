@@ -217,10 +217,10 @@ impl WithdrawalService {
 
         let vault_address = self
             .relayer
-            .vault_address_for_token(token)
+            .treasury_address_for_token(token)
             .ok_or_else(|| ClobError::Internal(format!(
                 "No vault address configured for token {token} \
-                 (set PM_USDC_VAULT_ADDRESS, PM_ZEN_VAULT_ADDRESS, or PRIVACY_WETH_VAULT_ADDRESS as appropriate)"
+                  (set PM_USDC_TREASURY_ADDRESS, PM_ZEN_TREASURY_ADDRESS, or PRIVACY_WETH_VAULT_ADDRESS as appropriate; vault aliases still work)"
             )))?;
 
         let tx_hash = self
@@ -319,8 +319,8 @@ mod tests {
                 chain_id: 1337,
                 private_key: "0x0000000000000000000000000000000000000000000000000000000000000001"
                     .to_string(),
-                pm_usdc_vault_address: None,
-                pm_zen_vault_address: None,
+                pm_usdc_treasury_address: None,
+                pm_zen_treasury_address: None,
                 privacy_weth_vault_address: None,
             },
         });

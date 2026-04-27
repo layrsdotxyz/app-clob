@@ -17,8 +17,8 @@ pub struct PredictionMarketClaimJob {
     pub last_error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    /// EVM vault contract address to route the claimWinnings call to.
-    /// Falls back to PM_VAULT_ADDRESS env var when empty.
+    /// EVM treasury contract address to route the claimWinnings call to.
+    /// Falls back to the configured PM treasury env vars when empty.
     #[serde(default)]
     pub vault_address: String,
 }

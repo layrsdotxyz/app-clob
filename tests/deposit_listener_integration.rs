@@ -99,8 +99,11 @@ async fn test_get_recent_deposit_events() {
         .or_else(|_| std::env::var("EVM_RPC_URL"))
         .or_else(|_| std::env::var("RPC_URL"))
         .expect("HORIZEN_RPC_URL not set");
-    let vault_addr = std::env::var("PREDICTION_MARKET_VAULT_ADDRESS")
-        .expect("PREDICTION_MARKET_VAULT_ADDRESS not set");
+    let vault_addr = std::env::var("PREDICTION_MARKET_TREASURY_ADDRESS")
+        .or_else(|_| std::env::var("PM_TREASURY_ADDRESS"))
+        .or_else(|_| std::env::var("PM_USDC_TREASURY_ADDRESS"))
+        .or_else(|_| std::env::var("PREDICTION_MARKET_VAULT_ADDRESS"))
+        .expect("PREDICTION_MARKET_TREASURY_ADDRESS (or legacy VAULT_ADDRESS) not set");
 
     let client = reqwest::Client::new();
 

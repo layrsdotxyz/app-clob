@@ -410,13 +410,22 @@ impl Database {
 
     // ==================== Order persistence ====================
 
+    async fn resolve_user_uuid(&self, user_id: &str) -> ClobResult<Uuid> {
+        if let Ok(uuid) = Uuid::parse_str(user_id) {
+            return Ok(uuid);
+        }
+
+        let resolved = self.get_or_create_user_id_by_wallet(user_id).await?;
+        Uuid::parse_str(&resolved)
+            .map_err(|e| ClobError::Internal(format!("invalid uuid from db: {}", e)))
+    }
+
     /// Insert or update an order row.
     pub async fn upsert_order(&self, order: &Order) -> ClobResult<()> {
         let status_str = format!("{:?}", order.status).to_lowercase();
         let side_str = format!("{:?}", order.side).to_lowercase();
-        let type_str = format!("{:?}", order.order_type).to_lowercase();
 
-        let user_uuid = Uuid::parse_str(&order.user_id).unwrap_or_else(|_| Uuid::new_v4());
+        let user_uuid = self.resolve_user_uuid(&order.user_id).await?;
 
         sqlx::query(
             "INSERT INTO orders
@@ -431,9 +440,9 @@ impl Database {
         .bind(order.id.to_string())
         .bind(user_uuid)
         .bind(&order.market_id)
-        .bind(format!("{}-{}", side_str, type_str))
+        .bind(side_str)
         .bind(order.price)
-        .bind(order.size)
+        .bind(order.remaining)
         .bind(status_str)
         .bind(order.created_at.naive_utc())
         .bind(order.updated_at.naive_utc())

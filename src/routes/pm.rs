@@ -15,7 +15,7 @@ use ethers::types::Address;
 
 use crate::{
     error::{ClobError, ClobResult},
-    models::{NoteLockRecord, NoteLockStatus, Order, Trade},
+    models::{NoteLockRecord, NoteLockStatus, Order, TimeInForce, Trade},
     pm_claim_worker::claim_input_key,
     prediction_market_claims::{PredictionMarketClaimJob, PM_CLAIM_QUEUE},
     proof_generation::{HonkProof, low_high_hex_to_bytes32, parse_u128_hex},
@@ -55,8 +55,8 @@ pub struct LockCollateralRequest {
     /// Unix timestamp after which the on-chain commitment expires (-1 = no expiry).
     #[serde(default = "default_commitment_expiry")]
     pub commitment_expiry_ts: i64,
-    /// Optional: EVM vault contract address. Routes to the correct vault.
-    /// Falls back to PM_VAULT_ADDRESS env var if absent or empty.
+    /// Optional: EVM treasury contract address. Routes to the correct treasury.
+    /// Falls back to the configured PM treasury env vars if absent or empty.
     #[serde(default)]
     pub vault_address: String,
 }
@@ -72,7 +72,7 @@ pub struct UnlockCollateralRequest {
     pub order_commitment_high: String,
     /// The user who owns this lock (required to update the index).
     pub user_id: String,
-    /// Optional: EVM vault contract address. Routes to the correct vault.
+    /// Optional: EVM treasury contract address. Routes to the correct treasury.
     #[serde(default)]
     pub vault_address: String,
 }
@@ -91,9 +91,9 @@ pub struct SettleFillRequest {
     pub position_payout_units_low: String,
     pub trade_fee_amount_low: String,
     pub proof: ProofPayload,
-    /// Optional: EVM vault contract address (from the order's vault_address field).
-    /// Routes settlement to the correct on-chain vault.
-    /// Falls back to PM_VAULT_ADDRESS env var if absent or empty.
+    /// Optional: EVM treasury contract address (from the order's compatibility field).
+    /// Routes settlement to the correct on-chain treasury.
+    /// Falls back to the configured PM treasury env vars if absent or empty.
     #[serde(default)]
     pub vault_address: String,
 }
@@ -103,8 +103,8 @@ pub struct ClaimWinningsRequest {
     /// EVM address of the recipient (hex, with 0x prefix).
     pub recipient: String,
     pub proof: ProofPayload,
-    /// Optional: EVM vault contract address. Routes claim to the correct vault.
-    /// Falls back to PM_VAULT_ADDRESS env var if absent or empty.
+    /// Optional: EVM treasury contract address. Routes claim to the correct treasury.
+    /// Falls back to the configured PM treasury env vars if absent or empty.
     #[serde(default)]
     pub vault_address: String,
 }
@@ -116,8 +116,8 @@ pub struct SubmitClaimRequest {
     pub outcome: u8,
     pub amount: String,
     pub proof_input: Value,
-    /// Optional: EVM vault contract address to route the on-chain claim to.
-    /// Falls back to PM_VAULT_ADDRESS env var if absent or empty.
+    /// Optional: EVM treasury contract address to route the on-chain claim to.
+    /// Falls back to the configured PM treasury env vars if absent or empty.
     #[serde(default)]
     pub vault_address: String,
 }
@@ -179,14 +179,14 @@ pub async fn lock_collateral(
 
     let relayer = get_relayer(&state)?;
     let proof: HonkProof = req.proof.into();
-    let vault_override = vault_override_opt(&req.vault_address);
+    let treasury_override = treasury_override_opt(&req.vault_address);
     let tx_hash = relayer
         .lock_collateral(
             low_high_hex_to_bytes32(&req.order_commitment_low, "0x0")?,
             parse_u128_hex(&req.required_amount_low, "required_amount")?.into(),
             req.lock_expiry_ts,
             &proof,
-            vault_override,
+            treasury_override,
         )
         .await?;
 
@@ -219,12 +219,12 @@ pub async fn unlock_collateral(
     Json(req): Json<UnlockCollateralRequest>,
 ) -> ClobResult<impl IntoResponse> {
     let relayer = get_relayer(&state)?;
-    let vault_override = vault_override_opt(&req.vault_address);
+    let treasury_override = treasury_override_opt(&req.vault_address);
     let tx_hash = relayer
         .unlock_collateral(
             low_high_hex_to_bytes32(&req.note_nullifier_low, &req.note_nullifier_high)?,
             low_high_hex_to_bytes32(&req.order_commitment_low, &req.order_commitment_high)?,
-            vault_override,
+            treasury_override,
         )
         .await?;
 
@@ -249,7 +249,7 @@ pub async fn settle_fill(
 ) -> ClobResult<impl IntoResponse> {
     let relayer = get_relayer(&state)?;
     let proof: HonkProof = req.proof.into();
-    let vault_override = vault_override_opt(&req.vault_address);
+    let treasury_override = treasury_override_opt(&req.vault_address);
     let tx_hash = relayer
         .settle_fill(
             req.market_id,
@@ -259,7 +259,7 @@ pub async fn settle_fill(
             parse_u128_hex(&req.position_payout_units_low, "position_payout_units")?,
             parse_u128_hex(&req.trade_fee_amount_low, "trade_fee_amount")?,
             &proof,
-            vault_override,
+            treasury_override,
         )
         .await?;
 
@@ -287,9 +287,9 @@ pub async fn claim_winnings(
     let recipient: Address = req.recipient.parse()
         .map_err(|e| ClobError::InvalidOrder(format!("invalid recipient address: {e}")))?;
     let proof: HonkProof = req.proof.into();
-    let vault_override = vault_override_opt(&req.vault_address);
+    let treasury_override = treasury_override_opt(&req.vault_address);
     let tx_hash = relayer
-        .claim_winnings(recipient, &proof, vault_override)
+        .claim_winnings(recipient, &proof, treasury_override)
         .await?;
     Ok(Json(RelayTxResponse { tx_hash }))
 }
@@ -381,6 +381,7 @@ pub async fn get_private_index(
         .get_user_orders(&user_id)
         .await?
         .into_iter()
+        .filter(|order| order.time_in_force == TimeInForce::Gtc && order.is_active())
         .filter(|order| market_filter.map(|market_id| order.market_id == market_id).unwrap_or(true))
         .take(limit)
         .collect::<Vec<_>>();
@@ -451,9 +452,9 @@ fn get_relayer(state: &AppState) -> ClobResult<Arc<crate::prediction_market_rela
         .ok_or_else(|| ClobError::Internal("prediction market relayer is not configured".to_string()))
 }
 
-/// Returns `Some(addr)` when `vault_address` is non-empty, else `None` so the
-/// relayer falls back to the configured default.
-fn vault_override_opt(vault_address: &str) -> Option<&str> {
+/// Returns `Some(addr)` when the compatibility address field is non-empty, else
+/// `None` so the relayer falls back to the configured treasury default.
+fn treasury_override_opt(vault_address: &str) -> Option<&str> {
     let trimmed = vault_address.trim();
     if trimmed.is_empty() { None } else { Some(trimmed) }
 }

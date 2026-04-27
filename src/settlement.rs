@@ -10,8 +10,21 @@ use crate::{
     redis_store::RedisStore,
 };
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
+
+const TRADE_PERSIST_QUEUE_PENDING: &str = "trade:persist:queue:pending";
+const TRADE_PERSIST_QUEUE_RETRY: &str = "trade:persist:queue:retry";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TradePersistenceJob {
+    trade: Trade,
+    maker_fill: Fill,
+    taker_fill: Fill,
+    attempt: u32,
+}
 
 /// Return an 8-character keccak256-based alias for a user ID.
 ///
@@ -111,24 +124,20 @@ impl SettlementEngine {
         // Save trade to Redis (primary fast path)
         self.store.save_trade(trade).await?;
 
-        // Update market stats
-        self.store.update_market_stats(trade).await?;
-
-        // Persist trade + fills to PostgreSQL (write-behind; log on failure, never abort trade)
-        if let Some(db) = &self.database {
-            if let Err(e) = db.save_trade(trade).await {
-                tracing::error!(trade_id = %trade.id, error = %e, "Failed to persist trade to DB");
-            }
-            if let Err(e) = db.save_fill(maker_fill).await {
-                tracing::error!(fill_id = %maker_fill.id, error = %e, "Failed to persist maker fill to DB");
-            }
-            if let Err(e) = db.save_fill(taker_fill).await {
-                tracing::error!(fill_id = %taker_fill.id, error = %e, "Failed to persist taker fill to DB");
-            }
+        if let Err(error) = self.update_balances_for_trade(trade, maker_fill, taker_fill).await {
+            let _ = self.store.delete_trade(trade).await;
+            return Err(error);
         }
 
-        // Update user balances
-        self.update_balances_for_trade(trade, maker_fill, taker_fill).await?;
+        if let Err(error) = self.enqueue_trade_persistence(trade, maker_fill, taker_fill).await {
+            let _ = self.rollback_trade(trade).await;
+            let _ = self.store.delete_trade(trade).await;
+            return Err(error);
+        }
+
+        if let Err(error) = self.store.update_market_stats(trade).await {
+            tracing::error!(trade_id = %trade.id, error = %error, "Failed to update market stats after trade settlement");
+        }
 
         tracing::info!(
             trade_id = %trade.id,
@@ -142,12 +151,92 @@ impl SettlementEngine {
         Ok(())
     }
 
+    pub fn start_trade_persistence_worker(self: Arc<Self>) -> Option<JoinHandle<()>> {
+        self.database.as_ref()?;
+
+        Some(tokio::spawn(async move {
+            loop {
+                let payload = match self.store.pop_queue(TRADE_PERSIST_QUEUE_RETRY).await {
+                    Ok(Some(payload)) => Some(payload),
+                    Ok(None) => match self.store.pop_queue(TRADE_PERSIST_QUEUE_PENDING).await {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            tracing::error!(error = %error, "Trade persistence worker failed to pop pending queue entry");
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            continue;
+                        }
+                    },
+                    Err(error) => {
+                        tracing::error!(error = %error, "Trade persistence worker failed to pop retry queue entry");
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        continue;
+                    }
+                };
+
+                let Some(payload) = payload else {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                    continue;
+                };
+
+                let mut job: TradePersistenceJob = match serde_json::from_str(&payload) {
+                    Ok(job) => job,
+                    Err(error) => {
+                        tracing::error!(error = %error, payload = %payload, "Trade persistence worker received invalid payload");
+                        continue;
+                    }
+                };
+
+                match self.persist_trade_bundle(&job).await {
+                    Ok(()) => {
+                        tracing::debug!(trade_id = %job.trade.id, attempt = job.attempt, "Trade persistence worker flushed trade + fills to DB");
+                    }
+                    Err(error) => {
+                        job.attempt += 1;
+                        let backoff_ms = 250u64.saturating_mul(1u64 << job.attempt.min(5));
+                        tracing::warn!(
+                            trade_id = %job.trade.id,
+                            attempt = job.attempt,
+                            backoff_ms,
+                            error = %error,
+                            "Trade persistence worker failed, requeueing"
+                        );
+
+                        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+
+                        match serde_json::to_string(&job) {
+                            Ok(retry_payload) => {
+                                if let Err(queue_error) = self
+                                    .store
+                                    .push_queue(TRADE_PERSIST_QUEUE_RETRY, &retry_payload)
+                                    .await
+                                {
+                                    tracing::error!(
+                                        trade_id = %job.trade.id,
+                                        error = %queue_error,
+                                        "Trade persistence worker failed to requeue payload"
+                                    );
+                                }
+                            }
+                            Err(serialize_error) => {
+                                tracing::error!(
+                                    trade_id = %job.trade.id,
+                                    error = %serialize_error,
+                                    "Trade persistence worker failed to serialize retry payload"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+    }
+
     /// Rollback a trade (used for FOK cancellation — credits both sides back).
     pub async fn rollback_trade(&self, trade: &Trade) -> ClobResult<()> {
         let maker_cost = trade.price * trade.size * (Decimal::ONE + Decimal::from(self.maker_fee_bps) / Decimal::from(10_000));
         let taker_cost = trade.price * trade.size * (Decimal::ONE + Decimal::from(self.taker_fee_bps) / Decimal::from(10_000));
-        self.balance_service.credit(&trade.maker_user_id, &trade.market_id, maker_cost);
-        self.balance_service.credit(&trade.taker_user_id, &trade.market_id, taker_cost);
+        self.balance_service.credit(&trade.maker_user_id, "USDC", maker_cost);
+        self.balance_service.credit(&trade.taker_user_id, "USDC", taker_cost);
         tracing::debug!(
             trade_id = %trade.id,
             maker_alias = %user_alias(&trade.maker_user_id),
@@ -225,7 +314,11 @@ impl SettlementEngine {
             "waiting_for_proof"
         };
 
-        let vault_address = std::env::var("PM_VAULT_ADDRESS").unwrap_or_default();
+        let vault_address = std::env::var("PM_TREASURY_ADDRESS")
+            .or_else(|_| std::env::var("PREDICTION_MARKET_TREASURY_ADDRESS"))
+            .or_else(|_| std::env::var("PM_VAULT_ADDRESS"))
+            .or_else(|_| std::env::var("PREDICTION_MARKET_VAULT_ADDRESS"))
+            .unwrap_or_default();
 
         let maker_leg = PredictionMarketSettlementLeg {
             leg_role: "maker".to_string(),
@@ -368,6 +461,39 @@ impl SettlementEngine {
         self.balance_service.release_balance(user_id, "USDC", amount)
     }
 
+    async fn enqueue_trade_persistence(
+        &self,
+        trade: &Trade,
+        maker_fill: &Fill,
+        taker_fill: &Fill,
+    ) -> ClobResult<()> {
+        if self.database.is_none() {
+            return Ok(());
+        }
+
+        let payload = serde_json::to_string(&TradePersistenceJob {
+            trade: trade.clone(),
+            maker_fill: maker_fill.clone(),
+            taker_fill: taker_fill.clone(),
+            attempt: 0,
+        })?;
+
+        self.store
+            .push_queue(TRADE_PERSIST_QUEUE_PENDING, &payload)
+            .await
+    }
+
+    async fn persist_trade_bundle(&self, job: &TradePersistenceJob) -> ClobResult<()> {
+        let Some(db) = &self.database else {
+            return Ok(());
+        };
+
+        db.save_trade(&job.trade).await?;
+        db.save_fill(&job.maker_fill).await?;
+        db.save_fill(&job.taker_fill).await?;
+        Ok(())
+    }
+
     async fn update_balances_for_trade(
         &self,
         trade: &Trade,
@@ -390,5 +516,129 @@ impl SettlementEngine {
             "Balances updated for trade"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mini_redis::server;
+    use rust_decimal_macros::dec;
+    use tokio::sync::oneshot;
+
+    async fn setup_settlement_engine(
+        maker_fee_bps: u16,
+        taker_fee_bps: u16,
+    ) -> (SettlementEngine, Arc<BalanceService>, oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let _ = server::run(listener, async { let _ = rx.await; }).await;
+        });
+
+        let client = redis::Client::open(format!("redis://{}/", addr)).unwrap();
+        let conn = redis::aio::ConnectionManager::new(client).await.unwrap();
+        let store = Arc::new(RedisStore::new(conn));
+        let balance_service = Arc::new(BalanceService::new(None));
+        let engine = SettlementEngine::new(
+            store,
+            None,
+            maker_fee_bps,
+            taker_fee_bps,
+            balance_service.clone(),
+        );
+
+        (engine, balance_service, tx)
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_check_balance_reserves_notional_plus_taker_fee() {
+        let (engine, balances, shutdown) = setup_settlement_engine(0, 20).await;
+        balances.deposit("alice", "USDC", dec!(1000));
+
+        let order = Order::new(
+            "alice".to_string(),
+            "BTC-1H".to_string(),
+            OrderSide::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            dec!(0.50),
+            dec!(100),
+        );
+
+        engine.check_balance("alice", "BTC-1H", &order).await.unwrap();
+
+        assert_eq!(balances.get_total_balance("alice", "USDC"), dec!(1000));
+        assert_eq!(balances.get_reserved_balance("alice", "USDC"), dec!(50.1));
+        assert_eq!(balances.get_available_balance("alice", "USDC"), dec!(949.9));
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_release_order_balance_uses_remaining_size_only() {
+        let (engine, balances, shutdown) = setup_settlement_engine(0, 0).await;
+        balances.deposit("alice", "USDC", dec!(1000));
+
+        let mut order = Order::new(
+            "alice".to_string(),
+            "BTC-1H".to_string(),
+            OrderSide::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            dec!(1),
+            dec!(100),
+        );
+
+        engine.check_balance("alice", "BTC-1H", &order).await.unwrap();
+        order.filled = dec!(40);
+        order.remaining = dec!(60);
+
+        engine.release_order_balance(&order).await.unwrap();
+
+        assert_eq!(balances.get_total_balance("alice", "USDC"), dec!(1000));
+        assert_eq!(balances.get_reserved_balance("alice", "USDC"), dec!(40));
+        assert_eq!(balances.get_available_balance("alice", "USDC"), dec!(960));
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_fok_rollback_recredits_both_sides() {
+        let (engine, balances, shutdown) = setup_settlement_engine(0, 0).await;
+        balances.deposit("maker", "USDC", dec!(1000));
+        balances.deposit("taker", "USDC", dec!(1000));
+        balances.reserve_balance("maker", "USDC", dec!(50)).unwrap();
+        balances.reserve_balance("taker", "USDC", dec!(50)).unwrap();
+        balances.debit("maker", "USDC", dec!(50)).unwrap();
+        balances.debit("taker", "USDC", dec!(50)).unwrap();
+
+        let trade = Trade {
+            id: Uuid::new_v4(),
+            market_id: "BTC-1H".to_string(),
+            maker_order_id: Uuid::new_v4(),
+            taker_order_id: Uuid::new_v4(),
+            maker_user_id: "maker".to_string(),
+            taker_user_id: "taker".to_string(),
+            side: OrderSide::Buy,
+            price: dec!(1),
+            size: dec!(50),
+            timestamp: chrono::Utc::now(),
+            maker_address: None,
+            taker_address: None,
+            market_id_uint: None,
+            settlement_tx: None,
+        };
+
+        engine.rollback_trade(&trade).await.unwrap();
+
+        assert_eq!(balances.get_total_balance("maker", "USDC"), dec!(1000));
+        assert_eq!(balances.get_total_balance("taker", "USDC"), dec!(1000));
+        assert_eq!(balances.get_reserved_balance("maker", "USDC"), dec!(0));
+        assert_eq!(balances.get_reserved_balance("taker", "USDC"), dec!(0));
+
+        let _ = shutdown.send(());
     }
 }

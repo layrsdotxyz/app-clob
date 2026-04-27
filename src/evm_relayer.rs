@@ -39,10 +39,10 @@ pub struct EvmRelayerConfig {
     pub chain_id: u64,
     /// Operator/relayer private key (hex, with or without 0x prefix).
     pub private_key: String,
-    /// PM USDC vault address.
-    pub pm_usdc_vault_address: Option<String>,
-    /// PM ZEN vault address.
-    pub pm_zen_vault_address: Option<String>,
+    /// PM USDC treasury address.
+    pub pm_usdc_treasury_address: Option<String>,
+    /// PM ZEN treasury address.
+    pub pm_zen_treasury_address: Option<String>,
     /// PrivacyVaultWeth address.
     pub privacy_weth_vault_address: Option<String>,
 }
@@ -64,17 +64,25 @@ impl EvmRelayerConfig {
             rpc_url,
             chain_id,
             private_key,
-            pm_usdc_vault_address: first_env(&[
+            pm_usdc_treasury_address: first_env(&[
+                "PM_USDC_TREASURY_ADDRESS",
+                "PREDICTION_MARKET_TREASURY_ADDRESS",
+                "PM_TREASURY_ADDRESS",
                 "PM_USDC_VAULT_ADDRESS",
                 "PREDICTION_MARKET_VAULT_ADDRESS",
                 "PM_VAULT_ADDRESS",
             ]),
-            pm_zen_vault_address: first_env(&[
+            pm_zen_treasury_address: first_env(&[
+                "PM_ZEN_TREASURY_ADDRESS",
+                "ZEN_PM_TREASURY_ADDRESS",
+                "ZEN_TREASURY_ADDRESS",
                 "PM_ZEN_VAULT_ADDRESS",
                 "ZEN_PM_VAULT_ADDRESS",
                 "ZEN_VAULT_ADDRESS",
             ]),
             privacy_weth_vault_address: first_env(&[
+                "PRIVACY_WETH_TREASURY_ADDRESS",
+                "LP_TREASURY_ADDRESS",
                 "PRIVACY_WETH_VAULT_ADDRESS",
                 "WETH_VAULT_ADDRESS",
                 "LP_VAULT_ADDRESS",
@@ -141,24 +149,24 @@ impl EvmRelayer {
         }
     }
 
-    pub fn vault_address(&self) -> Option<Address> {
-        self.config.pm_usdc_vault_address.as_deref()?.parse().ok()
+    pub fn treasury_address(&self) -> Option<Address> {
+        self.config.pm_usdc_treasury_address.as_deref()?.parse().ok()
     }
 
-    /// Resolve the vault address by token symbol.
+    /// Resolve the treasury address by token symbol.
     /// PM is restricted to USDC and ZEN; WETH resolves only through PrivacyVaultWeth.
-    pub fn vault_address_for_token(&self, token: &str) -> Option<String> {
+    pub fn treasury_address_for_token(&self, token: &str) -> Option<String> {
         match token.to_uppercase().as_str() {
-            "USDC" => self.config.pm_usdc_vault_address.clone(),
-            "ZEN" => self.config.pm_zen_vault_address.clone(),
+            "USDC" => self.config.pm_usdc_treasury_address.clone(),
+            "ZEN" => self.config.pm_zen_treasury_address.clone(),
             "WETH" | "ETH" => self.config.privacy_weth_vault_address.clone(),
             _ => None,
         }
     }
 
-    /// Submit a `withdrawWithProof` transaction to the PrivacyVault contract.
+    /// Submit a `withdrawWithProof` transaction to the PrivacyVault / PM treasury contract.
     ///
-    /// `vault_address_hex` — the deployed PrivacyVault/PredictionMarketVault address.
+    /// `vault_address_hex` — the deployed PrivacyVault or PredictionMarketTreasury address.
     /// `proof_output_json` — prover worker output with `proof_format: "ultra_honk"`,
     ///   `proof_hex`, and `public_inputs` (10 entries for vault_spend circuit).
     ///

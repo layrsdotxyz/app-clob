@@ -1,6 +1,6 @@
 /// Prediction market on-chain relayer — EVM edition.
 ///
-/// Encodes and submits calls to `PredictionMarketVault.sol` on Horizen EVM.
+/// Encodes and submits calls to `PredictionMarketTreasury.sol` on Horizen EVM.
 /// Proof format: UltraHonk flat `bytes` proof + `bytes32[]` public inputs.
 use std::sync::Arc;
 
@@ -18,36 +18,36 @@ use crate::{
 
 pub struct PredictionMarketRelayer {
     relayer: Arc<EvmRelayer>,
-    /// Default PM USDC vault address.
-    vault_addr: Address,
+    /// Default PM USDC treasury address.
+    treasury_addr: Address,
 }
 
 impl PredictionMarketRelayer {
-    pub fn from_env(_vault_address: Option<String>) -> Option<Self> {
+    pub fn from_env(_treasury_address: Option<String>) -> Option<Self> {
         let relayer = EvmRelayer::from_env()?;
-        let vault_addr = relayer.vault_address()?;
+        let treasury_addr = relayer.treasury_address()?;
         Some(Self {
             relayer: Arc::new(relayer),
-            vault_addr,
+            treasury_addr,
         })
     }
 
-    pub fn vault_address(&self) -> String {
-        format!("{:?}", self.vault_addr)
+    pub fn treasury_address(&self) -> String {
+        format!("{:?}", self.treasury_addr)
     }
 
-    /// Resolve the effective vault address to use for a call.
+    /// Resolve the effective treasury address to use for a call.
     ///
     /// 1. If `override_addr` is a non-empty, valid EVM address, use it.
-    /// 2. Otherwise fall back to `self.vault_addr` (from env).
-    fn effective_vault(&self, override_addr: Option<&str>) -> ClobResult<Address> {
+    /// 2. Otherwise fall back to `self.treasury_addr` (from env).
+    fn effective_treasury(&self, override_addr: Option<&str>) -> ClobResult<Address> {
         if let Some(addr_str) = override_addr.filter(|s| !s.trim().is_empty()) {
             addr_str
                 .trim()
                 .parse::<Address>()
-                .map_err(|e| ClobError::Internal(format!("invalid vault_address '{}': {}", addr_str, e)))
+                .map_err(|e| ClobError::Internal(format!("invalid treasury override '{}': {}", addr_str, e)))
         } else {
-            Ok(self.vault_addr)
+            Ok(self.treasury_addr)
         }
     }
 
@@ -65,7 +65,7 @@ impl PredictionMarketRelayer {
         proof: &HonkProof,
         vault_address_override: Option<&str>,
     ) -> ClobResult<String> {
-        let vault = self.effective_vault(vault_address_override)?;
+        let vault = self.effective_treasury(vault_address_override)?;
         let selector = &ethers::utils::keccak256(
             b"lockCollateral(bytes32,uint256,uint64,bytes,bytes32[6])",
         )[..4];
@@ -85,7 +85,7 @@ impl PredictionMarketRelayer {
         order_commitment: [u8; 32],
         vault_address_override: Option<&str>,
     ) -> ClobResult<String> {
-        let vault = self.effective_vault(vault_address_override)?;
+        let vault = self.effective_treasury(vault_address_override)?;
         let selector = &ethers::utils::keccak256(b"unlockCollateral(bytes32,bytes32)")[..4];
         let tokens = vec![
             Token::FixedBytes(note_nullifier.to_vec()),
@@ -101,8 +101,8 @@ impl PredictionMarketRelayer {
     //               uint128 tradeFeeAmount,
     //               bytes proof, bytes32[4] inputs)
     //
-    // `vault_address_override`: read from the order's `vault_address` field.
-    // Falls back to PM_VAULT_ADDRESS if empty.
+    // `vault_address_override`: read from the order's compatibility field.
+    // Falls back to the configured PM treasury if empty.
     pub async fn settle_fill(
         &self,
         market_id: u64,
@@ -114,7 +114,7 @@ impl PredictionMarketRelayer {
         proof: &HonkProof,
         vault_address_override: Option<&str>,
     ) -> ClobResult<String> {
-        let vault = self.effective_vault(vault_address_override)?;
+        let vault = self.effective_treasury(vault_address_override)?;
         let selector = &ethers::utils::keccak256(
             b"settleFill(uint64,bool,bytes32,uint128,uint128,uint128,bytes,bytes32[4])",
         )[..4];
@@ -142,14 +142,14 @@ impl PredictionMarketRelayer {
     //                   bytes proof, bytes32[7] inputs)
     //
     // `vault_address_override`: read from the claim request body.
-    // Falls back to PM_VAULT_ADDRESS if empty.
+    // Falls back to the configured PM treasury if empty.
     pub async fn claim_winnings(
         &self,
         recipient: Address,
         proof: &HonkProof,
         vault_address_override: Option<&str>,
     ) -> ClobResult<String> {
-        let vault = self.effective_vault(vault_address_override)?;
+        let vault = self.effective_treasury(vault_address_override)?;
         let selector = &ethers::utils::keccak256(
             b"claimWinnings(address,bytes,bytes32[7])",
         )[..4];

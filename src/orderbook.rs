@@ -32,11 +32,18 @@ impl OrderBookManager {
         }
     }
 
+    pub async fn persist_order_snapshot(&self, order: &Order) -> ClobResult<()> {
+        self.store.save_order(order).await?;
+
+        if let Some(db) = &self.database {
+            db.upsert_order(order).await?;
+        }
+
+        Ok(())
+    }
+
     /// Add order to the order book
     pub async fn add_order(&self, order: &Order) -> ClobResult<()> {
-        // Save order to Redis
-        self.store.save_order(order).await?;
-        
         // Add to order book sorted set
         self.store.add_to_orderbook(&order.market_id, order).await?;
 
@@ -46,13 +53,6 @@ impl OrderBookManager {
         // Mark market as active
         self.active_markets.insert(order.market_id.clone(), true);
         
-        // Persist to PostgreSQL (write-behind; log failure, don't abort)
-        if let Some(db) = &self.database {
-            if let Err(e) = db.upsert_order(order).await {
-                tracing::error!(order_id = %order.id, error = %e, "Failed to persist order to DB");
-            }
-        }
-
         // Update metrics
         self.metrics.record_order_added(&order.market_id, &order.side);
         
@@ -82,19 +82,6 @@ impl OrderBookManager {
 
         // Reduce open interest by the unfilled amount
         self.store.decrement_open_interest(&order.market_id, order.remaining).await?;
-        
-        // Delete order from Redis
-        self.store.delete_order(order_id, &order.user_id).await?;
-
-        // Persist cancellation to DB
-        if let Some(db) = &self.database {
-            if let Err(e) = db
-                .update_order_status(order_id, &OrderStatus::Cancelled, order.filled, Decimal::ZERO)
-                .await
-            {
-                tracing::error!(order_id = %order_id, error = %e, "Failed to persist order cancellation to DB");
-            }
-        }
 
         // Update metrics
         self.metrics.record_order_removed(&order.market_id, &order.side);
@@ -166,6 +153,7 @@ impl OrderBookManager {
             .get_order(order_id)
             .await?
             .ok_or_else(|| ClobError::OrderNotFound(order_id.to_string()))?;
+        let previous_order = order.clone();
         
         order.filled += filled_size;
         order.remaining -= filled_size;
@@ -195,13 +183,26 @@ impl OrderBookManager {
         // Save updated order
         self.store.save_order(&order).await?;
 
-        // Persist updated status to DB (write-behind)
+        // Persist updated status to DB, restoring the orderbook snapshot if the
+        // durable write fails.
         if let Some(db) = &self.database {
-            if let Err(e) = db
-                .update_order_status(order_id, &order.status, order.filled, order.remaining)
-                .await
-            {
-                tracing::error!(order_id = %order_id, error = %e, "Failed to persist order status update to DB");
+            if let Err(e) = db.upsert_order(&order).await {
+                let _ = self.store.save_order(&previous_order).await;
+                let _ = self.store.increment_open_interest(&previous_order.market_id, filled_size).await;
+
+                if order.remaining > Decimal::ZERO {
+                    let _ = self
+                        .store
+                        .remove_from_orderbook(&order.market_id, order_id, order.side.clone())
+                        .await;
+                }
+
+                let _ = self
+                    .store
+                    .add_to_orderbook(&previous_order.market_id, &previous_order)
+                    .await;
+
+                return Err(e);
             }
         }
         

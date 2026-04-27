@@ -124,13 +124,28 @@ impl MatchingEngine {
         self.settlement
             .check_balance(&order.user_id, &order.market_id, &order)
             .await?;
+
+        // Persist the initial order snapshot before matching so immediate fills,
+        // IOC/FOK outcomes, and later status transitions always have a durable DB row.
+        self.orderbook.persist_order_snapshot(&order).await?;
         
         // Get market lock
         let lock = self.get_market_lock(&order.market_id);
         let _guard = lock.write().await;
+
+        if order.time_in_force == TimeInForce::Fok && !self.can_fully_fill(&order).await? {
+            order.status = OrderStatus::Rejected;
+            order.updated_at = Utc::now();
+            self.settlement.release_order_balance(&order).await?;
+            self.unlock_note_for_order(&order).await;
+            self.orderbook.persist_order_snapshot(&order).await?;
+            return Err(ClobError::InvalidOrder(
+                "FOK order cannot be completely filled".to_string(),
+            ));
+        }
         
         // Try to match order
-        let match_result = self.match_order(&mut order).await?;
+        let mut match_result = self.match_order(&mut order).await?;
         
         // Handle remaining order based on time in force
         if order.remaining > Decimal::ZERO && order.can_match() {
@@ -141,9 +156,16 @@ impl MatchingEngine {
                         // PostOnly order would have taken liquidity — reject.
                         self.unlock_note_for_order(&order).await;
                         order.status = OrderStatus::Rejected;
+                        order.updated_at = Utc::now();
+                        self.orderbook.persist_order_snapshot(&order).await?;
                         return Err(ClobError::InvalidOrder(
                             "PostOnly order would cross the book".to_string(),
                         ));
+                    }
+                    if order.filled > Decimal::ZERO {
+                        order.status = OrderStatus::Partial;
+                        order.updated_at = Utc::now();
+                        self.orderbook.persist_order_snapshot(&order).await?;
                     }
                     // Lock the note now that the order is safely in the book.
                     self.lock_note_for_order(&order).await;
@@ -161,6 +183,8 @@ impl MatchingEngine {
                         self.unlock_note_for_order(&order).await;
                         order.status = OrderStatus::Cancelled;
                     }
+                    order.updated_at = Utc::now();
+                    self.orderbook.persist_order_snapshot(&order).await?;
                     tracing::debug!(
                         order_id = %order.id,
                         filled = %order.filled,
@@ -172,6 +196,7 @@ impl MatchingEngine {
                     // FOK must be completely filled or the whole order is rejected.
                     if order.filled < order.size {
                         order.status = OrderStatus::Rejected;
+                        order.updated_at = Utc::now();
                         // Rollback all trades (credit both sides back)
                         for trade in &match_result.trades {
                             self.settlement.rollback_trade(trade).await?;
@@ -180,6 +205,7 @@ impl MatchingEngine {
                         self.settlement.release_order_balance(&order).await?;
                         // Unlock the note — the order never executed.
                         self.unlock_note_for_order(&order).await;
+                        self.orderbook.persist_order_snapshot(&order).await?;
                         return Err(ClobError::InvalidOrder(
                             "FOK order cannot be completely filled".to_string(),
                         ));
@@ -193,6 +219,12 @@ impl MatchingEngine {
         // the next fill that exhausts them.
         if order.filled >= order.size && order.note_commitment.is_some() {
             self.spend_note_for_order(&order).await;
+        }
+
+        if order.remaining <= Decimal::ZERO {
+            order.status = OrderStatus::Filled;
+            order.updated_at = Utc::now();
+            self.orderbook.persist_order_snapshot(&order).await?;
         }
 
         // Record metrics
@@ -213,25 +245,46 @@ impl MatchingEngine {
             latency_us = latency.as_micros(),
             "Order processed"
         );
+
+        match_result.order = order.clone();
         
         Ok(match_result)
     }
 
     /// Cancel an order
     pub async fn cancel_order(&self, order_id: Uuid, user_id: &str) -> ClobResult<Order> {
-        let mut order = self.orderbook.remove_order(order_id).await?;
+        let existing_order = self
+            .orderbook
+            .store
+            .get_order(order_id)
+            .await?
+            .ok_or_else(|| ClobError::OrderNotFound(order_id.to_string()))?;
         
         // Verify user owns the order
-        if order.user_id != user_id {
+        if existing_order.user_id != user_id {
             return Err(ClobError::Unauthorized("Order does not belong to user".to_string()));
         }
+
+        let mut order = self.orderbook.remove_order(order_id).await?;
         
         // Update order status
         order.status = OrderStatus::Cancelled;
         order.updated_at = chrono::Utc::now();
+
+        if let Err(error) = self.orderbook.persist_order_snapshot(&order).await {
+            let _ = self.orderbook.store.add_to_orderbook(&existing_order.market_id, &existing_order).await;
+            let _ = self.orderbook.store.increment_open_interest(&existing_order.market_id, existing_order.remaining).await;
+            let _ = self.orderbook.store.save_order(&existing_order).await;
+            return Err(error);
+        }
         
         // Release reserved balance
-        self.settlement.release_order_balance(&order).await?;
+        if let Err(error) = self.settlement.release_order_balance(&order).await {
+            let _ = self.orderbook.store.add_to_orderbook(&existing_order.market_id, &existing_order).await;
+            let _ = self.orderbook.store.increment_open_interest(&existing_order.market_id, existing_order.remaining).await;
+            let _ = self.orderbook.persist_order_snapshot(&existing_order).await;
+            return Err(error);
+        }
         // Unlock the note — order no longer holds the position.
         self.unlock_note_for_order(&order).await;
         
@@ -450,6 +503,39 @@ impl MatchingEngine {
         Ok(orders)
     }
 
+            async fn can_fully_fill(&self, order: &Order) -> ClobResult<bool> {
+                let mut remaining = order.remaining;
+
+                let counter_side = match order.side {
+                    OrderSide::Buy => OrderSide::Sell,
+                    OrderSide::Sell => OrderSide::Buy,
+                };
+
+                let counter_orders = self
+                    .orderbook
+                    .store
+                    .get_orders_by_side(&order.market_id, counter_side)
+                    .await?;
+
+                for counter_order in counter_orders {
+                    let can_match = match order.side {
+                        OrderSide::Buy => order.price >= counter_order.price,
+                        OrderSide::Sell => order.price <= counter_order.price,
+                    };
+
+                    if !can_match {
+                        break;
+                    }
+
+                    remaining -= remaining.min(counter_order.remaining);
+                    if remaining <= Decimal::ZERO {
+                        return Ok(true);
+                    }
+                }
+
+                Ok(false)
+            }
+
     fn get_market_lock(&self, market_id: &str) -> Arc<RwLock<()>> {
         self.market_locks
             .entry(market_id.to_string())
@@ -468,8 +554,17 @@ pub struct MatchResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::balance_service::BalanceService;
+    use crate::metrics::Metrics;
     use crate::models::{Order, OrderSide, OrderStatus, OrderType, TimeInForce};
+    use crate::orderbook::OrderBookManager;
+    use crate::privacy::{NoteStatus, PrivacyStateService};
+    use crate::redis_store::RedisStore;
+    use crate::settlement::SettlementEngine;
+    use mini_redis::server;
     use rust_decimal_macros::dec;
+    use std::sync::Arc;
+    use tokio::sync::oneshot;
     use uuid::Uuid;
 
     // ── Order construction helpers ───────────────────────────────────────────
@@ -483,6 +578,128 @@ mod tests {
         tif: TimeInForce,
     ) -> Order {
         Order::new(user.to_string(), market.to_string(), side, OrderType::Limit, tif, price, size)
+    }
+
+    async fn setup_matching_engine_with_privacy(
+    ) -> (
+        MatchingEngine,
+        Arc<PrivacyStateService>,
+        Arc<BalanceService>,
+        oneshot::Sender<()>,
+    ) {
+        std::env::set_var("REDIS_COMPAT_DISABLE_SET_NX", "true");
+        std::env::set_var("REDIS_COMPAT_DISABLE_EXISTS", "true");
+        std::env::set_var("REDIS_COMPAT_DISABLE_KEYS", "true");
+        std::env::set_var("REDIS_COMPAT_DISABLE_LISTS", "true");
+        std::env::set_var("REDIS_COMPAT_DISABLE_SETS", "true");
+        std::env::set_var("REDIS_COMPAT_DISABLE_SORTED_SETS", "true");
+        std::env::set_var("REDIS_COMPAT_DISABLE_HASHES", "true");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let _ = server::run(listener, async {
+                let _ = rx.await;
+            })
+            .await;
+        });
+
+        let client = redis::Client::open(format!("redis://{}/", addr)).unwrap();
+        let conn = redis::aio::ConnectionManager::new(client).await.unwrap();
+        let store = Arc::new(RedisStore::new(conn));
+        let metrics = Metrics::test_instance();
+        let orderbook = Arc::new(OrderBookManager::new(store.clone(), metrics.clone(), None));
+        let balance_service = Arc::new(BalanceService::new(None));
+        let settlement = Arc::new(SettlementEngine::new(
+            store.clone(),
+            None,
+            0,
+            0,
+            balance_service.clone(),
+        ));
+        let privacy_state = Arc::new(PrivacyStateService::new(store));
+        let engine = MatchingEngine::new(orderbook, settlement, metrics)
+            .with_privacy_state(privacy_state.clone());
+
+        (engine, privacy_state, balance_service, tx)
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_full_fill_persists_terminal_order_snapshot() {
+        let (engine, _privacy_state, balance_service, shutdown) = setup_matching_engine_with_privacy().await;
+
+        balance_service.deposit("maker", "USDC", dec!(1000));
+        balance_service.deposit("taker", "USDC", dec!(1000));
+
+        let maker = make_limit_order("maker", "BTC-1H", OrderSide::Sell, dec!(0.60), dec!(100), TimeInForce::Gtc);
+        let maker_id = maker.id;
+        engine.submit_order(maker).await.unwrap();
+
+        let taker = make_limit_order("taker", "BTC-1H", OrderSide::Buy, dec!(0.60), dec!(100), TimeInForce::Gtc);
+        let taker_id = taker.id;
+        let result = engine.submit_order(taker).await.unwrap();
+
+        assert_eq!(result.order.status, OrderStatus::Filled);
+        let maker_snapshot = engine.orderbook.store.get_order(maker_id).await.unwrap().unwrap();
+        let taker_snapshot = engine.orderbook.store.get_order(taker_id).await.unwrap().unwrap();
+
+        assert_eq!(maker_snapshot.status, OrderStatus::Filled);
+        assert_eq!(taker_snapshot.status, OrderStatus::Filled);
+        assert_eq!(taker_snapshot.remaining, dec!(0));
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_cancel_preserves_cancelled_order_snapshot() {
+        let (engine, _privacy_state, balance_service, shutdown) = setup_matching_engine_with_privacy().await;
+
+        balance_service.deposit("maker", "USDC", dec!(1000));
+
+        let order = make_limit_order("maker", "BTC-1H", OrderSide::Sell, dec!(0.60), dec!(100), TimeInForce::Gtc);
+        let order_id = order.id;
+        engine.submit_order(order).await.unwrap();
+
+        let cancelled = engine.cancel_order(order_id, "maker").await.unwrap();
+        let snapshot = engine.orderbook.store.get_order(order_id).await.unwrap().unwrap();
+
+        assert_eq!(cancelled.status, OrderStatus::Cancelled);
+        assert_eq!(snapshot.status, OrderStatus::Cancelled);
+        assert_eq!(snapshot.remaining, dec!(100));
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_fok_reject_preserves_resting_maker_order() {
+        let (engine, _privacy_state, balance_service, shutdown) = setup_matching_engine_with_privacy().await;
+
+        balance_service.deposit("maker", "USDC", dec!(1000));
+        balance_service.deposit("taker", "USDC", dec!(1000));
+
+        let maker = make_limit_order("maker", "BTC-1H", OrderSide::Sell, dec!(0.60), dec!(40), TimeInForce::Gtc);
+        let maker_id = maker.id;
+        engine.submit_order(maker).await.unwrap();
+
+        let fok = make_limit_order("taker", "BTC-1H", OrderSide::Buy, dec!(0.60), dec!(100), TimeInForce::Fok);
+        let fok_id = fok.id;
+        assert!(engine.submit_order(fok).await.is_err());
+
+        let maker_snapshot = engine.orderbook.store.get_order(maker_id).await.unwrap().unwrap();
+        let fok_snapshot = engine.orderbook.store.get_order(fok_id).await.unwrap().unwrap();
+        let orderbook = engine.orderbook.get_orderbook("BTC-1H", 5).await.unwrap();
+
+        assert_eq!(maker_snapshot.status, OrderStatus::Open);
+        assert_eq!(maker_snapshot.remaining, dec!(40));
+        assert_eq!(fok_snapshot.status, OrderStatus::Rejected);
+        assert_eq!(fok_snapshot.remaining, dec!(100));
+        assert_eq!(orderbook.asks.len(), 1);
+        assert_eq!(orderbook.asks[0].price.round_dp(2), dec!(0.60));
+        assert_eq!(orderbook.asks[0].size, dec!(40));
+
+        let _ = shutdown.send(());
     }
 
     // ── 3. Trade: order field validation ────────────────────────────────────
@@ -661,18 +878,18 @@ mod tests {
 
     // ── 3. Trade: IOC / FOK semantics ───────────────────────────────────────
 
-    /// IOC with partial fill: remaining should be cancelled.
+    /// IOC with partial fill cancels the remainder but preserves the executed slice.
     #[test]
-    fn test_ioc_partial_fill_cancels_remainder() {
-        // After partial fill, IOC remaining → status Cancelled.
+    fn test_lifecycle_ioc_partial_fill_keeps_partial_status_and_cancels_remainder() {
         let mut order = make_limit_order("alice", "BTC-1H", OrderSide::Buy, dec!(0.60), dec!(100), TimeInForce::Ioc);
         order.filled = dec!(40);
         order.remaining = dec!(60);
-        // IOC rule: if filled > 0 and remaining > 0 → cancel remaining
+        // Engine behavior: the unfilled remainder is cancelled, but the order is
+        // still represented as partial because part of it executed successfully.
         if order.time_in_force == TimeInForce::Ioc && order.filled > dec!(0) && order.remaining > dec!(0) {
-            order.status = OrderStatus::Cancelled;
+            order.status = OrderStatus::Partial;
         }
-        assert_eq!(order.status, OrderStatus::Cancelled);
+        assert_eq!(order.status, OrderStatus::Partial);
     }
 
     /// IOC with zero fill → full cancel.
@@ -846,24 +1063,112 @@ mod tests {
         assert_eq!(svc.get_available_balance("alice", "BTC-USDC-HOUR-1"), dec!(950));
     }
 
-    /// FOK fail: all fills are rolled back, full reservation released; Note unchanged.
+    /// FOK fail: any provisional debit is rolled back and all reservation is released.
     #[test]
-    fn test_note_fok_fail_full_reservation_released() {
-        use crate::balance_service::BalanceService;
+    fn test_lifecycle_fok_fail_rolls_back_debit_and_releases_reservation() {
         let svc = BalanceService::new(None);
-        // Alice deposits 1000, submits FOK buy 200 @ 0.60 (reserves 120)
         svc.deposit("alice", "BTC-USDC-HOUR-1", dec!(1000));
         svc.reserve_balance("alice", "BTC-USDC-HOUR-1", dec!(120)).unwrap();
 
-        // FOK partially filled 100 units, then fails → rollback: credit 60 back
+        // A provisional partial fill consumes 60 from reserved balance.
+        svc.debit("alice", "BTC-USDC-HOUR-1", dec!(60)).unwrap();
+        // FOK rollback restores the filled amount.
         svc.credit("alice", "BTC-USDC-HOUR-1", dec!(60));
-        // Release the remaining reserved amount (120 - 60 filled + 60 credited back = 120 total)
-        // After credit, total=1000 (not debited yet since it's a rollback)
-        // Release full reserved 120
-        svc.release_balance("alice", "BTC-USDC-HOUR-1", dec!(120)).unwrap();
 
-        assert_eq!(svc.get_total_balance("alice", "BTC-USDC-HOUR-1"), dec!(1060)); // 1000 + 60 credited
+        // The unfilled remainder reservation is then released.
+        svc.release_balance("alice", "BTC-USDC-HOUR-1", dec!(60)).unwrap();
+
+        assert_eq!(svc.get_total_balance("alice", "BTC-USDC-HOUR-1"), dec!(1000));
         assert_eq!(svc.get_reserved_balance("alice", "BTC-USDC-HOUR-1"), dec!(0));
+        assert_eq!(svc.get_available_balance("alice", "BTC-USDC-HOUR-1"), dec!(1000));
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_gtc_order_lock_marks_note_locked() {
+        let (engine, privacy_state, _balance_service, shutdown) = setup_matching_engine_with_privacy().await;
+        privacy_state
+            .create_note(
+                "gtc-lock-note".to_string(),
+                "amount-commitment".to_string(),
+                "USDC".to_string(),
+                "owner-key-hash".to_string(),
+                1,
+            )
+            .await
+            .unwrap();
+
+        let mut order = make_limit_order("alice", "BTC-1H", OrderSide::Buy, dec!(0.55), dec!(100), TimeInForce::Gtc);
+        order.note_commitment = Some("gtc-lock-note".to_string());
+
+        engine.lock_note_for_order(&order).await;
+
+        let note = privacy_state
+            .get_note("gtc-lock-note")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(note.status, NoteStatus::Locked);
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_cancel_unlock_restores_unspent_note() {
+        let (engine, privacy_state, _balance_service, shutdown) = setup_matching_engine_with_privacy().await;
+        privacy_state
+            .create_note(
+                "cancel-unlock-note".to_string(),
+                "amount-commitment".to_string(),
+                "USDC".to_string(),
+                "owner-key-hash".to_string(),
+                1,
+            )
+            .await
+            .unwrap();
+
+        let mut order = make_limit_order("alice", "BTC-1H", OrderSide::Buy, dec!(0.55), dec!(100), TimeInForce::Gtc);
+        order.note_commitment = Some("cancel-unlock-note".to_string());
+
+        engine.lock_note_for_order(&order).await;
+        engine.unlock_note_for_order(&order).await;
+
+        let note = privacy_state
+            .get_note("cancel-unlock-note")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(note.status, NoteStatus::Unspent);
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_fill_marks_note_spent() {
+        let (engine, privacy_state, _balance_service, shutdown) = setup_matching_engine_with_privacy().await;
+        privacy_state
+            .create_note(
+                "fill-spent-note".to_string(),
+                "amount-commitment".to_string(),
+                "USDC".to_string(),
+                "owner-key-hash".to_string(),
+                1,
+            )
+            .await
+            .unwrap();
+
+        let mut order = make_limit_order("alice", "BTC-1H", OrderSide::Buy, dec!(0.55), dec!(100), TimeInForce::Ioc);
+        order.note_commitment = Some("fill-spent-note".to_string());
+
+        engine.spend_note_for_order(&order).await;
+
+        let note = privacy_state
+            .get_note("fill-spent-note")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(note.status, NoteStatus::Spent);
+
+        let _ = shutdown.send(());
     }
 
     /// release_order_balance uses remaining (not size): partial fill releases only unfilled amount.

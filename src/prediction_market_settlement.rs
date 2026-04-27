@@ -27,8 +27,8 @@ pub struct PredictionMarketSettlementLeg {
     pub position_payout_units_high: String,
     pub trade_fee_amount_low: String,
     pub trade_fee_amount_high: String,
-    /// EVM vault contract address for this leg's order. Routes the settleFill
-    /// call to the correct on-chain vault. Empty → use PM_VAULT_ADDRESS fallback.
+    /// EVM treasury contract address for this leg's order. Routes the settleFill
+    /// call to the correct on-chain treasury. Empty → use the PM treasury fallback.
     #[serde(default)]
     pub vault_address: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -62,9 +62,9 @@ pub struct PredictionMarketSettlementJob {
     pub taker_fee: String,
     pub settlement_status: String,
     pub relayer_configured: bool,
-    /// EVM vault contract address for this job (from the order's vault_address).
+    /// EVM treasury contract address for this job (from the order's compatibility field).
     /// Used for the single-proof (non-leg) settlement path.
-    /// Empty → fall back to PM_VAULT_ADDRESS env var.
+    /// Empty → fall back to the PM treasury env vars.
     #[serde(default)]
     pub vault_address: String,
     #[serde(default)]

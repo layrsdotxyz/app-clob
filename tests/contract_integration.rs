@@ -262,13 +262,16 @@ async fn test_horizen_chain_id_is_2651420() {
 }
 
 #[tokio::test]
-#[ignore = "requires PREDICTION_MARKET_VAULT_ADDRESS + live Horizen RPC"]
+#[ignore = "requires PREDICTION_MARKET_TREASURY_ADDRESS + live Horizen RPC"]
 async fn test_privacy_vault_has_code() {
     let rpc_url = std::env::var("HORIZEN_RPC_URL")
         .or_else(|_| std::env::var("EVM_RPC_URL"))
         .expect("HORIZEN_RPC_URL not set");
-    let vault_addr = std::env::var("PREDICTION_MARKET_VAULT_ADDRESS")
-        .expect("PREDICTION_MARKET_VAULT_ADDRESS not set");
+    let vault_addr = std::env::var("PREDICTION_MARKET_TREASURY_ADDRESS")
+        .or_else(|_| std::env::var("PM_TREASURY_ADDRESS"))
+        .or_else(|_| std::env::var("PM_USDC_TREASURY_ADDRESS"))
+        .or_else(|_| std::env::var("PREDICTION_MARKET_VAULT_ADDRESS"))
+        .expect("PREDICTION_MARKET_TREASURY_ADDRESS (or legacy VAULT_ADDRESS) not set");
 
     let client = reqwest::Client::new();
     let resp: serde_json::Value = client

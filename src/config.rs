@@ -29,14 +29,14 @@ pub struct Config {
     // Optional PostgreSQL database URL
     pub database_url: Option<String>,
 
-    // Explicit vault addresses for the current PM/privacy split
-    pub pm_usdc_vault_address: Option<String>,
-    pub pm_zen_vault_address: Option<String>,
+    // Explicit treasury addresses for the current PM/privacy split
+    pub pm_usdc_treasury_address: Option<String>,
+    pub pm_zen_treasury_address: Option<String>,
     pub privacy_weth_vault_address: Option<String>,
 
     // Compatibility aliases for older config consumers
-    pub prediction_market_vault_address: Option<String>,
-    pub zen_vault_address: Option<String>,
+    pub prediction_market_treasury_address: Option<String>,
+    pub zen_treasury_address: Option<String>,
 
     // Additional contract addresses used for runtime validation
     pub zen_token_address: Option<String>,
@@ -100,18 +100,26 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         dotenvy::dotenv().ok();
 
-        let pm_usdc_vault_address = first_env(&[
+        let pm_usdc_treasury_address = first_env(&[
+            "PM_USDC_TREASURY_ADDRESS",
+            "PREDICTION_MARKET_TREASURY_ADDRESS",
+            "PM_TREASURY_ADDRESS",
             "PM_USDC_VAULT_ADDRESS",
             "PREDICTION_MARKET_VAULT_ADDRESS",
             "PM_VAULT_ADDRESS",
             "USDC_VAULT_ADDRESS",
         ]);
-        let pm_zen_vault_address = first_env(&[
+        let pm_zen_treasury_address = first_env(&[
+            "PM_ZEN_TREASURY_ADDRESS",
+            "ZEN_PM_TREASURY_ADDRESS",
+            "ZEN_TREASURY_ADDRESS",
             "PM_ZEN_VAULT_ADDRESS",
             "ZEN_PM_VAULT_ADDRESS",
             "ZEN_VAULT_ADDRESS",
         ]);
         let privacy_weth_vault_address = first_env(&[
+            "PRIVACY_WETH_TREASURY_ADDRESS",
+            "LP_TREASURY_ADDRESS",
             "PRIVACY_WETH_VAULT_ADDRESS",
             "WETH_VAULT_ADDRESS",
             "ETH_VAULT_ADDRESS",
@@ -147,11 +155,11 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or_else(default_min_order_size),
             database_url: std::env::var("DATABASE_URL").ok(),
-            pm_usdc_vault_address: pm_usdc_vault_address.clone(),
-            pm_zen_vault_address: pm_zen_vault_address.clone(),
+            pm_usdc_treasury_address: pm_usdc_treasury_address.clone(),
+            pm_zen_treasury_address: pm_zen_treasury_address.clone(),
             privacy_weth_vault_address: privacy_weth_vault_address,
-            prediction_market_vault_address: pm_usdc_vault_address,
-            zen_vault_address: pm_zen_vault_address,
+            prediction_market_treasury_address: pm_usdc_treasury_address,
+            zen_treasury_address: pm_zen_treasury_address,
             zen_token_address: std::env::var("ZEN_TOKEN_ADDRESS").ok(),
             market_factory_address: std::env::var("MARKET_FACTORY_ADDRESS").ok(),
             market_oracle_enabled: std::env::var("MARKET_ORACLE_ENABLED")
@@ -193,12 +201,12 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         validate_optional_address(
-            "PM_USDC_VAULT_ADDRESS/PREDICTION_MARKET_VAULT_ADDRESS/PM_VAULT_ADDRESS",
-            self.pm_usdc_vault_address.as_deref(),
+            "PM_USDC_TREASURY_ADDRESS/PREDICTION_MARKET_TREASURY_ADDRESS/PM_TREASURY_ADDRESS/PM_USDC_VAULT_ADDRESS/PREDICTION_MARKET_VAULT_ADDRESS/PM_VAULT_ADDRESS",
+            self.pm_usdc_treasury_address.as_deref(),
         )?;
         validate_optional_address(
-            "PM_ZEN_VAULT_ADDRESS/ZEN_VAULT_ADDRESS",
-            self.pm_zen_vault_address.as_deref(),
+            "PM_ZEN_TREASURY_ADDRESS/ZEN_PM_TREASURY_ADDRESS/ZEN_TREASURY_ADDRESS/PM_ZEN_VAULT_ADDRESS/ZEN_VAULT_ADDRESS",
+            self.pm_zen_treasury_address.as_deref(),
         )?;
         validate_optional_address(
             "PRIVACY_WETH_VAULT_ADDRESS/WETH_VAULT_ADDRESS/LP_VAULT_ADDRESS",
@@ -225,35 +233,35 @@ impl Config {
             );
         }
 
-        if let (Some(pm_usdc_vault), Some(pm_zen_vault)) = (
-            self.pm_usdc_vault_address.as_ref(),
-            self.pm_zen_vault_address.as_ref(),
+        if let (Some(pm_usdc_treasury), Some(pm_zen_treasury)) = (
+            self.pm_usdc_treasury_address.as_ref(),
+            self.pm_zen_treasury_address.as_ref(),
         ) {
-            if pm_usdc_vault.eq_ignore_ascii_case(pm_zen_vault) {
+            if pm_usdc_treasury.eq_ignore_ascii_case(pm_zen_treasury) {
                 anyhow::bail!(
-                    "PM_USDC_VAULT_ADDRESS and PM_ZEN_VAULT_ADDRESS must refer to different vaults"
+                    "PM_USDC_TREASURY_ADDRESS/PM_USDC_VAULT_ADDRESS and PM_ZEN_TREASURY_ADDRESS/PM_ZEN_VAULT_ADDRESS must refer to different treasuries"
                 );
             }
         }
 
-        if let (Some(pm_usdc_vault), Some(privacy_weth_vault)) = (
-            self.pm_usdc_vault_address.as_ref(),
+        if let (Some(pm_usdc_treasury), Some(privacy_weth_vault)) = (
+            self.pm_usdc_treasury_address.as_ref(),
             self.privacy_weth_vault_address.as_ref(),
         ) {
-            if pm_usdc_vault.eq_ignore_ascii_case(privacy_weth_vault) {
+            if pm_usdc_treasury.eq_ignore_ascii_case(privacy_weth_vault) {
                 anyhow::bail!(
-                    "PM_USDC_VAULT_ADDRESS and PRIVACY_WETH_VAULT_ADDRESS must refer to different vaults"
+                    "PM_USDC_TREASURY_ADDRESS/PM_USDC_VAULT_ADDRESS and PRIVACY_WETH_VAULT_ADDRESS must refer to different contracts"
                 );
             }
         }
 
-        if let (Some(pm_zen_vault), Some(privacy_weth_vault)) = (
-            self.pm_zen_vault_address.as_ref(),
+        if let (Some(pm_zen_treasury), Some(privacy_weth_vault)) = (
+            self.pm_zen_treasury_address.as_ref(),
             self.privacy_weth_vault_address.as_ref(),
         ) {
-            if pm_zen_vault.eq_ignore_ascii_case(privacy_weth_vault) {
+            if pm_zen_treasury.eq_ignore_ascii_case(privacy_weth_vault) {
                 anyhow::bail!(
-                    "PM_ZEN_VAULT_ADDRESS and PRIVACY_WETH_VAULT_ADDRESS must refer to different vaults"
+                    "PM_ZEN_TREASURY_ADDRESS/PM_ZEN_VAULT_ADDRESS and PRIVACY_WETH_VAULT_ADDRESS must refer to different contracts"
                 );
             }
         }
