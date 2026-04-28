@@ -78,13 +78,19 @@ pub async fn deposit_balance(
     let amount = req.amount.to_decimal()
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    state.balance_service.deposit(&req.user_id, &req.market_id, amount);
+    // Normalize wallet addresses to lowercase so deposits and order-time
+    // balance lookups (which go through `auth.rs` → also lowercased) always
+    // share the same key. Mixed EIP-55 checksum casing would otherwise produce
+    // a separate balance bucket the matching engine never sees.
+    let user_id = req.user_id.trim().to_lowercase();
 
-    let new_balance = state.balance_service.get_total_balance(&req.user_id, &req.market_id);
+    state.balance_service.deposit(&user_id, &req.market_id, amount);
+
+    let new_balance = state.balance_service.get_total_balance(&user_id, &req.market_id);
 
     Ok(Json(DepositResponse {
         success: true,
-        user_id: req.user_id,
+        user_id,
         market_id: req.market_id,
         new_balance: new_balance.to_string(),
     }))

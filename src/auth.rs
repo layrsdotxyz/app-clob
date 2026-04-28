@@ -102,6 +102,13 @@ pub async fn require_auth(mut req: Request, next: Next) -> Result<Response, Resp
 
     match address {
         Some(addr) if !addr.is_empty() => {
+            // Normalize EVM addresses to lowercase so balance / nullifier / order
+            // lookups always hit the same DashMap / Redis keys regardless of how
+            // the wallet (Dynamic SDK, viem, etc.) chose to checksum-case the
+            // header. Without this, a deposit credited to "0xabc..." (lowercase
+            // from the event topic) is invisible to an order placed under
+            // "0xAbC..." (EIP-55 checksum from the wallet).
+            let addr = addr.trim().to_lowercase();
             let alias = pseudo_id(&addr);
             tracing::debug!(
                 alias = %alias,
