@@ -73,8 +73,42 @@ use crate::{
     prediction_market_relayer::PredictionMarketRelayer,
 };
 
+fn enforce_real_private_prover_configuration() -> Result<()> {
+    let configured_mode = std::env::var("PRIVATE_PROVER_MODE")
+        .unwrap_or_else(|_| "barretenberg".to_string())
+        .trim()
+        .to_lowercase();
+
+    match configured_mode.as_str() {
+        "barretenberg" | "honk" => {}
+        "mock" => {
+            anyhow::bail!(
+                "PRIVATE_PROVER_MODE=mock is forbidden for clob-service startup; use the real Barretenberg/UltraHonk prover"
+            );
+        }
+        other => {
+            anyhow::bail!(
+                "PRIVATE_PROVER_MODE='{}' is unsupported for clob-service startup; expected 'barretenberg' or 'honk'",
+                other
+            );
+        }
+    }
+
+    let allow_mock = std::env::var("ALLOW_INSECURE_MOCK_PROVER")
+        .map(|value| value.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if allow_mock {
+        anyhow::bail!(
+            "ALLOW_INSECURE_MOCK_PROVER=true is forbidden for clob-service startup"
+        );
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     eprintln!("[startup] CLOB service entrypoint reached (sync)");
+    enforce_real_private_prover_configuration()?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -242,20 +276,23 @@ async fn async_main() -> Result<()> {
     for mid in &seed_market_ids {
         orderbook_manager.seed_market(mid);
     }
-    if let Some(db) = database.as_ref() {
-        match db.list_active_prediction_market_metadata().await {
-            Ok(markets) => {
-                let seeded = markets.len();
-                for market in markets {
-                    orderbook_manager.seed_market(&market.market_id);
+    let db_market_seed_task = database.clone().map(|db| {
+        let orderbook_manager = orderbook_manager.clone();
+        tokio::spawn(async move {
+            match db.list_active_prediction_market_metadata().await {
+                Ok(markets) => {
+                    let seeded = markets.len();
+                    for market in markets {
+                        orderbook_manager.seed_market(&market.market_id);
+                    }
+                    tracing::info!(count = seeded, "Seeded DB-backed prediction markets in background");
                 }
-                tracing::info!(count = seeded, "Seeded DB-backed prediction markets on startup");
+                Err(error) => {
+                    tracing::warn!(error = %error, "Failed to seed DB-backed prediction markets in background");
+                }
             }
-            Err(error) => {
-                tracing::warn!(error = %error, "Failed to seed DB-backed prediction markets on startup");
-            }
-        }
-    }
+        })
+    });
 
     let prediction_market_relayer = match PredictionMarketRelayer::from_env(
         config.pm_usdc_treasury_address.clone(),
@@ -624,6 +661,9 @@ async fn async_main() -> Result<()> {
         task.abort();
     }
     if let Some(task) = market_oracle_task {
+        task.abort();
+    }
+    if let Some(task) = db_market_seed_task {
         task.abort();
     }
     if let Some(task) = trade_persist_task {
