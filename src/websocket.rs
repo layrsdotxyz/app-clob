@@ -36,7 +36,8 @@ impl WebSocketManager {
                 .map(|tx| tx.subscribe())
         });
 
-        let mut subscriptions: Vec<(String, broadcast::Receiver<WsMessage>)> = Vec::new();
+        let (agg_tx, mut agg_rx) = tokio::sync::mpsc::unbounded_channel::<WsMessage>();
+        let mut subscriptions: std::collections::HashMap<String, tokio::task::JoinHandle<()>> = std::collections::HashMap::new();
 
         loop {
             tokio::select! {
@@ -48,6 +49,7 @@ impl WebSocketManager {
                                 self.handle_client_message(
                                     &mut ws,
                                     &mut subscriptions,
+                                    &agg_tx,
                                     client_msg,
                                 ).await;
                             }
@@ -66,11 +68,7 @@ impl WebSocketManager {
 
                 // Broadcast from user channel
                 user_msg = async {
-                    if let Some(ref mut rx) = user_rx {
-                        rx.recv().await.ok()
-                    } else {
-                        None
-                    }
+                    user_rx.as_mut().unwrap().recv().await.ok()
                 }, if user_rx.is_some() => {
                     if let Some(msg) = user_msg {
                         if let Ok(json) = serde_json::to_string(&msg) {
@@ -80,14 +78,7 @@ impl WebSocketManager {
                 }
 
                 // Broadcast from subscribed channels
-                channel_msg = async {
-                    for (_, rx) in subscriptions.iter_mut() {
-                        if let Ok(msg) = rx.try_recv() {
-                            return Some(msg);
-                        }
-                    }
-                    None
-                } => {
+                channel_msg = agg_rx.recv() => {
                     if let Some(msg) = channel_msg {
                         if let Ok(json) = serde_json::to_string(&msg) {
                             let _ = ws.send(Message::Text(json)).await;
@@ -96,12 +87,18 @@ impl WebSocketManager {
                 }
             }
         }
+        
+        // Clean up spawned tasks when disconnected
+        for (_, handle) in subscriptions.drain() {
+            handle.abort();
+        }
     }
 
     async fn handle_client_message(
         &self,
         ws: &mut WebSocket,
-        subscriptions: &mut Vec<(String, broadcast::Receiver<WsMessage>)>,
+        subscriptions: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+        agg_tx: &tokio::sync::mpsc::UnboundedSender<WsMessage>,
         msg: WsClientMessage,
     ) {
         match msg {
@@ -113,7 +110,19 @@ impl WebSocketManager {
                     .or_insert_with(|| broadcast::channel(1000).0)
                     .clone();
                 
-                subscriptions.push((channel_key.clone(), tx.subscribe()));
+                let mut rx = tx.subscribe();
+                let snd = agg_tx.clone();
+                let handle = tokio::spawn(async move {
+                    while let Ok(msg) = rx.recv().await {
+                        if snd.send(msg).is_err() {
+                            break;
+                        }
+                    }
+                });
+                
+                if let Some(old_handle) = subscriptions.insert(channel_key.clone(), handle) {
+                    old_handle.abort();
+                }
                 
                 let response = WsMessage::Subscribed { channel, market_id };
                 if let Ok(json) = serde_json::to_string(&response) {
@@ -126,7 +135,9 @@ impl WebSocketManager {
             WsClientMessage::Unsubscribe { channel, market_id } => {
                 let channel_key = self.make_channel_key(&channel, market_id.as_deref());
                 
-                subscriptions.retain(|(key, _)| key != &channel_key);
+                if let Some(handle) = subscriptions.remove(&channel_key) {
+                    handle.abort();
+                }
                 
                 let response = WsMessage::Unsubscribed { channel, market_id };
                 if let Ok(json) = serde_json::to_string(&response) {

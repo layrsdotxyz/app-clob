@@ -9,7 +9,6 @@ use crate::{
     metrics::Metrics,
     privacy::{PrivacyStateService, TransitionStatus},
     proof_generation::{ProverJob, ProverJobStatus, ProverJobType, ProverPipeline},
-    withdrawal_service::WithdrawalService,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,8 +42,6 @@ pub struct ProverWorker {
     privacy_state: Arc<PrivacyStateService>,
     poll_interval: Duration,
     mode: ProverMode,
-    /// Optional withdrawal service — executes on-chain withdrawal after PrivateWithdraw proof succeeds.
-    withdrawal_service: Option<Arc<WithdrawalService>>,
     /// Optional Prometheus metrics — records job counts and queue depth.
     metrics: Option<Arc<Metrics>>,
 }
@@ -64,15 +61,8 @@ impl ProverWorker {
                 poll_interval_secs
             }),
             mode: ProverMode::from_env(),
-            withdrawal_service: None,
             metrics: None,
         }
-    }
-
-    /// Attach a withdrawal service (optional — enables on-chain execution after PrivateWithdraw attestation).
-    pub fn with_withdrawal_service(mut self, ws: Arc<WithdrawalService>) -> Self {
-        self.withdrawal_service = Some(ws);
-        self
     }
 
     /// Attach Prometheus metrics (optional — records job counts and queue depth).
@@ -167,46 +157,14 @@ impl ProverWorker {
                         .await?;
                 }
 
-                if matches!(job.job_type, ProverJobType::PrivateWithdraw) {
-                    if proof_generated {
-                        if let Some(ws) = &self.withdrawal_service {
-                            // Await on-chain withdrawal inline — NOT fire-and-forget.
-                            // The note is only marked spent AFTER on-chain confirmation so
-                            // that a failed or incomplete tx leaves the note intact and retryable.
-                            match ws.execute_after_attestation(&input, &output).await {
-                                Ok(()) => {
-                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&input) {
-                                        if let Some(commitment) = v.get("commitment").and_then(|x| x.as_str()) {
-                                            if let Err(e) = self.privacy_state.mark_note_spent(commitment).await {
-                                                tracing::error!(
-                                                    job_id = %job.job_id,
-                                                    error = %e,
-                                                    "On-chain withdrawal succeeded but failed to mark note spent — note may be double-spendable"
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    // Note is intentionally NOT marked spent — the proof job succeeded
-                                    // and the transition is Attested, but the chain tx failed.
-                                    // The user can re-submit the withdrawal to retry.
-                                    tracing::error!(
-                                        job_id = %job.job_id,
-                                        error = %e,
-                                        "execute_after_attestation failed — on-chain withdrawal did not execute. \
-                                         Note has NOT been marked spent; re-submit withdrawal to retry."
-                                    );
-                                }
-                            }
-                        } else {
-                            // No withdrawal service configured — mark note spent immediately
-                            // (local/dev mode with no on-chain step).
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&input) {
-                                if let Some(commitment) = v.get("commitment").and_then(|x| x.as_str()) {
-                                    let _ = self.privacy_state.mark_note_spent(commitment).await;
-                                }
-                            }
+                // PrivateWithdraw proofs generated here are for clob-service order-related
+                // flows (settlement). Full withdrawal execution — ZK proof + on-chain submit —
+                // is handled exclusively by vault-service via the internal /internal/v1/withdraw
+                // endpoint. Mark the note spent locally once proof is confirmed.
+                if matches!(job.job_type, ProverJobType::PrivateWithdraw) && proof_generated {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&input) {
+                        if let Some(commitment) = v.get("commitment").and_then(|x| x.as_str()) {
+                            let _ = self.privacy_state.mark_note_spent(commitment).await;
                         }
                     }
                 }

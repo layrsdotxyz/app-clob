@@ -11,3 +11,4 @@ pub mod websocket;
 pub mod metrics;
 pub mod settlements;
 pub mod stealth;
+pub mod withdrawal;

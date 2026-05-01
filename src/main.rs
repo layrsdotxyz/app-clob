@@ -71,6 +71,7 @@ use crate::{
     epoch_service::EpochService,
     proof_generation::{OrderMatchProver, ProverPipeline, ProverWorker},
     prediction_market_relayer::PredictionMarketRelayer,
+    withdrawal_service::WithdrawalService,
 };
 
 fn enforce_real_private_prover_configuration() -> Result<()> {
@@ -351,6 +352,30 @@ async fn async_main() -> Result<()> {
     let ip_rate_limiter = rate_limiter::RateLimiter::new(rl_rpm, rl_burst);
     tracing::info!(rpm = rl_rpm, burst = rl_burst, "IP rate limiter initialized");
 
+    // Withdrawal service: delegates ZK proof + on-chain execution to vault-service.
+    // Optional — gracefully disabled when VAULT_INTERNAL_URL is not set.
+    let withdrawal_service = match std::env::var("VAULT_INTERNAL_URL") {
+        Ok(vault_url) if !vault_url.trim().is_empty() => {
+            let key = std::env::var("INTERNAL_SERVICE_KEY").unwrap_or_default();
+            if key.is_empty() {
+                tracing::warn!("VAULT_INTERNAL_URL set but INTERNAL_SERVICE_KEY is missing — withdrawal service disabled");
+                None
+            } else {
+                tracing::info!(vault_url = %vault_url, "Withdrawal service enabled (vault-service delegation)");
+                Some(Arc::new(WithdrawalService::new(
+                    redis_store.clone(),
+                    balance_service.clone(),
+                    vault_url,
+                    key,
+                )))
+            }
+        }
+        _ => {
+            tracing::warn!("VAULT_INTERNAL_URL not set — withdrawal service disabled");
+            None
+        }
+    };
+
     // Build application state
     let app_state = Arc::new(AppState {
         config: config.clone(),
@@ -365,6 +390,7 @@ async fn async_main() -> Result<()> {
         prover_pipeline: prover_pipeline.clone(),
         privacy_state: privacy_state.clone(),
         prediction_market_relayer: prediction_market_relayer.clone(),
+        withdrawal_service,
     });
 
     // Build router
@@ -445,6 +471,10 @@ async fn async_main() -> Result<()> {
                 // G15: Auth-gated announce — operator or authenticated payer writes a
                 // stealth announcement; the ephemeral key is stored with no recipient data.
                 .route("/v1/stealth/announce", post(routes::stealth::create_announcement))
+
+                // Withdrawal: ledger-side orchestration; proof and on-chain execution delegated to vault-service.
+                .route("/v1/withdrawal", post(routes::withdrawal::initiate_withdrawal))
+                .route("/v1/withdrawal/:withdrawal_id/status", get(routes::withdrawal::get_withdrawal_status))
 
                 .route_layer(axum::middleware::from_fn(auth::require_auth))
         )

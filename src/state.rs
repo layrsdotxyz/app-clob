@@ -13,6 +13,7 @@ use crate::{
     redis_store::RedisStore,
     settlement::SettlementEngine,
     websocket::WebSocketManager,
+    withdrawal_service::WithdrawalService,
 };
 
 /// Shared application state threaded through every Axum handler via `State<Arc<AppState>>`.
@@ -33,6 +34,7 @@ pub struct AppState {
     pub prover_pipeline: Arc<ProverPipeline>,
     pub privacy_state: Arc<PrivacyStateService>,
     pub prediction_market_relayer: Option<Arc<PredictionMarketRelayer>>,
+    pub withdrawal_service: Option<Arc<WithdrawalService>>,
 }
 
 /// Lazily-initialised shared `Metrics` instance for test environments.
@@ -124,6 +126,7 @@ impl AppState {
             prover_pipeline,
             privacy_state,
             prediction_market_relayer,
+            withdrawal_service: None,
         })
     }
 }
