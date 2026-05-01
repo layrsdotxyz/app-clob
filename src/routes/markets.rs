@@ -98,12 +98,19 @@ pub async fn get_market_by_slug(
         ClobError::ServiceUnavailable("database is required for slug lookup".to_string())
     })?;
 
-    let market = database
-        .get_public_market_metadata_by_slug(&slug)
-        .await?
-        .ok_or_else(|| ClobError::MarketNotFound(slug.clone()))?;
+    // Try exact slug match first
+    if let Some(market) = database.get_public_market_metadata_by_slug(&slug).await? {
+        return Ok(Json(market));
+    }
 
-    Ok(Json(market))
+    // Fallback: treat slug as market_id (handles short "btc-160" style slugs
+    // returned by legacy_market_metadata when the DB-stored slug is description-based)
+    let market_id_upper = slug.to_uppercase();
+    if let Some(market) = database.get_public_market_metadata(&market_id_upper).await? {
+        return Ok(Json(market));
+    }
+
+    Err(ClobError::MarketNotFound(slug))
 }
 
 pub async fn get_market_stats(
@@ -127,6 +134,24 @@ pub async fn get_market_stats(
     }
     
     Ok(Json(stats))
+}
+
+pub async fn list_market_history(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> ClobResult<impl IntoResponse> {
+    let database = state.database.as_ref().ok_or_else(|| {
+        ClobError::ServiceUnavailable("database is required for market history".to_string())
+    })?;
+
+    let asset = params.get("asset").map(|s| s.as_str());
+    let limit = params.get("limit")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(50)
+        .min(200);
+
+    let markets = database.list_resolved_prediction_market_metadata(asset, limit).await?;
+    Ok(Json(serde_json::json!({ "markets": markets })))
 }
 
 pub async fn get_market_resolution_audit(

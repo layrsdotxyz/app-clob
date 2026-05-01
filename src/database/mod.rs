@@ -612,6 +612,44 @@ impl Database {
         Ok(rows.iter().map(market_metadata_from_row).collect())
     }
 
+    pub async fn list_resolved_prediction_market_metadata(
+        &self,
+        asset: Option<&str>,
+        limit: i64,
+    ) -> ClobResult<Vec<PublicMarketMetadata>> {
+        let rows = if let Some(asset_filter) = asset {
+            let prefix = format!("{}-", asset_filter.to_uppercase());
+            sqlx::query(
+                "SELECT market_id, slug, description, expiry, status, source, on_chain_market_id
+                 FROM markets
+                 WHERE status IN ('resolved', 'expired', 'closed')
+                   AND on_chain_market_id IS NOT NULL
+                   AND market_id LIKE $1
+                 ORDER BY expiry DESC NULLS LAST
+                 LIMIT $2",
+            )
+            .bind(format!("{}%", prefix))
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                "SELECT market_id, slug, description, expiry, status, source, on_chain_market_id
+                 FROM markets
+                 WHERE status IN ('resolved', 'expired', 'closed')
+                   AND on_chain_market_id IS NOT NULL
+                 ORDER BY expiry DESC NULLS LAST
+                 LIMIT $1",
+            )
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+        };
+
+        let rows = rows.map_err(|e| ClobError::Internal(format!("list_resolved_prediction_market_metadata failed: {}", e)))?;
+        Ok(rows.iter().map(market_metadata_from_row).collect())
+    }
+
     pub async fn get_expired_active_pyth_markets(
         &self,
         asset: &str,

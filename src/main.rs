@@ -401,6 +401,7 @@ async fn async_main() -> Result<()> {
         
         // Markets endpoints (public)
         .route("/v1/markets", get(routes::markets::list_markets))
+        .route("/v1/markets/history", get(routes::markets::list_market_history))
         .route("/v1/markets/by-slug/:slug", get(routes::markets::get_market_by_slug))
         .route("/v1/markets/:market_id/stats", get(routes::markets::get_market_stats))
         .route(
