@@ -443,6 +443,21 @@ impl MarketOracleService {
         now_ts: u64,
     ) -> ClobResult<Option<String>> {
         let market_key = format!("{asset}-{market_id}");
+
+        // Guard: if the market doesn't exist on-chain, it's a phantom DB record.
+        // Mark it as expired so we stop retrying — there's nothing to resolve.
+        if !self.is_market_registered(market_id).await? {
+            warn!(
+                asset,
+                market_id,
+                "Market not registered on-chain (phantom DB record) — marking as expired"
+            );
+            if let Some(db) = &self.database {
+                let _ = db.update_market_resolution(&market_key, Decimal::ZERO, "expired").await;
+            }
+            return Ok(None);
+        }
+
         let strike_price = self.get_market_strike_price(market_id).await?;
         let strike_decimal = scaled_u128_to_decimal(strike_price);
         let primary_price = self.fetch_pyth_price(asset, expiry_ts).await.ok();
@@ -540,6 +555,18 @@ impl MarketOracleService {
         self.store.set(&audit.redis_key(), &payload).await?;
         self.store.append_json_array_value(&audit.history_key(), &payload).await?;
         Ok(())
+    }
+
+    async fn is_market_registered(&self, market_id: u64) -> ClobResult<bool> {
+        let selector = &keccak256(b"isRegistered(uint64)")[..4];
+        let data = Bytes::from([
+            selector,
+            encode(&[Token::Uint(U256::from(market_id))]).as_slice(),
+        ].concat());
+        match self.call_view_registry(data).await {
+            Ok(result) => Ok(result.last().copied().unwrap_or(0) != 0),
+            Err(_) => Ok(false),
+        }
     }
 
     async fn get_market_strike_price(&self, market_id: u64) -> ClobResult<u128> {
