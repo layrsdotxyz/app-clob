@@ -31,6 +31,7 @@ use ethers::{
 };
 
 use crate::{
+    balance_service::BalanceService,
     database::{Database, PersistedOracleMarket},
     error::{ClobError, ClobResult},
     evm_relayer::EvmRelayer,
@@ -100,6 +101,8 @@ pub struct MarketOracleService {
     pending_markets: HashMap<String, u64>,
     /// Shared orderbook manager — new markets are seeded here on creation.
     orderbook_manager: Arc<OrderBookManager>,
+    /// In-memory balance service — credited for winning positions at resolution.
+    balance_service: Arc<BalanceService>,
 }
 
 impl MarketOracleService {
@@ -116,6 +119,7 @@ impl MarketOracleService {
         oracle: Arc<PythOracle>,
         policy: OraclePolicy,
         orderbook_manager: Arc<OrderBookManager>,
+        balance_service: Arc<BalanceService>,
     ) -> Self {
         Self {
             factory_address,
@@ -130,12 +134,13 @@ impl MarketOracleService {
             market_id_counter: 0,
             pending_markets: HashMap::new(),
             orderbook_manager,
+            balance_service,
         }
     }
 
     /// Build from environment variables.  Returns `None` when required vars are
     /// missing (so callers can treat the service as optional).
-    pub fn from_env(store: Arc<RedisStore>, database: Option<Arc<Database>>, orderbook_manager: Arc<OrderBookManager>) -> Option<Self> {
+    pub fn from_env(store: Arc<RedisStore>, database: Option<Arc<Database>>, orderbook_manager: Arc<OrderBookManager>, balance_service: Arc<BalanceService>) -> Option<Self> {
         let factory_address_str = std::env::var("MARKET_FACTORY_ADDRESS").ok()?;
         if factory_address_str.is_empty() {
             return None;
@@ -155,7 +160,7 @@ impl MarketOracleService {
         let oracle = Arc::new(PythOracle::new());
         let policy = OraclePolicy::from_env();
 
-        Some(Self::new(factory_address, resolver_address, registry_address, Arc::new(relayer), provider, store, database, oracle, policy, orderbook_manager))
+        Some(Self::new(factory_address, resolver_address, registry_address, Arc::new(relayer), provider, store, database, oracle, policy, orderbook_manager, balance_service))
     }
 
     // ─── Main loop ───────────────────────────────────────────────────────────
@@ -192,10 +197,36 @@ impl MarketOracleService {
             );
         }
 
+        // Unique ID for this instance — used as the lock value so we can identify the holder.
+        let instance_id = uuid::Uuid::new_v4().to_string();
+        // Lock TTL is 80 % of the interval so it always expires before the next tick,
+        // even if this instance crashes mid-tick without releasing the lock.
+        let lock_ttl_secs = (interval_secs * 4 / 5).max(60);
+
         loop {
             let now_ts = unix_now();
             let prev_interval_start = now_ts.saturating_sub(interval_secs);
             let next_interval_ts    = now_ts + interval_secs;
+
+            // Distributed lock — only one CLOB instance should create markets per interval.
+            // The lock key is aligned to the interval boundary so both instances target the
+            // same key and the loser skips without error.
+            let lock_key = format!("oracle:tick:lock:{}", prev_interval_start);
+            let acquired = self.store
+                .try_acquire_lock(&lock_key, &instance_id, lock_ttl_secs)
+                .await
+                .unwrap_or(false);
+
+            if !acquired {
+                info!(
+                    instance_id = %instance_id,
+                    lock_key = %lock_key,
+                    "Oracle tick skipped — another instance holds the market-creation lock"
+                );
+                let wait = secs_until_next_interval(interval_secs);
+                sleep(Duration::from_secs(wait.max(1) + GRACE_SECS)).await;
+                continue;
+            }
 
             info!(
                 assets = ?ORACLE_ASSETS,
@@ -507,6 +538,36 @@ impl MarketOracleService {
                     ClobError::InvalidPrice(format!("failed to scale oracle price {}", price))
                 })?;
                 let tx_hash = self.resolve_market(market_id, final_price).await?;
+
+                // Credit CLOB in-memory balances for the winning side so users see
+                // their funds returned without waiting for on-chain withdrawal.
+                let outcome_yes = price >= strike_decimal;
+                let winning_side = if outcome_yes { "yes" } else { "no" };
+                let market_key = format!("{}-{}", asset, market_id);
+                let pos_key = format!("positions:{}:{}", market_key, winning_side);
+
+                match self.store.get_positions(&pos_key).await {
+                    Ok(positions) if !positions.is_empty() => {
+                        let mut total_payout = Decimal::ZERO;
+                        for (user_id, net_size) in &positions {
+                            if *net_size > Decimal::ZERO {
+                                self.balance_service.credit(user_id, "USDC", *net_size);
+                                total_payout += net_size;
+                            }
+                        }
+                        info!(
+                            market = %market_key,
+                            outcome = if outcome_yes { "YES" } else { "NO" },
+                            recipients = positions.len(),
+                            total_payout = %total_payout,
+                            "CLOB payouts distributed for resolved market"
+                        );
+                        let _ = self.store.delete_key(&pos_key).await;
+                    }
+                    Ok(_) => {} // no positions recorded (e.g. MM-only market with no user fills)
+                    Err(e) => warn!(market = %market_key, error = %e, "Failed to read positions for CLOB payout — skipping"),
+                }
+
                 audit.status = OracleResolutionStatus::ResolvePublished;
                 audit.final_price = Some(price.to_string());
                 audit.published_tx_hash = Some(tx_hash.clone());

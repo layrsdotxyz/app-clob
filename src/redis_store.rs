@@ -217,11 +217,64 @@ impl RedisStore {
         Ok(())
     }
 
+    /// Atomically SET key=value with EX ttl_secs, only if key does not exist (SET NX EX).
+    /// Returns true if the lock was acquired, false if it already existed.
+    /// Used to elect a single CLOB instance as the oracle market-creator per interval.
+    pub async fn try_acquire_lock(&self, key: &str, value: &str, ttl_secs: u64) -> ClobResult<bool> {
+        let mut conn = self.conn.clone();
+        let result: Option<String> = redis::cmd("SET")
+            .arg(key)
+            .arg(value)
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl_secs)
+            .query_async(&mut conn)
+            .await?;
+        Ok(result.is_some())
+    }
+
     /// Delete a key from Redis.
     pub async fn delete_key(&self, key: &str) -> ClobResult<()> {
         let mut conn = self.conn.clone();
         conn.del::<_, ()>(key).await?;
         Ok(())
+    }
+
+    /// Atomically increment a user's prediction market position by `delta`.
+    ///
+    /// Key format: `positions:{parent_market_id}:{yes|no}`
+    /// Value: Redis hash of `{user_id -> decimal_string}`.
+    pub async fn increment_position(&self, key: &str, user_id: &str, delta: rust_decimal::Decimal) -> ClobResult<()> {
+        if std::env::var("REDIS_COMPAT_DISABLE_HASHES").as_deref() == Ok("true") {
+            let mut entries = self.get_hash_entries(key).await?;
+            let current = entries.get(user_id)
+                .and_then(|v| rust_decimal::Decimal::from_str_exact(v).ok())
+                .unwrap_or(rust_decimal::Decimal::ZERO);
+            entries.insert(user_id.to_string(), (current + delta).to_string());
+            return self.set_hash_entries(key, &entries).await;
+        }
+        let mut conn = self.conn.clone();
+        let _: String = redis::cmd("HINCRBYFLOAT")
+            .arg(key)
+            .arg(user_id)
+            .arg(delta.to_string())
+            .query_async(&mut conn)
+            .await?;
+        Ok(())
+    }
+
+    /// Read all positions from a prediction market position hash.
+    pub async fn get_positions(&self, key: &str) -> ClobResult<std::collections::HashMap<String, rust_decimal::Decimal>> {
+        let raw: std::collections::HashMap<String, String> =
+            if std::env::var("REDIS_COMPAT_DISABLE_HASHES").as_deref() == Ok("true") {
+                self.get_hash_entries(key).await?
+            } else {
+                let mut conn = self.conn.clone();
+                conn.hgetall(key).await?
+            };
+        Ok(raw.into_iter()
+            .filter_map(|(k, v)| rust_decimal::Decimal::from_str_exact(&v).ok().map(|d| (k, d)))
+            .collect())
     }
 
     /// Returns true if the key exists in Redis.

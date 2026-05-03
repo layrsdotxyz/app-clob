@@ -139,6 +139,11 @@ impl SettlementEngine {
             tracing::error!(trade_id = %trade.id, error = %error, "Failed to update market stats after trade settlement");
         }
 
+        // Record the buyer's long position for resolution payout (non-fatal).
+        if let Err(error) = self.record_position_for_trade(trade).await {
+            tracing::warn!(trade_id = %trade.id, error = %error, "Failed to record position — payout may be skipped for this fill");
+        }
+
         tracing::info!(
             trade_id = %trade.id,
             maker_alias = %user_alias(&trade.maker_user_id),
@@ -149,6 +154,29 @@ impl SettlementEngine {
         );
 
         Ok(())
+    }
+
+    /// Record the buyer's position in Redis for payout distribution at market resolution.
+    ///
+    /// Only applies to oracle-service binary sub-markets (suffix "-YES" or "-NO").
+    /// The buyer is: the taker when trade.side == Buy, the maker when trade.side == Sell.
+    async fn record_position_for_trade(&self, trade: &Trade) -> ClobResult<()> {
+        let (parent_id, side) = if let Some(s) = trade.market_id.strip_suffix("-YES") {
+            (s, "yes")
+        } else if let Some(s) = trade.market_id.strip_suffix("-NO") {
+            (s, "no")
+        } else {
+            return Ok(());
+        };
+
+        let pos_key = format!("positions:{}:{}", parent_id, side);
+
+        let buyer_id = match trade.side {
+            OrderSide::Buy => &trade.taker_user_id,
+            OrderSide::Sell => &trade.maker_user_id,
+        };
+
+        self.store.increment_position(&pos_key, buyer_id, trade.size).await
     }
 
     pub fn start_trade_persistence_worker(self: Arc<Self>) -> Option<JoinHandle<()>> {

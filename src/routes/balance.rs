@@ -84,9 +84,12 @@ pub async fn deposit_balance(
     // a separate balance bucket the matching engine never sees.
     let user_id = req.user_id.trim().to_lowercase();
 
-    state.balance_service.deposit(&user_id, &req.market_id, amount);
+    // Balance is stored under the global "USDC" token key regardless of which market
+    // the deposit references. The matching engine always checks the "USDC" bucket, so
+    // depositing to any other key would produce a balance the order check never sees.
+    state.balance_service.deposit(&user_id, "USDC", amount);
 
-    let new_balance = state.balance_service.get_total_balance(&user_id, &req.market_id);
+    let new_balance = state.balance_service.get_total_balance(&user_id, "USDC");
 
     Ok(Json(DepositResponse {
         success: true,

@@ -384,7 +384,17 @@ impl MatchingEngine {
                 if order.remaining <= Decimal::ZERO {
                     break;
                 }
-                
+
+                // Self-trade prevention: skip orders from the same user.
+                if counter_order.user_id == order.user_id {
+                    tracing::debug!(
+                        user_id = %order.user_id,
+                        market_id = %order.market_id,
+                        "STP: skipping self-trade"
+                    );
+                    continue;
+                }
+
                 // Calculate fill size
                 let fill_size = order.remaining.min(counter_order.remaining);
                 let fill_price = counter_order.price; // Maker price
