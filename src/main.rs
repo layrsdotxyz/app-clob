@@ -495,7 +495,7 @@ async fn async_main() -> Result<()> {
 
     // Start WebSocket broadcast task
     let ws_task = tokio::spawn(websocket::broadcast_task(
-        ws_manager,
+        ws_manager.clone(),
         orderbook_manager.clone(),
     ));
 
@@ -569,6 +569,7 @@ async fn async_main() -> Result<()> {
     let pm_settlement_task = prediction_market_relayer.clone().map(|relayer| {
         let rs = redis_store.clone();
         let pp = prover_pipeline.clone();
+        let ws = ws_manager.clone();
         let poll_secs = std::env::var("PM_SETTLEMENT_WORKER_POLL_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -580,6 +581,7 @@ async fn async_main() -> Result<()> {
                     rs.clone(),
                     pp.clone(),
                     relayer.clone(),
+                    ws.clone(),
                     poll_secs,
                 );
                 match worker.start().await {

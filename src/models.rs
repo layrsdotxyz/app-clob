@@ -288,6 +288,13 @@ pub enum WsMessage {
     Error {
         message: String,
     },
+    Fill {
+        market_id: String,
+        amount: String,
+        side: String,
+        trade_id: String,
+        tx_hash: String,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]

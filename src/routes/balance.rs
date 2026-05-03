@@ -173,6 +173,13 @@ pub struct BalanceProofRequest {
     pub honk_proof_hex: String,
     /// Ordered `0x`-prefixed `bytes32` public inputs.
     pub public_inputs: Vec<String>,
+    /// Optional full circuit witness (snarkjs-format input object) for
+    /// server-side ZK proof generation at settlement time. When provided it is
+    /// stored in Redis keyed by `pending_witness:{user_id}:{market_id}` so that
+    /// `create_order` can attach it to the `Order` without the frontend having
+    /// to resend the (potentially large) witness in the order request itself.
+    #[serde(default)]
+    pub note_witness: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -316,6 +323,30 @@ pub async fn submit_balance_proof(
         .redis_store
         .set_with_expiry(&lock_key, &soft_lock.to_string(), BALANCE_PROOF_TTL_SECS)
         .await;
+
+    // If the client supplied a circuit witness, park it in Redis so that
+    // `create_order` can attach it to the Order without requiring the
+    // (potentially large) witness to be resent in the order request body.
+    // TTL matches the balance-proof soft-lock (5 minutes); consumed on first use.
+    if let Some(witness) = &req.note_witness {
+        match serde_json::to_string(witness) {
+            Ok(witness_json) => {
+                let witness_key = format!("pending_witness:{}:{}", auth.user_id, req.market_id);
+                let _ = state
+                    .redis_store
+                    .set_with_expiry(&witness_key, &witness_json, BALANCE_PROOF_TTL_SECS)
+                    .await;
+                tracing::debug!(
+                    user_id = %auth.user_id,
+                    market_id = %req.market_id,
+                    "Stored pending note_witness for order submission"
+                );
+            }
+            Err(e) => {
+                tracing::warn!("Failed to serialize note_witness for Redis storage: {e}");
+            }
+        }
+    }
 
     // Fire-and-forget on-chain lockCollateral — settleFill requires noteLockExpiry != 0.
     // required_amount is public_inputs[2] per pm_balance_proof.nr circuit layout.

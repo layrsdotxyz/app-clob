@@ -21,6 +21,8 @@ pub struct CreateOrderRequest {
     pub time_in_force: TimeInForce,
     pub price: rust_decimal::Decimal,
     pub size: rust_decimal::Decimal,
+    #[serde(default)]
+    pub note_witness: Option<serde_json::Value>,
 }
 
 fn default_order_type() -> OrderType {
@@ -44,8 +46,26 @@ pub async fn create_order(
 ) -> ClobResult<impl IntoResponse> {
     // Create order — normalize user_id to lowercase to match balance_service key
     // (deposit_balance always stores at lowercase; mixed EIP-55 casing would miss the bucket)
-    let order = Order::new(
-        req.user_id.trim().to_lowercase(),
+    let user_id = req.user_id.trim().to_lowercase();
+
+    // Resolve note_witness: use the one supplied in the request, or fall back to
+    // any pending witness stored by the balance-proof step (keyed by user+market).
+    let note_witness: Option<serde_json::Value> = if req.note_witness.is_some() {
+        req.note_witness
+    } else {
+        let pending_key = format!("pending_witness:{}:{}", user_id, req.market_id);
+        match state.redis_store.get_optional(&pending_key).await {
+            Ok(Some(raw)) => {
+                // consume the one-time witness so it cannot be replayed
+                let _ = state.redis_store.delete_key(&pending_key).await;
+                serde_json::from_str(&raw).ok()
+            }
+            _ => None,
+        }
+    };
+
+    let mut order = Order::new(
+        user_id,
         req.market_id,
         req.side,
         req.order_type,
@@ -53,7 +73,8 @@ pub async fn create_order(
         req.price,
         req.size,
     );
-    
+    order.note_witness = note_witness;
+
     // Submit to matching engine
     let result = state.matching_engine.submit_order(order).await?;
     

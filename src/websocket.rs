@@ -192,6 +192,32 @@ impl WebSocketManager {
         let _ = tx.send(msg);
     }
 
+    /// Send a fill event to a specific user (fire-and-forget; ignored if the user has no active channel).
+    pub fn send_fill_event(
+        &self,
+        user_id: &str,
+        market_id: &str,
+        amount: &str,
+        side: &str,
+        trade_id: &str,
+        tx_hash: &str,
+    ) {
+        let tx = self.user_channels
+            .entry(user_id.to_string())
+            .or_insert_with(|| broadcast::channel(100).0)
+            .clone();
+
+        let msg = WsMessage::Fill {
+            market_id: market_id.to_string(),
+            amount: amount.to_string(),
+            side: side.to_string(),
+            trade_id: trade_id.to_string(),
+            tx_hash: tx_hash.to_string(),
+        };
+
+        let _ = tx.send(msg);
+    }
+
     fn make_channel_key(&self, channel: &str, market_id: Option<&str>) -> String {
         match market_id {
             Some(mid) => format!("{}:{}", channel, mid),

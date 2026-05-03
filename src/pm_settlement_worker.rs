@@ -13,12 +13,14 @@ use crate::{
     prediction_market_settlement::{PredictionMarketSettlementJob, PM_SETTLEMENT_JOB_PREFIX, PM_SETTLEMENT_QUEUE},
     proof_generation::{ProverJobStatus, ProverJobType, ProverPipeline, parse_honk_proof_from_output, low_high_hex_to_bytes32, parse_u128_hex},
     redis_store::RedisStore,
+    websocket::WebSocketManager,
 };
 
 pub struct PredictionMarketSettlementWorker {
     store: Arc<RedisStore>,
     prover_pipeline: Arc<ProverPipeline>,
     relayer: Arc<PredictionMarketRelayer>,
+    ws_manager: Arc<WebSocketManager>,
     poll_interval: Duration,
 }
 
@@ -27,12 +29,14 @@ impl PredictionMarketSettlementWorker {
         store: Arc<RedisStore>,
         prover_pipeline: Arc<ProverPipeline>,
         relayer: Arc<PredictionMarketRelayer>,
+        ws_manager: Arc<WebSocketManager>,
         poll_interval_secs: u64,
     ) -> Self {
         Self {
             store,
             prover_pipeline,
             relayer,
+            ws_manager,
             poll_interval: Duration::from_secs(if poll_interval_secs == 0 { 2 } else { poll_interval_secs }),
         }
     }
@@ -128,54 +132,23 @@ impl PredictionMarketSettlementWorker {
                 continue;
             }
 
-            let payload = json!({
-                "pm_settlement_job_id": job.job_id,
-                "trade_id": job.trade_id,
-                "market_id": job.market_id,
-                "maker_order_id": job.maker_order_id,
-                "taker_order_id": job.taker_order_id,
-                "maker_user_id": job.maker_user_id,
-                "taker_user_id": job.taker_user_id,
-                "maker_side": job.maker_side,
-                "taker_side": job.taker_side,
-                "maker_note_nullifier_low": job.maker_note_nullifier_low,
-                "maker_note_nullifier_high": job.maker_note_nullifier_high,
-                "taker_note_nullifier_low": job.taker_note_nullifier_low,
-                "taker_note_nullifier_high": job.taker_note_nullifier_high,
-                "maker_fill_size": job.maker_fill_size,
-                "taker_fill_size": job.taker_fill_size,
-                "price": job.price,
-                "maker_fee": job.maker_fee,
-                "taker_fee": job.taker_fee,
-            });
-
-            match self
-                .prover_pipeline
-                .submit_job(
-                    ProverJobType::PrivateTransferSettlement,
-                    "pm_settlement",
-                    &payload,
-                )
-                .await
-            {
-                Ok(proof_job) => {
-                    job.proof_job_id = Some(proof_job.job_id.clone());
-                    job.settlement_status = "proof_pending".to_string();
-                    job.last_error = None;
-                    self.save_job(&job).await?;
-                    info!(
-                        settlement_job_id = %job.job_id,
-                        prover_job_id = %proof_job.job_id,
-                        "PM settlement proof job submitted"
-                    );
-                }
-                Err(e) => {
-                    job.settlement_status = "proof_submission_failed".to_string();
-                    job.last_error = Some(e.to_string());
-                    self.save_job(&job).await?;
-                    warn!(settlement_job_id = %job.job_id, error = %e, "Failed to submit PM settlement proof job");
-                }
-            }
+            // Settlement jobs are always created with a maker leg and a taker leg
+            // (see settlement.rs). A job that reaches here with no legs can only exist
+            // due to a malformed Redis record. Submitting trade metadata as proof input
+            // would produce wrong ZK witnesses — the pm_settlement circuit expects
+            // owner_key_hash, input_amount, nullifier, receiver_commitment, etc. —
+            // and bb execute would fail with an opaque wrong-input error downstream.
+            let err = ClobError::Internal(
+                "settlement job has no legs — cannot generate ZK proof without per-leg circuit inputs"
+                    .to_string(),
+            );
+            job.settlement_status = "proof_submission_failed".to_string();
+            job.last_error = Some(err.to_string());
+            self.save_job(&job).await?;
+            warn!(
+                settlement_job_id = %job.job_id,
+                "PM settlement job has no legs; cannot generate ZK proof — marking failed"
+            );
         }
     }
 
@@ -293,8 +266,69 @@ impl PredictionMarketSettlementWorker {
                 job.legs[leg_index].status = "settled".to_string();
                 job.legs[leg_index].last_error = None;
                 if !job.settlement_txs.iter().any(|existing| existing == &tx_hash) {
-                    job.settlement_txs.push(tx_hash);
+                    job.settlement_txs.push(tx_hash.clone());
                 }
+
+                // --- Post-leg-settlement side effects (best-effort) ---
+                let leg = &job.legs[leg_index];
+
+                // 1. Notify vault-service about the new Merkle leaf for this leg's output note.
+                let vault_url = std::env::var("VAULT_INTERNAL_URL").unwrap_or_default();
+                if !vault_url.is_empty() {
+                    let url = format!("{}/v1/merkle/note", vault_url.trim_end_matches('/'));
+                    let leg_vault = leg.vault_address.clone();
+                    let tx_clone = tx_hash.clone();
+                    let leg_role_clone = leg.leg_role.clone();
+                    let job_id_clone = job.job_id.clone();
+                    tokio::spawn(async move {
+                        let client = reqwest::Client::new();
+                        let body = serde_json::json!({
+                            "vault_address": leg_vault,
+                            "tx_hash": tx_clone,
+                        });
+                        match client.post(&url).json(&body).send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                tracing::info!(
+                                    settlement_job_id = %job_id_clone,
+                                    leg_role = %leg_role_clone,
+                                    "Notified vault-service of PM leg fill leaf"
+                                );
+                            }
+                            Ok(resp) => {
+                                tracing::warn!(
+                                    settlement_job_id = %job_id_clone,
+                                    leg_role = %leg_role_clone,
+                                    status = %resp.status(),
+                                    "vault-service merkle/note returned non-success for leg"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    settlement_job_id = %job_id_clone,
+                                    leg_role = %leg_role_clone,
+                                    error = %e,
+                                    "Failed to notify vault-service of PM leg fill leaf"
+                                );
+                            }
+                        }
+                    });
+                }
+
+                // 2. Broadcast WebSocket fill event for this leg's user.
+                let user_id = leg.user_id.clone();
+                let side_str = format!("{:?}", leg.side).to_uppercase();
+                let fill_size = leg.fill_size.clone();
+                let market_id = job.market_id.clone();
+                let trade_id = job.trade_id.clone();
+                self.ws_manager.send_fill_event(
+                    &user_id,
+                    &market_id,
+                    &fill_size,
+                    &side_str,
+                    &trade_id,
+                    &tx_hash,
+                );
+
                 Ok(())
             }
             Err(e) => {
@@ -400,6 +434,70 @@ impl PredictionMarketSettlementWorker {
         job.last_error = None;
         self.save_job(job).await?;
         info!(settlement_job_id = %job.job_id, tx_count = job.settlement_txs.len(), "PM settlement relayed on-chain");
+
+        // --- Post-settlement side effects (best-effort, non-blocking) ---
+
+        // 1. Register output note commitments with vault-service as Merkle leaves.
+        let latest_tx = job.settlement_txs.last().cloned().unwrap_or_default();
+        let vault_url = std::env::var("VAULT_INTERNAL_URL").unwrap_or_default();
+        if !vault_url.is_empty() {
+            let vault_addr = job.vault_address.clone();
+            let tx_clone = latest_tx.clone();
+            let job_id_clone = job.job_id.clone();
+            let url = format!("{}/v1/merkle/note", vault_url.trim_end_matches('/'));
+            tokio::spawn(async move {
+                let client = reqwest::Client::new();
+                // Maker leg: use maker nullifier high as a proxy commitment identifier (no explicit output commitment field on job).
+                // We register one leaf per settled leg — the commitment is derived server-side by vault-service from the tx.
+                let body = serde_json::json!({
+                    "vault_address": vault_addr,
+                    "tx_hash": tx_clone,
+                });
+                match client.post(&url).json(&body).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        tracing::info!(
+                            settlement_job_id = %job_id_clone,
+                            "Notified vault-service of settled PM fill leaves"
+                        );
+                    }
+                    Ok(resp) => {
+                        tracing::warn!(
+                            settlement_job_id = %job_id_clone,
+                            status = %resp.status(),
+                            "vault-service merkle/note returned non-success"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            settlement_job_id = %job_id_clone,
+                            error = %e,
+                            "Failed to notify vault-service of PM fill leaves"
+                        );
+                    }
+                }
+            });
+        }
+
+        // 2. Broadcast WebSocket fill events to maker and taker.
+        let maker_side = format!("{:?}", job.maker_side).to_uppercase();
+        let taker_side = format!("{:?}", job.taker_side).to_uppercase();
+        self.ws_manager.send_fill_event(
+            &job.maker_user_id,
+            &job.market_id,
+            &job.maker_fill_size,
+            &maker_side,
+            &job.trade_id,
+            &latest_tx,
+        );
+        self.ws_manager.send_fill_event(
+            &job.taker_user_id,
+            &job.market_id,
+            &job.taker_fill_size,
+            &taker_side,
+            &job.trade_id,
+            &latest_tx,
+        );
+
         Ok(())
     }
 
