@@ -42,9 +42,10 @@ pub async fn create_order(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateOrderRequest>,
 ) -> ClobResult<impl IntoResponse> {
-    // Create order
+    // Create order — normalize user_id to lowercase to match balance_service key
+    // (deposit_balance always stores at lowercase; mixed EIP-55 casing would miss the bucket)
     let order = Order::new(
-        req.user_id,
+        req.user_id.trim().to_lowercase(),
         req.market_id,
         req.side,
         req.order_type,
@@ -78,10 +79,11 @@ pub async fn cancel_order(
     Path(order_id): Path<Uuid>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> ClobResult<impl IntoResponse> {
-    let user_id = params.get("user_id")
+    let raw_user_id = params.get("user_id")
         .ok_or_else(|| crate::error::ClobError::Unauthorized("user_id query parameter required".to_string()))?;
-    
-    let order = state.matching_engine.cancel_order(order_id, user_id).await?;
+    let user_id = raw_user_id.trim().to_lowercase();
+
+    let order = state.matching_engine.cancel_order(order_id, &user_id).await?;
     
     // Broadcast order update
     state.ws_manager.send_order_update(&order.user_id, &order);
@@ -106,7 +108,7 @@ pub async fn get_user_orders(
     State(state): State<Arc<AppState>>,
     Path(user_id): Path<String>,
 ) -> ClobResult<impl IntoResponse> {
-    let orders = state.orderbook_manager.get_user_orders(&user_id).await?;
+    let orders = state.orderbook_manager.get_user_orders(&user_id.trim().to_lowercase()).await?;
     
     Ok(Json(orders))
 }
