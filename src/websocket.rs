@@ -29,11 +29,14 @@ impl WebSocketManager {
         let session_id = Uuid::new_v4();
         tracing::info!(session_id = %session_id, user_id = ?user_id, "WebSocket connected");
 
-        // Subscribe to user-specific channel if authenticated
-        let mut user_rx = user_id.as_ref().and_then(|uid| {
+        // Subscribe to user-specific channel if authenticated.
+        // Create the channel if it doesn't exist yet — this ensures balance_update,
+        // order_update, and fill pushes reach clients who connect before placing any order.
+        let mut user_rx = user_id.as_ref().map(|uid| {
             self.user_channels
-                .get(uid)
-                .map(|tx| tx.subscribe())
+                .entry(uid.clone())
+                .or_insert_with(|| broadcast::channel(100).0)
+                .subscribe()
         });
 
         let (agg_tx, mut agg_rx) = tokio::sync::mpsc::unbounded_channel::<WsMessage>();
@@ -219,15 +222,18 @@ impl WebSocketManager {
     }
 
     /// Push a balance update to a user's private WS channel.
-    /// No-op if the user has no active connection — the REST endpoint covers that case.
+    /// Creates the channel if it doesn't exist so the push is never silently dropped.
     pub fn send_balance_update(&self, user_id: &str, total: &str, reserved: &str, available: &str) {
-        let Some(entry) = self.user_channels.get(user_id) else { return; };
+        let tx = self.user_channels
+            .entry(user_id.to_string())
+            .or_insert_with(|| broadcast::channel(100).0)
+            .clone();
         let msg = WsMessage::BalanceUpdate {
             total: total.to_string(),
             reserved: reserved.to_string(),
             available: available.to_string(),
         };
-        let _ = entry.value().send(msg);
+        let _ = tx.send(msg);
     }
 
     fn make_channel_key(&self, channel: &str, market_id: Option<&str>) -> String {
