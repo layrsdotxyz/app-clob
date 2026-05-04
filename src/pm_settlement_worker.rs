@@ -269,6 +269,16 @@ impl PredictionMarketSettlementWorker {
                     job.settlement_txs.push(tx_hash.clone());
                 }
 
+                // Write settlement_tx back to the Trade so frontend can show explorer link.
+                let store = self.store.clone();
+                let trade_id = job.trade_id.clone();
+                let tx = tx_hash.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = store.update_trade_settlement_tx(&trade_id, &tx).await {
+                        tracing::warn!(trade_id = %trade_id, error = %e, "Failed to write settlement_tx to Trade");
+                    }
+                });
+
                 // --- Post-leg-settlement side effects (best-effort) ---
                 let leg = &job.legs[leg_index];
 
@@ -416,6 +426,14 @@ impl PredictionMarketSettlementWorker {
             match tx_hash {
                 Ok(tx_hash) => {
                     job.relayed_leg_count += 1;
+                    let store = self.store.clone();
+                    let trade_id = job.trade_id.clone();
+                    let tx_clone = tx_hash.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = store.update_trade_settlement_tx(&trade_id, &tx_clone).await {
+                            tracing::warn!(trade_id = %trade_id, error = %e, "Failed to write settlement_tx to Trade");
+                        }
+                    });
                     job.settlement_txs.push(tx_hash);
                     job.settlement_status = "relay_pending".to_string();
                     job.last_error = None;

@@ -612,6 +612,20 @@ impl RedisStore {
         Ok(())
     }
 
+    pub async fn update_trade_settlement_tx(&self, trade_id: &str, tx_hash: &str) -> ClobResult<()> {
+        let mut conn = self.conn.clone();
+        let key = format!("trade:{}", trade_id);
+        let Some(json) = conn.get::<_, Option<String>>(&key).await? else {
+            return Ok(()); // trade not in Redis — nothing to update
+        };
+        let mut trade: crate::models::Trade = serde_json::from_str(&json)?;
+        if let Ok(h) = tx_hash.parse::<ethers::types::H256>() {
+            trade.settlement_tx = Some(h);
+        }
+        conn.set::<_, _, ()>(&key, serde_json::to_string(&trade)?).await?;
+        Ok(())
+    }
+
     pub async fn get_recent_trades(&self, market_id: &str, limit: usize) -> ClobResult<Vec<Trade>> {
         let mut conn = self.conn.clone();
         let key = format!("{}{}", MARKET_TRADES_PREFIX, market_id);

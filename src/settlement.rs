@@ -484,6 +484,12 @@ impl SettlementEngine {
             );
         }
 
+        // Store trade_id → job_id mapping so the worker can look up which job settled a trade
+        let trade_job_key = format!("trade:settlement_job:{}", trade.id);
+        if let Err(e) = self.store.set(&trade_job_key, &job_id).await {
+            tracing::warn!(trade_id = %trade.id, error = %e, "Failed to store trade→settlement_job mapping");
+        }
+
         Ok(())
     }
 
