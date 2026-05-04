@@ -10,9 +10,14 @@ const ORDER_PREFIX: &str = "order:";
 const ORDERBOOK_BID_PREFIX: &str = "ob:bid:";
 const ORDERBOOK_ASK_PREFIX: &str = "ob:ask:";
 const USER_ORDERS_PREFIX: &str = "user:orders:";
+/// Sorted set variant (score = unix timestamp) — used by get_user_orders for O(log N) paged reads.
+const USER_ORDERS_Z_PREFIX: &str = "user:orders:z:";
 const MARKET_TRADES_PREFIX: &str = "market:trades:";
 const USER_TRADES_PREFIX: &str = "user:trades:";
 const MARKET_STATS_PREFIX: &str = "market:stats:";
+
+/// Max orders returned by get_user_orders to prevent timeout on bloated user sets.
+const USER_ORDERS_LIMIT: isize = 500;
 
 pub struct RedisStore {
     conn: ConnectionManager,
@@ -321,13 +326,17 @@ impl RedisStore {
         
         conn.set::<_, _, ()>(&key, json).await?;
         
-        // Add to user's order set
+        // Add to user's order set (legacy SET for backward compat)
         let user_key = format!("{}{}", USER_ORDERS_PREFIX, order.user_id);
         if std::env::var("REDIS_COMPAT_DISABLE_SETS").as_deref() == Ok("true") {
             self.append_json_array_value(&user_key, &order.id.to_string()).await?;
         } else {
             conn.sadd::<_, _, ()>(&user_key, order.id.to_string()).await?;
         }
+        // Also write to sorted set (score = timestamp) for fast paged reads.
+        let user_z_key = format!("{}{}", USER_ORDERS_Z_PREFIX, order.user_id);
+        let score = order.created_at.timestamp() as f64;
+        let _ = conn.zadd::<_, _, _, ()>(&user_z_key, order.id.to_string(), score).await;
         
         Ok(())
     }
@@ -365,19 +374,32 @@ impl RedisStore {
 
     pub async fn get_user_orders(&self, user_id: &str) -> ClobResult<Vec<Order>> {
         let mut conn = self.conn.clone();
-        let user_key = format!("{}{}", USER_ORDERS_PREFIX, user_id);
-        
-        let order_ids: Vec<String> = if std::env::var("REDIS_COMPAT_DISABLE_SETS").as_deref() == Ok("true") {
-            self.get_optional(&user_key)
-                .await?
-                .as_deref()
-                .and_then(|raw| serde_json::from_str(raw).ok())
-                .unwrap_or_default()
+
+        // Fast path: sorted set (most recent USER_ORDERS_LIMIT orders by timestamp).
+        let user_z_key = format!("{}{}", USER_ORDERS_Z_PREFIX, user_id);
+        let z_ids: Vec<String> = conn
+            .zrevrange(&user_z_key, 0, USER_ORDERS_LIMIT - 1)
+            .await
+            .unwrap_or_default();
+
+        let order_ids: Vec<String> = if !z_ids.is_empty() {
+            z_ids
         } else {
-            conn.smembers(&user_key).await?
+            // Fallback: legacy SET — cap iteration to avoid timeout on large sets.
+            let user_key = format!("{}{}", USER_ORDERS_PREFIX, user_id);
+            let all_ids: Vec<String> = if std::env::var("REDIS_COMPAT_DISABLE_SETS").as_deref() == Ok("true") {
+                self.get_optional(&user_key)
+                    .await?
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str(raw).ok())
+                    .unwrap_or_default()
+            } else {
+                conn.smembers(&user_key).await?
+            };
+            all_ids.into_iter().take(USER_ORDERS_LIMIT as usize).collect()
         };
+
         let mut orders = Vec::new();
-        
         for order_id_str in order_ids {
             if let Ok(order_id) = Uuid::parse_str(&order_id_str) {
                 if let Some(order) = self.get_order(order_id).await? {
@@ -385,8 +407,22 @@ impl RedisStore {
                 }
             }
         }
-        
+
         Ok(orders)
+    }
+
+    /// Delete all resting orders from the bid and ask sorted sets for a market.
+    /// Does NOT remove order objects from Redis — only clears the orderbook depth.
+    /// Used to flush a clogged orderbook (e.g. after a market maker incident).
+    pub async fn flush_market_orderbook(&self, market_id: &str) -> ClobResult<usize> {
+        let mut conn = self.conn.clone();
+        let bid_key = format!("{}{}", ORDERBOOK_BID_PREFIX, market_id);
+        let ask_key = format!("{}{}", ORDERBOOK_ASK_PREFIX, market_id);
+        let bid_count: usize = conn.zcard(&bid_key).await.unwrap_or(0);
+        let ask_count: usize = conn.zcard(&ask_key).await.unwrap_or(0);
+        let _ = conn.del::<_, ()>(&bid_key).await;
+        let _ = conn.del::<_, ()>(&ask_key).await;
+        Ok(bid_count + ask_count)
     }
 
     // ==================== Order Book Operations ====================

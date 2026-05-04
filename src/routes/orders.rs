@@ -59,8 +59,32 @@ fn parse_pm_market_id(market_id: &str) -> Option<ethers::types::U256> {
 
 pub async fn create_order(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<CreateOrderRequest>,
 ) -> ClobResult<impl IntoResponse> {
+    // Phase 3a (optional) → Phase 3c (required): internal service key guard.
+    // Only the market-maker (and internal tooling) may use this endpoint.
+    let expected_key = std::env::var("INTERNAL_SERVICE_KEY").unwrap_or_default();
+    if !expected_key.is_empty() {
+        let provided = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "));
+        match provided {
+            Some(key) if key == expected_key => {} // valid
+            Some(_) => {
+                return Err(ClobError::Unauthorized(
+                    "invalid internal service key".to_string(),
+                ));
+            }
+            None => {
+                return Err(ClobError::Unauthorized(
+                    "Authorization header required".to_string(),
+                ));
+            }
+        }
+    }
+
     // Create order — normalize user_id to lowercase to match balance_service key
     // (deposit_balance always stores at lowercase; mixed EIP-55 casing would miss the bucket)
     let user_id = req.user_id.trim().to_lowercase();
