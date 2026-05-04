@@ -40,6 +40,7 @@ pub mod prediction_market_settlement;
 pub mod privacy;
 pub mod proof_batcher;
 pub mod proof_generation;
+pub mod proof_observability;
 pub mod rate_limiter;
 pub mod redis_store;
 pub mod routes;

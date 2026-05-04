@@ -40,6 +40,23 @@ pub struct CreateOrderResponse {
     pub trades: Vec<Trade>,
 }
 
+/// Extract the numeric on-chain market ID from a PM market string.
+/// "BTC-757-YES" → 757, "ETH-788-NO" → 788, "BTC-790" → 790, "USDC" → None.
+fn parse_pm_market_id(market_id: &str) -> Option<ethers::types::U256> {
+    let parsed = market_id
+        .split('-')
+        .nth(1)
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(ethers::types::U256::from);
+    if parsed.is_none() {
+        tracing::warn!(
+            market_id = %market_id,
+            "failed to parse on-chain market id; PM settlement will be skipped for orders in this market"
+        );
+    }
+    parsed
+}
+
 pub async fn create_order(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateOrderRequest>,
@@ -66,7 +83,7 @@ pub async fn create_order(
 
     let mut order = Order::new(
         user_id,
-        req.market_id,
+        req.market_id.clone(),
         req.side,
         req.order_type,
         req.time_in_force,
@@ -74,6 +91,7 @@ pub async fn create_order(
         req.size,
     );
     order.note_witness = note_witness;
+    order.market_id_uint = parse_pm_market_id(&req.market_id);
 
     // Submit to matching engine
     let result = state.matching_engine.submit_order(order).await?;
@@ -130,8 +148,33 @@ pub async fn get_user_orders(
     Path(user_id): Path<String>,
 ) -> ClobResult<impl IntoResponse> {
     let orders = state.orderbook_manager.get_user_orders(&user_id.trim().to_lowercase()).await?;
-    
     Ok(Json(orders))
+}
+
+/// DELETE /v1/admin/markets/:market_id/orderbook
+/// Flushes all resting orders from a market's bid/ask sorted sets.
+/// Protected by X-Internal-Key header.
+pub async fn flush_market_orderbook(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(market_id): Path<String>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let expected = std::env::var("INTERNAL_SERVICE_KEY").unwrap_or_default();
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if token != expected {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let flushed = state
+        .orderbook_manager
+        .store
+        .flush_market_orderbook(&market_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({ "market_id": market_id, "flushed": flushed })))
 }
 
 // ─── Commit-Reveal order placement ──────────────────────────────────────────
@@ -194,6 +237,9 @@ pub struct RevealOrderRequest {
     pub honk_proof_hex: String,
     /// Ordered `0x`-prefixed `bytes32` public inputs.
     pub public_inputs: Vec<String>,
+    /// pm_settlement circuit inputs (private note preimage + Merkle path + output notes).
+    #[serde(default)]
+    pub note_witness: Option<serde_json::Value>,
 }
 
 /// POST /v1/orders/commit
@@ -330,15 +376,17 @@ pub async fn reveal_order(
     let _ = state.redis_store.delete_key(&key).await;
 
     // Build and submit the order.
-    let order = Order::new(
+    let mut order = Order::new(
         auth.user_id.clone(),
-        record.market_id,
+        record.market_id.clone(),
         req.side,
         OrderType::Limit,
         TimeInForce::Gtc,
         req.price,
         req.size,
     );
+    order.note_witness = req.note_witness;
+    order.market_id_uint = parse_pm_market_id(&record.market_id);
 
     let result = state.matching_engine.submit_order(order).await?;
     state.ws_manager.send_order_update(&result.order.user_id, &result.order);

@@ -38,6 +38,9 @@ pub struct PredictionMarketSettlementLeg {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// proof_observability record ID for debugging bb execute/prove failures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof_attempt_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +119,7 @@ mod tests {
             relay_tx_hash: None,
             status: "pending".to_string(),
             last_error: None,
+            proof_attempt_id: None,
         }
     }
 

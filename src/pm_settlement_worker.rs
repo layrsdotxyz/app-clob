@@ -9,9 +9,11 @@ use tracing::{info, warn};
 
 use crate::{
     error::{ClobError, ClobResult},
+    poseidon2,
     prediction_market_relayer::PredictionMarketRelayer,
     prediction_market_settlement::{PredictionMarketSettlementJob, PM_SETTLEMENT_JOB_PREFIX, PM_SETTLEMENT_QUEUE},
     proof_generation::{ProverJobStatus, ProverJobType, ProverPipeline, parse_honk_proof_from_output, low_high_hex_to_bytes32, parse_u128_hex},
+    proof_observability,
     redis_store::RedisStore,
     websocket::WebSocketManager,
 };
@@ -82,8 +84,40 @@ impl PredictionMarketSettlementWorker {
                         continue;
                     }
 
-                    let proof_input = job.legs[leg_index].proof_input.clone();
+                    let mut proof_input = job.legs[leg_index].proof_input.clone();
                     let leg_role = job.legs[leg_index].leg_role.clone();
+
+                    if let Err(e) = fill_settlement_commitments(&mut proof_input) {
+                        job.legs[leg_index].status = "proof_submission_failed".to_string();
+                        job.legs[leg_index].last_error = Some(format!("commitment computation failed: {}", e));
+                        job.settlement_status = "proof_submission_failed".to_string();
+                        job.last_error = Some(e.to_string());
+                        self.save_job(&job).await?;
+                        warn!(
+                            settlement_job_id = %job.job_id,
+                            leg_role = %leg_role,
+                            error = %e,
+                            "Failed to compute pm_settlement commitments from private inputs"
+                        );
+                        break;
+                    }
+
+                    // Create observability record — captures full circuit inputs for debugging.
+                    let attempt_id = proof_observability::create_attempt(
+                        &self.store,
+                        "pm_settlement",
+                        Some(&job.legs[leg_index].user_id),
+                        Some(&job.trade_id),
+                        Some(&job.market_id),
+                        Some(proof_input.to_string()),
+                    )
+                    .await
+                    .unwrap_or_default();
+                    job.legs[leg_index].proof_attempt_id = if attempt_id.is_empty() {
+                        None
+                    } else {
+                        Some(attempt_id.clone())
+                    };
 
                     match self
                         .prover_pipeline
@@ -99,10 +133,19 @@ impl PredictionMarketSettlementWorker {
                             job.legs[leg_index].proof_job_id = Some(proof_job.job_id.clone());
                             job.legs[leg_index].status = "proof_pending".to_string();
                             job.legs[leg_index].last_error = None;
+                            // Update observability with prover job id.
+                            if !attempt_id.is_empty() {
+                                let _ = proof_observability::update_attempt(
+                                    &self.store, &attempt_id, "running",
+                                    Some(&proof_job.job_id),
+                                    None, None, None, None, None,
+                                ).await;
+                            }
                             info!(
                                 settlement_job_id = %job.job_id,
                                 leg_role = %leg_role,
                                 prover_job_id = %proof_job.job_id,
+                                proof_attempt_id = %attempt_id,
                                 "PM settlement leg proof job submitted"
                             );
                         }
@@ -111,6 +154,12 @@ impl PredictionMarketSettlementWorker {
                             job.legs[leg_index].last_error = Some(e.to_string());
                             job.settlement_status = "proof_submission_failed".to_string();
                             job.last_error = Some(e.to_string());
+                            if !attempt_id.is_empty() {
+                                let _ = proof_observability::update_attempt(
+                                    &self.store, &attempt_id, "verify_failed",
+                                    None, None, None, Some(e.to_string()), None, None,
+                                ).await;
+                            }
                             self.save_job(&job).await?;
                             warn!(
                                 settlement_job_id = %job.job_id,
@@ -260,6 +309,7 @@ impl PredictionMarketSettlementWorker {
             )
             .await;
 
+        let attempt_id = job.legs[leg_index].proof_attempt_id.clone();
         match tx_hash {
             Ok(tx_hash) => {
                 job.legs[leg_index].relay_tx_hash = Some(tx_hash.clone());
@@ -267,6 +317,12 @@ impl PredictionMarketSettlementWorker {
                 job.legs[leg_index].last_error = None;
                 if !job.settlement_txs.iter().any(|existing| existing == &tx_hash) {
                     job.settlement_txs.push(tx_hash.clone());
+                }
+                if let Some(ref aid) = attempt_id {
+                    let _ = proof_observability::update_attempt(
+                        &self.store, aid, "submitted",
+                        None, None, None, None, None, Some(tx_hash.clone()),
+                    ).await;
                 }
 
                 // Write settlement_tx back to the Trade so frontend can show explorer link.
@@ -342,6 +398,12 @@ impl PredictionMarketSettlementWorker {
                 Ok(())
             }
             Err(e) => {
+                if let Some(ref aid) = attempt_id {
+                    let _ = proof_observability::update_attempt(
+                        &self.store, aid, "submit_failed",
+                        None, None, None, Some(e.to_string()), None, None,
+                    ).await;
+                }
                 job.legs[leg_index].status = "relay_retry_pending".to_string();
                 job.legs[leg_index].last_error = Some(e.to_string());
                 Ok(())
@@ -532,6 +594,67 @@ impl PredictionMarketSettlementWorker {
             .set(&job.redis_key(), &serde_json::to_string(job)?)
             .await
     }
+}
+
+/// Compute and inject `receiver_commitment` and `change_commitment` into a pm_settlement
+/// `proof_input` JSON object using Poseidon2 (Barretenberg BN254 t=4).
+///
+/// The frontend sends private inputs only and leaves the public output commitments as `"0"`
+/// placeholders. This function recomputes them from the private inputs so `bb execute` gets
+/// a fully consistent Prover.toml.
+fn fill_settlement_commitments(proof_input: &mut serde_json::Value) -> ClobResult<()> {
+    fn parse_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> ClobResult<[u8; 32]> {
+        let s = obj.get(key)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ClobError::Internal(format!("pm_settlement proof_input missing field: {}", key)))?;
+        let n = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            BigUint::from_str_radix(hex, 16)
+        } else {
+            BigUint::from_str_radix(s, 10)
+        }.map_err(|e| ClobError::Internal(format!("invalid pm_settlement field {}: {}", key, e)))?;
+        let raw = n.to_bytes_be();
+        let mut out = [0u8; 32];
+        let start = 32usize.saturating_sub(raw.len());
+        out[start..].copy_from_slice(&raw[raw.len().saturating_sub(32)..]);
+        Ok(out)
+    }
+
+    fn biguint_to_decimal(b: &[u8; 32]) -> String {
+        BigUint::from_bytes_be(b).to_str_radix(10)
+    }
+
+    let obj = proof_input.as_object_mut()
+        .ok_or_else(|| ClobError::Internal("pm_settlement proof_input must be a JSON object".to_string()))?;
+
+    // Skip if already computed (non-zero placeholder injected by an earlier run).
+    let already_computed = obj.get("receiver_commitment")
+        .and_then(|v| v.as_str())
+        .map(|s| s != "0" && s != "0x0" && !s.is_empty())
+        .unwrap_or(false);
+    if already_computed {
+        return Ok(());
+    }
+
+    let receiver_key_hash = parse_field(obj, "receiver_key_hash")?;
+    let receiver_amount   = parse_field(obj, "receiver_amount")?;
+    let receiver_blind    = parse_field(obj, "receiver_blind")?;
+    let receiver_nonce    = parse_field(obj, "receiver_nonce")?;
+    let asset_domain      = parse_field(obj, "asset_domain")?;
+    let owner_key_hash    = parse_field(obj, "owner_key_hash")?;
+    let change_amount     = parse_field(obj, "change_amount")?;
+    let change_blind      = parse_field(obj, "change_blind")?;
+    let change_nonce      = parse_field(obj, "change_nonce")?;
+
+    let recv_amount_commit = poseidon2::hash_2(&receiver_amount, &receiver_blind)?;
+    let receiver_commitment = poseidon2::hash_4(&receiver_key_hash, &recv_amount_commit, &asset_domain, &receiver_nonce)?;
+
+    let chg_amount_commit = poseidon2::hash_2(&change_amount, &change_blind)?;
+    let change_commitment = poseidon2::hash_4(&owner_key_hash, &chg_amount_commit, &asset_domain, &change_nonce)?;
+
+    obj.insert("receiver_commitment".to_string(), serde_json::Value::String(biguint_to_decimal(&receiver_commitment)));
+    obj.insert("change_commitment".to_string(),   serde_json::Value::String(biguint_to_decimal(&change_commitment)));
+
+    Ok(())
 }
 
 /// Parsed from the prover output JSON — public signals only.

@@ -28,6 +28,7 @@ mod prediction_market_settlement;
 mod privacy;
 mod proof_batcher;
 mod proof_generation;
+mod proof_observability;
 mod rate_limiter;
 mod redis_store;
 mod routes;
@@ -479,9 +480,16 @@ async fn async_main() -> Result<()> {
                 .route("/v1/withdrawal", post(routes::withdrawal::initiate_withdrawal))
                 .route("/v1/withdrawal/:withdrawal_id/status", get(routes::withdrawal::get_withdrawal_status))
 
+                // Proof observability: inspect individual proof attempts and list by user.
+                .route("/v1/proofs/:proof_id", get(routes::proofs::get_proof_attempt))
+                .route("/v1/proofs/user/:user_id", get(routes::proofs::list_user_proof_attempts))
+
                 .route_layer(axum::middleware::from_fn(auth::require_auth))
         )
-        
+
+        // Admin endpoints — Bearer INTERNAL_SERVICE_KEY auth, no JWT
+        .route("/v1/admin/markets/:market_id/orderbook", delete(routes::orders::flush_market_orderbook))
+
         // Apply middleware (outermost → innermost in application order)
         // Rate limiter middleware reads RateLimiter from request extensions;
         // the Extension layer below injects it so the middleware can find it.

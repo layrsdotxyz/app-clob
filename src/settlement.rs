@@ -346,23 +346,22 @@ impl SettlementEngine {
             (format!("0x{:x}", raw), "0x0".to_string())
         }
 
-        let (maker_pot_low, maker_pot_high) = to_low_high(maker_fill.size * maker_fill.price);
-        let (maker_fee_low, maker_fee_high) = to_low_high(maker_fill.fee);
-        let (taker_pot_low, taker_pot_high) = to_low_high(taker_fill.size * taker_fill.price);
-        let (taker_fee_low, taker_fee_high) = to_low_high(taker_fill.fee);
-        let (payout_units_low, payout_units_high) = to_low_high(maker_fill.size);
+        // Only the party holding a ZK note (the real user) needs on-chain settlement.
+        // The MM side is CLOB balance-service only — no note, no on-chain leg.
+        let (user_order, user_fill, user_fill_index, user_role) =
+            if taker_order.note_witness.is_some() {
+                (taker_order, taker_fill, 1usize, "taker")
+            } else if maker_order.note_witness.is_some() {
+                (maker_order, maker_fill, 0usize, "maker")
+            } else {
+                // Neither side holds a ZK note — pure CLOB trade, no on-chain settlement.
+                return Ok(());
+            };
 
-        // Determine whether each side is buying YES (Buy) or YES-inverse (Sell).
-        let maker_position_side = matches!(maker_order.side, OrderSide::Buy);
-        let taker_position_side = matches!(taker_order.side, OrderSide::Buy);
-
-        let both_have_witness =
-            maker_order.note_witness.is_some() && taker_order.note_witness.is_some();
-        let settlement_status = if both_have_witness {
-            "pending_proof_generation"
-        } else {
-            "waiting_for_proof"
-        };
+        let (user_pot_low, user_pot_high) = to_low_high(user_fill.size * user_fill.price);
+        let (user_fee_low, user_fee_high) = to_low_high(user_fill.fee);
+        let (payout_units_low, payout_units_high) = to_low_high(user_fill.size);
+        let user_position_side = matches!(user_order.side, OrderSide::Buy);
 
         let vault_address = std::env::var("PM_TREASURY_ADDRESS")
             .or_else(|_| std::env::var("PREDICTION_MARKET_TREASURY_ADDRESS"))
@@ -370,65 +369,36 @@ impl SettlementEngine {
             .or_else(|_| std::env::var("PREDICTION_MARKET_VAULT_ADDRESS"))
             .unwrap_or_default();
 
-        let maker_leg = PredictionMarketSettlementLeg {
-            leg_role: "maker".to_string(),
-            order_id: maker_order.id.to_string(),
-            user_id: maker_order.user_id.clone(),
-            side: maker_order.side.clone(),
-            fill_size: maker_fill.size.to_string(),
-            fill_price: maker_fill.price.to_string(),
-            fee_amount: maker_fill.fee.to_string(),
+        let user_leg = PredictionMarketSettlementLeg {
+            leg_role: user_role.to_string(),
+            order_id: user_order.id.to_string(),
+            user_id: user_order.user_id.clone(),
+            side: user_order.side.clone(),
+            fill_size: user_fill.size.to_string(),
+            fill_price: user_fill.price.to_string(),
+            fee_amount: user_fill.fee.to_string(),
             market_id_onchain,
-            position_side: maker_position_side,
-            source_fill_index: 0,
-            proof_input: maker_order
+            position_side: user_position_side,
+            source_fill_index: user_fill_index,
+            proof_input: user_order
                 .note_witness
                 .clone()
                 .unwrap_or(serde_json::Value::Object(Default::default())),
             // Nullifiers come from the circuit's public output — "0x0" until proof runs.
             spent_note_nullifier_low: "0x0".to_string(),
             spent_note_nullifier_high: "0x0".to_string(),
-            pot_contribution_low: maker_pot_low,
-            pot_contribution_high: maker_pot_high,
-            position_payout_units_low: payout_units_low.clone(),
-            position_payout_units_high: payout_units_high.clone(),
-            trade_fee_amount_low: maker_fee_low,
-            trade_fee_amount_high: maker_fee_high,
-            vault_address: vault_address.clone(),
-            proof_job_id: None,
-            relay_tx_hash: None,
-            status: "pending".to_string(),
-            last_error: None,
-        };
-
-        let taker_leg = PredictionMarketSettlementLeg {
-            leg_role: "taker".to_string(),
-            order_id: taker_order.id.to_string(),
-            user_id: taker_order.user_id.clone(),
-            side: taker_order.side.clone(),
-            fill_size: taker_fill.size.to_string(),
-            fill_price: taker_fill.price.to_string(),
-            fee_amount: taker_fill.fee.to_string(),
-            market_id_onchain,
-            position_side: taker_position_side,
-            source_fill_index: 1,
-            proof_input: taker_order
-                .note_witness
-                .clone()
-                .unwrap_or(serde_json::Value::Object(Default::default())),
-            spent_note_nullifier_low: "0x0".to_string(),
-            spent_note_nullifier_high: "0x0".to_string(),
-            pot_contribution_low: taker_pot_low,
-            pot_contribution_high: taker_pot_high,
+            pot_contribution_low: user_pot_low,
+            pot_contribution_high: user_pot_high,
             position_payout_units_low: payout_units_low,
             position_payout_units_high: payout_units_high,
-            trade_fee_amount_low: taker_fee_low,
-            trade_fee_amount_high: taker_fee_high,
+            trade_fee_amount_low: user_fee_low,
+            trade_fee_amount_high: user_fee_high,
             vault_address: vault_address.clone(),
             proof_job_id: None,
             relay_tx_hash: None,
             status: "pending".to_string(),
             last_error: None,
+            proof_attempt_id: None,
         };
 
         let job = PredictionMarketSettlementJob {
@@ -441,7 +411,6 @@ impl SettlementEngine {
             taker_user_id: taker_order.user_id.clone(),
             maker_side: maker_order.side.clone(),
             taker_side: taker_order.side.clone(),
-            // Note nullifiers are populated from proof output, not known at job creation.
             maker_note_nullifier_low: "0x0".to_string(),
             maker_note_nullifier_high: "0x0".to_string(),
             taker_note_nullifier_low: "0x0".to_string(),
@@ -451,12 +420,12 @@ impl SettlementEngine {
             price: trade.price.to_string(),
             maker_fee: maker_fill.fee.to_string(),
             taker_fee: taker_fill.fee.to_string(),
-            settlement_status: settlement_status.to_string(),
+            settlement_status: "pending_proof_generation".to_string(),
             relayer_configured: !std::env::var("PM_RELAYER_PRIVATE_KEY")
                 .unwrap_or_default()
                 .is_empty(),
             vault_address,
-            legs: vec![maker_leg, taker_leg],
+            legs: vec![user_leg],
             proof_job_id: None,
             settlement_txs: vec![],
             relayed_leg_count: 0,
@@ -468,21 +437,12 @@ impl SettlementEngine {
             .set(&redis_key, &serde_json::to_string(&job)?)
             .await?;
 
-        // Only queue for processing immediately if we have the witness data.
-        if both_have_witness {
-            self.store.push_queue(PM_SETTLEMENT_QUEUE, &job_id).await?;
-            tracing::info!(
-                job_id = %job_id,
-                trade_id = %trade.id,
-                "PM settlement job created and queued (witness provided)"
-            );
-        } else {
-            tracing::info!(
-                job_id = %job_id,
-                trade_id = %trade.id,
-                "PM settlement job created, awaiting client witness"
-            );
-        }
+        self.store.push_queue(PM_SETTLEMENT_QUEUE, &job_id).await?;
+        tracing::info!(
+            job_id = %job_id,
+            trade_id = %trade.id,
+            "PM settlement job created and queued"
+        );
 
         // Store trade_id → job_id mapping so the worker can look up which job settled a trade
         let trade_job_key = format!("trade:settlement_job:{}", trade.id);
