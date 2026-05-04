@@ -801,13 +801,13 @@ impl Database {
         Ok(())
     }
 
-    /// Load all balances from DB into a Vec of (user_id_str, token_address, total, reserved).
-    /// Used on startup to re-populate the in-memory BalanceService.
+    /// Load all balances from DB into a Vec of (wallet_address, token_address, total, reserved).
+    /// Returns evm_address so the in-memory BalanceService key matches runtime lookups.
     pub async fn load_all_balances(
         &self,
     ) -> ClobResult<Vec<(String, String, Decimal, Decimal)>> {
         let rows = sqlx::query(
-            "SELECT u.user_id::text, b.token_address,
+            "SELECT u.evm_address, b.token_address,
                     b.balance::text, b.reserved::text
              FROM balances b
              JOIN users u ON u.user_id = b.user_id",
@@ -818,7 +818,7 @@ impl Database {
 
         let mut result = Vec::with_capacity(rows.len());
         for row in rows {
-            let user_id: String = row.get("user_id");
+            let user_id: String = row.get("evm_address");
             let token: String = row.get("token_address");
             let balance_str: String = row.get("balance");
             let reserved_str: String = row.get("reserved");
