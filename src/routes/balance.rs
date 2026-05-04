@@ -90,6 +90,14 @@ pub async fn deposit_balance(
     state.balance_service.deposit(&user_id, "USDC", amount);
 
     let new_balance = state.balance_service.get_total_balance(&user_id, "USDC");
+    let reserved = state.balance_service.get_reserved_balance(&user_id, "USDC");
+    let available = state.balance_service.get_available_balance(&user_id, "USDC");
+    state.ws_manager.send_balance_update(
+        &user_id,
+        &new_balance.to_string(),
+        &reserved.to_string(),
+        &available.to_string(),
+    );
 
     Ok(Json(DepositResponse {
         success: true,
@@ -146,6 +154,38 @@ pub async fn get_balance(
         user_id,
         market_id,
         has_active_proof,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+pub struct UserBalanceResponse {
+    pub usdc_total: String,
+    pub usdc_reserved: String,
+    pub usdc_available: String,
+}
+
+/// GET /v1/balance/:user_id
+///
+/// Returns the user's current USDC balance (total, reserved, available).
+/// Reads directly from the in-memory DashMap — always reflects the current
+/// state including open order reserves and recent fills.
+/// Self-scoped: the authenticated caller may only query their own balance.
+pub async fn get_user_balance(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthenticatedUser>,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+) -> Result<Json<UserBalanceResponse>, StatusCode> {
+    if auth.user_id.to_lowercase() != user_id.to_lowercase() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let uid = user_id.to_lowercase();
+    let total = state.balance_service.get_total_balance(&uid, "USDC");
+    let reserved = state.balance_service.get_reserved_balance(&uid, "USDC");
+    let available = state.balance_service.get_available_balance(&uid, "USDC");
+    Ok(Json(UserBalanceResponse {
+        usdc_total: total.to_string(),
+        usdc_reserved: reserved.to_string(),
+        usdc_available: available.to_string(),
     }))
 }
 

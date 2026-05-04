@@ -218,6 +218,18 @@ impl WebSocketManager {
         let _ = tx.send(msg);
     }
 
+    /// Push a balance update to a user's private WS channel.
+    /// No-op if the user has no active connection — the REST endpoint covers that case.
+    pub fn send_balance_update(&self, user_id: &str, total: &str, reserved: &str, available: &str) {
+        let Some(entry) = self.user_channels.get(user_id) else { return; };
+        let msg = WsMessage::BalanceUpdate {
+            total: total.to_string(),
+            reserved: reserved.to_string(),
+            available: available.to_string(),
+        };
+        let _ = entry.value().send(msg);
+    }
+
     fn make_channel_key(&self, channel: &str, market_id: Option<&str>) -> String {
         match market_id {
             Some(mid) => format!("{}:{}", channel, mid),

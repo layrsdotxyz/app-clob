@@ -295,6 +295,11 @@ pub enum WsMessage {
         trade_id: String,
         tx_hash: String,
     },
+    BalanceUpdate {
+        total: String,
+        reserved: String,
+        available: String,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]

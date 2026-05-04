@@ -67,12 +67,14 @@ impl AppState {
             metrics.clone(),
             None,
         ));
+        let ws_manager = Arc::new(WebSocketManager::new());
         let settlement_engine = Arc::new(SettlementEngine::new(
             redis_store.clone(),
             None,
             0,
             0,
             balance_service.clone(),
+            ws_manager.clone(),
         ));
         let matching_engine = Arc::new(
             MatchingEngine::new(
@@ -82,7 +84,6 @@ impl AppState {
             )
             .with_privacy_state(privacy_state.clone()),
         );
-        let ws_manager = Arc::new(WebSocketManager::new());
         let prover_pipeline = Arc::new(ProverPipeline::new(redis_store.clone(), 1));
 
         let config = Config {

@@ -8,6 +8,7 @@ use crate::{
         PM_SETTLEMENT_QUEUE,
     },
     redis_store::RedisStore,
+    websocket::WebSocketManager,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -48,6 +49,7 @@ pub struct SettlementEngine {
     maker_fee_bps: u16,
     taker_fee_bps: u16,
     balance_service: Arc<BalanceService>,
+    ws_manager: Arc<WebSocketManager>,
 }
 
 impl SettlementEngine {
@@ -57,8 +59,23 @@ impl SettlementEngine {
         maker_fee_bps: u16,
         taker_fee_bps: u16,
         balance_service: Arc<BalanceService>,
+        ws_manager: Arc<WebSocketManager>,
     ) -> Self {
-        Self { store, database, maker_fee_bps, taker_fee_bps, balance_service }
+        Self { store, database, maker_fee_bps, taker_fee_bps, balance_service, ws_manager }
+    }
+
+    /// Read the current in-memory balance for `user_id` and push it to their WS channel.
+    /// Called after every balance mutation so connected clients see instant updates.
+    fn push_balance_update(&self, user_id: &str) {
+        let total = self.balance_service.get_total_balance(user_id, "USDC");
+        let reserved = self.balance_service.get_reserved_balance(user_id, "USDC");
+        let available = self.balance_service.get_available_balance(user_id, "USDC");
+        self.ws_manager.send_balance_update(
+            user_id,
+            &total.to_string(),
+            &reserved.to_string(),
+            &available.to_string(),
+        );
     }
 
     /// Check that a valid balance proof soft-lock exists for the given nullifier hash (G11).
@@ -96,7 +113,8 @@ impl SettlementEngine {
         
         // Reserve balance for order
         self.reserve_balance(user_id, market_id, required).await?;
-        
+        self.push_balance_update(user_id);
+
         Ok(())
     }
 
@@ -265,6 +283,8 @@ impl SettlementEngine {
         let taker_cost = trade.price * trade.size * (Decimal::ONE + Decimal::from(self.taker_fee_bps) / Decimal::from(10_000));
         self.balance_service.credit(&trade.maker_user_id, "USDC", maker_cost);
         self.balance_service.credit(&trade.taker_user_id, "USDC", taker_cost);
+        self.push_balance_update(&trade.maker_user_id);
+        self.push_balance_update(&trade.taker_user_id);
         tracing::debug!(
             trade_id = %trade.id,
             maker_alias = %user_alias(&trade.maker_user_id),
@@ -281,7 +301,9 @@ impl SettlementEngine {
     pub async fn release_order_balance(&self, order: &Order) -> ClobResult<()> {
         let notional = order.remaining * order.price;
         let fee = self.calculate_fee(order.remaining, order.price, false);
-        self.release_balance(&order.user_id, &order.market_id, notional + fee).await
+        self.release_balance(&order.user_id, &order.market_id, notional + fee).await?;
+        self.push_balance_update(&order.user_id);
+        Ok(())
     }
 
     // ==================== PM Settlement Job Creation ====================
@@ -536,6 +558,9 @@ impl SettlementEngine {
         // Taker: debit cost+fee (their reservation covers this).
         let taker_cost = taker_fill.size * taker_fill.price + taker_fill.fee;
         self.balance_service.debit(&trade.taker_user_id, "USDC", taker_cost)?;
+
+        self.push_balance_update(&trade.maker_user_id);
+        self.push_balance_update(&trade.taker_user_id);
 
         tracing::debug!(
             trade_id = %trade.id,

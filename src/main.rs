@@ -312,15 +312,16 @@ async fn async_main() -> Result<()> {
             None
         }
     };
+    let ws_manager = Arc::new(WebSocketManager::new());
     let settlement_engine = Arc::new(SettlementEngine::new(
         redis_store.clone(),
         database.clone(),
         config.maker_fee_bps,
         config.taker_fee_bps,
         balance_service.clone(),
+        ws_manager.clone(),
     ));
     let trade_persist_task = settlement_engine.clone().start_trade_persistence_worker();
-    let ws_manager = Arc::new(WebSocketManager::new());
     let prover_pipeline = Arc::new(ProverPipeline::new(redis_store.clone(), 3));
     let privacy_state = Arc::new(PrivacyStateService::new(redis_store.clone()));
     let matching_engine = Arc::new(MatchingEngine::new(
@@ -460,6 +461,7 @@ async fn async_main() -> Result<()> {
                 // Balance endpoints: deposit is operator-only (X-Operator-Key), get is self-scoped
                 .route("/v1/balance/deposit", post(routes::balance::deposit_balance))
                 .route("/v1/balance/proof", post(routes::balance::submit_balance_proof))
+                .route("/v1/balance/:user_id", get(routes::balance::get_user_balance))
                 .route("/v1/balance/:user_id/:market_id", get(routes::balance::get_balance))
 
                 // Settlement endpoints
