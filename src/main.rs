@@ -702,10 +702,13 @@ async fn async_main() -> Result<()> {
     if let Some(task) = trade_persist_task {
         task.abort();
     }
-    // Give the balance persistence worker a brief window to flush any queued DB writes
-    // that arrived during graceful request draining, then abort.
+    // Close the persistence channel sender so the worker sees EOF and exits after
+    // draining all queued writes. Without this, the sender stays alive inside
+    // Arc<BalanceService> and the worker blocks on recv() until the timeout fires,
+    // meaning queued balance changes (e.g. deposits) are never written to PostgreSQL.
+    balance_service.close_persistence_channel();
     if let Some(task) = persist_task {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), task).await;
     }
 
     Ok(())

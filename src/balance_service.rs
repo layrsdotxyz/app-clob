@@ -20,8 +20,9 @@ pub struct BalanceService {
     reserved: Arc<DashMap<String, DashMap<String, Decimal>>>,
     /// PostgreSQL database for durable balance checkpointing.
     database: Option<Arc<Database>>,
-    /// Sender side of the DB persistence channel. Synchronous — safe to call from non-async methods.
-    persist_tx: Option<tokio::sync::mpsc::UnboundedSender<PersistMsg>>,
+    /// Sender side of the DB persistence channel. Wrapped in Mutex<Option<...>> so
+    /// `close_persistence_channel()` can drop it to signal EOF to the worker on shutdown.
+    persist_tx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<PersistMsg>>>,
     /// Receiver held until `start_persistence_worker` is called exactly once.
     persist_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<PersistMsg>>>,
 }
@@ -38,9 +39,17 @@ impl BalanceService {
             balances: Arc::new(DashMap::new()),
             reserved: Arc::new(DashMap::new()),
             database,
-            persist_tx,
+            persist_tx: std::sync::Mutex::new(persist_tx),
             persist_rx: std::sync::Mutex::new(persist_rx),
         }
+    }
+
+    /// Drop the persistence channel sender, signalling the worker to drain and exit.
+    /// Call this during graceful shutdown after all request handlers have stopped,
+    /// before awaiting the persist task. Without this, the worker waits for more
+    /// messages forever and the JoinHandle timeout fires before the queue drains.
+    pub fn close_persistence_channel(&self) {
+        let _ = self.persist_tx.lock().unwrap().take();
     }
 
     /// Populate in-memory state from PostgreSQL on service startup.
@@ -75,7 +84,8 @@ impl BalanceService {
     /// The persistence worker (started via `start_persistence_worker`) drains this channel
     /// and retries failed writes with exponential backoff rather than silently discarding them.
     fn persist_balance(&self, user_id: &str, token_address: &str) {
-        let Some(tx) = &self.persist_tx else { return; };
+        let guard = self.persist_tx.lock().unwrap();
+        let Some(tx) = guard.as_ref() else { return; };
         let total = self.get_total_balance(user_id, token_address);
         let reserved = self.get_reserved_balance(user_id, token_address);
         if let Err(_) = tx.send((user_id.to_string(), token_address.to_string(), total, reserved)) {
