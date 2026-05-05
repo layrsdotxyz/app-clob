@@ -235,11 +235,8 @@ pub struct BalanceProofResponse {
 ///                             produced by `bb write_vk` for pm_balance_proof.
 ///   BB_BIN                  — path to the `bb` binary (default: "bb").
 ///
-/// The proof bytes (binary) are decoded from the 0x-prefixed hex sent by the
-/// client and written to a temp file. `bb verify` embeds public inputs inside
-/// the UltraHonk proof binary, so no separate public inputs file is needed.
 /// Returns Ok(true) when verification ran, Ok(false) when skipped (not configured).
-async fn verify_honk_balance_proof(honk_proof_hex: &str) -> Result<bool, String> {
+async fn verify_honk_balance_proof(honk_proof_hex: &str, public_inputs: &[String]) -> Result<bool, String> {
     let vk_dir = match std::env::var("BALANCE_PROOF_BB_VK_DIR") {
         Ok(v) if !v.is_empty() => v,
         _ => {
@@ -257,26 +254,50 @@ async fn verify_honk_balance_proof(honk_proof_hex: &str) -> Result<bool, String>
         .map_err(|e| format!("invalid proof hex: {e}"))?;
 
     let tmp = tempdir().map_err(|e| format!("tempdir: {e}"))?;
-    let proof_path = tmp.path().join("proof");
+
+    // bb reads ./target/proof and ./target/public_inputs relative to its CWD.
+    let target_dir = tmp.path().join("target");
+    std::fs::create_dir_all(&target_dir)
+        .map_err(|e| format!("create target dir: {e}"))?;
+
+    let proof_path = target_dir.join("proof");
     std::fs::write(&proof_path, &proof_bytes)
         .map_err(|e| format!("write proof: {e}"))?;
 
-    let vk_path  = format!("{}/vk", vk_dir);
+    // Serialize public inputs as concatenated 32-byte big-endian field elements.
+    let mut pi_bytes = Vec::with_capacity(public_inputs.len() * 32);
+    for (i, s) in public_inputs.iter().enumerate() {
+        let hex = s.trim_start_matches("0x").trim_start_matches("0X");
+        let bytes = hex::decode(hex)
+            .map_err(|e| format!("public_inputs[{i}] invalid hex: {e}"))?;
+        if bytes.len() > 32 {
+            return Err(format!("public_inputs[{i}] exceeds 32 bytes"));
+        }
+        let mut padded = [0u8; 32];
+        padded[32 - bytes.len()..].copy_from_slice(&bytes);
+        pi_bytes.extend_from_slice(&padded);
+    }
+    std::fs::write(target_dir.join("public_inputs"), &pi_bytes)
+        .map_err(|e| format!("write public_inputs: {e}"))?;
+
+    let vk_path = format!("{}/vk", vk_dir);
     let proof_str = proof_path.to_str().unwrap().to_owned();
+    let tmp_path = tmp.path().to_owned();
 
     let result = tokio::task::spawn_blocking(move || {
         std::process::Command::new(&bb_bin)
             .arg("verify")
             .arg("--scheme").arg("ultra_honk")
+            .arg("--verifier_target").arg("evm")
             .arg("-k").arg(&vk_path)
             .arg("-p").arg(&proof_str)
+            .current_dir(&tmp_path)
             .output()
     })
     .await
     .map_err(|e| format!("spawn_blocking: {e}"))?
     .map_err(|e| format!("bb verify exec: {e}"))?;
 
-    // tmp dir (and proof file) are dropped here after bb exits.
     drop(tmp);
 
     if !result.status.success() {
@@ -326,7 +347,7 @@ pub async fn submit_balance_proof(
     // Cryptographic verification — rejects fake/invalid proofs before they can
     // enter the matching engine and cause stuck settlements.
     // Skipped (with a warning) when BALANCE_PROOF_BB_VK_DIR is not configured.
-    match verify_honk_balance_proof(&req.honk_proof_hex).await {
+    match verify_honk_balance_proof(&req.honk_proof_hex, &req.public_inputs).await {
         Ok(true)  => tracing::info!("balance proof cryptographically verified via bb"),
         Ok(false) => { /* warned inside verify_honk_balance_proof */ }
         Err(e)    => return Err(reject(&format!("proof verification failed: {e}"))),

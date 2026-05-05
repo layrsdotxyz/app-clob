@@ -348,6 +348,7 @@ impl ProverWorker {
                 let verify_out = std::process::Command::new(&bb_bin)
                     .arg("verify")
                     .arg("--scheme").arg("ultra_honk")
+                    .arg("--verifier_target").arg("evm")
                     .arg("-k").arg(&vk_path)
                     .arg("-p").arg(proof_dir.join("proof"))
                     .output()
