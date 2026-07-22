@@ -37,6 +37,7 @@ pub mod poseidon_bn254;
 pub mod prediction_market_claims;
 pub mod prediction_market_relayer;
 pub mod prediction_market_settlement;
+pub mod private_core;
 pub mod privacy;
 pub mod proof_batcher;
 pub mod proof_generation;

@@ -81,6 +81,10 @@ parking_lot = "0.12"
 bytes = "1.7"
 rand = "0.8"
 tempfile = "3"
+aes-gcm = "0.10"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+sha2 = "0.10"
+zeroize = { version = "1.8", features = ["derive"] }
 
 [dev-dependencies]
 criterion = "0.5"
@@ -92,3 +96,4 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
+panic = "abort"

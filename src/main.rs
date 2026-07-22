@@ -25,6 +25,7 @@ mod poseidon_bn254;
 mod prediction_market_claims;
 mod prediction_market_relayer;
 mod prediction_market_settlement;
+mod private_core;
 mod privacy;
 mod proof_batcher;
 mod proof_generation;
