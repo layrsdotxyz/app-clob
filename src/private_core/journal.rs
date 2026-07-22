@@ -35,9 +35,21 @@ pub struct EncryptedJournalRecord {
     pub record_hash: [u8; 32],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncryptedSnapshot {
+    pub sequence: u64,
+    pub journal_head: [u8; 32],
+    pub state_root: [u8; 32],
+    pub nonce: [u8; 12],
+    pub ciphertext: Vec<u8>,
+    pub ciphertext_hash: [u8; 32],
+}
+
 pub struct EncryptedJournal {
     cipher: Aes256Gcm,
     records: Vec<EncryptedJournalRecord>,
+    sequence: u64,
+    head: [u8; 32],
 }
 
 impl EncryptedJournal {
@@ -45,6 +57,8 @@ impl EncryptedJournal {
         Self {
             cipher: Aes256Gcm::new_from_slice(&key.0).expect("AES-256 key length is fixed"),
             records: Vec::new(),
+            sequence: 0,
+            head: [0u8; 32],
         }
     }
 
@@ -53,12 +67,11 @@ impl EncryptedJournal {
         state_root: [u8; 32],
         value: &T,
     ) -> CoreResult<EncryptedJournalRecord> {
-        let sequence = self.records.len() as u64 + 1;
-        let prior_record_hash = self
-            .records
-            .last()
-            .map(|record| record.record_hash)
-            .unwrap_or([0u8; 32]);
+        let sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(CoreError::JournalChainMismatch)?;
+        let prior_record_hash = self.head;
         let mut nonce = [0u8; 12];
         nonce[..8].copy_from_slice(&sequence.to_be_bytes());
         OsRng.fill_bytes(&mut nonce[8..]);
@@ -89,6 +102,8 @@ impl EncryptedJournal {
             ciphertext,
             record_hash,
         };
+        self.sequence = sequence;
+        self.head = record_hash;
         self.records.push(record.clone());
         Ok(record)
     }
@@ -138,6 +153,80 @@ impl EncryptedJournal {
     pub fn records(&self) -> &[EncryptedJournalRecord] {
         &self.records
     }
+
+    pub fn chain_head(&self) -> (u64, [u8; 32]) {
+        (self.sequence, self.head)
+    }
+
+    pub fn restore_chain_head(&mut self, sequence: u64, head: [u8; 32]) -> CoreResult<()> {
+        if (sequence == 0) != (head == [0u8; 32]) {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        self.sequence = sequence;
+        self.head = head;
+        self.records.clear();
+        Ok(())
+    }
+
+    pub fn seal_snapshot<T: Serialize>(
+        &self,
+        state_root: [u8; 32],
+        value: &T,
+    ) -> CoreResult<EncryptedSnapshot> {
+        let mut nonce = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce);
+        let aad = snapshot_associated_data(self.sequence, &self.head, &state_root);
+        let mut plaintext = bincode::serialize(value).map_err(|_| CoreError::JournalCrypto)?;
+        let result = self
+            .cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &plaintext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| CoreError::JournalCrypto);
+        plaintext.zeroize();
+        let ciphertext = result?;
+        let ciphertext_hash = Sha256::digest(&ciphertext).into();
+        Ok(EncryptedSnapshot {
+            sequence: self.sequence,
+            journal_head: self.head,
+            state_root,
+            nonce,
+            ciphertext,
+            ciphertext_hash,
+        })
+    }
+
+    pub fn open_snapshot<T: for<'de> Deserialize<'de>>(
+        &self,
+        snapshot: &EncryptedSnapshot,
+    ) -> CoreResult<T> {
+        let expected_hash: [u8; 32] = Sha256::digest(&snapshot.ciphertext).into();
+        if snapshot.ciphertext_hash != expected_hash {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        let aad = snapshot_associated_data(
+            snapshot.sequence,
+            &snapshot.journal_head,
+            &snapshot.state_root,
+        );
+        let mut plaintext = self
+            .cipher
+            .decrypt(
+                Nonce::from_slice(&snapshot.nonce),
+                Payload {
+                    msg: &snapshot.ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| CoreError::JournalCrypto)?;
+        let value = bincode::deserialize(&plaintext).map_err(|_| CoreError::JournalCrypto);
+        plaintext.zeroize();
+        value
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,21 +239,21 @@ pub struct EnclaveReceipt {
     pub prior_state_root: [u8; 32],
     pub state_root: [u8; 32],
     pub journal_hash: [u8; 32],
-    pub enclave_measurement: [u8; 32],
+    pub enclave_measurement_sha384: Vec<u8>,
     pub occurred_at_millis: i64,
     pub signature: Vec<u8>,
 }
 
 pub struct ReceiptSigner {
     signing_key: SigningKey,
-    enclave_measurement: [u8; 32],
+    enclave_measurement_sha384: [u8; 48],
 }
 
 impl ReceiptSigner {
-    pub fn generate(enclave_measurement: [u8; 32]) -> Self {
+    pub fn generate(enclave_measurement_sha384: [u8; 48]) -> Self {
         Self {
             signing_key: SigningKey::generate(&mut OsRng),
-            enclave_measurement,
+            enclave_measurement_sha384,
         }
     }
 
@@ -181,14 +270,19 @@ impl ReceiptSigner {
     ) -> EnclaveReceipt {
         let mut receipt = EnclaveReceipt {
             protocol_version: "layrs.v1".into(),
-            receipt_id: uuid::Uuid::new_v4().to_string(),
+            receipt_id: deterministic_receipt_id(
+                &command_id,
+                &idempotency_key,
+                enclave_sequence,
+                &state_root,
+            ),
             command_id,
             idempotency_key,
             enclave_sequence,
             prior_state_root,
             state_root,
             journal_hash,
-            enclave_measurement: self.enclave_measurement,
+            enclave_measurement_sha384: self.enclave_measurement_sha384.to_vec(),
             occurred_at_millis,
             signature: Vec::new(),
         };
@@ -202,12 +296,36 @@ impl ReceiptSigner {
     }
 }
 
+fn deterministic_receipt_id(
+    command_id: &str,
+    idempotency_key: &str,
+    sequence: u64,
+    state_root: &[u8; 32],
+) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.receipt.v1\0");
+    hash.update(command_id.as_bytes());
+    hash.update([0]);
+    hash.update(idempotency_key.as_bytes());
+    hash.update(sequence.to_be_bytes());
+    hash.update(state_root);
+    format!("receipt_{}", hex::encode(hash.finalize()))
+}
+
 fn associated_data(sequence: u64, prior: &[u8; 32], root: &[u8; 32]) -> Vec<u8> {
     let mut output = Vec::with_capacity(72);
     output.extend_from_slice(&sequence.to_be_bytes());
     output.extend_from_slice(prior);
     output.extend_from_slice(root);
     output
+}
+
+fn snapshot_associated_data(sequence: u64, head: &[u8; 32], root: &[u8; 32]) -> Vec<u8> {
+    let mut value = b"layrs.private-snapshot.v1\0".to_vec();
+    value.extend_from_slice(&sequence.to_be_bytes());
+    value.extend_from_slice(head);
+    value.extend_from_slice(root);
+    value
 }
 
 fn hash_record(

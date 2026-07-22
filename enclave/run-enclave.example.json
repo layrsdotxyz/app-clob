@@ -1,0 +1,8 @@
+{
+  "cpu_count": 2,
+  "memory_mib": 4096,
+  "eif_path": "/opt/layrsv2/layrsv2-clob.eif",
+  "enclave_cid": 16,
+  "debug_mode": false,
+  "vsock_port": 5003
+}

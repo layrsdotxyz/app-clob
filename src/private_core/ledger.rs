@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tiny_keccak::{Hasher, Keccak};
 
 use super::{CoreError, CoreResult};
@@ -12,6 +12,7 @@ pub enum AccountBucket {
     UserOrderHold,
     UserWithdrawalHold,
     UserPosition,
+    MarketCollateral,
     PoolCash,
     VenueInventory,
     BridgeInTransit,
@@ -26,9 +27,9 @@ pub struct AccountKey {
     pub owner: String,
     pub bucket: AccountBucket,
     pub asset: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub market_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub outcome: Option<String>,
 }
 
@@ -83,11 +84,86 @@ pub struct AppliedLedgerTransaction {
     pub transfers: Vec<Transfer>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ExternalFlowDirection {
+    Inflow,
+    Outflow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalFlowTransaction {
+    pub idempotency_key: String,
+    pub evidence_hash: [u8; 32],
+    pub account: AccountKey,
+    pub amount: u128,
+    pub direction: ExternalFlowDirection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CompleteSetDirection {
+    Mint,
+    Burn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompleteSetTransaction {
+    pub idempotency_key: String,
+    pub owner: String,
+    pub market_id: String,
+    pub settlement_asset: String,
+    pub quantity_micros: u128,
+    pub direction: CompleteSetDirection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimPayout {
+    pub claim_account: AccountKey,
+    pub destination: AccountKey,
+    pub claim_quantity_micros: u128,
+    pub gross_payout_micros: u128,
+    pub winning_fee_micros: u128,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct Ledger {
     balances: BTreeMap<AccountKey, u128>,
     applied_idempotency_keys: BTreeSet<String>,
     sequence: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LedgerWire {
+    balances: Vec<(AccountKey, u128)>,
+    applied_idempotency_keys: BTreeSet<String>,
+    sequence: u64,
+}
+
+impl Serialize for Ledger {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        LedgerWire {
+            balances: self
+                .balances
+                .iter()
+                .map(|(account, amount)| (account.clone(), *amount))
+                .collect(),
+            applied_idempotency_keys: self.applied_idempotency_keys.clone(),
+            sequence: self.sequence,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Ledger {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = LedgerWire::deserialize(deserializer)?;
+        Ok(Self {
+            balances: wire.balances.into_iter().collect(),
+            applied_idempotency_keys: wire.applied_idempotency_keys,
+            sequence: wire.sequence,
+        })
+    }
 }
 
 impl Ledger {
@@ -165,10 +241,223 @@ impl Ledger {
         })
     }
 
+    /// Applies a custody boundary movement only after independent chain finality evidence.
+    /// Unlike an internal transfer, this deliberately changes the total recognized asset and
+    /// must be reconciled one-for-one to the relevant LayrsPool transaction.
+    pub fn apply_external_flow(
+        &mut self,
+        transaction: ExternalFlowTransaction,
+    ) -> CoreResult<AppliedLedgerTransaction> {
+        if transaction.amount == 0 || transaction.evidence_hash == [0u8; 32] {
+            return Err(CoreError::ZeroAmount);
+        }
+        if self
+            .applied_idempotency_keys
+            .contains(&transaction.idempotency_key)
+        {
+            return Err(CoreError::DuplicateCommand);
+        }
+        let prior_state_root = self.state_root();
+        let current = self.balance(&transaction.account);
+        let next = match transaction.direction {
+            ExternalFlowDirection::Inflow => current
+                .checked_add(transaction.amount)
+                .ok_or(CoreError::UnbalancedTransaction)?,
+            ExternalFlowDirection::Outflow => current
+                .checked_sub(transaction.amount)
+                .ok_or(CoreError::InsufficientBalance)?,
+        };
+        self.balances.insert(transaction.account.clone(), next);
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(CoreError::UnbalancedTransaction)?;
+        self.applied_idempotency_keys
+            .insert(transaction.idempotency_key.clone());
+        let state_root = self.state_root();
+        Ok(AppliedLedgerTransaction {
+            sequence: self.sequence,
+            idempotency_key: transaction.idempotency_key,
+            business_reference: format!(
+                "external:{}:{}",
+                match transaction.direction {
+                    ExternalFlowDirection::Inflow => "inflow",
+                    ExternalFlowDirection::Outflow => "outflow",
+                },
+                hex::encode(transaction.evidence_hash)
+            ),
+            prior_state_root,
+            state_root,
+            transfers: Vec::new(),
+        })
+    }
+
+    /// Locks one settlement unit and creates one UP plus one DOWN claim, or performs the
+    /// exact reverse. This is the sole claim issuance path and keeps every binary market fully
+    /// collateralized without exposing owners outside the enclave.
+    pub fn apply_complete_set(
+        &mut self,
+        transaction: CompleteSetTransaction,
+    ) -> CoreResult<AppliedLedgerTransaction> {
+        if transaction.quantity_micros == 0 {
+            return Err(CoreError::ZeroAmount);
+        }
+        if self
+            .applied_idempotency_keys
+            .contains(&transaction.idempotency_key)
+        {
+            return Err(CoreError::DuplicateCommand);
+        }
+
+        let prior_state_root = self.state_root();
+        let mut next = self.balances.clone();
+        let available = AccountKey::new(
+            &transaction.owner,
+            AccountBucket::UserAvailable,
+            &transaction.settlement_asset,
+        );
+        let mut collateral = AccountKey::new(
+            "layrs",
+            AccountBucket::MarketCollateral,
+            &transaction.settlement_asset,
+        );
+        collateral.market_id = Some(transaction.market_id.clone());
+        let up = AccountKey::position(
+            &transaction.owner,
+            format!("CLAIM:{}:UP", transaction.market_id),
+            &transaction.market_id,
+            "UP",
+        );
+        let down = AccountKey::position(
+            &transaction.owner,
+            format!("CLAIM:{}:DOWN", transaction.market_id),
+            &transaction.market_id,
+            "DOWN",
+        );
+
+        match transaction.direction {
+            CompleteSetDirection::Mint => {
+                debit(&mut next, &available, transaction.quantity_micros)?;
+                credit(&mut next, &collateral, transaction.quantity_micros)?;
+                credit(&mut next, &up, transaction.quantity_micros)?;
+                credit(&mut next, &down, transaction.quantity_micros)?;
+            }
+            CompleteSetDirection::Burn => {
+                debit(&mut next, &up, transaction.quantity_micros)?;
+                debit(&mut next, &down, transaction.quantity_micros)?;
+                debit(&mut next, &collateral, transaction.quantity_micros)?;
+                credit(&mut next, &available, transaction.quantity_micros)?;
+            }
+        }
+
+        self.commit_special(
+            transaction.idempotency_key,
+            format!(
+                "complete-set:{}:{}",
+                match transaction.direction {
+                    CompleteSetDirection::Mint => "mint",
+                    CompleteSetDirection::Burn => "burn",
+                },
+                transaction.market_id
+            ),
+            prior_state_root,
+            next,
+        )
+    }
+
+    /// Burns resolved claims and pays exclusively from the market's collateral account.
+    /// Fee amounts are supplied by the deterministic position-cost engine and retained in the
+    /// same settlement asset for independent reconciliation.
+    pub fn apply_claim_payouts(
+        &mut self,
+        idempotency_key: String,
+        business_reference: String,
+        collateral: AccountKey,
+        fee_revenue: AccountKey,
+        payouts: Vec<ClaimPayout>,
+    ) -> CoreResult<AppliedLedgerTransaction> {
+        if payouts.is_empty() || self.applied_idempotency_keys.contains(&idempotency_key) {
+            return Err(if payouts.is_empty() {
+                CoreError::ZeroAmount
+            } else {
+                CoreError::DuplicateCommand
+            });
+        }
+        let prior_state_root = self.state_root();
+        let mut next = self.balances.clone();
+        for payout in &payouts {
+            if payout.claim_quantity_micros == 0
+                || payout.winning_fee_micros > payout.gross_payout_micros
+            {
+                return Err(CoreError::UnbalancedTransaction);
+            }
+            debit(
+                &mut next,
+                &payout.claim_account,
+                payout.claim_quantity_micros,
+            )?;
+            if payout.gross_payout_micros > 0 {
+                debit(&mut next, &collateral, payout.gross_payout_micros)?;
+                let net = payout.gross_payout_micros - payout.winning_fee_micros;
+                if net > 0 {
+                    credit(&mut next, &payout.destination, net)?;
+                }
+                if payout.winning_fee_micros > 0 {
+                    credit(&mut next, &fee_revenue, payout.winning_fee_micros)?;
+                }
+            }
+        }
+        self.commit_special(idempotency_key, business_reference, prior_state_root, next)
+    }
+
+    pub fn positions_for_market(&self, market_id: &str) -> Vec<(AccountKey, u128)> {
+        self.balances
+            .iter()
+            .filter(|(account, amount)| {
+                account.bucket == AccountBucket::UserPosition
+                    && account.market_id.as_deref() == Some(market_id)
+                    && **amount > 0
+            })
+            .map(|(account, amount)| (account.clone(), *amount))
+            .collect()
+    }
+
+    fn commit_special(
+        &mut self,
+        idempotency_key: String,
+        business_reference: String,
+        prior_state_root: [u8; 32],
+        balances: BTreeMap<AccountKey, u128>,
+    ) -> CoreResult<AppliedLedgerTransaction> {
+        self.balances = balances;
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(CoreError::UnbalancedTransaction)?;
+        self.applied_idempotency_keys
+            .insert(idempotency_key.clone());
+        Ok(AppliedLedgerTransaction {
+            sequence: self.sequence,
+            idempotency_key,
+            business_reference,
+            prior_state_root,
+            state_root: self.state_root(),
+            transfers: Vec::new(),
+        })
+    }
+
     pub fn total_for_asset(&self, asset: &str) -> u128 {
         self.balances
             .iter()
             .filter(|(key, _)| key.asset == asset)
+            .map(|(_, amount)| *amount)
+            .sum()
+    }
+
+    pub fn total_for_owner_asset(&self, owner: &str, asset: &str) -> u128 {
+        self.balances
+            .iter()
+            .filter(|(key, _)| key.owner == owner && key.asset == asset)
             .map(|(_, amount)| *amount)
             .sum()
     }
@@ -187,4 +476,34 @@ impl Ledger {
         hash.finalize(&mut output);
         output
     }
+}
+
+fn debit(
+    balances: &mut BTreeMap<AccountKey, u128>,
+    account: &AccountKey,
+    amount: u128,
+) -> CoreResult<()> {
+    let current = balances.get(account).copied().unwrap_or_default();
+    balances.insert(
+        account.clone(),
+        current
+            .checked_sub(amount)
+            .ok_or(CoreError::InsufficientBalance)?,
+    );
+    Ok(())
+}
+
+fn credit(
+    balances: &mut BTreeMap<AccountKey, u128>,
+    account: &AccountKey,
+    amount: u128,
+) -> CoreResult<()> {
+    let current = balances.get(account).copied().unwrap_or_default();
+    balances.insert(
+        account.clone(),
+        current
+            .checked_add(amount)
+            .ok_or(CoreError::UnbalancedTransaction)?,
+    );
+    Ok(())
 }

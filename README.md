@@ -2,6 +2,10 @@
 
 Rust/Axum central-limit-order-book and private-ledger service for Layrs.
 
+> Layrs v2 implementation note: the production ZEN path is documented in
+> [PRIVATE_CLOB_ARCHITECTURE.md](PRIVATE_CLOB_ARCHITECTURE.md). Predifi/Hedera-era modules remain
+> only as migration reference and are not part of the release enclave.
+
 This repository was extracted from the mature Predifi CLOB implementation at
 commit `82c2241ec318ae5aa83bda99093b59849aa6a469`. See
 [`UPSTREAM_SOURCE.md`](UPSTREAM_SOURCE.md) for provenance and the extraction

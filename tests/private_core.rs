@@ -1,8 +1,12 @@
 use clob_service::private_core::{
-    AccountBucket, AccountKey, BookOrder, CoreError, EncryptedJournal, JournalKey, Ledger,
-    LedgerTransaction, OrderAction, OrderStatus, Outcome, PriceTimeBook, SessionGuard,
-    SessionRequest, TimeInForce, Transfer,
+    command_request_hash, resolution_signing_payload, signing_payload, AccountBucket, AccountKey,
+    BookOrder, BoundaryEvidence, CommandResult, CompleteSetDirection, CoreError, EncryptedJournal,
+    ExternalFlowDirection, JournalKey, Ledger, LedgerTransaction, MarketConfig, OrderAction,
+    OrderStatus, Outcome, PriceTimeBook, PrivateTradingCore, ReceiptSigner, ResolutionStatement,
+    SessionGuard, SessionRequest, SignedResolution, SignedSessionRequest, TimeInForce, Transfer,
+    UserCommand, UserCommandAction,
 };
+use ed25519_dalek::{Signer, SigningKey};
 
 #[test]
 fn ledger_is_atomic_conservative_and_idempotent() {
@@ -200,4 +204,211 @@ fn session_guard_rejects_replays_and_expiry() {
         guard.accept(&expired, 5_000).unwrap_err(),
         CoreError::ExpiredSession
     );
+}
+
+#[test]
+fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
+    let oracle = SigningKey::from_bytes(&[11u8; 32]);
+    let alice = SigningKey::from_bytes(&[12u8; 32]);
+    let bob = SigningKey::from_bytes(&[13u8; 32]);
+    let journal_key = JournalKey::from_bytes([14u8; 32]);
+    let mut core = PrivateTradingCore::new_with_oracle(
+        journal_key.clone(),
+        ReceiptSigner::generate([15u8; 48]),
+        oracle.verifying_key().to_bytes(),
+    )
+    .unwrap();
+    let market_id = "layrs:v1:ZEN:15m:2000";
+    core.register_market(
+        "sys:market:1".into(),
+        MarketConfig {
+            market_id: market_id.into(),
+            settlement_asset: "ZEN".into(),
+            opens_at_millis: 900,
+            closes_at_millis: 2_000,
+            minimum_quantity_micros: 1,
+            maximum_quantity_micros: 10_000_000,
+            tick_size_micros: 1_000,
+            oracle_feed_id: 245,
+        },
+        800,
+    )
+    .unwrap();
+    for (index, owner, key) in [(1, "usr_alice", &alice), (2, "usr_bob", &bob)] {
+        core.register_session(
+            format!("sys:session:{index}"),
+            format!("session:{index}"),
+            owner.into(),
+            key.verifying_key().to_bytes(),
+            3_000,
+            800,
+        )
+        .unwrap();
+        core.apply_external_flow(
+            format!("sys:deposit:{index}"),
+            AccountKey::new(owner, AccountBucket::UserAvailable, "ZEN"),
+            1_000_000,
+            ExternalFlowDirection::Inflow,
+            [index as u8; 32],
+            850,
+        )
+        .unwrap();
+    }
+
+    execute_signed(
+        &mut core,
+        &bob,
+        "session:2",
+        1,
+        "cmd:mint",
+        UserCommandAction::CompleteSet {
+            market_id: market_id.into(),
+            quantity_micros: 1_000_000,
+            direction: CompleteSetDirection::Mint,
+        },
+        1_000,
+    );
+    execute_signed(
+        &mut core,
+        &bob,
+        "session:2",
+        2,
+        "cmd:sell",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "usr_bob",
+                market_id,
+                Outcome::Up,
+                OrderAction::Sell,
+                400_000,
+                1_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_100,
+    );
+    let fill = execute_signed(
+        &mut core,
+        &alice,
+        "session:1",
+        1,
+        "cmd:buy",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "usr_alice",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                400_000,
+                1_000_000,
+                TimeInForce::Fak,
+                None,
+            ),
+        },
+        1_200,
+    );
+    assert!(matches!(fill, CommandResult::Order { .. }));
+
+    let boundary = |end: i64, price: i64, marker: u8| BoundaryEvidence {
+        window_start_micros: end * 1_000 - 5_000_000,
+        window_end_micros: end * 1_000,
+        median_price_e8: price,
+        sample_count: 25,
+        minimum_publisher_count: 3,
+        signed_payload_commitment: [marker; 32],
+    };
+    let statement = ResolutionStatement {
+        market_id: market_id.into(),
+        oracle_feed_id: 245,
+        opening: boundary(900, 1_000_000_000, 21),
+        closing: boundary(2_000, 1_100_000_000, 22),
+        issued_at_millis: 2_100,
+    };
+    let signature = oracle
+        .sign(&resolution_signing_payload(&statement).unwrap())
+        .to_bytes()
+        .to_vec();
+    core.resolve_market(
+        "sys:resolve:1".into(),
+        SignedResolution {
+            statement,
+            signature,
+        },
+        2_100,
+    )
+    .unwrap();
+
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            "usr_alice",
+            AccountBucket::UserAvailable,
+            "ZEN"
+        )),
+        1_569_200
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new("layrs", AccountBucket::FeeRevenue, "ZEN")),
+        30_800
+    );
+
+    let snapshot = core.export_encrypted_snapshot().unwrap();
+    let restored = PrivateTradingCore::restore_encrypted_snapshot(
+        journal_key.clone(),
+        ReceiptSigner::generate([16u8; 48]),
+        &snapshot,
+        snapshot.sequence,
+    )
+    .unwrap();
+    assert_eq!(restored.state_root(), core.state_root());
+    assert_eq!(
+        restored.balance(&AccountKey::new(
+            "usr_alice",
+            AccountBucket::UserAvailable,
+            "ZEN"
+        )),
+        1_569_200
+    );
+    assert!(matches!(
+        PrivateTradingCore::restore_encrypted_snapshot(
+            journal_key,
+            ReceiptSigner::generate([17u8; 48]),
+            &snapshot,
+            snapshot.sequence + 1,
+        ),
+        Err(CoreError::RollbackDetected)
+    ));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_signed(
+    core: &mut PrivateTradingCore,
+    key: &SigningKey,
+    session_id: &str,
+    sequence: u64,
+    command_id: &str,
+    action: UserCommandAction,
+    now_millis: i64,
+) -> CommandResult {
+    let idempotency_key = format!("idem:{command_id}");
+    let request_hash = command_request_hash(command_id, &idempotency_key, &action).unwrap();
+    let request = SessionRequest {
+        session_id: session_id.into(),
+        sequence,
+        issued_at_millis: now_millis,
+        expires_at_millis: 2_900,
+        request_hash,
+    };
+    let signature = key.sign(&signing_payload(&request)).to_bytes().to_vec();
+    core.execute(
+        UserCommand {
+            command_id: command_id.into(),
+            idempotency_key,
+            session: SignedSessionRequest { request, signature },
+            action,
+        },
+        now_millis,
+    )
+    .unwrap()
+    .result
 }

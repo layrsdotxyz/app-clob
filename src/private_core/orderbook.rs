@@ -66,8 +66,33 @@ impl BookOrder {
         time_in_force: TimeInForce,
         expires_at_millis: Option<i64>,
     ) -> Self {
+        Self::with_id(
+            Uuid::new_v4(),
+            private_user_id,
+            market_id,
+            outcome,
+            action,
+            price_micros,
+            quantity_micros,
+            time_in_force,
+            expires_at_millis,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_id(
+        order_id: Uuid,
+        private_user_id: impl Into<String>,
+        market_id: impl Into<String>,
+        outcome: Outcome,
+        action: OrderAction,
+        price_micros: u64,
+        quantity_micros: u128,
+        time_in_force: TimeInForce,
+        expires_at_millis: Option<i64>,
+    ) -> Self {
         Self {
-            order_id: Uuid::new_v4(),
+            order_id,
             private_user_id: private_user_id.into(),
             market_id: market_id.into(),
             outcome,
@@ -97,7 +122,7 @@ pub struct Fill {
     pub sequence: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatchResult {
     pub accepted_order: Option<BookOrder>,
     pub fills: Vec<Fill>,
@@ -147,8 +172,15 @@ impl PriceTimeBook {
                 OrderStatus::PartiallyFilled
             };
             self.sequence += 1;
+            let fill_sequence = self.sequence;
+            let fill_id = deterministic_fill_id(
+                &incoming.market_id,
+                maker.order_id,
+                incoming.order_id,
+                fill_sequence,
+            );
             fills.push(Fill {
-                fill_id: Uuid::new_v4(),
+                fill_id,
                 market_id: incoming.market_id.clone(),
                 outcome: incoming.outcome,
                 maker_order_id: maker.order_id,
@@ -157,7 +189,7 @@ impl PriceTimeBook {
                 taker_private_user_id: incoming.private_user_id.clone(),
                 price_micros: maker.price_micros,
                 quantity_micros: quantity,
-                sequence: self.sequence,
+                sequence: fill_sequence,
             });
             if maker.remaining_micros == 0 {
                 self.active.remove(&candidate_id);
@@ -250,6 +282,28 @@ impl PriceTimeBook {
         (bids, asks)
     }
 
+    pub fn order(&self, order_id: Uuid) -> Option<&BookOrder> {
+        self.orders.get(&order_id)
+    }
+
+    pub fn cancel_all(&mut self, market_id: &str) -> Vec<BookOrder> {
+        let ids: Vec<Uuid> = self
+            .active
+            .iter()
+            .filter(|id| self.orders[*id].market_id == market_id)
+            .copied()
+            .collect();
+        let mut cancelled = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(order) = self.orders.get_mut(&id) {
+                order.status = OrderStatus::Cancelled;
+                cancelled.push(order.clone());
+            }
+            self.active.remove(&id);
+        }
+        cancelled
+    }
+
     fn validate(&self, order: &BookOrder, now_millis: i64) -> CoreResult<()> {
         if order.price_micros == 0 || u128::from(order.price_micros) >= PRICE_SCALE {
             return Err(CoreError::InvalidOrder(
@@ -303,6 +357,21 @@ impl PriceTimeBook {
         });
         candidates.into_iter().map(|order| order.order_id).collect()
     }
+}
+
+fn deterministic_fill_id(
+    market_id: &str,
+    maker_order_id: Uuid,
+    taker_order_id: Uuid,
+    sequence: u64,
+) -> Uuid {
+    let mut name = Vec::with_capacity(market_id.len() + 40);
+    name.extend_from_slice(b"layrs.fill.v1\0");
+    name.extend_from_slice(market_id.as_bytes());
+    name.extend_from_slice(maker_order_id.as_bytes());
+    name.extend_from_slice(taker_order_id.as_bytes());
+    name.extend_from_slice(&sequence.to_be_bytes());
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, &name)
 }
 
 fn crosses(incoming: &BookOrder, resting: &BookOrder) -> bool {

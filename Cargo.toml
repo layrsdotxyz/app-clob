@@ -12,6 +12,10 @@ path = "src/lib.rs"
 name = "layrs-clob-service"
 path = "src/main.rs"
 
+[[bin]]
+name = "layrs-enclave"
+path = "src/bin/layrs-enclave.rs"
+
 [features]
 test-helpers = []
 
@@ -27,7 +31,8 @@ tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip"]
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
+bincode = "1.3"
 
 # Redis client with TLS via native-tls (OpenSSL)
 # Enable tokio-native-tls compatibility to provide the async TLS connector required by redis when using tokio runtime.
@@ -37,7 +42,7 @@ redis = { version = "0.26.1", features = ["aio", "tokio-comp", "connection-manag
 futures-util = "0.3"
 
 # UUID and Time
-uuid = { version = "1.10", features = ["v4", "serde"] }
+uuid = { version = "1.10", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # Decimal arithmetic (critical for financial calculations)
@@ -85,6 +90,9 @@ aes-gcm = "0.10"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 sha2 = "0.10"
 zeroize = { version = "1.8", features = ["derive"] }
+aws-nitro-enclaves-nsm-api = "0.5.2"
+tokio-vsock = "0.7.2"
+x25519-dalek = { version = "3.0.0", features = ["static_secrets", "getrandom"] }
 
 [dev-dependencies]
 criterion = "0.5"
