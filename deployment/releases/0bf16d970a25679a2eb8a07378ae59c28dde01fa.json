@@ -7,6 +7,7 @@
   "packerSourceCommit": "189d121d91faaa2241f1ccf950056ff72accc559",
   "region": "us-east-1",
   "amiId": "ami-00524437e940d3b86",
+  "amiDisposition": "deregistered; backing snapshot deleted after the hardened replacement became available",
   "enclaveContainerImage": "255638996474.dkr.ecr.us-east-1.amazonaws.com/layrsv2-production-enclave-clob@sha256:ffe0ed2dee96de5674bfce50963ce855380c5e1727f13eca5715d9e6bd71071f",
   "artifacts": {
     "enclaveImage": {
