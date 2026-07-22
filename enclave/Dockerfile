@@ -8,8 +8,7 @@ COPY src ./src
 RUN test "${#LAYRS_OPERATOR_PUBLIC_KEY_HEX}" -eq 64 \
     && cargo build --locked --release --manifest-path enclave/runtime/Cargo.toml --bin layrs-enclave
 
-FROM debian:bookworm-slim
-RUN useradd --system --uid 10001 --no-create-home layrs
-COPY --from=builder /build/enclave/runtime/target/release/layrs-enclave /usr/local/bin/layrs-enclave
-USER 10001:10001
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=builder --chown=nonroot:nonroot /build/enclave/runtime/target/release/layrs-enclave /usr/local/bin/layrs-enclave
+USER nonroot:nonroot
 ENTRYPOINT ["/usr/local/bin/layrs-enclave"]
