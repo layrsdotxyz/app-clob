@@ -218,13 +218,21 @@ enum JournaledSystemCommand {
     RegisterSession {
         idempotency_key: String,
         session_id: String,
-        private_user_id: String,
+        identity_commitment: [u8; 32],
         public_key: [u8; 32],
         expires_at_millis: i64,
     },
     ExternalFlow {
         idempotency_key: String,
         flow: ExternalFlowTransaction,
+    },
+    ReleaseWithdrawal {
+        idempotency_key: String,
+        identity_commitment: [u8; 32],
+        asset: String,
+        #[serde(with = "super::decimal_u128")]
+        amount_atomic: u128,
+        evidence_hash: [u8; 32],
     },
     ResolveMarket {
         idempotency_key: String,
@@ -259,10 +267,12 @@ pub struct PrivateTradingCore {
     resolutions: BTreeMap<String, MarketResolution>,
     oracle_public_key: Option<[u8; 32]>,
     sequence: u64,
+    identity_key: [u8; 32],
 }
 
 impl PrivateTradingCore {
     pub fn new(journal_key: JournalKey, receipt_signer: ReceiptSigner) -> Self {
+        let identity_key = journal_key.derive(b"private-user-id");
         Self {
             ledger: Ledger::default(),
             books: BTreeMap::new(),
@@ -276,6 +286,7 @@ impl PrivateTradingCore {
             resolutions: BTreeMap::new(),
             oracle_public_key: None,
             sequence: 0,
+            identity_key,
         }
     }
 
@@ -330,6 +341,7 @@ impl PrivateTradingCore {
         if snapshot.sequence < minimum_anchored_sequence {
             return Err(CoreError::RollbackDetected);
         }
+        let identity_key = journal_key.derive(b"private-user-id");
         let mut journal = EncryptedJournal::new(journal_key);
         let state: CoreStateSnapshot = journal.open_snapshot(snapshot)?;
         if state.sequence != snapshot.sequence {
@@ -379,6 +391,7 @@ impl PrivateTradingCore {
             resolutions: state.resolutions,
             oracle_public_key: state.oracle_public_key,
             sequence: state.sequence,
+            identity_key,
         })
     }
 
@@ -449,7 +462,7 @@ impl PrivateTradingCore {
         &mut self,
         idempotency_key: String,
         session_id: String,
-        private_user_id: String,
+        identity_commitment: [u8; 32],
         public_key: [u8; 32],
         expires_at_millis: i64,
         now_millis: i64,
@@ -457,6 +470,7 @@ impl PrivateTradingCore {
         self.validate_new_system_key(&idempotency_key)?;
         let prior_root = self.state_root();
         let mut sessions = self.sessions.clone();
+        let private_user_id = derive_private_user_id(&self.identity_key, &identity_commitment);
         sessions.register(
             session_id.clone(),
             private_user_id.clone(),
@@ -482,7 +496,7 @@ impl PrivateTradingCore {
         let entry = JournaledSystemCommand::RegisterSession {
             idempotency_key: idempotency_key.clone(),
             session_id,
-            private_user_id,
+            identity_commitment,
             public_key,
             expires_at_millis,
         };
@@ -545,6 +559,100 @@ impl PrivateTradingCore {
         self.sequence = next_sequence;
         Ok(self.system_response(
             "external-flow",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_user_external_flow(
+        &mut self,
+        idempotency_key: String,
+        identity_commitment: [u8; 32],
+        asset: String,
+        bucket: AccountBucket,
+        amount: u128,
+        direction: ExternalFlowDirection,
+        evidence_hash: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        if !matches!(
+            bucket,
+            AccountBucket::UserAvailable | AccountBucket::UserWithdrawalHold
+        ) {
+            return Err(CoreError::InvalidOrder(
+                "invalid external user-flow bucket".into(),
+            ));
+        }
+        let owner = derive_private_user_id(&self.identity_key, &identity_commitment);
+        self.apply_external_flow(
+            idempotency_key,
+            AccountKey::new(owner, bucket, asset),
+            amount,
+            direction,
+            evidence_hash,
+            now_millis,
+        )
+    }
+
+    pub fn release_user_withdrawal(
+        &mut self,
+        idempotency_key: String,
+        identity_commitment: [u8; 32],
+        asset: String,
+        amount_atomic: u128,
+        evidence_hash: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        if evidence_hash == [0u8; 32] {
+            return Err(CoreError::InvalidOrder(
+                "withdrawal release requires evidence".into(),
+            ));
+        }
+        let owner = derive_private_user_id(&self.identity_key, &identity_commitment);
+        let prior_root = self.state_root();
+        let mut ledger = self.ledger.clone();
+        ledger.apply(LedgerTransaction {
+            idempotency_key: format!("withdrawal-release:{idempotency_key}"),
+            business_reference: hex::encode(evidence_hash),
+            transfers: vec![Transfer {
+                from: AccountKey::new(&owner, AccountBucket::UserWithdrawalHold, &asset),
+                to: AccountKey::new(owner, AccountBucket::UserAvailable, &asset),
+                amount: amount_atomic,
+            }],
+        })?;
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::ReleaseWithdrawal {
+            idempotency_key: idempotency_key.clone(),
+            identity_commitment,
+            asset,
+            amount_atomic,
+            evidence_hash,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.ledger = ledger;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            "release-withdrawal",
             idempotency_key,
             prior_root,
             next_root,
@@ -730,16 +838,13 @@ impl PrivateTradingCore {
         let mut position_cost_basis = self.position_cost_basis.clone();
         let result = match &command.action {
             UserCommandAction::SubmitOrder { order } => {
-                if order.private_user_id != private_user_id {
-                    return Err(CoreError::InvalidOrder(
-                        "order owner does not match session".into(),
-                    ));
-                }
+                let mut order = order.clone();
+                order.private_user_id = private_user_id.clone();
                 let market = self
                     .markets
                     .get(&order.market_id)
                     .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
-                validate_order_for_market(order, market, now_millis)?;
+                validate_order_for_market(&order, market, now_millis)?;
                 let book = books.entry(order.market_id.clone()).or_default();
                 let match_result = book.submit(order.clone(), now_millis)?;
                 if match_result
@@ -748,12 +853,12 @@ impl PrivateTradingCore {
                     .is_some_and(|accepted| accepted.status != OrderStatus::Rejected)
                 {
                     let transfers =
-                        settlement_transfers(&self.books, &books, market, order, &match_result)?;
+                        settlement_transfers(&self.books, &books, market, &order, &match_result)?;
                     apply_fill_cost_basis(
                         &self.ledger,
                         &self.books,
                         &books,
-                        order,
+                        &order,
                         &match_result,
                         &mut position_cost_basis,
                     )?;
@@ -1527,6 +1632,14 @@ fn validate_withdrawal(
         return Err(CoreError::InvalidOrder("invalid withdrawal request".into()));
     }
     Ok(())
+}
+
+fn derive_private_user_id(identity_key: &[u8; 32], commitment: &[u8; 32]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.private-user-id.v1\0");
+    hash.update(identity_key);
+    hash.update(commitment);
+    format!("usr_{}", hex::encode(hash.finalize()))
 }
 
 fn portfolio_snapshot(

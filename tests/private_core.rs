@@ -7,6 +7,21 @@ use clob_service::private_core::{
     UserCommand, UserCommandAction,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use sha2::{Digest, Sha256};
+
+fn derived_private_user(journal_key: [u8; 32], commitment: [u8; 32]) -> String {
+    let mut key_hash = Sha256::new();
+    key_hash.update(b"layrs.enclave-key-derivation.v1\0");
+    key_hash.update(journal_key);
+    key_hash.update((15u32).to_be_bytes());
+    key_hash.update(b"private-user-id");
+    let identity_key = key_hash.finalize();
+    let mut user_hash = Sha256::new();
+    user_hash.update(b"layrs.private-user-id.v1\0");
+    user_hash.update(identity_key);
+    user_hash.update(commitment);
+    format!("usr_{}", hex::encode(user_hash.finalize()))
+}
 
 #[test]
 fn ledger_is_atomic_conservative_and_idempotent() {
@@ -234,19 +249,23 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
         800,
     )
     .unwrap();
-    for (index, owner, key) in [(1, "usr_alice", &alice), (2, "usr_bob", &bob)] {
+    let alice_owner = derived_private_user([14u8; 32], [1u8; 32]);
+    for (index, key) in [(1, &alice), (2, &bob)] {
+        let commitment = [index as u8; 32];
         core.register_session(
             format!("sys:session:{index}"),
             format!("session:{index}"),
-            owner.into(),
+            commitment,
             key.verifying_key().to_bytes(),
             3_000,
             800,
         )
         .unwrap();
-        core.apply_external_flow(
+        core.apply_user_external_flow(
             format!("sys:deposit:{index}"),
-            AccountKey::new(owner, AccountBucket::UserAvailable, "ZEN"),
+            commitment,
+            "ZEN".into(),
+            AccountBucket::UserAvailable,
             1_000_000,
             ExternalFlowDirection::Inflow,
             [index as u8; 32],
@@ -341,7 +360,7 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
 
     assert_eq!(
         core.balance(&AccountKey::new(
-            "usr_alice",
+            &alice_owner,
             AccountBucket::UserAvailable,
             "ZEN"
         )),
@@ -363,7 +382,7 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
     assert_eq!(restored.state_root(), core.state_root());
     assert_eq!(
         restored.balance(&AccountKey::new(
-            "usr_alice",
+            &alice_owner,
             AccountBucket::UserAvailable,
             "ZEN"
         )),
@@ -385,19 +404,24 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
     let user = SigningKey::from_bytes(&[31u8; 32]);
     let receipt_signer = ReceiptSigner::generate([32u8; 48]);
     let receipt_public_key = receipt_signer.verifying_key();
-    let mut core = PrivateTradingCore::new(JournalKey::from_bytes([33u8; 32]), receipt_signer);
+    let journal_key = [33u8; 32];
+    let identity_commitment = [35u8; 32];
+    let private_user = derived_private_user(journal_key, identity_commitment);
+    let mut core = PrivateTradingCore::new(JournalKey::from_bytes(journal_key), receipt_signer);
     core.register_session(
         "sys:session:withdrawal".into(),
         "session:withdrawal".into(),
-        "usr_private".into(),
+        identity_commitment,
         user.verifying_key().to_bytes(),
         10_000,
         1_000,
     )
     .unwrap();
-    core.apply_external_flow(
+    core.apply_user_external_flow(
         "sys:deposit:withdrawal".into(),
-        AccountKey::new("usr_private", AccountBucket::UserAvailable, "USDC"),
+        identity_commitment,
+        "USDC".into(),
+        AccountBucket::UserAvailable,
         50_000_000,
         ExternalFlowDirection::Inflow,
         [34u8; 32],
@@ -441,7 +465,7 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
     assert_eq!(authorization.intent.receipt_id, response.receipt.receipt_id);
     assert_eq!(
         core.balance(&AccountKey::new(
-            "usr_private",
+            &private_user,
             AccountBucket::UserAvailable,
             "USDC"
         )),
@@ -449,7 +473,7 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
     );
     assert_eq!(
         core.balance(&AccountKey::new(
-            "usr_private",
+            &private_user,
             AccountBucket::UserWithdrawalHold,
             "USDC"
         )),
@@ -466,6 +490,31 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
             &Signature::from_slice(&authorization.signature).unwrap(),
         )
         .unwrap();
+    core.release_user_withdrawal(
+        "sys:withdrawal-release:35".into(),
+        identity_commitment,
+        "USDC".into(),
+        10_000_000,
+        [36u8; 32],
+        1_400,
+    )
+    .unwrap();
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &private_user,
+            AccountBucket::UserAvailable,
+            "USDC"
+        )),
+        50_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &private_user,
+            AccountBucket::UserWithdrawalHold,
+            "USDC"
+        )),
+        0
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

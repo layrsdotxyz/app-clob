@@ -23,6 +23,15 @@ impl JournalKey {
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
+
+    pub fn derive(&self, domain: &[u8]) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(b"layrs.enclave-key-derivation.v1\0");
+        hash.update(self.0);
+        hash.update((domain.len() as u32).to_be_bytes());
+        hash.update(domain);
+        hash.finalize().into()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
