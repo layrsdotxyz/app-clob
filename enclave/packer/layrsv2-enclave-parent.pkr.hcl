@@ -16,12 +16,14 @@ variable "release_id" {
 }
 
 source "amazon-ebs" "layrsv2_enclave_parent" {
-  region        = var.aws_region
-  instance_type = "m6i.xlarge"
-  ssh_username  = "ec2-user"
-  ami_name      = "layrsv2-enclave-parent-${var.release_id}"
-  ena_support   = true
-  imds_support  = "v2.0"
+  region                    = var.aws_region
+  instance_type             = "m6i.xlarge"
+  ssh_username              = "ec2-user"
+  ami_name                  = "layrsv2-enclave-parent-${var.release_id}"
+  ami_description           = "Layrs v2 Nitro enclave parent ${var.release_id}"
+  ena_support               = true
+  imds_support              = "v2.0"
+  ssh_clear_authorized_keys = true
   source_ami_filter {
     filters = {
       name                = "al2023-ami-2023.*-x86_64"
@@ -37,15 +39,46 @@ source "amazon-ebs" "layrsv2_enclave_parent" {
     Generation = "layrsv2"
     ManagedBy  = "Packer"
   }
+  run_tags = {
+    Name        = "layrsv2-enclave-parent-build-${var.release_id}"
+    Project     = "Layrs"
+    Generation  = "layrsv2"
+    Environment = "production"
+    Service     = "enclave-build"
+    ManagedBy   = "Packer"
+  }
+  run_volume_tags = {
+    Name        = "layrsv2-enclave-parent-build-${var.release_id}"
+    Project     = "Layrs"
+    Generation  = "layrsv2"
+    Environment = "production"
+    Service     = "enclave-build"
+    ManagedBy   = "Packer"
+  }
 }
 
 build {
   sources = ["source.amazon-ebs.layrsv2_enclave_parent"]
-  provisioner "file" { source = "build/layrs-enclave-parent", destination = "/tmp/layrs-enclave-parent" }
-  provisioner "file" { source = "build/layrsv2-clob.eif", destination = "/tmp/layrsv2-clob.eif" }
-  provisioner "file" { source = "enclave/systemd/layrsv2-enclave.service", destination = "/tmp/layrsv2-enclave.service" }
-  provisioner "file" { source = "enclave/systemd/layrsv2-enclave-parent.service", destination = "/tmp/layrsv2-enclave-parent.service" }
-  provisioner "file" { source = "enclave/allocator.yaml", destination = "/tmp/allocator.yaml" }
+  provisioner "file" {
+    source      = "build/layrs-enclave-parent"
+    destination = "/tmp/layrs-enclave-parent"
+  }
+  provisioner "file" {
+    source      = "build/layrsv2-clob.eif"
+    destination = "/tmp/layrsv2-clob.eif"
+  }
+  provisioner "file" {
+    source      = "enclave/systemd/layrsv2-enclave.service"
+    destination = "/tmp/layrsv2-enclave.service"
+  }
+  provisioner "file" {
+    source      = "enclave/systemd/layrsv2-enclave-parent.service"
+    destination = "/tmp/layrsv2-enclave-parent.service"
+  }
+  provisioner "file" {
+    source      = "enclave/allocator.yaml"
+    destination = "/tmp/allocator.yaml"
+  }
   provisioner "shell" {
     inline = [
       "sudo dnf install -y aws-nitro-enclaves-cli aws-nitro-enclaves-cli-devel",
