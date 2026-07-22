@@ -4,13 +4,31 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
+use aws_lc_rs::{
+    encoding::{AsDer, PublicKeyX509Der},
+    rsa::{KeySize, OaepPrivateDecryptingKey, PrivateDecryptingKey, OAEP_SHA256_MGF1SHA256},
+};
 use aws_nitro_enclaves_nsm_api::{
     api::{Request as NsmRequest, Response as NsmResponse},
     driver::{nsm_exit, nsm_init, nsm_process_request},
 };
+use clob_service::audit_signer::{
+    AuditBatchRequest, AuditSignerBundle, EnclaveAuditSigner, SignedAuditSettlementTransaction,
+};
+use clob_service::chain_signer::{
+    ChainSignerBundle, EnclaveChainSigner, MarketResolutionTransaction, PoolWithdrawalTransaction,
+};
+use clob_service::polymarket_enclave::{
+    EnclavePolymarketClient, PolymarketSecretBundle, SignedVenueRedemptionTransaction,
+    VenueConfirmation, VenueOrderIntent, VenueRedemptionTransactionIntent, VenueSide,
+};
 use clob_service::private_core::{
-    AccountKey, CoreResponse, EncryptedSnapshot, ExternalFlowDirection, JournalKey, MarketConfig,
-    PrivateTradingCore, ReceiptSigner, SignedResolution, SystemResponse, UserCommand,
+    polymarket_resolution_signing_payload, resolution_signing_payload, AccountKey,
+    BootstrapExecutionState, CoreResponse, EnclaveReceipt, EncryptedJournalRecord,
+    EncryptedSnapshot, ExternalFlowDirection, JournalKey, MarketConfig,
+    PolymarketResolutionStatement, PrivateTradingCore, ReceiptSigner, ResolutionStatement,
+    SignedAuditFillArtifact, SignedPolymarketResolution, SignedResolution,
+    SignedResolutionEvidence, SystemResponse, UserCommand, WithdrawalAuthorization,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::{rngs::OsRng, RngCore};
@@ -52,6 +70,10 @@ enum WireResponse {
     Encrypted {
         nonce: [u8; 12],
         ciphertext: Vec<u8>,
+        journal_artifacts: Vec<EncryptedJournalRecord>,
+        snapshot_artifacts: Vec<EncryptedSnapshot>,
+        receipt_artifacts: Vec<EnclaveReceipt>,
+        audit_artifacts: Vec<SignedAuditFillArtifact>,
     },
     Error {
         code: &'static str,
@@ -68,11 +90,118 @@ struct OperatorEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 enum OperatorCommand {
-    Provision {
-        journal_key: [u8; 32],
+    ProvisionStatus,
+    BeginProvision {
+        kms_key_id: String,
+        kms_ciphertext_blob: Option<Vec<u8>>,
         oracle_public_key: [u8; 32],
         snapshot: Option<EncryptedSnapshot>,
         minimum_anchored_sequence: u64,
+    },
+    CompleteProvision {
+        ciphertext_for_recipient: Vec<u8>,
+    },
+    PolymarketStatus,
+    BeginPolymarketProvision {
+        kms_key_id: String,
+        kms_ciphertext_blob: Vec<u8>,
+        bundle_nonce: [u8; 12],
+        bundle_ciphertext: Vec<u8>,
+    },
+    CompletePolymarketProvision {
+        ciphertext_for_recipient: Vec<u8>,
+    },
+    ChainSignerStatus,
+    BeginChainSignerProvision {
+        kms_key_id: String,
+        kms_ciphertext_blob: Vec<u8>,
+        bundle_nonce: [u8; 12],
+        bundle_ciphertext: Vec<u8>,
+    },
+    CompleteChainSignerProvision {
+        ciphertext_for_recipient: Vec<u8>,
+    },
+    AuditSignerStatus,
+    BeginAuditSignerProvision {
+        kms_key_id: String,
+        kms_ciphertext_blob: Vec<u8>,
+        bundle_nonce: [u8; 12],
+        bundle_ciphertext: Vec<u8>,
+    },
+    CompleteAuditSignerProvision {
+        ciphertext_for_recipient: Vec<u8>,
+    },
+    SignAuditBatch {
+        request: AuditBatchRequest,
+    },
+    SignPoolWithdrawal {
+        idempotency_key: String,
+        authorization: WithdrawalAuthorization,
+        nonce: u64,
+        gas_limit: u64,
+        max_fee_per_gas_wei: String,
+        max_priority_fee_per_gas_wei: String,
+        now_millis: i64,
+    },
+    SignMarketResolution {
+        chain: String,
+        market_id: String,
+        outcome: clob_service::private_core::ResolutionOutcome,
+        evidence: SignedResolutionEvidence,
+        reason_uri: String,
+        nonce: u64,
+        gas_limit: u64,
+        max_fee_per_gas_wei: String,
+        max_priority_fee_per_gas_wei: String,
+        now_millis: i64,
+    },
+    SignResolutionEvidence {
+        evidence: UnsignedResolutionEvidence,
+        now_millis: i64,
+    },
+    ExecuteBootstrap {
+        idempotency_key: String,
+        execution_id: uuid::Uuid,
+        timestamp_seconds: u64,
+        now_millis: i64,
+    },
+    ReconcileBootstrap {
+        idempotency_key: String,
+        execution_id: uuid::Uuid,
+        timestamp_seconds: u64,
+        now_millis: i64,
+    },
+    SignPolymarketRedemption {
+        market_id: String,
+        outcome: clob_service::private_core::ResolutionOutcome,
+        nonce: u64,
+        gas_limit: u64,
+        gas_price_wei: String,
+        now_millis: i64,
+    },
+    BootstrapExecutionStatus {
+        execution_id: uuid::Uuid,
+        identity_commitment: [u8; 32],
+    },
+    MarketStatus {
+        market_id: String,
+    },
+    ResolutionStatus {
+        market_id: String,
+    },
+    TradingFreezeStatus,
+    AggregateDepth {
+        market_id: String,
+        outcome: clob_service::private_core::Outcome,
+        now_millis: i64,
+        #[serde(with = "clob_service::private_core::decimal_u128")]
+        minimum_level_quantity_micros: u128,
+    },
+    SetTradingFreeze {
+        idempotency_key: String,
+        frozen: bool,
+        reason_commitment: [u8; 32],
+        now_millis: i64,
     },
     ExportSnapshot,
     RegisterMarket {
@@ -129,6 +258,42 @@ enum OperatorCommand {
         signed: SignedResolution,
         now_millis: i64,
     },
+    ResolvePolymarketMarket {
+        idempotency_key: String,
+        signed: SignedPolymarketResolution,
+        now_millis: i64,
+    },
+    MarkBootstrapSubmitted {
+        idempotency_key: String,
+        execution_id: uuid::Uuid,
+        venue_order_id: String,
+        now_millis: i64,
+    },
+    ConfirmBootstrapFill {
+        idempotency_key: String,
+        execution_id: uuid::Uuid,
+        fill_price_micros: u64,
+        evidence_hash: [u8; 32],
+        now_millis: i64,
+    },
+    FailBootstrapExecution {
+        idempotency_key: String,
+        execution_id: uuid::Uuid,
+        failure_code: String,
+        evidence_hash: [u8; 32],
+        now_millis: i64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    content = "statement",
+    rename_all = "SCREAMING_SNAKE_CASE"
+)]
+enum UnsignedResolutionEvidence {
+    Pyth(ResolutionStatement),
+    Polymarket(PolymarketResolutionStatement),
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,18 +319,72 @@ enum PlainRequest {
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 enum PlainResponse {
     Provisioned,
+    ProvisionStatus {
+        state: &'static str,
+    },
+    PolymarketStatus {
+        state: &'static str,
+    },
+    ChainSignerStatus {
+        state: &'static str,
+        verifier_public_key: Option<[u8; 32]>,
+    },
+    AuditSignerStatus {
+        state: &'static str,
+    },
+    KmsRecipientRequest {
+        attestation_document: Vec<u8>,
+        kms_key_id: String,
+        kms_ciphertext_blob: Option<Vec<u8>>,
+        operation: &'static str,
+        key_encryption_algorithm: &'static str,
+    },
     System {
         response: SystemResponse,
+    },
+    PoolWithdrawalSigned {
+        transaction: PoolWithdrawalTransaction,
+        response: Option<SystemResponse>,
+    },
+    MarketResolutionSigned {
+        transaction: MarketResolutionTransaction,
+    },
+    ResolutionEvidenceSigned {
+        evidence: SignedResolutionEvidence,
+        verifier_public_key: [u8; 32],
+    },
+    AuditBatchSigned {
+        transaction: SignedAuditSettlementTransaction,
+    },
+    PolymarketRedemptionSigned {
+        transaction: SignedVenueRedemptionTransaction,
+        expected_redemption_amount_atomic: String,
     },
     User {
         response: CoreResponse,
     },
     Depth {
-        bids: Vec<(u64, u128)>,
-        asks: Vec<(u64, u128)>,
+        bids: Vec<(u64, String)>,
+        asks: Vec<(u64, String)>,
     },
     Snapshot {
         snapshot: EncryptedSnapshot,
+    },
+    BootstrapPending {
+        execution_id: uuid::Uuid,
+    },
+    BootstrapExecutionStatus {
+        execution_id: uuid::Uuid,
+        state: BootstrapExecutionState,
+    },
+    MarketStatus {
+        market: Option<MarketConfig>,
+    },
+    ResolutionStatus {
+        resolution: Option<clob_service::private_core::MarketResolution>,
+    },
+    TradingFreezeStatus {
+        frozen: bool,
     },
     Error {
         code: String,
@@ -174,6 +393,7 @@ enum PlainResponse {
 
 struct EnclaveState {
     nsm_fd: i32,
+    enclave_measurement_sha384: [u8; 48],
     transport_secret: StaticSecret,
     transport_public_key: [u8; 32],
     receipt_signer: Option<ReceiptSigner>,
@@ -182,6 +402,38 @@ struct EnclaveState {
     operator_nonces: BTreeSet<[u8; 32]>,
     transport_nonces: BTreeSet<[u8; 44]>,
     core: Option<PrivateTradingCore>,
+    pending_provision: Option<PendingProvision>,
+    pending_polymarket_provision: Option<PendingPolymarketProvision>,
+    polymarket: Option<EnclavePolymarketClient>,
+    pending_chain_signer_provision: Option<PendingChainSignerProvision>,
+    chain_signer: Option<EnclaveChainSigner>,
+    pending_audit_signer_provision: Option<PendingAuditSignerProvision>,
+    audit_signer: Option<EnclaveAuditSigner>,
+}
+
+struct PendingProvision {
+    recipient_private_key: PrivateDecryptingKey,
+    oracle_public_key: [u8; 32],
+    snapshot: Option<EncryptedSnapshot>,
+    minimum_anchored_sequence: u64,
+}
+
+struct PendingPolymarketProvision {
+    recipient_private_key: PrivateDecryptingKey,
+    bundle_nonce: [u8; 12],
+    bundle_ciphertext: Vec<u8>,
+}
+
+struct PendingChainSignerProvision {
+    recipient_private_key: PrivateDecryptingKey,
+    bundle_nonce: [u8; 12],
+    bundle_ciphertext: Vec<u8>,
+}
+
+struct PendingAuditSignerProvision {
+    recipient_private_key: PrivateDecryptingKey,
+    bundle_nonce: [u8; 12],
+    bundle_ciphertext: Vec<u8>,
 }
 
 impl Drop for EnclaveState {
@@ -204,6 +456,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let receipt_public_key = receipt_signer.verifying_key();
     let state = Arc::new(Mutex::new(EnclaveState {
         nsm_fd,
+        enclave_measurement_sha384: measurement_sha384,
         transport_secret,
         transport_public_key,
         receipt_signer: Some(receipt_signer),
@@ -212,6 +465,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         operator_nonces: BTreeSet::new(),
         transport_nonces: BTreeSet::new(),
         core: None,
+        pending_provision: None,
+        pending_polymarket_provision: None,
+        polymarket: None,
+        pending_chain_signer_provision: None,
+        chain_signer: None,
+        pending_audit_signer_provision: None,
+        audit_signer: None,
     }));
 
     let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, PORT))?;
@@ -317,7 +577,54 @@ async fn handle_encrypted(
     };
     plaintext.zeroize();
     state.transport_nonces.insert(replay_key);
-    let response = dispatch(&mut state, request);
+    let response = dispatch(&mut state, request).await;
+    // These sidecars contain only AEAD ciphertext and its integrity/chain metadata. They let the
+    // untrusted parent persist state transitions without learning the encrypted response body.
+    let journal_artifacts = match &response {
+        PlainResponse::User { response } => vec![response.encrypted_record.clone()],
+        PlainResponse::System { response } => vec![response.encrypted_record.clone()],
+        PlainResponse::PoolWithdrawalSigned {
+            response: Some(response),
+            ..
+        } => vec![response.encrypted_record.clone()],
+        _ => Vec::new(),
+    };
+    let snapshot_artifacts = match &response {
+        PlainResponse::Snapshot { snapshot } => vec![snapshot.clone()],
+        _ if !journal_artifacts.is_empty() => match state
+            .core
+            .as_ref()
+            .and_then(|core| core.export_encrypted_snapshot().ok())
+        {
+            Some(snapshot) => vec![snapshot],
+            None => {
+                return WireResponse::Error {
+                    code: "SNAPSHOT_EXPORT_FAILED",
+                }
+            }
+        },
+        _ => Vec::new(),
+    };
+    let receipt_artifacts = match &response {
+        PlainResponse::User { response } => vec![response.receipt.clone()],
+        PlainResponse::System { response } => vec![response.receipt.clone()],
+        PlainResponse::PoolWithdrawalSigned {
+            response: Some(response),
+            ..
+        } => {
+            vec![response.receipt.clone()]
+        }
+        _ => Vec::new(),
+    };
+    let audit_artifacts = match &response {
+        PlainResponse::User { response } => response.audit_fills.clone(),
+        PlainResponse::System { response } => response.audit_fills.clone(),
+        PlainResponse::PoolWithdrawalSigned {
+            response: Some(response),
+            ..
+        } => response.audit_fills.clone(),
+        _ => Vec::new(),
+    };
     let encoded = match serde_json::to_vec(&response) {
         Ok(value) => value,
         Err(_) => {
@@ -338,6 +645,10 @@ async fn handle_encrypted(
         Ok(ciphertext) => WireResponse::Encrypted {
             nonce: response_nonce,
             ciphertext,
+            journal_artifacts,
+            snapshot_artifacts,
+            receipt_artifacts,
+            audit_artifacts,
         },
         Err(_) => WireResponse::Error {
             code: "ENCRYPTION_FAILED",
@@ -345,9 +656,16 @@ async fn handle_encrypted(
     }
 }
 
-fn dispatch(state: &mut EnclaveState, request: PlainRequest) -> PlainResponse {
+fn serialize_depth(levels: Vec<(u64, u128)>) -> Vec<(u64, String)> {
+    levels
+        .into_iter()
+        .map(|(price_micros, quantity_micros)| (price_micros, quantity_micros.to_string()))
+        .collect()
+}
+
+async fn dispatch(state: &mut EnclaveState, request: PlainRequest) -> PlainResponse {
     let result: Result<PlainResponse, String> = match request {
-        PlainRequest::Operator { envelope } => dispatch_operator(state, envelope),
+        PlainRequest::Operator { envelope } => dispatch_operator(state, envelope).await,
         PlainRequest::User {
             command,
             now_millis,
@@ -376,13 +694,16 @@ fn dispatch(state: &mut EnclaveState, request: PlainRequest) -> PlainResponse {
                     now_millis,
                     minimum_level_quantity_micros,
                 );
-                PlainResponse::Depth { bids, asks }
+                PlainResponse::Depth {
+                    bids: serialize_depth(bids),
+                    asks: serialize_depth(asks),
+                }
             }),
     };
     result.unwrap_or_else(|code| PlainResponse::Error { code })
 }
 
-fn dispatch_operator(
+async fn dispatch_operator(
     state: &mut EnclaveState,
     envelope: OperatorEnvelope,
 ) -> Result<PlainResponse, String> {
@@ -406,8 +727,18 @@ fn dispatch_operator(
     state.operator_nonces.insert(envelope.nonce);
 
     match envelope.command {
-        OperatorCommand::Provision {
-            journal_key,
+        OperatorCommand::ProvisionStatus => Ok(PlainResponse::ProvisionStatus {
+            state: if state.core.is_some() {
+                "READY"
+            } else if state.pending_provision.is_some() {
+                "PENDING"
+            } else {
+                "UNPROVISIONED"
+            },
+        }),
+        OperatorCommand::BeginProvision {
+            kms_key_id,
+            kms_ciphertext_blob,
             oracle_public_key,
             snapshot,
             minimum_anchored_sequence,
@@ -415,23 +746,750 @@ fn dispatch_operator(
             if state.core.is_some() {
                 return Err("ALREADY_PROVISIONED".into());
             }
-            let signer = state
-                .receipt_signer
+            if kms_key_id.is_empty()
+                || kms_key_id.len() > 2_048
+                || !kms_key_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b":/_-".contains(&byte))
+                || kms_ciphertext_blob
+                    .as_ref()
+                    .is_some_and(|blob| blob.is_empty() || blob.len() > 65_536)
+            {
+                return Err("INVALID_KMS_CIPHERTEXT".into());
+            }
+            VerifyingKey::from_bytes(&oracle_public_key)
+                .map_err(|_| "INVALID_ORACLE_PUBLIC_KEY".to_string())?;
+            let (recipient_private_key, recipient_public_key) = generate_recipient_key()?;
+            let mut binding = Vec::with_capacity(128);
+            binding.extend_from_slice(b"layrs.kms-recipient.v1\0");
+            binding.extend_from_slice(&Sha256::digest(kms_key_id.as_bytes()));
+            binding.extend_from_slice(&Sha256::digest(
+                kms_ciphertext_blob.as_deref().unwrap_or_default(),
+            ));
+            binding.extend_from_slice(&oracle_public_key);
+            let attestation_document = match nsm_process_request(
+                state.nsm_fd,
+                NsmRequest::Attestation {
+                    user_data: Some(binding.into()),
+                    nonce: None,
+                    public_key: Some(recipient_public_key.into()),
+                },
+            ) {
+                NsmResponse::Attestation { document } => document,
+                _ => return Err("KMS_RECIPIENT_ATTESTATION_FAILED".into()),
+            };
+            state.pending_provision = Some(PendingProvision {
+                recipient_private_key,
+                oracle_public_key,
+                snapshot,
+                minimum_anchored_sequence,
+            });
+            Ok(PlainResponse::KmsRecipientRequest {
+                attestation_document,
+                kms_key_id,
+                operation: if kms_ciphertext_blob.is_some() {
+                    "DECRYPT"
+                } else {
+                    "GENERATE_DATA_KEY"
+                },
+                kms_ciphertext_blob,
+                key_encryption_algorithm: "RSAES_OAEP_SHA_256",
+            })
+        }
+        OperatorCommand::CompleteProvision {
+            ciphertext_for_recipient,
+        } => {
+            if state.core.is_some() {
+                return Err("ALREADY_PROVISIONED".into());
+            }
+            if ciphertext_for_recipient.is_empty() || ciphertext_for_recipient.len() > 4_096 {
+                return Err("INVALID_RECIPIENT_CIPHERTEXT".into());
+            }
+            let pending = state
+                .pending_provision
                 .take()
-                .ok_or_else(|| "ALREADY_PROVISIONED".to_string())?;
+                .ok_or_else(|| "NO_PENDING_PROVISION".to_string())?;
+            let mut plaintext =
+                decrypt_recipient_key(pending.recipient_private_key, &ciphertext_for_recipient)?;
+            let journal_key: [u8; 32] = match plaintext.as_slice().try_into() {
+                Ok(key) => key,
+                Err(_) => {
+                    plaintext.zeroize();
+                    return Err("INVALID_KMS_KEY_MATERIAL".into());
+                }
+            };
+            plaintext.zeroize();
             let key = JournalKey::from_bytes(journal_key);
-            state.core = Some(match snapshot {
+            let mut receipt_seed = key.derive(b"receipt-signing-key-v1");
+            let signer = ReceiptSigner::from_seed(receipt_seed, state.enclave_measurement_sha384);
+            receipt_seed.zeroize();
+            state.receipt_public_key = signer.verifying_key();
+            state.receipt_signer = None;
+            state.core = Some(match pending.snapshot {
                 Some(snapshot) => PrivateTradingCore::restore_encrypted_snapshot(
                     key,
                     signer,
                     &snapshot,
-                    minimum_anchored_sequence,
+                    pending.minimum_anchored_sequence,
                 )
                 .map_err(|error| error.to_string())?,
-                None => PrivateTradingCore::new_with_oracle(key, signer, oracle_public_key)
+                None => PrivateTradingCore::new_with_oracle(key, signer, pending.oracle_public_key)
                     .map_err(|error| error.to_string())?,
             });
             Ok(PlainResponse::Provisioned)
+        }
+        OperatorCommand::PolymarketStatus => Ok(PlainResponse::PolymarketStatus {
+            state: if state.polymarket.is_some() {
+                "READY"
+            } else if state.pending_polymarket_provision.is_some() {
+                "PENDING"
+            } else {
+                "UNPROVISIONED"
+            },
+        }),
+        OperatorCommand::BeginPolymarketProvision {
+            kms_key_id,
+            kms_ciphertext_blob,
+            bundle_nonce,
+            bundle_ciphertext,
+        } => {
+            if state.polymarket.is_some() {
+                return Err("POLYMARKET_ALREADY_PROVISIONED".into());
+            }
+            validate_kms_reference(&kms_key_id, Some(&kms_ciphertext_blob))?;
+            if bundle_ciphertext.len() < 17 || bundle_ciphertext.len() > 65_536 {
+                return Err("INVALID_POLYMARKET_BUNDLE_CIPHERTEXT".into());
+            }
+            let (recipient_private_key, recipient_public_key) = generate_recipient_key()?;
+            let mut binding = Vec::with_capacity(128);
+            binding.extend_from_slice(b"layrs.polymarket-kms-recipient.v1\0");
+            binding.extend_from_slice(&Sha256::digest(kms_key_id.as_bytes()));
+            binding.extend_from_slice(&Sha256::digest(&kms_ciphertext_blob));
+            binding.extend_from_slice(&Sha256::digest(&bundle_ciphertext));
+            binding.extend_from_slice(&bundle_nonce);
+            let attestation_document = match nsm_process_request(
+                state.nsm_fd,
+                NsmRequest::Attestation {
+                    user_data: Some(binding.into()),
+                    nonce: None,
+                    public_key: Some(recipient_public_key.into()),
+                },
+            ) {
+                NsmResponse::Attestation { document } => document,
+                _ => return Err("KMS_RECIPIENT_ATTESTATION_FAILED".into()),
+            };
+            state.pending_polymarket_provision = Some(PendingPolymarketProvision {
+                recipient_private_key,
+                bundle_nonce,
+                bundle_ciphertext,
+            });
+            Ok(PlainResponse::KmsRecipientRequest {
+                attestation_document,
+                kms_key_id,
+                kms_ciphertext_blob: Some(kms_ciphertext_blob),
+                operation: "DECRYPT",
+                key_encryption_algorithm: "RSAES_OAEP_SHA_256",
+            })
+        }
+        OperatorCommand::CompletePolymarketProvision {
+            ciphertext_for_recipient,
+        } => {
+            if state.polymarket.is_some() {
+                return Err("POLYMARKET_ALREADY_PROVISIONED".into());
+            }
+            if ciphertext_for_recipient.is_empty() || ciphertext_for_recipient.len() > 4_096 {
+                return Err("INVALID_RECIPIENT_CIPHERTEXT".into());
+            }
+            let pending = state
+                .pending_polymarket_provision
+                .take()
+                .ok_or_else(|| "NO_PENDING_POLYMARKET_PROVISION".to_string())?;
+            let mut wrapping_key =
+                decrypt_recipient_key(pending.recipient_private_key, &ciphertext_for_recipient)?;
+            if wrapping_key.len() != 32 {
+                wrapping_key.zeroize();
+                return Err("INVALID_KMS_KEY_MATERIAL".into());
+            }
+            let bundle_cipher = Aes256Gcm::new_from_slice(&wrapping_key)
+                .map_err(|_| "INVALID_KMS_KEY_MATERIAL".to_string())?;
+            let mut plaintext = match bundle_cipher.decrypt(
+                Nonce::from_slice(&pending.bundle_nonce),
+                aes_gcm::aead::Payload {
+                    msg: &pending.bundle_ciphertext,
+                    aad: b"layrs.polymarket-secret-bundle.v1",
+                },
+            ) {
+                Ok(value) => value,
+                Err(_) => {
+                    wrapping_key.zeroize();
+                    return Err("POLYMARKET_BUNDLE_DECRYPT_FAILED".into());
+                }
+            };
+            wrapping_key.zeroize();
+            let parsed = serde_json::from_slice::<PolymarketSecretBundle>(&plaintext);
+            plaintext.zeroize();
+            let bundle = parsed.map_err(|_| "INVALID_POLYMARKET_SECRET_BUNDLE".to_string())?;
+            state.polymarket = Some(EnclavePolymarketClient::new(bundle)?);
+            Ok(PlainResponse::PolymarketStatus { state: "READY" })
+        }
+        OperatorCommand::ChainSignerStatus => Ok(PlainResponse::ChainSignerStatus {
+            state: if state.chain_signer.is_some() {
+                "READY"
+            } else if state.pending_chain_signer_provision.is_some() {
+                "PENDING"
+            } else {
+                "UNPROVISIONED"
+            },
+            verifier_public_key: state
+                .chain_signer
+                .as_ref()
+                .map(|signer| signer.resolution_verifying_key()),
+        }),
+        OperatorCommand::BeginChainSignerProvision {
+            kms_key_id,
+            kms_ciphertext_blob,
+            bundle_nonce,
+            bundle_ciphertext,
+        } => {
+            if state.chain_signer.is_some() {
+                return Err("CHAIN_SIGNER_ALREADY_PROVISIONED".into());
+            }
+            validate_kms_reference(&kms_key_id, Some(&kms_ciphertext_blob))?;
+            if bundle_ciphertext.len() < 17 || bundle_ciphertext.len() > 65_536 {
+                return Err("INVALID_CHAIN_SIGNER_BUNDLE_CIPHERTEXT".into());
+            }
+            let (recipient_private_key, recipient_public_key) = generate_recipient_key()?;
+            let mut binding = Vec::with_capacity(128);
+            binding.extend_from_slice(b"layrs.chain-signer-kms-recipient.v1\0");
+            binding.extend_from_slice(&Sha256::digest(kms_key_id.as_bytes()));
+            binding.extend_from_slice(&Sha256::digest(&kms_ciphertext_blob));
+            binding.extend_from_slice(&Sha256::digest(&bundle_ciphertext));
+            binding.extend_from_slice(&bundle_nonce);
+            let attestation_document = match nsm_process_request(
+                state.nsm_fd,
+                NsmRequest::Attestation {
+                    user_data: Some(binding.into()),
+                    nonce: None,
+                    public_key: Some(recipient_public_key.into()),
+                },
+            ) {
+                NsmResponse::Attestation { document } => document,
+                _ => return Err("KMS_RECIPIENT_ATTESTATION_FAILED".into()),
+            };
+            state.pending_chain_signer_provision = Some(PendingChainSignerProvision {
+                recipient_private_key,
+                bundle_nonce,
+                bundle_ciphertext,
+            });
+            Ok(PlainResponse::KmsRecipientRequest {
+                attestation_document,
+                kms_key_id,
+                kms_ciphertext_blob: Some(kms_ciphertext_blob),
+                operation: "DECRYPT",
+                key_encryption_algorithm: "RSAES_OAEP_SHA_256",
+            })
+        }
+        OperatorCommand::CompleteChainSignerProvision {
+            ciphertext_for_recipient,
+        } => {
+            if state.chain_signer.is_some() {
+                return Err("CHAIN_SIGNER_ALREADY_PROVISIONED".into());
+            }
+            if ciphertext_for_recipient.is_empty() || ciphertext_for_recipient.len() > 4_096 {
+                return Err("INVALID_RECIPIENT_CIPHERTEXT".into());
+            }
+            let pending = state
+                .pending_chain_signer_provision
+                .take()
+                .ok_or_else(|| "NO_PENDING_CHAIN_SIGNER_PROVISION".to_string())?;
+            let mut wrapping_key =
+                decrypt_recipient_key(pending.recipient_private_key, &ciphertext_for_recipient)?;
+            if wrapping_key.len() != 32 {
+                wrapping_key.zeroize();
+                return Err("INVALID_KMS_KEY_MATERIAL".into());
+            }
+            let bundle_cipher = Aes256Gcm::new_from_slice(&wrapping_key)
+                .map_err(|_| "INVALID_KMS_KEY_MATERIAL".to_string())?;
+            let mut plaintext = match bundle_cipher.decrypt(
+                Nonce::from_slice(&pending.bundle_nonce),
+                aes_gcm::aead::Payload {
+                    msg: &pending.bundle_ciphertext,
+                    aad: b"layrs.chain-signer-secret-bundle.v1",
+                },
+            ) {
+                Ok(value) => value,
+                Err(_) => {
+                    wrapping_key.zeroize();
+                    return Err("CHAIN_SIGNER_BUNDLE_DECRYPT_FAILED".into());
+                }
+            };
+            wrapping_key.zeroize();
+            let parsed = serde_json::from_slice::<ChainSignerBundle>(&plaintext);
+            plaintext.zeroize();
+            state.chain_signer =
+                Some(EnclaveChainSigner::new(parsed.map_err(|_| {
+                    "INVALID_CHAIN_SIGNER_SECRET_BUNDLE".to_string()
+                })?)?);
+            Ok(PlainResponse::ChainSignerStatus {
+                state: "READY",
+                verifier_public_key: state
+                    .chain_signer
+                    .as_ref()
+                    .map(|signer| signer.resolution_verifying_key()),
+            })
+        }
+        OperatorCommand::SignPoolWithdrawal {
+            idempotency_key,
+            authorization,
+            nonce,
+            gas_limit,
+            max_fee_per_gas_wei,
+            max_priority_fee_per_gas_wei,
+            now_millis,
+        } => {
+            verify_withdrawal_authorization(&authorization, state.receipt_public_key)?;
+            let core = state
+                .core
+                .as_mut()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?;
+            core.validate_withdrawal_intent(&authorization.intent)
+                .map_err(|error| error.to_string())?;
+            let signer = state
+                .chain_signer
+                .as_ref()
+                .ok_or_else(|| "CHAIN_SIGNER_NOT_PROVISIONED".to_string())?;
+            let transaction = signer
+                .sign_pool_withdrawal(
+                    &authorization.intent.chain,
+                    &authorization.intent.asset,
+                    &authorization.intent.destination,
+                    &authorization.intent.amount_atomic,
+                    nonce,
+                    gas_limit,
+                    &max_fee_per_gas_wei,
+                    &max_priority_fee_per_gas_wei,
+                )
+                .await?;
+            let raw = hex::decode(transaction.raw_transaction_hex.trim_start_matches("0x"))
+                .map_err(|_| "INVALID_SIGNED_WITHDRAWAL_TRANSACTION".to_string())?;
+            let commitment: [u8; 32] = Sha256::digest(raw).into();
+            if let Some((prior_commitment, prior_raw)) =
+                core.prepared_withdrawal(authorization.intent.withdrawal_id)
+            {
+                if prior_commitment != commitment || prior_raw != transaction.raw_transaction_hex {
+                    return Err("WITHDRAWAL_TRANSACTION_CONFLICT".into());
+                }
+                return Ok(PlainResponse::PoolWithdrawalSigned {
+                    transaction,
+                    response: None,
+                });
+            }
+            let response = core
+                .record_prepared_withdrawal(
+                    idempotency_key,
+                    authorization.intent.withdrawal_id,
+                    commitment,
+                    transaction.raw_transaction_hex.clone(),
+                    now_millis,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(PlainResponse::PoolWithdrawalSigned {
+                transaction,
+                response: Some(response),
+            })
+        }
+        OperatorCommand::SignResolutionEvidence {
+            evidence,
+            now_millis,
+        } => {
+            let signer = state
+                .chain_signer
+                .as_ref()
+                .ok_or_else(|| "CHAIN_SIGNER_NOT_PROVISIONED".to_string())?;
+            let (market_id, outcome, signed) = match evidence {
+                UnsignedResolutionEvidence::Pyth(statement) => {
+                    let outcome = if statement.closing.median_price_e8
+                        > statement.opening.median_price_e8
+                    {
+                        clob_service::private_core::ResolutionOutcome::Up
+                    } else if statement.closing.median_price_e8 < statement.opening.median_price_e8
+                    {
+                        clob_service::private_core::ResolutionOutcome::Down
+                    } else {
+                        clob_service::private_core::ResolutionOutcome::Push
+                    };
+                    let payload = resolution_signing_payload(&statement)
+                        .map_err(|error| error.to_string())?;
+                    let market_id = statement.market_id.clone();
+                    let signed = SignedResolutionEvidence::Pyth(SignedResolution {
+                        statement,
+                        signature: signer.sign_resolution_payload(&payload),
+                    });
+                    (market_id, outcome, signed)
+                }
+                UnsignedResolutionEvidence::Polymarket(statement) => {
+                    let outcome = statement.outcome;
+                    let payload = polymarket_resolution_signing_payload(&statement)
+                        .map_err(|error| error.to_string())?;
+                    let market_id = statement.market_id.clone();
+                    let signed = SignedResolutionEvidence::Polymarket(SignedPolymarketResolution {
+                        statement,
+                        signature: signer.sign_resolution_payload(&payload),
+                    });
+                    (market_id, outcome, signed)
+                }
+            };
+            state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .validate_onchain_resolution_authorization(&market_id, outcome, &signed, now_millis)
+                .map_err(|error| error.to_string())?;
+            Ok(PlainResponse::ResolutionEvidenceSigned {
+                evidence: signed,
+                verifier_public_key: signer.resolution_verifying_key(),
+            })
+        }
+        OperatorCommand::SignMarketResolution {
+            chain,
+            market_id,
+            outcome,
+            evidence,
+            reason_uri,
+            nonce,
+            gas_limit,
+            max_fee_per_gas_wei,
+            max_priority_fee_per_gas_wei,
+            now_millis,
+        } => {
+            state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .validate_onchain_resolution_authorization(
+                    &market_id, outcome, &evidence, now_millis,
+                )
+                .map_err(|error| error.to_string())?;
+            let outcome_name = match outcome {
+                clob_service::private_core::ResolutionOutcome::Up => "UP",
+                clob_service::private_core::ResolutionOutcome::Down => "DOWN",
+                clob_service::private_core::ResolutionOutcome::Push => "PUSH",
+            };
+            let transaction = state
+                .chain_signer
+                .as_ref()
+                .ok_or_else(|| "CHAIN_SIGNER_NOT_PROVISIONED".to_string())?
+                .sign_market_resolution(
+                    &chain,
+                    &market_id,
+                    outcome_name,
+                    &reason_uri,
+                    nonce,
+                    gas_limit,
+                    &max_fee_per_gas_wei,
+                    &max_priority_fee_per_gas_wei,
+                )
+                .await?;
+            Ok(PlainResponse::MarketResolutionSigned { transaction })
+        }
+        OperatorCommand::AuditSignerStatus => Ok(PlainResponse::AuditSignerStatus {
+            state: if state.audit_signer.is_some() {
+                "READY"
+            } else if state.pending_audit_signer_provision.is_some() {
+                "PENDING"
+            } else {
+                "UNPROVISIONED"
+            },
+        }),
+        OperatorCommand::BeginAuditSignerProvision {
+            kms_key_id,
+            kms_ciphertext_blob,
+            bundle_nonce,
+            bundle_ciphertext,
+        } => {
+            if state.audit_signer.is_some() {
+                return Err("AUDIT_SIGNER_ALREADY_PROVISIONED".into());
+            }
+            validate_kms_reference(&kms_key_id, Some(&kms_ciphertext_blob))?;
+            if bundle_ciphertext.len() < 17 || bundle_ciphertext.len() > 65_536 {
+                return Err("INVALID_AUDIT_SIGNER_BUNDLE_CIPHERTEXT".into());
+            }
+            let (recipient_private_key, recipient_public_key) = generate_recipient_key()?;
+            let mut binding = Vec::with_capacity(128);
+            binding.extend_from_slice(b"layrs.audit-signer-kms-recipient.v1\0");
+            binding.extend_from_slice(&Sha256::digest(kms_key_id.as_bytes()));
+            binding.extend_from_slice(&Sha256::digest(&kms_ciphertext_blob));
+            binding.extend_from_slice(&Sha256::digest(&bundle_ciphertext));
+            binding.extend_from_slice(&bundle_nonce);
+            let attestation_document = match nsm_process_request(
+                state.nsm_fd,
+                NsmRequest::Attestation {
+                    user_data: Some(binding.into()),
+                    nonce: None,
+                    public_key: Some(recipient_public_key.into()),
+                },
+            ) {
+                NsmResponse::Attestation { document } => document,
+                _ => return Err("KMS_RECIPIENT_ATTESTATION_FAILED".into()),
+            };
+            state.pending_audit_signer_provision = Some(PendingAuditSignerProvision {
+                recipient_private_key,
+                bundle_nonce,
+                bundle_ciphertext,
+            });
+            Ok(PlainResponse::KmsRecipientRequest {
+                attestation_document,
+                kms_key_id,
+                kms_ciphertext_blob: Some(kms_ciphertext_blob),
+                operation: "DECRYPT",
+                key_encryption_algorithm: "RSAES_OAEP_SHA_256",
+            })
+        }
+        OperatorCommand::CompleteAuditSignerProvision {
+            ciphertext_for_recipient,
+        } => {
+            if state.audit_signer.is_some() {
+                return Err("AUDIT_SIGNER_ALREADY_PROVISIONED".into());
+            }
+            if ciphertext_for_recipient.is_empty() || ciphertext_for_recipient.len() > 4_096 {
+                return Err("INVALID_RECIPIENT_CIPHERTEXT".into());
+            }
+            let pending = state
+                .pending_audit_signer_provision
+                .take()
+                .ok_or_else(|| "NO_PENDING_AUDIT_SIGNER_PROVISION".to_string())?;
+            let mut wrapping_key =
+                decrypt_recipient_key(pending.recipient_private_key, &ciphertext_for_recipient)?;
+            if wrapping_key.len() != 32 {
+                wrapping_key.zeroize();
+                return Err("INVALID_KMS_KEY_MATERIAL".into());
+            }
+            let bundle_cipher = Aes256Gcm::new_from_slice(&wrapping_key)
+                .map_err(|_| "INVALID_KMS_KEY_MATERIAL".to_string())?;
+            let mut plaintext = match bundle_cipher.decrypt(
+                Nonce::from_slice(&pending.bundle_nonce),
+                aes_gcm::aead::Payload {
+                    msg: &pending.bundle_ciphertext,
+                    aad: b"layrs.audit-signer-secret-bundle.v1",
+                },
+            ) {
+                Ok(value) => value,
+                Err(_) => {
+                    wrapping_key.zeroize();
+                    return Err("AUDIT_SIGNER_BUNDLE_DECRYPT_FAILED".into());
+                }
+            };
+            wrapping_key.zeroize();
+            let parsed = serde_json::from_slice::<AuditSignerBundle>(&plaintext);
+            plaintext.zeroize();
+            state.audit_signer =
+                Some(EnclaveAuditSigner::new(parsed.map_err(|_| {
+                    "INVALID_AUDIT_SIGNER_SECRET_BUNDLE".to_string()
+                })?)?);
+            Ok(PlainResponse::AuditSignerStatus { state: "READY" })
+        }
+        OperatorCommand::SignAuditBatch { request } => {
+            let signer = state
+                .audit_signer
+                .as_ref()
+                .ok_or_else(|| "AUDIT_SIGNER_NOT_PROVISIONED".to_string())?;
+            let transaction = signer
+                .sign_batch_transaction(request, state.receipt_public_key)
+                .await?;
+            Ok(PlainResponse::AuditBatchSigned { transaction })
+        }
+        OperatorCommand::ExecuteBootstrap {
+            idempotency_key,
+            execution_id,
+            timestamp_seconds,
+            now_millis,
+        } => {
+            let client = state
+                .polymarket
+                .as_ref()
+                .ok_or_else(|| "POLYMARKET_NOT_PROVISIONED".to_string())?;
+            let intent = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .bootstrap_venue_intent(execution_id)
+                .map_err(|error| error.to_string())?;
+            let venue = VenueOrderIntent {
+                token_id: intent.token_id,
+                side: match intent.action {
+                    clob_service::private_core::OrderAction::Buy => VenueSide::Buy,
+                    clob_service::private_core::OrderAction::Sell => VenueSide::Sell,
+                },
+                quantity_atomic: intent.quantity_micros,
+                limit_price_micros: intent.limit_price_micros,
+                fee_rate_bps: 0,
+                negative_risk: intent.negative_risk,
+                order_salt: intent.order_salt,
+            };
+            let (submitted, _) = client.submit_fok(&venue, timestamp_seconds).await?;
+            let response = state
+                .core
+                .as_mut()
+                .expect("core was checked before venue I/O")
+                .mark_bootstrap_submitted(
+                    idempotency_key,
+                    execution_id,
+                    submitted.order_id,
+                    now_millis,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(PlainResponse::System { response })
+        }
+        OperatorCommand::BootstrapExecutionStatus {
+            execution_id,
+            identity_commitment,
+        } => state
+            .core
+            .as_ref()
+            .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+            .bootstrap_execution_state_for_identity(execution_id, identity_commitment)
+            .map(|execution_state| PlainResponse::BootstrapExecutionStatus {
+                execution_id,
+                state: execution_state,
+            })
+            .map_err(|error| error.to_string()),
+        OperatorCommand::MarketStatus { market_id } => Ok(PlainResponse::MarketStatus {
+            market: state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .market_config(&market_id),
+        }),
+        OperatorCommand::ResolutionStatus { market_id } => Ok(PlainResponse::ResolutionStatus {
+            resolution: state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .market_resolution(&market_id),
+        }),
+        OperatorCommand::TradingFreezeStatus => Ok(PlainResponse::TradingFreezeStatus {
+            frozen: state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .trading_frozen(),
+        }),
+        OperatorCommand::AggregateDepth {
+            market_id,
+            outcome,
+            now_millis,
+            minimum_level_quantity_micros,
+        } => {
+            let (bids, asks) = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .aggregate_depth(
+                    &market_id,
+                    outcome,
+                    now_millis,
+                    minimum_level_quantity_micros,
+                );
+            Ok(PlainResponse::Depth {
+                bids: serialize_depth(bids),
+                asks: serialize_depth(asks),
+            })
+        }
+        OperatorCommand::ReconcileBootstrap {
+            idempotency_key,
+            execution_id,
+            timestamp_seconds,
+            now_millis,
+        } => {
+            let core = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?;
+            let order_id = core
+                .bootstrap_venue_order_id(execution_id)
+                .map_err(|error| error.to_string())?;
+            let view = core
+                .bootstrap_execution_view(execution_id)
+                .map_err(|error| error.to_string())?;
+            let confirmation = state
+                .polymarket
+                .as_ref()
+                .ok_or_else(|| "POLYMARKET_NOT_PROVISIONED".to_string())?
+                .confirmed_fill(&order_id, view.quantity_micros, timestamp_seconds)
+                .await?;
+            match confirmation {
+                VenueConfirmation::Pending => Ok(PlainResponse::BootstrapPending { execution_id }),
+                VenueConfirmation::Confirmed {
+                    fill_price_micros,
+                    evidence_hash,
+                } => {
+                    let response = state
+                        .core
+                        .as_mut()
+                        .expect("core was checked before venue I/O")
+                        .confirm_bootstrap_fill(
+                            idempotency_key,
+                            execution_id,
+                            fill_price_micros,
+                            evidence_hash,
+                            now_millis,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    Ok(PlainResponse::System { response })
+                }
+                VenueConfirmation::Rejected {
+                    failure_code,
+                    evidence_hash,
+                } => {
+                    let response = state
+                        .core
+                        .as_mut()
+                        .expect("core was checked before venue I/O")
+                        .fail_bootstrap_execution(
+                            idempotency_key,
+                            execution_id,
+                            failure_code,
+                            evidence_hash,
+                            now_millis,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    Ok(PlainResponse::System { response })
+                }
+            }
+        }
+        OperatorCommand::SignPolymarketRedemption {
+            market_id,
+            outcome,
+            nonce,
+            gas_limit,
+            gas_price_wei,
+            now_millis,
+        } => {
+            let redemption = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .polymarket_redemption_intent(&market_id, outcome, now_millis)
+                .map_err(|error| error.to_string())?;
+            let transaction = state
+                .polymarket
+                .as_ref()
+                .ok_or_else(|| "POLYMARKET_NOT_PROVISIONED".to_string())?
+                .sign_redemption_transaction(&VenueRedemptionTransactionIntent {
+                    condition_id: redemption.condition_id,
+                    up_outcome_index: redemption.up_outcome_index,
+                    down_outcome_index: redemption.down_outcome_index,
+                    nonce,
+                    gas_limit,
+                    gas_price_wei,
+                })
+                .await?;
+            Ok(PlainResponse::PolymarketRedemptionSigned {
+                transaction,
+                expected_redemption_amount_atomic: redemption
+                    .expected_redemption_amount_atomic
+                    .to_string(),
+            })
         }
         command => {
             let core = state
@@ -439,6 +1497,14 @@ fn dispatch_operator(
                 .as_mut()
                 .ok_or_else(|| "NOT_PROVISIONED".to_string())?;
             let response = match command {
+                OperatorCommand::SetTradingFreeze {
+                    idempotency_key,
+                    frozen,
+                    reason_commitment,
+                    now_millis,
+                } => {
+                    core.set_trading_freeze(idempotency_key, frozen, reason_commitment, now_millis)
+                }
                 OperatorCommand::RegisterMarket {
                     idempotency_key,
                     market,
@@ -528,13 +1594,78 @@ fn dispatch_operator(
                     signed,
                     now_millis,
                 } => core.resolve_market(idempotency_key, signed, now_millis),
+                OperatorCommand::ResolvePolymarketMarket {
+                    idempotency_key,
+                    signed,
+                    now_millis,
+                } => core.resolve_polymarket_market(idempotency_key, signed, now_millis),
+                OperatorCommand::MarkBootstrapSubmitted {
+                    idempotency_key,
+                    execution_id,
+                    venue_order_id,
+                    now_millis,
+                } => core.mark_bootstrap_submitted(
+                    idempotency_key,
+                    execution_id,
+                    venue_order_id,
+                    now_millis,
+                ),
+                OperatorCommand::ConfirmBootstrapFill {
+                    idempotency_key,
+                    execution_id,
+                    fill_price_micros,
+                    evidence_hash,
+                    now_millis,
+                } => core.confirm_bootstrap_fill(
+                    idempotency_key,
+                    execution_id,
+                    fill_price_micros,
+                    evidence_hash,
+                    now_millis,
+                ),
+                OperatorCommand::FailBootstrapExecution {
+                    idempotency_key,
+                    execution_id,
+                    failure_code,
+                    evidence_hash,
+                    now_millis,
+                } => core.fail_bootstrap_execution(
+                    idempotency_key,
+                    execution_id,
+                    failure_code,
+                    evidence_hash,
+                    now_millis,
+                ),
                 OperatorCommand::ExportSnapshot => {
                     return core
                         .export_encrypted_snapshot()
                         .map(|snapshot| PlainResponse::Snapshot { snapshot })
                         .map_err(|error| error.to_string());
                 }
-                OperatorCommand::Provision { .. } => unreachable!(),
+                OperatorCommand::BeginProvision { .. }
+                | OperatorCommand::CompleteProvision { .. }
+                | OperatorCommand::ProvisionStatus
+                | OperatorCommand::PolymarketStatus
+                | OperatorCommand::BeginPolymarketProvision { .. }
+                | OperatorCommand::CompletePolymarketProvision { .. }
+                | OperatorCommand::SignPolymarketRedemption { .. }
+                | OperatorCommand::ChainSignerStatus
+                | OperatorCommand::BeginChainSignerProvision { .. }
+                | OperatorCommand::CompleteChainSignerProvision { .. }
+                | OperatorCommand::SignPoolWithdrawal { .. }
+                | OperatorCommand::SignResolutionEvidence { .. }
+                | OperatorCommand::SignMarketResolution { .. }
+                | OperatorCommand::AuditSignerStatus
+                | OperatorCommand::BeginAuditSignerProvision { .. }
+                | OperatorCommand::CompleteAuditSignerProvision { .. }
+                | OperatorCommand::SignAuditBatch { .. }
+                | OperatorCommand::ExecuteBootstrap { .. }
+                | OperatorCommand::BootstrapExecutionStatus { .. }
+                | OperatorCommand::MarketStatus { .. }
+                | OperatorCommand::ResolutionStatus { .. }
+                | OperatorCommand::TradingFreezeStatus
+                | OperatorCommand::AggregateDepth { .. }
+                | OperatorCommand::ReconcileBootstrap { .. } => unreachable!(),
             }
             .map_err(|error| error.to_string())?;
             Ok(PlainResponse::System { response })
@@ -551,6 +1682,65 @@ fn operator_payload(nonce: [u8; 32], command: &OperatorCommand) -> Result<Vec<u8
     payload.extend_from_slice(&(encoded.len() as u64).to_be_bytes());
     payload.extend_from_slice(&encoded);
     Ok(payload)
+}
+
+fn verify_withdrawal_authorization(
+    authorization: &WithdrawalAuthorization,
+    receipt_public_key: [u8; 32],
+) -> Result<(), String> {
+    let signature: [u8; 64] = authorization
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| "INVALID_WITHDRAWAL_AUTHORIZATION".to_string())?;
+    let encoded = serde_json::to_vec(&authorization.intent)
+        .map_err(|_| "INVALID_WITHDRAWAL_AUTHORIZATION".to_string())?;
+    let mut payload = Vec::with_capacity(encoded.len() + 64);
+    payload.extend_from_slice(b"layrs.withdrawal-authorization.v1\0");
+    payload.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+    payload.extend_from_slice(&encoded);
+    VerifyingKey::from_bytes(&receipt_public_key)
+        .map_err(|_| "INVALID_WITHDRAWAL_AUTHORIZATION".to_string())?
+        .verify(&payload, &Signature::from_bytes(&signature))
+        .map_err(|_| "INVALID_WITHDRAWAL_AUTHORIZATION".to_string())
+}
+
+fn validate_kms_reference(kms_key_id: &str, ciphertext: Option<&[u8]>) -> Result<(), String> {
+    if kms_key_id.is_empty()
+        || kms_key_id.len() > 2_048
+        || !kms_key_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b":/_-".contains(&byte))
+        || ciphertext.is_some_and(|blob| blob.is_empty() || blob.len() > 65_536)
+    {
+        return Err("INVALID_KMS_CIPHERTEXT".into());
+    }
+    Ok(())
+}
+
+fn generate_recipient_key() -> Result<(PrivateDecryptingKey, Vec<u8>), String> {
+    let private_key = PrivateDecryptingKey::generate(KeySize::Rsa2048)
+        .map_err(|_| "RECIPIENT_KEY_GENERATION_FAILED".to_string())?;
+    let public_key: PublicKeyX509Der<'static> = private_key
+        .public_key()
+        .as_der()
+        .map_err(|_| "RECIPIENT_KEY_ENCODING_FAILED".to_string())?;
+    Ok((private_key, public_key.as_ref().to_vec()))
+}
+
+fn decrypt_recipient_key(
+    private_key: PrivateDecryptingKey,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, String> {
+    let private_key = OaepPrivateDecryptingKey::new(private_key)
+        .map_err(|_| "KMS_RECIPIENT_DECRYPT_FAILED".to_string())?;
+    let mut plaintext = vec![0; private_key.min_output_size()];
+    let plaintext_length = private_key
+        .decrypt(&OAEP_SHA256_MGF1SHA256, ciphertext, &mut plaintext, None)
+        .map_err(|_| "KMS_RECIPIENT_DECRYPT_FAILED".to_string())?
+        .len();
+    plaintext.truncate(plaintext_length);
+    Ok(plaintext)
 }
 
 fn transport_key(secret: &StaticSecret, client_public_key: [u8; 32]) -> [u8; 32] {

@@ -5,27 +5,27 @@ use serde::Deserialize;
 pub struct Config {
     #[serde(default = "default_host")]
     pub host: String,
-    
+
     #[serde(default = "default_port")]
     pub port: u16,
-    
+
     pub redis_url: String,
-    
+
     #[serde(default = "default_max_orders_per_user")]
     pub max_orders_per_user: usize,
-    
+
     #[serde(default = "default_max_order_size")]
     pub max_order_size: rust_decimal::Decimal,
-    
+
     #[serde(default = "default_maker_fee")]
     pub maker_fee_bps: u16,
-    
+
     #[serde(default = "default_taker_fee")]
     pub taker_fee_bps: u16,
-    
+
     #[serde(default = "default_min_order_size")]
     pub min_order_size: rust_decimal::Decimal,
-    
+
     // Optional PostgreSQL database URL
     pub database_url: Option<String>,
 
@@ -82,7 +82,7 @@ fn default_maker_fee() -> u16 {
 }
 
 fn default_taker_fee() -> u16 {
-    0 // 0% - No fees by default
+    20 // 0.20% - Approved Layrs taker fee
 }
 
 fn default_min_order_size() -> rust_decimal::Decimal {
@@ -125,15 +125,14 @@ impl Config {
             "ETH_VAULT_ADDRESS",
             "LP_VAULT_ADDRESS",
         ]);
-        
+
         let config = Self {
             host: std::env::var("HOST").unwrap_or_else(|_| default_host()),
             port: std::env::var("PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or_else(default_port),
-            redis_url: std::env::var("REDIS_URL")
-                .expect("REDIS_URL must be set"),
+            redis_url: std::env::var("REDIS_URL").expect("REDIS_URL must be set"),
             max_orders_per_user: std::env::var("MAX_ORDERS_PER_USER")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -157,7 +156,7 @@ impl Config {
             database_url: std::env::var("DATABASE_URL").ok(),
             pm_usdc_treasury_address: pm_usdc_treasury_address.clone(),
             pm_zen_treasury_address: pm_zen_treasury_address.clone(),
-            privacy_weth_vault_address: privacy_weth_vault_address,
+            privacy_weth_vault_address,
             prediction_market_treasury_address: pm_usdc_treasury_address,
             zen_treasury_address: pm_zen_treasury_address,
             zen_token_address: std::env::var("ZEN_TOKEN_ADDRESS").ok(),
@@ -228,9 +227,7 @@ impl Config {
         }
 
         if self.market_oracle_enabled && self.market_lifecycle_enabled {
-            anyhow::bail!(
-                "MARKET_ORACLE_ENABLED and MARKET_LIFECYCLE_ENABLED cannot both be true"
-            );
+            anyhow::bail!("MARKET_ORACLE_ENABLED and MARKET_LIFECYCLE_ENABLED cannot both be true");
         }
 
         if let (Some(pm_usdc_treasury), Some(pm_zen_treasury)) = (
@@ -268,9 +265,7 @@ impl Config {
 
         if self.market_oracle_enabled {
             if self.market_factory_address.is_none() {
-                anyhow::bail!(
-                    "MARKET_FACTORY_ADDRESS must be set when MARKET_ORACLE_ENABLED=true"
-                );
+                anyhow::bail!("MARKET_FACTORY_ADDRESS must be set when MARKET_ORACLE_ENABLED=true");
             }
 
             if self
@@ -296,9 +291,10 @@ impl Config {
 
         Ok(())
     }
-    
+
     pub fn settlement_contract_address(&self) -> Result<ethers::types::Address> {
-        let addr_str = self.settlement_contract
+        let addr_str = self
+            .settlement_contract
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("SETTLEMENT_CONTRACT not configured"))?;
         addr_str

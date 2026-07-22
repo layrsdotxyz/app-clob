@@ -23,12 +23,15 @@ pub async fn get_recent_trades(
     Path(market_id): Path<String>,
     Query(query): Query<TradesQuery>,
 ) -> ClobResult<impl IntoResponse> {
-    let trades = state.orderbook_manager
+    let trades = state
+        .orderbook_manager
         .store
         .get_recent_trades(&market_id, query.limit)
         .await?;
-    
-    Ok(Json(trades.iter().map(PublicTrade::from).collect::<Vec<_>>()))
+
+    Ok(Json(
+        trades.iter().map(PublicTrade::from).collect::<Vec<_>>(),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,19 +51,21 @@ pub async fn get_trade_history(
     Path(market_id): Path<String>,
     Query(query): Query<TradeHistoryQuery>,
 ) -> ClobResult<impl IntoResponse> {
-    let trades = state.orderbook_manager
+    let trades = state
+        .orderbook_manager
         .store
         .get_recent_trades(&market_id, query.limit)
         .await?;
-    
-    let filtered_trades: Vec<_> = trades.into_iter()
+
+    let filtered_trades: Vec<_> = trades
+        .into_iter()
         .filter(|trade| {
             let ts = trade.timestamp.timestamp();
-            query.from_timestamp.map_or(true, |from| ts >= from) &&
-            query.to_timestamp.map_or(true, |to| ts <= to)
+            query.from_timestamp.is_none_or(|from| ts >= from)
+                && query.to_timestamp.is_none_or(|to| ts <= to)
         })
         .collect();
-    
+
     let public_trades: Vec<PublicTrade> = filtered_trades.iter().map(PublicTrade::from).collect();
     Ok(Json(serde_json::json!({
         "trades": public_trades,
@@ -89,5 +94,6 @@ pub async fn get_user_trades(
     Ok(Json(serde_json::json!({
         "trades": trades,
         "count": trades.len(),
-    })).into_response())
+    }))
+    .into_response())
 }

@@ -1,5 +1,10 @@
-target/
-.git/
+.git
 *.md
 .env
 .env.*
+target
+**/target
+build
+coverage
+node_modules
+*.log

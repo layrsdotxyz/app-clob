@@ -1,9 +1,6 @@
 #![allow(dead_code)]
 
-use crate::{
-    error::ClobResult,
-    redis_store::RedisStore,
-};
+use crate::{error::ClobResult, redis_store::RedisStore};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -15,20 +12,20 @@ use tracing::{error, info, warn};
 pub struct MarketResolution {
     pub market_id: String,
     pub resolution_time: u64,
-    pub threshold: String,       // Decimal as string
+    pub threshold: String,        // Decimal as string
     pub settlement_price: String, // Decimal as string
     pub outcome: bool,            // YES/NO
     pub market_salt: String,      // For ZK proof privacy
 }
 
 /// Proof Batcher - Accumulates market resolutions for ZK proof generation
-/// 
+///
 /// Why batching?
 /// Batching reduces per-proof overhead: Cost = [Estimate + Tip] / batch_size
 /// - Without batching: 1.2 ACME per proof ($0.12 @ $0.10/ACME)
 /// - With 100-proof batch: 0.012 ACME per proof ($0.0012)
 /// - **100x cost reduction!**
-/// 
+///
 /// Strategy:
 /// - Accumulate proofs for `batch_interval` (default: 5 minutes)
 /// - Submit all pending proofs as a single batch for on-chain verification
@@ -64,7 +61,7 @@ impl ProofBatcher {
     pub async fn enqueue_proof(&self, resolution: MarketResolution) -> ClobResult<()> {
         let mut proofs = self.pending_proofs.lock().await;
         proofs.push(resolution.clone());
-        
+
         let batch_size = proofs.len();
         info!(
             market_id = %resolution.market_id,
@@ -109,7 +106,10 @@ impl ProofBatcher {
         }
 
         let batch_size = proofs.len();
-        info!(batch_size = batch_size, "Flushing proof batch to generation queue");
+        info!(
+            batch_size = batch_size,
+            "Flushing proof batch to generation queue"
+        );
 
         let batch_id = uuid::Uuid::new_v4().to_string();
         self.store
@@ -238,7 +238,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
-            let _ = mini_redis::server::run(listener, async { let _ = rx.await; }).await;
+            let _ = mini_redis::server::run(listener, async {
+                let _ = rx.await;
+            })
+            .await;
         });
         let client = redis::Client::open(format!("redis://{}/", addr)).unwrap();
         let conn = redis::aio::ConnectionManager::new(client).await.unwrap();

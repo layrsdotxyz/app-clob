@@ -1,0 +1,39 @@
+[package]
+name = "layrsv2-enclave-parent-runtime"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "clob_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "layrs-enclave-parent"
+path = "src/main.rs"
+
+[dependencies]
+aes-gcm = "0.10"
+axum = { version = "0.7", features = ["macros"] }
+base64 = "0.22"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+hmac = "0.12"
+hex = "0.4"
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "1.0"
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+tokio = { version = "1.40", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-vsock = "0.7.2"
+tower-http = { version = "0.5", features = ["request-id", "timeout"] }
+uuid = { version = "1.10", features = ["v4", "v5", "serde"] }
+zeroize = { version = "1.8", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

@@ -48,8 +48,8 @@ impl MarketSeriesConfig {
 
     /// Build the human-readable question for a given threshold and expiry time.
     pub fn question(&self, threshold: &Decimal, expiry_ts: u64) -> String {
-        let expiry_time = chrono::DateTime::from_timestamp(expiry_ts as i64, 0)
-            .unwrap_or_else(chrono::Utc::now);
+        let expiry_time =
+            chrono::DateTime::from_timestamp(expiry_ts as i64, 0).unwrap_or_else(chrono::Utc::now);
         let time_str = expiry_time.format("%H:%M UTC %b %d %Y").to_string();
         self.question_template
             .replace("{asset}", &self.oracle_asset.to_uppercase())
@@ -107,9 +107,7 @@ pub fn load_market_series() -> Vec<MarketSeriesConfig> {
             oracle_asset: asset.to_string(),
             currency: "USDC".to_string(),
             vault_address: usdc_vault.clone(),
-            question_template: format!(
-                "Will {{asset}} close above ${{price}} at {{time}}?"
-            ),
+            question_template: "Will {asset} close above ${price} at {time}?".to_string(),
             interval_secs: std::env::var("MARKET_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -121,9 +119,7 @@ pub fn load_market_series() -> Vec<MarketSeriesConfig> {
             oracle_asset: asset.to_string(),
             currency: "ZEN".to_string(),
             vault_address: zen_vault.clone(),
-            question_template: format!(
-                "Will {{asset}} close above ${{price}} at {{time}}?"
-            ),
+            question_template: "Will {asset} close above ${price} at {time}?".to_string(),
             interval_secs: std::env::var("MARKET_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -177,8 +173,7 @@ impl MarketLifecycleManager {
 
     /// Start the automated market lifecycle — runs forever.
     pub async fn start(self: Arc<Self>) {
-        let enabled: Vec<&MarketSeriesConfig> =
-            self.series.iter().filter(|s| s.enabled).collect();
+        let enabled: Vec<&MarketSeriesConfig> = self.series.iter().filter(|s| s.enabled).collect();
 
         info!(
             total = self.series.len(),
@@ -204,7 +199,7 @@ impl MarketLifecycleManager {
         let mins_into_interval = secs_into_interval / 60;
 
         // Guard: only act once per interval window (minutes 1-3 to allow Pyth data to settle).
-        if mins_into_interval < 1 || mins_into_interval > 3 {
+        if !(1..=3).contains(&mins_into_interval) {
             return Ok(());
         }
 
@@ -231,15 +226,16 @@ impl MarketLifecycleManager {
 
         info!(
             series = format!("{}-{}", cfg.oracle_asset, cfg.currency),
-            current_boundary,
-            next_boundary,
-            "Processing market lifecycle"
+            current_boundary, next_boundary, "Processing market lifecycle"
         );
 
         // Resolve previous market.
         let prev_id = cfg.market_id(previous_boundary);
         if self.should_resolve(&prev_id).await? {
-            match self.resolve_market(cfg, &prev_id, previous_boundary, now).await {
+            match self
+                .resolve_market(cfg, &prev_id, previous_boundary, now)
+                .await
+            {
                 Ok(_) => info!(market_id = %prev_id, "Resolved"),
                 Err(e) => warn!(market_id = %prev_id, error = %e, "Resolution failed"),
             }
@@ -248,7 +244,10 @@ impl MarketLifecycleManager {
         // Create next market.
         let new_id = cfg.market_id(next_boundary);
         if self.should_create(&new_id).await? {
-            match self.create_market(cfg, &new_id, current_boundary, next_boundary).await {
+            match self
+                .create_market(cfg, &new_id, current_boundary, next_boundary)
+                .await
+            {
                 Ok(_) => info!(market_id = %new_id, "Created"),
                 Err(e) => warn!(market_id = %new_id, error = %e, "Creation failed"),
             }
@@ -317,18 +316,21 @@ impl MarketLifecycleManager {
 
         // Persist to PostgreSQL
         if let Some(db) = &self.database {
-            if let Err(e) = db.upsert_market(
-                market_id,
-                &question,
-                expiry_ts,
-                "active",
-                None,
-                Some(threshold),
-                Some(&cfg.currency),
-                Some(&cfg.vault_address),
-                Some("pyth"),
-                None,
-            ).await {
+            if let Err(e) = db
+                .upsert_market(
+                    market_id,
+                    &question,
+                    expiry_ts,
+                    "active",
+                    None,
+                    Some(threshold),
+                    Some(&cfg.currency),
+                    Some(&cfg.vault_address),
+                    Some("pyth"),
+                    None,
+                )
+                .await
+            {
                 warn!(market_id, error = %e, "Failed to persist new market to DB");
             }
         }
@@ -404,7 +406,10 @@ impl MarketLifecycleManager {
                 audit.reason = Some(reason);
                 self.persist_audit(&audit).await?;
                 self.store
-                    .set(&format!("market:{}:status", market_id), "PENDING_RESOLUTION")
+                    .set(
+                        &format!("market:{}:status", market_id),
+                        "PENDING_RESOLUTION",
+                    )
                     .await?;
                 return Ok(());
             }
@@ -476,7 +481,10 @@ impl MarketLifecycleManager {
 
         // Persist resolution to PostgreSQL
         if let Some(db) = &self.database {
-            if let Err(e) = db.update_market_resolution(market_id, settlement_price, "resolved").await {
+            if let Err(e) = db
+                .update_market_resolution(market_id, settlement_price, "resolved")
+                .await
+            {
                 warn!(market_id, error = %e, "Failed to persist market resolution to DB");
             }
         }

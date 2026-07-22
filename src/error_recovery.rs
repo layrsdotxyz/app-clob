@@ -57,13 +57,19 @@ impl ErrorRecoveryService {
         info!(market_id = %market_id, "Creating order book snapshot");
 
         // Get all orders for this market
-        let bids = self.redis.get_orders_by_side(market_id, OrderSide::Buy).await?;
-        let asks = self.redis.get_orders_by_side(market_id, OrderSide::Sell).await?;
+        let bids = self
+            .redis
+            .get_orders_by_side(market_id, OrderSide::Buy)
+            .await?;
+        let asks = self
+            .redis
+            .get_orders_by_side(market_id, OrderSide::Sell)
+            .await?;
 
         // Get last trade ID
         let recent_trades = self.redis.get_recent_trades(market_id, 1).await.ok();
-        let last_trade_id = recent_trades
-            .and_then(|trades| trades.first().map(|t| t.id.to_string()));
+        let last_trade_id =
+            recent_trades.and_then(|trades| trades.first().map(|t| t.id.to_string()));
 
         let snapshot = OrderBookSnapshot {
             market_id: market_id.to_string(),
@@ -94,7 +100,7 @@ impl ErrorRecoveryService {
         // Keep only last 10 snapshots
         let _list_key = format!("snapshots:{}", snapshot.market_id);
         // This is a simplified version - in production, use LPUSH + LTRIM
-        
+
         info!(
             market_id = %snapshot.market_id,
             orders_count = %(snapshot.bids.len() + snapshot.asks.len()),
@@ -158,11 +164,11 @@ impl ErrorRecoveryService {
             }
             Err(e) => {
                 error!(error = %e, "Redis reconnection failed");
-                
+
                 // Wait before next attempt (exponential backoff)
                 let delay_secs = 2_u64.pow(*attempts);
                 tokio::time::sleep(tokio::time::Duration::from_secs(delay_secs)).await;
-                
+
                 Ok(false)
             }
         }
@@ -190,10 +196,7 @@ impl ErrorRecoveryService {
         );
 
         self.redis
-            .store_proof_data(
-                &format!("failure:order:{}", order.id),
-                &failure_log,
-            )
+            .store_proof_data(&format!("failure:order:{}", order.id), &failure_log)
             .await?;
 
         // Attempt to cancel order if it's in an inconsistent state
@@ -228,7 +231,10 @@ impl ErrorRecoveryService {
 
         // Check snapshot availability
         let snapshots = self.snapshots.read().await;
-        status.insert("available_snapshots".to_string(), snapshots.len().to_string());
+        status.insert(
+            "available_snapshots".to_string(),
+            snapshots.len().to_string(),
+        );
 
         Ok(status)
     }
@@ -242,13 +248,13 @@ impl ErrorRecoveryService {
         if snapshots.len() > self.max_snapshots {
             let to_remove = snapshots.len() - self.max_snapshots;
             snapshots.drain(0..to_remove);
-            
+
             info!(
                 removed = %to_remove,
                 remaining = %snapshots.len(),
                 "Cleaned up old snapshots"
             );
-            
+
             Ok(to_remove)
         } else {
             Ok(0)
@@ -267,7 +273,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
-            let _ = server::run(listener, async { let _ = rx.await; }).await;
+            let _ = server::run(listener, async {
+                let _ = rx.await;
+            })
+            .await;
         });
         let client = redis::Client::open(format!("redis://{}/", addr)).unwrap();
         let conn = redis::aio::ConnectionManager::new(client).await.unwrap();
@@ -278,7 +287,7 @@ mod tests {
     async fn test_recovery_service_creation() {
         let (redis, _shutdown) = setup_test_redis().await;
         let recovery = ErrorRecoveryService::new(redis);
-        
+
         let status = recovery.perform_health_check().await.unwrap();
         assert!(status.contains_key("redis"));
     }
@@ -287,7 +296,7 @@ mod tests {
     async fn test_snapshot_creation() {
         let (redis, _shutdown) = setup_test_redis().await;
         let recovery = ErrorRecoveryService::new(redis);
-        
+
         // This will fail if Redis is not running, which is expected in testing
         match recovery.create_snapshot("TEST-MARKET").await {
             Ok(snapshot) => {

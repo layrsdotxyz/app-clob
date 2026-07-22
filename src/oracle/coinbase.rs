@@ -14,10 +14,10 @@ type CandleData = Vec<Vec<f64>>;
 const COINBASE_API_BASE: &str = "https://api.exchange.coinbase.com";
 
 /// Coinbase oracle client for BTC/USD price resolution
-/// 
+///
 /// Price source: Coinbase Advanced Trade API (free)
 /// Documentation: https://docs.cloud.coinbase.com/exchange/reference
-/// 
+///
 /// Transparency: All market pages display TradingView chart for user verification
 pub struct CoinbaseOracle {
     client: Client,
@@ -26,10 +26,10 @@ pub struct CoinbaseOracle {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PriceResolution {
     pub market_id: String,
-    pub resolution_time: u64,      // Unix timestamp (hourly boundary)
-    pub btc_usd_close: Decimal,    // Coinbase BTC-USD hourly candle close
-    pub source: String,            // "coinbase"
-    pub granularity: u64,          // 3600 (hourly)
+    pub resolution_time: u64,            // Unix timestamp (hourly boundary)
+    pub btc_usd_close: Decimal,          // Coinbase BTC-USD hourly candle close
+    pub source: String,                  // "coinbase"
+    pub granularity: u64,                // 3600 (hourly)
     pub candle_data: Option<CandleInfo>, // For ZK proof
 }
 
@@ -54,13 +54,13 @@ impl CoinbaseOracle {
     }
 
     /// Get BTC-USD hourly candle close price at specific timestamp
-    /// 
+    ///
     /// # Arguments
     /// * `timestamp` - Unix timestamp (should be on hourly boundary, e.g., 1700000000)
-    /// 
+    ///
     /// # Returns
     /// * `Decimal` - Close price of the hourly candle ending at this timestamp
-    /// 
+    ///
     /// # Example
     /// ```no_run
     /// // let oracle = CoinbaseOracle::new();
@@ -73,12 +73,9 @@ impl CoinbaseOracle {
 
     /// Resolve market at specific timestamp with full candle data
     /// Used for generating ZK proofs of correct resolution
-    pub async fn resolve_market_at_timestamp(
-        &self,
-        timestamp: u64,
-    ) -> ClobResult<PriceResolution> {
+    pub async fn resolve_market_at_timestamp(&self, timestamp: u64) -> ClobResult<PriceResolution> {
         // Validate timestamp is on hourly boundary
-        if timestamp % 3600 != 0 {
+        if !timestamp.is_multiple_of(3600) {
             return Err(ClobError::InvalidPrice(format!(
                 "Timestamp {} is not on hourly boundary",
                 timestamp
@@ -201,8 +198,7 @@ impl CoinbaseOracle {
             .await
             .map_err(|e| ClobError::InvalidOrder(format!("Failed to parse ticker: {}", e)))?;
 
-        Decimal::from_str(&ticker.price)
-            .map_err(|e| ClobError::InvalidPrice(e.to_string()))
+        Decimal::from_str(&ticker.price).map_err(|e| ClobError::InvalidPrice(e.to_string()))
     }
 }
 
@@ -220,11 +216,11 @@ mod tests {
     async fn test_get_current_price() {
         let oracle = CoinbaseOracle::new();
         let price = oracle.get_current_price().await.unwrap();
-        
+
         // BTC should be between $10k and $200k
         assert!(price > Decimal::from(10000));
         assert!(price < Decimal::from(200000));
-        
+
         println!("Current BTC-USD price: ${}", price);
     }
 
@@ -232,26 +228,26 @@ mod tests {
     #[ignore] // Run manually: cargo test test_get_historical_candle -- --ignored
     async fn test_get_historical_candle() {
         let oracle = CoinbaseOracle::new();
-        
+
         // Test with a known timestamp (Jan 1, 2024, 00:00 UTC)
         let timestamp = 1704067200u64;
-        
+
         let resolution = oracle.resolve_market_at_timestamp(timestamp).await.unwrap();
-        
+
         assert_eq!(resolution.resolution_time, timestamp);
         assert_eq!(resolution.source, "coinbase");
         assert!(resolution.btc_usd_close > Decimal::ZERO);
-        
+
         println!("Resolution: {:?}", resolution);
     }
 
     #[test]
     fn test_timestamp_validation() {
         // Valid hourly boundaries
-        assert_eq!(1704067200 % 3600, 0);  // 2024-01-01 00:00:00
-        assert_eq!(1704070800 % 3600, 0);  // 2024-01-01 01:00:00
-        
+        assert_eq!(1704067200 % 3600, 0); // 2024-01-01 00:00:00
+        assert_eq!(1704070800 % 3600, 0); // 2024-01-01 01:00:00
+
         // Invalid (not on boundary)
-        assert_ne!(1704067230 % 3600, 0);  // 2024-01-01 00:00:30
+        assert_ne!(1704067230 % 3600, 0); // 2024-01-01 00:00:30
     }
 }

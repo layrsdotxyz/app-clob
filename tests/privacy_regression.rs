@@ -39,7 +39,10 @@ async fn make_test_redis() -> (
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
-        let _ = mini_redis::server::run(listener, async { let _ = rx.await; }).await;
+        let _ = mini_redis::server::run(listener, async {
+            let _ = rx.await;
+        })
+        .await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let client = redis::Client::open(format!("redis://{}/", addr)).unwrap();
@@ -115,8 +118,14 @@ fn g3_trade_serde_strips_identity() {
         taker_address: None,
     };
     let json2 = serde_json::to_value(&trade_no_addr).unwrap();
-    assert!(json2.get("maker_address").is_none(), "maker_address must not appear when None");
-    assert!(json2.get("taker_address").is_none(), "taker_address must not appear when None");
+    assert!(
+        json2.get("maker_address").is_none(),
+        "maker_address must not appear when None"
+    );
+    assert!(
+        json2.get("taker_address").is_none(),
+        "taker_address must not appear when None"
+    );
 }
 
 /// Mirror of `models::PublicTrade` — only the price-level fields should appear.
@@ -286,12 +295,14 @@ fn g10_claim_request_serde() {
     assert_eq!(req.recipient, "0xdead000000000000000000000000000000000001");
     assert_eq!(req.public_inputs.len(), 6);
     // Default vault_address is empty string.
-    assert!(req.vault_address.is_empty(), "vault_address should default to empty string");
+    assert!(
+        req.vault_address.is_empty(),
+        "vault_address should default to empty string"
+    );
 
     // Nullifier is at index 5 (PM_CLAIM_NULLIFIER_IDX).
     assert_eq!(
-        req.public_inputs[5],
-        "0x0000000000000000000000000000000000000000000000000000000000000006",
+        req.public_inputs[5], "0x0000000000000000000000000000000000000000000000000000000000000006",
         "nullifier must be at public_inputs[5]"
     );
 }
@@ -299,7 +310,7 @@ fn g10_claim_request_serde() {
 #[test]
 fn g10_claim_rejects_too_few_public_inputs() {
     // The handler checks `public_inputs.len() >= PM_CLAIM_MIN_INPUTS (6)`.
-    let inputs_too_short = vec!["0x01", "0x02", "0x03", "0x04", "0x05"];
+    let inputs_too_short = ["0x01", "0x02", "0x03", "0x04", "0x05"];
     assert!(
         inputs_too_short.len() < 6,
         "sanity: this vector is intentionally too short"
@@ -337,14 +348,27 @@ fn g12_commit_response_leaks_no_order_intent() {
     let obj = json.as_object().unwrap();
 
     // Must NOT contain side, price, size.
-    assert!(obj.get("side").is_none(), "side must not be in CommitOrderResponse");
-    assert!(obj.get("price").is_none(), "price must not be in CommitOrderResponse");
-    assert!(obj.get("size").is_none(), "size must not be in CommitOrderResponse");
+    assert!(
+        obj.get("side").is_none(),
+        "side must not be in CommitOrderResponse"
+    );
+    assert!(
+        obj.get("price").is_none(),
+        "price must not be in CommitOrderResponse"
+    );
+    assert!(
+        obj.get("size").is_none(),
+        "size must not be in CommitOrderResponse"
+    );
 
     // Must contain exactly commit_id + expires_at.
     assert!(obj.contains_key("commit_id"));
     assert!(obj.contains_key("expires_at"));
-    assert_eq!(obj.len(), 2, "CommitOrderResponse must have exactly 2 fields");
+    assert_eq!(
+        obj.len(),
+        2,
+        "CommitOrderResponse must have exactly 2 fields"
+    );
 }
 
 #[test]
@@ -398,11 +422,26 @@ fn g14_trade_to_public_trade_strips_addresses() {
     };
 
     let json = serde_json::to_value(&public_trade).unwrap();
-    assert!(json.get("maker_address").is_none(), "maker_address must not appear in PublicTrade");
-    assert!(json.get("taker_address").is_none(), "taker_address must not appear in PublicTrade");
-    assert!(json.get("maker_user_id").is_none(), "maker_user_id must not appear in PublicTrade");
-    assert!(json.get("taker_user_id").is_none(), "taker_user_id must not appear in PublicTrade");
-    assert!(json.get("settlement_tx").is_none(), "settlement_tx must not appear in PublicTrade");
+    assert!(
+        json.get("maker_address").is_none(),
+        "maker_address must not appear in PublicTrade"
+    );
+    assert!(
+        json.get("taker_address").is_none(),
+        "taker_address must not appear in PublicTrade"
+    );
+    assert!(
+        json.get("maker_user_id").is_none(),
+        "maker_user_id must not appear in PublicTrade"
+    );
+    assert!(
+        json.get("taker_user_id").is_none(),
+        "taker_user_id must not appear in PublicTrade"
+    );
+    assert!(
+        json.get("settlement_tx").is_none(),
+        "settlement_tx must not appear in PublicTrade"
+    );
 }
 
 #[test]
@@ -430,7 +469,10 @@ fn g14_public_trade_fields_are_minimal() {
             .copied()
             .collect();
 
-    assert_eq!(keys, expected, "PublicTrade must expose exactly these fields");
+    assert_eq!(
+        keys, expected,
+        "PublicTrade must expose exactly these fields"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -455,7 +497,10 @@ fn pseudo_id_mirror(salt: &str, address: &str) -> String {
     k.update(input.as_bytes());
     let mut out = [0u8; 32];
     k.finalize(&mut out);
-    format!("usr-{:02x}{:02x}{:02x}{:02x}", out[0], out[1], out[2], out[3])
+    format!(
+        "usr-{:02x}{:02x}{:02x}{:02x}",
+        out[0], out[1], out[2], out[3]
+    )
 }
 
 #[test]
@@ -465,7 +510,10 @@ fn g16_pseudo_id_format() {
     let alias = pseudo_id_mirror(salt, address);
 
     // Must start with "usr-".
-    assert!(alias.starts_with("usr-"), "alias must start with 'usr-', got: {alias}");
+    assert!(
+        alias.starts_with("usr-"),
+        "alias must start with 'usr-', got: {alias}"
+    );
     // Must be 12 characters: "usr-" (4) + 8 hex chars.
     assert_eq!(alias.len(), 12, "alias must be 12 chars, got: {alias}");
     // Must NOT contain the raw address fragment.
@@ -476,7 +524,10 @@ fn g16_pseudo_id_format() {
 
     // Different salts → different aliases (salt protects cross-process correlation).
     let alias2 = pseudo_id_mirror("other-salt-xyz", address);
-    assert_ne!(alias, alias2, "different salts must produce different aliases");
+    assert_ne!(
+        alias, alias2,
+        "different salts must produce different aliases"
+    );
 }
 
 #[test]
@@ -487,7 +538,10 @@ fn g16_user_alias_is_deterministic_within_process() {
     assert_eq!(alias_1, alias_2, "alias must be deterministic");
     assert_eq!(alias_1.len(), 8, "alias must be 8 hex chars");
     // Must not contain the original identifier.
-    assert!(!alias_1.contains("Alice"), "alias must not contain raw user ID");
+    assert!(
+        !alias_1.contains("Alice"),
+        "alias must not contain raw user ID"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -514,15 +568,28 @@ fn g1_g11_balance_sufficiency_response_has_no_plaintext_amounts() {
     let obj = json.as_object().unwrap();
 
     // Must NOT expose raw balance amounts.
-    assert!(obj.get("total").is_none(), "total must not appear in balance response");
-    assert!(obj.get("available").is_none(), "available must not appear in balance response");
-    assert!(obj.get("reserved").is_none(), "reserved must not appear in balance response");
+    assert!(
+        obj.get("total").is_none(),
+        "total must not appear in balance response"
+    );
+    assert!(
+        obj.get("available").is_none(),
+        "available must not appear in balance response"
+    );
+    assert!(
+        obj.get("reserved").is_none(),
+        "reserved must not appear in balance response"
+    );
 
     // Must contain exactly the proof-sufficiency fields.
     assert!(obj.contains_key("user_id"));
     assert!(obj.contains_key("market_id"));
     assert!(obj.contains_key("has_active_proof"));
-    assert_eq!(obj.len(), 3, "BalanceSufficiencyResponse must have 3 fields only");
+    assert_eq!(
+        obj.len(),
+        3,
+        "BalanceSufficiencyResponse must have 3 fields only"
+    );
 }
 
 #[tokio::test]
@@ -544,7 +611,10 @@ async fn g1_g11_balance_proof_soft_lock_roundtrip() {
         .query_async(&mut conn)
         .await
         .unwrap();
-    assert!(val.is_none(), "no soft-lock should exist before proof submission");
+    assert!(
+        val.is_none(),
+        "no soft-lock should exist before proof submission"
+    );
 
     // Simulate `submit_balance_proof` writing a soft-lock (SET, no TTL for mini-redis compat).
     let payload = r#"{"balance_proof_id":"bp-001","user_id":"0xAlice","market_id":"btc-usd"}"#;
@@ -562,7 +632,10 @@ async fn g1_g11_balance_proof_soft_lock_roundtrip() {
         .await
         .unwrap();
     assert!(val.is_some(), "soft-lock must exist after proof submission");
-    assert!(val.unwrap().contains("bp-001"), "soft-lock payload must be intact");
+    assert!(
+        val.unwrap().contains("bp-001"),
+        "soft-lock payload must be intact"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -593,14 +666,21 @@ async fn setup_test_redis() -> (
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
 
     let handle = tokio::spawn(async move {
-        let _ = mini_redis::server::run(listener, async { let _ = rx.await; }).await;
+        let _ = mini_redis::server::run(listener, async {
+            let _ = rx.await;
+        })
+        .await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
     let client = redis::Client::open(format!("redis://{}/", addr)).unwrap();
-    let mgr = redis::aio::ConnectionManager::new(client.clone()).await.unwrap();
+    let mgr = redis::aio::ConnectionManager::new(client.clone())
+        .await
+        .unwrap();
     let store = std::sync::Arc::new(clob_service::redis_store::RedisStore::new(mgr));
-    let privacy = std::sync::Arc::new(clob_service::privacy::PrivacyStateService::new(store.clone()));
+    let privacy = std::sync::Arc::new(clob_service::privacy::PrivacyStateService::new(
+        store.clone(),
+    ));
     let raw_conn = client.get_multiplexed_async_connection().await.unwrap();
 
     (store, privacy, raw_conn, handle, tx)
@@ -619,15 +699,15 @@ async fn setup_test_redis() -> (
 async fn g1_g11_check_balance_proof_absent_returns_insufficient_balance() {
     let (store, _privacy, mut raw_conn, _handle, shutdown) = setup_test_redis().await;
 
-    let balance_service = std::sync::Arc::new(
-        clob_service::balance_service::BalanceService::new(None),
-    );
+    let balance_service =
+        std::sync::Arc::new(clob_service::balance_service::BalanceService::new(None));
     let engine = clob_service::settlement::SettlementEngine::new(
         store.clone(),
         None,
         0,
         0,
         balance_service,
+        std::sync::Arc::new(clob_service::websocket::WebSocketManager::new()),
     );
 
     let nullifier = "test-null-g1-g11";
@@ -673,8 +753,8 @@ async fn g1_g11_check_balance_proof_absent_returns_insufficient_balance() {
 /// JSON object that contains none of the identity, address, or settlement fields.
 #[test]
 fn g14_real_public_trade_strips_all_private_fields() {
-    use clob_service::models::{OrderSide, PublicTrade, Trade};
     use chrono::Utc;
+    use clob_service::models::{OrderSide, PublicTrade, Trade};
     use uuid::Uuid;
 
     let trade = Trade {
@@ -688,8 +768,16 @@ fn g14_real_public_trade_strips_all_private_fields() {
         price: rust_decimal::Decimal::new(50000, 0),
         size: rust_decimal::Decimal::new(1, 0),
         timestamp: Utc::now(),
-        maker_address: Some("0xA11Ce0000000000000000000000000000000000A".parse().unwrap()),
-        taker_address: Some("0xb0b00000000000000000000000000000000000B0".parse().unwrap()),
+        maker_address: Some(
+            "0xA11Ce0000000000000000000000000000000000A"
+                .parse()
+                .unwrap(),
+        ),
+        taker_address: Some(
+            "0xb0b00000000000000000000000000000000000B0"
+                .parse()
+                .unwrap(),
+        ),
         market_id_uint: None,
         settlement_tx: None,
     };
@@ -698,8 +786,15 @@ fn g14_real_public_trade_strips_all_private_fields() {
     let json = serde_json::to_value(&public_trade).unwrap();
 
     // Private fields must be absent from PublicTrade JSON.
-    for private_field in &["maker_user_id", "taker_user_id", "maker_address", "taker_address",
-                            "settlement_tx", "maker_order_id", "taker_order_id"] {
+    for private_field in &[
+        "maker_user_id",
+        "taker_user_id",
+        "maker_address",
+        "taker_address",
+        "settlement_tx",
+        "maker_order_id",
+        "taker_order_id",
+    ] {
         assert!(
             json.get(private_field).is_none(),
             "private field '{}' must NOT appear in PublicTrade JSON",
@@ -741,8 +836,7 @@ async fn g14_get_recent_trades_handler_via_oneshot_returns_json_array() {
     };
     use tower::ServiceExt;
 
-    let (store, privacy, _raw_conn, _handle, shutdown) =
-        setup_test_redis().await;
+    let (store, privacy, _raw_conn, _handle, shutdown) = setup_test_redis().await;
 
     let state = clob_service::AppState::for_test(store, privacy, None).await;
 
@@ -785,7 +879,12 @@ async fn g14_get_recent_trades_handler_via_oneshot_returns_json_array() {
     // that no Trade private fields appear anywhere in the array elements.
     for trade_obj in value.as_array().unwrap() {
         let obj = trade_obj.as_object().unwrap();
-        for key in &["maker_user_id", "taker_user_id", "maker_address", "taker_address"] {
+        for key in &[
+            "maker_user_id",
+            "taker_user_id",
+            "maker_address",
+            "taker_address",
+        ] {
             assert!(
                 obj.get(*key).is_none(),
                 "private field '{}' must not appear in get_recent_trades response",
@@ -807,19 +906,17 @@ async fn g14_get_recent_trades_handler_via_oneshot_returns_json_array() {
 async fn g10_duplicate_nullifier_returns_409_via_http() {
     use axum::{
         body::Body,
-        http::{Request, StatusCode, header},
+        http::{header, Request, StatusCode},
         routing::post,
         Router,
     };
     use tower::ServiceExt;
 
-    let (store, privacy, mut raw_conn, _handle, shutdown) =
-        setup_test_redis().await;
+    let (store, privacy, mut raw_conn, _handle, shutdown) = setup_test_redis().await;
 
     // Pre-register the nullifier directly in Redis (privacy:nullifier:{hash}).
     // Use a 64-char hex nullifier (32 bytes).
-    let nullifier_hex =
-        "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+    let nullifier_hex = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
     let nullifier_key = format!("privacy:nullifier:{}", nullifier_hex);
     let _: () = redis::cmd("SET")
         .arg(&nullifier_key)
@@ -925,11 +1022,10 @@ fn g13_orderbook_struct_has_no_private_fields() {
     let obj = json.as_object().unwrap();
 
     // Top-level allowed fields.
-    let allowed_top: std::collections::HashSet<&str> =
-        ["market_id", "bids", "asks", "timestamp"]
-            .iter()
-            .copied()
-            .collect();
+    let allowed_top: std::collections::HashSet<&str> = ["market_id", "bids", "asks", "timestamp"]
+        .iter()
+        .copied()
+        .collect();
     for key in obj.keys() {
         assert!(
             allowed_top.contains(key.as_str()),
@@ -937,7 +1033,11 @@ fn g13_orderbook_struct_has_no_private_fields() {
             key
         );
     }
-    assert_eq!(obj.len(), 4, "G13: OrderBook must have exactly 4 top-level fields");
+    assert_eq!(
+        obj.len(),
+        4,
+        "G13: OrderBook must have exactly 4 top-level fields"
+    );
 
     // Level allowed fields.
     let allowed_level: std::collections::HashSet<&str> =
@@ -954,7 +1054,13 @@ fn g13_orderbook_struct_has_no_private_fields() {
     }
 
     // Explicitly confirm no private fields.
-    for private in &["user_id", "address", "nullifier", "commitment", "private_key"] {
+    for private in &[
+        "user_id",
+        "address",
+        "nullifier",
+        "commitment",
+        "private_key",
+    ] {
         assert!(
             obj.get(*private).is_none(),
             "G13: private field '{}' must not appear in OrderBook",
@@ -1009,14 +1115,15 @@ async fn g13_get_orderbook_handler_via_oneshot_returns_no_private_fields() {
         .await
         .unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let obj = value.as_object().expect("G13: response must be a JSON object");
+    let obj = value
+        .as_object()
+        .expect("G13: response must be a JSON object");
 
     // Top-level fields must be only the public aggregates.
-    let allowed: std::collections::HashSet<&str> =
-        ["market_id", "bids", "asks", "timestamp"]
-            .iter()
-            .copied()
-            .collect();
+    let allowed: std::collections::HashSet<&str> = ["market_id", "bids", "asks", "timestamp"]
+        .iter()
+        .copied()
+        .collect();
     for key in obj.keys() {
         assert!(
             allowed.contains(key.as_str()),
@@ -1026,7 +1133,13 @@ async fn g13_get_orderbook_handler_via_oneshot_returns_no_private_fields() {
     }
 
     // No private fields at any nesting level.
-    let private_fields = ["user_id", "address", "nullifier", "commitment", "private_key"];
+    let private_fields = [
+        "user_id",
+        "address",
+        "nullifier",
+        "commitment",
+        "private_key",
+    ];
     for field in &private_fields {
         assert!(
             obj.get(*field).is_none(),
@@ -1074,14 +1187,13 @@ async fn g13_get_orderbook_handler_via_oneshot_returns_no_private_fields() {
 async fn g10_missing_relayer_returns_503_via_http() {
     use axum::{
         body::Body,
-        http::{Request, StatusCode, header},
+        http::{header, Request, StatusCode},
         routing::post,
         Router,
     };
     use tower::ServiceExt;
 
-    let (store, privacy, _raw_conn, _handle, shutdown) =
-        setup_test_redis().await;
+    let (store, privacy, _raw_conn, _handle, shutdown) = setup_test_redis().await;
 
     // No relayer configured.
     let state = clob_service::AppState::for_test(store, privacy, None).await;
@@ -1095,8 +1207,7 @@ async fn g10_missing_relayer_returns_503_via_http() {
 
     // Use a fresh nullifier — it has NOT been pre-registered, so we get past
     // the duplicate-check and hit the relayer-missing check.
-    let fresh_nullifier =
-        "0xcafecafecafecafecafecafecafecafecafecafecafecafecafecafecafecafe";
+    let fresh_nullifier = "0xcafecafecafecafecafecafecafecafecafecafecafecafecafecafecafecafe";
     let req_body = serde_json::json!({
         "recipient": "0xdead000000000000000000000000000000000001",
         "proof_hex": "0xabcd",
@@ -1164,7 +1275,13 @@ fn g15_stealth_announcement_has_no_recipient_field() {
     let obj = json.as_object().unwrap();
 
     // G15: no recipient address must appear in the serialised announcement.
-    for private in &["recipient", "recipient_address", "address", "user_id", "private_key"] {
+    for private in &[
+        "recipient",
+        "recipient_address",
+        "address",
+        "user_id",
+        "private_key",
+    ] {
         assert!(
             obj.get(*private).is_none(),
             "G15: field '{}' must NOT appear in StealthAnnouncement JSON",
@@ -1173,11 +1290,15 @@ fn g15_stealth_announcement_has_no_recipient_field() {
     }
 
     // Expected fields: announcement_id, ephemeral_pubkey, viewing_tag, block_number.
-    let allowed: std::collections::HashSet<&str> =
-        ["announcement_id", "ephemeral_pubkey", "viewing_tag", "block_number"]
-            .iter()
-            .copied()
-            .collect();
+    let allowed: std::collections::HashSet<&str> = [
+        "announcement_id",
+        "ephemeral_pubkey",
+        "viewing_tag",
+        "block_number",
+    ]
+    .iter()
+    .copied()
+    .collect();
     for key in obj.keys() {
         assert!(
             allowed.contains(key.as_str()),
@@ -1185,7 +1306,11 @@ fn g15_stealth_announcement_has_no_recipient_field() {
             key
         );
     }
-    assert_eq!(obj.len(), 4, "G15: StealthAnnouncement must have exactly 4 fields");
+    assert_eq!(
+        obj.len(),
+        4,
+        "G15: StealthAnnouncement must have exactly 4 fields"
+    );
 }
 
 /// G15 HTTP regression — POST + GET round-trip: recipient is never echoed back.
@@ -1196,7 +1321,7 @@ fn g15_stealth_announcement_has_no_recipient_field() {
 async fn g15_stealth_announce_and_list_reveal_no_recipient() {
     use axum::{
         body::Body,
-        http::{Request, StatusCode, header},
+        http::{header, Request, StatusCode},
         routing::{get, post},
         Router,
     };
@@ -1278,12 +1403,21 @@ async fn g15_stealth_announce_and_list_reveal_no_recipient() {
         .await
         .unwrap();
     let list: serde_json::Value = serde_json::from_slice(&get_bytes).unwrap();
-    assert!(list.is_array(), "G15: announcement list must be a JSON array");
+    assert!(
+        list.is_array(),
+        "G15: announcement list must be a JSON array"
+    );
 
     for ann in list.as_array().unwrap() {
         let ann_obj = ann.as_object().unwrap();
         // Must not contain any recipient-identity field.
-        for private in &["recipient", "recipient_address", "address", "user_id", "private_key"] {
+        for private in &[
+            "recipient",
+            "recipient_address",
+            "address",
+            "user_id",
+            "private_key",
+        ] {
             assert!(
                 ann_obj.get(*private).is_none(),
                 "G15: field '{}' must not appear in listed StealthAnnouncement",
@@ -1291,9 +1425,18 @@ async fn g15_stealth_announce_and_list_reveal_no_recipient() {
             );
         }
         // Must contain the public scanning fields.
-        assert!(ann_obj.contains_key("ephemeral_pubkey"), "G15: ephemeral_pubkey must be present");
-        assert!(ann_obj.contains_key("viewing_tag"), "G15: viewing_tag must be present");
-        assert!(ann_obj.contains_key("block_number"), "G15: block_number must be present");
+        assert!(
+            ann_obj.contains_key("ephemeral_pubkey"),
+            "G15: ephemeral_pubkey must be present"
+        );
+        assert!(
+            ann_obj.contains_key("viewing_tag"),
+            "G15: viewing_tag must be present"
+        );
+        assert!(
+            ann_obj.contains_key("block_number"),
+            "G15: block_number must be present"
+        );
     }
 
     let _ = shutdown.send(());
@@ -1304,7 +1447,7 @@ async fn g15_stealth_announce_and_list_reveal_no_recipient() {
 async fn g15_from_block_filter_excludes_old_announcements() {
     use axum::{
         body::Body,
-        http::{Request, StatusCode, header},
+        http::{header, Request, StatusCode},
         routing::{get, post},
         Router,
     };
@@ -1359,17 +1502,26 @@ async fn g15_from_block_filter_excludes_old_announcements() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let list: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
 
-    assert_eq!(list.len(), 1, "G15: from_block filter must exclude old announcements");
+    assert_eq!(
+        list.len(),
+        1,
+        "G15: from_block filter must exclude old announcements"
+    );
     assert_eq!(
         list[0]["viewing_tag"].as_str().unwrap(),
         "bb",
         "G15: only the recent announcement must be returned"
     );
     // G15: still no recipient info.
-    assert!(list[0].get("recipient").is_none(), "G15: no recipient in filtered response");
+    assert!(
+        list[0].get("recipient").is_none(),
+        "G15: no recipient in filtered response"
+    );
 
     let _ = shutdown.send(());
 }

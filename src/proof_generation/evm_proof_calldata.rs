@@ -97,10 +97,7 @@ pub fn parse_honk_proof_from_output(output: &str) -> ClobResult<HonkProof> {
                 .strip_prefix("0x")
                 .or_else(|| s.strip_prefix("0X"))
                 .ok_or_else(|| {
-                    ClobError::Internal(format!(
-                        "public_inputs[{}] '{}' is not 0x-prefixed",
-                        i, s
-                    ))
+                    ClobError::Internal(format!("public_inputs[{}] '{}' is not 0x-prefixed", i, s))
                 })?;
             if hex.len() != 64 {
                 return Err(ClobError::Internal(format!(
@@ -112,7 +109,10 @@ pub fn parse_honk_proof_from_output(output: &str) -> ClobResult<HonkProof> {
         })
         .collect::<ClobResult<Vec<_>>>()?;
 
-    Ok(HonkProof { proof_hex, public_inputs })
+    Ok(HonkProof {
+        proof_hex,
+        public_inputs,
+    })
 }
 
 #[cfg(test)]

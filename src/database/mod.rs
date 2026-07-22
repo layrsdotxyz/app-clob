@@ -48,7 +48,10 @@ fn market_metadata_from_row(row: &sqlx::postgres::PgRow) -> PublicMarketMetadata
         .flatten()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| market_id.clone());
-    let on_chain_market_id = row.try_get::<Option<i64>, _>("on_chain_market_id").ok().flatten();
+    let on_chain_market_id = row
+        .try_get::<Option<i64>, _>("on_chain_market_id")
+        .ok()
+        .flatten();
     let slug = row
         .try_get::<Option<String>, _>("slug")
         .ok()
@@ -223,7 +226,11 @@ impl Database {
             .unwrap_or(0))
     }
 
-    pub async fn save_last_processed_block(&self, chain_id: i64, block_number: i64) -> ClobResult<()> {
+    pub async fn save_last_processed_block(
+        &self,
+        chain_id: i64,
+        block_number: i64,
+    ) -> ClobResult<()> {
         sqlx::query(
             "INSERT INTO deposit_checkpoints (chain_id, last_block, updated_at)
              VALUES ($1, $2, NOW())
@@ -240,12 +247,14 @@ impl Database {
     }
 
     pub async fn is_deposit_processed(&self, chain_id: i64, tx_hash: &str) -> ClobResult<bool> {
-        let row = sqlx::query("SELECT 1 FROM processed_deposits WHERE chain_id = $1 AND tx_hash = $2 LIMIT 1")
-            .bind(chain_id)
-            .bind(tx_hash)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| ClobError::Internal(format!("deposit processed lookup failed: {}", e)))?;
+        let row = sqlx::query(
+            "SELECT 1 FROM processed_deposits WHERE chain_id = $1 AND tx_hash = $2 LIMIT 1",
+        )
+        .bind(chain_id)
+        .bind(tx_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| ClobError::Internal(format!("deposit processed lookup failed: {}", e)))?;
 
         Ok(row.is_some())
     }
@@ -590,7 +599,9 @@ impl Database {
         .bind(slug)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| ClobError::Internal(format!("get_public_market_metadata_by_slug failed: {}", e)))?;
+        .map_err(|e| {
+            ClobError::Internal(format!("get_public_market_metadata_by_slug failed: {}", e))
+        })?;
 
         Ok(row.as_ref().map(market_metadata_from_row))
     }
@@ -607,7 +618,12 @@ impl Database {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| ClobError::Internal(format!("list_active_prediction_market_metadata failed: {}", e)))?;
+        .map_err(|e| {
+            ClobError::Internal(format!(
+                "list_active_prediction_market_metadata failed: {}",
+                e
+            ))
+        })?;
 
         Ok(rows.iter().map(market_metadata_from_row).collect())
     }
@@ -646,7 +662,12 @@ impl Database {
             .await
         };
 
-        let rows = rows.map_err(|e| ClobError::Internal(format!("list_resolved_prediction_market_metadata failed: {}", e)))?;
+        let rows = rows.map_err(|e| {
+            ClobError::Internal(format!(
+                "list_resolved_prediction_market_metadata failed: {}",
+                e
+            ))
+        })?;
         Ok(rows.iter().map(market_metadata_from_row).collect())
     }
 
@@ -674,7 +695,9 @@ impl Database {
         .bind(asset_prefix)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| ClobError::Internal(format!("get_expired_active_pyth_markets failed: {}", e)))?;
+        .map_err(|e| {
+            ClobError::Internal(format!("get_expired_active_pyth_markets failed: {}", e))
+        })?;
 
         let mut persisted = Vec::with_capacity(rows.len());
         for row in rows {
@@ -803,9 +826,7 @@ impl Database {
 
     /// Load all balances from DB into a Vec of (wallet_address, token_address, total, reserved).
     /// Returns evm_address so the in-memory BalanceService key matches runtime lookups.
-    pub async fn load_all_balances(
-        &self,
-    ) -> ClobResult<Vec<(String, String, Decimal, Decimal)>> {
+    pub async fn load_all_balances(&self) -> ClobResult<Vec<(String, String, Decimal, Decimal)>> {
         let rows = sqlx::query(
             "SELECT u.evm_address, b.token_address,
                     b.balance::text, b.reserved::text
@@ -825,14 +846,8 @@ impl Database {
 
             // Convert from 1e18-scaled integer string back to Decimal
             let scale = Decimal::from(1_000_000_000_000_000_000u64);
-            let total = balance_str
-                .parse::<Decimal>()
-                .unwrap_or(Decimal::ZERO)
-                / scale;
-            let reserved = reserved_str
-                .parse::<Decimal>()
-                .unwrap_or(Decimal::ZERO)
-                / scale;
+            let total = balance_str.parse::<Decimal>().unwrap_or(Decimal::ZERO) / scale;
+            let reserved = reserved_str.parse::<Decimal>().unwrap_or(Decimal::ZERO) / scale;
 
             result.push((user_id, token, total, reserved));
         }

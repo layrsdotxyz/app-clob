@@ -1,4 +1,7 @@
-use crate::{models::{PublicTrade, Trade, Order, OrderBook, WsMessage, WsClientMessage}, orderbook::OrderBookManager};
+use crate::{
+    models::{Order, OrderBook, PublicTrade, Trade, WsClientMessage, WsMessage},
+    orderbook::OrderBookManager,
+};
 use axum::extract::ws::{Message, WebSocket};
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -12,6 +15,12 @@ pub struct WebSocketManager {
     user_channels: Arc<DashMap<String, broadcast::Sender<WsMessage>>>,
 }
 
+impl Default for WebSocketManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WebSocketManager {
     pub fn new() -> Self {
         Self {
@@ -21,11 +30,7 @@ impl WebSocketManager {
     }
 
     /// Subscribe a WebSocket connection to channels
-    pub async fn handle_connection(
-        &self,
-        mut ws: WebSocket,
-        user_id: Option<String>,
-    ) {
+    pub async fn handle_connection(&self, mut ws: WebSocket, user_id: Option<String>) {
         let session_id = Uuid::new_v4();
         tracing::info!(session_id = %session_id, user_id = ?user_id, "WebSocket connected");
 
@@ -40,7 +45,8 @@ impl WebSocketManager {
         });
 
         let (agg_tx, mut agg_rx) = tokio::sync::mpsc::unbounded_channel::<WsMessage>();
-        let mut subscriptions: std::collections::HashMap<String, tokio::task::JoinHandle<()>> = std::collections::HashMap::new();
+        let mut subscriptions: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
 
         loop {
             tokio::select! {
@@ -90,7 +96,7 @@ impl WebSocketManager {
                 }
             }
         }
-        
+
         // Clean up spawned tasks when disconnected
         for (_, handle) in subscriptions.drain() {
             handle.abort();
@@ -107,12 +113,13 @@ impl WebSocketManager {
         match msg {
             WsClientMessage::Subscribe { channel, market_id } => {
                 let channel_key = self.make_channel_key(&channel, market_id.as_deref());
-                
-                let tx = self.channels
+
+                let tx = self
+                    .channels
                     .entry(channel_key.clone())
                     .or_insert_with(|| broadcast::channel(1000).0)
                     .clone();
-                
+
                 let mut rx = tx.subscribe();
                 let snd = agg_tx.clone();
                 let handle = tokio::spawn(async move {
@@ -122,31 +129,31 @@ impl WebSocketManager {
                         }
                     }
                 });
-                
+
                 if let Some(old_handle) = subscriptions.insert(channel_key.clone(), handle) {
                     old_handle.abort();
                 }
-                
+
                 let response = WsMessage::Subscribed { channel, market_id };
                 if let Ok(json) = serde_json::to_string(&response) {
                     let _ = ws.send(Message::Text(json)).await;
                 }
-                
+
                 tracing::debug!(channel = %channel_key, "Subscribed to channel");
             }
-            
+
             WsClientMessage::Unsubscribe { channel, market_id } => {
                 let channel_key = self.make_channel_key(&channel, market_id.as_deref());
-                
+
                 if let Some(handle) = subscriptions.remove(&channel_key) {
                     handle.abort();
                 }
-                
+
                 let response = WsMessage::Unsubscribed { channel, market_id };
                 if let Ok(json) = serde_json::to_string(&response) {
                     let _ = ws.send(Message::Text(json)).await;
                 }
-                
+
                 tracing::debug!(channel = %channel_key, "Unsubscribed from channel");
             }
         }
@@ -155,7 +162,7 @@ impl WebSocketManager {
     /// Broadcast order book update
     pub fn broadcast_orderbook_update(&self, orderbook: &OrderBook) {
         let channel_key = format!("orderbook:{}", orderbook.market_id);
-        
+
         if let Some(tx) = self.channels.get(&channel_key) {
             let msg = WsMessage::OrderBookUpdate {
                 market_id: orderbook.market_id.clone(),
@@ -163,7 +170,7 @@ impl WebSocketManager {
                 asks: orderbook.asks.clone(),
                 timestamp: orderbook.timestamp,
             };
-            
+
             let _ = tx.send(msg);
         }
     }
@@ -171,27 +178,28 @@ impl WebSocketManager {
     /// Broadcast an anonymous trade tick — no user IDs or settlement hash.
     pub fn broadcast_trade(&self, trade: &Trade) {
         let channel_key = format!("trades:{}", trade.market_id);
-        
+
         if let Some(tx) = self.channels.get(&channel_key) {
             let msg = WsMessage::Trade {
                 trade: PublicTrade::from(trade),
             };
-            
+
             let _ = tx.send(msg);
         }
     }
 
     /// Send order update to user
     pub fn send_order_update(&self, user_id: &str, order: &Order) {
-        let tx = self.user_channels
+        let tx = self
+            .user_channels
             .entry(user_id.to_string())
             .or_insert_with(|| broadcast::channel(100).0)
             .clone();
-        
+
         let msg = WsMessage::OrderUpdate {
             order: order.clone(),
         };
-        
+
         let _ = tx.send(msg);
     }
 
@@ -205,7 +213,8 @@ impl WebSocketManager {
         trade_id: &str,
         tx_hash: &str,
     ) {
-        let tx = self.user_channels
+        let tx = self
+            .user_channels
             .entry(user_id.to_string())
             .or_insert_with(|| broadcast::channel(100).0)
             .clone();
@@ -224,7 +233,8 @@ impl WebSocketManager {
     /// Push a balance update to a user's private WS channel.
     /// Creates the channel if it doesn't exist so the push is never silently dropped.
     pub fn send_balance_update(&self, user_id: &str, total: &str, reserved: &str, available: &str) {
-        let tx = self.user_channels
+        let tx = self
+            .user_channels
             .entry(user_id.to_string())
             .or_insert_with(|| broadcast::channel(100).0)
             .clone();

@@ -114,6 +114,7 @@ pub struct CompleteSetTransaction {
     pub market_id: String,
     pub settlement_asset: String,
     pub quantity_micros: u128,
+    pub collateral_amount_atomic: u128,
     pub direction: CompleteSetDirection,
 }
 
@@ -122,8 +123,8 @@ pub struct ClaimPayout {
     pub claim_account: AccountKey,
     pub destination: AccountKey,
     pub claim_quantity_micros: u128,
-    pub gross_payout_micros: u128,
-    pub winning_fee_micros: u128,
+    pub gross_payout_atomic: u128,
+    pub winning_fee_atomic: u128,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -299,7 +300,7 @@ impl Ledger {
         &mut self,
         transaction: CompleteSetTransaction,
     ) -> CoreResult<AppliedLedgerTransaction> {
-        if transaction.quantity_micros == 0 {
+        if transaction.quantity_micros == 0 || transaction.collateral_amount_atomic == 0 {
             return Err(CoreError::ZeroAmount);
         }
         if self
@@ -337,16 +338,16 @@ impl Ledger {
 
         match transaction.direction {
             CompleteSetDirection::Mint => {
-                debit(&mut next, &available, transaction.quantity_micros)?;
-                credit(&mut next, &collateral, transaction.quantity_micros)?;
+                debit(&mut next, &available, transaction.collateral_amount_atomic)?;
+                credit(&mut next, &collateral, transaction.collateral_amount_atomic)?;
                 credit(&mut next, &up, transaction.quantity_micros)?;
                 credit(&mut next, &down, transaction.quantity_micros)?;
             }
             CompleteSetDirection::Burn => {
                 debit(&mut next, &up, transaction.quantity_micros)?;
                 debit(&mut next, &down, transaction.quantity_micros)?;
-                debit(&mut next, &collateral, transaction.quantity_micros)?;
-                credit(&mut next, &available, transaction.quantity_micros)?;
+                debit(&mut next, &collateral, transaction.collateral_amount_atomic)?;
+                credit(&mut next, &available, transaction.collateral_amount_atomic)?;
             }
         }
 
@@ -387,7 +388,7 @@ impl Ledger {
         let mut next = self.balances.clone();
         for payout in &payouts {
             if payout.claim_quantity_micros == 0
-                || payout.winning_fee_micros > payout.gross_payout_micros
+                || payout.winning_fee_atomic > payout.gross_payout_atomic
             {
                 return Err(CoreError::UnbalancedTransaction);
             }
@@ -396,14 +397,14 @@ impl Ledger {
                 &payout.claim_account,
                 payout.claim_quantity_micros,
             )?;
-            if payout.gross_payout_micros > 0 {
-                debit(&mut next, &collateral, payout.gross_payout_micros)?;
-                let net = payout.gross_payout_micros - payout.winning_fee_micros;
+            if payout.gross_payout_atomic > 0 {
+                debit(&mut next, &collateral, payout.gross_payout_atomic)?;
+                let net = payout.gross_payout_atomic - payout.winning_fee_atomic;
                 if net > 0 {
                     credit(&mut next, &payout.destination, net)?;
                 }
-                if payout.winning_fee_micros > 0 {
-                    credit(&mut next, &fee_revenue, payout.winning_fee_micros)?;
+                if payout.winning_fee_atomic > 0 {
+                    credit(&mut next, &fee_revenue, payout.winning_fee_atomic)?;
                 }
             }
         }

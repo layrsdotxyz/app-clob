@@ -32,7 +32,10 @@ fn test_depositor_address_extracted_from_topic() {
     let hex = padded.trim_start_matches("0x");
     assert_eq!(hex.len(), 64);
     // First 24 hex chars (12 bytes) must be zero padding
-    assert!(hex[..24].chars().all(|c| c == '0'), "first 12 bytes must be zero");
+    assert!(
+        hex[..24].chars().all(|c| c == '0'),
+        "first 12 bytes must be zero"
+    );
     let addr = format!("0x{}", &hex[24..]);
     assert_eq!(addr.len(), 42); // 0x + 40 hex
     assert_eq!(addr, "0xabcdef1234567890abcdef1234567890abcdef12");
@@ -42,9 +45,9 @@ fn test_depositor_address_extracted_from_topic() {
 #[test]
 fn test_block_range_hex_encoding() {
     let from: u64 = 1_000_000;
-    let to: u64   = 1_001_000;
+    let to: u64 = 1_001_000;
     assert_eq!(format!("0x{:x}", from), "0xf4240");
-    assert_eq!(format!("0x{:x}", to),   "0xf4628");
+    assert_eq!(format!("0x{:x}", to), "0xf4628");
 }
 
 /// ABI-encoded uint256 in event data: big-endian, left-zero-padded to 32 bytes.
@@ -86,8 +89,14 @@ fn test_deposit_dedup_by_tx_hash() {
     let mut seen: HashSet<String> = HashSet::new();
     let tx_hash = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab";
 
-    assert!(seen.insert(tx_hash.to_string()), "first insert should succeed");
-    assert!(!seen.insert(tx_hash.to_string()), "duplicate should be detected");
+    assert!(
+        seen.insert(tx_hash.to_string()),
+        "first insert should succeed"
+    );
+    assert!(
+        !seen.insert(tx_hash.to_string()),
+        "duplicate should be detected"
+    );
 }
 
 // ─── Live EVM tests ──────────────────────────────────────────────────────────
@@ -113,10 +122,14 @@ async fn test_get_recent_deposit_events() {
         .json(&serde_json::json!({
             "jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1
         }))
-        .send().await.unwrap().json().await.unwrap();
-    let cur = u64::from_str_radix(
-        blk["result"].as_str().unwrap().trim_start_matches("0x"), 16
-    ).unwrap();
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let cur =
+        u64::from_str_radix(blk["result"].as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
     let from = cur.saturating_sub(1000);
 
     // Query Deposit events from vault
@@ -134,16 +147,31 @@ async fn test_get_recent_deposit_events() {
             }],
             "id": 2
         }))
-        .send().await.unwrap().json().await.unwrap();
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
 
-    assert!(resp.get("error").is_none(), "eth_getLogs error: {:?}", resp["error"]);
+    assert!(
+        resp.get("error").is_none(),
+        "eth_getLogs error: {:?}",
+        resp["error"]
+    );
     let logs = resp["result"].as_array().unwrap();
-    println!("Found {} Deposit event(s) in blocks {from}..{cur}", logs.len());
+    println!(
+        "Found {} Deposit event(s) in blocks {from}..{cur}",
+        logs.len()
+    );
 
     // Validate structure of any events found
     for log in logs {
         let topics = log["topics"].as_array().expect("log has topics");
-        assert!(topics.len() >= 2, "Deposit event should have topic0 + depositor topic");
+        assert!(
+            topics.len() >= 2,
+            "Deposit event should have topic0 + depositor topic"
+        );
         assert_eq!(
             topics[0].as_str().unwrap(),
             "0x90890809c654f11d6e72a28fa60149770a0d11ec6c92319d6ceb2bb0a4ea1a15",
@@ -166,10 +194,17 @@ async fn test_block_polling_advances() {
             .json(&serde_json::json!({
                 "jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1
             }))
-            .send().await.unwrap().json().await.unwrap();
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         u64::from_str_radix(
-            resp["result"].as_str().unwrap().trim_start_matches("0x"), 16
-        ).unwrap()
+            resp["result"].as_str().unwrap().trim_start_matches("0x"),
+            16,
+        )
+        .unwrap()
     };
 
     let b1 = fetch_block().await;

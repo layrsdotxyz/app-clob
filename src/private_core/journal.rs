@@ -185,7 +185,7 @@ impl EncryptedJournal {
         let mut nonce = [0u8; 12];
         OsRng.fill_bytes(&mut nonce);
         let aad = snapshot_associated_data(self.sequence, &self.head, &state_root);
-        let mut plaintext = bincode::serialize(value).map_err(|_| CoreError::JournalCrypto)?;
+        let mut plaintext = serde_json::to_vec(value).map_err(|_| CoreError::JournalCrypto)?;
         let result = self
             .cipher
             .encrypt(
@@ -232,7 +232,7 @@ impl EncryptedJournal {
                 },
             )
             .map_err(|_| CoreError::JournalCrypto)?;
-        let value = bincode::deserialize(&plaintext).map_err(|_| CoreError::JournalCrypto);
+        let value = serde_json::from_slice(&plaintext).map_err(|_| CoreError::JournalCrypto);
         plaintext.zeroize();
         value
     }
@@ -262,6 +262,17 @@ impl ReceiptSigner {
     pub fn generate(enclave_measurement_sha384: [u8; 48]) -> Self {
         Self {
             signing_key: SigningKey::generate(&mut OsRng),
+            enclave_measurement_sha384,
+        }
+    }
+
+    /// Restores the enclave receipt identity from KMS-protected key material.
+    /// The seed is derived inside the enclave from the private-core journal key,
+    /// so receipts remain verifiable across enclave restarts without ever
+    /// persisting an unsealed signing key outside the enclave boundary.
+    pub fn from_seed(seed: [u8; 32], enclave_measurement_sha384: [u8; 48]) -> Self {
+        Self {
+            signing_key: SigningKey::from_bytes(&seed),
             enclave_measurement_sha384,
         }
     }

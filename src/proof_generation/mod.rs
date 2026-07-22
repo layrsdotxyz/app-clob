@@ -1,17 +1,14 @@
-mod order_match_prover;
 mod evm_proof_calldata;
+mod order_match_prover;
 mod prover_pipeline;
 pub mod prover_worker;
 
-pub use order_match_prover::{OrderMatchProver, ORDER_MATCH_UNSUPPORTED_MESSAGE};
-pub use prover_worker::ProverWorker;
 pub use evm_proof_calldata::{
-    HonkProof,
-    parse_honk_proof_from_output,
-    low_high_hex_to_bytes32,
-    parse_u128_hex,
+    low_high_hex_to_bytes32, parse_honk_proof_from_output, parse_u128_hex, HonkProof,
 };
+pub use order_match_prover::{OrderMatchProver, ORDER_MATCH_UNSUPPORTED_MESSAGE};
 pub use prover_pipeline::{ProverJob, ProverJobStatus, ProverJobType, ProverPipeline};
+pub use prover_worker::ProverWorker;
 
 use serde::{Deserialize, Serialize};
 

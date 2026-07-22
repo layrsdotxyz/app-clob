@@ -167,13 +167,17 @@ impl PythOracle {
     /// Batch-fetch latest prices for all supported assets.
     /// Returns a map of asset → price.
     pub async fn get_latest_prices_all(&self) -> ClobResult<HashMap<String, Decimal>> {
-        let ids: Vec<&str> = SUPPORTED_ASSETS
-            .iter()
-            .filter_map(|a| feed_id(a))
-            .collect();
+        let ids: Vec<&str> = SUPPORTED_ASSETS.iter().filter_map(|a| feed_id(a)).collect();
 
-        let query = ids.iter().map(|id| format!("ids[]={}", id)).collect::<Vec<_>>().join("&");
-        let url = format!("{}/v2/updates/price/latest?{}&parsed=true", HERMES_BASE, query);
+        let query = ids
+            .iter()
+            .map(|id| format!("ids[]={}", id))
+            .collect::<Vec<_>>()
+            .join("&");
+        let url = format!(
+            "{}/v2/updates/price/latest?{}&parsed=true",
+            HERMES_BASE, query
+        );
 
         let response = self
             .client
@@ -184,7 +188,10 @@ impl PythOracle {
 
         if !response.status().is_success() {
             let status = response.status();
-            return Err(ClobError::InvalidOrder(format!("Pyth API returned {}", status)));
+            return Err(ClobError::InvalidOrder(format!(
+                "Pyth API returned {}",
+                status
+            )));
         }
 
         let hermes: HermesResponse = response.json().await.map_err(|e| {
@@ -205,7 +212,7 @@ impl PythOracle {
 
     // ─── Private helpers ─────────────────────────────────────────────────────
 
-    fn require_feed_id<'a>(&self, asset: &'a str) -> ClobResult<&'static str> {
+    fn require_feed_id(&self, asset: &str) -> ClobResult<&'static str> {
         feed_id(asset).ok_or_else(|| {
             ClobError::InvalidOrder(format!("No Pyth feed ID for asset '{}'", asset))
         })
@@ -299,7 +306,11 @@ mod tests {
     async fn test_live_btc() {
         let oracle = PythOracle::new();
         let price = oracle.get_latest_price("BTC").await.unwrap();
-        assert!(price > Decimal::from(1000), "BTC price seems too low: {}", price);
+        assert!(
+            price > Decimal::from(1000),
+            "BTC price seems too low: {}",
+            price
+        );
         println!("BTC/USD = ${}", price);
     }
 

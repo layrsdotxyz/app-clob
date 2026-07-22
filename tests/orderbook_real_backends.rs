@@ -104,7 +104,9 @@ impl DockerContainer {
 
 impl Drop for DockerContainer {
     fn drop(&mut self) {
-        let _ = Command::new("docker").args(["rm", "-f", &self.name]).status();
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &self.name])
+            .status();
     }
 }
 
@@ -138,9 +140,8 @@ impl RealBackends {
 
         let postgres = DockerContainer::start_postgres()?;
         let postgres_port = postgres.host_port(5432)?;
-        let database_url = format!(
-            "postgresql://postgres:postgres@127.0.0.1:{postgres_port}/clob_test"
-        );
+        let database_url =
+            format!("postgresql://postgres:postgres@127.0.0.1:{postgres_port}/clob_test");
         let database = wait_for_database(&database_url).await?;
         database.migrate().await?;
 
@@ -161,6 +162,7 @@ impl RealBackends {
             0,
             0,
             balance_service.clone(),
+            Arc::new(clob_service::websocket::WebSocketManager::new()),
         ));
         let trade_persist_task = settlement.clone().start_trade_persistence_worker();
         let engine = MatchingEngine::new(orderbook.clone(), settlement, metrics);
@@ -199,7 +201,8 @@ async fn wait_for_redis(redis_url: &str) -> Result<()> {
     for _ in 0..60 {
         if let Ok(client) = redis::Client::open(redis_url.to_string()) {
             if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
-                let ping: redis::RedisResult<String> = redis::cmd("PING").query_async(&mut conn).await;
+                let ping: redis::RedisResult<String> =
+                    redis::cmd("PING").query_async(&mut conn).await;
                 if ping.as_deref() == Ok("PONG") {
                     return Ok(());
                 }
@@ -269,7 +272,11 @@ async fn assert_order_row(
     let amount: Decimal = row.get("amount");
     let wallet_address: String = row.get("evm_address");
 
-    assert_eq!(row_count, 1, "order {} should upsert to exactly one row", order_id);
+    assert_eq!(
+        row_count, 1,
+        "order {} should upsert to exactly one row",
+        order_id
+    );
     assert_eq!(status, expected_status);
     assert_eq!(wallet_address, expected_wallet.to_lowercase());
     assert_eq!(amount.round_dp(6), expected_amount.round_dp(6));
@@ -345,12 +352,26 @@ async fn real_redis_orderbook_scenarios_persist_orders_to_db() -> Result<()> {
     balances.deposit("taker-gtc", "USDC", dec!(1000));
 
     let market = "REAL-GTC-FILL";
-    let maker = make_limit_order("maker-gtc", market, OrderSide::Sell, dec!(0.60), dec!(100), TimeInForce::Gtc);
+    let maker = make_limit_order(
+        "maker-gtc",
+        market,
+        OrderSide::Sell,
+        dec!(0.60),
+        dec!(100),
+        TimeInForce::Gtc,
+    );
     let maker_id = maker.id;
     let maker_result = engine.submit_order(maker).await?;
     assert_eq!(maker_result.order.status, OrderStatus::Open);
 
-    let taker = make_limit_order("taker-gtc", market, OrderSide::Buy, dec!(0.60), dec!(100), TimeInForce::Gtc);
+    let taker = make_limit_order(
+        "taker-gtc",
+        market,
+        OrderSide::Buy,
+        dec!(0.60),
+        dec!(100),
+        TimeInForce::Gtc,
+    );
     let taker_id = taker.id;
     let taker_result = engine.submit_order(taker).await?;
     assert_eq!(taker_result.order.status, OrderStatus::Filled);
@@ -366,11 +387,25 @@ async fn real_redis_orderbook_scenarios_persist_orders_to_db() -> Result<()> {
     balances.deposit("taker-partial", "USDC", dec!(1000));
 
     let market = "REAL-PARTIAL-CANCEL";
-    let maker = make_limit_order("maker-partial", market, OrderSide::Sell, dec!(0.61), dec!(100), TimeInForce::Gtc);
+    let maker = make_limit_order(
+        "maker-partial",
+        market,
+        OrderSide::Sell,
+        dec!(0.61),
+        dec!(100),
+        TimeInForce::Gtc,
+    );
     let maker_id = maker.id;
     engine.submit_order(maker).await?;
 
-    let taker = make_limit_order("taker-partial", market, OrderSide::Buy, dec!(0.61), dec!(40), TimeInForce::Gtc);
+    let taker = make_limit_order(
+        "taker-partial",
+        market,
+        OrderSide::Buy,
+        dec!(0.61),
+        dec!(40),
+        TimeInForce::Gtc,
+    );
     let taker_id = taker.id;
     let taker_result = engine.submit_order(taker).await?;
     assert_eq!(taker_result.order.status, OrderStatus::Filled);
@@ -393,11 +428,25 @@ async fn real_redis_orderbook_scenarios_persist_orders_to_db() -> Result<()> {
     balances.deposit("taker-ioc", "USDC", dec!(1000));
 
     let market = "REAL-IOC-TAIL";
-    let maker = make_limit_order("maker-ioc", market, OrderSide::Sell, dec!(0.62), dec!(40), TimeInForce::Gtc);
+    let maker = make_limit_order(
+        "maker-ioc",
+        market,
+        OrderSide::Sell,
+        dec!(0.62),
+        dec!(40),
+        TimeInForce::Gtc,
+    );
     let maker_id = maker.id;
     engine.submit_order(maker).await?;
 
-    let ioc = make_limit_order("taker-ioc", market, OrderSide::Buy, dec!(0.62), dec!(100), TimeInForce::Ioc);
+    let ioc = make_limit_order(
+        "taker-ioc",
+        market,
+        OrderSide::Buy,
+        dec!(0.62),
+        dec!(100),
+        TimeInForce::Ioc,
+    );
     let ioc_id = ioc.id;
     let ioc_result = engine.submit_order(ioc).await?;
     assert_eq!(ioc_result.order.status, OrderStatus::Partial);
@@ -414,11 +463,25 @@ async fn real_redis_orderbook_scenarios_persist_orders_to_db() -> Result<()> {
     balances.deposit("taker-fok", "USDC", dec!(1000));
 
     let market = "REAL-FOK-ROLLBACK";
-    let maker = make_limit_order("maker-fok", market, OrderSide::Sell, dec!(0.63), dec!(40), TimeInForce::Gtc);
+    let maker = make_limit_order(
+        "maker-fok",
+        market,
+        OrderSide::Sell,
+        dec!(0.63),
+        dec!(40),
+        TimeInForce::Gtc,
+    );
     let maker_id = maker.id;
     engine.submit_order(maker).await?;
 
-    let fok = make_limit_order("taker-fok", market, OrderSide::Buy, dec!(0.63), dec!(100), TimeInForce::Fok);
+    let fok = make_limit_order(
+        "taker-fok",
+        market,
+        OrderSide::Buy,
+        dec!(0.63),
+        dec!(100),
+        TimeInForce::Fok,
+    );
     let fok_id = fok.id;
     let error = engine.submit_order(fok).await.unwrap_err();
     assert!(matches!(

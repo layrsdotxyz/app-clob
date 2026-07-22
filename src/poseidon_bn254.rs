@@ -43,11 +43,7 @@ pub fn poseidon_hash(inputs: &[[u8; 32]]) -> ClobResult<[u8; 32]> {
         .collect();
 
     let mut hasher = Poseidon::<Fr>::new_circom(field_elems.len()).map_err(|e| {
-        ClobError::Internal(format!(
-            "poseidon init (n={}): {:?}",
-            field_elems.len(),
-            e
-        ))
+        ClobError::Internal(format!("poseidon init (n={}): {:?}", field_elems.len(), e))
     })?;
 
     let result = hasher

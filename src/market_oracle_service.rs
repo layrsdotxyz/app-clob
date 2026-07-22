@@ -140,7 +140,12 @@ impl MarketOracleService {
 
     /// Build from environment variables.  Returns `None` when required vars are
     /// missing (so callers can treat the service as optional).
-    pub fn from_env(store: Arc<RedisStore>, database: Option<Arc<Database>>, orderbook_manager: Arc<OrderBookManager>, balance_service: Arc<BalanceService>) -> Option<Self> {
+    pub fn from_env(
+        store: Arc<RedisStore>,
+        database: Option<Arc<Database>>,
+        orderbook_manager: Arc<OrderBookManager>,
+        balance_service: Arc<BalanceService>,
+    ) -> Option<Self> {
         let factory_address_str = std::env::var("MARKET_FACTORY_ADDRESS").ok()?;
         if factory_address_str.is_empty() {
             return None;
@@ -160,7 +165,19 @@ impl MarketOracleService {
         let oracle = Arc::new(PythOracle::new());
         let policy = OraclePolicy::from_env();
 
-        Some(Self::new(factory_address, resolver_address, registry_address, Arc::new(relayer), provider, store, database, oracle, policy, orderbook_manager, balance_service))
+        Some(Self::new(
+            factory_address,
+            resolver_address,
+            registry_address,
+            Arc::new(relayer),
+            provider,
+            store,
+            database,
+            oracle,
+            policy,
+            orderbook_manager,
+            balance_service,
+        ))
     }
 
     // ─── Main loop ───────────────────────────────────────────────────────────
@@ -186,7 +203,10 @@ impl MarketOracleService {
         }
 
         const GRACE_SECS: u64 = 30;
-        info!(secs = GRACE_SECS, "Applying grace period for Pyth data finality");
+        info!(
+            secs = GRACE_SECS,
+            "Applying grace period for Pyth data finality"
+        );
         sleep(Duration::from_secs(GRACE_SECS)).await;
 
         // Sync on-chain market count before the first tick.
@@ -206,13 +226,14 @@ impl MarketOracleService {
         loop {
             let now_ts = unix_now();
             let prev_interval_start = now_ts.saturating_sub(interval_secs);
-            let next_interval_ts    = now_ts + interval_secs;
+            let next_interval_ts = now_ts + interval_secs;
 
             // Distributed lock — only one CLOB instance should create markets per interval.
             // The lock key is aligned to the interval boundary so both instances target the
             // same key and the loser skips without error.
             let lock_key = format!("oracle:tick:lock:{}", prev_interval_start);
-            let acquired = self.store
+            let acquired = self
+                .store
                 .try_acquire_lock(&lock_key, &instance_id, lock_ttl_secs)
                 .await
                 .unwrap_or(false);
@@ -240,14 +261,24 @@ impl MarketOracleService {
             // Each successful create increments market_id_counter by 1.
             for asset in ORACLE_ASSETS {
                 let pending = self.pending_markets.get(*asset).copied();
-                match self.tick_asset(asset, prev_interval_start, now_ts, next_interval_ts, pending).await {
+                match self
+                    .tick_asset(
+                        asset,
+                        prev_interval_start,
+                        now_ts,
+                        next_interval_ts,
+                        pending,
+                    )
+                    .await
+                {
                     Ok(new_market_id) => {
                         info!(
                             asset,
                             market_id = new_market_id,
                             "Oracle tick succeeded — market created"
                         );
-                        self.pending_markets.insert(asset.to_string(), new_market_id);
+                        self.pending_markets
+                            .insert(asset.to_string(), new_market_id);
                     }
                     Err(e) => {
                         error!(asset, error = %e, "Oracle asset tick failed — will retry next hour");
@@ -269,9 +300,10 @@ impl MarketOracleService {
         info!("Syncing market oracle state from Horizen EVM");
 
         let selector = &keccak256(b"nextMarketId()")[..4];
-        let result = self.call_view_registry(
-            Bytes::from(selector.to_vec()),
-        ).await.map_err(|e| ClobError::Internal(format!("nextMarketId() call failed: {e}")))?;
+        let result = self
+            .call_view_registry(Bytes::from(selector.to_vec()))
+            .await
+            .map_err(|e| ClobError::Internal(format!("nextMarketId() call failed: {e}")))?;
 
         let count = if result.len() >= 32 {
             U256::from_big_endian(&result[..32]).as_u64()
@@ -338,9 +370,7 @@ impl MarketOracleService {
             }),
         );
 
-        let price_decimal = scaled_u128_to_decimal(
-            decimal_price_to_u128(close_price).unwrap_or(0),
-        );
+        let price_decimal = scaled_u128_to_decimal(decimal_price_to_u128(close_price).unwrap_or(0));
 
         for pending_market in markets_to_resolve {
             let prev_id = pending_market.on_chain_market_id;
@@ -357,7 +387,11 @@ impl MarketOracleService {
                     );
                     if let Some(db) = &self.database {
                         if let Err(error) = db
-                            .update_market_resolution(&pending_market.market_id, price_decimal, "resolved")
+                            .update_market_resolution(
+                                &pending_market.market_id,
+                                price_decimal,
+                                "resolved",
+                            )
                             .await
                         {
                             warn!(
@@ -392,7 +426,9 @@ impl MarketOracleService {
         let tx_hash = self
             .create_market(question_hash, strike_price, next_hour_ts)
             .await
-            .map_err(|e| ClobError::Internal(format!("createBinaryMarket failed for {asset}: {e}")))?;
+            .map_err(|e| {
+                ClobError::Internal(format!("createBinaryMarket failed for {asset}: {e}"))
+            })?;
 
         info!(
             asset,
@@ -406,20 +442,24 @@ impl MarketOracleService {
         // Persist new market to DB
         if let Some(db) = &self.database {
             let market_key = format!("{asset}-{expected_id}");
-            let description = format!("Will {asset} close above ${close_price} at Unix {next_hour_ts}?");
+            let description =
+                format!("Will {asset} close above ${close_price} at Unix {next_hour_ts}?");
             let strike_decimal = scaled_u128_to_decimal(strike_price);
-            if let Err(e) = db.upsert_market(
-                &market_key,
-                &description,
-                next_hour_ts,
-                "active",
-                None,
-                Some(strike_decimal),
-                None,
-                None,
-                Some("pyth"),
-                Some(expected_id as i64),
-            ).await {
+            if let Err(e) = db
+                .upsert_market(
+                    &market_key,
+                    &description,
+                    next_hour_ts,
+                    "active",
+                    None,
+                    Some(strike_decimal),
+                    None,
+                    None,
+                    Some("pyth"),
+                    Some(expected_id as i64),
+                )
+                .await
+            {
                 warn!(asset, market_id = expected_id, error = %e, "Failed to persist new market to DB");
             }
         }
@@ -432,8 +472,6 @@ impl MarketOracleService {
         self.market_id_counter += 1;
         Ok(expected_id)
     }
-
-    
 
     // ─── EVM contract helpers ─────────────────────────────────────────────────
 
@@ -484,7 +522,9 @@ impl MarketOracleService {
                 "Market not registered on-chain (phantom DB record) — marking as expired"
             );
             if let Some(db) = &self.database {
-                let _ = db.update_market_resolution(&market_key, Decimal::ZERO, "expired").await;
+                let _ = db
+                    .update_market_resolution(&market_key, Decimal::ZERO, "expired")
+                    .await;
             }
             return Ok(None);
         }
@@ -520,14 +560,18 @@ impl MarketOracleService {
 
         if self.is_market_invalidated(market_id).await? {
             audit.status = OracleResolutionStatus::Invalidated;
-            audit.reason.get_or_insert_with(|| "market already invalidated on-chain".to_string());
+            audit
+                .reason
+                .get_or_insert_with(|| "market already invalidated on-chain".to_string());
             self.persist_audit_record(&audit).await?;
             return Ok(None);
         }
 
         if self.is_market_resolved(market_id).await? {
             audit.status = OracleResolutionStatus::Finalized;
-            audit.reason.get_or_insert_with(|| "market already resolved on-chain".to_string());
+            audit
+                .reason
+                .get_or_insert_with(|| "market already resolved on-chain".to_string());
             self.persist_audit_record(&audit).await?;
             return Ok(None);
         }
@@ -565,7 +609,9 @@ impl MarketOracleService {
                         let _ = self.store.delete_key(&pos_key).await;
                     }
                     Ok(_) => {} // no positions recorded (e.g. MM-only market with no user fills)
-                    Err(e) => warn!(market = %market_key, error = %e, "Failed to read positions for CLOB payout — skipping"),
+                    Err(e) => {
+                        warn!(market = %market_key, error = %e, "Failed to read positions for CLOB payout — skipping")
+                    }
                 }
 
                 audit.status = OracleResolutionStatus::ResolvePublished;
@@ -614,16 +660,21 @@ impl MarketOracleService {
     async fn persist_audit_record(&self, audit: &OracleResolutionAuditRecord) -> ClobResult<()> {
         let payload = serde_json::to_string(audit)?;
         self.store.set(&audit.redis_key(), &payload).await?;
-        self.store.append_json_array_value(&audit.history_key(), &payload).await?;
+        self.store
+            .append_json_array_value(&audit.history_key(), &payload)
+            .await?;
         Ok(())
     }
 
     async fn is_market_registered(&self, market_id: u64) -> ClobResult<bool> {
         let selector = &keccak256(b"isRegistered(uint64)")[..4];
-        let data = Bytes::from([
-            selector,
-            encode(&[Token::Uint(U256::from(market_id))]).as_slice(),
-        ].concat());
+        let data = Bytes::from(
+            [
+                selector,
+                encode(&[Token::Uint(U256::from(market_id))]).as_slice(),
+            ]
+            .concat(),
+        );
         match self.call_view_registry(data).await {
             Ok(result) => Ok(result.last().copied().unwrap_or(0) != 0),
             Err(_) => Ok(false),
@@ -634,10 +685,13 @@ impl MarketOracleService {
         // getBinaryMarket(uint64) returns BinaryMarket struct.
         // ABI layout: questionHash(bytes32) at slot 0, strikePrice(uint128) at slot 1 (bytes 32..64).
         let selector = &keccak256(b"getBinaryMarket(uint64)")[..4];
-        let data = Bytes::from([
-            selector,
-            encode(&[Token::Uint(U256::from(market_id))]).as_slice(),
-        ].concat());
+        let data = Bytes::from(
+            [
+                selector,
+                encode(&[Token::Uint(U256::from(market_id))]).as_slice(),
+            ]
+            .concat(),
+        );
         let result = self.call_view_resolver(data).await?;
         if result.len() < 64 {
             return Ok(0);
@@ -650,10 +704,13 @@ impl MarketOracleService {
     async fn is_market_resolved(&self, market_id: u64) -> ClobResult<bool> {
         // `isResolved(uint64 marketId) returns (bool)` — on MarketResolver
         let selector = &keccak256(b"isResolved(uint64)")[..4];
-        let data = Bytes::from([
-            selector,
-            encode(&[Token::Uint(U256::from(market_id))]).as_slice(),
-        ].concat());
+        let data = Bytes::from(
+            [
+                selector,
+                encode(&[Token::Uint(U256::from(market_id))]).as_slice(),
+            ]
+            .concat(),
+        );
         let result = self.call_view_resolver(data).await?;
         Ok(result.last().copied().unwrap_or(0) != 0)
     }
@@ -661,10 +718,13 @@ impl MarketOracleService {
     async fn is_market_invalidated(&self, market_id: u64) -> ClobResult<bool> {
         // `isInvalidated(uint64 marketId) returns (bool)` — on MarketResolver
         let selector = &keccak256(b"isInvalidated(uint64)")[..4];
-        let data = Bytes::from([
-            selector,
-            encode(&[Token::Uint(U256::from(market_id))]).as_slice(),
-        ].concat());
+        let data = Bytes::from(
+            [
+                selector,
+                encode(&[Token::Uint(U256::from(market_id))]).as_slice(),
+            ]
+            .concat(),
+        );
         let result = self.call_view_resolver(data).await?;
         Ok(result.last().copied().unwrap_or(0) != 0)
     }
@@ -676,7 +736,7 @@ impl MarketOracleService {
                 &ethers::types::transaction::eip2718::TypedTransaction::Legacy(
                     ethers::types::TransactionRequest::new()
                         .to(self.resolver_address)
-                        .data(data)
+                        .data(data),
                 ),
                 None,
             )
@@ -691,7 +751,7 @@ impl MarketOracleService {
                 &ethers::types::transaction::eip2718::TypedTransaction::Legacy(
                     ethers::types::TransactionRequest::new()
                         .to(self.registry_address)
-                        .data(data)
+                        .data(data),
                 ),
                 None,
             )
@@ -726,46 +786,6 @@ impl MarketOracleService {
         }
 
         Err(last_err)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::merge_recovery_backlog;
-    use crate::database::PersistedOracleMarket;
-
-    #[test]
-    fn merge_recovery_backlog_dedupes_cached_pending_when_db_has_same_market() {
-        let merged = merge_recovery_backlog(
-            vec![PersistedOracleMarket {
-                market_id: "BTC-160".to_string(),
-                on_chain_market_id: 160,
-                expiry_ts: 1_714_148_100,
-            }],
-            Some(PersistedOracleMarket {
-                market_id: "BTC-160".to_string(),
-                on_chain_market_id: 160,
-                expiry_ts: 1_714_148_100,
-            }),
-        );
-
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].on_chain_market_id, 160);
-    }
-
-    #[test]
-    fn merge_recovery_backlog_keeps_cached_pending_when_db_is_empty() {
-        let merged = merge_recovery_backlog(
-            Vec::new(),
-            Some(PersistedOracleMarket {
-                market_id: "ETH-161".to_string(),
-                on_chain_market_id: 161,
-                expiry_ts: 1_714_148_100,
-            }),
-        );
-
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].market_id, "ETH-161");
     }
 }
 
@@ -815,3 +835,42 @@ fn scaled_u128_to_decimal(price: u128) -> Decimal {
     Decimal::from_i128_with_scale(price as i128, 8)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::merge_recovery_backlog;
+    use crate::database::PersistedOracleMarket;
+
+    #[test]
+    fn merge_recovery_backlog_dedupes_cached_pending_when_db_has_same_market() {
+        let merged = merge_recovery_backlog(
+            vec![PersistedOracleMarket {
+                market_id: "BTC-160".to_string(),
+                on_chain_market_id: 160,
+                expiry_ts: 1_714_148_100,
+            }],
+            Some(PersistedOracleMarket {
+                market_id: "BTC-160".to_string(),
+                on_chain_market_id: 160,
+                expiry_ts: 1_714_148_100,
+            }),
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].on_chain_market_id, 160);
+    }
+
+    #[test]
+    fn merge_recovery_backlog_keeps_cached_pending_when_db_is_empty() {
+        let merged = merge_recovery_backlog(
+            Vec::new(),
+            Some(PersistedOracleMarket {
+                market_id: "ETH-161".to_string(),
+                on_chain_market_id: 161,
+                expiry_ts: 1_714_148_100,
+            }),
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].market_id, "ETH-161");
+    }
+}

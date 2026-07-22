@@ -42,10 +42,9 @@ impl PredictionMarketRelayer {
     /// 2. Otherwise fall back to `self.treasury_addr` (from env).
     fn effective_treasury(&self, override_addr: Option<&str>) -> ClobResult<Address> {
         if let Some(addr_str) = override_addr.filter(|s| !s.trim().is_empty()) {
-            addr_str
-                .trim()
-                .parse::<Address>()
-                .map_err(|e| ClobError::Internal(format!("invalid treasury override '{}': {}", addr_str, e)))
+            addr_str.trim().parse::<Address>().map_err(|e| {
+                ClobError::Internal(format!("invalid treasury override '{}': {}", addr_str, e))
+            })
         } else {
             Ok(self.treasury_addr)
         }
@@ -66,11 +65,12 @@ impl PredictionMarketRelayer {
         vault_address_override: Option<&str>,
     ) -> ClobResult<String> {
         let vault = self.effective_treasury(vault_address_override)?;
-        let selector = &ethers::utils::keccak256(
-            b"lockCollateral(bytes32,uint256,uint64,bytes,bytes32[6])",
-        )[..4];
+        let selector =
+            &ethers::utils::keccak256(b"lockCollateral(bytes32,uint256,uint64,bytes,bytes32[6])")
+                [..4];
 
-        let tokens = encode_lock_collateral(order_commitment, required_amount, lock_expiry_ts, proof)?;
+        let tokens =
+            encode_lock_collateral(order_commitment, required_amount, lock_expiry_ts, proof)?;
         let data = Bytes::from([selector, &encode(&tokens)].concat());
         info!(vault = ?vault, "lockCollateral → sending tx");
         self.relayer.send_tx(vault, data).await
@@ -150,9 +150,7 @@ impl PredictionMarketRelayer {
         vault_address_override: Option<&str>,
     ) -> ClobResult<String> {
         let vault = self.effective_treasury(vault_address_override)?;
-        let selector = &ethers::utils::keccak256(
-            b"claimWinnings(address,bytes,bytes32[7])",
-        )[..4];
+        let selector = &ethers::utils::keccak256(b"claimWinnings(address,bytes,bytes32[7])")[..4];
 
         let tokens = encode_claim_winnings(recipient, proof)?;
         let data = Bytes::from([selector, &encode(&tokens)].concat());
@@ -169,8 +167,7 @@ fn decode_proof_hex(hex: &str) -> ClobResult<Vec<u8>> {
         .strip_prefix("0x")
         .or_else(|| hex.strip_prefix("0X"))
         .ok_or_else(|| ClobError::Internal("proof_hex must be 0x-prefixed".to_string()))?;
-    hex::decode(stripped)
-        .map_err(|e| ClobError::Internal(format!("invalid proof_hex: {}", e)))
+    hex::decode(stripped).map_err(|e| ClobError::Internal(format!("invalid proof_hex: {}", e)))
 }
 
 /// Decode a `0x`-prefixed 32-byte hex string into `[u8; 32]`.
@@ -209,10 +206,7 @@ fn honk_tokens(proof: &HonkProof) -> ClobResult<(Token, Token)> {
             Ok(Token::FixedBytes(b32.to_vec()))
         })
         .collect();
-    Ok((
-        Token::Bytes(proof_bytes),
-        Token::FixedArray(input_tokens?),
-    ))
+    Ok((Token::Bytes(proof_bytes), Token::FixedArray(input_tokens?)))
 }
 
 fn encode_lock_collateral(
@@ -255,9 +249,5 @@ fn encode_settle_fill(
 
 fn encode_claim_winnings(recipient: Address, proof: &HonkProof) -> ClobResult<Vec<Token>> {
     let (proof_token, inputs_token) = honk_tokens(proof)?;
-    Ok(vec![
-        Token::Address(recipient),
-        proof_token,
-        inputs_token,
-    ])
+    Ok(vec![Token::Address(recipient), proof_token, inputs_token])
 }

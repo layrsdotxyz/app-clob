@@ -51,7 +51,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
-            let _ = server::run(listener, async { let _ = rx.await; }).await;
+            let _ = server::run(listener, async {
+                let _ = rx.await;
+            })
+            .await;
         });
         let client = redis::Client::open(format!("redis://{}/", addr)).unwrap();
         let conn = redis::aio::ConnectionManager::new(client).await.unwrap();

@@ -30,11 +30,20 @@ pub mod decimal_u128 {
     }
 }
 
+// `src/main.rs` still compiles this module tree directly for the retained migration server,
+// while the release enclave imports these public types through the library crate. Keep the
+// stable public facade without treating the migration binary's duplicate module instance as an
+// unused-import error.
+#[allow(unused_imports)]
 pub use engine::{
-    command_request_hash, resolution_signing_payload, BoundaryEvidence, CommandResult,
-    CoreResponse, MarketConfig, MarketResolution, PortfolioSnapshot, PrivateBalance,
-    PrivatePosition, PrivateTradingCore, ResolutionOutcome, ResolutionStatement, SignedResolution,
-    SystemResponse, UserCommand, UserCommandAction, WithdrawalAuthorization, WithdrawalIntent,
+    command_request_hash, polymarket_resolution_signing_payload, resolution_signing_payload,
+    AuditFillStatement, BootstrapExecutionState, BootstrapExecutionView, BootstrapVenueIntent,
+    BoundaryEvidence, CommandResult, CoreResponse, MarketConfig, MarketExecution, MarketResolution,
+    PolymarketRedemptionIntent, PolymarketResolutionStatement, PortfolioSnapshot, PrivateBalance,
+    PrivatePosition, PrivateTradingCore, ResolutionEvidence, ResolutionOutcome,
+    ResolutionStatement, SignedAuditFillArtifact, SignedPolymarketResolution, SignedResolution,
+    SignedResolutionEvidence, SystemResponse, UserCommand, UserCommandAction,
+    WithdrawalAuthorization, WithdrawalIntent,
 };
 pub use journal::{
     EnclaveReceipt, EncryptedJournal, EncryptedJournalRecord, EncryptedSnapshot, JournalKey,
@@ -44,9 +53,11 @@ pub use ledger::{
     AccountBucket, AccountKey, ClaimPayout, CompleteSetDirection, CompleteSetTransaction,
     ExternalFlowDirection, ExternalFlowTransaction, Ledger, LedgerTransaction, Transfer,
 };
+#[allow(unused_imports)]
 pub use orderbook::{
     BookOrder, Fill, MatchResult, OrderAction, OrderStatus, Outcome, PriceTimeBook, TimeInForce,
 };
+#[allow(unused_imports)]
 pub use session::{signing_payload, SessionGuard, SessionRequest, SignedSessionRequest};
 
 use thiserror::Error;
@@ -79,6 +90,8 @@ pub enum CoreError {
     InvalidSessionSignature,
     #[error("request hash does not match the signed command")]
     RequestHashMismatch,
+    #[error("new trading risk is temporarily frozen")]
+    TradingFrozen,
     #[error("oracle resolution signature is invalid")]
     InvalidOracleSignature,
     #[error("invalid resolution: {0}")]

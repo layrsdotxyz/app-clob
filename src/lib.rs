@@ -1,3 +1,4 @@
+pub mod audit_signer;
 /// clob-service library crate.
 ///
 /// This lib target re-exports all internal modules so that integration tests
@@ -7,11 +8,10 @@
 /// The binary entry-point (`src/main.rs`) keeps its own independent `mod`
 /// declarations for its compilation unit; the two crates share source files
 /// but compile independently.
-
 // ─── Re-exported modules ────────────────────────────────────────────────────
-
 pub mod auth;
 pub mod balance_service;
+pub mod chain_signer;
 pub mod chain_types;
 pub mod circuit_breaker;
 pub mod config;
@@ -32,13 +32,14 @@ pub mod oracle;
 pub mod orderbook;
 pub mod pm_claim_worker;
 pub mod pm_settlement_worker;
+pub mod polymarket_enclave;
 pub mod poseidon2;
 pub mod poseidon_bn254;
 pub mod prediction_market_claims;
 pub mod prediction_market_relayer;
 pub mod prediction_market_settlement;
-pub mod private_core;
 pub mod privacy;
+pub mod private_core;
 pub mod proof_batcher;
 pub mod proof_generation;
 pub mod proof_observability;

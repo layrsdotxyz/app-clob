@@ -21,15 +21,15 @@ rules.
   circuit breakers, and Prometheus metrics.
 - Existing ZK proof and EVM settlement adapters retained as migration inputs.
 
-## Important privacy status
+## Privacy boundary
 
-This code is **not yet a confidential CLOB merely because it runs in Rust**.
-The present implementation can persist full order and ledger metadata in
-Redis/Valkey and PostgreSQL. Before production, the private matching and ledger
-boundary must run inside an attested AWS Nitro Enclave, with private state kept
-inside the enclave or written externally only as authenticated ciphertext.
-Public stores and APIs may expose aggregate depth, public prices, market status,
-and deliberately disclosed settlement artifacts only.
+The production path is `layrs-enclave`, not the retained migration server. The measured Nitro
+image owns private principals, balances, orders, matching, positions, withdrawals, resolution
+state, the bootstrapping Polymarket account, and the two audited-pool transaction signers. The
+EC2 parent relays encrypted frames and a fixed Polymarket TLS tunnel only; it has no AWS
+credentials, KMS permission, database access, object-store access, chain signing key, or
+plaintext application secret. External persistence contains authenticated ciphertext and
+deliberately public aggregates.
 
 The planned separation is:
 
@@ -39,8 +39,27 @@ The planned separation is:
 - external persistence: encrypted journal/checkpoints plus non-sensitive public
   projections.
 
-That separation will be implemented without silently treating Redis isolation
-as cryptographic confidentiality.
+The legacy Redis/PostgreSQL modules are not eligible for production private-order routing.
+The EIF and parent are compiled from separate locked manifests under `enclave/`; see
+[`SECURITY_ADVISORIES.md`](SECURITY_ADVISORIES.md) for their enforced dependency boundaries.
+
+## Production custody path
+
+The enclave accepts one sealed chain-signer bundle containing exactly two domains: Base
+`8453`/USDC and Horizen `26514`/ZEN. Each domain pins a chain, asset, audited `LayrsPool`
+address, an independently pinned `AdminOracle`, separate ledger/oracle EOA keys, and one
+cross-domain Ed25519 resolution-evidence key. A ledger signer can produce only an EIP-1559 call
+to `withdraw(address,uint256)` on its pinned pool after private-core authorization. An oracle
+signer can produce only `AdminOracle.resolve(bytes32,uint8,string)` after the core verifies the
+exact signed Pyth/Polymarket evidence and outcome. The Ed25519 key signs that evidence inside the
+enclave; only its public verifier enters ordinary service configuration. Nonces, raw transactions
+and fees are persisted before broadcast so recovery rebroadcasts identical bytes.
+
+Outcome-contract quantities and prices use six protocol decimals. Settlement balances always
+use token atomics: six decimals for USDC and eighteen decimals for ZEN. The enclave converts
+every ZEN notional, fee, collateral and payout leg by exactly `10^12`; deposit and withdrawal
+amounts cross the custody boundary without rescaling. Fields ending in `_micros` represent
+contract/quote units, while fields ending in `_atomic` represent the settlement token.
 
 ## Local build
 

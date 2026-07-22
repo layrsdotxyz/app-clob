@@ -50,7 +50,7 @@ fn test_low_high_round_trip_max() {
 
 #[test]
 fn test_low_high_round_trip_arbitrary() {
-    let low: u128  = 0x1234_5678_9abc_def0_1234_5678_9abc_def0;
+    let low: u128 = 0x1234_5678_9abc_def0_1234_5678_9abc_def0;
     let high: u128 = 0xfeed_face_cafe_babe_dead_beef_0001_0002;
     let b = low_high_to_bytes32(low, high);
     let (lo, hi) = bytes32_low_high(&b);
@@ -79,8 +79,14 @@ fn test_address_to_bytes32_padding() {
     let addr_bytes: [u8; 20] = [0xab; 20];
     let mut buf = [0u8; 32];
     buf[12..].copy_from_slice(&addr_bytes);
-    assert!(buf[..12].iter().all(|&b| b == 0), "first 12 bytes must be zero");
-    assert!(buf[12..].iter().all(|&b| b == 0xab), "last 20 bytes must be address");
+    assert!(
+        buf[..12].iter().all(|&b| b == 0),
+        "first 12 bytes must be zero"
+    );
+    assert!(
+        buf[12..].iter().all(|&b| b == 0xab),
+        "last 20 bytes must be address"
+    );
 }
 
 /// The withdrawWithProof selector used in evm_relayer.rs matches the
@@ -181,7 +187,9 @@ fn test_token_bucket_allows_burst() {
 #[test]
 fn test_token_bucket_refills_over_time() {
     let mut b = TokenBucket::new(60, 5); // 1 token/sec at 60 rpm
-    for _ in 0..5 { b.try_consume(); }
+    for _ in 0..5 {
+        b.try_consume();
+    }
     assert!(!b.try_consume());
 
     b.refill(2.0); // 2 seconds → 2 tokens
@@ -201,7 +209,8 @@ fn test_token_bucket_does_not_exceed_capacity() {
 fn test_token_bucket_independent_per_key() {
     let mut a = TokenBucket::new(60, 2);
     let mut b = TokenBucket::new(60, 2);
-    a.try_consume(); a.try_consume();
+    a.try_consume();
+    a.try_consume();
     assert!(!a.try_consume(), "a should be exhausted");
     assert!(b.try_consume(), "b should be unaffected by a");
 }
@@ -257,7 +266,10 @@ async fn test_horizen_chain_id_is_2651420() {
 
     let hex = resp["result"].as_str().expect("chainId not string");
     let id = u64::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap();
-    assert_eq!(id, 2651420, "Expected Horizen testnet chainId 2651420, got {id}");
+    assert_eq!(
+        id, 2651420,
+        "Expected Horizen testnet chainId 2651420, got {id}"
+    );
     println!("Chain ID: {id} ✓");
 }
 
@@ -288,6 +300,9 @@ async fn test_privacy_vault_has_code() {
         .unwrap();
 
     let code = resp["result"].as_str().unwrap_or("0x");
-    assert!(code.len() > 4, "PrivacyVault at {vault_addr} has no code: {code}");
+    assert!(
+        code.len() > 4,
+        "PrivacyVault at {vault_addr} has no code: {code}"
+    );
     println!("PrivacyVault bytecode: {} bytes", (code.len() - 2) / 2);
 }

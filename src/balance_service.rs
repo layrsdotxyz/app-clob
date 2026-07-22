@@ -1,4 +1,7 @@
-use crate::{database::Database, error::{ClobError, ClobResult}};
+use crate::{
+    database::Database,
+    error::{ClobError, ClobResult},
+};
 use dashmap::DashMap;
 use rust_decimal::Decimal;
 use std::sync::Arc;
@@ -55,20 +58,18 @@ impl BalanceService {
     /// Populate in-memory state from PostgreSQL on service startup.
     /// Logs a warning (rather than panicking) if the DB is unavailable.
     pub async fn load_from_db(&self) {
-        let Some(db) = &self.database else { return; };
+        let Some(db) = &self.database else {
+            return;
+        };
         match db.load_all_balances().await {
             Ok(rows) => {
                 let count = rows.len();
                 for (user_id, token_address, total, reserved) in rows {
-                    let user_balances = self.balances
-                        .entry(user_id.clone())
-                        .or_insert_with(DashMap::new);
+                    let user_balances = self.balances.entry(user_id.clone()).or_default();
                     user_balances.insert(token_address.clone(), total);
 
                     if reserved > Decimal::ZERO {
-                        let user_reserved = self.reserved
-                            .entry(user_id.clone())
-                            .or_insert_with(DashMap::new);
+                        let user_reserved = self.reserved.entry(user_id.clone()).or_default();
                         user_reserved.insert(token_address.clone(), reserved);
                     }
                 }
@@ -85,10 +86,20 @@ impl BalanceService {
     /// and retries failed writes with exponential backoff rather than silently discarding them.
     fn persist_balance(&self, user_id: &str, token_address: &str) {
         let guard = self.persist_tx.lock().unwrap();
-        let Some(tx) = guard.as_ref() else { return; };
+        let Some(tx) = guard.as_ref() else {
+            return;
+        };
         let total = self.get_total_balance(user_id, token_address);
         let reserved = self.get_reserved_balance(user_id, token_address);
-        if let Err(_) = tx.send((user_id.to_string(), token_address.to_string(), total, reserved)) {
+        if tx
+            .send((
+                user_id.to_string(),
+                token_address.to_string(),
+                total,
+                reserved,
+            ))
+            .is_err()
+        {
             tracing::error!(
                 user_id,
                 token_address,
@@ -112,7 +123,10 @@ impl BalanceService {
             while let Some((user_id, token_address, total, reserved)) = rx.recv().await {
                 let mut backoff_ms = 250u64;
                 for attempt in 1u8..=3 {
-                    match db.upsert_balance(&user_id, &token_address, total, reserved).await {
+                    match db
+                        .upsert_balance(&user_id, &token_address, total, reserved)
+                        .await
+                    {
                         Ok(()) => break,
                         Err(e) if attempt < 3 => {
                             tracing::warn!(
@@ -122,7 +136,8 @@ impl BalanceService {
                                 error = %e,
                                 "Balance DB persist failed, retrying"
                             );
-                            tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms))
+                                .await;
                             backoff_ms *= 2;
                         }
                         Err(e) => {
@@ -173,7 +188,7 @@ impl BalanceService {
         amount: Decimal,
     ) -> ClobResult<()> {
         let available = self.get_available_balance(user_id, market_id);
-        
+
         if available < amount {
             return Err(ClobError::InsufficientBalance {
                 required: amount,
@@ -182,7 +197,7 @@ impl BalanceService {
         }
 
         // Add to reserved
-        let user_reserved = self.reserved.entry(user_id.to_string()).or_insert_with(DashMap::new);
+        let user_reserved = self.reserved.entry(user_id.to_string()).or_default();
         user_reserved
             .entry(market_id.to_string())
             .and_modify(|r| *r += amount)
@@ -205,8 +220,8 @@ impl BalanceService {
         market_id: &str,
         amount: Decimal,
     ) -> ClobResult<()> {
-        let user_reserved = self.reserved.entry(user_id.to_string()).or_insert_with(DashMap::new);
-        
+        let user_reserved = self.reserved.entry(user_id.to_string()).or_default();
+
         let current_reserved = user_reserved
             .get(market_id)
             .map(|r| *r)
@@ -240,19 +255,14 @@ impl BalanceService {
     }
 
     /// Debit balance (remove from total, used when order fills)
-    pub fn debit(
-        &self,
-        user_id: &str,
-        market_id: &str,
-        amount: Decimal,
-    ) -> ClobResult<()> {
+    pub fn debit(&self, user_id: &str, market_id: &str, amount: Decimal) -> ClobResult<()> {
         // First release from reserved (since order execution consumes reserved funds)
         self.release_balance(user_id, market_id, amount)?;
 
         // Then debit from total — scope the entry guard so the DashMap shard lock is
         // released before persist_balance tries to read the same shard (avoids deadlock).
         {
-            let user_balances = self.balances.entry(user_id.to_string()).or_insert_with(DashMap::new);
+            let user_balances = self.balances.entry(user_id.to_string()).or_default();
 
             let current_balance = user_balances
                 .get(market_id)
@@ -284,16 +294,11 @@ impl BalanceService {
     }
 
     /// Credit balance (add to total, used when receiving trade proceeds)
-    pub fn credit(
-        &self,
-        user_id: &str,
-        market_id: &str,
-        amount: Decimal,
-    ) {
+    pub fn credit(&self, user_id: &str, market_id: &str, amount: Decimal) {
         // Scope the entry guard so the DashMap shard lock is released before
         // persist_balance reads the same shard (avoids deadlock).
         {
-            let user_balances = self.balances.entry(user_id.to_string()).or_insert_with(DashMap::new);
+            let user_balances = self.balances.entry(user_id.to_string()).or_default();
 
             user_balances
                 .entry(market_id.to_string())
@@ -312,14 +317,9 @@ impl BalanceService {
     }
 
     /// Deposit funds (e.g., from on-chain deposit or initial test balance)
-    pub fn deposit(
-        &self,
-        user_id: &str,
-        market_id: &str,
-        amount: Decimal,
-    ) {
+    pub fn deposit(&self, user_id: &str, market_id: &str, amount: Decimal) {
         self.credit(user_id, market_id, amount);
-        
+
         info!(
             user_id = %user_id,
             market_id = %market_id,
@@ -329,14 +329,9 @@ impl BalanceService {
     }
 
     /// Withdraw funds (e.g., to on-chain withdrawal)
-    pub fn withdraw(
-        &self,
-        user_id: &str,
-        market_id: &str,
-        amount: Decimal,
-    ) -> ClobResult<()> {
+    pub fn withdraw(&self, user_id: &str, market_id: &str, amount: Decimal) -> ClobResult<()> {
         let available = self.get_available_balance(user_id, market_id);
-        
+
         if available < amount {
             return Err(ClobError::InsufficientBalance {
                 required: amount,
@@ -345,7 +340,7 @@ impl BalanceService {
         }
 
         self.debit(user_id, market_id, amount)?;
-        
+
         Ok(())
     }
 
@@ -356,17 +351,18 @@ impl BalanceService {
         user_id: &str,
         market_id: &str,
         release_amount: Decimal,
-        balance_delta: Decimal,  // Can be negative
+        balance_delta: Decimal, // Can be negative
     ) -> ClobResult<()> {
         // Release from reserved
         self.release_balance(user_id, market_id, release_amount)?;
-        
+
         // Adjust total balance
-        let user_balances = self.balances.entry(user_id.to_string()).or_insert_with(DashMap::new);
-        user_balances.entry(market_id.to_string())
+        let user_balances = self.balances.entry(user_id.to_string()).or_default();
+        user_balances
+            .entry(market_id.to_string())
             .and_modify(|b| *b += balance_delta)
             .or_insert(balance_delta);
-        
+
         debug!(
             user_id = %user_id,
             market_id = %market_id,
@@ -374,7 +370,7 @@ impl BalanceService {
             delta = %balance_delta,
             "Balance released and adjusted for trade"
         );
-        
+
         Ok(())
     }
 }
@@ -393,10 +389,13 @@ mod tests {
     #[test]
     fn test_deposit_and_balance() {
         let service = BalanceService::new(None);
-        
+
         service.deposit("alice", "BTC-HOUR-1", dec!(1000));
         assert_eq!(service.get_total_balance("alice", "BTC-HOUR-1"), dec!(1000));
-        assert_eq!(service.get_available_balance("alice", "BTC-HOUR-1"), dec!(1000));
+        assert_eq!(
+            service.get_available_balance("alice", "BTC-HOUR-1"),
+            dec!(1000)
+        );
     }
 
     #[test]
@@ -405,27 +404,48 @@ mod tests {
         service.deposit("alice", "BTC-HOUR-1", dec!(1000));
 
         // Reserve 300
-        service.reserve_balance("alice", "BTC-HOUR-1", dec!(300)).unwrap();
+        service
+            .reserve_balance("alice", "BTC-HOUR-1", dec!(300))
+            .unwrap();
         assert_eq!(service.get_total_balance("alice", "BTC-HOUR-1"), dec!(1000));
-        assert_eq!(service.get_available_balance("alice", "BTC-HOUR-1"), dec!(700));
-        assert_eq!(service.get_reserved_balance("alice", "BTC-HOUR-1"), dec!(300));
+        assert_eq!(
+            service.get_available_balance("alice", "BTC-HOUR-1"),
+            dec!(700)
+        );
+        assert_eq!(
+            service.get_reserved_balance("alice", "BTC-HOUR-1"),
+            dec!(300)
+        );
 
         // Release 100
-        service.release_balance("alice", "BTC-HOUR-1", dec!(100)).unwrap();
-        assert_eq!(service.get_available_balance("alice", "BTC-HOUR-1"), dec!(800));
-        assert_eq!(service.get_reserved_balance("alice", "BTC-HOUR-1"), dec!(200));
+        service
+            .release_balance("alice", "BTC-HOUR-1", dec!(100))
+            .unwrap();
+        assert_eq!(
+            service.get_available_balance("alice", "BTC-HOUR-1"),
+            dec!(800)
+        );
+        assert_eq!(
+            service.get_reserved_balance("alice", "BTC-HOUR-1"),
+            dec!(200)
+        );
     }
 
     #[test]
     fn test_debit_and_credit() {
         let service = BalanceService::new(None);
         service.deposit("alice", "BTC-HOUR-1", dec!(1000));
-        service.reserve_balance("alice", "BTC-HOUR-1", dec!(300)).unwrap();
+        service
+            .reserve_balance("alice", "BTC-HOUR-1", dec!(300))
+            .unwrap();
 
         // Debit 200 (releases from reserved and deducts from total)
         service.debit("alice", "BTC-HOUR-1", dec!(200)).unwrap();
         assert_eq!(service.get_total_balance("alice", "BTC-HOUR-1"), dec!(800));
-        assert_eq!(service.get_reserved_balance("alice", "BTC-HOUR-1"), dec!(100));
+        assert_eq!(
+            service.get_reserved_balance("alice", "BTC-HOUR-1"),
+            dec!(100)
+        );
 
         // Credit 50
         service.credit("alice", "BTC-HOUR-1", dec!(50));
@@ -439,13 +459,16 @@ mod tests {
 
         let result = service.reserve_balance("alice", "BTC-HOUR-1", dec!(200));
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ClobError::InsufficientBalance { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            ClobError::InsufficientBalance { .. }
+        ));
     }
 
     #[test]
     fn test_multiple_users_and_markets() {
         let service = BalanceService::new(None);
-        
+
         service.deposit("alice", "BTC-HOUR-1", dec!(1000));
         service.deposit("alice", "ETH-HOUR-1", dec!(2000));
         service.deposit("bob", "BTC-HOUR-1", dec!(500));
@@ -463,7 +486,10 @@ mod tests {
         // No database → channel is never created → worker returns None.
         let service = BalanceService::new(None);
         let handle = service.start_persistence_worker();
-        assert!(handle.is_none(), "worker should be None when no database is configured");
+        assert!(
+            handle.is_none(),
+            "worker should be None when no database is configured"
+        );
     }
 
     #[test]
@@ -486,7 +512,10 @@ mod tests {
 
         // Second take must return None — guarantees the worker is idempotent.
         let taken_again = service.persist_rx.lock().unwrap().take();
-        assert!(taken_again.is_none(), "second take should be None (worker already started)");
+        assert!(
+            taken_again.is_none(),
+            "second take should be None (worker already started)"
+        );
     }
 
     #[test]
@@ -521,7 +550,7 @@ mod tests {
         // via construction, but accessible through the type alias here).
         // Since `persist_tx` is private, we inject through the struct field
         // by rebuilding. Instead, test the channel mechanics directly:
-        let _ = tx;  // just verify the channel type compiles
+        let _ = tx; // just verify the channel type compiles
 
         // Verify in-memory mutations work without a channel (no-DB path).
         service.deposit("bob", "ETH", dec!(1000));
@@ -529,7 +558,10 @@ mod tests {
         assert_eq!(service.get_total_balance("bob", "ETH"), dec!(1200));
 
         // Verify no messages were sent (persist_tx is None — no DB).
-        assert!(rx.try_recv().is_err(), "no DB → no persist messages should be enqueued");
+        assert!(
+            rx.try_recv().is_err(),
+            "no DB → no persist messages should be enqueued"
+        );
     }
 
     #[tokio::test]
@@ -539,8 +571,10 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<PersistMsg>();
 
         // Send a batch of messages and then drop the sender.
-        tx.send(("alice".into(), "USDC".into(), dec!(100), dec!(0))).unwrap();
-        tx.send(("bob".into(),   "ETH".into(),  dec!(200), dec!(50))).unwrap();
+        tx.send(("alice".into(), "USDC".into(), dec!(100), dec!(0)))
+            .unwrap();
+        tx.send(("bob".into(), "ETH".into(), dec!(200), dec!(50)))
+            .unwrap();
         drop(tx); // signals EOF to the worker loop (recv() returns None)
 
         // Drain the channel exactly as the worker would — verify ordering.
@@ -672,14 +706,23 @@ mod tests {
     fn test_yield_vault_multi_user_independence() {
         let svc = BalanceService::new(None);
         svc.deposit("alice", "yield-ZEN-epoch-5", dec!(300));
-        svc.deposit("bob",   "yield-ZEN-epoch-5", dec!(150));
+        svc.deposit("bob", "yield-ZEN-epoch-5", dec!(150));
         svc.deposit("carol", "yield-ZEN-epoch-5", dec!(600));
 
-        assert_eq!(svc.get_total_balance("alice", "yield-ZEN-epoch-5"), dec!(300));
-        assert_eq!(svc.get_total_balance("bob",   "yield-ZEN-epoch-5"), dec!(150));
-        assert_eq!(svc.get_total_balance("carol", "yield-ZEN-epoch-5"), dec!(600));
+        assert_eq!(
+            svc.get_total_balance("alice", "yield-ZEN-epoch-5"),
+            dec!(300)
+        );
+        assert_eq!(svc.get_total_balance("bob", "yield-ZEN-epoch-5"), dec!(150));
+        assert_eq!(
+            svc.get_total_balance("carol", "yield-ZEN-epoch-5"),
+            dec!(600)
+        );
         // No user sees another's balance
-        assert_eq!(svc.get_total_balance("alice", "yield-ZEN-epoch-5"), dec!(300));
+        assert_eq!(
+            svc.get_total_balance("alice", "yield-ZEN-epoch-5"),
+            dec!(300)
+        );
     }
 
     /// 2c. Yield distribution can be credited after epoch resolves.
@@ -696,10 +739,11 @@ mod tests {
     #[test]
     fn test_yield_vault_withdrawal_isolated_from_pm() {
         let svc = BalanceService::new(None);
-        svc.deposit("alice", "WETH", dec!(1000));         // PM position
+        svc.deposit("alice", "WETH", dec!(1000)); // PM position
         svc.deposit("alice", "yield-WETH-v1", dec!(500)); // Vault share
-        // Two-phase: reserve then withdraw
-        svc.reserve_balance("alice", "yield-WETH-v1", dec!(200)).unwrap();
+                                                          // Two-phase: reserve then withdraw
+        svc.reserve_balance("alice", "yield-WETH-v1", dec!(200))
+            .unwrap();
         svc.withdraw("alice", "yield-WETH-v1", dec!(200)).unwrap();
         // Vault share reduced, PM position untouched
         assert_eq!(svc.get_total_balance("alice", "yield-WETH-v1"), dec!(300));
@@ -801,7 +845,8 @@ mod tests {
         svc.deposit("alice", "WETH", dec!(1000));
         svc.reserve_balance("alice", "WETH", dec!(400)).unwrap();
         // Win: release 400 reserved, net gain +600
-        svc.release_and_adjust("alice", "WETH", dec!(400), dec!(600)).unwrap();
+        svc.release_and_adjust("alice", "WETH", dec!(400), dec!(600))
+            .unwrap();
         assert_eq!(svc.get_total_balance("alice", "WETH"), dec!(1600));
         assert_eq!(svc.get_reserved_balance("alice", "WETH"), dec!(0));
         assert_eq!(svc.get_available_balance("alice", "WETH"), dec!(1600));

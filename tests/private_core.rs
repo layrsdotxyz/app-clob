@@ -1,9 +1,11 @@
 use clob_service::private_core::{
-    command_request_hash, resolution_signing_payload, signing_payload, AccountBucket, AccountKey,
-    BookOrder, BoundaryEvidence, CommandResult, CompleteSetDirection, CoreError, EncryptedJournal,
-    ExternalFlowDirection, JournalKey, Ledger, LedgerTransaction, MarketConfig, OrderAction,
-    OrderStatus, Outcome, PriceTimeBook, PrivateTradingCore, ReceiptSigner, ResolutionStatement,
-    SessionGuard, SessionRequest, SignedResolution, SignedSessionRequest, TimeInForce, Transfer,
+    command_request_hash, polymarket_resolution_signing_payload, resolution_signing_payload,
+    signing_payload, AccountBucket, AccountKey, BookOrder, BoundaryEvidence, CommandResult,
+    CompleteSetDirection, CoreError, EncryptedJournal, ExternalFlowDirection, JournalKey, Ledger,
+    LedgerTransaction, MarketConfig, MarketExecution, OrderAction, OrderStatus, Outcome,
+    PolymarketResolutionStatement, PriceTimeBook, PrivateTradingCore, ReceiptSigner,
+    ResolutionOutcome, ResolutionStatement, SessionGuard, SessionRequest,
+    SignedPolymarketResolution, SignedResolution, SignedSessionRequest, TimeInForce, Transfer,
     UserCommand, UserCommandAction,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -239,12 +241,18 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
         MarketConfig {
             market_id: market_id.into(),
             settlement_asset: "ZEN".into(),
+            settlement_decimals: 18,
             opens_at_millis: 900,
             closes_at_millis: 2_000,
             minimum_quantity_micros: 1,
             maximum_quantity_micros: 10_000_000,
+            minimum_order_notional_micros: 1,
+            maximum_order_notional_micros: 10_000_000,
+            maximum_user_position_micros: 10_000_000,
+            maximum_pending_bootstrap_notional_micros: 100_000_000,
             tick_size_micros: 1_000,
             oracle_feed_id: 245,
+            execution: clob_service::private_core::MarketExecution::NativeClob,
         },
         800,
     )
@@ -266,13 +274,38 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
             commitment,
             "ZEN".into(),
             AccountBucket::UserAvailable,
-            1_000_000,
+            1_000_000_000_000_000_000,
             ExternalFlowDirection::Inflow,
             [index as u8; 32],
             850,
         )
         .unwrap();
     }
+
+    core.set_trading_freeze("sys:freeze:1".into(), true, [91u8; 32], 900)
+        .unwrap();
+    assert!(core.trading_frozen());
+    let frozen_action = UserCommandAction::CompleteSet {
+        market_id: market_id.into(),
+        quantity_micros: 1_000_000,
+        direction: CompleteSetDirection::Mint,
+    };
+    assert_eq!(
+        execute_signed_result(
+            &mut core,
+            &bob,
+            "session:2",
+            1,
+            "cmd:frozen-mint",
+            frozen_action,
+            950,
+        )
+        .unwrap_err(),
+        CoreError::TradingFrozen
+    );
+    core.set_trading_freeze("sys:unfreeze:1".into(), false, [92u8; 32], 975)
+        .unwrap();
+    assert!(!core.trading_frozen());
 
     execute_signed(
         &mut core,
@@ -307,7 +340,7 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
         },
         1_100,
     );
-    let fill = execute_signed(
+    let fill_response = execute_signed_response(
         &mut core,
         &alice,
         "session:1",
@@ -327,7 +360,35 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
         },
         1_200,
     );
-    assert!(matches!(fill, CommandResult::Order { .. }));
+    assert!(matches!(fill_response.result, CommandResult::Order { .. }));
+    assert_eq!(fill_response.audit_fills.len(), 1);
+    let audit = &fill_response.audit_fills[0];
+    assert_eq!(audit.statement.chain, "horizen");
+    assert_eq!(audit.statement.market_id, market_id);
+    assert_eq!(audit.statement.price_micros, 400_000);
+    assert_eq!(audit.statement.quantity_atomic, "1000000");
+    assert_ne!(
+        audit.statement.buyer_one_time_pseudonym,
+        audit.statement.seller_one_time_pseudonym
+    );
+    assert_eq!(audit.receipt_id, fill_response.receipt.receipt_id);
+    let mut unsigned = audit.clone();
+    let signature = std::mem::take(&mut unsigned.signature);
+    let encoded = serde_json::to_vec(&unsigned).unwrap();
+    let mut payload = b"layrs.audit-fill-artifact.v1\0".to_vec();
+    payload.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+    payload.extend_from_slice(&encoded);
+    VerifyingKey::from_bytes(&audit.receipt_public_key)
+        .unwrap()
+        .verify(&payload, &Signature::from_slice(&signature).unwrap())
+        .unwrap();
+    if let CommandResult::Order { result } = &fill_response.result {
+        assert!(result
+            .fills
+            .iter()
+            .all(|fill| fill.maker_private_user_id.is_empty()
+                && fill.taker_private_user_id.is_empty()));
+    }
 
     let boundary = |end: i64, price: i64, marker: u8| BoundaryEvidence {
         window_start_micros: end * 1_000 - 5_000_000,
@@ -364,11 +425,11 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
             AccountBucket::UserAvailable,
             "ZEN"
         )),
-        1_569_200
+        1_569_200_000_000_000_000
     );
     assert_eq!(
         core.balance(&AccountKey::new("layrs", AccountBucket::FeeRevenue, "ZEN")),
-        30_800
+        30_800_000_000_000_000
     );
 
     let snapshot = core.export_encrypted_snapshot().unwrap();
@@ -386,7 +447,7 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
             AccountBucket::UserAvailable,
             "ZEN"
         )),
-        1_569_200
+        1_569_200_000_000_000_000
     );
     assert!(matches!(
         PrivateTradingCore::restore_encrypted_snapshot(
@@ -397,6 +458,237 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
         ),
         Err(CoreError::RollbackDetected)
     ));
+}
+
+#[test]
+fn polymarket_bootstrap_never_credits_an_unconfirmed_fill() {
+    let oracle = SigningKey::from_bytes(&[40u8; 32]);
+    let user = SigningKey::from_bytes(&[41u8; 32]);
+    let journal_key = [42u8; 32];
+    let commitment = [43u8; 32];
+    let private_user = derived_private_user(journal_key, commitment);
+    let mut core = PrivateTradingCore::new_with_oracle(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([44u8; 48]),
+        oracle.verifying_key().to_bytes(),
+    )
+    .unwrap();
+    let market_id = "layrs:v1:BTC:15m:10000";
+    core.register_market(
+        "sys:market:bootstrap".into(),
+        MarketConfig {
+            market_id: market_id.into(),
+            settlement_asset: "USDC".into(),
+            settlement_decimals: 6,
+            opens_at_millis: 1_000,
+            closes_at_millis: 10_000,
+            minimum_quantity_micros: 1,
+            maximum_quantity_micros: 10_000_000,
+            minimum_order_notional_micros: 1,
+            maximum_order_notional_micros: 10_000_000,
+            maximum_user_position_micros: 10_000_000,
+            maximum_pending_bootstrap_notional_micros: 100_000_000,
+            tick_size_micros: 1_000,
+            oracle_feed_id: 1,
+            execution: MarketExecution::PolymarketBootstrap {
+                condition_id: format!("0x{}", "11".repeat(32)),
+                up_token_id: "123456789".into(),
+                down_token_id: "987654321".into(),
+                up_outcome_index: 0,
+                down_outcome_index: 1,
+                neg_risk: false,
+            },
+        },
+        900,
+    )
+    .unwrap();
+    core.register_session(
+        "sys:session:bootstrap".into(),
+        "session:bootstrap".into(),
+        commitment,
+        user.verifying_key().to_bytes(),
+        9_000,
+        900,
+    )
+    .unwrap();
+    core.apply_user_external_flow(
+        "sys:deposit:bootstrap".into(),
+        commitment,
+        "USDC".into(),
+        AccountBucket::UserAvailable,
+        1_000_000,
+        ExternalFlowDirection::Inflow,
+        [45u8; 32],
+        950,
+    )
+    .unwrap();
+    core.apply_external_flow(
+        "sys:pool-capital".into(),
+        AccountKey::new("layrs", AccountBucket::PoolCash, "USDC"),
+        1_000_000,
+        ExternalFlowDirection::Inflow,
+        [46u8; 32],
+        950,
+    )
+    .unwrap();
+
+    let execution_id = uuid::Uuid::from_u128(47);
+    let pending = execute_signed(
+        &mut core,
+        &user,
+        "session:bootstrap",
+        1,
+        "cmd:bootstrap-buy",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::with_id(
+                execution_id,
+                "ignored-by-enclave",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                400_000,
+                1_000_000,
+                TimeInForce::Fok,
+                None,
+            ),
+        },
+        1_100,
+    );
+    assert!(matches!(pending, CommandResult::BootstrapPending { .. }));
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &private_user,
+            AccountBucket::UserAvailable,
+            "USDC"
+        )),
+        599_200
+    );
+    assert_eq!(
+        core.balance(&AccountKey::position(
+            &private_user,
+            format!("CLAIM:{market_id}:UP"),
+            market_id,
+            "UP"
+        )),
+        0
+    );
+
+    core.mark_bootstrap_submitted(
+        "sys:venue-submitted:47".into(),
+        execution_id,
+        "pm-order-47".into(),
+        1_150,
+    )
+    .unwrap();
+    assert!(core
+        .confirm_bootstrap_fill(
+            "sys:bad-fill:47".into(),
+            execution_id,
+            401_000,
+            [48u8; 32],
+            1_160,
+        )
+        .is_err());
+    assert_eq!(
+        core.balance(&AccountKey::position(
+            &private_user,
+            format!("CLAIM:{market_id}:UP"),
+            market_id,
+            "UP"
+        )),
+        0
+    );
+
+    core.confirm_bootstrap_fill(
+        "sys:fill:47".into(),
+        execution_id,
+        390_000,
+        [49u8; 32],
+        1_170,
+    )
+    .unwrap();
+    assert_eq!(
+        core.balance(&AccountKey::position(
+            &private_user,
+            format!("CLAIM:{market_id}:UP"),
+            market_id,
+            "UP"
+        )),
+        1_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &private_user,
+            AccountBucket::UserAvailable,
+            "USDC"
+        )),
+        609_220
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new("layrs", AccountBucket::FeeRevenue, "USDC")),
+        780
+    );
+    assert!(core
+        .confirm_bootstrap_fill(
+            "sys:duplicate-fill:47".into(),
+            execution_id,
+            390_000,
+            [49u8; 32],
+            1_180,
+        )
+        .is_err());
+
+    let status = execute_signed(
+        &mut core,
+        &user,
+        "session:bootstrap",
+        2,
+        "cmd:bootstrap-status",
+        UserCommandAction::BootstrapStatus { execution_id },
+        1_200,
+    );
+    assert!(matches!(
+        status,
+        CommandResult::BootstrapStatus { execution }
+            if execution.state == clob_service::private_core::BootstrapExecutionState::VenueConfirmed
+                && execution.confirmed_price_micros == Some(390_000)
+    ));
+
+    let resolution = PolymarketResolutionStatement {
+        market_id: market_id.into(),
+        condition_id: format!("0x{}", "11".repeat(32)),
+        outcome: ResolutionOutcome::Up,
+        redemption_amount_atomic: 1_000_000,
+        redemption_transaction_hash: [51u8; 32],
+        redemption_block_number: 50_000_000,
+        evidence_hash: [50u8; 32],
+        issued_at_millis: 10_100,
+    };
+    let signature = oracle
+        .sign(&polymarket_resolution_signing_payload(&resolution).unwrap())
+        .to_bytes()
+        .to_vec();
+    core.resolve_polymarket_market(
+        "sys:resolve:bootstrap".into(),
+        SignedPolymarketResolution {
+            statement: resolution,
+            signature,
+        },
+        10_100,
+    )
+    .unwrap();
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &private_user,
+            AccountBucket::UserAvailable,
+            "USDC"
+        )),
+        1_578_720
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new("layrs", AccountBucket::FeeRevenue, "USDC")),
+        31_280
+    );
 }
 
 #[test]
@@ -490,6 +782,39 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
             &Signature::from_slice(&authorization.signature).unwrap(),
         )
         .unwrap();
+    core.validate_withdrawal_intent(&authorization.intent)
+        .unwrap();
+    let raw_transaction = format!("0x02{}", "11".repeat(80));
+    core.record_prepared_withdrawal(
+        "sys:withdrawal-prepare:35".into(),
+        authorization.intent.withdrawal_id,
+        [37u8; 32],
+        raw_transaction.clone(),
+        1_350,
+    )
+    .unwrap();
+    assert_eq!(
+        core.prepared_withdrawal(authorization.intent.withdrawal_id),
+        Some(([37u8; 32], raw_transaction)),
+    );
+    let snapshot = core.export_encrypted_snapshot().unwrap();
+    let restored = PrivateTradingCore::restore_encrypted_snapshot(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([32u8; 48]),
+        &snapshot,
+        0,
+    )
+    .unwrap();
+    restored
+        .validate_withdrawal_intent(&authorization.intent)
+        .unwrap();
+    assert_eq!(
+        restored
+            .prepared_withdrawal(authorization.intent.withdrawal_id)
+            .unwrap()
+            .0,
+        [37u8; 32]
+    );
     core.release_user_withdrawal(
         "sys:withdrawal-release:35".into(),
         identity_commitment,
@@ -543,6 +868,22 @@ fn execute_signed_response(
     action: UserCommandAction,
     now_millis: i64,
 ) -> clob_service::private_core::CoreResponse {
+    execute_signed_result(
+        core, key, session_id, sequence, command_id, action, now_millis,
+    )
+    .unwrap()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_signed_result(
+    core: &mut PrivateTradingCore,
+    key: &SigningKey,
+    session_id: &str,
+    sequence: u64,
+    command_id: &str,
+    action: UserCommandAction,
+    now_millis: i64,
+) -> Result<clob_service::private_core::CoreResponse, CoreError> {
     let idempotency_key = format!("idem:{command_id}");
     let request_hash = command_request_hash(command_id, &idempotency_key, &action).unwrap();
     let request = SessionRequest {
@@ -562,5 +903,4 @@ fn execute_signed_response(
         },
         now_millis,
     )
-    .unwrap()
 }

@@ -1,8 +1,11 @@
 # Rust
 /target/
+**/target/
 **/*.rs.bk
 *.pdb
 Cargo.lock
+!enclave/runtime/Cargo.lock
+!enclave/parent-runtime/Cargo.lock
 
 # IDE
 .vscode/

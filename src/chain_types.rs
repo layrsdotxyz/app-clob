@@ -12,8 +12,6 @@ pub struct MarketIdMapper {
     uint_to_string: Arc<RwLock<HashMap<U256, String>>>,
     /// Counter for sequential IDs
     next_id: Arc<RwLock<U256>>,
-    /// Offset to avoid collisions
-    offset: U256,
 }
 
 impl MarketIdMapper {
@@ -22,7 +20,6 @@ impl MarketIdMapper {
             string_to_uint: Arc::new(RwLock::new(HashMap::new())),
             uint_to_string: Arc::new(RwLock::new(HashMap::new())),
             next_id: Arc::new(RwLock::new(U256::from(offset))),
-            offset: U256::from(offset),
         }
     }
 
@@ -96,6 +93,12 @@ pub struct NonceTracker {
     nonces: Arc<RwLock<HashMap<Address, u64>>>,
 }
 
+impl Default for NonceTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NonceTracker {
     pub fn new() -> Self {
         Self {
@@ -147,7 +150,7 @@ pub mod conversions {
     /// Convert Decimal price to basis points (0-10000 = 0-100%)
     pub fn price_to_basis_points(price: Decimal) -> Result<U256> {
         use rust_decimal::prelude::ToPrimitive;
-        
+
         let bps = (price * Decimal::from(10000))
             .to_u64()
             .ok_or_else(|| anyhow::anyhow!("Price out of range"))?;

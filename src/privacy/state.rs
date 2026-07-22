@@ -5,11 +5,7 @@ use uuid::Uuid;
 use crate::{
     error::{ClobError, ClobResult},
     privacy::types::{
-        NoteStatus,
-        NullifierRecord,
-        PrivateNote,
-        PrivateStateTransition,
-        TransitionStatus,
+        NoteStatus, NullifierRecord, PrivateNote, PrivateStateTransition, TransitionStatus,
     },
     redis_store::RedisStore,
 };
@@ -75,7 +71,9 @@ impl PrivacyStateService {
             .await?;
 
         if !inserted {
-            return Err(ClobError::InvalidOrder("Commitment already exists".to_string()));
+            return Err(ClobError::InvalidOrder(
+                "Commitment already exists".to_string(),
+            ));
         }
 
         Ok(note)
@@ -90,7 +88,8 @@ impl PrivacyStateService {
     }
 
     pub async fn mark_note_locked(&self, commitment: &str) -> ClobResult<()> {
-        self.update_note_status(commitment, NoteStatus::Locked).await
+        self.update_note_status(commitment, NoteStatus::Locked)
+            .await
     }
 
     pub async fn mark_note_spent(&self, commitment: &str) -> ClobResult<()> {
@@ -99,15 +98,18 @@ impl PrivacyStateService {
 
     /// Publicly callable note status update — used by the matching engine to
     /// reset a note to `Unspent` when an order is cancelled or rejected.
-    pub async fn update_note_status_pub(&self, commitment: &str, status: NoteStatus) -> ClobResult<()> {
+    pub async fn update_note_status_pub(
+        &self,
+        commitment: &str,
+        status: NoteStatus,
+    ) -> ClobResult<()> {
         self.update_note_status(commitment, status).await
     }
 
     async fn update_note_status(&self, commitment: &str, status: NoteStatus) -> ClobResult<()> {
-        let mut note = self
-            .get_note(commitment)
-            .await?
-            .ok_or_else(|| ClobError::OrderNotFound(format!("Commitment {} not found", commitment)))?;
+        let mut note = self.get_note(commitment).await?.ok_or_else(|| {
+            ClobError::OrderNotFound(format!("Commitment {} not found", commitment))
+        })?;
 
         note.status = status;
         note.updated_at = Utc::now();
@@ -128,7 +130,9 @@ impl PrivacyStateService {
         tx_ref: String,
     ) -> ClobResult<NullifierRecord> {
         if self.nullifier_exists(&nullifier).await? {
-            return Err(ClobError::InvalidOrder("Nullifier already used".to_string()));
+            return Err(ClobError::InvalidOrder(
+                "Nullifier already used".to_string(),
+            ));
         }
 
         let record = NullifierRecord {
@@ -145,7 +149,9 @@ impl PrivacyStateService {
             .await?;
 
         if !inserted {
-            return Err(ClobError::InvalidOrder("Nullifier already used".to_string()));
+            return Err(ClobError::InvalidOrder(
+                "Nullifier already used".to_string(),
+            ));
         }
 
         Ok(record)
@@ -175,11 +181,15 @@ impl PrivacyStateService {
         };
 
         let key = format!("{}{}", TRANSITION_PREFIX, transition.transition_id);
-        self.redis.set(&key, &serde_json::to_string(&transition)?).await?;
+        self.redis
+            .set(&key, &serde_json::to_string(&transition)?)
+            .await?;
 
         if let Some(job_id) = &transition.proof_job_id {
             let index_key = format!("{}{}", TRANSITION_BY_JOB_PREFIX, job_id);
-            self.redis.set(&index_key, &transition.transition_id).await?;
+            self.redis
+                .set(&index_key, &transition.transition_id)
+                .await?;
         }
 
         Ok(transition)
@@ -191,17 +201,17 @@ impl PrivacyStateService {
         status: TransitionStatus,
     ) -> ClobResult<()> {
         let key = format!("{}{}", TRANSITION_PREFIX, transition_id);
-        let payload = self
-            .redis
-            .get_optional(&key)
-            .await?
-            .ok_or_else(|| ClobError::OrderNotFound(format!("Transition {} not found", transition_id)))?;
+        let payload = self.redis.get_optional(&key).await?.ok_or_else(|| {
+            ClobError::OrderNotFound(format!("Transition {} not found", transition_id))
+        })?;
 
         let mut transition: PrivateStateTransition = serde_json::from_str(&payload)?;
         transition.status = status;
         transition.updated_at = Utc::now();
 
-        self.redis.set(&key, &serde_json::to_string(&transition)?).await
+        self.redis
+            .set(&key, &serde_json::to_string(&transition)?)
+            .await
     }
 
     pub async fn set_transition_evm_tx_hash(
@@ -210,20 +220,23 @@ impl PrivacyStateService {
         tx_hash: &str,
     ) -> ClobResult<()> {
         let key = format!("{}{}", TRANSITION_PREFIX, transition_id);
-        let payload = self
-            .redis
-            .get_optional(&key)
-            .await?
-            .ok_or_else(|| ClobError::OrderNotFound(format!("Transition {} not found", transition_id)))?;
+        let payload = self.redis.get_optional(&key).await?.ok_or_else(|| {
+            ClobError::OrderNotFound(format!("Transition {} not found", transition_id))
+        })?;
 
         let mut transition: PrivateStateTransition = serde_json::from_str(&payload)?;
         transition.evm_tx_hash = Some(tx_hash.to_string());
         transition.updated_at = Utc::now();
 
-        self.redis.set(&key, &serde_json::to_string(&transition)?).await
+        self.redis
+            .set(&key, &serde_json::to_string(&transition)?)
+            .await
     }
 
-    pub async fn get_transition(&self, transition_id: &str) -> ClobResult<Option<PrivateStateTransition>> {
+    pub async fn get_transition(
+        &self,
+        transition_id: &str,
+    ) -> ClobResult<Option<PrivateStateTransition>> {
         let key = format!("{}{}", TRANSITION_PREFIX, transition_id);
         let payload = self.redis.get_optional(&key).await?;
         payload
@@ -241,7 +254,10 @@ impl PrivacyStateService {
         }
 
         // Backward-compatible fallback for older records without index key.
-        let keys = self.redis.scan_keys(&format!("{}*", TRANSITION_PREFIX)).await?;
+        let keys = self
+            .redis
+            .scan_keys(&format!("{}*", TRANSITION_PREFIX))
+            .await?;
         for key in keys {
             if let Some(payload) = self.redis.get_optional(&key).await? {
                 let transition: PrivateStateTransition = serde_json::from_str(&payload)?;
@@ -358,7 +374,13 @@ mod tests {
         let (state, shutdown) = setup_state().await;
 
         state
-            .create_note("commit-lock".to_string(), "amt".to_string(), "WETH".to_string(), "owner".to_string(), 1)
+            .create_note(
+                "commit-lock".to_string(),
+                "amt".to_string(),
+                "WETH".to_string(),
+                "owner".to_string(),
+                1,
+            )
             .await
             .unwrap();
 
@@ -376,7 +398,13 @@ mod tests {
         let (state, shutdown) = setup_state().await;
 
         state
-            .create_note("commit-spend".to_string(), "amt".to_string(), "WETH".to_string(), "owner".to_string(), 1)
+            .create_note(
+                "commit-spend".to_string(),
+                "amt".to_string(),
+                "WETH".to_string(),
+                "owner".to_string(),
+                1,
+            )
             .await
             .unwrap();
 
@@ -394,7 +422,13 @@ mod tests {
         let (state, shutdown) = setup_state().await;
 
         state
-            .create_note("commit-lifecycle".to_string(), "amt".to_string(), "WETH".to_string(), "owner".to_string(), 3)
+            .create_note(
+                "commit-lifecycle".to_string(),
+                "amt".to_string(),
+                "WETH".to_string(),
+                "owner".to_string(),
+                3,
+            )
             .await
             .unwrap();
 
@@ -436,28 +470,46 @@ mod tests {
 
         // Original note is spent (the input being consumed)
         state
-            .create_note("input-note".to_string(), "amt-in".to_string(), "WETH".to_string(), "owner".to_string(), 1)
+            .create_note(
+                "input-note".to_string(),
+                "amt-in".to_string(),
+                "WETH".to_string(),
+                "owner".to_string(),
+                1,
+            )
             .await
             .unwrap();
         state.mark_note_spent("input-note").await.unwrap();
 
         // Change note and deposit note are created in the same epoch
         state
-            .create_note("change-note".to_string(), "amt-change".to_string(), "WETH".to_string(), "owner".to_string(), 2)
+            .create_note(
+                "change-note".to_string(),
+                "amt-change".to_string(),
+                "WETH".to_string(),
+                "owner".to_string(),
+                2,
+            )
             .await
             .unwrap();
         state
-            .create_note("deposit-note".to_string(), "amt-deposit".to_string(), "WETH".to_string(), "owner".to_string(), 2)
+            .create_note(
+                "deposit-note".to_string(),
+                "amt-deposit".to_string(),
+                "WETH".to_string(),
+                "owner".to_string(),
+                2,
+            )
             .await
             .unwrap();
 
-        let input  = state.get_note("input-note").await.unwrap().unwrap();
+        let input = state.get_note("input-note").await.unwrap().unwrap();
         let change = state.get_note("change-note").await.unwrap().unwrap();
-        let dep    = state.get_note("deposit-note").await.unwrap().unwrap();
+        let dep = state.get_note("deposit-note").await.unwrap().unwrap();
 
-        assert_eq!(input.status,  NoteStatus::Spent);
+        assert_eq!(input.status, NoteStatus::Spent);
         assert_eq!(change.status, NoteStatus::Unspent);
-        assert_eq!(dep.status,    NoteStatus::Unspent);
+        assert_eq!(dep.status, NoteStatus::Unspent);
 
         let _ = shutdown.send(());
     }
@@ -493,13 +545,21 @@ mod tests {
 
         // First registration succeeds
         state
-            .register_nullifier("null-ds".to_string(), "commit-ds".to_string(), "tx-001".to_string())
+            .register_nullifier(
+                "null-ds".to_string(),
+                "commit-ds".to_string(),
+                "tx-001".to_string(),
+            )
             .await
             .unwrap();
 
         // Second registration must fail — nullifier_exists uses GET, which works with mini-redis
         let dup = state
-            .register_nullifier("null-ds".to_string(), "commit-ds-alt".to_string(), "tx-002".to_string())
+            .register_nullifier(
+                "null-ds".to_string(),
+                "commit-ds-alt".to_string(),
+                "tx-002".to_string(),
+            )
             .await;
 
         assert!(dup.is_err(), "double-spend must be rejected");
@@ -540,16 +600,37 @@ mod tests {
         let (state, shutdown) = setup_state().await;
 
         let t = state
-            .create_transition(6, "r-old".to_string(), "r-new".to_string(), vec![], vec![], None)
+            .create_transition(
+                6,
+                "r-old".to_string(),
+                "r-new".to_string(),
+                vec![],
+                vec![],
+                None,
+            )
             .await
             .unwrap();
 
-        state.update_transition_status(&t.transition_id, TransitionStatus::Attested).await.unwrap();
-        let fetched = state.get_transition(&t.transition_id).await.unwrap().unwrap();
+        state
+            .update_transition_status(&t.transition_id, TransitionStatus::Attested)
+            .await
+            .unwrap();
+        let fetched = state
+            .get_transition(&t.transition_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched.status, TransitionStatus::Attested);
 
-        state.update_transition_status(&t.transition_id, TransitionStatus::Finalized).await.unwrap();
-        let fetched = state.get_transition(&t.transition_id).await.unwrap().unwrap();
+        state
+            .update_transition_status(&t.transition_id, TransitionStatus::Finalized)
+            .await
+            .unwrap();
+        let fetched = state
+            .get_transition(&t.transition_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched.status, TransitionStatus::Finalized);
 
         let _ = shutdown.send(());
@@ -560,7 +641,9 @@ mod tests {
     async fn test_update_missing_transition_is_error() {
         let (state, shutdown) = setup_state().await;
 
-        let result = state.update_transition_status("nonexistent-id", TransitionStatus::Attested).await;
+        let result = state
+            .update_transition_status("nonexistent-id", TransitionStatus::Attested)
+            .await;
         assert!(result.is_err());
 
         let _ = shutdown.send(());
@@ -572,13 +655,27 @@ mod tests {
         let (state, shutdown) = setup_state().await;
 
         let t = state
-            .create_transition(7, "r-old".to_string(), "r-new".to_string(), vec![], vec![], None)
+            .create_transition(
+                7,
+                "r-old".to_string(),
+                "r-new".to_string(),
+                vec![],
+                vec![],
+                None,
+            )
             .await
             .unwrap();
 
-        state.set_transition_evm_tx_hash(&t.transition_id, "0xdeadbeef").await.unwrap();
+        state
+            .set_transition_evm_tx_hash(&t.transition_id, "0xdeadbeef")
+            .await
+            .unwrap();
 
-        let fetched = state.get_transition(&t.transition_id).await.unwrap().unwrap();
+        let fetched = state
+            .get_transition(&t.transition_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched.evm_tx_hash.as_deref(), Some("0xdeadbeef"));
 
         let _ = shutdown.send(());
@@ -601,7 +698,11 @@ mod tests {
             .await
             .unwrap();
 
-        let found = state.find_transition_by_proof_job_id("job-lookup").await.unwrap().unwrap();
+        let found = state
+            .find_transition_by_proof_job_id("job-lookup")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.transition_id, t.transition_id);
 
         let _ = shutdown.send(());
@@ -613,12 +714,15 @@ mod tests {
     #[tokio::test]
     async fn test_find_transition_by_nonexistent_job_id_is_none() {
         let (state, shutdown) = setup_state().await;
-        let result = state.find_transition_by_proof_job_id("no-such-job").await.unwrap();
+        let result = state
+            .find_transition_by_proof_job_id("no-such-job")
+            .await
+            .unwrap();
         assert!(result.is_none());
         let _ = shutdown.send(());
     }
 
-    // ── Epoch root ─────────────────────────────────────────────────────────── 
+    // ── Epoch root ───────────────────────────────────────────────────────────
 
     /// Epoch root can be set and retrieved by epoch ID.
     #[tokio::test]
@@ -718,7 +822,10 @@ mod tests {
     async fn test_nullifier_exists_returns_false_initially() {
         let (state, shutdown) = setup_state().await;
 
-        let exists = state.nullifier_exists("never-registered-null").await.unwrap();
+        let exists = state
+            .nullifier_exists("never-registered-null")
+            .await
+            .unwrap();
         assert!(!exists, "fresh nullifier must not exist");
 
         let _ = shutdown.send(());

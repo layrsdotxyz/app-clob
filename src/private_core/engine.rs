@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tiny_keccak::{Hasher, Keccak};
@@ -18,14 +19,91 @@ use super::{
 pub struct MarketConfig {
     pub market_id: String,
     pub settlement_asset: String,
+    pub settlement_decimals: u8,
     pub opens_at_millis: i64,
     pub closes_at_millis: i64,
     #[serde(with = "super::decimal_u128")]
     pub minimum_quantity_micros: u128,
     #[serde(with = "super::decimal_u128")]
     pub maximum_quantity_micros: u128,
+    /// Hard per-order quote-currency minimum. For ZEN this is expressed in six-decimal ZEN.
+    #[serde(with = "super::decimal_u128")]
+    pub minimum_order_notional_micros: u128,
+    /// Hard per-order quote-currency notional cap, enforced inside the enclave.
+    #[serde(with = "super::decimal_u128")]
+    pub maximum_order_notional_micros: u128,
+    /// Hard cap for one private user's position plus resting buy exposure per outcome.
+    #[serde(with = "super::decimal_u128")]
+    pub maximum_user_position_micros: u128,
+    /// Aggregate notional that may be awaiting a Polymarket venue confirmation.
+    #[serde(with = "super::decimal_u128")]
+    pub maximum_pending_bootstrap_notional_micros: u128,
     pub tick_size_micros: u64,
     pub oracle_feed_id: u64,
+    /// Determines where price discovery happens. The default preserves the native ZEN CLOB.
+    #[serde(default)]
+    pub execution: MarketExecution,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MarketExecution {
+    #[default]
+    NativeClob,
+    PolymarketBootstrap {
+        condition_id: String,
+        up_token_id: String,
+        down_token_id: String,
+        up_outcome_index: u8,
+        down_outcome_index: u8,
+        #[serde(default)]
+        neg_risk: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolymarketRedemptionIntent {
+    pub market_id: String,
+    pub condition_id: String,
+    pub up_outcome_index: u8,
+    pub down_outcome_index: u8,
+    #[serde(with = "super::decimal_u128")]
+    pub expected_redemption_amount_atomic: u128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BootstrapExecutionState {
+    FundsReserved,
+    VenueSubmitted,
+    VenueConfirmed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapExecutionView {
+    pub execution_id: Uuid,
+    pub market_id: String,
+    pub outcome: Outcome,
+    pub action: OrderAction,
+    pub limit_price_micros: u64,
+    #[serde(with = "super::decimal_u128")]
+    pub quantity_micros: u128,
+    pub state: BootstrapExecutionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_price_micros: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct BootstrapExecution {
+    view: BootstrapExecutionView,
+    private_user_id: String,
+    reserved_atomic: u128,
+    venue_order_id: Option<String>,
+    venue_evidence_hash: Option<[u8; 32]>,
+    created_at_millis: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -69,9 +147,46 @@ pub struct SignedResolution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolymarketResolutionStatement {
+    pub market_id: String,
+    pub condition_id: String,
+    pub outcome: ResolutionOutcome,
+    #[serde(with = "super::decimal_u128")]
+    pub redemption_amount_atomic: u128,
+    pub redemption_transaction_hash: [u8; 32],
+    pub redemption_block_number: u64,
+    pub evidence_hash: [u8; 32],
+    pub issued_at_millis: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedPolymarketResolution {
+    pub statement: PolymarketResolutionStatement,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "signed", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SignedResolutionEvidence {
+    Pyth(SignedResolution),
+    Polymarket(SignedPolymarketResolution),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ResolutionEvidence {
+    PythHistoricalMedian {
+        statement: ResolutionStatement,
+    },
+    PolymarketExactCondition {
+        statement: PolymarketResolutionStatement,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketResolution {
     pub outcome: ResolutionOutcome,
-    pub statement: ResolutionStatement,
+    pub evidence: ResolutionEvidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,6 +206,12 @@ pub enum UserCommandAction {
         direction: CompleteSetDirection,
     },
     Portfolio,
+    BootstrapStatus {
+        execution_id: Uuid,
+    },
+    CancelBootstrap {
+        execution_id: Uuid,
+    },
     RequestWithdrawal {
         withdrawal_id: Uuid,
         chain: String,
@@ -146,6 +267,29 @@ pub struct WithdrawalAuthorization {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditFillStatement {
+    pub protocol_version: String,
+    pub chain: String,
+    pub market_id: String,
+    pub market_id_bytes32: String,
+    pub buyer_one_time_pseudonym: String,
+    pub seller_one_time_pseudonym: String,
+    pub quantity_atomic: String,
+    pub price_micros: u64,
+    pub fee_atomic: String,
+    pub nonce: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedAuditFillArtifact {
+    pub statement: AuditFillStatement,
+    pub receipt_id: String,
+    pub state_root: [u8; 32],
+    pub receipt_public_key: [u8; 32],
+    pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserCommand {
     pub command_id: String,
     pub idempotency_key: String,
@@ -171,6 +315,15 @@ pub enum CommandResult {
     Portfolio {
         snapshot: PortfolioSnapshot,
     },
+    BootstrapPending {
+        execution: BootstrapExecutionView,
+    },
+    BootstrapStatus {
+        execution: BootstrapExecutionView,
+    },
+    BootstrapCancelled {
+        execution: BootstrapExecutionView,
+    },
     WithdrawalReserved {
         withdrawal_id: Uuid,
         chain: String,
@@ -188,12 +341,42 @@ pub struct CoreResponse {
     pub encrypted_record: EncryptedJournalRecord,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub withdrawal_authorization: Option<WithdrawalAuthorization>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audit_fills: Vec<SignedAuditFillArtifact>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemResponse {
     pub receipt: EnclaveReceipt,
     pub encrypted_record: EncryptedJournalRecord,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audit_fills: Vec<SignedAuditFillArtifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_commitment: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone)]
+struct AuditFillDraft {
+    fill_id: Uuid,
+    chain: String,
+    market_id: String,
+    buyer_private_user_id: String,
+    seller_private_user_id: String,
+    quantity_atomic: u128,
+    price_micros: u64,
+    fee_atomic: u128,
+    nonce: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapVenueIntent {
+    pub execution_id: Uuid,
+    pub token_id: String,
+    pub action: OrderAction,
+    pub quantity_micros: u128,
+    pub limit_price_micros: u64,
+    pub negative_risk: bool,
+    pub order_salt: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,6 +394,11 @@ struct ProcessedCommand {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 enum JournaledSystemCommand {
+    SetTradingFreeze {
+        idempotency_key: String,
+        frozen: bool,
+        reason_commitment: [u8; 32],
+    },
     RegisterMarket {
         idempotency_key: String,
         market: MarketConfig,
@@ -234,9 +422,32 @@ enum JournaledSystemCommand {
         amount_atomic: u128,
         evidence_hash: [u8; 32],
     },
+    PrepareWithdrawal {
+        idempotency_key: String,
+        withdrawal_id: Uuid,
+        transaction_commitment: [u8; 32],
+        raw_transaction_hex: String,
+    },
     ResolveMarket {
         idempotency_key: String,
         resolution: MarketResolution,
+    },
+    MarkBootstrapSubmitted {
+        idempotency_key: String,
+        execution_id: Uuid,
+        venue_order_commitment: [u8; 32],
+    },
+    ConfirmBootstrapFill {
+        idempotency_key: String,
+        execution_id: Uuid,
+        fill_price_micros: u64,
+        evidence_hash: [u8; 32],
+    },
+    FailBootstrapExecution {
+        idempotency_key: String,
+        execution_id: Uuid,
+        failure_code: String,
+        evidence_hash: [u8; 32],
     },
 }
 
@@ -251,6 +462,10 @@ struct CoreStateSnapshot {
     position_cost_basis: Vec<(PositionKey, u128)>,
     resolutions: BTreeMap<String, MarketResolution>,
     oracle_public_key: Option<[u8; 32]>,
+    #[serde(default)]
+    bootstrap_executions: BTreeMap<Uuid, BootstrapExecution>,
+    #[serde(default)]
+    trading_frozen: bool,
     sequence: u64,
 }
 
@@ -266,6 +481,8 @@ pub struct PrivateTradingCore {
     position_cost_basis: BTreeMap<PositionKey, u128>,
     resolutions: BTreeMap<String, MarketResolution>,
     oracle_public_key: Option<[u8; 32]>,
+    bootstrap_executions: BTreeMap<Uuid, BootstrapExecution>,
+    trading_frozen: bool,
     sequence: u64,
     identity_key: [u8; 32],
 }
@@ -285,6 +502,8 @@ impl PrivateTradingCore {
             position_cost_basis: BTreeMap::new(),
             resolutions: BTreeMap::new(),
             oracle_public_key: None,
+            bootstrap_executions: BTreeMap::new(),
+            trading_frozen: false,
             sequence: 0,
             identity_key,
         }
@@ -304,6 +523,20 @@ impl PrivateTradingCore {
 
     pub fn balance(&self, account: &AccountKey) -> u128 {
         self.ledger.balance(account)
+    }
+
+    /// Market specifications are public consensus inputs. This read is used by the
+    /// idempotent signed-manifest importer to verify enclave registration after a retry.
+    pub fn market_config(&self, market_id: &str) -> Option<MarketConfig> {
+        self.markets.get(market_id).cloned()
+    }
+
+    /// Returns the immutable resolution already committed for a market.  This
+    /// is deliberately read-only and lets the operator make a resolution
+    /// command retry-safe after a network or process failure obscures the
+    /// original response.
+    pub fn market_resolution(&self, market_id: &str) -> Option<MarketResolution> {
+        self.resolutions.get(market_id).cloned()
     }
 
     pub fn export_encrypted_snapshot(&self) -> CoreResult<EncryptedSnapshot> {
@@ -327,6 +560,8 @@ impl PrivateTradingCore {
                     .collect(),
                 resolutions: self.resolutions.clone(),
                 oracle_public_key: self.oracle_public_key,
+                bootstrap_executions: self.bootstrap_executions.clone(),
+                trading_frozen: self.trading_frozen,
                 sequence: self.sequence,
             },
         )
@@ -372,6 +607,8 @@ impl PrivateTradingCore {
             &position_cost_basis,
             &state.resolutions,
             &state.oracle_public_key,
+            &state.bootstrap_executions,
+            state.trading_frozen,
             state.sequence,
         );
         if computed_root != snapshot.state_root {
@@ -390,6 +627,8 @@ impl PrivateTradingCore {
             position_cost_basis,
             resolutions: state.resolutions,
             oracle_public_key: state.oracle_public_key,
+            bootstrap_executions: state.bootstrap_executions,
+            trading_frozen: state.trading_frozen,
             sequence: state.sequence,
             identity_key,
         })
@@ -406,8 +645,68 @@ impl PrivateTradingCore {
             &self.position_cost_basis,
             &self.resolutions,
             &self.oracle_public_key,
+            &self.bootstrap_executions,
+            self.trading_frozen,
             self.sequence,
         )
+    }
+
+    pub fn trading_frozen(&self) -> bool {
+        self.trading_frozen
+    }
+
+    pub fn set_trading_freeze(
+        &mut self,
+        idempotency_key: String,
+        frozen: bool,
+        reason_commitment: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        if reason_commitment == [0u8; 32] {
+            return Err(CoreError::InvalidOrder(
+                "trading freeze requires a non-zero reason commitment".into(),
+            ));
+        }
+        let prior_root = self.state_root();
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &self.ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::SetTradingFreeze {
+            idempotency_key: idempotency_key.clone(),
+            frozen,
+            reason_commitment,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.system_keys = keys;
+        self.trading_frozen = frozen;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            if frozen {
+                "trading-freeze"
+            } else {
+                "trading-unfreeze"
+            },
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
     }
 
     pub fn register_market(
@@ -437,6 +736,8 @@ impl PrivateTradingCore {
             &self.position_cost_basis,
             &self.resolutions,
             &self.oracle_public_key,
+            &self.bootstrap_executions,
+            self.trading_frozen,
             next_sequence,
         );
         let entry = JournaledSystemCommand::RegisterMarket {
@@ -491,6 +792,8 @@ impl PrivateTradingCore {
             &self.position_cost_basis,
             &self.resolutions,
             &self.oracle_public_key,
+            &self.bootstrap_executions,
+            self.trading_frozen,
             next_sequence,
         );
         let entry = JournaledSystemCommand::RegisterSession {
@@ -547,6 +850,8 @@ impl PrivateTradingCore {
             &self.position_cost_basis,
             &self.resolutions,
             &self.oracle_public_key,
+            &self.bootstrap_executions,
+            self.trading_frozen,
             next_sequence,
         );
         let entry = JournaledSystemCommand::ExternalFlow {
@@ -638,6 +943,8 @@ impl PrivateTradingCore {
             &self.position_cost_basis,
             &self.resolutions,
             &self.oracle_public_key,
+            &self.bootstrap_executions,
+            self.trading_frozen,
             next_sequence,
         );
         let entry = JournaledSystemCommand::ReleaseWithdrawal {
@@ -661,6 +968,104 @@ impl PrivateTradingCore {
         ))
     }
 
+    pub fn validate_withdrawal_intent(&self, intent: &WithdrawalIntent) -> CoreResult<()> {
+        if intent.protocol_version != "layrs.withdrawal.v1" {
+            return Err(CoreError::InvalidOrder(
+                "invalid withdrawal protocol".into(),
+            ));
+        }
+        let marker = withdrawal_reservation_marker(
+            &intent.session_id,
+            intent.withdrawal_id,
+            &intent.chain,
+            &intent.asset,
+            &intent.amount_atomic,
+            &intent.destination,
+        )?;
+        if !self.system_keys.contains(&marker) {
+            return Err(CoreError::InvalidOrder(
+                "unknown withdrawal reservation".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn prepared_withdrawal(&self, withdrawal_id: Uuid) -> Option<([u8; 32], String)> {
+        let prefix = format!("prepared-withdrawal:{withdrawal_id}:");
+        self.system_keys.iter().find_map(|key| {
+            let value = key.strip_prefix(&prefix)?;
+            let (commitment, raw) = value.split_once(':')?;
+            let commitment: [u8; 32] = hex::decode(commitment).ok()?.try_into().ok()?;
+            Some((commitment, raw.to_owned()))
+        })
+    }
+
+    pub fn record_prepared_withdrawal(
+        &mut self,
+        idempotency_key: String,
+        withdrawal_id: Uuid,
+        transaction_commitment: [u8; 32],
+        raw_transaction_hex: String,
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        if !raw_transaction_hex.starts_with("0x02")
+            || raw_transaction_hex.len() < 100
+            || raw_transaction_hex.len() > 2_048
+            || !raw_transaction_hex[2..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(CoreError::InvalidOrder(
+                "invalid signed withdrawal transaction".into(),
+            ));
+        }
+        if self.prepared_withdrawal(withdrawal_id).is_some() {
+            return Err(CoreError::InvalidOrder(
+                "withdrawal transaction already prepared".into(),
+            ));
+        }
+        let prior_root = self.state_root();
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        keys.insert(format!(
+            "prepared-withdrawal:{withdrawal_id}:{}:{raw_transaction_hex}",
+            hex::encode(transaction_commitment),
+        ));
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &self.ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::PrepareWithdrawal {
+            idempotency_key: idempotency_key.clone(),
+            withdrawal_id,
+            transaction_commitment,
+            raw_transaction_hex,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            "prepare-withdrawal",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
+    }
+
     pub fn resolve_market(
         &mut self,
         idempotency_key: String,
@@ -672,11 +1077,6 @@ impl PrivateTradingCore {
             .markets
             .get(&signed.statement.market_id)
             .ok_or_else(|| CoreError::InvalidResolution("unknown market".into()))?;
-        if self.resolutions.contains_key(&market.market_id) {
-            return Err(CoreError::InvalidResolution(
-                "market is already resolved".into(),
-            ));
-        }
         validate_resolution(market, &signed, self.oracle_public_key, now_millis)?;
         let outcome = if signed.statement.closing.median_price_e8
             > signed.statement.opening.median_price_e8
@@ -691,8 +1091,54 @@ impl PrivateTradingCore {
         };
         let resolution = MarketResolution {
             outcome,
-            statement: signed.statement,
+            evidence: ResolutionEvidence::PythHistoricalMedian {
+                statement: signed.statement,
+            },
         };
+        self.commit_market_resolution(idempotency_key, resolution, now_millis)
+    }
+
+    pub fn resolve_polymarket_market(
+        &mut self,
+        idempotency_key: String,
+        signed: SignedPolymarketResolution,
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        let market = self
+            .markets
+            .get(&signed.statement.market_id)
+            .ok_or_else(|| CoreError::InvalidResolution("unknown market".into()))?;
+        validate_polymarket_resolution(market, &signed, self.oracle_public_key, now_millis)?;
+        let resolution = MarketResolution {
+            outcome: signed.statement.outcome,
+            evidence: ResolutionEvidence::PolymarketExactCondition {
+                statement: signed.statement,
+            },
+        };
+        self.commit_market_resolution(idempotency_key, resolution, now_millis)
+    }
+
+    fn commit_market_resolution(
+        &mut self,
+        idempotency_key: String,
+        resolution: MarketResolution,
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        let market_id = match &resolution.evidence {
+            ResolutionEvidence::PythHistoricalMedian { statement } => &statement.market_id,
+            ResolutionEvidence::PolymarketExactCondition { statement } => &statement.market_id,
+        };
+        let market = self
+            .markets
+            .get(market_id)
+            .ok_or_else(|| CoreError::InvalidResolution("unknown market".into()))?;
+        if self.resolutions.contains_key(&market.market_id) {
+            return Err(CoreError::InvalidResolution(
+                "market is already resolved".into(),
+            ));
+        }
+        let outcome = resolution.outcome;
 
         let prior_root = self.state_root();
         let mut ledger = self.ledger.clone();
@@ -715,6 +1161,7 @@ impl PrivateTradingCore {
 
         let positions = ledger.positions_for_market(&market.market_id);
         let mut payouts = Vec::with_capacity(positions.len());
+        let mut total_gross_payout = 0u128;
         for (claim_account, quantity) in positions {
             let claim_outcome = match claim_account.outcome.as_deref() {
                 Some("UP") => Outcome::Up,
@@ -727,26 +1174,57 @@ impl PrivateTradingCore {
             };
             let key = position_key(&claim_account.owner, &market.market_id, claim_outcome);
             let basis = position_cost_basis.remove(&key).unwrap_or_default();
-            let gross = match outcome {
+            let gross_micros = match outcome {
                 ResolutionOutcome::Up if claim_outcome == Outcome::Up => quantity,
                 ResolutionOutcome::Down if claim_outcome == Outcome::Down => quantity,
                 ResolutionOutcome::Push => quantity / 2,
                 _ => 0,
             };
+            let gross = settlement_atomic(market, gross_micros)?;
             let winning_fee = if matches!(outcome, ResolutionOutcome::Push) {
                 0
             } else {
                 ceil_bps(gross.saturating_sub(basis), 500)?
             };
+            total_gross_payout = total_gross_payout
+                .checked_add(gross)
+                .ok_or(CoreError::UnbalancedTransaction)?;
             payouts.push(ClaimPayout {
                 claim_account,
                 destination: available(&key.owner, &market.settlement_asset),
                 claim_quantity_micros: quantity,
-                gross_payout_micros: gross,
-                winning_fee_micros: winning_fee,
+                gross_payout_atomic: gross,
+                winning_fee_atomic: winning_fee,
             });
         }
         let collateral = market_collateral(&market.market_id, &market.settlement_asset);
+        if let ResolutionEvidence::PolymarketExactCondition { statement } = &resolution.evidence {
+            if statement.redemption_amount_atomic != total_gross_payout {
+                return Err(CoreError::InvalidResolution(
+                    "venue redemption does not equal the winning claim liability".into(),
+                ));
+            }
+            if total_gross_payout > 0 {
+                let pool =
+                    AccountKey::new("layrs", AccountBucket::PoolCash, &market.settlement_asset);
+                ledger.apply_external_flow(ExternalFlowTransaction {
+                    idempotency_key: format!("resolution-redemption:{idempotency_key}"),
+                    evidence_hash: statement.evidence_hash,
+                    account: pool.clone(),
+                    amount: total_gross_payout,
+                    direction: ExternalFlowDirection::Inflow,
+                })?;
+                ledger.apply(LedgerTransaction {
+                    idempotency_key: format!("resolution-collateralize:{idempotency_key}"),
+                    business_reference: market.market_id.clone(),
+                    transfers: vec![Transfer {
+                        from: pool,
+                        to: collateral.clone(),
+                        amount: total_gross_payout,
+                    }],
+                })?;
+            }
+        }
         if !payouts.is_empty() {
             ledger.apply_claim_payouts(
                 format!("resolution-payout:{idempotency_key}"),
@@ -788,6 +1266,8 @@ impl PrivateTradingCore {
             &position_cost_basis,
             &resolutions,
             &self.oracle_public_key,
+            &self.bootstrap_executions,
+            self.trading_frozen,
             next_sequence,
         );
         let entry = JournaledSystemCommand::ResolveMarket {
@@ -803,6 +1283,619 @@ impl PrivateTradingCore {
         self.sequence = next_sequence;
         Ok(self.system_response(
             "resolve-market",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
+    }
+
+    pub fn bootstrap_venue_intent(&self, execution_id: Uuid) -> CoreResult<BootstrapVenueIntent> {
+        let execution = self
+            .bootstrap_executions
+            .get(&execution_id)
+            .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
+        if execution.view.state != BootstrapExecutionState::FundsReserved {
+            return Err(CoreError::InvalidOrder(
+                "bootstrap execution is not ready for venue submission".into(),
+            ));
+        }
+        let market = self
+            .markets
+            .get(&execution.view.market_id)
+            .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
+        let MarketExecution::PolymarketBootstrap {
+            up_token_id,
+            down_token_id,
+            neg_risk,
+            ..
+        } = &market.execution
+        else {
+            return Err(CoreError::InvalidOrder(
+                "market is not a bootstrap venue market".into(),
+            ));
+        };
+        Ok(BootstrapVenueIntent {
+            execution_id,
+            token_id: match execution.view.outcome {
+                Outcome::Up => up_token_id.clone(),
+                Outcome::Down => down_token_id.clone(),
+            },
+            action: execution.view.action,
+            quantity_micros: execution.view.quantity_micros,
+            limit_price_micros: execution.view.limit_price_micros,
+            negative_risk: *neg_risk,
+            order_salt: bootstrap_order_salt(execution_id),
+        })
+    }
+
+    /// Produces the exact public venue-redemption intent that backs the outstanding private
+    /// claims. Signing and broadcasting are separate so the prepared raw transaction can be
+    /// durably recorded before it is sent to Polygon.
+    pub fn polymarket_redemption_intent(
+        &self,
+        market_id: &str,
+        outcome: ResolutionOutcome,
+        now_millis: i64,
+    ) -> CoreResult<PolymarketRedemptionIntent> {
+        let market = self
+            .markets
+            .get(market_id)
+            .ok_or_else(|| CoreError::InvalidResolution("unknown market".into()))?;
+        let MarketExecution::PolymarketBootstrap {
+            condition_id,
+            up_outcome_index,
+            down_outcome_index,
+            ..
+        } = &market.execution
+        else {
+            return Err(CoreError::InvalidResolution(
+                "market is not a Polymarket bootstrap market".into(),
+            ));
+        };
+        if now_millis < market.closes_at_millis || self.resolutions.contains_key(market_id) {
+            return Err(CoreError::InvalidResolution(
+                "market is not ready for venue redemption".into(),
+            ));
+        }
+        let total_micros = self
+            .ledger
+            .positions_for_market(market_id)
+            .into_iter()
+            .try_fold(0u128, |total, (claim, quantity)| {
+                let claim_outcome = match claim.outcome.as_deref() {
+                    Some("UP") => Outcome::Up,
+                    Some("DOWN") => Outcome::Down,
+                    _ => {
+                        return Err(CoreError::InvalidResolution(
+                            "invalid claim outcome in ledger".into(),
+                        ));
+                    }
+                };
+                let payout = match outcome {
+                    ResolutionOutcome::Up if claim_outcome == Outcome::Up => quantity,
+                    ResolutionOutcome::Down if claim_outcome == Outcome::Down => quantity,
+                    ResolutionOutcome::Push => quantity / 2,
+                    _ => 0,
+                };
+                total
+                    .checked_add(payout)
+                    .ok_or(CoreError::UnbalancedTransaction)
+            })?;
+        Ok(PolymarketRedemptionIntent {
+            market_id: market_id.into(),
+            condition_id: condition_id.clone(),
+            up_outcome_index: *up_outcome_index,
+            down_outcome_index: *down_outcome_index,
+            expected_redemption_amount_atomic: settlement_atomic(market, total_micros)?,
+        })
+    }
+
+    pub fn validate_onchain_resolution_authorization(
+        &self,
+        market_id: &str,
+        outcome: ResolutionOutcome,
+        evidence: &SignedResolutionEvidence,
+        now_millis: i64,
+    ) -> CoreResult<()> {
+        let market = self
+            .markets
+            .get(market_id)
+            .ok_or_else(|| CoreError::InvalidResolution("unknown market".into()))?;
+        if self.resolutions.contains_key(market_id) {
+            return Err(CoreError::InvalidResolution(
+                "market is already resolved".into(),
+            ));
+        }
+        match evidence {
+            SignedResolutionEvidence::Pyth(signed) => {
+                validate_resolution(market, signed, self.oracle_public_key, now_millis)?;
+                let derived = match signed
+                    .statement
+                    .closing
+                    .median_price_e8
+                    .cmp(&signed.statement.opening.median_price_e8)
+                {
+                    std::cmp::Ordering::Greater => ResolutionOutcome::Up,
+                    std::cmp::Ordering::Less => ResolutionOutcome::Down,
+                    std::cmp::Ordering::Equal => ResolutionOutcome::Push,
+                };
+                if signed.statement.market_id != market_id || derived != outcome {
+                    return Err(CoreError::InvalidResolution(
+                        "on-chain outcome does not match Pyth evidence".into(),
+                    ));
+                }
+            }
+            SignedResolutionEvidence::Polymarket(signed) => {
+                validate_polymarket_resolution(market, signed, self.oracle_public_key, now_millis)?;
+                if signed.statement.market_id != market_id || signed.statement.outcome != outcome {
+                    return Err(CoreError::InvalidResolution(
+                        "on-chain outcome does not match Polymarket evidence".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn bootstrap_venue_order_id(&self, execution_id: Uuid) -> CoreResult<String> {
+        let execution = self
+            .bootstrap_executions
+            .get(&execution_id)
+            .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
+        if execution.view.state != BootstrapExecutionState::VenueSubmitted {
+            return Err(CoreError::InvalidOrder(
+                "bootstrap execution is not awaiting venue confirmation".into(),
+            ));
+        }
+        execution
+            .venue_order_id
+            .clone()
+            .ok_or_else(|| CoreError::InvalidOrder("venue order id is unavailable".into()))
+    }
+
+    pub fn bootstrap_execution_view(
+        &self,
+        execution_id: Uuid,
+    ) -> CoreResult<BootstrapExecutionView> {
+        self.bootstrap_executions
+            .get(&execution_id)
+            .map(|execution| execution.view.clone())
+            .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))
+    }
+
+    pub fn bootstrap_execution_state_for_identity(
+        &self,
+        execution_id: Uuid,
+        identity_commitment: [u8; 32],
+    ) -> CoreResult<BootstrapExecutionState> {
+        let expected = derive_private_user_id(&self.identity_key, &identity_commitment);
+        self.bootstrap_executions
+            .get(&execution_id)
+            .filter(|execution| execution.private_user_id == expected)
+            .map(|execution| execution.view.state)
+            .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))
+    }
+
+    /// Records the venue's accepted order identifier as a one-way commitment. The plaintext
+    /// identifier remains inside the enclave-owned executor and is never part of a public event.
+    pub fn mark_bootstrap_submitted(
+        &mut self,
+        idempotency_key: String,
+        execution_id: Uuid,
+        venue_order_id: String,
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        if venue_order_id.is_empty()
+            || venue_order_id.len() > 256
+            || !venue_order_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+        {
+            return Err(CoreError::InvalidOrder(
+                "valid venue order id is required".into(),
+            ));
+        }
+        let venue_order_commitment = Sha256::digest(venue_order_id.as_bytes()).into();
+        let prior_root = self.state_root();
+        let mut executions = self.bootstrap_executions.clone();
+        let execution = executions
+            .get_mut(&execution_id)
+            .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
+        if execution.view.state != BootstrapExecutionState::FundsReserved {
+            return Err(CoreError::InvalidOrder(
+                "bootstrap execution is not awaiting venue submission".into(),
+            ));
+        }
+        execution.view.state = BootstrapExecutionState::VenueSubmitted;
+        execution.venue_order_id = Some(venue_order_id);
+
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &self.ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &executions,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::MarkBootstrapSubmitted {
+            idempotency_key: idempotency_key.clone(),
+            execution_id,
+            venue_order_commitment,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.bootstrap_executions = executions;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            "bootstrap-submitted",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
+    }
+
+    /// Atomically recognizes a FOK venue fill and the matching user fill. No user claim or cash
+    /// movement occurs before this transition, and the committed venue evidence is single-use.
+    pub fn confirm_bootstrap_fill(
+        &mut self,
+        idempotency_key: String,
+        execution_id: Uuid,
+        fill_price_micros: u64,
+        evidence_hash: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        if evidence_hash == [0u8; 32]
+            || fill_price_micros == 0
+            || fill_price_micros >= PRICE_SCALE as u64
+        {
+            return Err(CoreError::InvalidOrder(
+                "valid venue fill evidence is required".into(),
+            ));
+        }
+        let prior_root = self.state_root();
+        let mut executions = self.bootstrap_executions.clone();
+        let execution = executions
+            .get_mut(&execution_id)
+            .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
+        if execution.view.state != BootstrapExecutionState::VenueSubmitted
+            || execution.venue_order_id.is_none()
+        {
+            return Err(CoreError::InvalidOrder(
+                "bootstrap execution has no pending venue order".into(),
+            ));
+        }
+        match execution.view.action {
+            OrderAction::Buy if fill_price_micros > execution.view.limit_price_micros => {
+                return Err(CoreError::InvalidOrder(
+                    "venue buy fill exceeded the user's limit".into(),
+                ));
+            }
+            OrderAction::Sell if fill_price_micros < execution.view.limit_price_micros => {
+                return Err(CoreError::InvalidOrder(
+                    "venue sell fill was below the user's limit".into(),
+                ));
+            }
+            _ => {}
+        }
+        let market = self
+            .markets
+            .get(&execution.view.market_id)
+            .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
+        if !matches!(
+            market.execution,
+            MarketExecution::PolymarketBootstrap { .. }
+        ) {
+            return Err(CoreError::InvalidOrder(
+                "market is not a bootstrap venue market".into(),
+            ));
+        }
+
+        let mut ledger = self.ledger.clone();
+        let mut position_cost_basis = self.position_cost_basis.clone();
+        let quantity = execution.view.quantity_micros;
+        let fill_notional = notional(fill_price_micros, quantity)?;
+        let taker_fee = ceil_bps(fill_notional, 20)?;
+        let claim = claim_asset(&execution.view.market_id, execution.view.outcome);
+        let inventory = venue_inventory(&execution.view.market_id, execution.view.outcome, &claim);
+        let pool = AccountKey::new("layrs", AccountBucket::PoolCash, &market.settlement_asset);
+
+        match execution.view.action {
+            OrderAction::Buy => {
+                let user_total = fill_notional
+                    .checked_add(taker_fee)
+                    .ok_or(CoreError::UnbalancedTransaction)?;
+                let refund = execution
+                    .reserved_atomic
+                    .checked_sub(user_total)
+                    .ok_or(CoreError::UnbalancedTransaction)?;
+                ledger.apply_external_flow(ExternalFlowTransaction {
+                    idempotency_key: format!("bootstrap-venue-cash:{idempotency_key}"),
+                    evidence_hash,
+                    account: pool.clone(),
+                    amount: fill_notional,
+                    direction: ExternalFlowDirection::Outflow,
+                })?;
+                ledger.apply_external_flow(ExternalFlowTransaction {
+                    idempotency_key: format!("bootstrap-venue-claim:{idempotency_key}"),
+                    evidence_hash,
+                    account: inventory.clone(),
+                    amount: quantity,
+                    direction: ExternalFlowDirection::Inflow,
+                })?;
+                let hold = bootstrap_hold(execution, market);
+                let mut transfers = vec![
+                    Transfer {
+                        from: hold.clone(),
+                        to: pool,
+                        amount: fill_notional,
+                    },
+                    Transfer {
+                        from: inventory,
+                        to: claim_position_for(
+                            &execution.private_user_id,
+                            &execution.view.market_id,
+                            execution.view.outcome,
+                        ),
+                        amount: quantity,
+                    },
+                ];
+                if taker_fee > 0 {
+                    transfers.push(Transfer {
+                        from: hold.clone(),
+                        to: AccountKey::new(
+                            "layrs",
+                            AccountBucket::FeeRevenue,
+                            &market.settlement_asset,
+                        ),
+                        amount: taker_fee,
+                    });
+                }
+                if refund > 0 {
+                    transfers.push(Transfer {
+                        from: hold,
+                        to: available(&execution.private_user_id, &market.settlement_asset),
+                        amount: refund,
+                    });
+                }
+                ledger.apply(LedgerTransaction {
+                    idempotency_key: format!("bootstrap-user-fill:{idempotency_key}"),
+                    business_reference: hex::encode(evidence_hash),
+                    transfers,
+                })?;
+                add_basis(
+                    &mut position_cost_basis,
+                    position_key(
+                        &execution.private_user_id,
+                        &execution.view.market_id,
+                        execution.view.outcome,
+                    ),
+                    fill_notional,
+                )?;
+            }
+            OrderAction::Sell => {
+                let key = position_key(
+                    &execution.private_user_id,
+                    &execution.view.market_id,
+                    execution.view.outcome,
+                );
+                reduce_basis_for_held_quantity(
+                    &ledger,
+                    &mut position_cost_basis,
+                    key,
+                    &execution.private_user_id,
+                    &execution.view.market_id,
+                    execution.view.outcome,
+                    quantity,
+                )?;
+                ledger.apply_external_flow(ExternalFlowTransaction {
+                    idempotency_key: format!("bootstrap-venue-claim:{idempotency_key}"),
+                    evidence_hash,
+                    account: inventory.clone(),
+                    amount: quantity,
+                    direction: ExternalFlowDirection::Outflow,
+                })?;
+                ledger.apply_external_flow(ExternalFlowTransaction {
+                    idempotency_key: format!("bootstrap-venue-cash:{idempotency_key}"),
+                    evidence_hash,
+                    account: pool.clone(),
+                    amount: fill_notional,
+                    direction: ExternalFlowDirection::Inflow,
+                })?;
+                let user_proceeds = fill_notional
+                    .checked_sub(taker_fee)
+                    .ok_or(CoreError::UnbalancedTransaction)?;
+                let mut transfers = vec![
+                    Transfer {
+                        from: bootstrap_hold(execution, market),
+                        to: inventory,
+                        amount: quantity,
+                    },
+                    Transfer {
+                        from: pool.clone(),
+                        to: available(&execution.private_user_id, &market.settlement_asset),
+                        amount: user_proceeds,
+                    },
+                ];
+                if taker_fee > 0 {
+                    transfers.push(Transfer {
+                        from: pool,
+                        to: AccountKey::new(
+                            "layrs",
+                            AccountBucket::FeeRevenue,
+                            &market.settlement_asset,
+                        ),
+                        amount: taker_fee,
+                    });
+                }
+                ledger.apply(LedgerTransaction {
+                    idempotency_key: format!("bootstrap-user-fill:{idempotency_key}"),
+                    business_reference: hex::encode(evidence_hash),
+                    transfers,
+                })?;
+            }
+        }
+        execution.view.state = BootstrapExecutionState::VenueConfirmed;
+        execution.view.confirmed_price_micros = Some(fill_price_micros);
+        execution.venue_evidence_hash = Some(evidence_hash);
+        let next_sequence = checked_sequence(self.sequence)?;
+        let (buyer_private_user_id, seller_private_user_id) = match execution.view.action {
+            OrderAction::Buy => (execution.private_user_id.clone(), "layrs".to_string()),
+            OrderAction::Sell => ("layrs".to_string(), execution.private_user_id.clone()),
+        };
+        let audit_draft = AuditFillDraft {
+            fill_id: execution_id,
+            chain: "base".into(),
+            market_id: execution.view.market_id.clone(),
+            buyer_private_user_id,
+            seller_private_user_id,
+            quantity_atomic: quantity,
+            price_micros: fill_price_micros,
+            fee_atomic: taker_fee,
+            nonce: next_sequence,
+        };
+
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        let next_root = state_root(
+            &ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &executions,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::ConfirmBootstrapFill {
+            idempotency_key: idempotency_key.clone(),
+            execution_id,
+            fill_price_micros,
+            evidence_hash,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.ledger = ledger;
+        self.position_cost_basis = position_cost_basis;
+        self.bootstrap_executions = executions;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        let mut response = self.system_response(
+            "bootstrap-confirmed",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        );
+        response.evidence_commitment = Some(evidence_hash);
+        response.audit_fills = signed_audit_fills(
+            &self.receipt_signer,
+            &self.identity_key,
+            &response.receipt,
+            vec![audit_draft],
+        )?;
+        Ok(response)
+    }
+
+    /// Releases the user's reservation only after an authenticated venue rejection or confirmed
+    /// cancellation. A host timeout alone is deliberately insufficient evidence.
+    pub fn fail_bootstrap_execution(
+        &mut self,
+        idempotency_key: String,
+        execution_id: Uuid,
+        failure_code: String,
+        evidence_hash: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        if evidence_hash == [0u8; 32]
+            || failure_code.is_empty()
+            || failure_code.len() > 64
+            || !failure_code
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return Err(CoreError::InvalidOrder(
+                "authenticated venue failure evidence is required".into(),
+            ));
+        }
+        let prior_root = self.state_root();
+        let mut ledger = self.ledger.clone();
+        let mut executions = self.bootstrap_executions.clone();
+        let execution = executions
+            .get_mut(&execution_id)
+            .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
+        if !matches!(
+            execution.view.state,
+            BootstrapExecutionState::FundsReserved | BootstrapExecutionState::VenueSubmitted
+        ) {
+            return Err(CoreError::InvalidOrder(
+                "bootstrap execution is already terminal".into(),
+            ));
+        }
+        let market = self
+            .markets
+            .get(&execution.view.market_id)
+            .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
+        release_bootstrap_hold(
+            &mut ledger,
+            execution,
+            market,
+            &format!("bootstrap-failure:{idempotency_key}"),
+            &hex::encode(evidence_hash),
+        )?;
+        execution.view.state = BootstrapExecutionState::Failed;
+        execution.view.failure_code = Some(failure_code.clone());
+        execution.venue_evidence_hash = Some(evidence_hash);
+
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &executions,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::FailBootstrapExecution {
+            idempotency_key: idempotency_key.clone(),
+            execution_id,
+            failure_code,
+            evidence_hash,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.ledger = ledger;
+        self.bootstrap_executions = executions;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            "bootstrap-failed",
             idempotency_key,
             prior_root,
             next_root,
@@ -829,6 +1922,14 @@ impl PrivateTradingCore {
                 .clone()
                 .ok_or(CoreError::PreviouslyProcessed);
         }
+        if self.trading_frozen
+            && matches!(
+                command.action,
+                UserCommandAction::SubmitOrder { .. } | UserCommandAction::CompleteSet { .. }
+            )
+        {
+            return Err(CoreError::TradingFrozen);
+        }
 
         let prior_root = self.state_root();
         let mut sessions = self.sessions.clone();
@@ -836,6 +1937,9 @@ impl PrivateTradingCore {
         let mut ledger = self.ledger.clone();
         let mut books = self.books.clone();
         let mut position_cost_basis = self.position_cost_basis.clone();
+        let mut bootstrap_executions = self.bootstrap_executions.clone();
+        let mut system_keys = self.system_keys.clone();
+        let mut audit_drafts = Vec::new();
         let result = match &command.action {
             UserCommandAction::SubmitOrder { order } => {
                 let mut order = order.clone();
@@ -845,31 +1949,103 @@ impl PrivateTradingCore {
                     .get(&order.market_id)
                     .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
                 validate_order_for_market(&order, market, now_millis)?;
-                let book = books.entry(order.market_id.clone()).or_default();
-                let match_result = book.submit(order.clone(), now_millis)?;
-                if match_result
-                    .accepted_order
-                    .as_ref()
-                    .is_some_and(|accepted| accepted.status != OrderStatus::Rejected)
-                {
-                    let transfers =
-                        settlement_transfers(&self.books, &books, market, &order, &match_result)?;
-                    apply_fill_cost_basis(
-                        &self.ledger,
-                        &self.books,
-                        &books,
-                        &order,
-                        &match_result,
-                        &mut position_cost_basis,
-                    )?;
-                    ledger.apply(LedgerTransaction {
-                        idempotency_key: format!("order:{}", command.idempotency_key),
-                        business_reference: command.command_id.clone(),
-                        transfers,
-                    })?;
-                }
-                CommandResult::Order {
-                    result: match_result,
+                enforce_user_position_limit(
+                    &ledger,
+                    &books,
+                    &bootstrap_executions,
+                    market,
+                    &order,
+                )?;
+                match &market.execution {
+                    MarketExecution::NativeClob => {
+                        let book = books.entry(order.market_id.clone()).or_default();
+                        let match_result = book.submit(order.clone(), now_millis)?;
+                        if match_result
+                            .accepted_order
+                            .as_ref()
+                            .is_some_and(|accepted| accepted.status != OrderStatus::Rejected)
+                        {
+                            let transfers = settlement_transfers(
+                                &self.books,
+                                &books,
+                                market,
+                                &order,
+                                &match_result,
+                            )?;
+                            apply_fill_cost_basis(
+                                &self.ledger,
+                                &self.books,
+                                &books,
+                                market,
+                                &order,
+                                &match_result,
+                                &mut position_cost_basis,
+                            )?;
+                            ledger.apply(LedgerTransaction {
+                                idempotency_key: format!("order:{}", command.idempotency_key),
+                                business_reference: command.command_id.clone(),
+                                transfers,
+                            })?;
+                        }
+                        audit_drafts = native_audit_drafts(&order, &match_result, market)?;
+                        CommandResult::Order {
+                            result: redact_match_result(match_result),
+                        }
+                    }
+                    MarketExecution::PolymarketBootstrap { .. } => {
+                        if !matches!(order.time_in_force, super::TimeInForce::Fok) {
+                            return Err(CoreError::InvalidOrder(
+                                "bootstrap execution requires fill-or-kill".into(),
+                            ));
+                        }
+                        if bootstrap_executions.contains_key(&order.order_id) {
+                            return Err(CoreError::DuplicateCommand);
+                        }
+                        enforce_pending_bootstrap_limit(&bootstrap_executions, market, &order)?;
+                        let reserved_atomic = bootstrap_reservation(&order, market)?;
+                        let (from, to) = match order.action {
+                            OrderAction::Buy => (
+                                available(&private_user_id, &market.settlement_asset),
+                                cash_hold(&order, &market.settlement_asset),
+                            ),
+                            OrderAction::Sell => (claim_position(&order), claim_hold(&order)),
+                        };
+                        ledger.apply(LedgerTransaction {
+                            idempotency_key: format!(
+                                "bootstrap-reserve:{}",
+                                command.idempotency_key
+                            ),
+                            business_reference: command.command_id.clone(),
+                            transfers: vec![Transfer {
+                                from,
+                                to,
+                                amount: reserved_atomic,
+                            }],
+                        })?;
+                        let view = BootstrapExecutionView {
+                            execution_id: order.order_id,
+                            market_id: order.market_id.clone(),
+                            outcome: order.outcome,
+                            action: order.action,
+                            limit_price_micros: order.price_micros,
+                            quantity_micros: order.quantity_micros,
+                            state: BootstrapExecutionState::FundsReserved,
+                            confirmed_price_micros: None,
+                            failure_code: None,
+                        };
+                        bootstrap_executions.insert(
+                            order.order_id,
+                            BootstrapExecution {
+                                view: view.clone(),
+                                private_user_id,
+                                reserved_atomic,
+                                venue_order_id: None,
+                                venue_evidence_hash: None,
+                                created_at_millis: now_millis,
+                            },
+                        );
+                        CommandResult::BootstrapPending { execution: view }
+                    }
                 }
             }
             UserCommandAction::CancelOrder {
@@ -890,7 +2066,11 @@ impl PrivateTradingCore {
                     business_reference: command.command_id.clone(),
                     transfers,
                 })?;
-                CommandResult::Cancelled { order }
+                let mut public_order = order;
+                public_order.private_user_id.clear();
+                CommandResult::Cancelled {
+                    order: public_order,
+                }
             }
             UserCommandAction::CompleteSet {
                 market_id,
@@ -911,12 +2091,29 @@ impl PrivateTradingCore {
                         "complete set violates market limits".into(),
                     ));
                 }
+                if matches!(direction, CompleteSetDirection::Mint) {
+                    for outcome in [Outcome::Up, Outcome::Down] {
+                        let projected = ledger
+                            .total_for_owner_asset(
+                                &private_user_id,
+                                &claim_asset(market_id, outcome),
+                            )
+                            .checked_add(*quantity_micros)
+                            .ok_or(CoreError::UnbalancedTransaction)?;
+                        if projected > market.maximum_user_position_micros {
+                            return Err(CoreError::InvalidOrder(
+                                "complete set exceeds the user position limit".into(),
+                            ));
+                        }
+                    }
+                }
                 apply_complete_set_cost_basis(
                     &ledger,
                     &mut position_cost_basis,
                     &private_user_id,
                     market_id,
                     *quantity_micros,
+                    settlement_atomic(market, *quantity_micros)?,
                     *direction,
                 )?;
                 ledger.apply_complete_set(CompleteSetTransaction {
@@ -925,6 +2122,7 @@ impl PrivateTradingCore {
                     market_id: market_id.clone(),
                     settlement_asset: market.settlement_asset.clone(),
                     quantity_micros: *quantity_micros,
+                    collateral_amount_atomic: settlement_atomic(market, *quantity_micros)?,
                     direction: *direction,
                 })?;
                 CommandResult::CompleteSet {
@@ -942,6 +2140,42 @@ impl PrivateTradingCore {
                     now_millis,
                 ),
             },
+            UserCommandAction::BootstrapStatus { execution_id } => {
+                let execution = bootstrap_executions
+                    .get(execution_id)
+                    .filter(|execution| execution.private_user_id == private_user_id)
+                    .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
+                CommandResult::BootstrapStatus {
+                    execution: execution.view.clone(),
+                }
+            }
+            UserCommandAction::CancelBootstrap { execution_id } => {
+                let execution = bootstrap_executions
+                    .get_mut(execution_id)
+                    .filter(|execution| execution.private_user_id == private_user_id)
+                    .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
+                if execution.view.state != BootstrapExecutionState::FundsReserved {
+                    return Err(CoreError::InvalidOrder(
+                        "venue-submitted execution requires confirmed venue cancellation".into(),
+                    ));
+                }
+                let market = self
+                    .markets
+                    .get(&execution.view.market_id)
+                    .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
+                release_bootstrap_hold(
+                    &mut ledger,
+                    execution,
+                    market,
+                    &format!("bootstrap-user-cancel:{}", command.idempotency_key),
+                    &command.command_id,
+                )?;
+                execution.view.state = BootstrapExecutionState::Failed;
+                execution.view.failure_code = Some("USER_CANCELLED".into());
+                CommandResult::BootstrapCancelled {
+                    execution: execution.view.clone(),
+                }
+            }
             UserCommandAction::RequestWithdrawal {
                 withdrawal_id,
                 chain,
@@ -950,6 +2184,21 @@ impl PrivateTradingCore {
                 destination,
             } => {
                 validate_withdrawal(chain, asset, *amount_atomic, destination)?;
+                let reservation_marker = withdrawal_reservation_marker(
+                    &command.session.request.session_id,
+                    *withdrawal_id,
+                    chain,
+                    asset,
+                    &amount_atomic.to_string(),
+                    destination,
+                )?;
+                if system_keys
+                    .iter()
+                    .any(|key| key.starts_with(&format!("withdrawal-reservation:{withdrawal_id}:")))
+                {
+                    return Err(CoreError::DuplicateCommand);
+                }
+                system_keys.insert(reservation_marker);
                 ledger.apply(LedgerTransaction {
                     idempotency_key: format!("withdrawal:{}", command.idempotency_key),
                     business_reference: withdrawal_id.to_string(),
@@ -986,10 +2235,12 @@ impl PrivateTradingCore {
             &self.markets,
             &sessions,
             &processed_hash_map,
-            &self.system_keys,
+            &system_keys,
             &position_cost_basis,
             &self.resolutions,
             &self.oracle_public_key,
+            &bootstrap_executions,
+            self.trading_frozen,
             next_sequence,
         );
         let journal_value = JournaledUserCommand {
@@ -1036,16 +2287,25 @@ impl PrivateTradingCore {
             }
             _ => None,
         };
+        let audit_fills = signed_audit_fills(
+            &self.receipt_signer,
+            &self.identity_key,
+            &receipt,
+            audit_drafts,
+        )?;
         let response = CoreResponse {
             result,
             receipt,
             encrypted_record: record,
             withdrawal_authorization,
+            audit_fills,
         };
         self.ledger = ledger;
         self.books = books;
         self.sessions = sessions;
         self.position_cost_basis = position_cost_basis;
+        self.bootstrap_executions = bootstrap_executions;
+        self.system_keys = system_keys;
         self.sequence = next_sequence;
         self.processed.insert(
             command.idempotency_key,
@@ -1108,6 +2368,8 @@ impl PrivateTradingCore {
         SystemResponse {
             receipt,
             encrypted_record,
+            audit_fills: Vec::new(),
+            evidence_commitment: None,
         }
     }
 }
@@ -1138,13 +2400,17 @@ fn settlement_transfers(
     let mut transfers = Vec::new();
     let incoming_cash_hold = cash_hold(incoming, &market.settlement_asset);
     let incoming_claim_hold = claim_hold(incoming);
-    let initial_notional = notional(incoming.price_micros, incoming.quantity_micros)?;
+    let initial_notional_micros = notional(incoming.price_micros, incoming.quantity_micros)?;
+    let initial_notional = settlement_atomic(market, initial_notional_micros)?;
     match incoming.action {
         OrderAction::Buy => transfers.push(Transfer {
             from: available(&incoming.private_user_id, &market.settlement_asset),
             to: incoming_cash_hold.clone(),
             amount: initial_notional
-                .checked_add(ceil_bps(initial_notional, 20)?)
+                .checked_add(settlement_atomic(
+                    market,
+                    ceil_bps(initial_notional_micros, 20)?,
+                )?)
                 .ok_or(CoreError::UnbalancedTransaction)?,
         }),
         OrderAction::Sell => transfers.push(Transfer {
@@ -1165,8 +2431,9 @@ fn settlement_transfers(
             .and_then(|book| book.order(fill.maker_order_id))
             .or_else(|| next_book.order(fill.maker_order_id))
             .ok_or_else(|| CoreError::InvalidOrder("maker order missing".into()))?;
-        let fill_notional = notional(fill.price_micros, fill.quantity_micros)?;
-        let taker_fee = ceil_bps(fill_notional, 20)?;
+        let fill_notional_micros = notional(fill.price_micros, fill.quantity_micros)?;
+        let fill_notional = settlement_atomic(market, fill_notional_micros)?;
+        let taker_fee = settlement_atomic(market, ceil_bps(fill_notional_micros, 20)?)?;
         let (buyer, seller, buyer_hold, seller_hold) = match incoming.action {
             OrderAction::Buy => (
                 incoming,
@@ -1228,9 +2495,15 @@ fn settlement_transfers(
     match incoming.action {
         OrderAction::Buy => {
             let initially_reserved = initial_notional
-                .checked_add(ceil_bps(initial_notional, 20)?)
+                .checked_add(settlement_atomic(
+                    market,
+                    ceil_bps(initial_notional_micros, 20)?,
+                )?)
                 .ok_or(CoreError::UnbalancedTransaction)?;
-            let desired_hold = notional(incoming.price_micros, accepted.remaining_micros)?;
+            let desired_hold = settlement_atomic(
+                market,
+                notional(incoming.price_micros, accepted.remaining_micros)?,
+            )?;
             let refund = initially_reserved
                 .checked_sub(incoming_cash_used)
                 .and_then(|value| value.checked_sub(desired_hold))
@@ -1266,6 +2539,7 @@ fn apply_fill_cost_basis(
     ledger: &Ledger,
     prior_books: &BTreeMap<String, PriceTimeBook>,
     next_books: &BTreeMap<String, PriceTimeBook>,
+    market: &MarketConfig,
     incoming: &BookOrder,
     result: &MatchResult,
     cost_basis: &mut BTreeMap<PositionKey, u128>,
@@ -1310,7 +2584,8 @@ fn apply_fill_cost_basis(
         *seller_quantity -= fill.quantity_micros;
 
         let buyer_key = position_key(&buyer.private_user_id, &buyer.market_id, buyer.outcome);
-        let acquisition_cost = notional(fill.price_micros, fill.quantity_micros)?;
+        let acquisition_cost =
+            settlement_atomic(market, notional(fill.price_micros, fill.quantity_micros)?)?;
         let buyer_basis = cost_basis.get(&buyer_key).copied().unwrap_or_default();
         cost_basis.insert(
             buyer_key,
@@ -1328,14 +2603,15 @@ fn apply_complete_set_cost_basis(
     owner: &str,
     market_id: &str,
     quantity_micros: u128,
+    collateral_amount_atomic: u128,
     direction: CompleteSetDirection,
 ) -> CoreResult<()> {
     let up_key = position_key(owner, market_id, Outcome::Up);
     let down_key = position_key(owner, market_id, Outcome::Down);
     match direction {
         CompleteSetDirection::Mint => {
-            let up_allocation = quantity_micros / 2;
-            let down_allocation = quantity_micros - up_allocation;
+            let up_allocation = collateral_amount_atomic / 2;
+            let down_allocation = collateral_amount_atomic - up_allocation;
             add_basis(cost_basis, up_key, up_allocation)?;
             add_basis(cost_basis, down_key, down_allocation)?;
         }
@@ -1390,6 +2666,32 @@ fn reduce_basis_for_quantity(
     Ok(())
 }
 
+fn reduce_basis_for_held_quantity(
+    ledger: &Ledger,
+    cost_basis: &mut BTreeMap<PositionKey, u128>,
+    key: PositionKey,
+    owner: &str,
+    market_id: &str,
+    outcome: Outcome,
+    quantity_micros: u128,
+) -> CoreResult<()> {
+    let current_quantity = ledger.total_for_owner_asset(owner, &claim_asset(market_id, outcome));
+    if current_quantity < quantity_micros {
+        return Err(CoreError::InsufficientBalance);
+    }
+    let current_basis = cost_basis.get(&key).copied().unwrap_or_default();
+    let removed = if current_quantity == quantity_micros {
+        current_basis
+    } else {
+        current_basis
+            .checked_mul(quantity_micros)
+            .ok_or(CoreError::UnbalancedTransaction)?
+            / current_quantity
+    };
+    cost_basis.insert(key, current_basis - removed);
+    Ok(())
+}
+
 fn add_basis(
     cost_basis: &mut BTreeMap<PositionKey, u128>,
     key: PositionKey,
@@ -1418,7 +2720,10 @@ fn cancellation_transfers(market: &MarketConfig, order: &BookOrder) -> CoreResul
         OrderAction::Buy => Transfer {
             from: cash_hold(order, &market.settlement_asset),
             to: available(&order.private_user_id, &market.settlement_asset),
-            amount: notional(order.price_micros, order.remaining_micros)?,
+            amount: settlement_atomic(
+                market,
+                notional(order.price_micros, order.remaining_micros)?,
+            )?,
         },
         OrderAction::Sell => Transfer {
             from: claim_hold(order),
@@ -1474,6 +2779,183 @@ fn claim_hold(order: &BookOrder) -> AccountKey {
     account
 }
 
+fn bootstrap_reservation(order: &BookOrder, market: &MarketConfig) -> CoreResult<u128> {
+    match order.action {
+        OrderAction::Buy => {
+            let maximum_notional = notional(order.price_micros, order.quantity_micros)?;
+            settlement_atomic(market, maximum_notional)?
+                .checked_add(settlement_atomic(market, ceil_bps(maximum_notional, 20)?)?)
+                .ok_or(CoreError::UnbalancedTransaction)
+        }
+        OrderAction::Sell => Ok(order.quantity_micros),
+    }
+}
+
+fn enforce_user_position_limit(
+    ledger: &Ledger,
+    books: &BTreeMap<String, PriceTimeBook>,
+    bootstrap_executions: &BTreeMap<Uuid, BootstrapExecution>,
+    market: &MarketConfig,
+    order: &BookOrder,
+) -> CoreResult<()> {
+    if order.action != OrderAction::Buy {
+        return Ok(());
+    }
+    let current_position = ledger.total_for_owner_asset(
+        &order.private_user_id,
+        &claim_asset(&order.market_id, order.outcome),
+    );
+    let native_resting_buys = books
+        .get(&order.market_id)
+        .map(|book| {
+            book.orders_for_owner(&order.private_user_id)
+                .into_iter()
+                .filter(|resting| {
+                    resting.outcome == order.outcome
+                        && resting.action == OrderAction::Buy
+                        && matches!(
+                            resting.status,
+                            OrderStatus::Open | OrderStatus::PartiallyFilled
+                        )
+                })
+                .try_fold(0u128, |total, resting| {
+                    total
+                        .checked_add(resting.remaining_micros)
+                        .ok_or(CoreError::UnbalancedTransaction)
+                })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let pending_bootstrap_buys = bootstrap_executions
+        .values()
+        .filter(|execution| {
+            execution.private_user_id == order.private_user_id
+                && execution.view.market_id == order.market_id
+                && execution.view.outcome == order.outcome
+                && execution.view.action == OrderAction::Buy
+                && matches!(
+                    execution.view.state,
+                    BootstrapExecutionState::FundsReserved
+                        | BootstrapExecutionState::VenueSubmitted
+                )
+        })
+        .try_fold(0u128, |total, execution| {
+            total
+                .checked_add(execution.view.quantity_micros)
+                .ok_or(CoreError::UnbalancedTransaction)
+        })?;
+    let projected = current_position
+        .checked_add(native_resting_buys)
+        .and_then(|value| value.checked_add(pending_bootstrap_buys))
+        .and_then(|value| value.checked_add(order.quantity_micros))
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    if projected > market.maximum_user_position_micros {
+        return Err(CoreError::InvalidOrder(
+            "order exceeds the user position limit".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn enforce_pending_bootstrap_limit(
+    bootstrap_executions: &BTreeMap<Uuid, BootstrapExecution>,
+    market: &MarketConfig,
+    order: &BookOrder,
+) -> CoreResult<()> {
+    let pending = bootstrap_executions
+        .values()
+        .filter(|execution| {
+            execution.view.market_id == order.market_id
+                && matches!(
+                    execution.view.state,
+                    BootstrapExecutionState::FundsReserved
+                        | BootstrapExecutionState::VenueSubmitted
+                )
+        })
+        .try_fold(0u128, |total, execution| {
+            total
+                .checked_add(notional(
+                    execution.view.limit_price_micros,
+                    execution.view.quantity_micros,
+                )?)
+                .ok_or(CoreError::UnbalancedTransaction)
+        })?;
+    let projected = pending
+        .checked_add(notional(order.price_micros, order.quantity_micros)?)
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    if projected > market.maximum_pending_bootstrap_notional_micros {
+        return Err(CoreError::InvalidOrder(
+            "order exceeds the pending venue exposure limit".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn bootstrap_order_salt(execution_id: Uuid) -> u64 {
+    let digest = Sha256::digest(
+        [
+            b"layrs.polymarket-order-salt.v1\0".as_slice(),
+            execution_id.as_bytes(),
+        ]
+        .concat(),
+    );
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    (u64::from_be_bytes(bytes) & ((1u64 << 53) - 1)).max(1)
+}
+
+fn bootstrap_hold(execution: &BootstrapExecution, market: &MarketConfig) -> AccountKey {
+    let synthetic = BookOrder::with_id(
+        execution.view.execution_id,
+        &execution.private_user_id,
+        &execution.view.market_id,
+        execution.view.outcome,
+        execution.view.action,
+        execution.view.limit_price_micros,
+        execution.view.quantity_micros,
+        super::TimeInForce::Fok,
+        None,
+    );
+    match execution.view.action {
+        OrderAction::Buy => cash_hold(&synthetic, &market.settlement_asset),
+        OrderAction::Sell => claim_hold(&synthetic),
+    }
+}
+
+fn release_bootstrap_hold(
+    ledger: &mut Ledger,
+    execution: &BootstrapExecution,
+    market: &MarketConfig,
+    idempotency_key: &str,
+    business_reference: &str,
+) -> CoreResult<()> {
+    let destination = match execution.view.action {
+        OrderAction::Buy => available(&execution.private_user_id, &market.settlement_asset),
+        OrderAction::Sell => claim_position_for(
+            &execution.private_user_id,
+            &execution.view.market_id,
+            execution.view.outcome,
+        ),
+    };
+    ledger.apply(LedgerTransaction {
+        idempotency_key: idempotency_key.into(),
+        business_reference: business_reference.into(),
+        transfers: vec![Transfer {
+            from: bootstrap_hold(execution, market),
+            to: destination,
+            amount: execution.reserved_atomic,
+        }],
+    })?;
+    Ok(())
+}
+
+fn venue_inventory(market_id: &str, outcome: Outcome, asset: &str) -> AccountKey {
+    let mut account = AccountKey::new("polymarket", AccountBucket::VenueInventory, asset);
+    account.market_id = Some(market_id.into());
+    account.outcome = Some(outcome_name(outcome).into());
+    account
+}
+
 fn outcome_name(outcome: Outcome) -> &'static str {
     match outcome {
         Outcome::Up => "UP",
@@ -1491,6 +2973,21 @@ fn notional(price_micros: u64, quantity_micros: u128) -> CoreResult<u128> {
         / PRICE_SCALE)
 }
 
+fn settlement_atomic(market: &MarketConfig, amount_micros: u128) -> CoreResult<u128> {
+    let scale = match market.settlement_decimals {
+        6 => 1,
+        18 => 1_000_000_000_000,
+        _ => {
+            return Err(CoreError::InvalidOrder(
+                "unsupported settlement decimals".into(),
+            ))
+        }
+    };
+    amount_micros
+        .checked_mul(scale)
+        .ok_or(CoreError::UnbalancedTransaction)
+}
+
 fn ceil_bps(amount: u128, bps: u128) -> CoreResult<u128> {
     if amount == 0 || bps == 0 {
         return Ok(0);
@@ -1502,22 +2999,203 @@ fn ceil_bps(amount: u128, bps: u128) -> CoreResult<u128> {
         .ok_or(CoreError::UnbalancedTransaction)
 }
 
+fn native_audit_drafts(
+    incoming: &BookOrder,
+    result: &MatchResult,
+    market: &MarketConfig,
+) -> CoreResult<Vec<AuditFillDraft>> {
+    let chain = match market.settlement_asset.as_str() {
+        "USDC" => "base",
+        "ZEN" => "horizen",
+        _ => {
+            return Err(CoreError::InvalidOrder(
+                "unsupported audit settlement asset".into(),
+            ))
+        }
+    };
+    result
+        .fills
+        .iter()
+        .map(|fill| {
+            let fill_notional = notional(fill.price_micros, fill.quantity_micros)?;
+            let (buyer, seller) = match incoming.action {
+                OrderAction::Buy => (
+                    fill.taker_private_user_id.clone(),
+                    fill.maker_private_user_id.clone(),
+                ),
+                OrderAction::Sell => (
+                    fill.maker_private_user_id.clone(),
+                    fill.taker_private_user_id.clone(),
+                ),
+            };
+            Ok(AuditFillDraft {
+                fill_id: fill.fill_id,
+                chain: chain.into(),
+                market_id: fill.market_id.clone(),
+                buyer_private_user_id: buyer,
+                seller_private_user_id: seller,
+                quantity_atomic: fill.quantity_micros,
+                price_micros: fill.price_micros,
+                fee_atomic: settlement_atomic(market, ceil_bps(fill_notional, 20)?)?,
+                nonce: fill.sequence,
+            })
+        })
+        .collect()
+}
+
+fn redact_match_result(mut result: MatchResult) -> MatchResult {
+    if let Some(order) = result.accepted_order.as_mut() {
+        order.private_user_id.clear();
+    }
+    for fill in &mut result.fills {
+        fill.maker_private_user_id.clear();
+        fill.taker_private_user_id.clear();
+    }
+    result
+}
+
+fn signed_audit_fills(
+    signer: &ReceiptSigner,
+    identity_key: &[u8; 32],
+    receipt: &EnclaveReceipt,
+    drafts: Vec<AuditFillDraft>,
+) -> CoreResult<Vec<SignedAuditFillArtifact>> {
+    drafts
+        .into_iter()
+        .map(|draft| {
+            if draft.price_micros == 0
+                || draft.price_micros >= PRICE_SCALE as u64
+                || draft.price_micros % 100 != 0
+            {
+                return Err(CoreError::InvalidOrder(
+                    "fill price cannot be represented by the audited settlement rail".into(),
+                ));
+            }
+            let statement = AuditFillStatement {
+                protocol_version: "layrs.audit-fill.v1".into(),
+                chain: draft.chain,
+                market_id_bytes32: market_id_bytes32(&draft.market_id),
+                market_id: draft.market_id,
+                buyer_one_time_pseudonym: one_time_pseudonym(
+                    identity_key,
+                    draft.fill_id,
+                    b"buyer",
+                    &draft.buyer_private_user_id,
+                ),
+                seller_one_time_pseudonym: one_time_pseudonym(
+                    identity_key,
+                    draft.fill_id,
+                    b"seller",
+                    &draft.seller_private_user_id,
+                ),
+                quantity_atomic: draft.quantity_atomic.to_string(),
+                price_micros: draft.price_micros,
+                fee_atomic: draft.fee_atomic.to_string(),
+                nonce: draft.nonce.to_string(),
+            };
+            let mut artifact = SignedAuditFillArtifact {
+                statement,
+                receipt_id: receipt.receipt_id.clone(),
+                state_root: receipt.state_root,
+                receipt_public_key: signer.verifying_key(),
+                signature: Vec::new(),
+            };
+            artifact.signature =
+                signer.sign_domain_payload(b"layrs.audit-fill-artifact.v1\0", &artifact);
+            Ok(artifact)
+        })
+        .collect()
+}
+
+fn one_time_pseudonym(
+    identity_key: &[u8; 32],
+    fill_id: Uuid,
+    role: &[u8],
+    private_user_id: &str,
+) -> String {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(identity_key)
+        .expect("HMAC accepts the fixed identity key");
+    mac.update(b"layrs.audit-one-time-pseudonym.v1\0");
+    mac.update(fill_id.as_bytes());
+    mac.update(&(role.len() as u32).to_be_bytes());
+    mac.update(role);
+    mac.update(private_user_id.as_bytes());
+    let digest = mac.finalize().into_bytes();
+    let mut address = [0u8; 20];
+    address.copy_from_slice(&digest[digest.len() - 20..]);
+    if address == [0u8; 20] {
+        address[19] = 1;
+    }
+    format!("0x{}", hex::encode(address))
+}
+
+fn market_id_bytes32(market_id: &str) -> String {
+    let mut hash = Keccak::v256();
+    let mut output = [0u8; 32];
+    hash.update(market_id.as_bytes());
+    hash.finalize(&mut output);
+    format!("0x{}", hex::encode(output))
+}
+
 fn validate_market(market: &MarketConfig, now_millis: i64) -> CoreResult<()> {
     if !market.market_id.starts_with("layrs:v1:")
-        || market.settlement_asset.is_empty()
+        || !matches!(
+            (market.settlement_asset.as_str(), market.settlement_decimals),
+            ("USDC", 6) | ("ZEN", 18)
+        )
         || market.opens_at_millis >= market.closes_at_millis
         || market.closes_at_millis <= now_millis
         || market.minimum_quantity_micros == 0
         || market.minimum_quantity_micros > market.maximum_quantity_micros
+        || market.minimum_order_notional_micros == 0
+        || market.minimum_order_notional_micros > market.maximum_order_notional_micros
+        || market.maximum_order_notional_micros == 0
+        || market.maximum_user_position_micros < market.maximum_quantity_micros
+        || market.maximum_pending_bootstrap_notional_micros < market.maximum_order_notional_micros
         || market.tick_size_micros == 0
         || market.tick_size_micros >= PRICE_SCALE as u64
+        || !market.tick_size_micros.is_multiple_of(100)
         || market.oracle_feed_id == 0
     {
         return Err(CoreError::InvalidOrder(
             "invalid market configuration".into(),
         ));
     }
+    if let MarketExecution::PolymarketBootstrap {
+        condition_id,
+        up_token_id,
+        down_token_id,
+        up_outcome_index,
+        down_outcome_index,
+        ..
+    } = &market.execution
+    {
+        if market.settlement_asset != "USDC"
+            || !valid_hex32(condition_id)
+            || !valid_decimal_token_id(up_token_id)
+            || !valid_decimal_token_id(down_token_id)
+            || up_token_id == down_token_id
+            || up_outcome_index == down_outcome_index
+        {
+            return Err(CoreError::InvalidOrder(
+                "invalid Polymarket bootstrap mapping".into(),
+            ));
+        }
+    }
     Ok(())
+}
+
+fn valid_hex32(value: &str) -> bool {
+    value.len() == 66
+        && value.starts_with("0x")
+        && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_decimal_token_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 78
+        && !(value.len() > 1 && value.starts_with('0'))
+        && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn validate_resolution(
@@ -1526,6 +3204,11 @@ fn validate_resolution(
     oracle_public_key: Option<[u8; 32]>,
     now_millis: i64,
 ) -> CoreResult<()> {
+    if !matches!(market.execution, MarketExecution::NativeClob) {
+        return Err(CoreError::InvalidResolution(
+            "Pyth boundary resolution is valid only for native markets".into(),
+        ));
+    }
     let statement = &signed.statement;
     if now_millis < market.closes_at_millis
         || statement.market_id != market.market_id
@@ -1549,6 +3232,46 @@ fn validate_resolution(
         .map_err(|_| CoreError::InvalidOracleSignature)?;
     key.verify(
         &resolution_signing_payload(statement)?,
+        &Signature::from_bytes(&signature_bytes),
+    )
+    .map_err(|_| CoreError::InvalidOracleSignature)
+}
+
+fn validate_polymarket_resolution(
+    market: &MarketConfig,
+    signed: &SignedPolymarketResolution,
+    oracle_public_key: Option<[u8; 32]>,
+    now_millis: i64,
+) -> CoreResult<()> {
+    let MarketExecution::PolymarketBootstrap { condition_id, .. } = &market.execution else {
+        return Err(CoreError::InvalidResolution(
+            "Polymarket condition resolution is valid only for bootstrap markets".into(),
+        ));
+    };
+    let statement = &signed.statement;
+    if now_millis < market.closes_at_millis
+        || statement.market_id != market.market_id
+        || &statement.condition_id != condition_id
+        || statement.evidence_hash == [0u8; 32]
+        || statement.redemption_transaction_hash == [0u8; 32]
+        || statement.redemption_block_number == 0
+        || statement.issued_at_millis < market.closes_at_millis
+        || statement.issued_at_millis > now_millis + 30_000
+    {
+        return Err(CoreError::InvalidResolution(
+            "Polymarket resolution timing, condition, or evidence is invalid".into(),
+        ));
+    }
+    let key =
+        VerifyingKey::from_bytes(&oracle_public_key.ok_or(CoreError::InvalidOracleSignature)?)
+            .map_err(|_| CoreError::InvalidOracleSignature)?;
+    let signature_bytes: [u8; 64] = signed
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| CoreError::InvalidOracleSignature)?;
+    key.verify(
+        &polymarket_resolution_signing_payload(statement)?,
         &Signature::from_bytes(&signature_bytes),
     )
     .map_err(|_| CoreError::InvalidOracleSignature)
@@ -1582,6 +3305,18 @@ pub fn resolution_signing_payload(statement: &ResolutionStatement) -> CoreResult
     Ok(payload)
 }
 
+pub fn polymarket_resolution_signing_payload(
+    statement: &PolymarketResolutionStatement,
+) -> CoreResult<Vec<u8>> {
+    let encoded = serde_json::to_vec(statement)
+        .map_err(|_| CoreError::InvalidResolution("cannot encode resolution".into()))?;
+    let mut payload = Vec::with_capacity(encoded.len() + 48);
+    payload.extend_from_slice(b"layrs.polymarket-resolution.v1\0");
+    payload.extend_from_slice(&(encoded.len() as u64).to_be_bytes());
+    payload.extend_from_slice(&encoded);
+    Ok(payload)
+}
+
 fn validate_order_for_market(
     order: &BookOrder,
     market: &MarketConfig,
@@ -1592,10 +3327,18 @@ fn validate_order_for_market(
     }
     if order.quantity_micros < market.minimum_quantity_micros
         || order.quantity_micros > market.maximum_quantity_micros
-        || order.price_micros % market.tick_size_micros != 0
+        || !order.price_micros.is_multiple_of(market.tick_size_micros)
     {
         return Err(CoreError::InvalidOrder(
             "order violates market limits".into(),
+        ));
+    }
+    let order_notional = notional(order.price_micros, order.quantity_micros)?;
+    if order_notional < market.minimum_order_notional_micros
+        || order_notional > market.maximum_order_notional_micros
+    {
+        return Err(CoreError::InvalidOrder(
+            "order violates the notional limits".into(),
         ));
     }
     if order
@@ -1682,6 +3425,9 @@ fn portfolio_snapshot(
         .values()
         .flat_map(|book| book.orders_for_owner(owner))
         .collect();
+    for order in &mut orders {
+        order.private_user_id.clear();
+    }
     orders.sort_by_key(|order| (order.market_id.clone(), order.sequence));
     PortfolioSnapshot {
         balances,
@@ -1709,11 +3455,14 @@ fn state_root(
     position_cost_basis: &BTreeMap<PositionKey, u128>,
     resolutions: &BTreeMap<String, MarketResolution>,
     oracle_public_key: &Option<[u8; 32]>,
+    bootstrap_executions: &BTreeMap<Uuid, BootstrapExecution>,
+    trading_frozen: bool,
     sequence: u64,
 ) -> [u8; 32] {
     let mut hash = Keccak::v256();
     hash.update(b"layrs.private-trading-core.v1\0");
     hash.update(&sequence.to_be_bytes());
+    hash.update(&[u8::from(trading_frozen)]);
     hash.update(&ledger.state_root());
     for value in [
         serde_json::to_vec(books),
@@ -1724,6 +3473,7 @@ fn state_root(
         serde_json::to_vec(&position_cost_basis.iter().collect::<Vec<_>>()),
         serde_json::to_vec(resolutions),
         serde_json::to_vec(oracle_public_key),
+        serde_json::to_vec(bootstrap_executions),
     ] {
         let encoded = value.expect("private core state serialization cannot fail");
         hash.update(&(encoded.len() as u64).to_be_bytes());
@@ -1732,4 +3482,37 @@ fn state_root(
     let mut output = [0u8; 32];
     hash.finalize(&mut output);
     output
+}
+
+fn withdrawal_reservation_marker(
+    session_id: &str,
+    withdrawal_id: Uuid,
+    chain: &str,
+    asset: &str,
+    amount_atomic: &str,
+    destination: &str,
+) -> CoreResult<String> {
+    if session_id.is_empty()
+        || session_id.len() > 128
+        || !matches!((chain, asset), ("base", "USDC") | ("horizen", "ZEN"))
+        || !amount_atomic.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(CoreError::InvalidOrder(
+            "invalid withdrawal reservation".into(),
+        ));
+    }
+    let canonical = serde_json::to_vec(&(
+        "layrs.withdrawal-reservation.v1",
+        session_id,
+        withdrawal_id,
+        chain,
+        asset,
+        amount_atomic,
+        destination.to_ascii_lowercase(),
+    ))
+    .map_err(|_| CoreError::InvalidOrder("invalid withdrawal reservation".into()))?;
+    Ok(format!(
+        "withdrawal-reservation:{withdrawal_id}:{}",
+        hex::encode(Sha256::digest(canonical)),
+    ))
 }

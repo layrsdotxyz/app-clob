@@ -46,19 +46,19 @@ pub struct MonitoringService {
 impl MonitoringService {
     pub fn new() -> Self {
         let mut configs = HashMap::new();
-        
+
         // Default alert configurations
         configs.insert(
             "high_error_rate".to_string(),
             AlertConfig {
                 name: "high_error_rate".to_string(),
                 severity: AlertSeverity::Error,
-                threshold: 0.05, // 5% error rate
+                threshold: 0.05,     // 5% error rate
                 window_seconds: 300, // 5 minutes
                 enabled: true,
             },
         );
-        
+
         configs.insert(
             "slow_response_time".to_string(),
             AlertConfig {
@@ -69,7 +69,7 @@ impl MonitoringService {
                 enabled: true,
             },
         );
-        
+
         configs.insert(
             "high_memory_usage".to_string(),
             AlertConfig {
@@ -80,7 +80,7 @@ impl MonitoringService {
                 enabled: true,
             },
         );
-        
+
         configs.insert(
             "redis_connection_failure".to_string(),
             AlertConfig {
@@ -91,7 +91,7 @@ impl MonitoringService {
                 enabled: true,
             },
         );
-        
+
         configs.insert(
             "order_matching_backlog".to_string(),
             AlertConfig {
@@ -114,14 +114,14 @@ impl MonitoringService {
     pub async fn record_metric(&self, name: &str, value: f64) {
         let timestamp = chrono::Utc::now().timestamp();
         let mut history = self.metrics_history.write().await;
-        
+
         let entry = history.entry(name.to_string()).or_insert_with(Vec::new);
         entry.push((timestamp, value));
-        
+
         // Keep only last hour of data
         let cutoff = timestamp - 3600;
         entry.retain(|(ts, _)| *ts > cutoff);
-        
+
         // Check if this triggers any alerts
         drop(history);
         self.check_alerts(name, value).await;
@@ -130,14 +130,14 @@ impl MonitoringService {
     /// Check if metric triggers any alerts
     async fn check_alerts(&self, metric_name: &str, current_value: f64) {
         let configs = self.configs.read().await;
-        
+
         let mut triggered_alerts = Vec::new();
-        
+
         for (alert_name, config) in configs.iter() {
             if !config.enabled {
                 continue;
             }
-            
+
             // Simple threshold check for now
             if current_value > config.threshold {
                 triggered_alerts.push(Alert {
@@ -153,9 +153,9 @@ impl MonitoringService {
                 });
             }
         }
-        
+
         drop(configs);
-        
+
         // Trigger all alerts after releasing the lock
         for alert in triggered_alerts {
             self.trigger_alert(alert).await;
@@ -189,13 +189,13 @@ impl MonitoringService {
         // Store alert
         let mut alerts = self.alerts.write().await;
         alerts.push(alert.clone());
-        
+
         // Keep only last 1000 alerts
         if alerts.len() > 1000 {
             let len = alerts.len();
             alerts.drain(0..len - 1000);
         }
-        
+
         let alert_payload = serde_json::json!({
             "name": alert.name,
             "severity": format!("{:?}", alert.severity),
@@ -255,7 +255,7 @@ impl MonitoringService {
     /// Check system health
     pub async fn check_health(&self) -> HashMap<String, String> {
         let mut health = HashMap::new();
-        
+
         // Check recent critical alerts
         let alerts = self.alerts.read().await;
         let recent_critical = alerts
@@ -265,22 +265,16 @@ impl MonitoringService {
                     && a.timestamp > chrono::Utc::now().timestamp() - 300
             })
             .count();
-        
+
         health.insert(
             "recent_critical_alerts".to_string(),
             recent_critical.to_string(),
         );
-        
-        health.insert(
-            "total_alerts".to_string(),
-            alerts.len().to_string(),
-        );
-        
-        health.insert(
-            "monitoring_status".to_string(),
-            "active".to_string(),
-        );
-        
+
+        health.insert("total_alerts".to_string(), alerts.len().to_string());
+
+        health.insert("monitoring_status".to_string(), "active".to_string());
+
         health
     }
 }
@@ -299,7 +293,7 @@ mod tests {
     async fn test_monitoring_creation() {
         let monitor = MonitoringService::new();
         let configs = monitor.get_alert_configs().await;
-        
+
         assert!(configs.contains_key("high_error_rate"));
         assert!(configs.contains_key("redis_connection_failure"));
     }
@@ -307,9 +301,9 @@ mod tests {
     #[tokio::test]
     async fn test_record_metric() {
         let monitor = MonitoringService::new();
-        
+
         monitor.record_metric("test_metric", 50.0).await;
-        
+
         let history = monitor.metrics_history.read().await;
         assert!(history.contains_key("test_metric"));
         assert_eq!(history.get("test_metric").unwrap().len(), 1);
@@ -318,10 +312,10 @@ mod tests {
     #[tokio::test]
     async fn test_alert_trigger() {
         let monitor = MonitoringService::new();
-        
+
         // Should trigger high_error_rate alert (threshold 0.05)
         monitor.record_metric("high_error_rate", 0.10).await;
-        
+
         let alerts = monitor.get_recent_alerts(10).await;
         assert!(!alerts.is_empty());
     }
@@ -329,7 +323,7 @@ mod tests {
     #[tokio::test]
     async fn test_update_config() {
         let monitor = MonitoringService::new();
-        
+
         let config = AlertConfig {
             name: "test_alert".to_string(),
             severity: AlertSeverity::Info,
@@ -337,9 +331,9 @@ mod tests {
             window_seconds: 60,
             enabled: true,
         };
-        
+
         monitor.update_alert_config(config.clone()).await;
-        
+
         let configs = monitor.get_alert_configs().await;
         assert!(configs.contains_key("test_alert"));
     }

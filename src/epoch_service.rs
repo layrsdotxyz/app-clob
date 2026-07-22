@@ -2,12 +2,12 @@
 
 use crate::{
     error::ClobResult,
+    metrics::Metrics,
     orderbook::OrderBookManager,
     proof_generation::{
         OrderMatchProver, ProverJobType, ProverPipeline, ORDER_MATCH_UNSUPPORTED_MESSAGE,
     },
     redis_store::RedisStore,
-    metrics::Metrics,
 };
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
@@ -91,7 +91,7 @@ impl EpochService {
     async fn process_epoch(&self) -> ClobResult<()> {
         // Get all markets
         let markets = self.orderbook.list_markets().await?;
-        
+
         for market_id in markets {
             match self.process_market_epoch(&market_id).await {
                 Ok(_) => {
@@ -118,8 +118,11 @@ impl EpochService {
     /// Process single market for current epoch
     async fn process_market_epoch(&self, market_id: &str) -> ClobResult<()> {
         // Get epoch trades
-        let trades = self.orderbook.get_epoch_trades(market_id, self.current_epoch).await?;
-        
+        let trades = self
+            .orderbook
+            .get_epoch_trades(market_id, self.current_epoch)
+            .await?;
+
         if trades.is_empty() {
             info!(
                 epoch_id = self.current_epoch,
@@ -137,11 +140,11 @@ impl EpochService {
             "ORDER_MATCH proof requested in deprecated build path"
         );
 
-        let proof_data = match self.prover.generate_order_match_proof(
-            self.current_epoch,
-            market_id,
-            &trades,
-        ).await {
+        let proof_data = match self
+            .prover
+            .generate_order_match_proof(self.current_epoch, market_id, &trades)
+            .await
+        {
             Ok(proof_data) => proof_data,
             Err(error) => {
                 warn!(
@@ -169,11 +172,14 @@ impl EpochService {
                 "market_id": market_id,
                 "num_trades": trades.len(),
             });
-            match pp.submit_job(
-                ProverJobType::PrivateYieldDistribution,
-                "private_yield_distribution",
-                &payload,
-            ).await {
+            match pp
+                .submit_job(
+                    ProverJobType::PrivateYieldDistribution,
+                    "private_yield_distribution",
+                    &payload,
+                )
+                .await
+            {
                 Ok(job) => info!(
                     epoch_id = self.current_epoch,
                     market_id = %market_id,
@@ -200,10 +206,10 @@ impl EpochService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::Metrics;
     use crate::orderbook::OrderBookManager;
     use crate::proof_generation::OrderMatchProver;
     use crate::redis_store::RedisStore;
-    use crate::metrics::Metrics;
     use mini_redis::server;
     use std::sync::Arc;
     use tokio::sync::oneshot;
@@ -213,7 +219,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
-            let _ = server::run(listener, async { let _ = rx.await; }).await;
+            let _ = server::run(listener, async {
+                let _ = rx.await;
+            })
+            .await;
         });
         let client = redis::Client::open(format!("redis://{}/", addr)).unwrap();
         let conn = redis::aio::ConnectionManager::new(client).await.unwrap();
@@ -227,13 +236,7 @@ mod tests {
         let orderbook = Arc::new(OrderBookManager::new(redis.clone(), metrics.clone(), None));
         let prover = Arc::new(OrderMatchProver::new(redis.clone()));
 
-        let service = EpochService::new(
-            orderbook,
-            prover,
-            redis.clone(),
-            metrics,
-            300,
-        );
+        let service = EpochService::new(orderbook, prover, redis.clone(), metrics, 300);
         assert_eq!(service.current_epoch, 0);
         assert_eq!(service.epoch_duration.as_secs(), 300);
     }

@@ -1,19 +1,11 @@
 use std::sync::Arc;
 
 use crate::{
-    balance_service::BalanceService,
-    config::Config,
-    database::Database,
-    matching::MatchingEngine,
-    metrics::Metrics,
-    orderbook::OrderBookManager,
-    prediction_market_relayer::PredictionMarketRelayer,
-    privacy::PrivacyStateService,
-    proof_generation::ProverPipeline,
-    redis_store::RedisStore,
-    settlement::SettlementEngine,
-    websocket::WebSocketManager,
-    withdrawal_service::WithdrawalService,
+    balance_service::BalanceService, config::Config, database::Database, matching::MatchingEngine,
+    metrics::Metrics, orderbook::OrderBookManager,
+    prediction_market_relayer::PredictionMarketRelayer, privacy::PrivacyStateService,
+    proof_generation::ProverPipeline, redis_store::RedisStore, settlement::SettlementEngine,
+    websocket::WebSocketManager, withdrawal_service::WithdrawalService,
 };
 
 /// Shared application state threaded through every Axum handler via `State<Arc<AppState>>`.
@@ -37,17 +29,6 @@ pub struct AppState {
     pub withdrawal_service: Option<Arc<WithdrawalService>>,
 }
 
-/// Lazily-initialised shared `Metrics` instance for test environments.
-///
-/// Prometheus's default registry panics (`AlreadyReg`) if the same metric name
-/// is registered twice in the same process. Using a `OnceLock` ensures every
-/// `AppState::for_test` call reuses the single already-registered `Metrics`.
-#[allow(dead_code)]
-fn once_test_metrics() -> Arc<Metrics> {
-    static METRICS: std::sync::OnceLock<Arc<Metrics>> = std::sync::OnceLock::new();
-    METRICS.get_or_init(|| Arc::new(Metrics::new())).clone()
-}
-
 impl AppState {
     /// Minimal test constructor — only populates the fields that the claims handler
     /// (`submit_public_claim`) and the trades handler (`get_recent_trades`) need.
@@ -60,7 +41,7 @@ impl AppState {
     ) -> Arc<Self> {
         use rust_decimal::Decimal;
 
-        let metrics = once_test_metrics();
+        let metrics = Metrics::test_instance();
         let balance_service = Arc::new(BalanceService::new(None));
         let orderbook_manager = Arc::new(OrderBookManager::new(
             redis_store.clone(),

@@ -6,19 +6,17 @@
 use std::sync::Arc;
 
 use ethers::{
-    abi::{encode, Token},
-    contract::Contract,
+    abi::Token,
     middleware::SignerMiddleware,
-    prelude::*,
-    providers::{Http, Provider, Middleware},
+    providers::{Http, Middleware, Provider},
     signers::{LocalWallet, Signer},
-    types::{Address, Bytes, TransactionRequest, U256, H256},
+    types::{Address, Bytes, TransactionRequest},
 };
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::{
     error::{ClobError, ClobResult},
-    proof_generation::{parse_honk_proof_from_output, HonkProof},
+    proof_generation::parse_honk_proof_from_output,
 };
 
 pub type EvmClient = SignerMiddleware<Provider<Http>, LocalWallet>;
@@ -106,7 +104,8 @@ impl EvmRelayer {
             .ok()?;
 
         let key = config.private_key.trim_start_matches("0x");
-        let wallet: LocalWallet = key.parse()
+        let wallet: LocalWallet = key
+            .parse()
             .map_err(|e| error!("EVM relayer: bad private key: {e}"))
             .ok()?;
         let wallet = wallet.with_chain_id(config.chain_id);
@@ -150,7 +149,11 @@ impl EvmRelayer {
     }
 
     pub fn treasury_address(&self) -> Option<Address> {
-        self.config.pm_usdc_treasury_address.as_deref()?.parse().ok()
+        self.config
+            .pm_usdc_treasury_address
+            .as_deref()?
+            .parse()
+            .ok()
     }
 
     /// Resolve the treasury address by token symbol.
@@ -225,17 +228,12 @@ impl EvmRelayer {
             })
             .collect();
 
-        let tokens = vec![
-            Token::Bytes(proof_bytes),
-            Token::FixedArray(input_tokens?),
-        ];
+        let tokens = vec![Token::Bytes(proof_bytes), Token::FixedArray(input_tokens?)];
 
         use ethers::abi::encode;
         let calldata: Bytes = [selector, encode(&tokens).as_slice()].concat().into();
 
-        let tx = TransactionRequest::new()
-            .to(vault_addr)
-            .data(calldata);
+        let tx = TransactionRequest::new().to(vault_addr).data(calldata);
 
         let pending = self
             .client
@@ -248,4 +246,3 @@ impl EvmRelayer {
         Ok(tx_hash)
     }
 }
-

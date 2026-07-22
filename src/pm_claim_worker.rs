@@ -11,7 +11,9 @@ use crate::{
     error::{ClobError, ClobResult},
     prediction_market_claims::{PredictionMarketClaimJob, PM_CLAIM_JOB_PREFIX, PM_CLAIM_QUEUE},
     prediction_market_relayer::PredictionMarketRelayer,
-    proof_generation::{ProverJobStatus, ProverJobType, ProverPipeline, parse_honk_proof_from_output},
+    proof_generation::{
+        parse_honk_proof_from_output, ProverJobStatus, ProverJobType, ProverPipeline,
+    },
     redis_store::RedisStore,
 };
 
@@ -33,12 +35,19 @@ impl PredictionMarketClaimWorker {
             store,
             prover_pipeline,
             relayer,
-            poll_interval: Duration::from_secs(if poll_interval_secs == 0 { 2 } else { poll_interval_secs }),
+            poll_interval: Duration::from_secs(if poll_interval_secs == 0 {
+                2
+            } else {
+                poll_interval_secs
+            }),
         }
     }
 
     pub async fn start(&self) -> ClobResult<()> {
-        info!(poll_interval_secs = self.poll_interval.as_secs(), "Prediction market claim worker started");
+        info!(
+            poll_interval_secs = self.poll_interval.as_secs(),
+            "Prediction market claim worker started"
+        );
         let mut ticker = interval(self.poll_interval);
 
         loop {
@@ -72,12 +81,18 @@ impl PredictionMarketClaimWorker {
                 .store
                 .get_optional(&claim_input_key)
                 .await?
-                .ok_or_else(|| ClobError::OrderNotFound(format!("missing claim input for job {}", job.job_id)))?;
+                .ok_or_else(|| {
+                    ClobError::OrderNotFound(format!("missing claim input for job {}", job.job_id))
+                })?;
             let input_payload: Value = serde_json::from_str(&raw_input)?;
 
             match self
                 .prover_pipeline
-                .submit_job(ProverJobType::PrivateMarketClaim, "pm_claim", &input_payload)
+                .submit_job(
+                    ProverJobType::PrivateMarketClaim,
+                    "pm_claim",
+                    &input_payload,
+                )
                 .await
             {
                 Ok(prover_job) => {
@@ -99,7 +114,11 @@ impl PredictionMarketClaimWorker {
     }
 
     async fn advance_jobs(&self) -> ClobResult<()> {
-        for key in self.store.scan_keys(&format!("{}*", PM_CLAIM_JOB_PREFIX)).await? {
+        for key in self
+            .store
+            .scan_keys(&format!("{}*", PM_CLAIM_JOB_PREFIX))
+            .await?
+        {
             let Some(payload) = self.store.get_optional(&key).await? else {
                 continue;
             };
@@ -107,7 +126,9 @@ impl PredictionMarketClaimWorker {
 
             match job.status.as_str() {
                 "proof_pending" => self.handle_proof_pending(&mut job).await?,
-                "relay_pending" | "relay_retry_pending" => self.handle_relay_pending(&mut job).await?,
+                "relay_pending" | "relay_retry_pending" => {
+                    self.handle_relay_pending(&mut job).await?
+                }
                 _ => {}
             }
         }
@@ -149,13 +170,20 @@ impl PredictionMarketClaimWorker {
 
     async fn handle_relay_pending(&self, job: &mut PredictionMarketClaimJob) -> ClobResult<()> {
         let Some(prover_job_id) = job.prover_job_id.as_deref() else {
-            return Err(ClobError::Internal("missing prover job id for claim relay".to_string()));
+            return Err(ClobError::Internal(
+                "missing prover job id for claim relay".to_string(),
+            ));
         };
         let output = self
             .prover_pipeline
             .get_output(prover_job_id)
             .await?
-            .ok_or_else(|| ClobError::ProofGenerationFailed(format!("proof output missing for {}", prover_job_id)))?;
+            .ok_or_else(|| {
+                ClobError::ProofGenerationFailed(format!(
+                    "proof output missing for {}",
+                    prover_job_id
+                ))
+            })?;
         let proof = parse_honk_proof_from_output(&output)?;
 
         let vault_override: Option<&str> = if job.vault_address.trim().is_empty() {
@@ -187,14 +215,21 @@ impl PredictionMarketClaimWorker {
     }
 
     async fn load_job(&self, job_id: &str) -> ClobResult<Option<PredictionMarketClaimJob>> {
-        let payload = self.store.get_optional(&format!("{}{}", PM_CLAIM_JOB_PREFIX, job_id)).await?;
+        let payload = self
+            .store
+            .get_optional(&format!("{}{}", PM_CLAIM_JOB_PREFIX, job_id))
+            .await?;
         payload
-            .map(|value| serde_json::from_str::<PredictionMarketClaimJob>(&value).map_err(ClobError::from))
+            .map(|value| {
+                serde_json::from_str::<PredictionMarketClaimJob>(&value).map_err(ClobError::from)
+            })
             .transpose()
     }
 
     async fn save_job(&self, job: &PredictionMarketClaimJob) -> ClobResult<()> {
-        self.store.set(&job.redis_key(), &serde_json::to_string(job)?).await
+        self.store
+            .set(&job.redis_key(), &serde_json::to_string(job)?)
+            .await
     }
 }
 
@@ -204,17 +239,16 @@ pub fn claim_input_key(job_id: &str) -> String {
 
 /// Parse the EVM recipient address from a hex string (with or without 0x prefix).
 fn parse_recipient(recipient: &str) -> ClobResult<Address> {
-    recipient
-        .parse::<Address>()
-        .map_err(|e| ClobError::InvalidHex(format!("invalid recipient address '{}': {}", recipient, e)))
+    recipient.parse::<Address>().map_err(|e| {
+        ClobError::InvalidHex(format!("invalid recipient address '{}': {}", recipient, e))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        prediction_market_relayer::PredictionMarketRelayer,
-        proof_generation::ProverPipeline,
+        prediction_market_relayer::PredictionMarketRelayer, proof_generation::ProverPipeline,
     };
     use mini_redis::server;
     use std::sync::Arc;
@@ -275,8 +309,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    async fn setup_claim_worker(
-    ) -> (
+    async fn setup_claim_worker() -> (
         PredictionMarketClaimWorker,
         Arc<RedisStore>,
         Arc<ProverPipeline>,
@@ -299,7 +332,10 @@ mod tests {
         let (tx, rx) = oneshot::channel::<()>();
 
         tokio::spawn(async move {
-            let _ = server::run(listener, async { let _ = rx.await; }).await;
+            let _ = server::run(listener, async {
+                let _ = rx.await;
+            })
+            .await;
         });
 
         let client = redis::Client::open(format!("redis://{}/", addr)).unwrap();
@@ -307,12 +343,8 @@ mod tests {
         let store = Arc::new(RedisStore::new(conn));
         let prover_pipeline = Arc::new(ProverPipeline::new(store.clone(), 1));
         let relayer = Arc::new(PredictionMarketRelayer::from_env(None).unwrap());
-        let worker = PredictionMarketClaimWorker::new(
-            store.clone(),
-            prover_pipeline.clone(),
-            relayer,
-            1,
-        );
+        let worker =
+            PredictionMarketClaimWorker::new(store.clone(), prover_pipeline.clone(), relayer, 1);
 
         (worker, store, prover_pipeline, tx)
     }
@@ -370,11 +402,12 @@ mod tests {
 
         worker.claim_new_jobs().await.unwrap();
 
-        let saved: PredictionMarketClaimJob = serde_json::from_str(
-            &store.get(&job.redis_key()).await.unwrap(),
-        )
-        .unwrap();
-        let prover_job_id = saved.prover_job_id.clone().expect("prover job should exist");
+        let saved: PredictionMarketClaimJob =
+            serde_json::from_str(&store.get(&job.redis_key()).await.unwrap()).unwrap();
+        let prover_job_id = saved
+            .prover_job_id
+            .clone()
+            .expect("prover job should exist");
         let prover_job = prover_pipeline
             .get_job(&prover_job_id)
             .await

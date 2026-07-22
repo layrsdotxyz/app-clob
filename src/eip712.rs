@@ -52,11 +52,11 @@ pub struct Eip712Order {
     pub order_id: U256,
     pub market_id: U256,
     pub maker: Address,
-    pub side: u8,  // 0 = BUY, 1 = SELL
-    pub price: U256,  // Basis points (0-10000)
+    pub side: u8,    // 0 = BUY, 1 = SELL
+    pub price: U256, // Basis points (0-10000)
     pub size: U256,
     pub nonce: U256,
-    pub expiry: U256,  // Unix timestamp
+    pub expiry: U256, // Unix timestamp
 }
 
 impl Eip712Order {
@@ -107,7 +107,11 @@ impl Eip712Order {
     }
 
     /// Verify the order signature
-    pub fn verify_signature(&self, domain: &Eip712Domain, signature: &Signature) -> Result<Address> {
+    pub fn verify_signature(
+        &self,
+        domain: &Eip712Domain,
+        signature: &Signature,
+    ) -> Result<Address> {
         let digest = self.digest(domain);
         let recovered = signature.recover(digest)?;
         Ok(recovered)
@@ -127,7 +131,11 @@ pub struct Eip712Signer {
 }
 
 impl Eip712Signer {
-    pub fn new(chain_id: u64, contract_address: Address, private_key: Option<&str>) -> Result<Self> {
+    pub fn new(
+        chain_id: u64,
+        contract_address: Address,
+        private_key: Option<&str>,
+    ) -> Result<Self> {
         let wallet = if let Some(key) = private_key {
             Some(key.parse()?)
         } else {
@@ -187,7 +195,7 @@ mod tests {
             order_id: U256::from(1),
             market_id: U256::from(1000000),
             maker: wallet.address(),
-            side: 0, // BUY
+            side: 0,                 // BUY
             price: U256::from(5000), // 50%
             size: U256::from(100),
             nonce: U256::from(1),

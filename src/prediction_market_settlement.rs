@@ -197,14 +197,17 @@ mod tests {
         assert_eq!(d.leg_role, leg.leg_role);
         assert_eq!(d.order_id, leg.order_id);
         assert_eq!(d.status, leg.status);
-        assert_eq!(d.position_side, true);
+        assert!(d.position_side);
     }
 
     #[test]
     fn job_optional_fields_omitted_when_none() {
         let job = sample_job();
         let v: serde_json::Value = serde_json::to_value(&job).unwrap();
-        assert!(v.get("proof_job_id").is_none(), "proof_job_id should be absent");
+        assert!(
+            v.get("proof_job_id").is_none(),
+            "proof_job_id should be absent"
+        );
         assert!(v.get("last_error").is_none(), "last_error should be absent");
     }
 

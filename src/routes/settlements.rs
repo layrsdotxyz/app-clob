@@ -76,8 +76,14 @@ pub async fn get_settlement_job(
     };
 
     // Users may only view jobs in which they are the maker or taker.
-    let maker_uid = job.get("maker_user_id").and_then(|v| v.as_str()).unwrap_or("");
-    let taker_uid = job.get("taker_user_id").and_then(|v| v.as_str()).unwrap_or("");
+    let maker_uid = job
+        .get("maker_user_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let taker_uid = job
+        .get("taker_user_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     if auth.user_id != maker_uid && auth.user_id != taker_uid {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -210,9 +216,9 @@ pub async fn submit_leg_witness(
         None => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    let leg_index = legs.iter().position(|leg| {
-        leg.get("leg_role").and_then(|v| v.as_str()) == Some(leg_role.as_str())
-    });
+    let leg_index = legs
+        .iter()
+        .position(|leg| leg.get("leg_role").and_then(|v| v.as_str()) == Some(leg_role.as_str()));
 
     let Some(idx) = leg_index else {
         return StatusCode::NOT_FOUND.into_response();
@@ -408,10 +414,18 @@ mod tests {
         let accepted: &[&str] = &["maker", "taker"];
         let rejected: &[&str] = &["", "Maker", "TAKER", "buyer", "seller", "maker "];
         for &role in accepted {
-            assert!(role == "maker" || role == "taker", "expected '{}' to be accepted", role);
+            assert!(
+                role == "maker" || role == "taker",
+                "expected '{}' to be accepted",
+                role
+            );
         }
         for &role in rejected {
-            assert!(role != "maker" && role != "taker", "expected '{}' to be rejected", role);
+            assert!(
+                role != "maker" && role != "taker",
+                "expected '{}' to be rejected",
+                role
+            );
         }
     }
 }

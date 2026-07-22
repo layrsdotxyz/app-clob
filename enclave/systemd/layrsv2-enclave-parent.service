@@ -1,0 +1,32 @@
+[Unit]
+Description=Layrs v2 ciphertext and fixed-egress Nitro parent
+After=network-online.target layrsv2-enclave.service
+Requires=layrsv2-enclave.service
+
+[Service]
+Type=simple
+User=layrsv2
+Group=layrsv2
+Environment=PORT=8443
+Environment=LAYRS_ENCLAVE_CID=16
+Environment=LAYRS_PARENT_MAX_CONCURRENCY=256
+ExecStart=/opt/layrsv2/layrs-enclave-parent
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

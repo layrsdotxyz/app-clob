@@ -67,7 +67,10 @@ pub fn pseudo_id(address: &str) -> String {
     k.update(address.as_bytes());
     let mut out = [0u8; 32];
     k.finalize(&mut out);
-    format!("usr-{:08x}", u32::from_be_bytes([out[0], out[1], out[2], out[3]]))
+    format!(
+        "usr-{:08x}",
+        u32::from_be_bytes([out[0], out[1], out[2], out[3]])
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -177,7 +180,11 @@ mod tests {
     #[test]
     fn pseudo_id_format() {
         let alias = pseudo_id("0xABCDEF");
-        assert!(alias.starts_with("usr-"), "alias should start with 'usr-': {}", alias);
+        assert!(
+            alias.starts_with("usr-"),
+            "alias should start with 'usr-': {}",
+            alias
+        );
         assert_eq!(alias.len(), 12, "alias should be 12 chars: {}", alias);
     }
 
@@ -196,14 +203,7 @@ mod tests {
     // require_auth middleware tests
     // -----------------------------------------------------------------------
 
-    use axum::{
-        body::Body,
-        extract::Extension,
-        http::Request,
-        middleware,
-        routing::get,
-        Router,
-    };
+    use axum::{body::Body, extract::Extension, http::Request, middleware, routing::get, Router};
     use tower::ServiceExt; // for `oneshot`
 
     fn auth_router() -> Router {
@@ -242,7 +242,10 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/test")
-                    .header("x-wallet-address", "0x1234567890abcdef1234567890abcdef12345678")
+                    .header(
+                        "x-wallet-address",
+                        "0x1234567890abcdef1234567890abcdef12345678",
+                    )
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -272,7 +275,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 256).await.unwrap();
-        assert_eq!(body.as_ref(), addr.as_bytes());
+        assert_eq!(body.as_ref(), addr.to_lowercase().as_bytes());
     }
 
     #[tokio::test]

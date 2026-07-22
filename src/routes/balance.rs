@@ -1,18 +1,22 @@
-use axum::{extract::{Extension, Query, State}, http::{HeaderMap, StatusCode}, Json};
+use axum::{
+    extract::{Extension, Query, State},
+    http::{HeaderMap, StatusCode},
+    Json,
+};
 use chrono::Utc;
-use uuid::Uuid;
+use ethers::types::U256;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::str::FromStr;
+use std::sync::Arc;
 use tempfile::tempdir;
-use ethers::types::U256;
+use uuid::Uuid;
 
 use crate::{auth::AuthenticatedUser, proof_generation::HonkProof, AppState};
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-pub(crate) enum AmountValue {
+pub enum AmountValue {
     String(String),
     Number(i64),
     Float(f64),
@@ -75,7 +79,9 @@ pub async fn deposit_balance(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let amount = req.amount.to_decimal()
+    let amount = req
+        .amount
+        .to_decimal()
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // Normalize wallet addresses to lowercase so deposits and order-time
@@ -91,7 +97,9 @@ pub async fn deposit_balance(
 
     let new_balance = state.balance_service.get_total_balance(&user_id, "USDC");
     let reserved = state.balance_service.get_reserved_balance(&user_id, "USDC");
-    let available = state.balance_service.get_available_balance(&user_id, "USDC");
+    let available = state
+        .balance_service
+        .get_available_balance(&user_id, "USDC");
     state.ws_manager.send_balance_update(
         &user_id,
         &new_balance.to_string(),
@@ -236,7 +244,10 @@ pub struct BalanceProofResponse {
 ///   BB_BIN                  — path to the `bb` binary (default: "bb").
 ///
 /// Returns Ok(true) when verification ran, Ok(false) when skipped (not configured).
-async fn verify_honk_balance_proof(honk_proof_hex: &str, public_inputs: &[String]) -> Result<bool, String> {
+async fn verify_honk_balance_proof(
+    honk_proof_hex: &str,
+    public_inputs: &[String],
+) -> Result<bool, String> {
     let vk_dir = match std::env::var("BALANCE_PROOF_BB_VK_DIR") {
         Ok(v) if !v.is_empty() => v,
         _ => {
@@ -250,26 +261,22 @@ async fn verify_honk_balance_proof(honk_proof_hex: &str, public_inputs: &[String
     let bb_bin = std::env::var("BB_BIN").unwrap_or_else(|_| "bb".to_string());
 
     let proof_hex = honk_proof_hex.trim_start_matches("0x");
-    let proof_bytes = hex::decode(proof_hex)
-        .map_err(|e| format!("invalid proof hex: {e}"))?;
+    let proof_bytes = hex::decode(proof_hex).map_err(|e| format!("invalid proof hex: {e}"))?;
 
     let tmp = tempdir().map_err(|e| format!("tempdir: {e}"))?;
 
     // bb reads ./target/proof and ./target/public_inputs relative to its CWD.
     let target_dir = tmp.path().join("target");
-    std::fs::create_dir_all(&target_dir)
-        .map_err(|e| format!("create target dir: {e}"))?;
+    std::fs::create_dir_all(&target_dir).map_err(|e| format!("create target dir: {e}"))?;
 
     let proof_path = target_dir.join("proof");
-    std::fs::write(&proof_path, &proof_bytes)
-        .map_err(|e| format!("write proof: {e}"))?;
+    std::fs::write(&proof_path, &proof_bytes).map_err(|e| format!("write proof: {e}"))?;
 
     // Serialize public inputs as concatenated 32-byte big-endian field elements.
     let mut pi_bytes = Vec::with_capacity(public_inputs.len() * 32);
     for (i, s) in public_inputs.iter().enumerate() {
         let hex = s.trim_start_matches("0x").trim_start_matches("0X");
-        let bytes = hex::decode(hex)
-            .map_err(|e| format!("public_inputs[{i}] invalid hex: {e}"))?;
+        let bytes = hex::decode(hex).map_err(|e| format!("public_inputs[{i}] invalid hex: {e}"))?;
         if bytes.len() > 32 {
             return Err(format!("public_inputs[{i}] exceeds 32 bytes"));
         }
@@ -287,10 +294,14 @@ async fn verify_honk_balance_proof(honk_proof_hex: &str, public_inputs: &[String
     let result = tokio::task::spawn_blocking(move || {
         std::process::Command::new(&bb_bin)
             .arg("verify")
-            .arg("--scheme").arg("ultra_honk")
-            .arg("--verifier_target").arg("evm")
-            .arg("-k").arg(&vk_path)
-            .arg("-p").arg(&proof_str)
+            .arg("--scheme")
+            .arg("ultra_honk")
+            .arg("--verifier_target")
+            .arg("evm")
+            .arg("-k")
+            .arg(&vk_path)
+            .arg("-p")
+            .arg(&proof_str)
             .current_dir(&tmp_path)
             .output()
     })
@@ -348,9 +359,9 @@ pub async fn submit_balance_proof(
     // enter the matching engine and cause stuck settlements.
     // Skipped (with a warning) when BALANCE_PROOF_BB_VK_DIR is not configured.
     match verify_honk_balance_proof(&req.honk_proof_hex, &req.public_inputs).await {
-        Ok(true)  => tracing::info!("balance proof cryptographically verified via bb"),
+        Ok(true) => tracing::info!("balance proof cryptographically verified via bb"),
         Ok(false) => { /* warned inside verify_honk_balance_proof */ }
-        Err(e)    => return Err(reject(&format!("proof verification failed: {e}"))),
+        Err(e) => return Err(reject(&format!("proof verification failed: {e}"))),
     }
 
     // Double-spend check.
@@ -420,21 +431,37 @@ pub async fn submit_balance_proof(
         let required_amount_hex = req.public_inputs.get(2).cloned().unwrap_or_default();
         tokio::spawn(async move {
             let order_commitment = match crate::prediction_market_relayer::decode_bytes32_pub(
-                &order_commitment_hex, "order_commitment"
+                &order_commitment_hex,
+                "order_commitment",
             ) {
                 Ok(v) => v,
-                Err(e) => { tracing::warn!("lockCollateral: bad order_commitment: {e}"); return; }
+                Err(e) => {
+                    tracing::warn!("lockCollateral: bad order_commitment: {e}");
+                    return;
+                }
             };
             let required_amount = match parse_u256_from_hex(&required_amount_hex) {
                 Ok(v) => v,
-                Err(e) => { tracing::warn!("lockCollateral: bad required_amount: {e}"); return; }
+                Err(e) => {
+                    tracing::warn!("lockCollateral: bad required_amount: {e}");
+                    return;
+                }
             };
-            if let Err(e) = relayer.lock_collateral(
-                order_commitment, required_amount, lock_expiry_ts, &proof, None
-            ).await {
+            if let Err(e) = relayer
+                .lock_collateral(
+                    order_commitment,
+                    required_amount,
+                    lock_expiry_ts,
+                    &proof,
+                    None,
+                )
+                .await
+            {
                 tracing::warn!("lockCollateral on-chain failed: {e}");
             } else {
-                tracing::info!("lockCollateral on-chain succeeded for commitment {order_commitment_hex}");
+                tracing::info!(
+                    "lockCollateral on-chain succeeded for commitment {order_commitment_hex}"
+                );
             }
         });
     }

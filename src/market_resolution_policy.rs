@@ -67,14 +67,26 @@ pub struct OraclePolicy {
 impl OraclePolicy {
     pub fn from_env() -> Self {
         Self {
-            resolution_sla_secs: read_u64_env("PM_ORACLE_RESOLUTION_SLA_SECS", DEFAULT_RESOLUTION_SLA_SECS),
-            dispute_after_secs: read_u64_env("PM_ORACLE_DISPUTE_AFTER_SECS", DEFAULT_DISPUTE_AFTER_SECS),
-            invalidate_after_secs: read_u64_env("PM_ORACLE_INVALIDATE_AFTER_SECS", DEFAULT_INVALIDATE_AFTER_SECS),
+            resolution_sla_secs: read_u64_env(
+                "PM_ORACLE_RESOLUTION_SLA_SECS",
+                DEFAULT_RESOLUTION_SLA_SECS,
+            ),
+            dispute_after_secs: read_u64_env(
+                "PM_ORACLE_DISPUTE_AFTER_SECS",
+                DEFAULT_DISPUTE_AFTER_SECS,
+            ),
+            invalidate_after_secs: read_u64_env(
+                "PM_ORACLE_INVALIDATE_AFTER_SECS",
+                DEFAULT_INVALIDATE_AFTER_SECS,
+            ),
             max_source_deviation_bps: read_u64_env(
                 "PM_ORACLE_MAX_SOURCE_DEVIATION_BPS",
                 DEFAULT_MAX_SOURCE_DEVIATION_BPS,
             ),
-            max_hourly_move_bps: read_u64_env("PM_ORACLE_MAX_HOURLY_MOVE_BPS", DEFAULT_MAX_HOURLY_MOVE_BPS),
+            max_hourly_move_bps: read_u64_env(
+                "PM_ORACLE_MAX_HOURLY_MOVE_BPS",
+                DEFAULT_MAX_HOURLY_MOVE_BPS,
+            ),
         }
     }
 }
@@ -264,7 +276,11 @@ pub fn create_audit_record(
     }
 }
 
-fn filter_sane_price(price: Option<Decimal>, strike_price: Option<Decimal>, policy: &OraclePolicy) -> Option<Decimal> {
+fn filter_sane_price(
+    price: Option<Decimal>,
+    strike_price: Option<Decimal>,
+    policy: &OraclePolicy,
+) -> Option<Decimal> {
     let price = price?;
     if price <= Decimal::ZERO {
         return None;
@@ -330,7 +346,11 @@ mod tests {
         );
 
         match decision {
-            OracleResolutionDecision::Resolve { source, source_deviation_bps, .. } => {
+            OracleResolutionDecision::Resolve {
+                source,
+                source_deviation_bps,
+                ..
+            } => {
                 assert_eq!(source, "coinbase");
                 assert!(source_deviation_bps.unwrap() < policy.max_source_deviation_bps);
             }

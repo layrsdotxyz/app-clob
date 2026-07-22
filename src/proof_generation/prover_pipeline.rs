@@ -232,7 +232,11 @@ mod tests {
 
         let stored = pipeline.get_job(&claimed.job_id).await.unwrap().unwrap();
         assert_eq!(stored.status, ProverJobStatus::Completed);
-        assert!(pipeline.get_output(&claimed.job_id).await.unwrap().is_some());
+        assert!(pipeline
+            .get_output(&claimed.job_id)
+            .await
+            .unwrap()
+            .is_some());
 
         let _ = shutdown.send(());
     }

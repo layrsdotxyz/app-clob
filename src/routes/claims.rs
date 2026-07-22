@@ -14,17 +14,13 @@
 /// 8. Return 200 `{ "tx_hash": "0x..." }`.
 use std::sync::Arc;
 
-use axum::{
-    extract::State,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, response::IntoResponse, Json};
 use ethers::types::Address;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{ClobError, ClobResult},
-    proof_generation::{HonkProof, parse_honk_proof_from_output},
+    proof_generation::{parse_honk_proof_from_output, HonkProof},
     AppState,
 };
 
@@ -64,9 +60,10 @@ pub async fn submit_public_claim(
     Json(req): Json<PermissionlessClaimRequest>,
 ) -> ClobResult<impl IntoResponse> {
     // 1. Parse recipient address.
-    let recipient: Address = req.recipient.parse().map_err(|e| {
-        ClobError::InvalidOrder(format!("invalid recipient address: {e}"))
-    })?;
+    let recipient: Address = req
+        .recipient
+        .parse()
+        .map_err(|e| ClobError::InvalidOrder(format!("invalid recipient address: {e}")))?;
 
     // 2. Validate UltraHonk proof structure.
     let proof_json = serde_json::json!({
@@ -145,12 +142,7 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::oneshot;
 
-    async fn setup_claim_state(
-    ) -> (
-        Arc<AppState>,
-        Arc<PrivacyStateService>,
-        oneshot::Sender<()>,
-    ) {
+    async fn setup_claim_state() -> (Arc<AppState>, Arc<PrivacyStateService>, oneshot::Sender<()>) {
         std::env::set_var("REDIS_COMPAT_DISABLE_SET_NX", "true");
         std::env::set_var("REDIS_COMPAT_DISABLE_EXISTS", "true");
 
@@ -159,7 +151,10 @@ mod tests {
         let (tx, rx) = oneshot::channel::<()>();
 
         tokio::spawn(async move {
-            let _ = server::run(listener, async { let _ = rx.await; }).await;
+            let _ = server::run(listener, async {
+                let _ = rx.await;
+            })
+            .await;
         });
 
         let client = redis::Client::open(format!("redis://{}/", addr)).unwrap();

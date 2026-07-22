@@ -1,4 +1,9 @@
-use crate::{auth::AuthenticatedUser, error::{ClobError, ClobResult}, models::*, AppState};
+use crate::{
+    auth::AuthenticatedUser,
+    error::{ClobError, ClobResult},
+    models::*,
+    AppState,
+};
 use axum::{
     extract::{Extension, Path, Query, State},
     http::StatusCode,
@@ -119,21 +124,23 @@ pub async fn create_order(
 
     // Submit to matching engine
     let result = state.matching_engine.submit_order(order).await?;
-    
+
     // Broadcast order updates
-    state.ws_manager.send_order_update(&result.order.user_id, &result.order);
-    
+    state
+        .ws_manager
+        .send_order_update(&result.order.user_id, &result.order);
+
     // Broadcast trades
     for trade in &result.trades {
         state.ws_manager.broadcast_trade(trade);
     }
-    
+
     let response = CreateOrderResponse {
         order: result.order,
         fills: result.fills,
         trades: result.trades,
     };
-    
+
     Ok((StatusCode::CREATED, Json(response)))
 }
 
@@ -142,15 +149,19 @@ pub async fn cancel_order(
     Path(order_id): Path<Uuid>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> ClobResult<impl IntoResponse> {
-    let raw_user_id = params.get("user_id")
-        .ok_or_else(|| crate::error::ClobError::Unauthorized("user_id query parameter required".to_string()))?;
+    let raw_user_id = params.get("user_id").ok_or_else(|| {
+        crate::error::ClobError::Unauthorized("user_id query parameter required".to_string())
+    })?;
     let user_id = raw_user_id.trim().to_lowercase();
 
-    let order = state.matching_engine.cancel_order(order_id, &user_id).await?;
-    
+    let order = state
+        .matching_engine
+        .cancel_order(order_id, &user_id)
+        .await?;
+
     // Broadcast order update
     state.ws_manager.send_order_update(&order.user_id, &order);
-    
+
     Ok(Json(order))
 }
 
@@ -163,7 +174,7 @@ pub async fn get_order(
         .get_order(order_id)
         .await?
         .ok_or_else(|| crate::error::ClobError::OrderNotFound(order_id.to_string()))?;
-    
+
     Ok(Json(order))
 }
 
@@ -171,7 +182,10 @@ pub async fn get_user_orders(
     State(state): State<Arc<AppState>>,
     Path(user_id): Path<String>,
 ) -> ClobResult<impl IntoResponse> {
-    let orders = state.orderbook_manager.get_user_orders(&user_id.trim().to_lowercase()).await?;
+    let orders = state
+        .orderbook_manager
+        .get_user_orders(&user_id.trim().to_lowercase())
+        .await?;
     Ok(Json(orders))
 }
 
@@ -198,7 +212,9 @@ pub async fn flush_market_orderbook(
         .flush_market_orderbook(&market_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({ "market_id": market_id, "flushed": flushed })))
+    Ok(Json(
+        serde_json::json!({ "market_id": market_id, "flushed": flushed }),
+    ))
 }
 
 // ─── Commit-Reveal order placement ──────────────────────────────────────────
@@ -308,7 +324,13 @@ pub async fn commit_order(
         .set_with_expiry(&key, &serde_json::to_string(&record)?, COMMIT_TTL_SECS)
         .await?;
 
-    Ok((StatusCode::CREATED, Json(CommitOrderResponse { commit_id, expires_at })))
+    Ok((
+        StatusCode::CREATED,
+        Json(CommitOrderResponse {
+            commit_id,
+            expires_at,
+        }),
+    ))
 }
 
 /// POST /v1/orders/reveal
@@ -327,16 +349,12 @@ pub async fn reveal_order(
 
     // Load the commit record.
     let key = format!("commit:{}", req.commit_id);
-    let record_json = state
-        .redis_store
-        .get_optional(&key)
-        .await?
-        .ok_or_else(|| {
-            ClobError::OrderNotFound(format!(
-                "commit {} not found or already consumed",
-                req.commit_id
-            ))
-        })?;
+    let record_json = state.redis_store.get_optional(&key).await?.ok_or_else(|| {
+        ClobError::OrderNotFound(format!(
+            "commit {} not found or already consumed",
+            req.commit_id
+        ))
+    })?;
 
     let record: CommitRecord = serde_json::from_str(&record_json)
         .map_err(|e| ClobError::Other(format!("corrupt commit record: {e}")))?;
@@ -382,9 +400,11 @@ pub async fn reveal_order(
         .settlement_engine
         .check_balance_with_proof(&record.note_nullifier_hash)
         .await
-        .map_err(|_| ClobError::InvalidOrder(
-            "no valid balance proof found — submit POST /v1/balance/proof first".to_string(),
-        ))?;
+        .map_err(|_| {
+            ClobError::InvalidOrder(
+                "no valid balance proof found — submit POST /v1/balance/proof first".to_string(),
+            )
+        })?;
 
     // Atomically claim the nullifier before placing the order.
     state
@@ -413,7 +433,9 @@ pub async fn reveal_order(
     order.market_id_uint = parse_pm_market_id(&record.market_id);
 
     let result = state.matching_engine.submit_order(order).await?;
-    state.ws_manager.send_order_update(&result.order.user_id, &result.order);
+    state
+        .ws_manager
+        .send_order_update(&result.order.user_id, &result.order);
     for trade in &result.trades {
         state.ws_manager.broadcast_trade(trade);
     }

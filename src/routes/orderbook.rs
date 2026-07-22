@@ -22,10 +22,11 @@ pub async fn get_orderbook(
     Path(market_id): Path<String>,
     Query(query): Query<OrderBookQuery>,
 ) -> ClobResult<impl IntoResponse> {
-    let orderbook = state.orderbook_manager
+    let orderbook = state
+        .orderbook_manager
         .get_orderbook(&market_id, query.depth)
         .await?;
-    
+
     Ok(Json(orderbook))
 }
 
@@ -44,10 +45,11 @@ pub async fn get_depth(
     Path(market_id): Path<String>,
     Query(query): Query<DepthQuery>,
 ) -> ClobResult<impl IntoResponse> {
-    let orderbook = state.orderbook_manager
+    let orderbook = state
+        .orderbook_manager
         .get_orderbook(&market_id, query.levels)
         .await?;
-    
+
     // Format as depth chart data
     let depth_data = serde_json::json!({
         "market_id": market_id,
@@ -69,6 +71,6 @@ pub async fn get_depth(
         }).collect::<Vec<_>>(),
         "timestamp": orderbook.timestamp,
     });
-    
+
     Ok(Json(depth_data))
 }

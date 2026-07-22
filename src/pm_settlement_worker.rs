@@ -3,7 +3,6 @@ use std::sync::Arc;
 use num_bigint::BigUint;
 use num_traits::{Num, ToPrimitive};
 use serde::Deserialize;
-use serde_json::json;
 use tokio::time::{interval, Duration};
 use tracing::{info, warn};
 
@@ -11,8 +10,13 @@ use crate::{
     error::{ClobError, ClobResult},
     poseidon2,
     prediction_market_relayer::PredictionMarketRelayer,
-    prediction_market_settlement::{PredictionMarketSettlementJob, PM_SETTLEMENT_JOB_PREFIX, PM_SETTLEMENT_QUEUE},
-    proof_generation::{ProverJobStatus, ProverJobType, ProverPipeline, parse_honk_proof_from_output, low_high_hex_to_bytes32, parse_u128_hex},
+    prediction_market_settlement::{
+        PredictionMarketSettlementJob, PM_SETTLEMENT_JOB_PREFIX, PM_SETTLEMENT_QUEUE,
+    },
+    proof_generation::{
+        low_high_hex_to_bytes32, parse_honk_proof_from_output, parse_u128_hex, ProverJobStatus,
+        ProverJobType, ProverPipeline,
+    },
     proof_observability,
     redis_store::RedisStore,
     websocket::WebSocketManager,
@@ -39,7 +43,11 @@ impl PredictionMarketSettlementWorker {
             prover_pipeline,
             relayer,
             ws_manager,
-            poll_interval: Duration::from_secs(if poll_interval_secs == 0 { 2 } else { poll_interval_secs }),
+            poll_interval: Duration::from_secs(if poll_interval_secs == 0 {
+                2
+            } else {
+                poll_interval_secs
+            }),
         }
     }
 
@@ -89,7 +97,8 @@ impl PredictionMarketSettlementWorker {
 
                     if let Err(e) = fill_settlement_commitments(&mut proof_input) {
                         job.legs[leg_index].status = "proof_submission_failed".to_string();
-                        job.legs[leg_index].last_error = Some(format!("commitment computation failed: {}", e));
+                        job.legs[leg_index].last_error =
+                            Some(format!("commitment computation failed: {}", e));
                         job.settlement_status = "proof_submission_failed".to_string();
                         job.last_error = Some(e.to_string());
                         self.save_job(&job).await?;
@@ -136,10 +145,17 @@ impl PredictionMarketSettlementWorker {
                             // Update observability with prover job id.
                             if !attempt_id.is_empty() {
                                 let _ = proof_observability::update_attempt(
-                                    &self.store, &attempt_id, "running",
+                                    &self.store,
+                                    &attempt_id,
+                                    "running",
                                     Some(&proof_job.job_id),
-                                    None, None, None, None, None,
-                                ).await;
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                )
+                                .await;
                             }
                             info!(
                                 settlement_job_id = %job.job_id,
@@ -156,9 +172,17 @@ impl PredictionMarketSettlementWorker {
                             job.last_error = Some(e.to_string());
                             if !attempt_id.is_empty() {
                                 let _ = proof_observability::update_attempt(
-                                    &self.store, &attempt_id, "verify_failed",
-                                    None, None, None, Some(e.to_string()), None, None,
-                                ).await;
+                                    &self.store,
+                                    &attempt_id,
+                                    "verify_failed",
+                                    None,
+                                    None,
+                                    None,
+                                    Some(e.to_string()),
+                                    None,
+                                    None,
+                                )
+                                .await;
                             }
                             self.save_job(&job).await?;
                             warn!(
@@ -202,7 +226,11 @@ impl PredictionMarketSettlementWorker {
     }
 
     async fn advance_jobs(&self) -> ClobResult<()> {
-        for key in self.store.scan_keys(&format!("{}*", PM_SETTLEMENT_JOB_PREFIX)).await? {
+        for key in self
+            .store
+            .scan_keys(&format!("{}*", PM_SETTLEMENT_JOB_PREFIX))
+            .await?
+        {
             let Some(payload) = self.store.get_optional(&key).await? else {
                 continue;
             };
@@ -213,7 +241,9 @@ impl PredictionMarketSettlementWorker {
                     let status = job.legs[idx].status.clone();
                     match status.as_str() {
                         "proof_pending" => self.handle_leg_proof_pending(&mut job, idx).await?,
-                        "relay_pending" | "relay_retry_pending" => self.handle_leg_relay_pending(&mut job, idx).await?,
+                        "relay_pending" | "relay_retry_pending" => {
+                            self.handle_leg_relay_pending(&mut job, idx).await?
+                        }
                         _ => {}
                     }
                 }
@@ -223,18 +253,16 @@ impl PredictionMarketSettlementWorker {
                     .iter()
                     .filter(|leg| leg.status == "settled")
                     .count();
-                job.last_error = job
-                    .legs
-                    .iter()
-                    .rev()
-                    .find_map(|leg| leg.last_error.clone());
+                job.last_error = job.legs.iter().rev().find_map(|leg| leg.last_error.clone());
                 self.save_job(&job).await?;
                 continue;
             }
 
             match job.settlement_status.as_str() {
                 "proof_pending" => self.handle_proof_pending(&mut job).await?,
-                "relay_pending" | "relay_retry_pending" => self.handle_relay_pending(&mut job).await?,
+                "relay_pending" | "relay_retry_pending" => {
+                    self.handle_relay_pending(&mut job).await?
+                }
                 _ => {}
             }
         }
@@ -279,7 +307,9 @@ impl PredictionMarketSettlementWorker {
         leg_index: usize,
     ) -> ClobResult<()> {
         let Some(proof_job_id) = job.legs[leg_index].proof_job_id.clone() else {
-            return Err(ClobError::Internal("missing proof job id for PM settlement leg relay".to_string()));
+            return Err(ClobError::Internal(
+                "missing proof job id for PM settlement leg relay".to_string(),
+            ));
         };
         let Some(output) = self.prover_pipeline.get_output(&proof_job_id).await? else {
             return Err(ClobError::ProofGenerationFailed(format!(
@@ -300,7 +330,10 @@ impl PredictionMarketSettlementWorker {
             .settle_fill(
                 leg.market_id_onchain,
                 leg.position_side,
-                low_high_hex_to_bytes32(&leg.spent_note_nullifier_low, &leg.spent_note_nullifier_high)?,
+                low_high_hex_to_bytes32(
+                    &leg.spent_note_nullifier_low,
+                    &leg.spent_note_nullifier_high,
+                )?,
                 parse_u128_hex(&leg.pot_contribution_low, "pot_contribution")?,
                 parse_u128_hex(&leg.position_payout_units_low, "position_payout_units")?,
                 parse_u128_hex(&leg.trade_fee_amount_low, "trade_fee_amount")?,
@@ -315,14 +348,26 @@ impl PredictionMarketSettlementWorker {
                 job.legs[leg_index].relay_tx_hash = Some(tx_hash.clone());
                 job.legs[leg_index].status = "settled".to_string();
                 job.legs[leg_index].last_error = None;
-                if !job.settlement_txs.iter().any(|existing| existing == &tx_hash) {
+                if !job
+                    .settlement_txs
+                    .iter()
+                    .any(|existing| existing == &tx_hash)
+                {
                     job.settlement_txs.push(tx_hash.clone());
                 }
                 if let Some(ref aid) = attempt_id {
                     let _ = proof_observability::update_attempt(
-                        &self.store, aid, "submitted",
-                        None, None, None, None, None, Some(tx_hash.clone()),
-                    ).await;
+                        &self.store,
+                        aid,
+                        "submitted",
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(tx_hash.clone()),
+                    )
+                    .await;
                 }
 
                 // Write settlement_tx back to the Trade so frontend can show explorer link.
@@ -387,12 +432,7 @@ impl PredictionMarketSettlementWorker {
                 let market_id = job.market_id.clone();
                 let trade_id = job.trade_id.clone();
                 self.ws_manager.send_fill_event(
-                    &user_id,
-                    &market_id,
-                    &fill_size,
-                    &side_str,
-                    &trade_id,
-                    &tx_hash,
+                    &user_id, &market_id, &fill_size, &side_str, &trade_id, &tx_hash,
                 );
 
                 Ok(())
@@ -400,9 +440,17 @@ impl PredictionMarketSettlementWorker {
             Err(e) => {
                 if let Some(ref aid) = attempt_id {
                     let _ = proof_observability::update_attempt(
-                        &self.store, aid, "submit_failed",
-                        None, None, None, Some(e.to_string()), None, None,
-                    ).await;
+                        &self.store,
+                        aid,
+                        "submit_failed",
+                        None,
+                        None,
+                        None,
+                        Some(e.to_string()),
+                        None,
+                        None,
+                    )
+                    .await;
                 }
                 job.legs[leg_index].status = "relay_retry_pending".to_string();
                 job.legs[leg_index].last_error = Some(e.to_string());
@@ -411,7 +459,10 @@ impl PredictionMarketSettlementWorker {
         }
     }
 
-    async fn handle_proof_pending(&self, job: &mut PredictionMarketSettlementJob) -> ClobResult<()> {
+    async fn handle_proof_pending(
+        &self,
+        job: &mut PredictionMarketSettlementJob,
+    ) -> ClobResult<()> {
         let Some(proof_job_id) = job.proof_job_id.as_deref() else {
             job.settlement_status = "proof_submission_failed".to_string();
             job.last_error = Some("missing proof job id".to_string());
@@ -442,9 +493,14 @@ impl PredictionMarketSettlementWorker {
         }
     }
 
-    async fn handle_relay_pending(&self, job: &mut PredictionMarketSettlementJob) -> ClobResult<()> {
+    async fn handle_relay_pending(
+        &self,
+        job: &mut PredictionMarketSettlementJob,
+    ) -> ClobResult<()> {
         let Some(proof_job_id) = job.proof_job_id.as_deref() else {
-            return Err(ClobError::Internal("missing proof job id for relay step".to_string()));
+            return Err(ClobError::Internal(
+                "missing proof job id for relay step".to_string(),
+            ));
         };
         let Some(output) = self.prover_pipeline.get_output(proof_job_id).await? else {
             return Err(ClobError::ProofGenerationFailed(format!(
@@ -476,7 +532,10 @@ impl PredictionMarketSettlementWorker {
                 .settle_fill(
                     leg.market_id,
                     leg.position_side,
-                    low_high_hex_to_bytes32(&leg.spent_note_nullifier_low, &leg.spent_note_nullifier_high)?,
+                    low_high_hex_to_bytes32(
+                        &leg.spent_note_nullifier_low,
+                        &leg.spent_note_nullifier_high,
+                    )?,
                     parse_u128_hex(&leg.pot_contribution_low, "pot_contribution")?,
                     parse_u128_hex(&leg.position_payout_units_low, "position_payout_units")?,
                     parse_u128_hex(&leg.trade_fee_amount_low, "trade_fee_amount")?,
@@ -492,7 +551,8 @@ impl PredictionMarketSettlementWorker {
                     let trade_id = job.trade_id.clone();
                     let tx_clone = tx_hash.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = store.update_trade_settlement_tx(&trade_id, &tx_clone).await {
+                        if let Err(e) = store.update_trade_settlement_tx(&trade_id, &tx_clone).await
+                        {
                             tracing::warn!(trade_id = %trade_id, error = %e, "Failed to write settlement_tx to Trade");
                         }
                     });
@@ -585,7 +645,10 @@ impl PredictionMarketSettlementWorker {
         let key = format!("{}{}", PM_SETTLEMENT_JOB_PREFIX, job_id);
         let payload = self.store.get_optional(&key).await?;
         payload
-            .map(|value| serde_json::from_str::<PredictionMarketSettlementJob>(&value).map_err(ClobError::from))
+            .map(|value| {
+                serde_json::from_str::<PredictionMarketSettlementJob>(&value)
+                    .map_err(ClobError::from)
+            })
             .transpose()
     }
 
@@ -603,15 +666,19 @@ impl PredictionMarketSettlementWorker {
 /// placeholders. This function recomputes them from the private inputs so `bb execute` gets
 /// a fully consistent Prover.toml.
 fn fill_settlement_commitments(proof_input: &mut serde_json::Value) -> ClobResult<()> {
-    fn parse_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> ClobResult<[u8; 32]> {
-        let s = obj.get(key)
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ClobError::Internal(format!("pm_settlement proof_input missing field: {}", key)))?;
+    fn parse_field(
+        obj: &serde_json::Map<String, serde_json::Value>,
+        key: &str,
+    ) -> ClobResult<[u8; 32]> {
+        let s = obj.get(key).and_then(|v| v.as_str()).ok_or_else(|| {
+            ClobError::Internal(format!("pm_settlement proof_input missing field: {}", key))
+        })?;
         let n = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
             BigUint::from_str_radix(hex, 16)
         } else {
             BigUint::from_str_radix(s, 10)
-        }.map_err(|e| ClobError::Internal(format!("invalid pm_settlement field {}: {}", key, e)))?;
+        }
+        .map_err(|e| ClobError::Internal(format!("invalid pm_settlement field {}: {}", key, e)))?;
         let raw = n.to_bytes_be();
         let mut out = [0u8; 32];
         let start = 32usize.saturating_sub(raw.len());
@@ -623,11 +690,13 @@ fn fill_settlement_commitments(proof_input: &mut serde_json::Value) -> ClobResul
         BigUint::from_bytes_be(b).to_str_radix(10)
     }
 
-    let obj = proof_input.as_object_mut()
-        .ok_or_else(|| ClobError::Internal("pm_settlement proof_input must be a JSON object".to_string()))?;
+    let obj = proof_input.as_object_mut().ok_or_else(|| {
+        ClobError::Internal("pm_settlement proof_input must be a JSON object".to_string())
+    })?;
 
     // Skip if already computed (non-zero placeholder injected by an earlier run).
-    let already_computed = obj.get("receiver_commitment")
+    let already_computed = obj
+        .get("receiver_commitment")
         .and_then(|v| v.as_str())
         .map(|s| s != "0" && s != "0x0" && !s.is_empty())
         .unwrap_or(false);
@@ -636,23 +705,39 @@ fn fill_settlement_commitments(proof_input: &mut serde_json::Value) -> ClobResul
     }
 
     let receiver_key_hash = parse_field(obj, "receiver_key_hash")?;
-    let receiver_amount   = parse_field(obj, "receiver_amount")?;
-    let receiver_blind    = parse_field(obj, "receiver_blind")?;
-    let receiver_nonce    = parse_field(obj, "receiver_nonce")?;
-    let asset_domain      = parse_field(obj, "asset_domain")?;
-    let owner_key_hash    = parse_field(obj, "owner_key_hash")?;
-    let change_amount     = parse_field(obj, "change_amount")?;
-    let change_blind      = parse_field(obj, "change_blind")?;
-    let change_nonce      = parse_field(obj, "change_nonce")?;
+    let receiver_amount = parse_field(obj, "receiver_amount")?;
+    let receiver_blind = parse_field(obj, "receiver_blind")?;
+    let receiver_nonce = parse_field(obj, "receiver_nonce")?;
+    let asset_domain = parse_field(obj, "asset_domain")?;
+    let owner_key_hash = parse_field(obj, "owner_key_hash")?;
+    let change_amount = parse_field(obj, "change_amount")?;
+    let change_blind = parse_field(obj, "change_blind")?;
+    let change_nonce = parse_field(obj, "change_nonce")?;
 
     let recv_amount_commit = poseidon2::hash_2(&receiver_amount, &receiver_blind)?;
-    let receiver_commitment = poseidon2::hash_4(&receiver_key_hash, &recv_amount_commit, &asset_domain, &receiver_nonce)?;
+    let receiver_commitment = poseidon2::hash_4(
+        &receiver_key_hash,
+        &recv_amount_commit,
+        &asset_domain,
+        &receiver_nonce,
+    )?;
 
     let chg_amount_commit = poseidon2::hash_2(&change_amount, &change_blind)?;
-    let change_commitment = poseidon2::hash_4(&owner_key_hash, &chg_amount_commit, &asset_domain, &change_nonce)?;
+    let change_commitment = poseidon2::hash_4(
+        &owner_key_hash,
+        &chg_amount_commit,
+        &asset_domain,
+        &change_nonce,
+    )?;
 
-    obj.insert("receiver_commitment".to_string(), serde_json::Value::String(biguint_to_decimal(&receiver_commitment)));
-    obj.insert("change_commitment".to_string(),   serde_json::Value::String(biguint_to_decimal(&change_commitment)));
+    obj.insert(
+        "receiver_commitment".to_string(),
+        serde_json::Value::String(biguint_to_decimal(&receiver_commitment)),
+    );
+    obj.insert(
+        "change_commitment".to_string(),
+        serde_json::Value::String(biguint_to_decimal(&change_commitment)),
+    );
 
     Ok(())
 }
@@ -690,7 +775,9 @@ struct SettlementPublicSignals {
 
 fn parse_settlement_output(output: &str) -> ClobResult<Vec<SettlementLeg>> {
     let envelope: SettlementProofOutput = serde_json::from_str(output).map_err(|_| {
-        ClobError::ProofGenerationFailed("unsupported PM settlement proof output format".to_string())
+        ClobError::ProofGenerationFailed(
+            "unsupported PM settlement proof output format".to_string(),
+        )
     })?;
     let signals = parse_settlement_public_signals(&envelope.public_signals)?;
 
@@ -708,7 +795,9 @@ fn parse_settlement_output(output: &str) -> ClobResult<Vec<SettlementLeg>> {
     }])
 }
 
-fn parse_settlement_public_signals(public_signals: &[String]) -> ClobResult<SettlementPublicSignals> {
+fn parse_settlement_public_signals(
+    public_signals: &[String],
+) -> ClobResult<SettlementPublicSignals> {
     if public_signals.len() != 12 {
         return Err(ClobError::ProofGenerationFailed(format!(
             "PM settlement proof output expected 12 public signals, got {}",
@@ -754,7 +843,10 @@ fn parse_biguint_signal(value: &str, label: &str) -> ClobResult<BigUint> {
         )));
     }
 
-    let parsed = if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+    let parsed = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
         BigUint::from_str_radix(hex, 16)
     } else {
         BigUint::from_str_radix(trimmed, 10)
@@ -782,10 +874,18 @@ fn summarize_job_status(job: &PredictionMarketSettlementJob) -> String {
     if job.legs.is_empty() {
         return job.settlement_status.clone();
     }
-    if job.legs.iter().any(|leg| leg.status == "relay_retry_pending") {
+    if job
+        .legs
+        .iter()
+        .any(|leg| leg.status == "relay_retry_pending")
+    {
         return "relay_retry_pending".to_string();
     }
-    if job.legs.iter().any(|leg| leg.status == "proof_failed" || leg.status == "proof_submission_failed") {
+    if job
+        .legs
+        .iter()
+        .any(|leg| leg.status == "proof_failed" || leg.status == "proof_submission_failed")
+    {
         return "proof_failed".to_string();
     }
     if job.legs.iter().all(|leg| leg.status == "settled") {
@@ -798,6 +898,16 @@ fn summarize_job_status(job: &PredictionMarketSettlementJob) -> String {
         return "proof_pending".to_string();
     }
     "pending_proof_generation".to_string()
+}
+
+// parse_felt_vec / parse_felt replaced by proof_generation::low_high_hex_to_bytes32
+// and proof_generation::parse_u128_hex for EVM ABI encoding.
+
+#[allow(dead_code)]
+fn _legacy_parse_felt_placeholder(value: &str, label: &str) -> ClobResult<()> {
+    // Kept as tombstone only; removed Starknet dependency.
+    let _ = (value, label);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -886,14 +996,3 @@ mod tests {
         assert_eq!(summarize_job_status(&job), "pending_proof_generation");
     }
 }
-
-// parse_felt_vec / parse_felt replaced by proof_generation::low_high_hex_to_bytes32
-// and proof_generation::parse_u128_hex for EVM ABI encoding.
-
-#[allow(dead_code)]
-fn _legacy_parse_felt_placeholder(value: &str, label: &str) -> ClobResult<()> {
-    // Kept as tombstone only; removed Starknet dependency.
-    let _ = (value, label);
-    Ok(())
-}
-

@@ -61,7 +61,14 @@ impl SettlementEngine {
         balance_service: Arc<BalanceService>,
         ws_manager: Arc<WebSocketManager>,
     ) -> Self {
-        Self { store, database, maker_fee_bps, taker_fee_bps, balance_service, ws_manager }
+        Self {
+            store,
+            database,
+            maker_fee_bps,
+            taker_fee_bps,
+            balance_service,
+            ws_manager,
+        }
     }
 
     /// Read the current in-memory balance for `user_id` and push it to their WS channel.
@@ -103,14 +110,14 @@ impl SettlementEngine {
     ) -> ClobResult<()> {
         let required = self.calculate_required_balance(order);
         let available = self.get_user_balance(user_id, market_id).await?;
-        
+
         if available < required {
             return Err(ClobError::InsufficientBalance {
                 required,
                 available,
             });
         }
-        
+
         // Reserve balance for order
         self.reserve_balance(user_id, market_id, required).await?;
         self.push_balance_update(user_id);
@@ -128,7 +135,11 @@ impl SettlementEngine {
     /// Calculate fee for a fill
     pub fn calculate_fee(&self, size: Decimal, price: Decimal, is_maker: bool) -> Decimal {
         let notional = size * price;
-        let fee_bps = if is_maker { self.maker_fee_bps } else { self.taker_fee_bps };
+        let fee_bps = if is_maker {
+            self.maker_fee_bps
+        } else {
+            self.taker_fee_bps
+        };
         notional * Decimal::from(fee_bps) / Decimal::from(10_000)
     }
 
@@ -142,12 +153,18 @@ impl SettlementEngine {
         // Save trade to Redis (primary fast path)
         self.store.save_trade(trade).await?;
 
-        if let Err(error) = self.update_balances_for_trade(trade, maker_fill, taker_fill).await {
+        if let Err(error) = self
+            .update_balances_for_trade(trade, maker_fill, taker_fill)
+            .await
+        {
             let _ = self.store.delete_trade(trade).await;
             return Err(error);
         }
 
-        if let Err(error) = self.enqueue_trade_persistence(trade, maker_fill, taker_fill).await {
+        if let Err(error) = self
+            .enqueue_trade_persistence(trade, maker_fill, taker_fill)
+            .await
+        {
             let _ = self.rollback_trade(trade).await;
             let _ = self.store.delete_trade(trade).await;
             return Err(error);
@@ -194,7 +211,9 @@ impl SettlementEngine {
             OrderSide::Sell => &trade.maker_user_id,
         };
 
-        self.store.increment_position(&pos_key, buyer_id, trade.size).await
+        self.store
+            .increment_position(&pos_key, buyer_id, trade.size)
+            .await
     }
 
     pub fn start_trade_persistence_worker(self: Arc<Self>) -> Option<JoinHandle<()>> {
@@ -279,10 +298,16 @@ impl SettlementEngine {
 
     /// Rollback a trade (used for FOK cancellation — credits both sides back).
     pub async fn rollback_trade(&self, trade: &Trade) -> ClobResult<()> {
-        let maker_cost = trade.price * trade.size * (Decimal::ONE + Decimal::from(self.maker_fee_bps) / Decimal::from(10_000));
-        let taker_cost = trade.price * trade.size * (Decimal::ONE + Decimal::from(self.taker_fee_bps) / Decimal::from(10_000));
-        self.balance_service.credit(&trade.maker_user_id, "USDC", maker_cost);
-        self.balance_service.credit(&trade.taker_user_id, "USDC", taker_cost);
+        let maker_cost = trade.price
+            * trade.size
+            * (Decimal::ONE + Decimal::from(self.maker_fee_bps) / Decimal::from(10_000));
+        let taker_cost = trade.price
+            * trade.size
+            * (Decimal::ONE + Decimal::from(self.taker_fee_bps) / Decimal::from(10_000));
+        self.balance_service
+            .credit(&trade.maker_user_id, "USDC", maker_cost);
+        self.balance_service
+            .credit(&trade.taker_user_id, "USDC", taker_cost);
         self.push_balance_update(&trade.maker_user_id);
         self.push_balance_update(&trade.taker_user_id);
         tracing::debug!(
@@ -301,7 +326,8 @@ impl SettlementEngine {
     pub async fn release_order_balance(&self, order: &Order) -> ClobResult<()> {
         let notional = order.remaining * order.price;
         let fee = self.calculate_fee(order.remaining, order.price, false);
-        self.release_balance(&order.user_id, &order.market_id, notional + fee).await?;
+        self.release_balance(&order.user_id, &order.market_id, notional + fee)
+            .await?;
         self.push_balance_update(&order.user_id);
         Ok(())
     }
@@ -339,10 +365,7 @@ impl SettlementEngine {
         // All realistic PM amounts fit in 128 bits so high == "0x0".
         fn to_low_high(d: Decimal) -> (String, String) {
             // Convert to u128 (saturating at max — actual amounts are well below 2^128).
-            let raw = d
-                .mantissa()
-                .unsigned_abs()
-                .min(u128::MAX as u128) as u128;
+            let raw = d.mantissa().unsigned_abs();
             (format!("0x{:x}", raw), "0x0".to_string())
         }
 
@@ -373,7 +396,7 @@ impl SettlementEngine {
             leg_role: user_role.to_string(),
             order_id: user_order.id.to_string(),
             user_id: user_order.user_id.clone(),
-            side: user_order.side.clone(),
+            side: user_order.side,
             fill_size: user_fill.size.to_string(),
             fill_price: user_fill.price.to_string(),
             fee_amount: user_fill.fee.to_string(),
@@ -409,8 +432,8 @@ impl SettlementEngine {
             taker_order_id: taker_order.id.to_string(),
             maker_user_id: maker_order.user_id.clone(),
             taker_user_id: taker_order.user_id.clone(),
-            maker_side: maker_order.side.clone(),
-            taker_side: taker_order.side.clone(),
+            maker_side: maker_order.side,
+            taker_side: taker_order.side,
             maker_note_nullifier_low: "0x0".to_string(),
             maker_note_nullifier_high: "0x0".to_string(),
             taker_note_nullifier_low: "0x0".to_string(),
@@ -465,7 +488,8 @@ impl SettlementEngine {
         _market_id: &str,
         amount: Decimal,
     ) -> ClobResult<()> {
-        self.balance_service.reserve_balance(user_id, "USDC", amount)
+        self.balance_service
+            .reserve_balance(user_id, "USDC", amount)
     }
 
     async fn release_balance(
@@ -474,7 +498,8 @@ impl SettlementEngine {
         _market_id: &str,
         amount: Decimal,
     ) -> ClobResult<()> {
-        self.balance_service.release_balance(user_id, "USDC", amount)
+        self.balance_service
+            .release_balance(user_id, "USDC", amount)
     }
 
     async fn enqueue_trade_persistence(
@@ -519,11 +544,13 @@ impl SettlementEngine {
         // Maker: release reserved (the order commitment), then debit the fill cost.
         // The reserved amount was size*price+fee; debit the actual fill cost+fee.
         let maker_cost = maker_fill.size * maker_fill.price + maker_fill.fee;
-        self.balance_service.debit(&trade.maker_user_id, "USDC", maker_cost)?;
+        self.balance_service
+            .debit(&trade.maker_user_id, "USDC", maker_cost)?;
 
         // Taker: debit cost+fee (their reservation covers this).
         let taker_cost = taker_fill.size * taker_fill.price + taker_fill.fee;
-        self.balance_service.debit(&trade.taker_user_id, "USDC", taker_cost)?;
+        self.balance_service
+            .debit(&trade.taker_user_id, "USDC", taker_cost)?;
 
         self.push_balance_update(&trade.maker_user_id);
         self.push_balance_update(&trade.taker_user_id);
@@ -554,7 +581,10 @@ mod tests {
         let (tx, rx) = oneshot::channel::<()>();
 
         tokio::spawn(async move {
-            let _ = server::run(listener, async { let _ = rx.await; }).await;
+            let _ = server::run(listener, async {
+                let _ = rx.await;
+            })
+            .await;
         });
 
         let client = redis::Client::open(format!("redis://{}/", addr)).unwrap();
@@ -567,6 +597,7 @@ mod tests {
             maker_fee_bps,
             taker_fee_bps,
             balance_service.clone(),
+            Arc::new(crate::websocket::WebSocketManager::new()),
         );
 
         (engine, balance_service, tx)
@@ -587,7 +618,10 @@ mod tests {
             dec!(100),
         );
 
-        engine.check_balance("alice", "BTC-1H", &order).await.unwrap();
+        engine
+            .check_balance("alice", "BTC-1H", &order)
+            .await
+            .unwrap();
 
         assert_eq!(balances.get_total_balance("alice", "USDC"), dec!(1000));
         assert_eq!(balances.get_reserved_balance("alice", "USDC"), dec!(50.1));
@@ -611,7 +645,10 @@ mod tests {
             dec!(100),
         );
 
-        engine.check_balance("alice", "BTC-1H", &order).await.unwrap();
+        engine
+            .check_balance("alice", "BTC-1H", &order)
+            .await
+            .unwrap();
         order.filled = dec!(40);
         order.remaining = dec!(60);
 

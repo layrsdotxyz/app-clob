@@ -18,7 +18,7 @@ use crate::{
     models::{NoteLockRecord, NoteLockStatus, Order, TimeInForce, Trade},
     pm_claim_worker::claim_input_key,
     prediction_market_claims::{PredictionMarketClaimJob, PM_CLAIM_QUEUE},
-    proof_generation::{HonkProof, low_high_hex_to_bytes32, parse_u128_hex},
+    proof_generation::{low_high_hex_to_bytes32, parse_u128_hex, HonkProof},
     AppState,
 };
 
@@ -36,7 +36,10 @@ pub struct ProofPayload {
 
 impl From<ProofPayload> for HonkProof {
     fn from(p: ProofPayload) -> Self {
-        Self { proof_hex: p.proof_hex, public_inputs: p.public_inputs }
+        Self {
+            proof_hex: p.proof_hex,
+            public_inputs: p.public_inputs,
+        }
     }
 }
 
@@ -61,8 +64,12 @@ pub struct LockCollateralRequest {
     pub vault_address: String,
 }
 
-fn default_side() -> String { "unknown".to_string() }
-fn default_commitment_expiry() -> i64 { -1 }
+fn default_side() -> String {
+    "unknown".to_string()
+}
+fn default_commitment_expiry() -> i64 {
+    -1
+}
 
 #[derive(Debug, Deserialize)]
 pub struct UnlockCollateralRequest {
@@ -229,7 +236,11 @@ pub async fn unlock_collateral(
         .await?;
 
     // Update note-lock status to Unlocked (update in-place to preserve history).
-    let key = format!("pm:note_lock:{}:{}", req.user_id.trim(), &req.order_commitment_low);
+    let key = format!(
+        "pm:note_lock:{}:{}",
+        req.user_id.trim(),
+        &req.order_commitment_low
+    );
     if let Some(json) = state.redis_store.get_optional(&key).await? {
         if let Ok(mut record) = serde_json::from_str::<NoteLockRecord>(&json) {
             record.status = NoteLockStatus::Unlocked;
@@ -254,7 +265,10 @@ pub async fn settle_fill(
         .settle_fill(
             req.market_id,
             req.position_side,
-            low_high_hex_to_bytes32(&req.spent_note_nullifier_low, &req.spent_note_nullifier_high)?,
+            low_high_hex_to_bytes32(
+                &req.spent_note_nullifier_low,
+                &req.spent_note_nullifier_high,
+            )?,
             parse_u128_hex(&req.pot_contribution_low, "pot_contribution")?,
             parse_u128_hex(&req.position_payout_units_low, "position_payout_units")?,
             parse_u128_hex(&req.trade_fee_amount_low, "trade_fee_amount")?,
@@ -264,7 +278,11 @@ pub async fn settle_fill(
         .await?;
 
     // Update note-lock status to Settled.
-    let key = format!("pm:note_lock:{}:{}", req.user_id.trim(), &req.order_commitment_low);
+    let key = format!(
+        "pm:note_lock:{}:{}",
+        req.user_id.trim(),
+        &req.order_commitment_low
+    );
     if let Some(json) = state.redis_store.get_optional(&key).await? {
         if let Ok(mut record) = serde_json::from_str::<NoteLockRecord>(&json) {
             record.status = NoteLockStatus::Settled;
@@ -284,7 +302,9 @@ pub async fn claim_winnings(
     Json(req): Json<ClaimWinningsRequest>,
 ) -> ClobResult<impl IntoResponse> {
     let relayer = get_relayer(&state)?;
-    let recipient: Address = req.recipient.parse()
+    let recipient: Address = req
+        .recipient
+        .parse()
         .map_err(|e| ClobError::InvalidOrder(format!("invalid recipient address: {e}")))?;
     let proof: HonkProof = req.proof.into();
     let treasury_override = treasury_override_opt(&req.vault_address);
@@ -299,17 +319,29 @@ pub async fn submit_claim(
     Json(req): Json<SubmitClaimRequest>,
 ) -> ClobResult<impl IntoResponse> {
     if req.outcome > 1 {
-        return Err(ClobError::InvalidOrder("claim outcome must be 0 or 1".to_string()));
+        return Err(ClobError::InvalidOrder(
+            "claim outcome must be 0 or 1".to_string(),
+        ));
     }
     if req.market_id.trim().is_empty() || req.amount.trim().is_empty() {
-        return Err(ClobError::InvalidOrder("market_id and amount are required".to_string()));
+        return Err(ClobError::InvalidOrder(
+            "market_id and amount are required".to_string(),
+        ));
     }
 
     // Parse and normalise the EVM recipient address (checksum-normalise for dedup).
-    let recipient: Address = req.recipient.parse()
+    let recipient: Address = req
+        .recipient
+        .parse()
         .map_err(|e| ClobError::InvalidOrder(format!("invalid recipient address: {e}")))?;
     let recipient_str = format!("{recipient:?}");
-    validate_claim_input(&req.proof_input, &recipient_str, &req.market_id, req.outcome, &req.amount)?;
+    validate_claim_input(
+        &req.proof_input,
+        &recipient_str,
+        &req.market_id,
+        req.outcome,
+        &req.amount,
+    )?;
 
     let dedup_key = claim_dedup_key(&req.recipient, &req.market_id, req.outcome, &req.amount);
     if let Some(existing_job_id) = state.redis_store.get_optional(&dedup_key).await? {
@@ -349,7 +381,10 @@ pub async fn submit_claim(
 
     state
         .redis_store
-        .set(&claim_input_key(&job.job_id), &serde_json::to_string(&req.proof_input)?)
+        .set(
+            &claim_input_key(&job.job_id),
+            &serde_json::to_string(&req.proof_input)?,
+        )
         .await?;
     state
         .redis_store
@@ -363,9 +398,15 @@ pub async fn submit_claim(
             &job.job_id,
         )
         .await?;
-    state.redis_store.push_queue(PM_CLAIM_QUEUE, &job.job_id).await?;
+    state
+        .redis_store
+        .push_queue(PM_CLAIM_QUEUE, &job.job_id)
+        .await?;
 
-    Ok((StatusCode::CREATED, Json(SubmitClaimResponse { claim_job: job })))
+    Ok((
+        StatusCode::CREATED,
+        Json(SubmitClaimResponse { claim_job: job }),
+    ))
 }
 
 pub async fn get_private_index(
@@ -374,7 +415,11 @@ pub async fn get_private_index(
     Query(query): Query<PrivateIndexQuery>,
 ) -> ClobResult<impl IntoResponse> {
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
-    let market_filter = query.market_id.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let market_filter = query
+        .market_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
 
     let open_orders = state
         .redis_store
@@ -382,7 +427,11 @@ pub async fn get_private_index(
         .await?
         .into_iter()
         .filter(|order| order.time_in_force == TimeInForce::Gtc && order.is_active())
-        .filter(|order| market_filter.map(|market_id| order.market_id == market_id).unwrap_or(true))
+        .filter(|order| {
+            market_filter
+                .map(|market_id| order.market_id == market_id)
+                .unwrap_or(true)
+        })
         .take(limit)
         .collect::<Vec<_>>();
 
@@ -416,7 +465,11 @@ pub async fn get_private_index(
         .get_user_trades(&user_id, limit)
         .await?
         .into_iter()
-        .filter(|trade| market_filter.map(|market_id| trade.market_id == market_id).unwrap_or(true))
+        .filter(|trade| {
+            market_filter
+                .map(|market_id| trade.market_id == market_id)
+                .unwrap_or(true)
+        })
         .collect::<Vec<_>>();
 
     let claims = get_claim_jobs_for_recipient(&state, &user_id, limit, market_filter).await?;
@@ -445,20 +498,24 @@ pub async fn get_claim_status(
     Ok(Json(job))
 }
 
-fn get_relayer(state: &AppState) -> ClobResult<Arc<crate::prediction_market_relayer::PredictionMarketRelayer>> {
-    state
-        .prediction_market_relayer
-        .clone()
-        .ok_or_else(|| ClobError::Internal("prediction market relayer is not configured".to_string()))
+fn get_relayer(
+    state: &AppState,
+) -> ClobResult<Arc<crate::prediction_market_relayer::PredictionMarketRelayer>> {
+    state.prediction_market_relayer.clone().ok_or_else(|| {
+        ClobError::Internal("prediction market relayer is not configured".to_string())
+    })
 }
 
 /// Returns `Some(addr)` when the compatibility address field is non-empty, else
 /// `None` so the relayer falls back to the configured treasury default.
 fn treasury_override_opt(vault_address: &str) -> Option<&str> {
     let trimmed = vault_address.trim();
-    if trimmed.is_empty() { None } else { Some(trimmed) }
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
-
 
 async fn get_claim_jobs_for_recipient(
     state: &Arc<AppState>,
@@ -488,7 +545,10 @@ async fn get_claim_jobs_for_recipient(
             continue;
         };
 
-        if market_filter.map(|market_id| job.market_id == market_id).unwrap_or(true) {
+        if market_filter
+            .map(|market_id| job.market_id == market_id)
+            .unwrap_or(true)
+        {
             jobs.push(job);
         }
     }
@@ -533,16 +593,22 @@ pub async fn deposit_note(
     });
 
     let entry_key = format!("pm:deposit_note:{}:{}", wallet_key, record_id);
-    state.redis_store.set(&entry_key, &record.to_string()).await?;
     state
         .redis_store
-        .append_json_array_value(
-            &format!("pm:deposit_records:{}", wallet_key),
-            &record_id,
-        )
+        .set(&entry_key, &record.to_string())
+        .await?;
+    state
+        .redis_store
+        .append_json_array_value(&format!("pm:deposit_records:{}", wallet_key), &record_id)
         .await?;
 
-    Ok((StatusCode::CREATED, Json(DepositNoteResponse { acknowledged: true, record_id })))
+    Ok((
+        StatusCode::CREATED,
+        Json(DepositNoteResponse {
+            acknowledged: true,
+            record_id,
+        }),
+    ))
 }
 
 fn claim_dedup_key(recipient: &str, market_id: &str, outcome: u8, amount: &str) -> String {
@@ -557,30 +623,7 @@ fn claim_dedup_key(recipient: &str, market_id: &str, outcome: u8, amount: &str) 
 }
 
 fn is_retryable_claim_status(status: &str) -> bool {
-    matches!(
-        status,
-        "proof_submission_failed" | "proof_failed"
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn claim_dedup_key_is_stable() {
-        let first = claim_dedup_key("0xABC", "42", 1, "10");
-        let second = claim_dedup_key("0xabc", "42", 1, "10");
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn only_failed_claim_statuses_are_retryable() {
-        assert!(is_retryable_claim_status("proof_submission_failed"));
-        assert!(is_retryable_claim_status("proof_failed"));
-        assert!(!is_retryable_claim_status("pending_proof_generation"));
-        assert!(!is_retryable_claim_status("claimed"));
-    }
+    matches!(status, "proof_submission_failed" | "proof_failed")
 }
 
 fn validate_claim_input(
@@ -593,20 +636,34 @@ fn validate_claim_input(
     let destination = proof_input
         .get("destinationAddressField")
         .and_then(Value::as_str)
-        .ok_or_else(|| ClobError::InvalidOrder("claim proof_input.destinationAddressField is required".to_string()))?;
+        .ok_or_else(|| {
+            ClobError::InvalidOrder(
+                "claim proof_input.destinationAddressField is required".to_string(),
+            )
+        })?;
     let proof_market_id = proof_input
         .get("market_id")
         .and_then(Value::as_str)
-        .ok_or_else(|| ClobError::InvalidOrder("claim proof_input.market_id is required".to_string()))?;
+        .ok_or_else(|| {
+            ClobError::InvalidOrder("claim proof_input.market_id is required".to_string())
+        })?;
     let proof_amount = proof_input
         .get("amount")
         .and_then(Value::as_str)
-        .ok_or_else(|| ClobError::InvalidOrder("claim proof_input.amount is required".to_string()))?;
+        .ok_or_else(|| {
+            ClobError::InvalidOrder("claim proof_input.amount is required".to_string())
+        })?;
 
     let proof_outcome = proof_input
         .get("outcome")
-        .and_then(|value| value.as_u64().or_else(|| value.as_str().and_then(|s| s.parse::<u64>().ok())))
-        .ok_or_else(|| ClobError::InvalidOrder("claim proof_input.outcome is required".to_string()))?;
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|s| s.parse::<u64>().ok()))
+        })
+        .ok_or_else(|| {
+            ClobError::InvalidOrder("claim proof_input.outcome is required".to_string())
+        })?;
 
     // EVM address comparison: normalise both to lowercase for case-insensitive match.
     if destination.to_lowercase() != recipient.to_lowercase() {
@@ -630,4 +687,24 @@ fn validate_claim_input(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claim_dedup_key_is_stable() {
+        let first = claim_dedup_key("0xABC", "42", 1, "10");
+        let second = claim_dedup_key("0xabc", "42", 1, "10");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn only_failed_claim_statuses_are_retryable() {
+        assert!(is_retryable_claim_status("proof_submission_failed"));
+        assert!(is_retryable_claim_status("proof_failed"));
+        assert!(!is_retryable_claim_status("pending_proof_generation"));
+        assert!(!is_retryable_claim_status("claimed"));
+    }
 }

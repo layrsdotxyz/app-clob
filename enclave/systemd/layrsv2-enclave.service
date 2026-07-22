@@ -1,0 +1,17 @@
+[Unit]
+Description=Layrs v2 Nitro private trading enclave
+After=nitro-enclaves-allocator.service network-online.target
+Requires=nitro-enclaves-allocator.service
+Before=layrsv2-enclave-parent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/usr/bin/test -r /opt/layrsv2/layrsv2-clob.eif
+ExecStart=/bin/bash -c '/usr/bin/nitro-cli describe-enclaves | /usr/bin/grep -q "\"EnclaveCID\": 16" || /usr/bin/nitro-cli run-enclave --cpu-count 2 --memory 4096 --eif-path /opt/layrsv2/layrsv2-clob.eif --enclave-cid 16'
+ExecStop=/usr/bin/nitro-cli terminate-enclave --all
+TimeoutStartSec=120
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

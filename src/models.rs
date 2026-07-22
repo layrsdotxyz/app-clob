@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
+use ethers::types::{Address, Signature};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use ethers::types::{Address, Signature};
 
 /// Order side
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,28 +34,28 @@ impl OrderSide {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderType {
-    Limit,      // Standard limit order
-    Market,     // Market order (not supported in CLOB, converted to aggressive limit)
-    PostOnly,   // Maker-only order (fails if would take)
+    Limit,    // Standard limit order
+    Market,   // Market order (not supported in CLOB, converted to aggressive limit)
+    PostOnly, // Maker-only order (fails if would take)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TimeInForce {
-    Gtc,  // Good-til-cancelled
-    Ioc,  // Immediate-or-cancel
-    Fok,  // Fill-or-kill
+    Gtc, // Good-til-cancelled
+    Ioc, // Immediate-or-cancel
+    Fok, // Fill-or-kill
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderStatus {
-    Open,       // Active in order book
-    Partial,    // Partially filled
-    Filled,     // Completely filled
-    Cancelled,  // Cancelled by user
-    Rejected,   // Rejected by system
-    Expired,    // Expired (IOC/FOK)
+    Open,      // Active in order book
+    Partial,   // Partially filled
+    Filled,    // Completely filled
+    Cancelled, // Cancelled by user
+    Rejected,  // Rejected by system
+    Expired,   // Expired (IOC/FOK)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,7 +74,7 @@ pub struct Order {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub fills: Vec<Fill>,
-    
+
     // Smart contract integration fields
     #[serde(skip_serializing_if = "Option::is_none")]
     pub maker_address: Option<Address>,
@@ -185,7 +185,7 @@ pub struct Trade {
     pub price: Decimal,
     pub size: Decimal,
     pub timestamp: DateTime<Utc>,
-    
+
     // Smart contract settlement fields
     #[serde(skip_serializing_if = "Option::is_none")]
     pub maker_address: Option<Address>,

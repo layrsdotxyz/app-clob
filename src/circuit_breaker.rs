@@ -7,9 +7,9 @@ use tokio::sync::RwLock;
 /// Circuit breaker states
 #[derive(Debug, Clone, PartialEq)]
 pub enum CircuitState {
-    Closed,      // Normal operation
-    Open,        // Failing, rejecting requests
-    HalfOpen,    // Testing if service recovered
+    Closed,   // Normal operation
+    Open,     // Failing, rejecting requests
+    HalfOpen, // Testing if service recovered
 }
 
 /// Circuit breaker for external service calls
@@ -61,7 +61,7 @@ impl CircuitBreaker {
         // Check if we can proceed
         {
             let mut state = self.state.write().await;
-            
+
             match state.state {
                 CircuitState::Open => {
                     // Check if timeout has elapsed
@@ -75,7 +75,7 @@ impl CircuitBreaker {
                 }
                 CircuitState::HalfOpen => {
                     // In half-open, only allow one request at a time
-                    if state.last_state_change.elapsed() < Duration::from_millis(100) {
+                    if state.last_state_change.elapsed() < self.half_open_timeout {
                         return Err(CircuitBreakerError::CircuitOpen);
                     }
                 }
@@ -100,7 +100,7 @@ impl CircuitBreaker {
 
     async fn on_success(&self) {
         let mut state = self.state.write().await;
-        
+
         match state.state {
             CircuitState::HalfOpen => {
                 state.success_count += 1;
@@ -124,14 +124,17 @@ impl CircuitBreaker {
 
     async fn on_failure(&self) {
         let mut state = self.state.write().await;
-        
+
         match state.state {
             CircuitState::Closed => {
                 state.failure_count += 1;
                 state.last_failure_time = Some(Instant::now());
-                
+
                 if state.failure_count >= self.failure_threshold {
-                    tracing::warn!("Circuit breaker opening due to {} failures", state.failure_count);
+                    tracing::warn!(
+                        "Circuit breaker opening due to {} failures",
+                        state.failure_count
+                    );
                     state.state = CircuitState::Open;
                     state.last_state_change = Instant::now();
                 }
@@ -202,7 +205,7 @@ mod tests {
 
         // Next call should transition to half-open
         let _ = cb.call(async { Ok::<_, &str>(()) }).await;
-        
+
         // Should still be half-open (need 2 successes)
         let state = cb.get_state().await;
         assert!(state == CircuitState::HalfOpen || state == CircuitState::Closed);

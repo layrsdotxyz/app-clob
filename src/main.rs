@@ -25,8 +25,8 @@ mod poseidon_bn254;
 mod prediction_market_claims;
 mod prediction_market_relayer;
 mod prediction_market_settlement;
-mod private_core;
 mod privacy;
+mod private_core;
 mod proof_batcher;
 mod proof_generation;
 mod proof_observability;
@@ -43,36 +43,32 @@ use crate::state::AppState;
 
 use anyhow::Result;
 use axum::{
-    routing::{get, post, delete},
+    routing::{delete, get, post},
     Router,
 };
 use std::sync::Arc;
 use tower::ServiceBuilder;
-use tower_http::{
-    cors::CorsLayer,
-    trace::TraceLayer,
-    compression::CompressionLayer,
-};
+use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
+    balance_service::BalanceService,
     config::Config,
     database::Database,
-    matching::MatchingEngine,
-    orderbook::OrderBookManager,
-    privacy::PrivacyStateService,
-    redis_store::RedisStore,
-    settlement::SettlementEngine,
-    balance_service::BalanceService,
-    oracle::PythOracle,
+    epoch_service::EpochService,
     market_lifecycle::MarketLifecycleManager,
-    websocket::WebSocketManager,
+    matching::MatchingEngine,
     metrics::Metrics,
+    oracle::PythOracle,
+    orderbook::OrderBookManager,
     pm_claim_worker::PredictionMarketClaimWorker,
     pm_settlement_worker::PredictionMarketSettlementWorker,
-    epoch_service::EpochService,
-    proof_generation::{OrderMatchProver, ProverPipeline, ProverWorker},
     prediction_market_relayer::PredictionMarketRelayer,
+    privacy::PrivacyStateService,
+    proof_generation::{OrderMatchProver, ProverPipeline, ProverWorker},
+    redis_store::RedisStore,
+    settlement::SettlementEngine,
+    websocket::WebSocketManager,
     withdrawal_service::WithdrawalService,
 };
 
@@ -101,9 +97,7 @@ fn enforce_real_private_prover_configuration() -> Result<()> {
         .map(|value| value.trim().eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     if allow_mock {
-        anyhow::bail!(
-            "ALLOW_INSECURE_MOCK_PROVER=true is forbidden for clob-service startup"
-        );
+        anyhow::bail!("ALLOW_INSECURE_MOCK_PROVER=true is forbidden for clob-service startup");
     }
 
     Ok(())
@@ -136,7 +130,10 @@ async fn async_main() -> Result<()> {
 
     // Bind listener ASAP so the ECS health check probe succeeds even before full config loads
     let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
-    let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8080);
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8080);
     let addr = format!("{}:{}", host, port);
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(listener) => {
@@ -155,8 +152,10 @@ async fn async_main() -> Result<()> {
             match std::env::var(key) {
                 Ok(v) if !v.trim().is_empty() => return Some(v),
                 _ => {
-                    if i == attempts { break; }
-                    tracing::warn!(attempt=i, key, "Env var not present yet, retrying");
+                    if i == attempts {
+                        break;
+                    }
+                    tracing::warn!(attempt = i, key, "Env var not present yet, retrying");
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }
             }
@@ -164,7 +163,8 @@ async fn async_main() -> Result<()> {
         None
     }
 
-    if std::env::var("REDIS_URL").is_err() { // only wait if missing
+    if std::env::var("REDIS_URL").is_err() {
+        // only wait if missing
         if let Some(val) = wait_for_env("REDIS_URL", 10, 500).await {
             tracing::info!("Acquired REDIS_URL after wait");
             // set again explicitly (already set by var read) but keep semantics clear
@@ -183,7 +183,11 @@ async fn async_main() -> Result<()> {
             return Err(e);
         }
     };
-    tracing::info!(maker_fee_bps=config.maker_fee_bps, taker_fee_bps=config.taker_fee_bps, "Starting CLOB service");
+    tracing::info!(
+        maker_fee_bps = config.maker_fee_bps,
+        taker_fee_bps = config.taker_fee_bps,
+        "Starting CLOB service"
+    );
 
     // Initialize Valkey/Redis client (AWS ElastiCache standalone, no TLS, no auth)
     let redis_client = redis::Client::open(config.redis_url.clone())
@@ -266,7 +270,11 @@ async fn async_main() -> Result<()> {
     balance_service.load_from_db().await;
     // Spawn the DB persistence worker so balance writes are durably flushed with retries.
     let persist_task = balance_service.start_persistence_worker();
-    let orderbook_manager = Arc::new(OrderBookManager::new(redis_store.clone(), metrics.clone(), database.clone()));
+    let orderbook_manager = Arc::new(OrderBookManager::new(
+        redis_store.clone(),
+        metrics.clone(),
+        database.clone(),
+    ));
 
     // Seed active markets on startup so /v1/markets always returns them regardless of order activity.
     // Override via SEED_MARKETS env var (comma-separated list of market IDs).
@@ -326,11 +334,14 @@ async fn async_main() -> Result<()> {
     let trade_persist_task = settlement_engine.clone().start_trade_persistence_worker();
     let prover_pipeline = Arc::new(ProverPipeline::new(redis_store.clone(), 3));
     let privacy_state = Arc::new(PrivacyStateService::new(redis_store.clone()));
-    let matching_engine = Arc::new(MatchingEngine::new(
-        orderbook_manager.clone(),
-        settlement_engine.clone(),
-        metrics.clone(),
-    ).with_privacy_state(privacy_state.clone()));
+    let matching_engine = Arc::new(
+        MatchingEngine::new(
+            orderbook_manager.clone(),
+            settlement_engine.clone(),
+            metrics.clone(),
+        )
+        .with_privacy_state(privacy_state.clone()),
+    );
 
     // Initialize Pyth oracle and market lifecycle manager (BTC/ETH/SOL × USDC/ZEN)
     let oracle = Arc::new(PythOracle::new());
@@ -340,8 +351,6 @@ async fn async_main() -> Result<()> {
         balance_service.clone(),
         database.clone(),
     ));
-
-
 
     // Initialize IP-based rate limiter (token bucket, configurable via env).
     let rl_rpm: u32 = std::env::var("RATE_LIMIT_RPM")
@@ -353,7 +362,11 @@ async fn async_main() -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(50);
     let ip_rate_limiter = rate_limiter::RateLimiter::new(rl_rpm, rl_burst);
-    tracing::info!(rpm = rl_rpm, burst = rl_burst, "IP rate limiter initialized");
+    tracing::info!(
+        rpm = rl_rpm,
+        burst = rl_burst,
+        "IP rate limiter initialized"
+    );
 
     // Withdrawal service: delegates ZK proof + on-chain execution to vault-service.
     // Optional — gracefully disabled when VAULT_INTERNAL_URL is not set.
@@ -401,34 +414,45 @@ async fn async_main() -> Result<()> {
         // Health check (always public)
         .route("/health", get(routes::health::health_check))
         .route("/ready", get(routes::health::readiness_check))
-        
         // Markets endpoints (public)
         .route("/v1/markets", get(routes::markets::list_markets))
-        .route("/v1/markets/history", get(routes::markets::list_market_history))
-        .route("/v1/markets/by-slug/:slug", get(routes::markets::get_market_by_slug))
-        .route("/v1/markets/:market_id/stats", get(routes::markets::get_market_stats))
+        .route(
+            "/v1/markets/history",
+            get(routes::markets::list_market_history),
+        )
+        .route(
+            "/v1/markets/by-slug/:slug",
+            get(routes::markets::get_market_by_slug),
+        )
+        .route(
+            "/v1/markets/:market_id/stats",
+            get(routes::markets::get_market_stats),
+        )
         .route(
             "/v1/markets/:market_id/resolution-audit",
             get(routes::markets::get_market_resolution_audit),
         )
-
         // G10: Permissionless claim endpoint — proof is the authorisation, no JWT needed.
         .route("/v1/claims", post(routes::claims::submit_public_claim))
-
         // G13: Public orderbook — aggregated price levels only, no user or address data.
-        .route("/v1/orderbook/:market_id", get(routes::orderbook::get_orderbook))
-        .route("/v1/orderbook/:market_id/depth", get(routes::orderbook::get_depth))
-
+        .route(
+            "/v1/orderbook/:market_id",
+            get(routes::orderbook::get_orderbook),
+        )
+        .route(
+            "/v1/orderbook/:market_id/depth",
+            get(routes::orderbook::get_depth),
+        )
         // G15: Public scan endpoint — no auth required; recipients scan locally.
-        .route("/v1/stealth/announcements", get(routes::stealth::list_announcements))
-
+        .route(
+            "/v1/stealth/announcements",
+            get(routes::stealth::list_announcements),
+        )
         // WebSocket (auth is optional — public channels get anonymous trade ticks,
         // private user channel requires wallet address via ?address= query param)
         .route("/v1/ws", get(routes::websocket::ws_handler))
-
         // Metrics
         .route("/metrics", get(routes::metrics::metrics_handler))
-
         // ----------------------------------------------------------------
         // Protected routes — require valid Dynamic.xyz JWT
         // ----------------------------------------------------------------
@@ -436,71 +460,110 @@ async fn async_main() -> Result<()> {
             Router::new()
                 // Wallet endpoints
                 .route("/v1/wallet/register", post(routes::wallet::register_wallet))
-                .route("/v1/wallet/deploy", post(routes::wallet::deploy_smart_account))
+                .route(
+                    "/v1/wallet/deploy",
+                    post(routes::wallet::deploy_smart_account),
+                )
                 .route("/v1/wallet/:user_id", get(routes::wallet::get_wallet_info))
-
                 // Prediction market treasury relay endpoints
                 .route("/v1/pm/lock-collateral", post(routes::pm::lock_collateral))
-                .route("/v1/pm/unlock-collateral", post(routes::pm::unlock_collateral))
+                .route(
+                    "/v1/pm/unlock-collateral",
+                    post(routes::pm::unlock_collateral),
+                )
                 .route("/v1/pm/settle-fill", post(routes::pm::settle_fill))
                 .route("/v1/pm/claim-winnings", post(routes::pm::claim_winnings))
                 .route("/v1/pm/claims", post(routes::pm::submit_claim))
                 .route("/v1/pm/claims/:job_id", get(routes::pm::get_claim_status))
-                .route("/v1/pm/private-index/:user_id", get(routes::pm::get_private_index))
+                .route(
+                    "/v1/pm/private-index/:user_id",
+                    get(routes::pm::get_private_index),
+                )
                 .route("/v1/pm/deposit-note", post(routes::pm::deposit_note))
-
                 // Order endpoints
                 .route("/v1/orders", post(routes::orders::create_order))
                 .route("/v1/orders/commit", post(routes::orders::commit_order))
                 .route("/v1/orders/reveal", post(routes::orders::reveal_order))
                 .route("/v1/orders/:order_id", delete(routes::orders::cancel_order))
                 .route("/v1/orders/:order_id", get(routes::orders::get_order))
-                .route("/v1/orders/user/:user_id", get(routes::orders::get_user_orders))
-
+                .route(
+                    "/v1/orders/user/:user_id",
+                    get(routes::orders::get_user_orders),
+                )
                 // Trades endpoints (user-scoped only — aggregate market trades are intentionally hidden)
-                .route("/v1/trades/user/:user_id", get(routes::trades::get_user_trades))
-
+                .route(
+                    "/v1/trades/user/:user_id",
+                    get(routes::trades::get_user_trades),
+                )
                 // Balance endpoints: deposit is operator-only (X-Operator-Key), get is self-scoped
-                .route("/v1/balance/deposit", post(routes::balance::deposit_balance))
-                .route("/v1/balance/proof", post(routes::balance::submit_balance_proof))
-                .route("/v1/balance/:user_id", get(routes::balance::get_user_balance))
-                .route("/v1/balance/:user_id/:market_id", get(routes::balance::get_balance))
-
+                .route(
+                    "/v1/balance/deposit",
+                    post(routes::balance::deposit_balance),
+                )
+                .route(
+                    "/v1/balance/proof",
+                    post(routes::balance::submit_balance_proof),
+                )
+                .route(
+                    "/v1/balance/:user_id",
+                    get(routes::balance::get_user_balance),
+                )
+                .route(
+                    "/v1/balance/:user_id/:market_id",
+                    get(routes::balance::get_balance),
+                )
                 // Settlement endpoints
-                .route("/v1/settlements/:job_id", get(routes::settlements::get_settlement_job))
+                .route(
+                    "/v1/settlements/:job_id",
+                    get(routes::settlements::get_settlement_job),
+                )
                 .route(
                     "/v1/settlements/:job_id/legs/:leg_role/witness",
                     post(routes::settlements::submit_leg_witness),
                 )
-
                 // G15: Auth-gated announce — operator or authenticated payer writes a
                 // stealth announcement; the ephemeral key is stored with no recipient data.
-                .route("/v1/stealth/announce", post(routes::stealth::create_announcement))
-
+                .route(
+                    "/v1/stealth/announce",
+                    post(routes::stealth::create_announcement),
+                )
                 // Withdrawal: ledger-side orchestration; proof and on-chain execution delegated to vault-service.
-                .route("/v1/withdrawal", post(routes::withdrawal::initiate_withdrawal))
-                .route("/v1/withdrawal/:withdrawal_id/status", get(routes::withdrawal::get_withdrawal_status))
-
+                .route(
+                    "/v1/withdrawal",
+                    post(routes::withdrawal::initiate_withdrawal),
+                )
+                .route(
+                    "/v1/withdrawal/:withdrawal_id/status",
+                    get(routes::withdrawal::get_withdrawal_status),
+                )
                 // Proof observability: inspect individual proof attempts and list by user.
-                .route("/v1/proofs/:proof_id", get(routes::proofs::get_proof_attempt))
-                .route("/v1/proofs/user/:user_id", get(routes::proofs::list_user_proof_attempts))
-
-                .route_layer(axum::middleware::from_fn(auth::require_auth))
+                .route(
+                    "/v1/proofs/:proof_id",
+                    get(routes::proofs::get_proof_attempt),
+                )
+                .route(
+                    "/v1/proofs/user/:user_id",
+                    get(routes::proofs::list_user_proof_attempts),
+                )
+                .route_layer(axum::middleware::from_fn(auth::require_auth)),
         )
-
         // Admin endpoints — Bearer INTERNAL_SERVICE_KEY auth, no JWT
-        .route("/v1/admin/markets/:market_id/orderbook", delete(routes::orders::flush_market_orderbook))
-
+        .route(
+            "/v1/admin/markets/:market_id/orderbook",
+            delete(routes::orders::flush_market_orderbook),
+        )
         // Apply middleware (outermost → innermost in application order)
         // Rate limiter middleware reads RateLimiter from request extensions;
         // the Extension layer below injects it so the middleware can find it.
-        .route_layer(axum::middleware::from_fn(rate_limiter::rate_limit_middleware))
+        .route_layer(axum::middleware::from_fn(
+            rate_limiter::rate_limit_middleware,
+        ))
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
                 .layer(CorsLayer::permissive())
                 .layer(CompressionLayer::new())
-                .layer(axum::Extension(ip_rate_limiter))
+                .layer(axum::Extension(ip_rate_limiter)),
         )
         .with_state(app_state.clone());
 
@@ -520,24 +583,23 @@ async fn async_main() -> Result<()> {
             reason = %crate::proof_generation::ORDER_MATCH_UNSUPPORTED_MESSAGE,
             "Proof generation enabled, but the deprecated ORDER_MATCH prover is unavailable in this build"
         );
-        
-        let prover = Arc::new(OrderMatchProver::new(
-            redis_store.clone(),
-        ));
-        
+
+        let prover = Arc::new(OrderMatchProver::new(redis_store.clone()));
+
         let epoch_duration = std::env::var("EPOCH_DURATION_SECS")
             .unwrap_or_else(|_| "3600".to_string())
             .parse()
             .unwrap_or(3600);
-        
+
         let mut epoch_service = EpochService::new(
             orderbook_manager.clone(),
             prover,
             redis_store.clone(),
             metrics.clone(),
             epoch_duration,
-        ).with_prover_pipeline(prover_pipeline.clone());
-        
+        )
+        .with_prover_pipeline(prover_pipeline.clone());
+
         Some(tokio::spawn(async move {
             if let Err(e) = epoch_service.start().await {
                 tracing::error!(error = %e, "Epoch service failed");
@@ -642,41 +704,51 @@ async fn async_main() -> Result<()> {
     let relayer_task: Option<tokio::task::JoinHandle<()>> = None;
 
     // Start market lifecycle manager (if MARKET_LIFECYCLE_ENABLED=true)
-    let lifecycle_task = if std::env::var("MARKET_LIFECYCLE_ENABLED").unwrap_or_default() == "true" {
+    let lifecycle_task = if std::env::var("MARKET_LIFECYCLE_ENABLED").unwrap_or_default() == "true"
+    {
         tracing::info!("🤖 Market Lifecycle Manager enabled - automated hourly markets starting");
         Some(tokio::spawn(lifecycle_manager.start()))
     } else {
-        tracing::info!("Market Lifecycle Manager disabled (set MARKET_LIFECYCLE_ENABLED=true to enable)");
+        tracing::info!(
+            "Market Lifecycle Manager disabled (set MARKET_LIFECYCLE_ENABLED=true to enable)"
+        );
         None
     };
 
     // Start market oracle service (if MARKET_ORACLE_ENABLED=true)
-    let market_oracle_task: Option<tokio::task::JoinHandle<()>> =
-        if std::env::var("MARKET_ORACLE_ENABLED").unwrap_or_default() == "true" {
-            match market_oracle_service::MarketOracleService::from_env(redis_store.clone(), database.clone(), orderbook_manager.clone(), balance_service.clone()) {
-                Some(svc) => {
-                    tracing::info!(
+    let market_oracle_task: Option<tokio::task::JoinHandle<()>> = if std::env::var(
+        "MARKET_ORACLE_ENABLED",
+    )
+    .unwrap_or_default()
+        == "true"
+    {
+        match market_oracle_service::MarketOracleService::from_env(
+            redis_store.clone(),
+            database.clone(),
+            orderbook_manager.clone(),
+            balance_service.clone(),
+        ) {
+            Some(svc) => {
+                tracing::info!(
                         "Market oracle service enabled — 15-min BTC/ETH/SOL markets will be created on Horizen EVM"
                     );
-                    Some(tokio::spawn(async move {
-                        if let Err(e) = svc.start().await {
-                            tracing::error!(error = %e, "Market oracle service failed");
-                        }
-                    }))
-                }
-                None => {
-                    tracing::warn!(
+                Some(tokio::spawn(async move {
+                    if let Err(e) = svc.start().await {
+                        tracing::error!(error = %e, "Market oracle service failed");
+                    }
+                }))
+            }
+            None => {
+                tracing::warn!(
                         "Market oracle service enabled but MARKET_FACTORY_ADDRESS / EVM vars missing (set HORIZEN_RPC_URL, EVM_OPERATOR_PRIVATE_KEY)"
                     );
-                    None
-                }
+                None
             }
-        } else {
-            tracing::info!(
-                "Market oracle service disabled (set MARKET_ORACLE_ENABLED=true to enable)"
-            );
-            None
-        };
+        }
+    } else {
+        tracing::info!("Market oracle service disabled (set MARKET_ORACLE_ENABLED=true to enable)");
+        None
+    };
 
     // Bind and serve
     tracing::info!("CLOB service listening on {}", addr);

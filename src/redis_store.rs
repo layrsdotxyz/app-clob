@@ -98,7 +98,8 @@ impl RedisStore {
 
     async fn set_sorted_set_entries(&self, key: &str, entries: &[(String, f64)]) -> ClobResult<()> {
         let mut conn = self.conn.clone();
-        conn.set::<_, _, ()>(key, serde_json::to_string(entries)?).await?;
+        conn.set::<_, _, ()>(key, serde_json::to_string(entries)?)
+            .await?;
         Ok(())
     }
 
@@ -129,9 +130,14 @@ impl RedisStore {
             .unwrap_or_default())
     }
 
-    async fn set_hash_entries(&self, key: &str, entries: &HashMap<String, String>) -> ClobResult<()> {
+    async fn set_hash_entries(
+        &self,
+        key: &str,
+        entries: &HashMap<String, String>,
+    ) -> ClobResult<()> {
         let mut conn = self.conn.clone();
-        conn.set::<_, _, ()>(key, serde_json::to_string(entries)?).await?;
+        conn.set::<_, _, ()>(key, serde_json::to_string(entries)?)
+            .await?;
         Ok(())
     }
 
@@ -164,7 +170,8 @@ impl RedisStore {
             }
 
             let value = values.remove(0);
-            self.set(queue_key, &serde_json::to_string(&values)?).await?;
+            self.set(queue_key, &serde_json::to_string(&values)?)
+                .await?;
             return Ok(Some(value));
         }
 
@@ -225,7 +232,12 @@ impl RedisStore {
     /// Atomically SET key=value with EX ttl_secs, only if key does not exist (SET NX EX).
     /// Returns true if the lock was acquired, false if it already existed.
     /// Used to elect a single CLOB instance as the oracle market-creator per interval.
-    pub async fn try_acquire_lock(&self, key: &str, value: &str, ttl_secs: u64) -> ClobResult<bool> {
+    pub async fn try_acquire_lock(
+        &self,
+        key: &str,
+        value: &str,
+        ttl_secs: u64,
+    ) -> ClobResult<bool> {
         let mut conn = self.conn.clone();
         let result: Option<String> = redis::cmd("SET")
             .arg(key)
@@ -249,10 +261,16 @@ impl RedisStore {
     ///
     /// Key format: `positions:{parent_market_id}:{yes|no}`
     /// Value: Redis hash of `{user_id -> decimal_string}`.
-    pub async fn increment_position(&self, key: &str, user_id: &str, delta: rust_decimal::Decimal) -> ClobResult<()> {
+    pub async fn increment_position(
+        &self,
+        key: &str,
+        user_id: &str,
+        delta: rust_decimal::Decimal,
+    ) -> ClobResult<()> {
         if std::env::var("REDIS_COMPAT_DISABLE_HASHES").as_deref() == Ok("true") {
             let mut entries = self.get_hash_entries(key).await?;
-            let current = entries.get(user_id)
+            let current = entries
+                .get(user_id)
                 .and_then(|v| rust_decimal::Decimal::from_str_exact(v).ok())
                 .unwrap_or(rust_decimal::Decimal::ZERO);
             entries.insert(user_id.to_string(), (current + delta).to_string());
@@ -269,7 +287,10 @@ impl RedisStore {
     }
 
     /// Read all positions from a prediction market position hash.
-    pub async fn get_positions(&self, key: &str) -> ClobResult<std::collections::HashMap<String, rust_decimal::Decimal>> {
+    pub async fn get_positions(
+        &self,
+        key: &str,
+    ) -> ClobResult<std::collections::HashMap<String, rust_decimal::Decimal>> {
         let raw: std::collections::HashMap<String, String> =
             if std::env::var("REDIS_COMPAT_DISABLE_HASHES").as_deref() == Ok("true") {
                 self.get_hash_entries(key).await?
@@ -277,8 +298,13 @@ impl RedisStore {
                 let mut conn = self.conn.clone();
                 conn.hgetall(key).await?
             };
-        Ok(raw.into_iter()
-            .filter_map(|(k, v)| rust_decimal::Decimal::from_str_exact(&v).ok().map(|d| (k, d)))
+        Ok(raw
+            .into_iter()
+            .filter_map(|(k, v)| {
+                rust_decimal::Decimal::from_str_exact(&v)
+                    .ok()
+                    .map(|d| (k, d))
+            })
             .collect())
     }
 
@@ -303,14 +329,18 @@ impl RedisStore {
         self.get_optional(key).await
     }
 
-    pub async fn get_orders_by_side(&self, market_id: &str, side: OrderSide) -> ClobResult<Vec<Order>> {
-        let levels = self
-            .get_orderbook_levels(market_id, side, 10_000)
-            .await?;
+    pub async fn get_orders_by_side(
+        &self,
+        market_id: &str,
+        side: OrderSide,
+    ) -> ClobResult<Vec<Order>> {
+        let levels = self.get_orderbook_levels(market_id, side, 10_000).await?;
 
         let mut orders = Vec::new();
         for level in levels {
-            let at_price = self.get_orders_at_price(market_id, &side, level.price).await?;
+            let at_price = self
+                .get_orders_at_price(market_id, &side, level.price)
+                .await?;
             orders.extend(at_price);
         }
 
@@ -318,43 +348,50 @@ impl RedisStore {
     }
 
     // ==================== Order Operations ====================
-    
+
     pub async fn save_order(&self, order: &Order) -> ClobResult<()> {
         let mut conn = self.conn.clone();
         let key = format!("{}{}", ORDER_PREFIX, order.id);
         let json = serde_json::to_string(order).unwrap();
-        
+
         conn.set::<_, _, ()>(&key, json).await?;
-        
+
         // Add to user's order set (legacy SET for backward compat)
         let user_key = format!("{}{}", USER_ORDERS_PREFIX, order.user_id);
         if std::env::var("REDIS_COMPAT_DISABLE_SETS").as_deref() == Ok("true") {
-            self.append_json_array_value(&user_key, &order.id.to_string()).await?;
+            self.append_json_array_value(&user_key, &order.id.to_string())
+                .await?;
         } else {
-            conn.sadd::<_, _, ()>(&user_key, order.id.to_string()).await?;
+            conn.sadd::<_, _, ()>(&user_key, order.id.to_string())
+                .await?;
         }
         // Also write to sorted set (score = timestamp) for fast paged reads.
         let user_z_key = format!("{}{}", USER_ORDERS_Z_PREFIX, order.user_id);
         let score = order.created_at.timestamp() as f64;
-        let _ = conn.zadd::<_, _, _, ()>(&user_z_key, order.id.to_string(), score).await;
-        
+        let _ = conn
+            .zadd::<_, _, _, ()>(&user_z_key, order.id.to_string(), score)
+            .await;
+
         Ok(())
     }
 
     pub async fn get_order(&self, order_id: Uuid) -> ClobResult<Option<Order>> {
         let mut conn = self.conn.clone();
         let key = format!("{}{}", ORDER_PREFIX, order_id);
-        
+
         let json: Option<String> = conn.get(&key).await?;
-        Ok(json.and_then(|s| serde_json::from_str(&s).ok()))
+        match json {
+            Some(raw) => Ok(Some(serde_json::from_str(&raw)?)),
+            None => Ok(None),
+        }
     }
 
     pub async fn delete_order(&self, order_id: Uuid, user_id: &str) -> ClobResult<()> {
         let mut conn = self.conn.clone();
         let key = format!("{}{}", ORDER_PREFIX, order_id);
-        
+
         conn.del::<_, ()>(&key).await?;
-        
+
         // Remove from user's order set
         let user_key = format!("{}{}", USER_ORDERS_PREFIX, user_id);
         if std::env::var("REDIS_COMPAT_DISABLE_SETS").as_deref() == Ok("true") {
@@ -364,11 +401,13 @@ impl RedisStore {
                 .and_then(|raw| serde_json::from_str(raw).ok())
                 .unwrap_or_default();
             values.retain(|value| value != &order_id.to_string());
-            conn.set::<_, _, ()>(&user_key, serde_json::to_string(&values)?).await?;
+            conn.set::<_, _, ()>(&user_key, serde_json::to_string(&values)?)
+                .await?;
         } else {
-            conn.srem::<_, _, ()>(&user_key, order_id.to_string()).await?;
+            conn.srem::<_, _, ()>(&user_key, order_id.to_string())
+                .await?;
         }
-        
+
         Ok(())
     }
 
@@ -387,16 +426,20 @@ impl RedisStore {
         } else {
             // Fallback: legacy SET — cap iteration to avoid timeout on large sets.
             let user_key = format!("{}{}", USER_ORDERS_PREFIX, user_id);
-            let all_ids: Vec<String> = if std::env::var("REDIS_COMPAT_DISABLE_SETS").as_deref() == Ok("true") {
-                self.get_optional(&user_key)
-                    .await?
-                    .as_deref()
-                    .and_then(|raw| serde_json::from_str(raw).ok())
-                    .unwrap_or_default()
-            } else {
-                conn.smembers(&user_key).await?
-            };
-            all_ids.into_iter().take(USER_ORDERS_LIMIT as usize).collect()
+            let all_ids: Vec<String> =
+                if std::env::var("REDIS_COMPAT_DISABLE_SETS").as_deref() == Ok("true") {
+                    self.get_optional(&user_key)
+                        .await?
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str(raw).ok())
+                        .unwrap_or_default()
+                } else {
+                    conn.smembers(&user_key).await?
+                };
+            all_ids
+                .into_iter()
+                .take(USER_ORDERS_LIMIT as usize)
+                .collect()
         };
 
         let mut orders = Vec::new();
@@ -426,34 +469,35 @@ impl RedisStore {
     }
 
     // ==================== Order Book Operations ====================
-    
-    pub async fn add_to_orderbook(
-        &self,
-        market_id: &str,
-        order: &Order,
-    ) -> ClobResult<()> {
+
+    pub async fn add_to_orderbook(&self, market_id: &str, order: &Order) -> ClobResult<()> {
         let mut conn = self.conn.clone();
-        
+
         let key = match order.side {
             OrderSide::Buy => format!("{}{}", ORDERBOOK_BID_PREFIX, market_id),
             OrderSide::Sell => format!("{}{}", ORDERBOOK_ASK_PREFIX, market_id),
         };
-        
+
         // Use price as score, with negative for bids to sort descending
         let score = match order.side {
             OrderSide::Buy => -order.price.to_string().parse::<f64>().unwrap_or(0.0),
             OrderSide::Sell => order.price.to_string().parse::<f64>().unwrap_or(0.0),
         };
-        
+
         // Store order_id:size:timestamp as member
-        let member = format!("{}:{}:{}", order.id, order.remaining, order.created_at.timestamp_nanos_opt().unwrap_or(0));
+        let member = format!(
+            "{}:{}:{}",
+            order.id,
+            order.remaining,
+            order.created_at.timestamp_nanos_opt().unwrap_or(0)
+        );
 
         if std::env::var("REDIS_COMPAT_DISABLE_SORTED_SETS").as_deref() == Ok("true") {
             return self.add_sorted_set_entry(&key, &member, score).await;
         }
-        
+
         conn.zadd::<_, _, _, ()>(&key, &member, score).await?;
-        
+
         Ok(())
     }
 
@@ -464,7 +508,7 @@ impl RedisStore {
         side: OrderSide,
     ) -> ClobResult<()> {
         let mut conn = self.conn.clone();
-        
+
         let key = match side {
             OrderSide::Buy => format!("{}{}", ORDERBOOK_BID_PREFIX, market_id),
             OrderSide::Sell => format!("{}{}", ORDERBOOK_ASK_PREFIX, market_id),
@@ -475,16 +519,16 @@ impl RedisStore {
             entries.retain(|(member, _)| !member.starts_with(&format!("{}:", order_id)));
             return self.set_sorted_set_entries(&key, &entries).await;
         }
-        
+
         // Remove all members with this order_id prefix
         let members: Vec<String> = conn.zrange(&key, 0, -1).await?;
-        
+
         for member in members {
             if member.starts_with(&format!("{}:", order_id)) {
                 conn.zrem::<_, _, ()>(&key, &member).await?;
             }
         }
-        
+
         Ok(())
     }
 
@@ -495,34 +539,35 @@ impl RedisStore {
         price: Decimal,
     ) -> ClobResult<Vec<Order>> {
         let mut conn = self.conn.clone();
-        
+
         let key = match side {
             OrderSide::Buy => format!("{}{}", ORDERBOOK_BID_PREFIX, market_id),
             OrderSide::Sell => format!("{}{}", ORDERBOOK_ASK_PREFIX, market_id),
         };
-        
+
         // Get all members at this price
         let score = match side {
             OrderSide::Buy => -(price.to_string().parse::<f64>().unwrap_or(0.0)),
             OrderSide::Sell => price.to_string().parse::<f64>().unwrap_or(0.0),
         };
 
-        let members: Vec<String> = if std::env::var("REDIS_COMPAT_DISABLE_SORTED_SETS").as_deref() == Ok("true") {
-            self.get_sorted_set_entries(&key)
-                .await?
-                .into_iter()
-                .filter_map(|(member, entry_score)| {
-                    if entry_score == score {
-                        Some(member)
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        } else {
-            conn.zrangebyscore(&key, score, score).await?
-        };
-        
+        let members: Vec<String> =
+            if std::env::var("REDIS_COMPAT_DISABLE_SORTED_SETS").as_deref() == Ok("true") {
+                self.get_sorted_set_entries(&key)
+                    .await?
+                    .into_iter()
+                    .filter_map(|(member, entry_score)| {
+                        if entry_score == score {
+                            Some(member)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                conn.zrangebyscore(&key, score, score).await?
+            };
+
         // Extract order IDs and fetch full orders
         let mut orders = Vec::new();
         for member in members {
@@ -535,10 +580,10 @@ impl RedisStore {
                 }
             }
         }
-        
+
         Ok(orders)
     }
-    
+
     pub async fn get_orderbook_levels(
         &self,
         market_id: &str,
@@ -546,41 +591,49 @@ impl RedisStore {
         depth: usize,
     ) -> ClobResult<Vec<OrderBookLevel>> {
         let mut conn = self.conn.clone();
-        
+
         let key = match side {
             OrderSide::Buy => format!("{}{}", ORDERBOOK_BID_PREFIX, market_id),
             OrderSide::Sell => format!("{}{}", ORDERBOOK_ASK_PREFIX, market_id),
         };
 
-        let members: Vec<(String, f64)> = if std::env::var("REDIS_COMPAT_DISABLE_SORTED_SETS").as_deref() == Ok("true") {
-            let mut entries = self.get_sorted_set_entries(&key).await?;
-            if entries.len() > depth {
-                entries.truncate(depth);
-            }
-            entries
-        } else {
-            conn.zrange_withscores(&key, 0, depth as isize - 1).await?
-        };
-        
+        let members: Vec<(String, f64)> =
+            if std::env::var("REDIS_COMPAT_DISABLE_SORTED_SETS").as_deref() == Ok("true") {
+                let mut entries = self.get_sorted_set_entries(&key).await?;
+                if entries.len() > depth {
+                    entries.truncate(depth);
+                }
+                entries
+            } else {
+                conn.zrange_withscores(&key, 0, depth as isize - 1).await?
+            };
+
         let mut price_map: HashMap<String, (Decimal, Decimal, u32)> = HashMap::new();
-        
+
         for (member, score) in members {
             let parts: Vec<&str> = member.split(':').collect();
             if parts.len() >= 2 {
                 if let (Ok(size), price_float) = (parts[1].parse::<Decimal>(), score) {
                     let price = match side {
-                        OrderSide::Buy => Decimal::from_f64_retain(-price_float).unwrap_or(Decimal::ZERO),
-                        OrderSide::Sell => Decimal::from_f64_retain(price_float).unwrap_or(Decimal::ZERO),
+                        OrderSide::Buy => {
+                            Decimal::from_f64_retain(-price_float).unwrap_or(Decimal::ZERO)
+                        }
+                        OrderSide::Sell => {
+                            Decimal::from_f64_retain(price_float).unwrap_or(Decimal::ZERO)
+                        }
                     };
-                    
+
                     let price_key = price.to_string();
-                    let entry = price_map.entry(price_key.clone()).or_insert((price, Decimal::ZERO, 0));
+                    let entry =
+                        price_map
+                            .entry(price_key.clone())
+                            .or_insert((price, Decimal::ZERO, 0));
                     entry.1 += size;
                     entry.2 += 1;
                 }
             }
         }
-        
+
         let mut levels: Vec<OrderBookLevel> = price_map
             .into_iter()
             .map(|(_, (price, size, count))| OrderBookLevel {
@@ -589,45 +642,51 @@ impl RedisStore {
                 order_count: count,
             })
             .collect();
-        
+
         levels.sort_by(|a, b| match side {
             OrderSide::Buy => b.price.cmp(&a.price),
             OrderSide::Sell => a.price.cmp(&b.price),
         });
-        
+
         Ok(levels)
     }
 
     // ==================== Trade Operations ====================
-    
+
     pub async fn save_trade(&self, trade: &Trade) -> ClobResult<()> {
         let mut conn = self.conn.clone();
-        
+
         // Save trade object
         let key = format!("trade:{}", trade.id);
         let json = serde_json::to_string(trade).unwrap();
         conn.set::<_, _, ()>(&key, &json).await?;
-        
+
         // Add to market trades sorted set (by timestamp)
         let market_key = format!("{}{}", MARKET_TRADES_PREFIX, trade.market_id);
         let score = trade.timestamp.timestamp() as f64;
         if std::env::var("REDIS_COMPAT_DISABLE_SORTED_SETS").as_deref() == Ok("true") {
-            self.add_sorted_set_entry(&market_key, &trade.id.to_string(), score).await?;
+            self.add_sorted_set_entry(&market_key, &trade.id.to_string(), score)
+                .await?;
         } else {
-            conn.zadd::<_, _, _, ()>(&market_key, trade.id.to_string(), score).await?;
+            conn.zadd::<_, _, _, ()>(&market_key, trade.id.to_string(), score)
+                .await?;
         }
-        
+
         // Add to user trades
         let maker_key = format!("{}{}", USER_TRADES_PREFIX, trade.maker_user_id);
         let taker_key = format!("{}{}", USER_TRADES_PREFIX, trade.taker_user_id);
         if std::env::var("REDIS_COMPAT_DISABLE_SORTED_SETS").as_deref() == Ok("true") {
-            self.add_sorted_set_entry(&maker_key, &trade.id.to_string(), score).await?;
-            self.add_sorted_set_entry(&taker_key, &trade.id.to_string(), score).await?;
+            self.add_sorted_set_entry(&maker_key, &trade.id.to_string(), score)
+                .await?;
+            self.add_sorted_set_entry(&taker_key, &trade.id.to_string(), score)
+                .await?;
         } else {
-            conn.zadd::<_, _, _, ()>(&maker_key, trade.id.to_string(), score).await?;
-            conn.zadd::<_, _, _, ()>(&taker_key, trade.id.to_string(), score).await?;
+            conn.zadd::<_, _, _, ()>(&maker_key, trade.id.to_string(), score)
+                .await?;
+            conn.zadd::<_, _, _, ()>(&taker_key, trade.id.to_string(), score)
+                .await?;
         }
-        
+
         Ok(())
     }
 
@@ -648,7 +707,11 @@ impl RedisStore {
         Ok(())
     }
 
-    pub async fn update_trade_settlement_tx(&self, trade_id: &str, tx_hash: &str) -> ClobResult<()> {
+    pub async fn update_trade_settlement_tx(
+        &self,
+        trade_id: &str,
+        tx_hash: &str,
+    ) -> ClobResult<()> {
         let mut conn = self.conn.clone();
         let key = format!("trade:{}", trade_id);
         let Some(json) = conn.get::<_, Option<String>>(&key).await? else {
@@ -658,7 +721,8 @@ impl RedisStore {
         if let Ok(h) = tx_hash.parse::<ethers::types::H256>() {
             trade.settlement_tx = Some(h);
         }
-        conn.set::<_, _, ()>(&key, serde_json::to_string(&trade)?).await?;
+        conn.set::<_, _, ()>(&key, serde_json::to_string(&trade)?)
+            .await?;
         Ok(())
     }
 
@@ -666,18 +730,19 @@ impl RedisStore {
         let mut conn = self.conn.clone();
         let key = format!("{}{}", MARKET_TRADES_PREFIX, market_id);
 
-        let trade_ids: Vec<String> = if std::env::var("REDIS_COMPAT_DISABLE_SORTED_SETS").as_deref() == Ok("true") {
-            self.get_sorted_set_entries(&key)
-                .await?
-                .into_iter()
-                .rev()
-                .take(limit)
-                .map(|(trade_id, _)| trade_id)
-                .collect()
-        } else {
-            conn.zrevrange(&key, 0, limit as isize - 1).await?
-        };
-        
+        let trade_ids: Vec<String> =
+            if std::env::var("REDIS_COMPAT_DISABLE_SORTED_SETS").as_deref() == Ok("true") {
+                self.get_sorted_set_entries(&key)
+                    .await?
+                    .into_iter()
+                    .rev()
+                    .take(limit)
+                    .map(|(trade_id, _)| trade_id)
+                    .collect()
+            } else {
+                conn.zrevrange(&key, 0, limit as isize - 1).await?
+            };
+
         let mut trades = Vec::new();
         for trade_id_str in trade_ids {
             if let Ok(trade_id) = Uuid::parse_str(&trade_id_str) {
@@ -689,7 +754,7 @@ impl RedisStore {
                 }
             }
         }
-        
+
         Ok(trades)
     }
 
@@ -714,13 +779,20 @@ impl RedisStore {
 
     /// Persist a note-lock record under `pm:note_lock:<user_id>:<order_commitment_low>`.
     pub async fn save_note_lock(&self, record: &crate::models::NoteLockRecord) -> ClobResult<()> {
-        let key = format!("pm:note_lock:{}:{}", record.user_id, record.order_commitment_low);
+        let key = format!(
+            "pm:note_lock:{}:{}",
+            record.user_id, record.order_commitment_low
+        );
         let json = serde_json::to_string(record)?;
         self.set(&key, &json).await
     }
 
     /// Delete a note-lock record (e.g. after it has been fully spent and confirmed).
-    pub async fn delete_note_lock(&self, user_id: &str, order_commitment_low: &str) -> ClobResult<()> {
+    pub async fn delete_note_lock(
+        &self,
+        user_id: &str,
+        order_commitment_low: &str,
+    ) -> ClobResult<()> {
         let mut conn = self.conn.clone();
         let key = format!("pm:note_lock:{}:{}", user_id, order_commitment_low);
         conn.del::<_, ()>(&key).await?;
@@ -767,7 +839,7 @@ impl RedisStore {
     }
 
     // ==================== Market Stats ====================
-    
+
     pub async fn update_market_stats(&self, trade: &Trade) -> ClobResult<()> {
         let mut conn = self.conn.clone();
         let key = format!("{}{}", MARKET_STATS_PREFIX, trade.market_id);
@@ -803,9 +875,10 @@ impl RedisStore {
             stats.insert("updated_at".to_string(), Utc::now().timestamp().to_string());
             return self.set_hash_entries(&key, &stats).await;
         }
-        
+
         // Use Lua script for atomic stats update
-        let script = Script::new(r"
+        let script = Script::new(
+            r"
             local key = KEYS[1]
             local price = tonumber(ARGV[1])
             local size = tonumber(ARGV[2])
@@ -826,15 +899,17 @@ impl RedisStore {
             
             redis.call('HSET', key, 'updated_at', timestamp)
             return 1
-        ");
-        
-        script.key(&key)
+        ",
+        );
+
+        script
+            .key(&key)
             .arg(trade.price.to_string().parse::<f64>().unwrap_or(0.0))
             .arg(trade.size.to_string().parse::<f64>().unwrap_or(0.0))
             .arg(Utc::now().timestamp())
             .invoke_async::<i32>(&mut conn)
             .await?;
-        
+
         Ok(())
     }
 
@@ -842,29 +917,29 @@ impl RedisStore {
         let mut conn = self.conn.clone();
         let key = format!("{}{}", MARKET_STATS_PREFIX, market_id);
 
-        let stats: HashMap<String, String> = if std::env::var("REDIS_COMPAT_DISABLE_HASHES").as_deref() == Ok("true") {
-            self.get_hash_entries(&key).await?
-        } else {
-            conn.hgetall(&key).await?
-        };
-        
+        let stats: HashMap<String, String> =
+            if std::env::var("REDIS_COMPAT_DISABLE_HASHES").as_deref() == Ok("true") {
+                self.get_hash_entries(&key).await?
+            } else {
+                conn.hgetall(&key).await?
+            };
+
         if stats.is_empty() {
             return Ok(None);
         }
-        
-        let parse_decimal = |key: &str| -> Option<Decimal> {
-            stats.get(key).and_then(|v| v.parse().ok())
-        };
-        
+
+        let parse_decimal =
+            |key: &str| -> Option<Decimal> { stats.get(key).and_then(|v| v.parse().ok()) };
+
         Ok(Some(MarketStats {
             market_id: market_id.to_string(),
             last_price: parse_decimal("last_price"),
             volume_24h: parse_decimal("volume_24h").unwrap_or(Decimal::ZERO),
             high_24h: parse_decimal("high_24h"),
             low_24h: parse_decimal("low_24h"),
-            best_bid: None,   // Computed separately
-            best_ask: None,   // Computed separately
-            spread: None,     // Computed separately
+            best_bid: None, // Computed separately
+            best_ask: None, // Computed separately
+            spread: None,   // Computed separately
             open_interest: parse_decimal("open_interest").unwrap_or(Decimal::ZERO),
         }))
     }
@@ -886,7 +961,8 @@ impl RedisStore {
         }
 
         let delta = size.to_string().parse::<f64>().unwrap_or(0.0);
-        conn.hincr::<_, _, _, ()>(&key, "open_interest", delta).await?;
+        conn.hincr::<_, _, _, ()>(&key, "open_interest", delta)
+            .await?;
         Ok(())
     }
 
@@ -907,7 +983,8 @@ impl RedisStore {
         }
 
         let delta = -(size.to_string().parse::<f64>().unwrap_or(0.0));
-        conn.hincr::<_, _, _, ()>(&key, "open_interest", delta).await?;
+        conn.hincr::<_, _, _, ()>(&key, "open_interest", delta)
+            .await?;
         Ok(())
     }
 }

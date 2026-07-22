@@ -162,7 +162,10 @@ impl WithdrawalService {
     /// 3. POST to vault-service to start proof generation.
     /// 4. On vault-service error: release the reservation, return error.
     /// 5. On success: store tracking record, return status=pending.
-    pub async fn process_withdrawal(&self, req: WithdrawalRequest) -> ClobResult<WithdrawalResponse> {
+    pub async fn process_withdrawal(
+        &self,
+        req: WithdrawalRequest,
+    ) -> ClobResult<WithdrawalResponse> {
         let intent = &req.intent;
 
         // ── 1. Pre-lock validation (zero side effects) ────────────────────────
@@ -264,18 +267,18 @@ impl WithdrawalService {
             Ok(resp) => {
                 // Vault rejected — release lock immediately.
                 let status = resp.status();
-                let _ = self
-                    .balance_service
-                    .release_balance(&intent.user_id, &intent.token, amount);
+                let _ =
+                    self.balance_service
+                        .release_balance(&intent.user_id, &intent.token, amount);
                 Err(ClobError::Internal(format!(
                     "vault-service rejected withdrawal with status {status}"
                 )))
             }
             Err(e) => {
                 // Network failure — release lock.
-                let _ = self
-                    .balance_service
-                    .release_balance(&intent.user_id, &intent.token, amount);
+                let _ =
+                    self.balance_service
+                        .release_balance(&intent.user_id, &intent.token, amount);
                 Err(ClobError::Internal(format!(
                     "vault-service unreachable: {e}"
                 )))
@@ -327,8 +330,7 @@ impl WithdrawalService {
                     .and_then(|s| s.as_str())
                     .unwrap_or("pending");
 
-                let amount =
-                    Decimal::from_str(&tracking.locked_amount).unwrap_or(Decimal::ZERO);
+                let amount = Decimal::from_str(&tracking.locked_amount).unwrap_or(Decimal::ZERO);
 
                 match status_str {
                     "completed" => {
@@ -337,9 +339,9 @@ impl WithdrawalService {
                             .and_then(|t| t.as_str())
                             .map(|s| s.to_string());
                         // debit() = release reservation + reduce total balance.
-                        let _ = self
-                            .balance_service
-                            .debit(&tracking.user_id, &tracking.token, amount);
+                        let _ =
+                            self.balance_service
+                                .debit(&tracking.user_id, &tracking.token, amount);
                         tracking.status = WithdrawalStatus::Completed;
                         tracking.tx_hash = tx_hash;
                         let _ = self
@@ -352,9 +354,11 @@ impl WithdrawalService {
                     }
                     "failed" => {
                         // Release reservation only — total is unchanged.
-                        let _ = self
-                            .balance_service
-                            .release_balance(&tracking.user_id, &tracking.token, amount);
+                        let _ = self.balance_service.release_balance(
+                            &tracking.user_id,
+                            &tracking.token,
+                            amount,
+                        );
                         tracking.status = WithdrawalStatus::Failed;
                         let _ = self
                             .redis
@@ -446,11 +450,7 @@ mod tests {
                 .into_response();
         }
         if s.post_status == 403 {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({"error": "forbidden"})),
-            )
-                .into_response();
+            return (StatusCode::FORBIDDEN, Json(json!({"error": "forbidden"}))).into_response();
         }
         if s.post_status == 500 {
             return (
@@ -516,10 +516,7 @@ mod tests {
         };
         let app = Router::new()
             .route("/internal/v1/withdraw", post(mock_vault_post))
-            .route(
-                "/internal/v1/withdraw/:id/status",
-                get(mock_vault_status),
-            )
+            .route("/internal/v1/withdraw/:id/status", get(mock_vault_status))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -592,8 +589,7 @@ mod tests {
     async fn test_happy_path_reserves_balance_returns_pending() {
         let (vault_url, _received, vault_shutdown) =
             setup_mock_vault(200, json!({"status": "pending"}), "test-key").await;
-        let (service, balances, redis_shutdown) =
-            setup_service(&vault_url, "test-key").await;
+        let (service, balances, redis_shutdown) = setup_service(&vault_url, "test-key").await;
 
         balances.deposit("alice", "USDC", dec!(1000));
         let resp = service
@@ -617,8 +613,7 @@ mod tests {
     async fn test_happy_path_rollover_fields_forwarded_intact_to_vault() {
         let (vault_url, received, vault_shutdown) =
             setup_mock_vault(200, json!({"status": "pending"}), "test-key").await;
-        let (service, balances, redis_shutdown) =
-            setup_service(&vault_url, "test-key").await;
+        let (service, balances, redis_shutdown) = setup_service(&vault_url, "test-key").await;
 
         balances.deposit("bob", "USDC", dec!(1000));
         let rollover = json!({
@@ -650,8 +645,7 @@ mod tests {
         let status_payload = json!({"status": "completed", "tx_hash": "0xabc123"});
         let (vault_url, _received, vault_shutdown) =
             setup_mock_vault(200, status_payload, "test-key").await;
-        let (service, balances, redis_shutdown) =
-            setup_service(&vault_url, "test-key").await;
+        let (service, balances, redis_shutdown) = setup_service(&vault_url, "test-key").await;
 
         balances.deposit("carol", "USDC", dec!(1000));
         let resp = service
@@ -682,8 +676,7 @@ mod tests {
     async fn test_insufficient_balance_rejected_vault_not_called() {
         let (vault_url, received, vault_shutdown) =
             setup_mock_vault(200, json!({"status": "pending"}), "test-key").await;
-        let (service, balances, redis_shutdown) =
-            setup_service(&vault_url, "test-key").await;
+        let (service, balances, redis_shutdown) = setup_service(&vault_url, "test-key").await;
 
         balances.deposit("dave", "USDC", dec!(100));
         let err = service
@@ -711,8 +704,7 @@ mod tests {
     async fn test_zero_amount_rejected_before_lock() {
         let (vault_url, received, vault_shutdown) =
             setup_mock_vault(200, json!({"status": "pending"}), "test-key").await;
-        let (service, balances, redis_shutdown) =
-            setup_service(&vault_url, "test-key").await;
+        let (service, balances, redis_shutdown) = setup_service(&vault_url, "test-key").await;
 
         balances.deposit("eve", "USDC", dec!(1000));
         let err = service
@@ -735,8 +727,7 @@ mod tests {
     async fn test_invalid_destination_rejected_before_lock() {
         let (vault_url, received, vault_shutdown) =
             setup_mock_vault(200, json!({"status": "pending"}), "test-key").await;
-        let (service, balances, redis_shutdown) =
-            setup_service(&vault_url, "test-key").await;
+        let (service, balances, redis_shutdown) = setup_service(&vault_url, "test-key").await;
 
         balances.deposit("frank", "USDC", dec!(1000));
         let mut req = make_request("frank", "USDC", "500", 6);
@@ -762,8 +753,7 @@ mod tests {
     async fn test_vault_returns_500_releases_lock() {
         let (vault_url, _received, vault_shutdown) =
             setup_mock_vault(500, json!({}), "test-key").await;
-        let (service, balances, redis_shutdown) =
-            setup_service(&vault_url, "test-key").await;
+        let (service, balances, redis_shutdown) = setup_service(&vault_url, "test-key").await;
 
         balances.deposit("grace", "USDC", dec!(1000));
         let err = service
@@ -793,8 +783,7 @@ mod tests {
         // Correct key on server side; wrong key used by service → triggers 401.
         let (vault_url, _received, vault_shutdown) =
             setup_mock_vault(200, json!({}), "correct-key").await;
-        let (service, balances, redis_shutdown) =
-            setup_service(&vault_url, "wrong-key").await;
+        let (service, balances, redis_shutdown) = setup_service(&vault_url, "wrong-key").await;
 
         balances.deposit("henry", "USDC", dec!(1000));
         let err = service
@@ -819,8 +808,7 @@ mod tests {
     async fn test_vault_returns_403_releases_lock() {
         let (vault_url, _received, vault_shutdown) =
             setup_mock_vault(403, json!({}), "test-key").await;
-        let (service, balances, redis_shutdown) =
-            setup_service(&vault_url, "test-key").await;
+        let (service, balances, redis_shutdown) = setup_service(&vault_url, "test-key").await;
 
         balances.deposit("iris", "USDC", dec!(1000));
         let _ = service
@@ -842,8 +830,7 @@ mod tests {
         let dead_url = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
 
-        let (service, balances, redis_shutdown) =
-            setup_service(&dead_url, "test-key").await;
+        let (service, balances, redis_shutdown) = setup_service(&dead_url, "test-key").await;
 
         balances.deposit("jack", "USDC", dec!(1000));
         let err = service
@@ -869,12 +856,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_vault_proof_fails_on_poll_releases_lock() {
-        let status_payload =
-            json!({"status": "failed", "error": "proof generation failed"});
+        let status_payload = json!({"status": "failed", "error": "proof generation failed"});
         let (vault_url, _received, vault_shutdown) =
             setup_mock_vault(200, status_payload, "test-key").await;
-        let (service, balances, redis_shutdown) =
-            setup_service(&vault_url, "test-key").await;
+        let (service, balances, redis_shutdown) = setup_service(&vault_url, "test-key").await;
 
         balances.deposit("kate", "USDC", dec!(1000));
         let resp = service
@@ -907,8 +892,7 @@ mod tests {
     async fn test_duplicate_nonce_rejected_balance_locked_once() {
         let (vault_url, received, vault_shutdown) =
             setup_mock_vault(200, json!({"status": "pending"}), "test-key").await;
-        let (service, balances, redis_shutdown) =
-            setup_service(&vault_url, "test-key").await;
+        let (service, balances, redis_shutdown) = setup_service(&vault_url, "test-key").await;
 
         balances.deposit("lena", "USDC", dec!(2000));
 

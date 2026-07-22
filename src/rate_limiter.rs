@@ -1,5 +1,4 @@
 use axum::{
-    body::Body,
     extract::Request,
     http::StatusCode,
     middleware::Next,
@@ -7,7 +6,6 @@ use axum::{
 };
 use std::{
     collections::HashMap,
-    net::IpAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -62,20 +60,16 @@ impl RateLimiter {
     pub async fn cleanup(&self) {
         let mut buckets = self.buckets.write().await;
         let now = Instant::now();
-        buckets.retain(|_, bucket| {
-            now.duration_since(bucket.last_refill) < Duration::from_secs(300)
-        });
+        buckets
+            .retain(|_, bucket| now.duration_since(bucket.last_refill) < Duration::from_secs(300));
     }
 }
 
 /// Rate limiting middleware
-pub async fn rate_limit_middleware(
-    request: Request,
-    next: Next,
-) -> Response {
+pub async fn rate_limit_middleware(request: Request, next: Next) -> Response {
     // Extract rate limiter from extensions if available
     let limiter = request.extensions().get::<RateLimiter>().cloned();
-    
+
     if let Some(limiter) = limiter {
         // Use IP address as key (in production, use user_id if authenticated)
         let key = request

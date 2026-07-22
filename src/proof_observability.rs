@@ -62,7 +62,11 @@ pub async fn create_attempt(
 
     let key = format!("{}{}", PROOF_ATTEMPT_PREFIX, proof_id);
     store
-        .set_with_expiry(&key, &serde_json::to_string(&attempt)?, PROOF_ATTEMPT_TTL_SECS)
+        .set_with_expiry(
+            &key,
+            &serde_json::to_string(&attempt)?,
+            PROOF_ATTEMPT_TTL_SECS,
+        )
         .await?;
 
     // Index by user so list-by-user queries are O(1).
@@ -114,12 +118,19 @@ pub async fn update_attempt(
     }
 
     store
-        .set_with_expiry(&key, &serde_json::to_string(&attempt)?, PROOF_ATTEMPT_TTL_SECS)
+        .set_with_expiry(
+            &key,
+            &serde_json::to_string(&attempt)?,
+            PROOF_ATTEMPT_TTL_SECS,
+        )
         .await?;
     Ok(())
 }
 
-pub async fn get_attempt(store: &Arc<RedisStore>, proof_id: &str) -> ClobResult<Option<ProofAttempt>> {
+pub async fn get_attempt(
+    store: &Arc<RedisStore>,
+    proof_id: &str,
+) -> ClobResult<Option<ProofAttempt>> {
     let key = format!("{}{}", PROOF_ATTEMPT_PREFIX, proof_id);
     let Some(raw) = store.get_optional(&key).await? else {
         return Ok(None);
@@ -135,7 +146,9 @@ pub async fn list_user_attempts(
     filter_type: Option<&str>,
 ) -> ClobResult<Vec<ProofAttempt>> {
     let user_key = format!("{}{}", PROOF_ATTEMPT_USER_PREFIX, user_id.to_lowercase());
-    let ids = store.get_json_array_values(&user_key, MAX_PROOF_LIST).await?;
+    let ids = store
+        .get_json_array_values(&user_key, MAX_PROOF_LIST)
+        .await?;
 
     let mut out = Vec::new();
     // Iterate in reverse so newest attempts come first.
