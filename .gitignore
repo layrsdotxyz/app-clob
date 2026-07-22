@@ -26,6 +26,7 @@ Thumbs.db
 .env.local
 
 # Build artifacts
+/build/
 *.so
 *.dylib
 *.dll
