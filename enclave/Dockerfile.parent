@@ -1,14 +1,13 @@
-FROM rust:1.94-bookworm AS builder
+FROM rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55 AS builder
 WORKDIR /build
 COPY enclave/parent-runtime/Cargo.toml enclave/parent-runtime/Cargo.lock ./enclave/parent-runtime/
 COPY enclave/parent-runtime/src ./enclave/parent-runtime/src
 COPY src ./src
 RUN cargo build --locked --release --manifest-path enclave/parent-runtime/Cargo.toml --bin layrs-enclave-parent
 
-FROM debian:bookworm-slim
-RUN useradd --system --uid 10001 --no-create-home layrs
-COPY --from=builder /build/enclave/parent-runtime/target/release/layrs-enclave-parent /usr/local/bin/layrs-enclave-parent
-USER 10001:10001
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e
+COPY --from=builder --chown=nonroot:nonroot /build/enclave/parent-runtime/target/release/layrs-enclave-parent /usr/local/bin/layrs-enclave-parent
+USER nonroot:nonroot
 EXPOSE 8443
 ENV PORT=8443 LAYRS_ENCLAVE_CID=16 LAYRS_PARENT_MAX_CONCURRENCY=256
 ENTRYPOINT ["/usr/local/bin/layrs-enclave-parent"]
