@@ -1,15 +1,15 @@
 [package]
-name = "clob-service"
+name = "layrs-clob-service"
 version = "0.1.0"
 edition = "2021"
-authors = ["Predifi Team"]
+authors = ["Layrs Team"]
 
 [lib]
 name = "clob_service"
 path = "src/lib.rs"
 
 [[bin]]
-name = "clob-service"
+name = "layrs-clob-service"
 path = "src/main.rs"
 
 [features]

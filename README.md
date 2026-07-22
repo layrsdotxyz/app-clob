@@ -1,182 +1,65 @@
-# Predifi CLOB Service
+# Layrs CLOB Service
 
-Production-grade Central Limit Order Book (CLOB) microservice for the Predifi prediction market platform.
+Rust/Axum central-limit-order-book and private-ledger service for Layrs.
 
-## Overview
+This repository was extracted from the mature Predifi CLOB implementation at
+commit `82c2241ec318ae5aa83bda99093b59849aa6a469`. See
+[`UPSTREAM_SOURCE.md`](UPSTREAM_SOURCE.md) for provenance and the extraction
+rules.
 
-The CLOB service is a standalone microservice that provides:
-- **Order Book Management**: Redis-backed in-memory order books with price-time priority
-- **Matching Engine**: High-performance order matching with atomic execution
-- **REST API**: Order submission, cancellation, order book snapshots, trade history
-- **WebSocket Server**: Real-time broadcasts for order book updates, trades, and order status
-- **Settlement Integration**: Hooks for balance verification and position settlement
-- **Monitoring**: Prometheus metrics for latency, throughput, and system health
+## Current capabilities
 
-## Architecture
+- Price-time-priority matching with GTC, IOC, FOK, and post-only behavior.
+- Redis/Valkey order-book operations and PostgreSQL durable order, fill, trade,
+  balance, and lifecycle records.
+- REST and WebSocket interfaces with private user channels.
+- Balance reservation, settlement, retry workers, oracle-driven markets,
+  circuit breakers, and Prometheus metrics.
+- Existing ZK proof and EVM settlement adapters retained as migration inputs.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     CLOB Service                             │
-├─────────────────────────────────────────────────────────────┤
-│                                                               │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
-│  │  REST API    │    │  WebSocket   │    │   Metrics    │  │
-│  │  (Fastify)   │    │  (Socket.io) │    │ (Prometheus) │  │
-│  └──────┬───────┘    └──────┬───────┘    └──────────────┘  │
-│         │                   │                                │
-│  ┌──────▼───────────────────▼──────────────────────────┐   │
-│  │           Matching Engine (Core Logic)              │   │
-│  │  • Order validation & matching                      │   │
-│  │  • Price-time priority algorithm                    │   │
-│  │  • Partial fills & order types (GTC/IOC/FOK)       │   │
-│  │  • Event emission (fills, cancels, updates)        │   │
-│  └──────┬──────────────────────────────────────────────┘   │
-│         │                                                    │
-│  ┌──────▼───────────────────────────────────────────────┐  │
-│  │         Order Book Manager (Redis)                   │  │
-│  │  • Sorted sets for bids/asks (price-time)           │  │
-│  │  • Fast lookups: O(log n) insert, O(1) best price   │  │
-│  │  • Atomic operations with Lua scripts               │  │
-│  └──────┬──────────────────────────────────────────────┘  │
-│         │                                                    │
-└─────────┼────────────────────────────────────────────────────┘
-          │
-    ┌─────▼─────┐       ┌──────────────┐
-    │   Redis   │       │  PostgreSQL  │
-    │  (Orders) │       │  (Trades)    │
-    └───────────┘       └──────────────┘
-```
+## Important privacy status
 
-## Tech Stack
+This code is **not yet a confidential CLOB merely because it runs in Rust**.
+The present implementation can persist full order and ledger metadata in
+Redis/Valkey and PostgreSQL. Before production, the private matching and ledger
+boundary must run inside an attested AWS Nitro Enclave, with private state kept
+inside the enclave or written externally only as authenticated ciphertext.
+Public stores and APIs may expose aggregate depth, public prices, market status,
+and deliberately disclosed settlement artifacts only.
 
-- **Runtime**: Node.js 20+ with TypeScript
-- **Web Framework**: Fastify 5 (REST API)
-- **WebSocket**: Socket.io 4 (real-time broadcasts)
-- **Order Book Storage**: Redis 7 (sorted sets, pub/sub)
-- **Trade Persistence**: PostgreSQL 15 (historical trades, order ledger)
-- **Metrics**: prom-client (Prometheus)
-- **Deployment**: AWS ECS (Fargate) on cluster `layrs`
-- **Testing**: Vitest with integration test suite
+The planned separation is:
 
-## Order Types
+- `clob-core`: deterministic matching and risk logic;
+- `enclave-clob`: attested private order, matching, and balance authority;
+- `clob-gateway`: untrusted network proxy and public aggregate publisher;
+- external persistence: encrypted journal/checkpoints plus non-sensitive public
+  projections.
 
-- **GTC (Good Till Cancel)**: Remains in book until filled or explicitly cancelled
-- **IOC (Immediate or Cancel)**: Fill immediately or cancel unfilled portion
-- **FOK (Fill or Kill)**: Fill entire order immediately or cancel completely
-- **POST_ONLY**: Only add liquidity, reject if would match existing orders
+That separation will be implemented without silently treating Redis isolation
+as cryptographic confidentiality.
 
-## API Endpoints
+## Local build
 
-### REST API
-
-```
-POST   /v1/orders              - Submit new order
-DELETE /v1/orders/:id          - Cancel order
-GET    /v1/orders/:id          - Get order status
-GET    /v1/orders              - List user orders (authenticated)
-GET    /v1/orderbook/:marketId - Get order book snapshot
-GET    /v1/trades/:marketId    - Get recent trades
-GET    /v1/trades/:marketId/history - Get historical trades (paginated)
-GET    /health                 - Health check
-GET    /metrics                - Prometheus metrics
-```
-
-### WebSocket Events
-
-```javascript
-// Subscribe to market
-socket.emit('subscribe', { channel: 'orderbook', marketId: 'market-123' })
-socket.emit('subscribe', { channel: 'trades', marketId: 'market-123' })
-socket.emit('subscribe', { channel: 'orders', userId: 'user-456' }) // authenticated
-
-// Orderbook updates
-socket.on('orderbook:update', { marketId, bids: [...], asks: [...], timestamp })
-
-// Trade executions
-socket.on('trade:executed', { marketId, price, size, side, timestamp, takerOrderId, makerOrderId })
-
-// User order updates (private channel)
-socket.on('order:status', { orderId, status, filledSize, remainingSize })
-```
-
-## Deployment
+Prerequisites are a Rust toolchain, Redis/Valkey, and PostgreSQL. Copy
+`.env.example` to an untracked `.env`, then run:
 
 ```bash
-# Run from layrs-backend/ — builds image, pushes to ECR, deploys to ECS
-AWS_PROFILE=layrs bash deploy-clob.sh
-
-# Service URL
-https://clob.layrs.xyz
+cargo build
+cargo run --bin layrs-clob-service
 ```
 
-## Environment Variables
+The real-backend integration harness and lifecycle matrix live under `tests/`
+and `LIFECYCLE_VERDICT_MATRIX.md`.
 
-See `.env.example` for complete configuration. Key variables:
+## Deployment naming
 
-```bash
-NODE_ENV=production
-PORT=8080
+All new AWS infrastructure, secrets, images, roles, logs, and data stores for
+this generation must use the `layrsv2` prefix. The public product and source
+code remain branded **Layrs**; `layrsv2` is the infrastructure-generation
+identifier.
 
-# Redis (order book)
-REDIS_HOST=redis-12345.c1.us-east1-1.gce.redns.redis-cloud.com
-REDIS_PORT=12345
-REDIS_PASSWORD=secret
-
-# PostgreSQL (trades)
-DATABASE_URL=postgresql://user:pass@host:5432/clob
-
-# Security
-JWT_SECRET=your-jwt-secret
-CORS_ORIGINS=https://predifi.com,https://app.predifi.com
-
-# Performance
-MAX_ORDERS_PER_USER=100
-MAX_ORDER_BOOK_DEPTH=1000
-MATCHING_ENGINE_TICK_MS=10
-```
-
-## Monitoring
-
-Prometheus metrics exposed at `/metrics`:
-
-- `clob_orders_total{status}` - Total orders submitted
-- `clob_orders_matched_total` - Total orders matched
-- `clob_order_latency_seconds` - Order processing latency histogram
-- `clob_matching_duration_seconds` - Matching engine cycle duration
-- `clob_orderbook_depth{side}` - Current order book depth
-- `clob_websocket_connections` - Active WebSocket connections
-- `clob_redis_operations_total{operation}` - Redis operation counter
-
-## Development
-
-```bash
-# Install dependencies
-npm install
-
-# Run in development mode
-npm run dev
-
-# Run tests
-npm test
-
-# Run integration tests
-npm run test:integration
-
-# Build for production
-npm run build
-
-# Start production server
-npm start
-```
-
-## Performance Targets
-
-- Order submission latency: < 10ms (p99)
-- Matching cycle duration: < 5ms (p99)
-- WebSocket broadcast latency: < 50ms (p99)
-- Order book snapshot generation: < 20ms
-- Throughput: > 1,000 orders/sec per market
+No legacy Layrs AWS resource is a deployment target for this repository.
 
 ## License
 
-Proprietary - Predifi © 2025
+Proprietary — Layrs.

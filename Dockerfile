@@ -1,93 +1,37 @@
-# Multi-stage build for minimal production image.
-#
-# Build context: layrs-backend/  (one level UP from this file)
-# Example:
-#   docker build -f clob-service/Dockerfile -t clob-service:latest .
-#
-# This is required so we can COPY the ZK circuit artifacts (../circuits/) which
-# live outside the clob-service/ sub-directory.
+# Standalone container for the Layrs CLOB service. Build from this repository's
+# root: docker build -t layrs-clob-service:local .
 FROM rustlang/rust:nightly-bookworm-slim AS builder
 
 WORKDIR /build
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy manifests (from clob-service/ sub-directory relative to build context)
-COPY clob-service/Cargo.toml clob-service/Cargo.lock ./
+COPY Cargo.toml ./
+COPY migrations ./migrations
+COPY src ./src
 
-# Create dummy main + lib to cache dependencies
-RUN mkdir src && \
-    echo "fn main() {}" > src/main.rs && \
-    echo "" > src/lib.rs && \
-    cargo build --release && \
-    rm -rf src
+RUN cargo build --release --bin layrs-clob-service
 
-# Copy migrations (embedded at compile time by sqlx::migrate!)
-COPY clob-service/migrations ./migrations
-
-# Copy actual source code
-COPY clob-service/src ./src
-
-# Touch source files so their mtime is newer than the cached dummy binary,
-# forcing cargo to detect the change and recompile the real binary.
-RUN touch src/main.rs src/lib.rs
-
-# Build release binary with full optimizations
-RUN cargo build --release
-
-# --- Production image --------------------------------------------------------
-# ubuntu:24.04 provides GLIBC 2.39, required by the bb binary.
-FROM ubuntu:24.04
+FROM debian:bookworm-slim
 
 WORKDIR /app
 
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    libssl3 \
     curl \
-    && rm -rf /var/lib/apt/lists/*
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 1001 clob
 
-# Copy bb binary (staged by deploy-clob.sh into the Docker build context)
-COPY circuits/bb/bb /app/bb
+COPY --from=builder /build/target/release/layrs-clob-service /app/layrs-clob-service
 
-# Copy Noir circuit ACIR JSON files (used by bb prove at runtime)
-COPY circuits/noir/pm_balance_proof/target/pm_balance_proof.json /app/circuits/noir/pm_balance_proof/target/pm_balance_proof.json
-COPY circuits/noir/pm_claim/target/pm_claim.json /app/circuits/noir/pm_claim/target/pm_claim.json
-COPY circuits/noir/pm_deposit/target/pm_deposit.json /app/circuits/noir/pm_deposit/target/pm_deposit.json
-COPY circuits/noir/pm_order_commitment/target/pm_order_commitment.json /app/circuits/noir/pm_order_commitment/target/pm_order_commitment.json
-COPY circuits/noir/pm_settlement/target/pm_settlement.json /app/circuits/noir/pm_settlement/target/pm_settlement.json
-COPY circuits/noir/pm_withdraw/target/pm_withdraw.json /app/circuits/noir/pm_withdraw/target/pm_withdraw.json
-COPY circuits/noir/pm_yield_distribution/target/pm_yield_distribution.json /app/circuits/noir/pm_yield_distribution/target/pm_yield_distribution.json
-COPY circuits/noir/vault_spend/target/vault_spend.json /app/circuits/noir/vault_spend/target/vault_spend.json
-
-# Copy Noir VK files (used by bb verify at runtime)
-COPY circuits/noir/pm_balance_proof/target/vk/vk /app/circuits/noir/pm_balance_proof/target/vk/vk
-COPY circuits/noir/pm_claim/target/vk/vk /app/circuits/noir/pm_claim/target/vk/vk
-COPY circuits/noir/pm_deposit/target/vk/vk /app/circuits/noir/pm_deposit/target/vk/vk
-COPY circuits/noir/pm_order_commitment/target/vk/vk /app/circuits/noir/pm_order_commitment/target/vk/vk
-COPY circuits/noir/pm_settlement/target/vk/vk /app/circuits/noir/pm_settlement/target/vk/vk
-COPY circuits/noir/pm_withdraw/target/vk/vk /app/circuits/noir/pm_withdraw/target/vk/vk
-COPY circuits/noir/pm_yield_distribution/target/vk/vk /app/circuits/noir/pm_yield_distribution/target/vk/vk
-COPY circuits/noir/vault_spend/target/vk/vk /app/circuits/noir/vault_spend/target/vk/vk
-
-# Copy binary from builder
-COPY --from=builder /build/target/release/clob-service /app/clob-service
-
-# Create non-root user (UID 1001 to avoid collision with ubuntu's default UID 1000)
-RUN useradd -m -u 1001 clob && chown -R clob:clob /app
 USER clob
-
-# Expose ports
-EXPOSE 8081
-EXPOSE 9090
+EXPOSE 8081 9090
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD curl -sf http://localhost:8081/health || exit 1
+    CMD curl -fsS http://localhost:8081/health || exit 1
 
-# Run the service
-CMD ["/app/clob-service"]
+ENTRYPOINT ["/app/layrs-clob-service"]

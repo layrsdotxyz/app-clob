@@ -1,4 +1,4 @@
-# CLOB Service
+# Layrs CLOB Service
 
 Production-grade Central Limit Order Book (CLOB) matching engine built in Rust.
 
@@ -135,11 +135,14 @@ cargo bench
 
 ## Deployment
 
-### AWS ECS
+### AWS deployment
 ```bash
-# Run from layrs-backend/
-AWS_PROFILE=layrs bash deploy-clob.sh
+# Build from this repository. Production infrastructure is delivered separately.
+docker build -t layrs-clob-service:local .
 ```
+
+Every new AWS resource and secret must use the `layrsv2` prefix. The legacy
+Layrs AWS estate is not a deployment target.
 
 ### Configuration
 
@@ -185,4 +188,4 @@ Target latencies:
 
 ## License
 
-Proprietary - Predifi.com
+Proprietary - Layrs
