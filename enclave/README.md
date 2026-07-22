@@ -4,6 +4,11 @@ This image contains the only process allowed to see private principals, balances
 positions, fills and Pyth resolution inputs. It has no TCP networking or persistent block device.
 The parent instance can transport only length-prefixed encrypted frames over VSOCK port `5003`.
 
+`layrs-enclave-parent` is the deliberately untrusted HTTP-to-VSOCK adapter. It validates bounds,
+applies timeouts and concurrency limits, but has no decryption key. `GET /v1/attestation` returns
+the raw NSM document and bound public keys; `POST /v1/private/relay` passes only base64url
+ciphertext. It must be reachable only from the `layrsv2` internal load balancer/security group.
+
 ## Trust bootstrap
 
 1. Build the EIF with a release Ed25519 operator public key. The key is compiled into the image,

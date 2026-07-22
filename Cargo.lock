@@ -2899,6 +2899,7 @@ dependencies = [
  "ark-ff",
  "aws-nitro-enclaves-nsm-api",
  "axum",
+ "base64 0.22.1",
  "bincode",
  "bytes",
  "chrono",
@@ -5660,6 +5661,7 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+ "uuid 1.22.0",
 ]
 
 [[package]]

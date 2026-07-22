@@ -16,6 +16,10 @@ path = "src/main.rs"
 name = "layrs-enclave"
 path = "src/bin/layrs-enclave.rs"
 
+[[bin]]
+name = "layrs-enclave-parent"
+path = "src/bin/layrs-enclave-parent.rs"
+
 [features]
 test-helpers = []
 
@@ -27,7 +31,7 @@ tokio-util = "0.7"
 # Web framework
 axum = { version = "0.7", features = ["ws", "macros"] }
 tower = { version = "0.4", features = ["full"] }
-tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip", "request-id", "timeout"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -93,6 +97,7 @@ zeroize = { version = "1.8", features = ["derive"] }
 aws-nitro-enclaves-nsm-api = "0.5.2"
 tokio-vsock = "0.7.2"
 x25519-dalek = { version = "3.0.0", features = ["static_secrets", "getrandom"] }
+base64 = "0.22"
 
 [dev-dependencies]
 criterion = "0.5"
