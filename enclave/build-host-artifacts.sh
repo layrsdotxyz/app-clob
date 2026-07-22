@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ ${#LAYRS_OPERATOR_PUBLIC_KEY_HEX:-0} -ne 64 ]]; then
+if [[ -z ${LAYRS_OPERATOR_PUBLIC_KEY_HEX:-} || ${#LAYRS_OPERATOR_PUBLIC_KEY_HEX} -ne 64 ]]; then
   echo "LAYRS_OPERATOR_PUBLIC_KEY_HEX must be a 32-byte hex Ed25519 key" >&2
   exit 1
 fi
