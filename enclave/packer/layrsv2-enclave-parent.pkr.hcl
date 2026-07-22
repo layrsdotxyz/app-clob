@@ -16,14 +16,15 @@ variable "release_id" {
 }
 
 source "amazon-ebs" "layrsv2_enclave_parent" {
-  region                    = var.aws_region
-  instance_type             = "m6i.xlarge"
-  ssh_username              = "ec2-user"
-  ami_name                  = "layrsv2-enclave-parent-${var.release_id}"
-  ami_description           = "Layrs v2 Nitro enclave parent ${var.release_id}"
-  ena_support               = true
-  imds_support              = "v2.0"
-  ssh_clear_authorized_keys = true
+  region                                    = var.aws_region
+  instance_type                             = "m6i.xlarge"
+  ssh_username                              = "ec2-user"
+  ami_name                                  = "layrsv2-enclave-parent-${var.release_id}"
+  ami_description                           = "Layrs v2 Nitro enclave parent ${var.release_id}"
+  ena_support                               = true
+  imds_support                              = "v2.0"
+  ssh_clear_authorized_keys                 = true
+  temporary_security_group_source_public_ip = true
   source_ami_filter {
     filters = {
       name                = "al2023-ami-2023.*-x86_64"
