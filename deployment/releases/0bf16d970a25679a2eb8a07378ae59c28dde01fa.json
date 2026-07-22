@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "rejected",
+  "rejectionReason": "The Debian runtime image scan reported 3 critical and 5 high findings; this release was never activated.",
+  "releaseId": "0bf16d970a25679a2eb8a07378ae59c28dde01fa",
+  "sourceCommit": "0bf16d970a25679a2eb8a07378ae59c28dde01fa",
+  "packerSourceCommit": "189d121d91faaa2241f1ccf950056ff72accc559",
+  "region": "us-east-1",
+  "amiId": "ami-00524437e940d3b86",
+  "enclaveContainerImage": "255638996474.dkr.ecr.us-east-1.amazonaws.com/layrsv2-production-enclave-clob@sha256:ffe0ed2dee96de5674bfce50963ce855380c5e1727f13eca5715d9e6bd71071f",
+  "artifacts": {
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "sizeBytes": 87552648,
+      "sha384": "e5bffc0c98aff060bfd0634e02e1e4b05f9c28e67ec8ceb3e4ce3664aaa4a58db6464b06ee72a8aa9ec8407796d2632a"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "sizeBytes": 1157856,
+      "sha384": "90bbfccfef83b18c5987b12f240377f72afd488c3d690db3043127b102e3b2718adb5ffe8f73ed573aee26f80c3cb62b"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "666cbaee4e93495975b79c23b7511a47e3a6b46ab8139bd0db3e7384d832902d9468ee7adc7b3e7013fb448cb8cc60fe",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "514cfa63b005f2f65c2f06197c4098c39beb7aeb4b5973c478b915b969a95d519105a9f9c958304ded33b2a0d0d595c8"
+  },
+  "signature": null,
+  "signatureNote": "EIF identity is enforced through pinned PCR0 and KMS attestation policy; release authorization is separately signed by the compiled operator key."
+}
