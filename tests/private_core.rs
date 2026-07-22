@@ -6,7 +6,7 @@ use clob_service::private_core::{
     SessionGuard, SessionRequest, SignedResolution, SignedSessionRequest, TimeInForce, Transfer,
     UserCommand, UserCommandAction,
 };
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
 #[test]
 fn ledger_is_atomic_conservative_and_idempotent() {
@@ -380,6 +380,94 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
     ));
 }
 
+#[test]
+fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
+    let user = SigningKey::from_bytes(&[31u8; 32]);
+    let receipt_signer = ReceiptSigner::generate([32u8; 48]);
+    let receipt_public_key = receipt_signer.verifying_key();
+    let mut core = PrivateTradingCore::new(JournalKey::from_bytes([33u8; 32]), receipt_signer);
+    core.register_session(
+        "sys:session:withdrawal".into(),
+        "session:withdrawal".into(),
+        "usr_private".into(),
+        user.verifying_key().to_bytes(),
+        10_000,
+        1_000,
+    )
+    .unwrap();
+    core.apply_external_flow(
+        "sys:deposit:withdrawal".into(),
+        AccountKey::new("usr_private", AccountBucket::UserAvailable, "USDC"),
+        50_000_000,
+        ExternalFlowDirection::Inflow,
+        [34u8; 32],
+        1_100,
+    )
+    .unwrap();
+
+    let portfolio = execute_signed_response(
+        &mut core,
+        &user,
+        "session:withdrawal",
+        1,
+        "cmd:portfolio",
+        UserCommandAction::Portfolio,
+        1_200,
+    );
+    match portfolio.result {
+        CommandResult::Portfolio { snapshot } => {
+            assert_eq!(snapshot.balances.len(), 1);
+            assert_eq!(snapshot.balances[0].amount_atomic, "50000000");
+        }
+        _ => panic!("expected private portfolio"),
+    }
+
+    let response = execute_signed_response(
+        &mut core,
+        &user,
+        "session:withdrawal",
+        2,
+        "cmd:withdrawal",
+        UserCommandAction::RequestWithdrawal {
+            withdrawal_id: uuid::Uuid::from_u128(35),
+            chain: "base".into(),
+            asset: "USDC".into(),
+            amount_atomic: 10_000_000,
+            destination: "0x1111111111111111111111111111111111111111".into(),
+        },
+        1_300,
+    );
+    let authorization = response.withdrawal_authorization.unwrap();
+    assert_eq!(authorization.intent.receipt_id, response.receipt.receipt_id);
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            "usr_private",
+            AccountBucket::UserAvailable,
+            "USDC"
+        )),
+        40_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            "usr_private",
+            AccountBucket::UserWithdrawalHold,
+            "USDC"
+        )),
+        10_000_000
+    );
+    let encoded = serde_json::to_vec(&authorization.intent).unwrap();
+    let mut signed = b"layrs.withdrawal-authorization.v1\0".to_vec();
+    signed.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+    signed.extend_from_slice(&encoded);
+    VerifyingKey::from_bytes(&receipt_public_key)
+        .unwrap()
+        .verify(
+            &signed,
+            &Signature::from_slice(&authorization.signature).unwrap(),
+        )
+        .unwrap();
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_signed(
     core: &mut PrivateTradingCore,
@@ -390,6 +478,22 @@ fn execute_signed(
     action: UserCommandAction,
     now_millis: i64,
 ) -> CommandResult {
+    execute_signed_response(
+        core, key, session_id, sequence, command_id, action, now_millis,
+    )
+    .result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_signed_response(
+    core: &mut PrivateTradingCore,
+    key: &SigningKey,
+    session_id: &str,
+    sequence: u64,
+    command_id: &str,
+    action: UserCommandAction,
+    now_millis: i64,
+) -> clob_service::private_core::CoreResponse {
     let idempotency_key = format!("idem:{command_id}");
     let request_hash = command_request_hash(command_id, &idempotency_key, &action).unwrap();
     let request = SessionRequest {
@@ -410,5 +514,4 @@ fn execute_signed(
         now_millis,
     )
     .unwrap()
-    .result
 }

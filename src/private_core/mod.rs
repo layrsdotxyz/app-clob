@@ -9,10 +9,32 @@ pub mod ledger;
 pub mod orderbook;
 pub mod session;
 
+pub mod decimal_u128 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &u128, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u128, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        if value.is_empty()
+            || (value.len() > 1 && value.starts_with('0'))
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(serde::de::Error::custom(
+                "expected canonical unsigned decimal string",
+            ));
+        }
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 pub use engine::{
     command_request_hash, resolution_signing_payload, BoundaryEvidence, CommandResult,
-    CoreResponse, MarketConfig, MarketResolution, PrivateTradingCore, ResolutionOutcome,
-    ResolutionStatement, SignedResolution, SystemResponse, UserCommand, UserCommandAction,
+    CoreResponse, MarketConfig, MarketResolution, PortfolioSnapshot, PrivateBalance,
+    PrivatePosition, PrivateTradingCore, ResolutionOutcome, ResolutionStatement, SignedResolution,
+    SystemResponse, UserCommand, UserCommandAction, WithdrawalAuthorization, WithdrawalIntent,
 };
 pub use journal::{
     EnclaveReceipt, EncryptedJournal, EncryptedJournalRecord, EncryptedSnapshot, JournalKey,

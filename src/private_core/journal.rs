@@ -294,6 +294,15 @@ impl ReceiptSigner {
     pub fn verifying_key(&self) -> [u8; 32] {
         self.signing_key.verifying_key().to_bytes()
     }
+
+    pub fn sign_domain_payload<T: Serialize>(&self, domain: &[u8], value: &T) -> Vec<u8> {
+        let encoded = serde_json::to_vec(value).expect("authorization serialization cannot fail");
+        let mut payload = Vec::with_capacity(domain.len() + 4 + encoded.len());
+        payload.extend_from_slice(domain);
+        payload.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&encoded);
+        self.signing_key.sign(&payload).to_bytes().to_vec()
+    }
 }
 
 fn deterministic_receipt_id(

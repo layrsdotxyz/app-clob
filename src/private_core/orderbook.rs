@@ -47,7 +47,9 @@ pub struct BookOrder {
     pub action: OrderAction,
     /// Probability price in millionths, strictly between 0 and 1_000_000.
     pub price_micros: u64,
+    #[serde(with = "super::decimal_u128")]
     pub quantity_micros: u128,
+    #[serde(with = "super::decimal_u128")]
     pub remaining_micros: u128,
     pub time_in_force: TimeInForce,
     pub expires_at_millis: Option<i64>,
@@ -118,6 +120,7 @@ pub struct Fill {
     pub maker_private_user_id: String,
     pub taker_private_user_id: String,
     pub price_micros: u64,
+    #[serde(with = "super::decimal_u128")]
     pub quantity_micros: u128,
     pub sequence: u64,
 }
@@ -126,6 +129,7 @@ pub struct Fill {
 pub struct MatchResult {
     pub accepted_order: Option<BookOrder>,
     pub fills: Vec<Fill>,
+    #[serde(with = "super::decimal_u128")]
     pub cancelled_remainder_micros: u128,
 }
 
@@ -284,6 +288,14 @@ impl PriceTimeBook {
 
     pub fn order(&self, order_id: Uuid) -> Option<&BookOrder> {
         self.orders.get(&order_id)
+    }
+
+    pub fn orders_for_owner(&self, owner: &str) -> Vec<BookOrder> {
+        self.orders
+            .values()
+            .filter(|order| order.private_user_id == owner)
+            .cloned()
+            .collect()
     }
 
     pub fn cancel_all(&mut self, market_id: &str) -> Vec<BookOrder> {

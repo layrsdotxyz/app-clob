@@ -422,6 +422,14 @@ impl Ledger {
             .collect()
     }
 
+    pub fn balances_for_owner(&self, owner: &str) -> Vec<(AccountKey, u128)> {
+        self.balances
+            .iter()
+            .filter(|(account, amount)| account.owner == owner && **amount > 0)
+            .map(|(account, amount)| (account.clone(), *amount))
+            .collect()
+    }
+
     fn commit_special(
         &mut self,
         idempotency_key: String,

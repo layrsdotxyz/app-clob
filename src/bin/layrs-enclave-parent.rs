@@ -1,14 +1,19 @@
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
 use axum::{
     extract::{DefaultBodyLimit, Query, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::Semaphore,
@@ -19,6 +24,7 @@ use tower_http::{
     request_id::MakeRequestUuid, request_id::PropagateRequestIdLayer,
     request_id::SetRequestIdLayer, timeout::TimeoutLayer,
 };
+use x25519_dalek::{PublicKey, StaticSecret};
 
 const MAX_FRAME_BYTES: usize = 1_048_576;
 const VSOCK_PORT: u32 = 5_003;
@@ -27,6 +33,7 @@ const VSOCK_PORT: u32 = 5_003;
 struct AppState {
     enclave_cid: u32,
     permits: Arc<Semaphore>,
+    operator_token_hash: [u8; 32],
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -102,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         enclave_cid: cid,
         permits: Arc::new(Semaphore::new(concurrency)),
+        operator_token_hash: Sha256::digest(required_string("LAYRS_PARENT_OPERATOR_TOKEN")?).into(),
     };
     let app = Router::new()
         .route(
@@ -110,6 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/v1/attestation", get(attestation))
         .route("/v1/private/relay", post(relay))
+        .route("/v1/operator/relay", post(operator_relay))
         .layer(DefaultBodyLimit::max(MAX_FRAME_BYTES))
         .layer(TimeoutLayer::new(Duration::from_secs(12)))
         .layer(PropagateRequestIdLayer::x_request_id())
@@ -122,6 +131,129 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(address).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn operator_relay(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(envelope): Json<serde_json::Value>,
+) -> Response {
+    let supplied = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    if !constant_time_equal(
+        &Sha256::digest(supplied.as_bytes()),
+        &state.operator_token_hash,
+    ) {
+        return gateway_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED").into_response();
+    }
+    if !envelope.is_object() {
+        return gateway_error(StatusCode::BAD_REQUEST, "INVALID_OPERATOR_ENVELOPE").into_response();
+    }
+    let attestation_nonce = rand::random::<[u8; 32]>().to_vec();
+    let enclave_public_key = match exchange(
+        &state,
+        WireRequest::Attestation {
+            nonce: attestation_nonce,
+        },
+    )
+    .await
+    {
+        Ok(WireResponse::Attestation {
+            transport_public_key,
+            ..
+        }) => transport_public_key,
+        _ => {
+            return gateway_error(StatusCode::SERVICE_UNAVAILABLE, "ENCLAVE_UNAVAILABLE")
+                .into_response()
+        }
+    };
+    let plaintext = match serde_json::to_vec(
+        &serde_json::json!({ "type": "OPERATOR", "envelope": envelope }),
+    ) {
+        Ok(value) => value,
+        Err(_) => {
+            return gateway_error(StatusCode::BAD_REQUEST, "INVALID_OPERATOR_ENVELOPE")
+                .into_response()
+        }
+    };
+    match encrypted_exchange(&state, enclave_public_key, &plaintext).await {
+        Ok(value) => (
+            StatusCode::OK,
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(value),
+        )
+            .into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn encrypted_exchange(
+    state: &AppState,
+    enclave_public_key: [u8; 32],
+    plaintext: &[u8],
+) -> Result<serde_json::Value, ApiError> {
+    let client_secret = StaticSecret::random();
+    let client_public_key = PublicKey::from(&client_secret).to_bytes();
+    let shared = client_secret.diffie_hellman(&PublicKey::from(enclave_public_key));
+    let mut key_hash = Sha256::new();
+    key_hash.update(b"layrs.enclave-transport.v1\0");
+    key_hash.update(shared.as_bytes());
+    let key: [u8; 32] = key_hash.finalize().into();
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "ENCRYPTION_FAILED"))?;
+    let nonce = rand::random::<[u8; 12]>();
+    let mut request_aad = b"layrs.enclave-request.v1\0".to_vec();
+    request_aad.extend_from_slice(&client_public_key);
+    request_aad.extend_from_slice(&enclave_public_key);
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            aes_gcm::aead::Payload {
+                msg: plaintext,
+                aad: &request_aad,
+            },
+        )
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "ENCRYPTION_FAILED"))?;
+    match exchange(
+        state,
+        WireRequest::Encrypted {
+            client_public_key,
+            nonce,
+            ciphertext,
+        },
+    )
+    .await?
+    {
+        WireResponse::Encrypted { nonce, ciphertext } => {
+            let mut response_aad = b"layrs.enclave-response.v1\0".to_vec();
+            response_aad.extend_from_slice(&client_public_key);
+            response_aad.extend_from_slice(&enclave_public_key);
+            let decoded = cipher
+                .decrypt(
+                    Nonce::from_slice(&nonce),
+                    aes_gcm::aead::Payload {
+                        msg: &ciphertext,
+                        aad: &response_aad,
+                    },
+                )
+                .map_err(|_| {
+                    ApiError::new(
+                        StatusCode::BAD_GATEWAY,
+                        "ENCLAVE_RESPONSE_DECRYPTION_FAILED",
+                    )
+                })?;
+            serde_json::from_slice(&decoded)
+                .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "INVALID_ENCLAVE_RESPONSE"))
+        }
+        WireResponse::Error { code } => Err(ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, code)),
+        _ => Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "UNEXPECTED_ENCLAVE_RESPONSE",
+        )),
+    }
 }
 
 async fn attestation(
@@ -281,6 +413,21 @@ fn required_u32(name: &str) -> Result<u32, Box<dyn std::error::Error>> {
     Ok(std::env::var(name)
         .map_err(|_| format!("{name} is required"))?
         .parse()?)
+}
+fn required_string(name: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let value = std::env::var(name).map_err(|_| format!("{name} is required"))?;
+    if value.len() < 32 {
+        return Err(format!("{name} must contain at least 32 bytes").into());
+    }
+    Ok(value)
+}
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+            == 0
 }
 fn optional_u16(name: &str, default: u16) -> Result<u16, Box<dyn std::error::Error>> {
     Ok(std::env::var(name).map_or(Ok(default), |value| value.parse())?)

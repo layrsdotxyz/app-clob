@@ -91,6 +91,7 @@ enum OperatorCommand {
     ExternalFlow {
         idempotency_key: String,
         account: AccountKey,
+        #[serde(with = "clob_service::private_core::decimal_u128")]
         amount: u128,
         direction: ExternalFlowDirection,
         evidence_hash: [u8; 32],
@@ -117,6 +118,7 @@ enum PlainRequest {
         market_id: String,
         outcome: clob_service::private_core::Outcome,
         now_millis: i64,
+        #[serde(with = "clob_service::private_core::decimal_u128")]
         minimum_level_quantity_micros: u128,
     },
 }

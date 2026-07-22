@@ -20,7 +20,9 @@ pub struct MarketConfig {
     pub settlement_asset: String,
     pub opens_at_millis: i64,
     pub closes_at_millis: i64,
+    #[serde(with = "super::decimal_u128")]
     pub minimum_quantity_micros: u128,
+    #[serde(with = "super::decimal_u128")]
     pub maximum_quantity_micros: u128,
     pub tick_size_micros: u64,
     pub oracle_feed_id: u64,
@@ -84,9 +86,63 @@ pub enum UserCommandAction {
     },
     CompleteSet {
         market_id: String,
+        #[serde(with = "super::decimal_u128")]
         quantity_micros: u128,
         direction: CompleteSetDirection,
     },
+    Portfolio,
+    RequestWithdrawal {
+        withdrawal_id: Uuid,
+        chain: String,
+        asset: String,
+        #[serde(with = "super::decimal_u128")]
+        amount_atomic: u128,
+        destination: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrivateBalance {
+    pub asset: String,
+    pub bucket: AccountBucket,
+    pub amount_atomic: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrivatePosition {
+    pub market_id: String,
+    pub outcome: String,
+    pub quantity_micros: String,
+    pub cost_basis_micros: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortfolioSnapshot {
+    pub balances: Vec<PrivateBalance>,
+    pub positions: Vec<PrivatePosition>,
+    pub orders: Vec<BookOrder>,
+    pub as_of_millis: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WithdrawalIntent {
+    pub protocol_version: String,
+    pub withdrawal_id: Uuid,
+    pub session_id: String,
+    pub chain: String,
+    pub asset: String,
+    pub amount_atomic: String,
+    pub destination: String,
+    pub receipt_id: String,
+    pub enclave_sequence: u64,
+    pub state_root: [u8; 32],
+    pub expires_at_millis: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WithdrawalAuthorization {
+    pub intent: WithdrawalIntent,
+    pub signature: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,8 +164,20 @@ pub enum CommandResult {
     },
     CompleteSet {
         market_id: String,
+        #[serde(with = "super::decimal_u128")]
         quantity_micros: u128,
         direction: CompleteSetDirection,
+    },
+    Portfolio {
+        snapshot: PortfolioSnapshot,
+    },
+    WithdrawalReserved {
+        withdrawal_id: Uuid,
+        chain: String,
+        asset: String,
+        #[serde(with = "super::decimal_u128")]
+        amount_atomic: u128,
+        destination: String,
     },
 }
 
@@ -118,6 +186,8 @@ pub struct CoreResponse {
     pub result: CommandResult,
     pub receipt: EnclaveReceipt,
     pub encrypted_record: EncryptedJournalRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withdrawal_authorization: Option<WithdrawalAuthorization>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -758,6 +828,48 @@ impl PrivateTradingCore {
                     direction: *direction,
                 }
             }
+            UserCommandAction::Portfolio => CommandResult::Portfolio {
+                snapshot: portfolio_snapshot(
+                    &ledger,
+                    &books,
+                    &position_cost_basis,
+                    &private_user_id,
+                    now_millis,
+                ),
+            },
+            UserCommandAction::RequestWithdrawal {
+                withdrawal_id,
+                chain,
+                asset,
+                amount_atomic,
+                destination,
+            } => {
+                validate_withdrawal(chain, asset, *amount_atomic, destination)?;
+                ledger.apply(LedgerTransaction {
+                    idempotency_key: format!("withdrawal:{}", command.idempotency_key),
+                    business_reference: withdrawal_id.to_string(),
+                    transfers: vec![Transfer {
+                        from: AccountKey::new(
+                            &private_user_id,
+                            AccountBucket::UserAvailable,
+                            asset,
+                        ),
+                        to: AccountKey::new(
+                            &private_user_id,
+                            AccountBucket::UserWithdrawalHold,
+                            asset,
+                        ),
+                        amount: *amount_atomic,
+                    }],
+                })?;
+                CommandResult::WithdrawalReserved {
+                    withdrawal_id: *withdrawal_id,
+                    chain: chain.clone(),
+                    asset: asset.clone(),
+                    amount_atomic: *amount_atomic,
+                    destination: destination.clone(),
+                }
+            }
         };
 
         let mut processed_hash_map = processed_hashes(&self.processed);
@@ -789,10 +901,41 @@ impl PrivateTradingCore {
             record.record_hash,
             now_millis,
         );
+        let withdrawal_authorization = match &result {
+            CommandResult::WithdrawalReserved {
+                withdrawal_id,
+                chain,
+                asset,
+                amount_atomic,
+                destination,
+            } => {
+                let intent = WithdrawalIntent {
+                    protocol_version: "layrs.withdrawal.v1".into(),
+                    withdrawal_id: *withdrawal_id,
+                    session_id: command.session.request.session_id.clone(),
+                    chain: chain.clone(),
+                    asset: asset.clone(),
+                    amount_atomic: amount_atomic.to_string(),
+                    destination: destination.clone(),
+                    receipt_id: receipt.receipt_id.clone(),
+                    enclave_sequence: next_sequence,
+                    state_root: next_root,
+                    expires_at_millis: now_millis.saturating_add(15 * 60_000),
+                };
+                Some(WithdrawalAuthorization {
+                    signature: self
+                        .receipt_signer
+                        .sign_domain_payload(b"layrs.withdrawal-authorization.v1\0", &intent),
+                    intent,
+                })
+            }
+            _ => None,
+        };
         let response = CoreResponse {
             result,
             receipt,
             encrypted_record: record,
+            withdrawal_authorization,
         };
         self.ledger = ledger;
         self.books = books;
@@ -1365,6 +1508,74 @@ fn checked_sequence(sequence: u64) -> CoreResult<u64> {
     sequence
         .checked_add(1)
         .ok_or(CoreError::UnbalancedTransaction)
+}
+
+fn validate_withdrawal(
+    chain: &str,
+    asset: &str,
+    amount: u128,
+    destination: &str,
+) -> CoreResult<()> {
+    if amount == 0
+        || !matches!((chain, asset), ("base", "USDC") | ("horizen", "ZEN"))
+        || !destination.starts_with("0x")
+        || destination.len() != 42
+        || !destination[2..]
+            .bytes()
+            .all(|value| value.is_ascii_hexdigit())
+    {
+        return Err(CoreError::InvalidOrder("invalid withdrawal request".into()));
+    }
+    Ok(())
+}
+
+fn portfolio_snapshot(
+    ledger: &Ledger,
+    books: &BTreeMap<String, PriceTimeBook>,
+    cost_basis: &BTreeMap<PositionKey, u128>,
+    owner: &str,
+    now_millis: i64,
+) -> PortfolioSnapshot {
+    let mut balances = Vec::new();
+    let mut positions = Vec::new();
+    for (account, amount) in ledger.balances_for_owner(owner) {
+        if account.bucket == AccountBucket::UserPosition {
+            if let (Some(market_id), Some(outcome)) = (account.market_id, account.outcome) {
+                let parsed = if outcome == "UP" {
+                    Outcome::Up
+                } else {
+                    Outcome::Down
+                };
+                positions.push(PrivatePosition {
+                    cost_basis_micros: cost_basis
+                        .get(&position_key(owner, &market_id, parsed))
+                        .copied()
+                        .unwrap_or_default()
+                        .to_string(),
+                    market_id,
+                    outcome,
+                    quantity_micros: amount.to_string(),
+                });
+            }
+        } else {
+            balances.push(PrivateBalance {
+                asset: account.asset,
+                bucket: account.bucket,
+                amount_atomic: amount.to_string(),
+            });
+        }
+    }
+    let mut orders: Vec<BookOrder> = books
+        .values()
+        .flat_map(|book| book.orders_for_owner(owner))
+        .collect();
+    orders.sort_by_key(|order| (order.market_id.clone(), order.sequence));
+    PortfolioSnapshot {
+        balances,
+        positions,
+        orders,
+        as_of_millis: now_millis,
+    }
 }
 
 fn processed_hashes(processed: &BTreeMap<String, ProcessedCommand>) -> BTreeMap<String, [u8; 32]> {
