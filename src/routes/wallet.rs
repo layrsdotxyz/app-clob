@@ -189,7 +189,7 @@ fn build_deposit_instruction() -> DepositInstruction {
         eth_vault,
         zen_vault,
         chain_id,
-        chain_name: if chain_id == 1663 { "Horizen Gobi Testnet".into() } else { "Horizen EON".into() },
+        chain_name: if chain_id == 1663 { "Horizen Gobi Testnet".into() } else { "Horizen Chain".into() },
     }
 }
 

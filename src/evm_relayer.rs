@@ -31,7 +31,7 @@ fn first_env(names: &[&str]) -> Option<String> {
 /// Config loaded from environment variables.
 #[derive(Debug, Clone)]
 pub struct EvmRelayerConfig {
-    /// JSON-RPC endpoint for Horizen EON / testnet.
+    /// JSON-RPC endpoint for Horizen Chain / testnet.
     pub rpc_url: String,
     /// Chain ID (e.g. 1663 for Horizen Gobi testnet).
     pub chain_id: u64,
