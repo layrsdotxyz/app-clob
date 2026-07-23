@@ -3,8 +3,8 @@ version: 2.1
 jobs:
   clob-ci:
     docker:
-      - image: cimg/rust:1.94
-    resource_class: xlarge
+      - image: cimg/rust:stable
+    resource_class: large
     working_directory: ~/project
     steps:
       - checkout
