@@ -92,6 +92,7 @@ bytes = "1.7"
 rand = "0.8"
 tempfile = "3"
 aes-gcm = "0.10"
+openssl = { version = "0.10", features = ["vendored"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 sha2 = "0.10"
 zeroize = { version = "1.8", features = ["derive"] }

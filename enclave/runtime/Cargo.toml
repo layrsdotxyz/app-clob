@@ -22,6 +22,7 @@ ethers-core = { version = "2.0.14", default-features = false }
 ethers-signers = { version = "2.0.14", default-features = false }
 hex = "0.4"
 hmac = "0.12"
+openssl = { version = "0.10", features = ["vendored"] }
 rand = "0.8"
 rust_decimal = { version = "1.35", features = ["serde-float"] }
 serde = { version = "1.0", features = ["derive"] }

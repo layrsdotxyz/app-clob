@@ -4,10 +4,6 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
-use aws_lc_rs::{
-    encoding::{AsDer, PublicKeyX509Der},
-    rsa::{KeySize, OaepPrivateDecryptingKey, PrivateDecryptingKey, OAEP_SHA256_MGF1SHA256},
-};
 use aws_nitro_enclaves_nsm_api::{
     api::{Request as NsmRequest, Response as NsmResponse},
     driver::{nsm_exit, nsm_init, nsm_process_request},
@@ -31,6 +27,11 @@ use clob_service::private_core::{
     SignedResolutionEvidence, SystemResponse, UserCommand, WithdrawalAuthorization,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use openssl::{
+    cms::CmsContentInfo,
+    pkey::{PKey, Private},
+    rsa::Rsa,
+};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -412,26 +413,26 @@ struct EnclaveState {
 }
 
 struct PendingProvision {
-    recipient_private_key: PrivateDecryptingKey,
+    recipient_private_key: PKey<Private>,
     oracle_public_key: [u8; 32],
     snapshot: Option<EncryptedSnapshot>,
     minimum_anchored_sequence: u64,
 }
 
 struct PendingPolymarketProvision {
-    recipient_private_key: PrivateDecryptingKey,
+    recipient_private_key: PKey<Private>,
     bundle_nonce: [u8; 12],
     bundle_ciphertext: Vec<u8>,
 }
 
 struct PendingChainSignerProvision {
-    recipient_private_key: PrivateDecryptingKey,
+    recipient_private_key: PKey<Private>,
     bundle_nonce: [u8; 12],
     bundle_ciphertext: Vec<u8>,
 }
 
 struct PendingAuditSignerProvision {
-    recipient_private_key: PrivateDecryptingKey,
+    recipient_private_key: PKey<Private>,
     bundle_nonce: [u8; 12],
     bundle_ciphertext: Vec<u8>,
 }
@@ -1718,29 +1719,24 @@ fn validate_kms_reference(kms_key_id: &str, ciphertext: Option<&[u8]>) -> Result
     Ok(())
 }
 
-fn generate_recipient_key() -> Result<(PrivateDecryptingKey, Vec<u8>), String> {
-    let private_key = PrivateDecryptingKey::generate(KeySize::Rsa2048)
-        .map_err(|_| "RECIPIENT_KEY_GENERATION_FAILED".to_string())?;
-    let public_key: PublicKeyX509Der<'static> = private_key
-        .public_key()
-        .as_der()
+fn generate_recipient_key() -> Result<(PKey<Private>, Vec<u8>), String> {
+    let rsa = Rsa::generate(2048).map_err(|_| "RECIPIENT_KEY_GENERATION_FAILED".to_string())?;
+    let private_key =
+        PKey::from_rsa(rsa).map_err(|_| "RECIPIENT_KEY_GENERATION_FAILED".to_string())?;
+    let public_key = private_key
+        .public_key_to_der()
         .map_err(|_| "RECIPIENT_KEY_ENCODING_FAILED".to_string())?;
-    Ok((private_key, public_key.as_ref().to_vec()))
+    Ok((private_key, public_key))
 }
 
 fn decrypt_recipient_key(
-    private_key: PrivateDecryptingKey,
-    ciphertext: &[u8],
+    private_key: PKey<Private>,
+    ciphertext_for_recipient: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let private_key = OaepPrivateDecryptingKey::new(private_key)
+    let cms = CmsContentInfo::from_der(ciphertext_for_recipient)
         .map_err(|_| "KMS_RECIPIENT_DECRYPT_FAILED".to_string())?;
-    let mut plaintext = vec![0; private_key.min_output_size()];
-    let plaintext_length = private_key
-        .decrypt(&OAEP_SHA256_MGF1SHA256, ciphertext, &mut plaintext, None)
-        .map_err(|_| "KMS_RECIPIENT_DECRYPT_FAILED".to_string())?
-        .len();
-    plaintext.truncate(plaintext_length);
-    Ok(plaintext)
+    cms.decrypt_without_cert_check(&private_key)
+        .map_err(|_| "KMS_RECIPIENT_DECRYPT_FAILED".to_string())
 }
 
 fn transport_key(secret: &StaticSecret, client_public_key: [u8; 32]) -> [u8; 32] {
