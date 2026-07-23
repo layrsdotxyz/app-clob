@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, io, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashSet, VecDeque},
+    io,
+    sync::Arc,
+};
 
 use aes_gcm::{
     aead::{Aead, KeyInit},
@@ -48,7 +52,8 @@ use zeroize::Zeroize;
 
 const PORT: u32 = 5_003;
 const MAX_FRAME_BYTES: usize = 1_048_576;
-const MAX_REPLAY_ENTRIES: usize = 100_000;
+const MAX_TRANSPORT_REPLAY_ENTRIES: usize = 262_144;
+const MAX_OPERATOR_REPLAY_ENTRIES: usize = 100_000;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
@@ -404,7 +409,7 @@ struct EnclaveState {
     receipt_public_key: [u8; 32],
     operator_public_key: VerifyingKey,
     operator_nonces: BTreeSet<[u8; 32]>,
-    transport_nonces: BTreeSet<[u8; 44]>,
+    transport_nonces: ReplayCache<44>,
     core: Option<PrivateTradingCore>,
     pending_provision: Option<PendingProvision>,
     pending_polymarket_provision: Option<PendingPolymarketProvision>,
@@ -413,6 +418,41 @@ struct EnclaveState {
     chain_signer: Option<EnclaveChainSigner>,
     pending_audit_signer_provision: Option<PendingAuditSignerProvision>,
     audit_signer: Option<EnclaveAuditSigner>,
+}
+
+struct ReplayCache<const N: usize> {
+    seen: HashSet<[u8; N]>,
+    order: VecDeque<[u8; N]>,
+    capacity: usize,
+}
+
+impl<const N: usize> ReplayCache<N> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            seen: HashSet::with_capacity(capacity.min(16_384)),
+            order: VecDeque::with_capacity(capacity.min(16_384)),
+            capacity,
+        }
+    }
+
+    fn contains(&self, key: &[u8; N]) -> bool {
+        self.seen.contains(key)
+    }
+
+    fn remember(&mut self, key: [u8; N]) -> bool {
+        if self.capacity == 0 || self.seen.contains(&key) {
+            return false;
+        }
+        while self.order.len() >= self.capacity {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(key);
+        self.seen.insert(key)
+    }
 }
 
 struct PendingProvision {
@@ -467,7 +507,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         receipt_public_key,
         operator_public_key,
         operator_nonces: BTreeSet::new(),
-        transport_nonces: BTreeSet::new(),
+        transport_nonces: ReplayCache::new(MAX_TRANSPORT_REPLAY_ENTRIES),
         core: None,
         pending_provision: None,
         pending_polymarket_provision: None,
@@ -548,9 +588,7 @@ async fn handle_encrypted(
     let mut replay_key = [0u8; 44];
     replay_key[..32].copy_from_slice(&client_public_key);
     replay_key[32..].copy_from_slice(&nonce);
-    if state.transport_nonces.len() >= MAX_REPLAY_ENTRIES
-        || state.transport_nonces.contains(&replay_key)
-    {
+    if state.transport_nonces.contains(&replay_key) {
         return WireResponse::Error {
             code: "REPLAY_REJECTED",
         };
@@ -580,7 +618,11 @@ async fn handle_encrypted(
         }
     };
     plaintext.zeroize();
-    state.transport_nonces.insert(replay_key);
+    if !state.transport_nonces.remember(replay_key) {
+        return WireResponse::Error {
+            code: "REPLAY_REJECTED",
+        };
+    }
     let response = dispatch(&mut state, request).await;
     // These sidecars contain only AEAD ciphertext and its integrity/chain metadata. They let the
     // untrusted parent persist state transitions without learning the encrypted response body.
@@ -711,10 +753,11 @@ async fn dispatch_operator(
     state: &mut EnclaveState,
     envelope: OperatorEnvelope,
 ) -> Result<PlainResponse, String> {
-    if state.operator_nonces.contains(&envelope.nonce)
-        || state.operator_nonces.len() >= MAX_REPLAY_ENTRIES
-    {
+    if state.operator_nonces.contains(&envelope.nonce) {
         return Err("OPERATOR_REPLAY_REJECTED".into());
+    }
+    if state.operator_nonces.len() >= MAX_OPERATOR_REPLAY_ENTRIES {
+        return Err("OPERATOR_REPLAY_CACHE_FULL".into());
     }
     let signature_bytes: [u8; 64] = envelope
         .signature
@@ -2129,6 +2172,40 @@ async fn write_frame(stream: &mut VsockStream, value: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_cache_rejects_duplicate_keys() {
+        let mut cache = ReplayCache::<4>::new(8);
+        let key = [7u8; 4];
+
+        assert!(!cache.contains(&key));
+        assert!(cache.remember(key));
+        assert!(cache.contains(&key));
+        assert!(!cache.remember(key));
+    }
+
+    #[test]
+    fn replay_cache_evicts_oldest_key_instead_of_bricking() {
+        let mut cache = ReplayCache::<2>::new(2);
+        let first = [1u8, 1];
+        let second = [2u8, 2];
+        let third = [3u8, 3];
+
+        assert!(cache.remember(first));
+        assert!(cache.remember(second));
+        assert!(cache.remember(third));
+
+        assert!(!cache.contains(&first));
+        assert!(cache.contains(&second));
+        assert!(cache.contains(&third));
+        assert!(cache.remember(first));
+    }
+
+    #[test]
+    fn replay_cache_zero_capacity_fails_closed() {
+        let mut cache = ReplayCache::<2>::new(0);
+        assert!(!cache.remember([1u8, 1]));
+    }
 
     #[test]
     fn decrypts_kms_style_cms_enveloped_data() {

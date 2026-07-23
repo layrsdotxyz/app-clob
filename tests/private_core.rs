@@ -601,14 +601,15 @@ fn polymarket_bootstrap_never_credits_an_unconfirmed_fill() {
         0
     );
 
-    let fill_response = core.confirm_bootstrap_fill(
-        "sys:fill:47".into(),
-        execution_id,
-        390_000,
-        [49u8; 32],
-        1_170,
-    )
-    .unwrap();
+    let fill_response = core
+        .confirm_bootstrap_fill(
+            "sys:fill:47".into(),
+            execution_id,
+            390_000,
+            [49u8; 32],
+            1_170,
+        )
+        .unwrap();
     assert_eq!(fill_response.audit_fills[0].statement.chain, "horizen");
     assert_eq!(
         core.balance(&AccountKey::position(
