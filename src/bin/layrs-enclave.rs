@@ -1762,8 +1762,13 @@ fn decrypt_kms_recipient_enveloped_data(
         content_key.zeroize();
         return Err("KMS_RECIPIENT_DECRYPT_FAILED".into());
     }
-    let plaintext = symm_decrypt(Cipher::aes_256_cbc(), &content_key, Some(&parts.iv), &parts.ciphertext)
-        .map_err(|_| "KMS_RECIPIENT_DECRYPT_FAILED".to_string());
+    let plaintext = symm_decrypt(
+        Cipher::aes_256_cbc(),
+        &content_key,
+        Some(&parts.iv),
+        &parts.ciphertext,
+    )
+    .map_err(|_| "KMS_RECIPIENT_DECRYPT_FAILED".to_string());
     content_key.zeroize();
     plaintext
 }
@@ -1785,7 +1790,10 @@ fn parse_kms_recipient_enveloped_data(input: &[u8]) -> Result<KmsRecipientParts,
     }
 
     let mut content_info = BerReader::new(content_info.content);
-    expect_oid(content_info.read_expected(0x06)?.content, OID_PKCS7_ENVELOPED_DATA)?;
+    expect_oid(
+        content_info.read_expected(0x06)?.content,
+        OID_PKCS7_ENVELOPED_DATA,
+    )?;
     let explicit_content = content_info.read_expected(0xa0)?;
     if !content_info.is_empty() {
         return Err("KMS_RECIPIENT_DECRYPT_FAILED".into());
@@ -1814,7 +1822,10 @@ fn parse_kms_recipient_enveloped_data(input: &[u8]) -> Result<KmsRecipientParts,
     let _recipient_identifier = recipient_info.read()?;
     let key_encryption_algorithm = recipient_info.read_expected(0x30)?;
     let mut key_encryption_algorithm = BerReader::new(key_encryption_algorithm.content);
-    expect_oid(key_encryption_algorithm.read_expected(0x06)?.content, OID_RSAES_OAEP)?;
+    expect_oid(
+        key_encryption_algorithm.read_expected(0x06)?.content,
+        OID_RSAES_OAEP,
+    )?;
     let encrypted_content_key = recipient_info.read_expected(0x04)?.content.to_vec();
     if encrypted_content_key.is_empty() || !recipient_info.is_empty() {
         return Err("KMS_RECIPIENT_DECRYPT_FAILED".into());
@@ -1822,11 +1833,20 @@ fn parse_kms_recipient_enveloped_data(input: &[u8]) -> Result<KmsRecipientParts,
 
     let encrypted_content_info = enveloped_data.read_expected(0x30)?;
     let mut encrypted_content_info = BerReader::new(encrypted_content_info.content);
-    expect_oid(encrypted_content_info.read_expected(0x06)?.content, OID_PKCS7_DATA)?;
+    expect_oid(
+        encrypted_content_info.read_expected(0x06)?.content,
+        OID_PKCS7_DATA,
+    )?;
     let content_encryption_algorithm = encrypted_content_info.read_expected(0x30)?;
     let mut content_encryption_algorithm = BerReader::new(content_encryption_algorithm.content);
-    expect_oid(content_encryption_algorithm.read_expected(0x06)?.content, OID_AES_256_CBC)?;
-    let iv = content_encryption_algorithm.read_expected(0x04)?.content.to_vec();
+    expect_oid(
+        content_encryption_algorithm.read_expected(0x06)?.content,
+        OID_AES_256_CBC,
+    )?;
+    let iv = content_encryption_algorithm
+        .read_expected(0x04)?
+        .content
+        .to_vec();
     if iv.len() != 16 || !content_encryption_algorithm.is_empty() {
         return Err("KMS_RECIPIENT_DECRYPT_FAILED".into());
     }
@@ -1847,8 +1867,12 @@ fn parse_kms_recipient_enveloped_data(input: &[u8]) -> Result<KmsRecipientParts,
     })
 }
 
-fn rsa_oaep_sha256_decrypt(private_key: &PKey<Private>, ciphertext: &[u8]) -> Result<Vec<u8>, String> {
-    let mut context = PkeyCtx::new(private_key).map_err(|_| "KMS_RECIPIENT_DECRYPT_FAILED".to_string())?;
+fn rsa_oaep_sha256_decrypt(
+    private_key: &PKey<Private>,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, String> {
+    let mut context =
+        PkeyCtx::new(private_key).map_err(|_| "KMS_RECIPIENT_DECRYPT_FAILED".to_string())?;
     context
         .decrypt_init()
         .map_err(|_| "KMS_RECIPIENT_DECRYPT_FAILED".to_string())?;
@@ -1875,7 +1899,9 @@ fn collect_octet_string_fragments(input: &[u8]) -> Result<Vec<u8>, String> {
         let fragment = reader.read()?;
         match fragment.tag {
             0x04 | 0x80 => output.extend_from_slice(fragment.content),
-            0x24 | 0xa0 => output.extend_from_slice(&collect_octet_string_fragments(fragment.content)?),
+            0x24 | 0xa0 => {
+                output.extend_from_slice(&collect_octet_string_fragments(fragment.content)?)
+            }
             _ => return Err("KMS_RECIPIENT_DECRYPT_FAILED".into()),
         }
     }
@@ -2020,9 +2046,7 @@ fn ber_element_bounds(input: &[u8], offset: usize) -> Result<BerBounds, String> 
 
 fn find_indefinite_content_end(input: &[u8], mut offset: usize) -> Result<usize, String> {
     loop {
-        if offset
-            .checked_add(2)
-            .is_some_and(|end| end <= input.len())
+        if offset.checked_add(2).is_some_and(|end| end <= input.len())
             && input[offset] == 0
             && input[offset + 1] == 0
         {
@@ -2054,12 +2078,8 @@ mod tests {
             context
                 .set_rsa_padding(Padding::PKCS1_OAEP)
                 .expect("oaep padding");
-            context
-                .set_rsa_oaep_md(Md::sha256())
-                .expect("oaep sha256");
-            context
-                .set_rsa_mgf1_md(Md::sha256())
-                .expect("mgf1 sha256");
+            context.set_rsa_oaep_md(Md::sha256()).expect("oaep sha256");
+            context.set_rsa_mgf1_md(Md::sha256()).expect("mgf1 sha256");
             let mut encrypted = Vec::new();
             context
                 .encrypt_to_vec(&content_key, &mut encrypted)
@@ -2067,20 +2087,20 @@ mod tests {
             encrypted
         };
 
-        let ciphertext = openssl::symm::encrypt(
-            Cipher::aes_256_cbc(),
-            &content_key,
-            Some(&iv),
-            plaintext,
-        )
-        .expect("aes encrypt");
+        let ciphertext =
+            openssl::symm::encrypt(Cipher::aes_256_cbc(), &content_key, Some(&iv), plaintext)
+                .expect("aes encrypt");
         let cms = kms_style_cms_fixture(&encrypted_content_key, &iv, &ciphertext);
 
         let decrypted = decrypt_kms_recipient_enveloped_data(&key_pair, &cms).expect("decrypt cms");
         assert_eq!(decrypted, plaintext);
     }
 
-    fn kms_style_cms_fixture(encrypted_content_key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Vec<u8> {
+    fn kms_style_cms_fixture(
+        encrypted_content_key: &[u8],
+        iv: &[u8],
+        ciphertext: &[u8],
+    ) -> Vec<u8> {
         sequence(vec![
             oid(OID_PKCS7_ENVELOPED_DATA),
             tlv(
@@ -2140,7 +2160,10 @@ mod tests {
             return;
         }
         let encoded = length.to_be_bytes();
-        let first = encoded.iter().position(|byte| *byte != 0).unwrap_or(encoded.len() - 1);
+        let first = encoded
+            .iter()
+            .position(|byte| *byte != 0)
+            .unwrap_or(encoded.len() - 1);
         let significant = &encoded[first..];
         output.push(0x80 | significant.len() as u8);
         output.extend_from_slice(significant);
