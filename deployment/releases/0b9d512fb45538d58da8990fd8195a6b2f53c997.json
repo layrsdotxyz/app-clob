@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "validated-ready-for-activation",
+  "releaseId": "0b9d512fb45538d58da8990fd8195a6b2f53c997",
+  "sourceCommit": "0b9d512fb45538d58da8990fd8195a6b2f53c997",
+  "packerSourceCommit": "0b9d512fb45538d58da8990fd8195a6b2f53c997",
+  "region": "us-east-1",
+  "amiId": "ami-0c56fa4589100e6ac",
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/0b9d512fb45538d58da8990fd8195a6b2f53c997",
+  "artifacts": {
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/0b9d512fb45538d58da8990fd8195a6b2f53c997/layrsv2-clob.eif",
+      "sizeBytes": 40796473,
+      "sha384": "5554de8790d96ea44962842551ba416538d217d9c7a942881beeeaaa8717049490f2b51ebee48b254ce6ac5ab42cd655"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/0b9d512fb45538d58da8990fd8195a6b2f53c997/layrs-enclave-parent",
+      "sizeBytes": 1157856,
+      "sha384": "90bbfccfef83b18c5987b12f240377f72afd488c3d690db3043127b102e3b2718adb5ffe8f73ed573aee26f80c3cb62b"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "309797c8414358a3a53e60f31cddc13e13e65ce8657eec299a63b0482bd067674374c1764ad92120484702f2713c0e71",
+    "pcr1": "0343b056cd8485ca7890ddd833476d78460aed2aa161548e4e26bedf321726696257d623e8805f3f605946b3d8b0c6aa",
+    "pcr2": "965319ba5985beb805dae7df47a665fcb9da1b24871c105090c7bca7a9db2f5c63f802eb686d3f1875f0c95cb0e5af70"
+  },
+  "signature": null,
+  "signatureNote": "EIF identity is enforced through pinned PCR0 and KMS attestation policy; release authorization is separately signed by the compiled operator key."
+}
