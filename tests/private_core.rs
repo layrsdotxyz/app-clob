@@ -242,7 +242,6 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
             market_id: market_id.into(),
             settlement_asset: "ZEN".into(),
             settlement_decimals: 18,
-            public_settlement_chain: "horizen".into(),
             opens_at_millis: 900,
             closes_at_millis: 2_000,
             minimum_quantity_micros: 1,
@@ -481,7 +480,6 @@ fn polymarket_bootstrap_never_credits_an_unconfirmed_fill() {
             market_id: market_id.into(),
             settlement_asset: "USDC".into(),
             settlement_decimals: 6,
-            public_settlement_chain: "horizen".into(),
             opens_at_millis: 1_000,
             closes_at_millis: 10_000,
             minimum_quantity_micros: 1,
@@ -601,16 +599,14 @@ fn polymarket_bootstrap_never_credits_an_unconfirmed_fill() {
         0
     );
 
-    let fill_response = core
-        .confirm_bootstrap_fill(
-            "sys:fill:47".into(),
-            execution_id,
-            390_000,
-            [49u8; 32],
-            1_170,
-        )
-        .unwrap();
-    assert_eq!(fill_response.audit_fills[0].statement.chain, "horizen");
+    core.confirm_bootstrap_fill(
+        "sys:fill:47".into(),
+        execution_id,
+        390_000,
+        [49u8; 32],
+        1_170,
+    )
+    .unwrap();
     assert_eq!(
         core.balance(&AccountKey::position(
             &private_user,
