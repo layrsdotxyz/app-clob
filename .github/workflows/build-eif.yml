@@ -1,6 +1,20 @@
 name: layrsv2 signed EIF reference
 
-on: { workflow_dispatch: {} }
+on:
+  workflow_dispatch:
+    inputs:
+      snapshot_compat_base:
+        description: Currently deployed app-clob release commit to compare against before building the EIF
+        required: true
+        type: string
+      allow_state_schema_change:
+        description: Allow private-core snapshot/schema changes only with a migration approval document
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 permissions: { contents: read, id-token: write, attestations: write }
 
 jobs:
@@ -9,8 +23,21 @@ jobs:
     environment: production-enclave-release
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with: { toolchain: '1.94.0' }
+      - name: Enclave snapshot compatibility guard
+        shell: bash
+        env:
+          SNAPSHOT_COMPAT_BASE: ${{ inputs.snapshot_compat_base }}
+          ALLOW_STATE_SCHEMA_CHANGE: ${{ inputs.allow_state_schema_change }}
+        run: |
+          args=(--base "$SNAPSHOT_COMPAT_BASE" --mode release)
+          if [[ "$ALLOW_STATE_SCHEMA_CHANGE" == "true" ]]; then
+            args+=(--allow-state-schema-change)
+          fi
+          scripts/check-enclave-snapshot-compatibility.sh "${args[@]}"
       - name: Audit locked production artifacts
         run: |
           cargo install cargo-audit --locked
