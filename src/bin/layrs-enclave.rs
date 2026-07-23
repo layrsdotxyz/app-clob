@@ -2060,6 +2060,72 @@ fn find_indefinite_content_end(input: &[u8], mut offset: usize) -> Result<usize,
     }
 }
 
+fn transport_key(secret: &StaticSecret, client_public_key: [u8; 32]) -> [u8; 32] {
+    let shared = secret.diffie_hellman(&PublicKey::from(client_public_key));
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.enclave-transport.v1\0");
+    hash.update(shared.as_bytes());
+    hash.finalize().into()
+}
+
+fn request_aad(client: &[u8; 32], enclave: &[u8; 32]) -> Vec<u8> {
+    let mut aad = b"layrs.enclave-request.v1\0".to_vec();
+    aad.extend_from_slice(client);
+    aad.extend_from_slice(enclave);
+    aad
+}
+
+fn response_aad(client: &[u8; 32], enclave: &[u8; 32]) -> Vec<u8> {
+    let mut aad = b"layrs.enclave-response.v1\0".to_vec();
+    aad.extend_from_slice(client);
+    aad.extend_from_slice(enclave);
+    aad
+}
+
+fn compile_time_operator_key() -> Result<VerifyingKey, Box<dyn std::error::Error>> {
+    let encoded = option_env!("LAYRS_OPERATOR_PUBLIC_KEY_HEX")
+        .ok_or("LAYRS_OPERATOR_PUBLIC_KEY_HEX must be set while building the EIF")?;
+    let bytes = hex::decode(encoded)?;
+    let key: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| "operator public key must be 32 bytes")?;
+    Ok(VerifyingKey::from_bytes(&key)?)
+}
+
+fn read_pcr0(nsm_fd: i32) -> Result<[u8; 48], Box<dyn std::error::Error>> {
+    match nsm_process_request(nsm_fd, NsmRequest::DescribePCR { index: 0 }) {
+        NsmResponse::DescribePCR { data, .. } => data
+            .try_into()
+            .map_err(|_| "PCR0 must be a SHA-384 measurement".into()),
+        _ => Err("unable to read PCR0".into()),
+    }
+}
+
+async fn read_frame(stream: &mut VsockStream) -> io::Result<Vec<u8>> {
+    let length = stream.read_u32().await? as usize;
+    if length == 0 || length > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid frame length",
+        ));
+    }
+    let mut frame = vec![0u8; length];
+    stream.read_exact(&mut frame).await?;
+    Ok(frame)
+}
+
+async fn write_frame(stream: &mut VsockStream, value: &[u8]) -> io::Result<()> {
+    if value.is_empty() || value.len() > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid frame length",
+        ));
+    }
+    stream.write_u32(value.len() as u32).await?;
+    stream.write_all(value).await?;
+    stream.shutdown().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2168,70 +2234,4 @@ mod tests {
         output.push(0x80 | significant.len() as u8);
         output.extend_from_slice(significant);
     }
-}
-
-fn transport_key(secret: &StaticSecret, client_public_key: [u8; 32]) -> [u8; 32] {
-    let shared = secret.diffie_hellman(&PublicKey::from(client_public_key));
-    let mut hash = Sha256::new();
-    hash.update(b"layrs.enclave-transport.v1\0");
-    hash.update(shared.as_bytes());
-    hash.finalize().into()
-}
-
-fn request_aad(client: &[u8; 32], enclave: &[u8; 32]) -> Vec<u8> {
-    let mut aad = b"layrs.enclave-request.v1\0".to_vec();
-    aad.extend_from_slice(client);
-    aad.extend_from_slice(enclave);
-    aad
-}
-
-fn response_aad(client: &[u8; 32], enclave: &[u8; 32]) -> Vec<u8> {
-    let mut aad = b"layrs.enclave-response.v1\0".to_vec();
-    aad.extend_from_slice(client);
-    aad.extend_from_slice(enclave);
-    aad
-}
-
-fn compile_time_operator_key() -> Result<VerifyingKey, Box<dyn std::error::Error>> {
-    let encoded = option_env!("LAYRS_OPERATOR_PUBLIC_KEY_HEX")
-        .ok_or("LAYRS_OPERATOR_PUBLIC_KEY_HEX must be set while building the EIF")?;
-    let bytes = hex::decode(encoded)?;
-    let key: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| "operator public key must be 32 bytes")?;
-    Ok(VerifyingKey::from_bytes(&key)?)
-}
-
-fn read_pcr0(nsm_fd: i32) -> Result<[u8; 48], Box<dyn std::error::Error>> {
-    match nsm_process_request(nsm_fd, NsmRequest::DescribePCR { index: 0 }) {
-        NsmResponse::DescribePCR { data, .. } => data
-            .try_into()
-            .map_err(|_| "PCR0 must be a SHA-384 measurement".into()),
-        _ => Err("unable to read PCR0".into()),
-    }
-}
-
-async fn read_frame(stream: &mut VsockStream) -> io::Result<Vec<u8>> {
-    let length = stream.read_u32().await? as usize;
-    if length == 0 || length > MAX_FRAME_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid frame length",
-        ));
-    }
-    let mut frame = vec![0u8; length];
-    stream.read_exact(&mut frame).await?;
-    Ok(frame)
-}
-
-async fn write_frame(stream: &mut VsockStream, value: &[u8]) -> io::Result<()> {
-    if value.is_empty() || value.len() > MAX_FRAME_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid frame length",
-        ));
-    }
-    stream.write_u32(value.len() as u32).await?;
-    stream.write_all(value).await?;
-    stream.shutdown().await
 }
