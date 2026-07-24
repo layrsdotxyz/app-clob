@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "validated-ready-for-activation",
+  "releaseId": "4236c94cf933f6f64261c7991bfc4f5d4c29b077",
+  "sourceCommit": "4236c94cf933f6f64261c7991bfc4f5d4c29b077",
+  "packerSourceCommit": "4236c94cf933f6f64261c7991bfc4f5d4c29b077",
+  "builtAt": "2026-07-24T04:47:45Z",
+  "region": "us-east-1",
+  "amiId": "ami-00c31d9824c73ecb3",
+  "snapshotId": "snap-0c7f5619e39e8688d",
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/4236c94cf933f6f64261c7991bfc4f5d4c29b077",
+  "artifacts": {
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/4236c94cf933f6f64261c7991bfc4f5d4c29b077/layrsv2-clob.eif",
+      "sizeBytes": 40796985,
+      "sha384": "5817b4ab23ec8f49402288d86cdc14ce2a2bb7d7c79a371c93a4e73e29c266082b9de2ae262e76540461be519ca01137"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/4236c94cf933f6f64261c7991bfc4f5d4c29b077/layrs-enclave-parent",
+      "sizeBytes": 1157856,
+      "sha384": "90bbfccfef83b18c5987b12f240377f72afd488c3d690db3043127b102e3b2718adb5ffe8f73ed573aee26f80c3cb62b"
+    },
+    "measurements": {
+      "path": "build/layrsv2-clob-measurements.json",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/4236c94cf933f6f64261c7991bfc4f5d4c29b077/layrsv2-clob-measurements.json",
+      "sizeBytes": 402,
+      "sha384": "15c8b429fc0931d51da6693d8917dc7ab5880561778c6f26079ae67dbe0d31981e409588354fbd24a5c39dfc861d0ca3"
+    },
+    "hostArtifactManifest": {
+      "path": "build/layrsv2-host-artifacts.sha384",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/4236c94cf933f6f64261c7991bfc4f5d4c29b077/layrsv2-host-artifacts.sha384",
+      "sizeBytes": 246,
+      "sha384": "8d11ec3f5649906fd0988ffd67c41cba76a338a9606994d0489492dba9de007619af673e9d254ddc02de5a78cd1ce3d3"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "90582b0c1de692c4398d1ccca48d3af96b2a919eb1c25c5e7b7d67d9ccf0208b0b4341b1f9dbf0980751c41df695a8f4",
+    "pcr1": "0343b056cd8485ca7890ddd833476d78460aed2aa161548e4e26bedf321726696257d623e8805f3f605946b3d8b0c6aa",
+    "pcr2": "b53917f7c821d1482e248671c5f2532656068fa1da1fd835b45148a3ff4ea2330eb4d0d8d93929ab1601d2132071d31d"
+  },
+  "signature": null,
+  "signatureNote": "EIF identity is enforced through pinned PCR0 and KMS attestation policy. This release preserves public_settlement_chain inside the enclave MarketConfig so read-back registration checks match backend market specs and USDC/Zen audit fills can explicitly target the Horizen public settlement rail. It also retains the layrs:v2 rolling market namespace support from 4923b273."
+}
