@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     io,
     sync::Arc,
 };
@@ -408,7 +408,7 @@ struct EnclaveState {
     receipt_signer: Option<ReceiptSigner>,
     receipt_public_key: [u8; 32],
     operator_public_key: VerifyingKey,
-    operator_nonces: BTreeSet<[u8; 32]>,
+    operator_nonces: ReplayCache<32>,
     transport_nonces: ReplayCache<44>,
     core: Option<PrivateTradingCore>,
     pending_provision: Option<PendingProvision>,
@@ -506,7 +506,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         receipt_signer: Some(receipt_signer),
         receipt_public_key,
         operator_public_key,
-        operator_nonces: BTreeSet::new(),
+        operator_nonces: ReplayCache::new(MAX_OPERATOR_REPLAY_ENTRIES),
         transport_nonces: ReplayCache::new(MAX_TRANSPORT_REPLAY_ENTRIES),
         core: None,
         pending_provision: None,
@@ -756,9 +756,6 @@ async fn dispatch_operator(
     if state.operator_nonces.contains(&envelope.nonce) {
         return Err("OPERATOR_REPLAY_REJECTED".into());
     }
-    if state.operator_nonces.len() >= MAX_OPERATOR_REPLAY_ENTRIES {
-        return Err("OPERATOR_REPLAY_CACHE_FULL".into());
-    }
     let signature_bytes: [u8; 64] = envelope
         .signature
         .as_slice()
@@ -771,7 +768,9 @@ async fn dispatch_operator(
             &Signature::from_bytes(&signature_bytes),
         )
         .map_err(|_| "INVALID_OPERATOR_SIGNATURE".to_string())?;
-    state.operator_nonces.insert(envelope.nonce);
+    if !state.operator_nonces.remember(envelope.nonce) {
+        return Err("OPERATOR_REPLAY_REJECTED".into());
+    }
 
     match envelope.command {
         OperatorCommand::ProvisionStatus => Ok(PlainResponse::ProvisionStatus {
