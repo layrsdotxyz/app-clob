@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "validated-ready-for-activation",
+  "releaseId": "32adcf96e0be4eec4e17ed229bad3bc43ab14313",
+  "sourceCommit": "32adcf96e0be4eec4e17ed229bad3bc43ab14313",
+  "packerSourceCommit": "32adcf96e0be4eec4e17ed229bad3bc43ab14313",
+  "region": "us-east-1",
+  "amiId": "ami-0620b9bf6e67bcc41",
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/32adcf96e0be4eec4e17ed229bad3bc43ab14313",
+  "artifacts": {
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/32adcf96e0be4eec4e17ed229bad3bc43ab14313/layrsv2-clob.eif",
+      "sizeBytes": 40797497,
+      "sha384": "fb1d216f3162e29324a1e388a18678dbf6e5ebcb8e7259256c25b229f477158953527b198d6564fa77407bf09bef0966"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/32adcf96e0be4eec4e17ed229bad3bc43ab14313/layrs-enclave-parent",
+      "sizeBytes": 1157856,
+      "sha384": "90bbfccfef83b18c5987b12f240377f72afd488c3d690db3043127b102e3b2718adb5ffe8f73ed573aee26f80c3cb62b"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "76594572b419ee5d7efe2e3eee1d103b6218bb753cd90920099d4345bab0e55d29e5f17df04625c0c16864f5f58a288f",
+    "pcr1": "0343b056cd8485ca7890ddd833476d78460aed2aa161548e4e26bedf321726696257d623e8805f3f605946b3d8b0c6aa",
+    "pcr2": "4193369cf8d5766af8f1720c1e9b1d7f90140fa4914be390dc51275d14d734b0605b1a3342628f84030145418238bb28"
+  },
+  "signature": null,
+  "signatureNote": "EIF identity is enforced through pinned PCR0 and KMS attestation policy; release authorization is separately signed by the compiled operator key. This hotfix only replaces the operator replay cache with the bounded eviction cache and intentionally does not change private-core state, journal, ledger, orderbook or settlement semantics."
+}
