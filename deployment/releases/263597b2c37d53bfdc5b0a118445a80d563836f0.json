@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "validated-ready-for-activation",
+  "releaseId": "263597b2c37d53bfdc5b0a118445a80d563836f0",
+  "sourceCommit": "263597b2c37d53bfdc5b0a118445a80d563836f0",
+  "packerSourceCommit": "263597b2c37d53bfdc5b0a118445a80d563836f0",
+  "builtAt": "2026-07-24T05:25:31Z",
+  "region": "us-east-1",
+  "amiId": "ami-08887d0e54f982c82",
+  "snapshotId": "snap-060ddf141db0e2040",
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/263597b2c37d53bfdc5b0a118445a80d563836f0",
+  "artifacts": {
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/263597b2c37d53bfdc5b0a118445a80d563836f0/layrsv2-clob.eif",
+      "sizeBytes": 40797497,
+      "sha384": "ab23fac7a3a461a37570bae815adfcf709940a2fed83f9101650a6527952a35990eb65b55827a61e36593344a52f8c0e"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/263597b2c37d53bfdc5b0a118445a80d563836f0/layrs-enclave-parent",
+      "sizeBytes": 1157856,
+      "sha384": "90bbfccfef83b18c5987b12f240377f72afd488c3d690db3043127b102e3b2718adb5ffe8f73ed573aee26f80c3cb62b"
+    },
+    "measurements": {
+      "path": "build/layrsv2-clob-measurements.json",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/263597b2c37d53bfdc5b0a118445a80d563836f0/layrsv2-clob-measurements.json",
+      "sizeBytes": 402,
+      "sha384": "a782532c44bf15abb7876c9acaa99efff0029ef7e0147939eb8673ee8e08af80fb845233e1494ad2beb0ae1591ae5d3b"
+    },
+    "hostArtifactManifest": {
+      "path": "build/layrsv2-host-artifacts.sha384",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/263597b2c37d53bfdc5b0a118445a80d563836f0/layrsv2-host-artifacts.sha384",
+      "sizeBytes": 246,
+      "sha384": "3fa448cac00e0ec849c73158231c1094e618224c72d7238de7d85ef377bc86fde1289d07d48476ea3777ed3ba1a0b83a"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "170942ad70f37a15f26657e49bcb25db4ba139f35b00228b17db0017e48cf9b13226d617f5efe5cab051951dae0e44a8",
+    "pcr1": "0343b056cd8485ca7890ddd833476d78460aed2aa161548e4e26bedf321726696257d623e8805f3f605946b3d8b0c6aa",
+    "pcr2": "5a65d1b6214f5a7ff9606412fde1f2f6d5df92b4b0a783f29999ddbe02cb9113212129b4aab1bc7f62e5228e5766ec04"
+  },
+  "signature": null,
+  "signatureNote": "EIF identity is enforced through pinned PCR0 and KMS attestation policy. This release keeps public_settlement_chain optional and omitted for legacy snapshot wire shape compatibility, while still preserving explicit public settlement chain on newly released market specs. It retains layrs:v2 rolling market namespace support and avoids replaying/rewriting existing append-only enclave state."
+}
