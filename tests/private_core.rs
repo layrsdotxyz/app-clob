@@ -224,6 +224,30 @@ fn session_guard_rejects_replays_and_expiry() {
 }
 
 #[test]
+fn legacy_market_config_keeps_public_settlement_chain_out_of_snapshot_wire_shape() {
+    let raw = serde_json::json!({
+        "market_id": "layrs:v1:ZEN:15m:2000",
+        "settlement_asset": "ZEN",
+        "settlement_decimals": 18,
+        "opens_at_millis": 900,
+        "closes_at_millis": 2000,
+        "minimum_quantity_micros": "1",
+        "maximum_quantity_micros": "10000000",
+        "minimum_order_notional_micros": "1",
+        "maximum_order_notional_micros": "10000000",
+        "maximum_user_position_micros": "10000000",
+        "maximum_pending_bootstrap_notional_micros": "100000000",
+        "tick_size_micros": 1000,
+        "oracle_feed_id": 245,
+        "execution": "NATIVE_CLOB"
+    });
+    let market: MarketConfig = serde_json::from_value(raw).unwrap();
+    assert_eq!(market.public_settlement_chain, None);
+    let encoded = serde_json::to_value(&market).unwrap();
+    assert!(encoded.get("public_settlement_chain").is_none());
+}
+
+#[test]
 fn private_core_accepts_v2_rolling_market_ids() {
     let mut core = PrivateTradingCore::new(
         JournalKey::from_bytes([41u8; 32]),
@@ -236,7 +260,7 @@ fn private_core_accepts_v2_rolling_market_ids() {
             market_id: "layrs:v2:ZEN:15m:2000".into(),
             settlement_asset: "ZEN".into(),
             settlement_decimals: 18,
-            public_settlement_chain: "horizen".into(),
+            public_settlement_chain: Some("horizen".into()),
             opens_at_millis: 900,
             closes_at_millis: 2_000,
             minimum_quantity_micros: 1,
@@ -273,7 +297,7 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
             market_id: market_id.into(),
             settlement_asset: "ZEN".into(),
             settlement_decimals: 18,
-            public_settlement_chain: "horizen".into(),
+            public_settlement_chain: Some("horizen".into()),
             opens_at_millis: 900,
             closes_at_millis: 2_000,
             minimum_quantity_micros: 1,
@@ -512,7 +536,7 @@ fn polymarket_bootstrap_never_credits_an_unconfirmed_fill() {
             market_id: market_id.into(),
             settlement_asset: "USDC".into(),
             settlement_decimals: 6,
-            public_settlement_chain: "horizen".into(),
+            public_settlement_chain: Some("horizen".into()),
             opens_at_millis: 1_000,
             closes_at_millis: 10_000,
             minimum_quantity_micros: 1,
