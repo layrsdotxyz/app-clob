@@ -20,6 +20,8 @@ pub struct MarketConfig {
     pub market_id: String,
     pub settlement_asset: String,
     pub settlement_decimals: u8,
+    #[serde(default = "default_public_settlement_chain")]
+    pub public_settlement_chain: String,
     pub opens_at_millis: i64,
     pub closes_at_millis: i64,
     #[serde(with = "super::decimal_u128")]
@@ -59,6 +61,10 @@ pub enum MarketExecution {
         #[serde(default)]
         neg_risk: bool,
     },
+}
+
+fn default_public_settlement_chain() -> String {
+    "horizen".into()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1759,7 +1765,7 @@ impl PrivateTradingCore {
         };
         let audit_draft = AuditFillDraft {
             fill_id: execution_id,
-            chain: "base".into(),
+            chain: market.public_settlement_chain.clone(),
             market_id: execution.view.market_id.clone(),
             buyer_private_user_id,
             seller_private_user_id,
@@ -3004,12 +3010,11 @@ fn native_audit_drafts(
     result: &MatchResult,
     market: &MarketConfig,
 ) -> CoreResult<Vec<AuditFillDraft>> {
-    let chain = match market.settlement_asset.as_str() {
-        "USDC" => "base",
-        "ZEN" => "horizen",
+    let chain = match market.public_settlement_chain.as_str() {
+        "base" | "horizen" => market.public_settlement_chain.as_str(),
         _ => {
             return Err(CoreError::InvalidOrder(
-                "unsupported audit settlement asset".into(),
+                "unsupported public settlement chain".into(),
             ))
         }
     };
@@ -3143,6 +3148,7 @@ fn validate_market(market: &MarketConfig, now_millis: i64) -> CoreResult<()> {
             (market.settlement_asset.as_str(), market.settlement_decimals),
             ("USDC", 6) | ("ZEN", 18)
         )
+        || !matches!(market.public_settlement_chain.as_str(), "base" | "horizen")
         || market.opens_at_millis >= market.closes_at_millis
         || market.closes_at_millis <= now_millis
         || market.minimum_quantity_micros == 0
