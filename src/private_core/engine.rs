@@ -3378,10 +3378,7 @@ fn validate_withdrawal(
     destination: &str,
 ) -> CoreResult<()> {
     if amount == 0
-        || !matches!(
-            (chain, asset),
-            ("base", "USDC") | ("base", "ZEN") | ("horizen", "ZEN")
-        )
+        || !matches!((chain, asset), ("base", "USDC") | ("horizen", "ZEN"))
         || !destination.starts_with("0x")
         || destination.len() != 42
         || !destination[2..]
