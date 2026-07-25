@@ -51,7 +51,10 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
 const PORT: u32 = 5_003;
-const MAX_FRAME_BYTES: usize = 1_048_576;
+// Must match or exceed the parent relay cap. Provisioning restores encrypted
+// checkpoints over this vsock channel; JSON byte-array encoding expands a
+// ~1 MiB archived snapshot into a multi-MiB operator command.
+const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TRANSPORT_REPLAY_ENTRIES: usize = 262_144;
 const MAX_OPERATOR_REPLAY_ENTRIES: usize = 100_000;
 
@@ -2204,6 +2207,11 @@ mod tests {
     fn replay_cache_zero_capacity_fails_closed() {
         let mut cache = ReplayCache::<2>::new(0);
         assert!(!cache.remember([1u8, 1]));
+    }
+
+    #[test]
+    fn relay_frame_limit_supports_checkpoint_restore_payloads() {
+        assert!(MAX_FRAME_BYTES >= 64 * 1024 * 1024);
     }
 
     #[test]

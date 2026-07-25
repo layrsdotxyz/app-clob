@@ -24,7 +24,14 @@ use tower_http::{
     request_id::SetRequestIdLayer, timeout::TimeoutLayer,
 };
 
-const MAX_FRAME_BYTES: usize = 1_048_576;
+// Provisioning restores the latest encrypted private-core snapshot through the same
+// ciphertext-only relay used by ordinary private commands. The snapshot object is
+// compact at rest in S3, but the current JSON wire encoding expands byte arrays
+// substantially before the parent forwards the frame over vsock. A 1 MiB cap was
+// enough for early alpha state and then failed closed once rolling markets and
+// sessions pushed the restore envelope over the limit. Keep this high enough for
+// production checkpoint growth while still bounded for the private internal origin.
+const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const VSOCK_PORT: u32 = 5_003;
 const EGRESS_VSOCK_PORT: u32 = 5_004;
 const EGRESS_PREFACE: &[u8] = b"LAYRS_EGRESS_V1\n";
@@ -338,6 +345,16 @@ fn decode_fixed<const N: usize>(value: &str, code: &'static str) -> Result<[u8; 
     decoded
         .try_into()
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, code))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MAX_FRAME_BYTES;
+
+    #[test]
+    fn relay_frame_limit_supports_checkpoint_restore_payloads() {
+        assert!(MAX_FRAME_BYTES >= 64 * 1024 * 1024);
+    }
 }
 
 fn decode_bounded(
