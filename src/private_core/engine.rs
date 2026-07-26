@@ -7,6 +7,9 @@ use sha2::{Digest, Sha256};
 use tiny_keccak::{Hasher, Keccak};
 use uuid::Uuid;
 
+use super::rewards::{
+    PrivateRewardBook, PrivateRewardEntitlement, RewardClaimAuthorization, RewardClaimIntent,
+};
 use super::{
     AccountBucket, AccountKey, BookOrder, ClaimPayout, CompleteSetDirection,
     CompleteSetTransaction, CoreError, CoreResult, EnclaveReceipt, EncryptedJournal,
@@ -208,6 +211,14 @@ pub enum UserCommandAction {
         direction: CompleteSetDirection,
     },
     Portfolio,
+    Rewards,
+    RequestRewardClaim {
+        chain: String,
+        account: String,
+        recipient: String,
+        reward_token: String,
+        deadline_seconds: u64,
+    },
     BootstrapStatus {
         execution_id: Uuid,
     },
@@ -317,6 +328,12 @@ pub enum CommandResult {
     Portfolio {
         snapshot: PortfolioSnapshot,
     },
+    Rewards {
+        entitlements: Vec<PrivateRewardEntitlement>,
+    },
+    RewardClaimAuthorized {
+        intent: RewardClaimIntent,
+    },
     BootstrapPending {
         execution: BootstrapExecutionView,
     },
@@ -343,6 +360,8 @@ pub struct CoreResponse {
     pub encrypted_record: EncryptedJournalRecord,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub withdrawal_authorization: Option<WithdrawalAuthorization>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reward_claim_authorization: Option<RewardClaimAuthorization>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audit_fills: Vec<SignedAuditFillArtifact>,
 }
@@ -416,6 +435,15 @@ enum JournaledSystemCommand {
         idempotency_key: String,
         flow: ExternalFlowTransaction,
     },
+    AccrueReward {
+        idempotency_key: String,
+        identity_commitment: [u8; 32],
+        chain: String,
+        reward_token: String,
+        #[serde(with = "super::decimal_u128")]
+        amount_atomic: u128,
+        evidence_hash: [u8; 32],
+    },
     ReleaseWithdrawal {
         idempotency_key: String,
         identity_commitment: [u8; 32],
@@ -467,6 +495,8 @@ struct CoreStateSnapshot {
     #[serde(default)]
     bootstrap_executions: BTreeMap<Uuid, BootstrapExecution>,
     #[serde(default)]
+    private_rewards: PrivateRewardBook,
+    #[serde(default)]
     trading_frozen: bool,
     sequence: u64,
 }
@@ -484,6 +514,7 @@ pub struct PrivateTradingCore {
     resolutions: BTreeMap<String, MarketResolution>,
     oracle_public_key: Option<[u8; 32]>,
     bootstrap_executions: BTreeMap<Uuid, BootstrapExecution>,
+    private_rewards: PrivateRewardBook,
     trading_frozen: bool,
     sequence: u64,
     identity_key: [u8; 32],
@@ -505,6 +536,7 @@ impl PrivateTradingCore {
             resolutions: BTreeMap::new(),
             oracle_public_key: None,
             bootstrap_executions: BTreeMap::new(),
+            private_rewards: PrivateRewardBook::default(),
             trading_frozen: false,
             sequence: 0,
             identity_key,
@@ -563,6 +595,7 @@ impl PrivateTradingCore {
                 resolutions: self.resolutions.clone(),
                 oracle_public_key: self.oracle_public_key,
                 bootstrap_executions: self.bootstrap_executions.clone(),
+                private_rewards: self.private_rewards.clone(),
                 trading_frozen: self.trading_frozen,
                 sequence: self.sequence,
             },
@@ -610,6 +643,7 @@ impl PrivateTradingCore {
             &state.resolutions,
             &state.oracle_public_key,
             &state.bootstrap_executions,
+            &state.private_rewards,
             state.trading_frozen,
             state.sequence,
         );
@@ -630,6 +664,7 @@ impl PrivateTradingCore {
             resolutions: state.resolutions,
             oracle_public_key: state.oracle_public_key,
             bootstrap_executions: state.bootstrap_executions,
+            private_rewards: state.private_rewards,
             trading_frozen: state.trading_frozen,
             sequence: state.sequence,
             identity_key,
@@ -648,6 +683,7 @@ impl PrivateTradingCore {
             &self.resolutions,
             &self.oracle_public_key,
             &self.bootstrap_executions,
+            &self.private_rewards,
             self.trading_frozen,
             self.sequence,
         )
@@ -685,6 +721,7 @@ impl PrivateTradingCore {
             &self.resolutions,
             &self.oracle_public_key,
             &self.bootstrap_executions,
+            &self.private_rewards,
             frozen,
             next_sequence,
         );
@@ -739,6 +776,7 @@ impl PrivateTradingCore {
             &self.resolutions,
             &self.oracle_public_key,
             &self.bootstrap_executions,
+            &self.private_rewards,
             self.trading_frozen,
             next_sequence,
         );
@@ -795,6 +833,7 @@ impl PrivateTradingCore {
             &self.resolutions,
             &self.oracle_public_key,
             &self.bootstrap_executions,
+            &self.private_rewards,
             self.trading_frozen,
             next_sequence,
         );
@@ -853,6 +892,7 @@ impl PrivateTradingCore {
             &self.resolutions,
             &self.oracle_public_key,
             &self.bootstrap_executions,
+            &self.private_rewards,
             self.trading_frozen,
             next_sequence,
         );
@@ -905,6 +945,67 @@ impl PrivateTradingCore {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn accrue_private_reward(
+        &mut self,
+        idempotency_key: String,
+        identity_commitment: [u8; 32],
+        chain: String,
+        reward_token: String,
+        amount_atomic: u128,
+        evidence_hash: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        if evidence_hash == [0u8; 32] {
+            return Err(CoreError::InvalidOrder(
+                "reward accrual requires evidence".into(),
+            ));
+        }
+        let owner = derive_private_user_id(&self.identity_key, &identity_commitment);
+        let prior_root = self.state_root();
+        let mut private_rewards = self.private_rewards.clone();
+        private_rewards.accrue(&owner, &chain, &reward_token, amount_atomic)?;
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &self.ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            &private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::AccrueReward {
+            idempotency_key: idempotency_key.clone(),
+            identity_commitment,
+            chain,
+            reward_token,
+            amount_atomic,
+            evidence_hash,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.private_rewards = private_rewards;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            "accrue-reward",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
+    }
+
     pub fn release_user_withdrawal(
         &mut self,
         idempotency_key: String,
@@ -946,6 +1047,7 @@ impl PrivateTradingCore {
             &self.resolutions,
             &self.oracle_public_key,
             &self.bootstrap_executions,
+            &self.private_rewards,
             self.trading_frozen,
             next_sequence,
         );
@@ -1046,6 +1148,7 @@ impl PrivateTradingCore {
             &self.resolutions,
             &self.oracle_public_key,
             &self.bootstrap_executions,
+            &self.private_rewards,
             self.trading_frozen,
             next_sequence,
         );
@@ -1269,6 +1372,7 @@ impl PrivateTradingCore {
             &resolutions,
             &self.oracle_public_key,
             &self.bootstrap_executions,
+            &self.private_rewards,
             self.trading_frozen,
             next_sequence,
         );
@@ -1528,6 +1632,7 @@ impl PrivateTradingCore {
             &self.resolutions,
             &self.oracle_public_key,
             &executions,
+            &self.private_rewards,
             self.trading_frozen,
             next_sequence,
         );
@@ -1784,6 +1889,7 @@ impl PrivateTradingCore {
             &self.resolutions,
             &self.oracle_public_key,
             &executions,
+            &self.private_rewards,
             self.trading_frozen,
             next_sequence,
         );
@@ -1882,6 +1988,7 @@ impl PrivateTradingCore {
             &self.resolutions,
             &self.oracle_public_key,
             &executions,
+            &self.private_rewards,
             self.trading_frozen,
             next_sequence,
         );
@@ -1940,6 +2047,7 @@ impl PrivateTradingCore {
         let mut books = self.books.clone();
         let mut position_cost_basis = self.position_cost_basis.clone();
         let mut bootstrap_executions = self.bootstrap_executions.clone();
+        let mut private_rewards = self.private_rewards.clone();
         let mut system_keys = self.system_keys.clone();
         let mut audit_drafts = Vec::new();
         let result = match &command.action {
@@ -2142,6 +2250,38 @@ impl PrivateTradingCore {
                     now_millis,
                 ),
             },
+            UserCommandAction::Rewards => CommandResult::Rewards {
+                entitlements: private_rewards.entitlements(&private_user_id),
+            },
+            UserCommandAction::RequestRewardClaim {
+                chain,
+                account,
+                recipient,
+                reward_token,
+                deadline_seconds,
+            } => {
+                let now_seconds = u64::try_from(now_millis / 1_000).map_err(|_| {
+                    CoreError::InvalidOrder("invalid reward claim timestamp".into())
+                })?;
+                if *deadline_seconds <= now_seconds
+                    || *deadline_seconds > now_seconds.saturating_add(15 * 60)
+                {
+                    return Err(CoreError::InvalidOrder(
+                        "reward claim deadline must be within 15 minutes".into(),
+                    ));
+                }
+                CommandResult::RewardClaimAuthorized {
+                    intent: private_rewards.authorize(
+                        &private_user_id,
+                        chain,
+                        account,
+                        recipient,
+                        reward_token,
+                        *deadline_seconds,
+                        &command.idempotency_key,
+                    )?,
+                }
+            }
             UserCommandAction::BootstrapStatus { execution_id } => {
                 let execution = bootstrap_executions
                     .get(execution_id)
@@ -2242,6 +2382,7 @@ impl PrivateTradingCore {
             &self.resolutions,
             &self.oracle_public_key,
             &bootstrap_executions,
+            &private_rewards,
             self.trading_frozen,
             next_sequence,
         );
@@ -2300,6 +2441,7 @@ impl PrivateTradingCore {
             receipt,
             encrypted_record: record,
             withdrawal_authorization,
+            reward_claim_authorization: None,
             audit_fills,
         };
         self.ledger = ledger;
@@ -2307,6 +2449,7 @@ impl PrivateTradingCore {
         self.sessions = sessions;
         self.position_cost_basis = position_cost_basis;
         self.bootstrap_executions = bootstrap_executions;
+        self.private_rewards = private_rewards;
         self.system_keys = system_keys;
         self.sequence = next_sequence;
         self.processed.insert(
@@ -3471,6 +3614,7 @@ fn state_root(
     resolutions: &BTreeMap<String, MarketResolution>,
     oracle_public_key: &Option<[u8; 32]>,
     bootstrap_executions: &BTreeMap<Uuid, BootstrapExecution>,
+    private_rewards: &PrivateRewardBook,
     trading_frozen: bool,
     sequence: u64,
 ) -> [u8; 32] {
@@ -3489,6 +3633,7 @@ fn state_root(
         serde_json::to_vec(resolutions),
         serde_json::to_vec(oracle_public_key),
         serde_json::to_vec(bootstrap_executions),
+        serde_json::to_vec(private_rewards),
     ] {
         let encoded = value.expect("private core state serialization cannot fail");
         hash.update(&(encoded.len() as u64).to_be_bytes());

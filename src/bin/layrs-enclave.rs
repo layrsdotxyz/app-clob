@@ -26,7 +26,7 @@ use clob_service::polymarket_enclave::{
 };
 use clob_service::private_core::{
     polymarket_resolution_signing_payload, resolution_signing_payload, AccountKey,
-    BootstrapExecutionState, CoreResponse, EnclaveReceipt, EncryptedJournalRecord,
+    BootstrapExecutionState, CommandResult, CoreResponse, EnclaveReceipt, EncryptedJournalRecord,
     EncryptedSnapshot, ExternalFlowDirection, JournalKey, MarketConfig,
     PolymarketResolutionStatement, PrivateTradingCore, ReceiptSigner, ResolutionStatement,
     SignedAuditFillArtifact, SignedPolymarketResolution, SignedResolution,
@@ -244,6 +244,16 @@ enum OperatorCommand {
         idempotency_key: String,
         identity_commitment: [u8; 32],
         asset: String,
+        #[serde(with = "clob_service::private_core::decimal_u128")]
+        amount_atomic: u128,
+        evidence_hash: [u8; 32],
+        now_millis: i64,
+    },
+    AccrueReward {
+        idempotency_key: String,
+        identity_commitment: [u8; 32],
+        chain: String,
+        reward_token: String,
         #[serde(with = "clob_service::private_core::decimal_u128")]
         amount_atomic: u128,
         evidence_hash: [u8; 32],
@@ -720,15 +730,24 @@ async fn dispatch(state: &mut EnclaveState, request: PlainRequest) -> PlainRespo
         PlainRequest::User {
             command,
             now_millis,
-        } => state
-            .core
-            .as_mut()
-            .ok_or_else(|| "NOT_PROVISIONED".into())
-            .and_then(|core| {
-                core.execute(command, now_millis)
-                    .map(|response| PlainResponse::User { response })
-                    .map_err(|error| error.to_string())
-            }),
+        } => (|| -> Result<PlainResponse, String> {
+            let mut response = state
+                .core
+                .as_mut()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())
+                .and_then(|core| {
+                    core.execute(command, now_millis)
+                        .map_err(|error| error.to_string())
+                })?;
+            if let CommandResult::RewardClaimAuthorized { intent } = &response.result {
+                let signer = state
+                    .chain_signer
+                    .as_ref()
+                    .ok_or_else(|| "CHAIN_SIGNER_NOT_PROVISIONED".to_string())?;
+                response.reward_claim_authorization = Some(signer.sign_reward_claim(intent)?);
+            }
+            Ok(PlainResponse::User { response })
+        })(),
         PlainRequest::AggregateDepth {
             market_id,
             outcome,
@@ -1605,6 +1624,23 @@ async fn dispatch_operator(
                     clob_service::private_core::AccountBucket::UserAvailable,
                     amount_atomic,
                     ExternalFlowDirection::Inflow,
+                    evidence_hash,
+                    now_millis,
+                ),
+                OperatorCommand::AccrueReward {
+                    idempotency_key,
+                    identity_commitment,
+                    chain,
+                    reward_token,
+                    amount_atomic,
+                    evidence_hash,
+                    now_millis,
+                } => core.accrue_private_reward(
+                    idempotency_key,
+                    identity_commitment,
+                    chain,
+                    reward_token,
+                    amount_atomic,
                     evidence_hash,
                     now_millis,
                 ),

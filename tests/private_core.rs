@@ -1650,6 +1650,133 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
     );
 }
 
+#[test]
+fn private_rewards_accrue_cumulatively_and_authorize_only_the_bound_account() {
+    let user = SigningKey::from_bytes(&[41u8; 32]);
+    let journal_key = [42u8; 32];
+    let identity_commitment = [43u8; 32];
+    let mut core = PrivateTradingCore::new(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([44u8; 48]),
+    );
+    core.register_session(
+        "sys:session:rewards".into(),
+        "session:rewards".into(),
+        identity_commitment,
+        user.verifying_key().to_bytes(),
+        10_000,
+        1_000,
+    )
+    .unwrap();
+    let reward_token = "0x0000000000000000000000000000000000000011";
+    core.accrue_private_reward(
+        "sys:reward:one".into(),
+        identity_commitment,
+        "base".into(),
+        reward_token.into(),
+        100,
+        [45u8; 32],
+        1_100,
+    )
+    .unwrap();
+    core.accrue_private_reward(
+        "sys:reward:two".into(),
+        identity_commitment,
+        "base".into(),
+        reward_token.into(),
+        25,
+        [46u8; 32],
+        1_200,
+    )
+    .unwrap();
+
+    match execute_signed(
+        &mut core,
+        &user,
+        "session:rewards",
+        1,
+        "cmd:rewards",
+        UserCommandAction::Rewards,
+        1_300,
+    ) {
+        CommandResult::Rewards { entitlements } => {
+            assert_eq!(entitlements.len(), 1);
+            assert_eq!(entitlements[0].cumulative_amount_atomic, "125");
+            assert!(entitlements[0].claim_account.is_none());
+        }
+        _ => panic!("expected private rewards"),
+    }
+
+    let account = "0x0000000000000000000000000000000000000022";
+    let recipient = "0x0000000000000000000000000000000000000033";
+    let authorized = execute_signed_response(
+        &mut core,
+        &user,
+        "session:rewards",
+        2,
+        "cmd:reward-claim",
+        UserCommandAction::RequestRewardClaim {
+            chain: "base".into(),
+            account: account.into(),
+            recipient: recipient.into(),
+            reward_token: reward_token.into(),
+            deadline_seconds: 900,
+        },
+        1_400,
+    );
+    match authorized.result {
+        CommandResult::RewardClaimAuthorized { intent } => {
+            assert_eq!(intent.account, account);
+            assert_eq!(intent.recipient, recipient);
+            assert_eq!(intent.cumulative_amount_atomic, "125");
+            assert_ne!(intent.context_hash, [0u8; 32]);
+        }
+        _ => panic!("expected reward claim authorization"),
+    }
+    assert!(authorized.reward_claim_authorization.is_none());
+
+    let changed_account = execute_signed_result(
+        &mut core,
+        &user,
+        "session:rewards",
+        3,
+        "cmd:reward-claim-redirect",
+        UserCommandAction::RequestRewardClaim {
+            chain: "base".into(),
+            account: "0x0000000000000000000000000000000000000044".into(),
+            recipient: recipient.into(),
+            reward_token: reward_token.into(),
+            deadline_seconds: 901,
+        },
+        1_500,
+    );
+    assert!(matches!(changed_account, Err(CoreError::InvalidOrder(_))));
+
+    let snapshot = core.export_encrypted_snapshot().unwrap();
+    let mut restored = PrivateTradingCore::restore_encrypted_snapshot(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([44u8; 48]),
+        &snapshot,
+        snapshot.sequence,
+    )
+    .unwrap();
+    match execute_signed(
+        &mut restored,
+        &user,
+        "session:rewards",
+        3,
+        "cmd:rewards-restored",
+        UserCommandAction::Rewards,
+        1_600,
+    ) {
+        CommandResult::Rewards { entitlements } => {
+            assert_eq!(entitlements[0].claim_account.as_deref(), Some(account));
+            assert_eq!(entitlements[0].cumulative_amount_atomic, "125");
+        }
+        _ => panic!("expected restored private rewards"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_signed(
     core: &mut PrivateTradingCore,

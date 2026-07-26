@@ -3,7 +3,7 @@ use ethers_core::{
     abi::{encode, Token},
     types::{
         transaction::eip2718::TypedTransaction, Address, Bytes, Eip1559TransactionRequest,
-        NameOrAddress, U256,
+        NameOrAddress, H256, U256,
     },
     utils::keccak256,
 };
@@ -17,6 +17,17 @@ use zeroize::Zeroize;
 pub struct ChainSignerBundle {
     pub domains: Vec<ChainSignerDomainSecret>,
     pub resolution_private_key_hex: String,
+    #[serde(default)]
+    pub reward_claim_domains: Vec<RewardClaimDomainSecret>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RewardClaimDomainSecret {
+    pub chain: String,
+    pub chain_id: u64,
+    pub distributor_address: String,
+    pub private_key_hex: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -39,6 +50,13 @@ struct ChainSignerDomain {
     ledger_wallet: LocalWallet,
     admin_oracle: Address,
     oracle_wallet: LocalWallet,
+}
+
+#[derive(Debug, Clone)]
+struct RewardClaimDomain {
+    chain_id: u64,
+    distributor: Address,
+    wallet: LocalWallet,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,11 +86,13 @@ pub struct MarketResolutionTransaction {
 
 pub struct EnclaveChainSigner {
     domains: BTreeMap<String, ChainSignerDomain>,
+    reward_claim_domains: BTreeMap<String, RewardClaimDomain>,
     resolution_signer: SigningKey,
 }
 
 impl EnclaveChainSigner {
     pub fn new(mut bundle: ChainSignerBundle) -> Result<Self, String> {
+        let reward_claim_domains = parse_reward_claim_domains(&mut bundle.reward_claim_domains)?;
         if bundle.domains.len() != 2 {
             bundle
                 .domains
@@ -164,9 +184,81 @@ impl EnclaveChainSigner {
                 },
             );
         }
+        for reward_domain in reward_claim_domains.values() {
+            if domains.values().any(|domain| {
+                reward_domain.wallet.address() == domain.ledger_wallet.address()
+                    || reward_domain.wallet.address() == domain.oracle_wallet.address()
+            }) {
+                return Err("REWARD_CLAIM_KEY_MUST_BE_SEPARATED".into());
+            }
+        }
         Ok(Self {
             domains,
+            reward_claim_domains,
             resolution_signer,
+        })
+    }
+
+    pub fn sign_reward_claim(
+        &self,
+        intent: &crate::private_core::RewardClaimIntent,
+    ) -> Result<crate::private_core::RewardClaimAuthorization, String> {
+        if intent.protocol_version != "layrs.reward-claim.v1"
+            || intent.deadline_seconds == 0
+            || intent.context_hash == [0u8; 32]
+        {
+            return Err("INVALID_REWARD_CLAIM_INTENT".into());
+        }
+        let domain = self
+            .reward_claim_domains
+            .get(&intent.chain)
+            .ok_or_else(|| "REWARD_CLAIM_SIGNER_NOT_CONFIGURED".to_string())?;
+        let account = parse_nonzero_address(&intent.account)?;
+        let recipient = parse_nonzero_address(&intent.recipient)?;
+        let reward_token = parse_nonzero_address(&intent.reward_token)?;
+        let cumulative_amount = U256::from_dec_str(&intent.cumulative_amount_atomic)
+            .map_err(|_| "INVALID_REWARD_CLAIM_AMOUNT".to_string())?;
+        if cumulative_amount.is_zero() {
+            return Err("INVALID_REWARD_CLAIM_AMOUNT".into());
+        }
+
+        let domain_typehash = keccak256(
+            b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+        );
+        let claim_typehash = keccak256(
+            b"Claim(address account,address recipient,address rewardToken,uint256 cumulativeAmount,uint256 deadline,bytes32 contextHash)",
+        );
+        let domain_separator = keccak256(encode(&[
+            Token::FixedBytes(domain_typehash.to_vec()),
+            Token::FixedBytes(keccak256(b"LayrsRewardClaimDistributor").to_vec()),
+            Token::FixedBytes(keccak256(b"1").to_vec()),
+            Token::Uint(domain.chain_id.into()),
+            Token::Address(domain.distributor),
+        ]));
+        let struct_hash = keccak256(encode(&[
+            Token::FixedBytes(claim_typehash.to_vec()),
+            Token::Address(account),
+            Token::Address(recipient),
+            Token::Address(reward_token),
+            Token::Uint(cumulative_amount),
+            Token::Uint(intent.deadline_seconds.into()),
+            Token::FixedBytes(intent.context_hash.to_vec()),
+        ]));
+        let mut encoded = Vec::with_capacity(66);
+        encoded.extend_from_slice(b"\x19\x01");
+        encoded.extend_from_slice(&domain_separator);
+        encoded.extend_from_slice(&struct_hash);
+        let digest = H256::from(keccak256(encoded));
+        let signature = domain
+            .wallet
+            .sign_hash(digest)
+            .map_err(|_| "REWARD_CLAIM_SIGNING_FAILED".to_string())?;
+        Ok(crate::private_core::RewardClaimAuthorization {
+            intent: intent.clone(),
+            chain_id: domain.chain_id,
+            distributor: format!("{:#x}", domain.distributor),
+            signer: format!("{:#x}", domain.wallet.address()),
+            signature: signature.to_vec(),
         })
     }
 
@@ -343,6 +435,60 @@ fn valid_market_id(value: &str) -> bool {
         && parts[4].bytes().all(|byte| byte.is_ascii_digit())
 }
 
+fn parse_reward_claim_domains(
+    secrets: &mut Vec<RewardClaimDomainSecret>,
+) -> Result<BTreeMap<String, RewardClaimDomain>, String> {
+    let mut domains = BTreeMap::new();
+    for index in 0..secrets.len() {
+        let secret = &mut secrets[index];
+        let expected_chain_id = match secret.chain.as_str() {
+            "base" => 8_453,
+            "horizen" => 26_514,
+            _ => {
+                zeroize_reward_secrets(secrets);
+                return Err("INVALID_REWARD_CLAIM_DOMAIN".into());
+            }
+        };
+        let distributor = Address::from_str(&secret.distributor_address)
+            .ok()
+            .filter(|address| *address != Address::zero());
+        let parsed_wallet = secret.private_key_hex.parse::<LocalWallet>();
+        secret.private_key_hex.zeroize();
+        if secret.chain_id != expected_chain_id
+            || domains.contains_key(&secret.chain)
+            || distributor.is_none()
+            || parsed_wallet.is_err()
+        {
+            zeroize_reward_secrets(secrets);
+            return Err("INVALID_REWARD_CLAIM_DOMAIN".into());
+        }
+        domains.insert(
+            secret.chain.clone(),
+            RewardClaimDomain {
+                chain_id: secret.chain_id,
+                distributor: distributor.expect("checked above"),
+                wallet: parsed_wallet
+                    .expect("checked above")
+                    .with_chain_id(secret.chain_id),
+            },
+        );
+    }
+    Ok(domains)
+}
+
+fn zeroize_reward_secrets(secrets: &mut [RewardClaimDomainSecret]) {
+    for secret in secrets {
+        secret.private_key_hex.zeroize();
+    }
+}
+
+fn parse_nonzero_address(value: &str) -> Result<Address, String> {
+    Address::from_str(value)
+        .ok()
+        .filter(|address| *address != Address::zero())
+        .ok_or_else(|| "INVALID_REWARD_CLAIM_ADDRESS".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,6 +499,7 @@ mod tests {
         let signer = EnclaveChainSigner::new(ChainSignerBundle {
             resolution_private_key_hex:
                 "0x4f3edf983ac63ad7c7f9a2f8b7f3fb6d84ff79d59bf393ae7d4bc0f6f1a5c06d".into(),
+            reward_claim_domains: vec![],
             domains: vec![
                 ChainSignerDomainSecret {
                     chain: "base".into(),
@@ -403,6 +550,7 @@ mod tests {
         let signer = EnclaveChainSigner::new(ChainSignerBundle {
             resolution_private_key_hex:
                 "0x4f3edf983ac63ad7c7f9a2f8b7f3fb6d84ff79d59bf393ae7d4bc0f6f1a5c06d".into(),
+            reward_claim_domains: vec![],
             domains: vec![
                 ChainSignerDomainSecret {
                     chain: "base".into(),
@@ -449,5 +597,100 @@ mod tests {
             "0x5555555555555555555555555555555555555555"
         );
         assert!(signed.raw_transaction_hex.starts_with("0x02"));
+    }
+
+    #[test]
+    fn reward_claim_signature_matches_contract_eip712_digest() {
+        let reward_key = "0x7c852118294f2e4a0f8e0f7343f93b99b01f6e2ed0a2b2f5f2f1f0ed998c1d8a";
+        let signer = EnclaveChainSigner::new(ChainSignerBundle {
+            resolution_private_key_hex:
+                "0x4f3edf983ac63ad7c7f9a2f8b7f3fb6d84ff79d59bf393ae7d4bc0f6f1a5c06d".into(),
+            reward_claim_domains: vec![RewardClaimDomainSecret {
+                chain: "base".into(),
+                chain_id: 8453,
+                distributor_address: "0x6666666666666666666666666666666666666666".into(),
+                private_key_hex: reward_key.into(),
+            }],
+            domains: vec![
+                ChainSignerDomainSecret {
+                    chain: "base".into(),
+                    chain_id: 8453,
+                    asset: "USDC".into(),
+                    pool_address: "0x1111111111111111111111111111111111111111".into(),
+                    eoa_private_key_hex:
+                        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d".into(),
+                    admin_oracle_address: "0x4444444444444444444444444444444444444444".into(),
+                    oracle_private_key_hex:
+                        "0x0dbbe8e4e7a7e1bfa5fd84f122539111716f10a741f14e20511e097c620c4681".into(),
+                },
+                ChainSignerDomainSecret {
+                    chain: "horizen".into(),
+                    chain_id: 26514,
+                    asset: "ZEN".into(),
+                    pool_address: "0x2222222222222222222222222222222222222222".into(),
+                    eoa_private_key_hex:
+                        "0x8b3a350cf5c34c9194ca3a545d9c34e9e00f4d10b423f7594c35c3bb2d95b42f".into(),
+                    admin_oracle_address: "0x5555555555555555555555555555555555555555".into(),
+                    oracle_private_key_hex:
+                        "0x47e179ec197488593b187f80a00eb0da91f1b9d9e85bc7b52cda8535144f2381".into(),
+                },
+            ],
+        })
+        .unwrap();
+        let intent = crate::private_core::RewardClaimIntent {
+            protocol_version: "layrs.reward-claim.v1".into(),
+            chain: "base".into(),
+            account: "0x0000000000000000000000000000000000000011".into(),
+            recipient: "0x0000000000000000000000000000000000000022".into(),
+            reward_token: "0x0000000000000000000000000000000000000033".into(),
+            cumulative_amount_atomic: "125".into(),
+            deadline_seconds: 1_800_000_000,
+            context_hash: [9u8; 32],
+        };
+        let authorization = signer.sign_reward_claim(&intent).unwrap();
+        let signature =
+            ethers_core::types::Signature::try_from(authorization.signature.as_slice()).unwrap();
+        let expected = reward_key.parse::<LocalWallet>().unwrap().address();
+        let digest =
+            reward_claim_digest(&intent, authorization.chain_id, &authorization.distributor);
+        assert_eq!(signature.recover(digest).unwrap(), expected);
+        assert_eq!(authorization.signer, format!("{expected:#x}"));
+    }
+
+    fn reward_claim_digest(
+        intent: &crate::private_core::RewardClaimIntent,
+        chain_id: u64,
+        distributor: &str,
+    ) -> H256 {
+        let domain_separator = keccak256(encode(&[
+            Token::FixedBytes(
+                keccak256(
+                    b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+                )
+                .to_vec(),
+            ),
+            Token::FixedBytes(keccak256(b"LayrsRewardClaimDistributor").to_vec()),
+            Token::FixedBytes(keccak256(b"1").to_vec()),
+            Token::Uint(chain_id.into()),
+            Token::Address(Address::from_str(distributor).unwrap()),
+        ]));
+        let struct_hash = keccak256(encode(&[
+            Token::FixedBytes(
+                keccak256(
+                    b"Claim(address account,address recipient,address rewardToken,uint256 cumulativeAmount,uint256 deadline,bytes32 contextHash)",
+                )
+                .to_vec(),
+            ),
+            Token::Address(Address::from_str(&intent.account).unwrap()),
+            Token::Address(Address::from_str(&intent.recipient).unwrap()),
+            Token::Address(Address::from_str(&intent.reward_token).unwrap()),
+            Token::Uint(U256::from_dec_str(&intent.cumulative_amount_atomic).unwrap()),
+            Token::Uint(intent.deadline_seconds.into()),
+            Token::FixedBytes(intent.context_hash.to_vec()),
+        ]));
+        let mut encoded = b"\x19\x01".to_vec();
+        encoded.extend_from_slice(&domain_separator);
+        encoded.extend_from_slice(&struct_hash);
+        H256::from(keccak256(encoded))
     }
 }

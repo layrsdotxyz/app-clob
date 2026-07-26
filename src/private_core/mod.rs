@@ -7,6 +7,7 @@ pub mod engine;
 pub mod journal;
 pub mod ledger;
 pub mod orderbook;
+mod rewards;
 pub mod session;
 
 pub mod decimal_u128 {
@@ -57,6 +58,8 @@ pub use ledger::{
 pub use orderbook::{
     BookOrder, Fill, MatchResult, OrderAction, OrderStatus, Outcome, PriceTimeBook, TimeInForce,
 };
+#[allow(unused_imports)]
+pub use rewards::{PrivateRewardEntitlement, RewardClaimAuthorization, RewardClaimIntent};
 #[allow(unused_imports)]
 pub use session::{signing_payload, SessionGuard, SessionRequest, SignedSessionRequest};
 
