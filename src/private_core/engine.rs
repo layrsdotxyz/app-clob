@@ -3150,7 +3150,9 @@ fn market_id_bytes32(market_id: &str) -> String {
 }
 
 fn validate_market(market: &MarketConfig, now_millis: i64) -> CoreResult<()> {
-    if !(market.market_id.starts_with("layrs:v1:") || market.market_id.starts_with("layrs:v2:"))
+    if !(market.market_id.starts_with("layrs:v1:")
+        || market.market_id.starts_with("layrs:v2:")
+        || market.market_id.starts_with("layrs:v3:"))
         || !matches!(
             (market.settlement_asset.as_str(), market.settlement_decimals),
             ("USDC", 6) | ("ZEN", 18)

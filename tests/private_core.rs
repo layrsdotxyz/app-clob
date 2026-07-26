@@ -279,6 +279,37 @@ fn private_core_accepts_v2_rolling_market_ids() {
 }
 
 #[test]
+fn private_core_accepts_v3_rolling_market_ids() {
+    let mut core = PrivateTradingCore::new(
+        JournalKey::from_bytes([43u8; 32]),
+        ReceiptSigner::generate([44u8; 48]),
+    );
+
+    core.register_market(
+        "sys:market:v3:1".into(),
+        MarketConfig {
+            market_id: "layrs:v3:ZEN:15m:2000".into(),
+            settlement_asset: "ZEN".into(),
+            settlement_decimals: 18,
+            public_settlement_chain: Some("horizen".into()),
+            opens_at_millis: 900,
+            closes_at_millis: 2_000,
+            minimum_quantity_micros: 250_000,
+            maximum_quantity_micros: 10_000_000,
+            minimum_order_notional_micros: 250_000,
+            maximum_order_notional_micros: 10_000_000,
+            maximum_user_position_micros: 10_000_000,
+            maximum_pending_bootstrap_notional_micros: 100_000_000,
+            tick_size_micros: 1_000,
+            oracle_feed_id: 245,
+            execution: MarketExecution::NativeClob,
+        },
+        800,
+    )
+    .unwrap();
+}
+
+#[test]
 fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
     let oracle = SigningKey::from_bytes(&[11u8; 32]);
     let alice = SigningKey::from_bytes(&[12u8; 32]);
