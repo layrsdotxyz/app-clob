@@ -820,6 +820,313 @@ fn native_clob_partial_fill_locks_remainder_and_cancel_releases_once() {
 }
 
 #[test]
+fn rolling_zen_markets_handle_many_small_multi_user_trades_cancellation_and_locked_withdrawal() {
+    let oracle = SigningKey::from_bytes(&[81u8; 32]);
+    let seller = SigningKey::from_bytes(&[82u8; 32]);
+    let buyer_one = SigningKey::from_bytes(&[83u8; 32]);
+    let buyer_two = SigningKey::from_bytes(&[84u8; 32]);
+    let journal_key = [85u8; 32];
+    let mut core = PrivateTradingCore::new_with_oracle(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([86u8; 48]),
+        oracle.verifying_key().to_bytes(),
+    )
+    .unwrap();
+    let markets = [
+        ("layrs:v3:ZEN:15m:3000", 3_000_i64),
+        ("layrs:v3:ZEN:15m:4000", 4_000_i64),
+    ];
+    for (index, (market_id, closes_at)) in markets.iter().enumerate() {
+        core.register_market(
+            format!("sys:market:stress:{index}"),
+            MarketConfig {
+                market_id: (*market_id).into(),
+                settlement_asset: "ZEN".into(),
+                settlement_decimals: 18,
+                public_settlement_chain: Some("horizen".into()),
+                opens_at_millis: 900,
+                closes_at_millis: *closes_at,
+                minimum_quantity_micros: 1,
+                maximum_quantity_micros: 10_000_000,
+                minimum_order_notional_micros: 1,
+                maximum_order_notional_micros: 10_000_000,
+                maximum_user_position_micros: 10_000_000,
+                maximum_pending_bootstrap_notional_micros: 100_000_000,
+                tick_size_micros: 1_000,
+                oracle_feed_id: 245,
+                execution: MarketExecution::NativeClob,
+            },
+            800,
+        )
+        .unwrap();
+    }
+
+    let users = [
+        (
+            "seller",
+            &seller,
+            [87u8; 32],
+            5_000_000_000_000_000_000_u128,
+        ),
+        (
+            "buyer-one",
+            &buyer_one,
+            [88u8; 32],
+            2_000_000_000_000_000_000_u128,
+        ),
+        (
+            "buyer-two",
+            &buyer_two,
+            [89u8; 32],
+            2_000_000_000_000_000_000_u128,
+        ),
+    ];
+    for (label, key, commitment, amount) in &users {
+        core.register_session(
+            format!("sys:session:stress:{label}"),
+            format!("session:stress:{label}"),
+            *commitment,
+            key.verifying_key().to_bytes(),
+            10_000,
+            850,
+        )
+        .unwrap();
+        core.apply_user_external_flow(
+            format!("sys:deposit:stress:{label}"),
+            *commitment,
+            "ZEN".into(),
+            AccountBucket::UserAvailable,
+            *amount,
+            ExternalFlowDirection::Inflow,
+            *commitment,
+            875,
+        )
+        .unwrap();
+    }
+
+    let mut buyer_one_sequence = 1_u64;
+    let mut buyer_two_sequence = 1_u64;
+    for (market_index, (market_id, _)) in markets.iter().enumerate() {
+        execute_signed(
+            &mut core,
+            &seller,
+            "session:stress:seller",
+            (market_index * 2 + 1) as u64,
+            &format!("cmd:stress:mint:{market_index}"),
+            UserCommandAction::CompleteSet {
+                market_id: (*market_id).into(),
+                quantity_micros: 1_000_000,
+                direction: CompleteSetDirection::Mint,
+            },
+            1_000 + market_index as i64 * 100,
+        );
+        execute_signed(
+            &mut core,
+            &seller,
+            "session:stress:seller",
+            (market_index * 2 + 2) as u64,
+            &format!("cmd:stress:sell:{market_index}"),
+            UserCommandAction::SubmitOrder {
+                order: BookOrder::new(
+                    "ignored",
+                    *market_id,
+                    Outcome::Up,
+                    OrderAction::Sell,
+                    500_000,
+                    200_000,
+                    TimeInForce::Gtc,
+                    None,
+                ),
+            },
+            1_025 + market_index as i64 * 100,
+        );
+
+        for trade_index in 0..20 {
+            let (buyer, session_id, sequence) = if trade_index % 2 == 0 {
+                let sequence = buyer_one_sequence;
+                buyer_one_sequence += 1;
+                (&buyer_one, "session:stress:buyer-one", sequence)
+            } else {
+                let sequence = buyer_two_sequence;
+                buyer_two_sequence += 1;
+                (&buyer_two, "session:stress:buyer-two", sequence)
+            };
+            let response = execute_signed_response(
+                &mut core,
+                buyer,
+                session_id,
+                sequence,
+                &format!("cmd:stress:buy:{market_index}:{trade_index}"),
+                UserCommandAction::SubmitOrder {
+                    order: BookOrder::new(
+                        "ignored",
+                        *market_id,
+                        Outcome::Up,
+                        OrderAction::Buy,
+                        500_000,
+                        10_000,
+                        TimeInForce::Fak,
+                        None,
+                    ),
+                },
+                1_200 + market_index as i64 * 300 + trade_index as i64,
+            );
+            match response.result {
+                CommandResult::Order { result } => {
+                    assert_eq!(result.fills.len(), 1);
+                    let accepted = result.accepted_order.unwrap();
+                    assert_eq!(accepted.status, OrderStatus::Filled);
+                    assert_eq!(accepted.remaining_micros, 0);
+                }
+                _ => panic!("expected small ZEN fill"),
+            }
+            assert_eq!(response.audit_fills.len(), 1);
+        }
+    }
+
+    let buyer_one_owner = derived_private_user(journal_key, [88u8; 32]);
+    let available_before_resting = core.balance(&AccountKey::new(
+        &buyer_one_owner,
+        AccountBucket::UserAvailable,
+        "ZEN",
+    ));
+    let resting = execute_signed_response(
+        &mut core,
+        &buyer_one,
+        "session:stress:buyer-one",
+        buyer_one_sequence,
+        "cmd:stress:resting",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                markets[1].0,
+                Outcome::Down,
+                OrderAction::Buy,
+                400_000,
+                100_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_900,
+    );
+    buyer_one_sequence += 1;
+    let resting_order_id = match resting.result {
+        CommandResult::Order { result } => result.accepted_order.unwrap().order_id,
+        _ => panic!("expected resting order"),
+    };
+
+    let locked_withdrawal = execute_signed_result(
+        &mut core,
+        &buyer_one,
+        "session:stress:buyer-one",
+        buyer_one_sequence,
+        "cmd:stress:locked-withdrawal",
+        UserCommandAction::RequestWithdrawal {
+            withdrawal_id: uuid::Uuid::from_u128(90),
+            chain: "horizen".into(),
+            asset: "ZEN".into(),
+            amount_atomic: available_before_resting,
+            destination: "0x1111111111111111111111111111111111111111".into(),
+        },
+        1_925,
+    );
+    buyer_one_sequence += 1;
+    assert_eq!(
+        locked_withdrawal.unwrap_err(),
+        CoreError::InsufficientBalance
+    );
+
+    execute_signed(
+        &mut core,
+        &buyer_one,
+        "session:stress:buyer-one",
+        buyer_one_sequence,
+        "cmd:stress:cancel-resting",
+        UserCommandAction::CancelOrder {
+            market_id: markets[1].0.into(),
+            order_id: resting_order_id,
+        },
+        1_950,
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &buyer_one_owner,
+            AccountBucket::UserAvailable,
+            "ZEN",
+        )),
+        available_before_resting
+    );
+
+    let boundary = |end: i64, price: i64, marker: u8| BoundaryEvidence {
+        window_start_micros: end * 1_000 - 5_000_000,
+        window_end_micros: end * 1_000,
+        median_price_e8: price,
+        sample_count: 25,
+        minimum_publisher_count: 3,
+        signed_payload_commitment: [marker; 32],
+    };
+    for (index, (market_id, closes_at)) in markets.iter().enumerate() {
+        let statement = ResolutionStatement {
+            market_id: (*market_id).into(),
+            oracle_feed_id: 245,
+            opening: boundary(900, 1_000_000_000, 100 + index as u8),
+            closing: boundary(
+                *closes_at,
+                if index == 0 {
+                    1_100_000_000
+                } else {
+                    900_000_000
+                },
+                102 + index as u8,
+            ),
+            issued_at_millis: closes_at + 100,
+        };
+        let signature = oracle
+            .sign(&resolution_signing_payload(&statement).unwrap())
+            .to_bytes()
+            .to_vec();
+        core.resolve_market(
+            format!("sys:resolve:stress:{index}"),
+            SignedResolution {
+                statement,
+                signature,
+            },
+            closes_at + 100,
+        )
+        .unwrap();
+    }
+
+    assert!(core.balance(&AccountKey::new("layrs", AccountBucket::FeeRevenue, "ZEN",)) > 0);
+    for owner in [
+        derived_private_user(journal_key, [87u8; 32]),
+        buyer_one_owner,
+        derived_private_user(journal_key, [89u8; 32]),
+    ] {
+        for market_id in markets.map(|market| market.0) {
+            assert_eq!(
+                core.balance(&AccountKey::position(
+                    &owner,
+                    format!("CLAIM:{market_id}:UP"),
+                    market_id,
+                    "UP",
+                )),
+                0
+            );
+            assert_eq!(
+                core.balance(&AccountKey::position(
+                    &owner,
+                    format!("CLAIM:{market_id}:DOWN"),
+                    market_id,
+                    "DOWN",
+                )),
+                0
+            );
+        }
+    }
+}
+
+#[test]
 fn resolution_cannot_double_credit_and_dust_fees_stay_conservative() {
     let oracle = SigningKey::from_bytes(&[71u8; 32]);
     let user = SigningKey::from_bytes(&[72u8; 32]);
