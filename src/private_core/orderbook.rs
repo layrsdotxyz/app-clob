@@ -143,6 +143,9 @@ pub struct PriceTimeBook {
 impl PriceTimeBook {
     pub fn submit(&mut self, mut incoming: BookOrder, now_millis: i64) -> CoreResult<MatchResult> {
         self.validate(&incoming, now_millis)?;
+        if self.orders.contains_key(&incoming.order_id) {
+            return Err(CoreError::InvalidOrder("duplicate order id".into()));
+        }
         if incoming.time_in_force == TimeInForce::Fok
             && self.executable_quantity(&incoming, now_millis) < incoming.quantity_micros
         {

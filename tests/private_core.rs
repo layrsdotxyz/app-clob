@@ -180,6 +180,54 @@ fn fok_rejects_without_mutating_resting_liquidity() {
 }
 
 #[test]
+fn duplicate_order_id_is_rejected_before_it_can_replace_resting_liquidity() {
+    let mut book = PriceTimeBook::default();
+    let now = 1_800_000_000_000;
+    let order_id = uuid::Uuid::new_v4();
+    let market_id = "layrs:v1:ZEN:15m:1800000000";
+
+    book.submit(
+        BookOrder::with_id(
+            order_id,
+            "usr_A",
+            market_id,
+            Outcome::Up,
+            OrderAction::Buy,
+            500_000,
+            1_000_000,
+            TimeInForce::Gtc,
+            None,
+        ),
+        now,
+    )
+    .unwrap();
+
+    let duplicate = book.submit(
+        BookOrder::with_id(
+            order_id,
+            "usr_A",
+            market_id,
+            Outcome::Up,
+            OrderAction::Buy,
+            600_000,
+            2_000_000,
+            TimeInForce::Gtc,
+            None,
+        ),
+        now,
+    );
+
+    assert!(matches!(
+        duplicate.unwrap_err(),
+        CoreError::InvalidOrder(message) if message == "duplicate order id"
+    ));
+
+    let (bids, asks) = book.aggregate_depth(market_id, Outcome::Up, now);
+    assert_eq!(bids, vec![(500_000, 1_000_000, 1)]);
+    assert!(asks.is_empty());
+}
+
+#[test]
 fn encrypted_journal_detects_ciphertext_and_chain_tampering() {
     let mut journal = EncryptedJournal::new(JournalKey::from_bytes([7u8; 32]));
     let record = journal
