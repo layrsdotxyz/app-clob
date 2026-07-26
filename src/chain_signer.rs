@@ -224,6 +224,21 @@ impl EnclaveChainSigner {
         })
     }
 
+    /// Returns only public EVM addresses. This allows deployment automation to
+    /// grant the enclave-held keys narrowly scoped roles without exporting key
+    /// material from the enclave.
+    pub fn bridge_approval_signers(&self) -> BTreeMap<String, String> {
+        self.domains
+            .iter()
+            .map(|(chain, domain)| {
+                (
+                    chain.clone(),
+                    format!("{:#x}", domain.ledger_wallet.address()),
+                )
+            })
+            .collect()
+    }
+
     pub fn sign_reward_claim(
         &self,
         intent: &crate::private_core::RewardClaimIntent,
@@ -658,6 +673,18 @@ mod tests {
             ],
         })
         .unwrap()
+    }
+
+    #[test]
+    fn exposes_only_public_bridge_approval_signer_addresses() {
+        let signers = test_signer().bridge_approval_signers();
+        assert_eq!(signers.len(), 2);
+        for chain in ["base", "horizen"] {
+            let address = signers.get(chain).expect("configured chain address");
+            assert!(address.starts_with("0x"));
+            assert_eq!(address.len(), 42);
+        }
+        assert_ne!(signers["base"], signers["horizen"]);
     }
 
     #[tokio::test]
