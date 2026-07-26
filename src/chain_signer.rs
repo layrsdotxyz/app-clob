@@ -436,7 +436,7 @@ fn valid_market_id(value: &str) -> bool {
 }
 
 fn parse_reward_claim_domains(
-    secrets: &mut Vec<RewardClaimDomainSecret>,
+    secrets: &mut [RewardClaimDomainSecret],
 ) -> Result<BTreeMap<String, RewardClaimDomain>, String> {
     let mut domains = BTreeMap::new();
     for index in 0..secrets.len() {
