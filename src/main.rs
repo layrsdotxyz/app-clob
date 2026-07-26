@@ -252,15 +252,13 @@ async fn async_main() -> Result<()> {
                 }
             }
         }
+    } else if allow_in_memory_only {
+        tracing::warn!("DATABASE_URL not set; ALLOW_IN_MEMORY_ONLY_CLOB=true so running without PostgreSQL persistence layer");
+        None
     } else {
-        if allow_in_memory_only {
-            tracing::warn!("DATABASE_URL not set; ALLOW_IN_MEMORY_ONLY_CLOB=true so running without PostgreSQL persistence layer");
-            None
-        } else {
-            return Err(anyhow::anyhow!(
-                "DATABASE_URL must be set for clob-service durability; set ALLOW_IN_MEMORY_ONLY_CLOB=true only for local/dev bypass"
-            ));
-        }
+        return Err(anyhow::anyhow!(
+            "DATABASE_URL must be set for clob-service durability; set ALLOW_IN_MEMORY_ONLY_CLOB=true only for local/dev bypass"
+        ));
     };
 
     // Initialize core components
