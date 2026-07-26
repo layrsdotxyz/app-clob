@@ -27,6 +27,7 @@ Thumbs.db
 
 # Build artifacts
 /build/
+deployment/releases/*.json
 *.so
 *.dylib
 *.dll
