@@ -84,6 +84,31 @@ pub struct MarketResolutionTransaction {
     pub raw_transaction_hex: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeApprovalRequest {
+    pub chain: String,
+    pub verifying_contract: String,
+    pub independent_approver: String,
+    pub tee_approver: String,
+    pub amount_atomic: String,
+    pub destination_eid: u32,
+    pub recipient: String,
+    pub minimum_destination_amount_atomic: String,
+    pub native_fee_wei: String,
+    pub nonce: String,
+    pub deadline_seconds: u64,
+    pub route_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeApprovalSignature {
+    pub chain: String,
+    pub chain_id: u64,
+    pub verifying_contract: String,
+    pub signer: String,
+    pub signature_hex: String,
+}
+
 pub struct EnclaveChainSigner {
     domains: BTreeMap<String, ChainSignerDomain>,
     reward_claim_domains: BTreeMap<String, RewardClaimDomain>,
@@ -259,6 +284,100 @@ impl EnclaveChainSigner {
             distributor: format!("{:#x}", domain.distributor),
             signer: format!("{:#x}", domain.wallet.address()),
             signature: signature.to_vec(),
+        })
+    }
+
+    pub fn sign_bridge_approval(
+        &self,
+        request: &BridgeApprovalRequest,
+        now_millis: i64,
+    ) -> Result<BridgeApprovalSignature, String> {
+        let domain = self
+            .domains
+            .get(&request.chain)
+            .ok_or_else(|| "CHAIN_SIGNER_DOMAIN_NOT_FOUND".to_string())?;
+        let expected_destination_eid = match request.chain.as_str() {
+            "base" => 30_399,
+            "horizen" => 30_184,
+            _ => return Err("INVALID_BRIDGE_APPROVAL_CHAIN".into()),
+        };
+        if request.destination_eid != expected_destination_eid
+            || now_millis < 0
+            || request.deadline_seconds <= (now_millis as u64 / 1_000)
+            || request.deadline_seconds > (now_millis as u64 / 1_000).saturating_add(86_400)
+        {
+            return Err("INVALID_BRIDGE_APPROVAL_WINDOW".into());
+        }
+
+        let verifying_contract = parse_nonzero_address(&request.verifying_contract)?;
+        let independent_approver = parse_nonzero_address(&request.independent_approver)?;
+        let tee_approver = parse_nonzero_address(&request.tee_approver)?;
+        let recipient = parse_nonzero_address(&request.recipient)?;
+        if independent_approver == tee_approver || tee_approver != domain.ledger_wallet.address() {
+            return Err("INVALID_BRIDGE_APPROVAL_SIGNER".into());
+        }
+
+        let amount = parse_positive_u256(&request.amount_atomic, "INVALID_BRIDGE_APPROVAL_AMOUNT")?;
+        let minimum_destination_amount = parse_positive_u256(
+            &request.minimum_destination_amount_atomic,
+            "INVALID_BRIDGE_APPROVAL_MINIMUM",
+        )?;
+        if minimum_destination_amount > amount {
+            return Err("INVALID_BRIDGE_APPROVAL_MINIMUM".into());
+        }
+        let native_fee = U256::from_dec_str(&request.native_fee_wei)
+            .map_err(|_| "INVALID_BRIDGE_APPROVAL_FEE".to_string())?;
+        let nonce = U256::from_dec_str(&request.nonce)
+            .map_err(|_| "INVALID_BRIDGE_APPROVAL_NONCE".to_string())?;
+        let route_hash = parse_nonzero_h256(&request.route_hash, "INVALID_BRIDGE_APPROVAL_ROUTE")?;
+
+        let domain_name = if request.chain == "base" {
+            b"LayrsBaseZenStrategyManager".as_slice()
+        } else {
+            b"LayrsHorizenZenStrategyReceiver".as_slice()
+        };
+        let domain_typehash = keccak256(
+            b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+        );
+        let approval_typehash = keccak256(
+            b"BridgeApproval(address independentApprover,address teeApprover,uint256 amount,uint32 destinationEid,address recipient,uint256 minAmountLD,uint256 nativeFee,uint256 nonce,uint256 deadline,bytes32 routeHash)",
+        );
+        let domain_separator = keccak256(encode(&[
+            Token::FixedBytes(domain_typehash.to_vec()),
+            Token::FixedBytes(keccak256(domain_name).to_vec()),
+            Token::FixedBytes(keccak256(b"1").to_vec()),
+            Token::Uint(domain.chain_id.into()),
+            Token::Address(verifying_contract),
+        ]));
+        let struct_hash = keccak256(encode(&[
+            Token::FixedBytes(approval_typehash.to_vec()),
+            Token::Address(independent_approver),
+            Token::Address(tee_approver),
+            Token::Uint(amount),
+            Token::Uint(request.destination_eid.into()),
+            Token::Address(recipient),
+            Token::Uint(minimum_destination_amount),
+            Token::Uint(native_fee),
+            Token::Uint(nonce),
+            Token::Uint(request.deadline_seconds.into()),
+            Token::FixedBytes(route_hash.as_bytes().to_vec()),
+        ]));
+        let mut encoded = Vec::with_capacity(66);
+        encoded.extend_from_slice(b"\x19\x01");
+        encoded.extend_from_slice(&domain_separator);
+        encoded.extend_from_slice(&struct_hash);
+        let digest = H256::from(keccak256(encoded));
+        let signature = domain
+            .ledger_wallet
+            .sign_hash(digest)
+            .map_err(|_| "BRIDGE_APPROVAL_SIGNING_FAILED".to_string())?;
+
+        Ok(BridgeApprovalSignature {
+            chain: request.chain.clone(),
+            chain_id: domain.chain_id,
+            verifying_contract: format!("{verifying_contract:#x}"),
+            signer: format!("{:#x}", domain.ledger_wallet.address()),
+            signature_hex: format!("0x{}", hex::encode(signature.to_vec())),
         })
     }
 
@@ -489,10 +608,57 @@ fn parse_nonzero_address(value: &str) -> Result<Address, String> {
         .ok_or_else(|| "INVALID_REWARD_CLAIM_ADDRESS".to_string())
 }
 
+fn parse_positive_u256(value: &str, error: &str) -> Result<U256, String> {
+    U256::from_dec_str(value)
+        .ok()
+        .filter(|amount| !amount.is_zero())
+        .ok_or_else(|| error.to_string())
+}
+
+fn parse_nonzero_h256(value: &str, error: &str) -> Result<H256, String> {
+    H256::from_str(value)
+        .ok()
+        .filter(|hash| *hash != H256::zero())
+        .ok_or_else(|| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ethers_core::utils::rlp::Rlp;
+
+    fn test_signer() -> EnclaveChainSigner {
+        EnclaveChainSigner::new(ChainSignerBundle {
+            resolution_private_key_hex:
+                "0x4f3edf983ac63ad7c7f9a2f8b7f3fb6d84ff79d59bf393ae7d4bc0f6f1a5c06d".into(),
+            reward_claim_domains: vec![],
+            domains: vec![
+                ChainSignerDomainSecret {
+                    chain: "base".into(),
+                    chain_id: 8453,
+                    asset: "USDC".into(),
+                    pool_address: "0x1111111111111111111111111111111111111111".into(),
+                    eoa_private_key_hex:
+                        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d".into(),
+                    admin_oracle_address: "0x4444444444444444444444444444444444444444".into(),
+                    oracle_private_key_hex:
+                        "0x0dbbe8e4e7a7e1bfa5fd84f122539111716f10a741f14e20511e097c620c4681".into(),
+                },
+                ChainSignerDomainSecret {
+                    chain: "horizen".into(),
+                    chain_id: 26514,
+                    asset: "ZEN".into(),
+                    pool_address: "0x2222222222222222222222222222222222222222".into(),
+                    eoa_private_key_hex:
+                        "0x8b3a350cf5c34c9194ca3a545d9c34e9e00f4d10b423f7594c35c3bb2d95b42f".into(),
+                    admin_oracle_address: "0x5555555555555555555555555555555555555555".into(),
+                    oracle_private_key_hex:
+                        "0x47e179ec197488593b187f80a00eb0da91f1b9d9e85bc7b52cda8535144f2381".into(),
+                },
+            ],
+        })
+        .unwrap()
+    }
 
     #[tokio::test]
     async fn signs_only_the_audited_pool_withdraw_selector() {
@@ -657,6 +823,103 @@ mod tests {
         assert_eq!(authorization.signer, format!("{expected:#x}"));
     }
 
+    #[test]
+    fn bridge_approval_signature_matches_contract_eip712_digest() {
+        let ledger_key = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+        let signer = EnclaveChainSigner::new(ChainSignerBundle {
+            resolution_private_key_hex:
+                "0x4f3edf983ac63ad7c7f9a2f8b7f3fb6d84ff79d59bf393ae7d4bc0f6f1a5c06d".into(),
+            reward_claim_domains: vec![],
+            domains: vec![
+                ChainSignerDomainSecret {
+                    chain: "base".into(),
+                    chain_id: 8453,
+                    asset: "USDC".into(),
+                    pool_address: "0x1111111111111111111111111111111111111111".into(),
+                    eoa_private_key_hex: ledger_key.into(),
+                    admin_oracle_address: "0x4444444444444444444444444444444444444444".into(),
+                    oracle_private_key_hex:
+                        "0x0dbbe8e4e7a7e1bfa5fd84f122539111716f10a741f14e20511e097c620c4681".into(),
+                },
+                ChainSignerDomainSecret {
+                    chain: "horizen".into(),
+                    chain_id: 26514,
+                    asset: "ZEN".into(),
+                    pool_address: "0x2222222222222222222222222222222222222222".into(),
+                    eoa_private_key_hex:
+                        "0x8b3a350cf5c34c9194ca3a545d9c34e9e00f4d10b423f7594c35c3bb2d95b42f".into(),
+                    admin_oracle_address: "0x5555555555555555555555555555555555555555".into(),
+                    oracle_private_key_hex:
+                        "0x47e179ec197488593b187f80a00eb0da91f1b9d9e85bc7b52cda8535144f2381".into(),
+                },
+            ],
+        })
+        .unwrap();
+        let tee_approver = format!(
+            "{:#x}",
+            ledger_key.parse::<LocalWallet>().unwrap().address()
+        );
+        let request = BridgeApprovalRequest {
+            chain: "base".into(),
+            verifying_contract: "0x7777777777777777777777777777777777777777".into(),
+            independent_approver: "0x8888888888888888888888888888888888888888".into(),
+            tee_approver: tee_approver.clone(),
+            amount_atomic: "1000000000000000000".into(),
+            destination_eid: 30399,
+            recipient: "0x9999999999999999999999999999999999999999".into(),
+            minimum_destination_amount_atomic: "999000000000000000".into(),
+            native_fee_wei: "12345".into(),
+            nonce: "42".into(),
+            deadline_seconds: 1_800_000_000,
+            route_hash: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        };
+        let signed = signer
+            .sign_bridge_approval(&request, 1_799_999_000_000)
+            .unwrap();
+        let signature = ethers_core::types::Signature::from_str(&signed.signature_hex).unwrap();
+        let digest = bridge_approval_digest(&request, signed.chain_id);
+        assert_eq!(
+            signature.recover(digest).unwrap(),
+            ledger_key.parse::<LocalWallet>().unwrap().address()
+        );
+        assert_eq!(signed.signer, tee_approver);
+    }
+
+    #[test]
+    fn bridge_approval_rejects_wrong_route_and_signer() {
+        let signer = test_signer();
+        let tee = signer.domains.get("base").unwrap().ledger_wallet.address();
+        let mut request = BridgeApprovalRequest {
+            chain: "base".into(),
+            verifying_contract: "0x7777777777777777777777777777777777777777".into(),
+            independent_approver: "0x8888888888888888888888888888888888888888".into(),
+            tee_approver: format!("{tee:#x}"),
+            amount_atomic: "1".into(),
+            destination_eid: 30399,
+            recipient: "0x9999999999999999999999999999999999999999".into(),
+            minimum_destination_amount_atomic: "1".into(),
+            native_fee_wei: "1".into(),
+            nonce: "1".into(),
+            deadline_seconds: 2_000,
+            route_hash: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        };
+        request.destination_eid = 30184;
+        assert_eq!(
+            signer
+                .sign_bridge_approval(&request, 1_000_000)
+                .unwrap_err(),
+            "INVALID_BRIDGE_APPROVAL_WINDOW"
+        );
+        request.destination_eid = 30399;
+        request.tee_approver = request.independent_approver.clone();
+        assert_eq!(
+            signer
+                .sign_bridge_approval(&request, 1_000_000)
+                .unwrap_err(),
+            "INVALID_BRIDGE_APPROVAL_SIGNER"
+        );
+    }
+
     fn reward_claim_digest(
         intent: &crate::private_core::RewardClaimIntent,
         chain_id: u64,
@@ -687,6 +950,55 @@ mod tests {
             Token::Uint(U256::from_dec_str(&intent.cumulative_amount_atomic).unwrap()),
             Token::Uint(intent.deadline_seconds.into()),
             Token::FixedBytes(intent.context_hash.to_vec()),
+        ]));
+        let mut encoded = b"\x19\x01".to_vec();
+        encoded.extend_from_slice(&domain_separator);
+        encoded.extend_from_slice(&struct_hash);
+        H256::from(keccak256(encoded))
+    }
+
+    fn bridge_approval_digest(request: &BridgeApprovalRequest, chain_id: u64) -> H256 {
+        let domain_name = if request.chain == "base" {
+            b"LayrsBaseZenStrategyManager".as_slice()
+        } else {
+            b"LayrsHorizenZenStrategyReceiver".as_slice()
+        };
+        let domain_separator = keccak256(encode(&[
+            Token::FixedBytes(
+                keccak256(
+                    b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+                )
+                .to_vec(),
+            ),
+            Token::FixedBytes(keccak256(domain_name).to_vec()),
+            Token::FixedBytes(keccak256(b"1").to_vec()),
+            Token::Uint(chain_id.into()),
+            Token::Address(Address::from_str(&request.verifying_contract).unwrap()),
+        ]));
+        let struct_hash = keccak256(encode(&[
+            Token::FixedBytes(
+                keccak256(
+                    b"BridgeApproval(address independentApprover,address teeApprover,uint256 amount,uint32 destinationEid,address recipient,uint256 minAmountLD,uint256 nativeFee,uint256 nonce,uint256 deadline,bytes32 routeHash)",
+                )
+                .to_vec(),
+            ),
+            Token::Address(Address::from_str(&request.independent_approver).unwrap()),
+            Token::Address(Address::from_str(&request.tee_approver).unwrap()),
+            Token::Uint(U256::from_dec_str(&request.amount_atomic).unwrap()),
+            Token::Uint(request.destination_eid.into()),
+            Token::Address(Address::from_str(&request.recipient).unwrap()),
+            Token::Uint(
+                U256::from_dec_str(&request.minimum_destination_amount_atomic).unwrap(),
+            ),
+            Token::Uint(U256::from_dec_str(&request.native_fee_wei).unwrap()),
+            Token::Uint(U256::from_dec_str(&request.nonce).unwrap()),
+            Token::Uint(request.deadline_seconds.into()),
+            Token::FixedBytes(
+                H256::from_str(&request.route_hash)
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec(),
+            ),
         ]));
         let mut encoded = b"\x19\x01".to_vec();
         encoded.extend_from_slice(&domain_separator);

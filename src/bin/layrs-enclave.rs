@@ -18,7 +18,8 @@ use clob_service::audit_signer::{
     AuditBatchRequest, AuditSignerBundle, EnclaveAuditSigner, SignedAuditSettlementTransaction,
 };
 use clob_service::chain_signer::{
-    ChainSignerBundle, EnclaveChainSigner, MarketResolutionTransaction, PoolWithdrawalTransaction,
+    BridgeApprovalRequest, BridgeApprovalSignature, ChainSignerBundle, EnclaveChainSigner,
+    MarketResolutionTransaction, PoolWithdrawalTransaction,
 };
 use clob_service::polymarket_enclave::{
     EnclavePolymarketClient, PolymarketSecretBundle, SignedVenueRedemptionTransaction,
@@ -155,6 +156,10 @@ enum OperatorCommand {
         gas_limit: u64,
         max_fee_per_gas_wei: String,
         max_priority_fee_per_gas_wei: String,
+        now_millis: i64,
+    },
+    SignBridgeApproval {
+        request: BridgeApprovalRequest,
         now_millis: i64,
     },
     SignMarketResolution {
@@ -369,6 +374,9 @@ enum PlainResponse {
     PoolWithdrawalSigned {
         transaction: PoolWithdrawalTransaction,
         response: Option<SystemResponse>,
+    },
+    BridgeApprovalSigned {
+        approval: BridgeApprovalSignature,
     },
     MarketResolutionSigned {
         transaction: MarketResolutionTransaction,
@@ -1168,6 +1176,17 @@ async fn dispatch_operator(
                 response: Some(response),
             })
         }
+        OperatorCommand::SignBridgeApproval {
+            request,
+            now_millis,
+        } => {
+            let approval = state
+                .chain_signer
+                .as_ref()
+                .ok_or_else(|| "CHAIN_SIGNER_NOT_PROVISIONED".to_string())?
+                .sign_bridge_approval(&request, now_millis)?;
+            Ok(PlainResponse::BridgeApprovalSigned { approval })
+        }
         OperatorCommand::SignResolutionEvidence {
             evidence,
             now_millis,
@@ -1740,6 +1759,7 @@ async fn dispatch_operator(
                 | OperatorCommand::BeginChainSignerProvision { .. }
                 | OperatorCommand::CompleteChainSignerProvision { .. }
                 | OperatorCommand::SignPoolWithdrawal { .. }
+                | OperatorCommand::SignBridgeApproval { .. }
                 | OperatorCommand::SignResolutionEvidence { .. }
                 | OperatorCommand::SignMarketResolution { .. }
                 | OperatorCommand::AuditSignerStatus
