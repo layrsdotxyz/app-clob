@@ -2211,7 +2211,7 @@ mod tests {
 
     #[test]
     fn relay_frame_limit_supports_checkpoint_restore_payloads() {
-        assert!(MAX_FRAME_BYTES >= 64 * 1024 * 1024);
+        const { assert!(MAX_FRAME_BYTES >= 64 * 1024 * 1024) };
     }
 
     #[test]
