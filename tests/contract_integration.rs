@@ -1,3 +1,5 @@
+#![allow(dead_code, clippy::empty_line_after_doc_comments)]
+
 /// EVM / Horizen integration tests for clob-service.
 ///
 /// These tests replace the old Starknet contract tests.  They are self-contained

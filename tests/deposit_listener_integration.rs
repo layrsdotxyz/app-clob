@@ -1,3 +1,5 @@
+#![allow(dead_code, clippy::empty_line_after_doc_comments)]
+
 /// EVM deposit listener integration tests.
 ///
 /// Verify deposit event parsing logic and optionally poll Horizen testnet

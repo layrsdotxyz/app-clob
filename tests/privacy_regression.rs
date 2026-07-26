@@ -1,3 +1,5 @@
+#![allow(dead_code, clippy::empty_line_after_doc_comments)]
+
 /// Privacy guarantee regression tests for the CLOB service.
 ///
 /// These tests lock in the set of privacy properties described in the 16-guarantee

@@ -1,3 +1,5 @@
+#![allow(dead_code, clippy::large_enum_variant)]
+
 use std::{
     collections::{HashSet, VecDeque},
     io,

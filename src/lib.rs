@@ -1,3 +1,13 @@
+#![allow(
+    dead_code,
+    clippy::enum_variant_names,
+    clippy::large_enum_variant,
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::wrong_self_convention
+)]
+
 pub mod audit_signer;
 /// clob-service library crate.
 ///
