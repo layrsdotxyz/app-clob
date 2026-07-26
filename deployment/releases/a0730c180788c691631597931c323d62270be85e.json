@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "validated-ready-for-activation",
+  "releaseId": "a0730c180788c691631597931c323d62270be85e",
+  "sourceCommit": "a0730c180788c691631597931c323d62270be85e",
+  "packerSourceCommit": "a0730c180788c691631597931c323d62270be85e",
+  "builtAt": "2026-07-26T05:32:34Z",
+  "region": "us-east-1",
+  "amiId": "ami-05e9a888fa2ba8f77",
+  "snapshotId": "snap-098c58626c65a3712",
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/a0730c180788c691631597931c323d62270be85e",
+  "artifacts": {
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/a0730c180788c691631597931c323d62270be85e/layrsv2-clob.eif",
+      "sizeBytes": 40797497,
+      "sha384": "bf64e4cdb14456e11716f6138fb753784cf53cf14a60f5c982bc95deea355898e064f09edaeab5f1139d619102ac2555"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/a0730c180788c691631597931c323d62270be85e/layrs-enclave-parent",
+      "sizeBytes": 1157856,
+      "sha384": "78a4495a7b17047a217c12f21f8b3c9dff6bc83033884cf0e0f1b8212912b44d4c59049394c4f4ad5d42ec431931e715"
+    },
+    "measurements": {
+      "path": "build/layrsv2-clob-measurements.json",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/a0730c180788c691631597931c323d62270be85e/layrsv2-clob-measurements.json",
+      "sizeBytes": 402,
+      "sha384": "85ca7f79e5b72391d70473129f5e53c75e38160cd1652177121cf95cb59f60117b9ab3d7f08558caa6634b908d8055f1"
+    },
+    "hostArtifactManifest": {
+      "path": "build/layrsv2-host-artifacts.sha384",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/a0730c180788c691631597931c323d62270be85e/layrsv2-host-artifacts.sha384",
+      "sizeBytes": 246,
+      "sha384": "5ec06e0d7033afc197673ae739a3f5cf3c0a95fb3bf589b159e159702ed973572e470501f7ff115171bf917bff390300"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "df0ab505e1c144ad0e7695719e73335658429858dcb9aee20a174b51633df63aa2f5dc45ab8089b84f04a51516bfe2e2",
+    "pcr1": "0343b056cd8485ca7890ddd833476d78460aed2aa161548e4e26bedf321726696257d623e8805f3f605946b3d8b0c6aa",
+    "pcr2": "706d86a60d04f8d600ee7c823bed1a83f35d3cbde77cd59944dd6dc57054841ae9b84551c47126b335d919ef03eeb260"
+  },
+  "verification": {
+    "cargoFmtCheck": "passed",
+    "privateCoreFocusedTests": "passed",
+    "enclaveRuntimeLockedTests": "passed",
+    "enclaveParentLockedTests": "passed",
+    "snapshotCompatibilityGate": "approved",
+    "cargoAudit": "passed-with-known-serde-cbor-maintenance-warning"
+  },
+  "signature": null,
+  "signatureNote": "EIF identity is enforced through pinned PCR0 and KMS attestation policy. This release extends private-core market validation to accept the layrs:v3 rolling namespace so corrected 0.25 ZEN alpha market limits can be emitted without mutating already registered v2 markets. It does not change custody, ledger schema, orderbook matching, settlement, resolution, withdrawal, audit-signing, fee math, or journal semantics."
+}
