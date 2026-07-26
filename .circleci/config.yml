@@ -1,7 +1,59 @@
 version: 2.1
 
+parameters:
+  ci-profile:
+    type: string
+    default: "fast"
+
 jobs:
-  clob-ci:
+  clob-fast-ci:
+    docker:
+      - image: cimg/rust:1.92.0
+    resource_class: large
+    working_directory: ~/project
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - cargo-v1-{{ checksum "Cargo.lock" }}
+            - cargo-v1-
+      - run:
+          name: Install rustfmt and clippy
+          command: rustup component add rustfmt clippy
+      - run:
+          name: Enclave snapshot compatibility guard
+          command: |
+            git fetch --no-tags origin main:refs/remotes/origin/main || true
+            base="$(git merge-base origin/main HEAD 2>/dev/null || git rev-parse HEAD^)"
+            scripts/check-enclave-snapshot-compatibility.sh --base "$base" --mode ci
+      - run:
+          name: Format check
+          command: cargo fmt --check
+      - run:
+          name: Cargo check
+          command: cargo check --all-targets --locked
+      - run:
+          name: Fast library tests
+          command: cargo test --locked --lib
+      - run:
+          name: Strict clippy
+          command: >-
+            cargo clippy --all-targets --locked -- -D warnings
+            -A dead-code
+            -A clippy::too-many-arguments
+            -A clippy::type-complexity
+            -A clippy::large-enum-variant
+            -A clippy::needless-range-loop
+            -A clippy::empty-line-after-doc-comments
+            -A clippy::wrong-self-convention
+            -A clippy::enum-variant-names
+      - save_cache:
+          key: cargo-v1-{{ checksum "Cargo.lock" }}
+          paths:
+            - ~/.cargo
+            - target
+
+  clob-full-ci:
     docker:
       - image: cimg/rust:1.92.0
     resource_class: large
@@ -64,6 +116,14 @@ jobs:
             - target
 
 workflows:
-  clob:
+  clob-fast:
+    when:
+      not:
+        equal: ["full", << pipeline.parameters.ci-profile >>]
     jobs:
-      - clob-ci
+      - clob-fast-ci
+  clob-full:
+    when:
+      equal: ["full", << pipeline.parameters.ci-profile >>]
+    jobs:
+      - clob-full-ci
