@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "validated-ready-for-activation",
+  "releaseId": "090f8fc22238bcdfe20a0b8b0c3b8c14c9e4c8be",
+  "sourceCommit": "090f8fc22238bcdfe20a0b8b0c3b8c14c9e4c8be",
+  "packerSourceCommit": "090f8fc22238bcdfe20a0b8b0c3b8c14c9e4c8be",
+  "snapshotCompatibilityBase": "1901e5eb6f6b67d1a01c5b4a26cc7fd627849ad5",
+  "snapshotApproval": "enclave/snapshot-migrations/2026-07-27-base-zen-bridgeback-withdrawal.md",
+  "region": "us-east-1",
+  "amiId": "ami-0d1d80cb96a352f57",
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/090f8fc22238bcdfe20a0b8b0c3b8c14c9e4c8be",
+  "artifacts": {
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/090f8fc22238bcdfe20a0b8b0c3b8c14c9e4c8be/layrsv2-clob.eif",
+      "sizeBytes": 40845625,
+      "sha384": "86121c284cb3f8974325df0096389155f6dc79ab3a269e01a33dc80444478614f0d92dbc782f80aa5b6a2432c166f5fd"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/090f8fc22238bcdfe20a0b8b0c3b8c14c9e4c8be/layrs-enclave-parent",
+      "sizeBytes": 1157856,
+      "sha384": "78a4495a7b17047a217c12f21f8b3c9dff6bc83033884cf0e0f1b8212912b44d4c59049394c4f4ad5d42ec431931e715"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "dc7ea972c20d9440aeac889d9dc02cadf5ec776c2bcb0138947e550caa0b958ed8827b4c4d48ba916ae7df04db3a0bb3",
+    "pcr1": "0343b056cd8485ca7890ddd833476d78460aed2aa161548e4e26bedf321726696257d623e8805f3f605946b3d8b0c6aa",
+    "pcr2": "2186ca1482ffbf77afb4cb19c6cf1f6a03cf580c9723f886d82c7e5e8877576d6a8daf2d73e7edd15b32e7bd31c074fe"
+  },
+  "objectLock": {
+    "mode": "COMPLIANCE",
+    "retainUntil": "2026-08-26T03:16:23Z"
+  },
+  "signature": null,
+  "signatureNote": "EIF identity is enforced through pinned PCR0 and KMS attestation policy; release authorization is separately signed by the compiled operator key."
+}
