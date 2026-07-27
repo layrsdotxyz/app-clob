@@ -970,6 +970,33 @@ impl PrivateTradingCore {
         ))
     }
 
+    pub fn correct_released_confirmed_withdrawal(
+        &mut self,
+        idempotency_key: String,
+        prior_release_idempotency_key: String,
+        identity_commitment: [u8; 32],
+        asset: String,
+        amount_atomic: u128,
+        evidence_hash: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        if !self.system_keys.contains(&prior_release_idempotency_key) {
+            return Err(CoreError::InvalidOrder(
+                "withdrawal correction requires the prior release".into(),
+            ));
+        }
+        self.apply_user_external_flow(
+            idempotency_key,
+            identity_commitment,
+            asset,
+            AccountBucket::UserAvailable,
+            amount_atomic,
+            ExternalFlowDirection::Outflow,
+            evidence_hash,
+            now_millis,
+        )
+    }
+
     pub fn validate_withdrawal_intent(&self, intent: &WithdrawalIntent) -> CoreResult<()> {
         if intent.protocol_version != "layrs.withdrawal.v1" {
             return Err(CoreError::InvalidOrder(

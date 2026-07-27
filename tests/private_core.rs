@@ -708,7 +708,6 @@ fn polymarket_bootstrap_never_credits_an_unconfirmed_fill() {
         )),
         0
     );
-
     core.mark_bootstrap_submitted(
         "sys:venue-submitted:47".into(),
         execution_id,
@@ -977,6 +976,65 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
             "USDC"
         )),
         0
+    );
+    core.correct_released_confirmed_withdrawal(
+        "sys:withdrawal-correction:35".into(),
+        "sys:withdrawal-release:35".into(),
+        identity_commitment,
+        "USDC".into(),
+        10_000_000,
+        [38u8; 32],
+        1_450,
+    )
+    .unwrap();
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &private_user,
+            AccountBucket::UserAvailable,
+            "USDC"
+        )),
+        40_000_000
+    );
+    assert!(core
+        .correct_released_confirmed_withdrawal(
+            "sys:withdrawal-correction:missing".into(),
+            "sys:withdrawal-release:missing".into(),
+            identity_commitment,
+            "USDC".into(),
+            1,
+            [39u8; 32],
+            1_500,
+        )
+        .is_err());
+    assert!(core
+        .correct_released_confirmed_withdrawal(
+            "sys:withdrawal-correction:35".into(),
+            "sys:withdrawal-release:35".into(),
+            identity_commitment,
+            "USDC".into(),
+            1,
+            [40u8; 32],
+            1_550,
+        )
+        .is_err());
+    assert!(core
+        .correct_released_confirmed_withdrawal(
+            "sys:withdrawal-correction:overdraw".into(),
+            "sys:withdrawal-release:35".into(),
+            identity_commitment,
+            "USDC".into(),
+            40_000_001,
+            [41u8; 32],
+            1_600,
+        )
+        .is_err());
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &private_user,
+            AccountBucket::UserAvailable,
+            "USDC"
+        )),
+        40_000_000
     );
 }
 

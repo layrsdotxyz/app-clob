@@ -270,6 +270,16 @@ enum OperatorCommand {
         evidence_hash: [u8; 32],
         now_millis: i64,
     },
+    CorrectReleasedConfirmedWithdrawal {
+        idempotency_key: String,
+        prior_release_idempotency_key: String,
+        identity_commitment: [u8; 32],
+        asset: String,
+        #[serde(with = "clob_service::private_core::decimal_u128")]
+        amount_atomic: u128,
+        evidence_hash: [u8; 32],
+        now_millis: i64,
+    },
     ResolveMarket {
         idempotency_key: String,
         signed: SignedResolution,
@@ -1660,6 +1670,23 @@ async fn dispatch_operator(
                     now_millis,
                 } => core.release_user_withdrawal(
                     idempotency_key,
+                    identity_commitment,
+                    asset,
+                    amount_atomic,
+                    evidence_hash,
+                    now_millis,
+                ),
+                OperatorCommand::CorrectReleasedConfirmedWithdrawal {
+                    idempotency_key,
+                    prior_release_idempotency_key,
+                    identity_commitment,
+                    asset,
+                    amount_atomic,
+                    evidence_hash,
+                    now_millis,
+                } => core.correct_released_confirmed_withdrawal(
+                    idempotency_key,
+                    prior_release_idempotency_key,
                     identity_commitment,
                     asset,
                     amount_atomic,
