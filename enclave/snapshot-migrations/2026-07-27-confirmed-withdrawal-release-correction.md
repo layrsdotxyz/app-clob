@@ -1,5 +1,10 @@
 # Confirmed withdrawal release correction
 
+SNAPSHOT_SCHEMA_CHANGE_APPROVED: true
+BASE_RELEASE_COMMIT: 090f8fc22238bcdfe20a0b8b0c3b8c14c9e4c8be
+PRODUCTION_REPLAY_PLAN: true
+ROLLBACK_PLAN: true
+
 ## Scope
 
 This release adds an evidence-bound operator command that reverses only an
