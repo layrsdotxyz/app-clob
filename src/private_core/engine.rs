@@ -3380,7 +3380,10 @@ fn validate_withdrawal(
     destination: &str,
 ) -> CoreResult<()> {
     if amount == 0
-        || !matches!((chain, asset), ("base", "USDC") | ("horizen", "ZEN"))
+        || !matches!(
+            (chain, asset),
+            ("base", "USDC") | ("base", "ZEN") | ("horizen", "ZEN")
+        )
         || !destination.starts_with("0x")
         || destination.len() != 42
         || !destination[2..]
@@ -3509,7 +3512,10 @@ fn withdrawal_reservation_marker(
 ) -> CoreResult<String> {
     if session_id.is_empty()
         || session_id.len() > 128
-        || !matches!((chain, asset), ("base", "USDC") | ("horizen", "ZEN"))
+        || !matches!(
+            (chain, asset),
+            ("base", "USDC") | ("base", "ZEN") | ("horizen", "ZEN")
+        )
         || !amount_atomic.bytes().all(|byte| byte.is_ascii_digit())
     {
         return Err(CoreError::InvalidOrder(
