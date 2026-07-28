@@ -4,6 +4,7 @@ ARG LAYRS_OPERATOR_PUBLIC_KEY_HEX
 ENV LAYRS_OPERATOR_PUBLIC_KEY_HEX=${LAYRS_OPERATOR_PUBLIC_KEY_HEX}
 COPY enclave/runtime/Cargo.toml enclave/runtime/Cargo.lock ./enclave/runtime/
 COPY enclave/runtime/src ./enclave/runtime/src
+COPY proofs/settlement/core ./proofs/settlement/core
 COPY src ./src
 RUN test "${#LAYRS_OPERATOR_PUBLIC_KEY_HEX}" -eq 64 \
     && cargo build --locked --release --manifest-path enclave/runtime/Cargo.toml --bin layrs-enclave

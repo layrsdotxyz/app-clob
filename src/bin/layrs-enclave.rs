@@ -1,5 +1,3 @@
-#![allow(dead_code, clippy::large_enum_variant)]
-
 use std::{
     collections::{HashSet, VecDeque},
     io,
@@ -511,7 +509,7 @@ impl Drop for EnclaveState {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let operator_public_key = compile_time_operator_key()?;
     let nsm_fd = nsm_init();
     if nsm_fd < 0 {

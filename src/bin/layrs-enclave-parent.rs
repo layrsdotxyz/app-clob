@@ -1,5 +1,3 @@
-#![allow(dead_code, clippy::large_enum_variant)]
-
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
@@ -115,7 +113,7 @@ struct PrivateResponseEnvelope {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cid = required_u32("LAYRS_ENCLAVE_CID")?;
     if cid < 4 {
         return Err("LAYRS_ENCLAVE_CID must be a non-reserved CID".into());

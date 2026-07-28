@@ -2,6 +2,7 @@ FROM rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba
 WORKDIR /build
 COPY enclave/parent-runtime/Cargo.toml enclave/parent-runtime/Cargo.lock ./enclave/parent-runtime/
 COPY enclave/parent-runtime/src ./enclave/parent-runtime/src
+COPY proofs/settlement/core ./proofs/settlement/core
 COPY src ./src
 RUN cargo build --locked --release --manifest-path enclave/parent-runtime/Cargo.toml --bin layrs-enclave-parent
 
