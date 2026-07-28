@@ -1,7 +1,7 @@
 # 2026-07-29 — complete-set CLOB matching
 
 SNAPSHOT_SCHEMA_CHANGE_APPROVED: true
-BASE_RELEASE_COMMIT: 2b85c2aaa6143395e69c5deea2f7423356a15cd0
+BASE_RELEASE_COMMIT: df3c45d582a2d3cabdaf64353fab6a6476213af1
 PRODUCTION_REPLAY_PLAN: true
 ROLLBACK_PLAN: true
 
@@ -50,7 +50,7 @@ identical replayed state-root checks.
 ## Rollback plan
 
 Before the first accepted complementary fill, rollback may restore the immutable
-pre-cutover snapshot and the `2b85c2aaa6143395e69c5deea2f7423356a15cd0`
+pre-cutover snapshot and the `df3c45d582a2d3cabdaf64353fab6a6476213af1`
 release/PCR allowlist.
 
 After a complementary fill is committed, do not replay that command with the
