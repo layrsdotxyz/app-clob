@@ -60,7 +60,7 @@ jobs:
           command: cargo test --locked --manifest-path proofs/settlement/core/Cargo.toml
       - run:
           name: Settlement proof host input-policy tests
-          command: cargo test --locked --manifest-path proofs/settlement/host/Cargo.toml
+          command: RISC0_SKIP_BUILD=1 cargo test --locked --manifest-path proofs/settlement/host/Cargo.toml
       - run:
           name: Enclave settlement equivalence
           command: cargo test --locked --test settlement_equivalence
@@ -125,7 +125,7 @@ jobs:
           command: cargo test --locked --manifest-path proofs/settlement/core/Cargo.toml
       - run:
           name: Settlement proof host input-policy tests
-          command: cargo test --locked --manifest-path proofs/settlement/host/Cargo.toml
+          command: RISC0_SKIP_BUILD=1 cargo test --locked --manifest-path proofs/settlement/host/Cargo.toml
       - run:
           name: Enclave settlement equivalence
           command: cargo test --locked --test settlement_equivalence
