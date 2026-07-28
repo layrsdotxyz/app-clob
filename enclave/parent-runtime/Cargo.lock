@@ -569,6 +569,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "layrs-settlement-proof-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sha2",
+]
+
+[[package]]
 name = "layrsv2-enclave-parent-runtime"
 version = "0.1.0"
 dependencies = [
@@ -578,6 +586,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hmac",
+ "layrs-settlement-proof-core",
  "rand",
  "serde",
  "serde_json",

@@ -19,6 +19,7 @@ base64 = "0.22"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 hmac = "0.12"
 hex = "0.4"
+layrs-settlement-proof-core = { path = "../../proofs/settlement/core" }
 rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
