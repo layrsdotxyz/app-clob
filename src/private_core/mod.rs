@@ -57,7 +57,8 @@ pub use ledger::{
 };
 #[allow(unused_imports)]
 pub use orderbook::{
-    BookOrder, Fill, MatchResult, OrderAction, OrderStatus, Outcome, PriceTimeBook, TimeInForce,
+    BookOrder, Fill, MatchResult, MatchType, OrderAction, OrderStatus, Outcome, PriceTimeBook,
+    TimeInForce,
 };
 #[allow(unused_imports)]
 pub use rewards::{PrivateRewardEntitlement, RewardClaimAuthorization, RewardClaimIntent};

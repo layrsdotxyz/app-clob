@@ -38,6 +38,21 @@ pub enum OrderStatus {
     Rejected,
 }
 
+/// The collateral operation represented by a fill.
+///
+/// NORMAL transfers one existing outcome claim between users. MINT combines
+/// opposite-outcome BUY orders into one newly collateralized complete set.
+/// MERGE combines opposite-outcome SELL orders and burns one complete set back
+/// into settlement collateral.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MatchType {
+    #[default]
+    Normal,
+    Mint,
+    Merge,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BookOrder {
     pub order_id: Uuid,
@@ -114,7 +129,12 @@ impl BookOrder {
 pub struct Fill {
     pub fill_id: Uuid,
     pub market_id: String,
+    /// The incoming/taker outcome. For NORMAL the maker outcome is identical;
+    /// for MINT/MERGE it is the opposite outcome.
     pub outcome: Outcome,
+    /// Defaults to NORMAL so pre-complete-set journal records remain readable.
+    #[serde(default)]
+    pub match_type: MatchType,
     pub maker_order_id: Uuid,
     pub taker_order_id: Uuid,
     pub maker_private_user_id: String,
@@ -123,6 +143,32 @@ pub struct Fill {
     #[serde(with = "super::decimal_u128")]
     pub quantity_micros: u128,
     pub sequence: u64,
+}
+
+impl Fill {
+    pub fn maker_outcome(&self) -> Outcome {
+        match self.match_type {
+            MatchType::Normal => self.outcome,
+            MatchType::Mint | MatchType::Merge => opposite_outcome(self.outcome),
+        }
+    }
+
+    /// Price paid/received by the incoming taker. NORMAL executes at the
+    /// resting maker price. Complete-set matches execute the taker at the exact
+    /// complement, so both legs always sum to PRICE_SCALE.
+    pub fn taker_price_micros(&self) -> u64 {
+        match self.match_type {
+            MatchType::Normal => self.price_micros,
+            MatchType::Mint | MatchType::Merge => PRICE_SCALE as u64 - self.price_micros,
+        }
+    }
+}
+
+fn opposite_outcome(outcome: Outcome) -> Outcome {
+    match outcome {
+        Outcome::Up => Outcome::Down,
+        Outcome::Down => Outcome::Up,
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,13 +208,13 @@ impl PriceTimeBook {
         let candidate_ids = self.matching_candidates(&incoming, now_millis);
         let mut fills = Vec::new();
 
-        for candidate_id in candidate_ids {
+        for candidate in candidate_ids {
             if incoming.remaining_micros == 0 {
                 break;
             }
             let maker = self
                 .orders
-                .get_mut(&candidate_id)
+                .get_mut(&candidate.order_id)
                 .expect("active candidate must exist");
             let quantity = incoming.remaining_micros.min(maker.remaining_micros);
             incoming.remaining_micros -= quantity;
@@ -190,6 +236,7 @@ impl PriceTimeBook {
                 fill_id,
                 market_id: incoming.market_id.clone(),
                 outcome: incoming.outcome,
+                match_type: candidate.match_type,
                 maker_order_id: maker.order_id,
                 taker_order_id: incoming.order_id,
                 maker_private_user_id: maker.private_user_id.clone(),
@@ -199,7 +246,7 @@ impl PriceTimeBook {
                 sequence: fill_sequence,
             });
             if maker.remaining_micros == 0 {
-                self.active.remove(&candidate_id);
+                self.active.remove(&candidate.order_id);
             }
         }
 
@@ -345,32 +392,90 @@ impl PriceTimeBook {
     fn executable_quantity(&self, incoming: &BookOrder, now_millis: i64) -> u128 {
         self.matching_candidates(incoming, now_millis)
             .iter()
-            .map(|id| self.orders[id].remaining_micros)
+            .map(|candidate| self.orders[&candidate.order_id].remaining_micros)
             .sum()
     }
 
-    fn matching_candidates(&self, incoming: &BookOrder, now_millis: i64) -> Vec<Uuid> {
-        let mut candidates: Vec<&BookOrder> = self
+    /// Returns one deterministic queue spanning direct and complete-set
+    /// liquidity. The taker receives the best effective price first. An exact
+    /// effective-price tie prefers NORMAL to avoid an unnecessary mint/burn,
+    /// then preserves resting time priority and finally UUID order.
+    fn matching_candidates(&self, incoming: &BookOrder, now_millis: i64) -> Vec<MatchCandidate> {
+        let mut candidates: Vec<MatchCandidate> = self
             .active
             .iter()
             .filter_map(|id| self.orders.get(id))
-            .filter(|resting| {
-                resting.market_id == incoming.market_id
-                    && resting.outcome == incoming.outcome
-                    && resting.action != incoming.action
-                    && resting.private_user_id != incoming.private_user_id
-                    && !is_expired(resting, now_millis)
-                    && crosses(incoming, resting)
+            .filter_map(|resting| {
+                if resting.market_id != incoming.market_id
+                    || resting.private_user_id == incoming.private_user_id
+                    || is_expired(resting, now_millis)
+                {
+                    return None;
+                }
+                let match_type = classify_match(incoming, resting)?;
+                Some(MatchCandidate {
+                    order_id: resting.order_id,
+                    match_type,
+                    effective_taker_price_micros: effective_taker_price(resting, match_type),
+                    maker_sequence: resting.sequence,
+                })
             })
             .collect();
         candidates.sort_by(|left, right| {
             let price_order = match incoming.action {
-                OrderAction::Buy => left.price_micros.cmp(&right.price_micros),
-                OrderAction::Sell => right.price_micros.cmp(&left.price_micros),
+                OrderAction::Buy => left
+                    .effective_taker_price_micros
+                    .cmp(&right.effective_taker_price_micros),
+                OrderAction::Sell => right
+                    .effective_taker_price_micros
+                    .cmp(&left.effective_taker_price_micros),
             };
-            price_order.then_with(|| left.sequence.cmp(&right.sequence))
+            price_order
+                .then_with(|| {
+                    match_type_priority(left.match_type).cmp(&match_type_priority(right.match_type))
+                })
+                .then_with(|| left.maker_sequence.cmp(&right.maker_sequence))
+                .then_with(|| left.order_id.cmp(&right.order_id))
         });
-        candidates.into_iter().map(|order| order.order_id).collect()
+        candidates
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MatchCandidate {
+    order_id: Uuid,
+    match_type: MatchType,
+    effective_taker_price_micros: u64,
+    maker_sequence: u64,
+}
+
+fn classify_match(incoming: &BookOrder, resting: &BookOrder) -> Option<MatchType> {
+    if resting.outcome == incoming.outcome && resting.action != incoming.action {
+        return crosses(incoming, resting).then_some(MatchType::Normal);
+    }
+    if resting.outcome == incoming.outcome || resting.action != incoming.action {
+        return None;
+    }
+    let price_sum = incoming.price_micros.checked_add(resting.price_micros)?;
+    match incoming.action {
+        OrderAction::Buy if price_sum >= PRICE_SCALE as u64 => Some(MatchType::Mint),
+        OrderAction::Sell if price_sum <= PRICE_SCALE as u64 => Some(MatchType::Merge),
+        _ => None,
+    }
+}
+
+fn effective_taker_price(resting: &BookOrder, match_type: MatchType) -> u64 {
+    match match_type {
+        MatchType::Normal => resting.price_micros,
+        MatchType::Mint | MatchType::Merge => PRICE_SCALE as u64 - resting.price_micros,
+    }
+}
+
+fn match_type_priority(match_type: MatchType) -> u8 {
+    match match_type {
+        MatchType::Normal => 0,
+        MatchType::Mint => 1,
+        MatchType::Merge => 2,
     }
 }
 
