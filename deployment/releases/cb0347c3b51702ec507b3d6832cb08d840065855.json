@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "measured-staged-awaiting-activation",
+  "releaseId": "cb0347c3b51702ec507b3d6832cb08d840065855",
+  "sourceCommit": "cb0347c3b51702ec507b3d6832cb08d840065855",
+  "snapshotCompatibilityBase": "df3c45d582a2d3cabdaf64353fab6a6476213af1",
+  "snapshotApproval": "enclave/snapshot-migrations/2026-07-29-complete-set-matching.md",
+  "region": "us-east-1",
+  "amiId": null,
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/cb0347c3b51702ec507b3d6832cb08d840065855",
+  "artifacts": {
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/cb0347c3b51702ec507b3d6832cb08d840065855/layrsv2-clob.eif",
+      "versionId": "NSbgjwvErlSc2hXqBZT1ShWgcohPxKV5",
+      "sizeBytes": 40963443,
+      "sha384": "092c1d10b093a4673d29af00009e0986639e0c80cdc788d3132ab22146a52e58a20b81535aa7382d5a4e410cd173e90b"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/cb0347c3b51702ec507b3d6832cb08d840065855/layrs-enclave-parent",
+      "versionId": "b3cPrtxt3wJJ46choUzv0Jtc9z43erCx",
+      "sizeBytes": 1157744,
+      "sha384": "e58c235bb2b4570be8ed19b5fb3986f8d1423233fbb7660dc75f8f7f7c43915fee70f09f944b70bfdaa32993fa5765d6"
+    },
+    "measurements": {
+      "path": "build/layrsv2-clob-measurements.json",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/cb0347c3b51702ec507b3d6832cb08d840065855/layrsv2-clob-measurements.json",
+      "versionId": "cM0SMkEwj4o1lrWgQUo2uz9Z0hzxrdqh",
+      "sizeBytes": 402,
+      "sha384": "3b9045525f4f03f1c72af0b00da5507b7887f92acee59f98a4db28d392c2a68c850f304932ff29568aed2f660044fe5a"
+    },
+    "checksums": {
+      "path": "build/layrsv2-host-artifacts.sha384",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/cb0347c3b51702ec507b3d6832cb08d840065855/layrsv2-host-artifacts.sha384",
+      "versionId": "xAGqPl97bHU5kv92LfLRisZW4cNpg8rZ",
+      "sizeBytes": 246,
+      "sha384": "b15ed50b2c7b650429a6d33c22eed6003a3d52e66a8140b75c604ad3e6ef0a6754cf4775f39ca24f9d8d8c0493513287"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "bf55885e104b1fd525bc4ecce634f4fc30d2e8477f6dceb0200f04e52f789a15d91f6500e4164296ba962ec74dcbde93",
+    "pcr1": "0343b056cd8485ca7890ddd833476d78460aed2aa161548e4e26bedf321726696257d623e8805f3f605946b3d8b0c6aa",
+    "pcr2": "32cf203f76e4de64d4fe080749f63eb2b2b1dcad7f15da12c21e00568fcf80aa97ca9cb283e3a43a3130dc0506ba936d"
+  },
+  "objectLock": {
+    "mode": "COMPLIANCE",
+    "retainUntilAtLeast": "2026-08-27T19:32:07.432000+00:00"
+  },
+  "signature": null,
+  "signatureNote": "Staged measured artifact only. Production activation still requires AMI bake, signed release manifest, PCR/KMS rotation, passive replay, canaries and owner approval."
+}
