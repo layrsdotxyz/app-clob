@@ -69,7 +69,7 @@ for _ in $(seq 1 120); do
     --repository-name "$repository_name" \
     --image-id "imageDigest=$image_digest" \
     --output json 2>/dev/null || true)
-  scan_status=$(node -e "const x=JSON.parse(require('fs').readFileSync(0) || '{}'); console.log(x.imageScanStatus?.status ?? '')" <<<"$scan_json")
+  scan_status=$(node -e "const raw=require('fs').readFileSync(0,'utf8').trim(); const x=raw ? JSON.parse(raw) : {}; console.log(x.imageScanStatus?.status ?? '')" <<<"$scan_json")
   [[ "$scan_status" == COMPLETE ]] && break
   if [[ "$scan_status" =~ ^(FAILED|UNSUPPORTED_IMAGE|SCAN_ELIGIBILITY_EXPIRED|FINDINGS_UNAVAILABLE)$ ]]; then
     echo "ECR_SCAN_FAILED status=$scan_status" >&2
@@ -81,8 +81,8 @@ done
   echo "ECR_SCAN_INCOMPLETE status=${scan_status:-unknown}" >&2
   exit 78
 }
-critical=$(node -e "const x=JSON.parse(require('fs').readFileSync(0)); console.log(x.imageScanFindings?.findingSeverityCounts?.CRITICAL ?? 0)" <<<"$scan_json")
-high=$(node -e "const x=JSON.parse(require('fs').readFileSync(0)); console.log(x.imageScanFindings?.findingSeverityCounts?.HIGH ?? 0)" <<<"$scan_json")
+critical=$(node -e "const raw=require('fs').readFileSync(0,'utf8').trim(); const x=raw ? JSON.parse(raw) : {}; console.log(x.imageScanFindings?.findingSeverityCounts?.CRITICAL ?? 0)" <<<"$scan_json")
+high=$(node -e "const raw=require('fs').readFileSync(0,'utf8').trim(); const x=raw ? JSON.parse(raw) : {}; console.log(x.imageScanFindings?.findingSeverityCounts?.HIGH ?? 0)" <<<"$scan_json")
 [[ "$critical" == 0 && "$high" == 0 ]] || {
   echo "ECR_SCAN_REJECTED critical=$critical high=$high" >&2
   exit 78
