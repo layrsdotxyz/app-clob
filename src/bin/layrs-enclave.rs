@@ -1206,16 +1206,10 @@ async fn dispatch_operator(
                 .ok_or_else(|| "CHAIN_SIGNER_NOT_PROVISIONED".to_string())?;
             let (market_id, outcome, signed) = match evidence {
                 UnsignedResolutionEvidence::Pyth(statement) => {
-                    let outcome = if statement.closing.median_price_e8
-                        > statement.opening.median_price_e8
-                    {
-                        clob_service::private_core::ResolutionOutcome::Up
-                    } else if statement.closing.median_price_e8 < statement.opening.median_price_e8
-                    {
-                        clob_service::private_core::ResolutionOutcome::Down
-                    } else {
-                        clob_service::private_core::ResolutionOutcome::Push
-                    };
+                    let outcome = clob_service::private_core::derive_resolution_outcome(
+                        statement.opening.median_price_e8,
+                        statement.closing.median_price_e8,
+                    );
                     let payload = resolution_signing_payload(&statement)
                         .map_err(|error| error.to_string())?;
                     let market_id = statement.market_id.clone();

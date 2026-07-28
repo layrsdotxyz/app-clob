@@ -1,0 +1,11 @@
+[package]
+name = "layrs_settlement_guest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+layrs-settlement-proof-core = { path = "../../core" }
+risc0-zkvm = { version = "=2.2.0", default-features = false, features = ["std"] }

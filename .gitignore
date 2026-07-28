@@ -6,6 +6,8 @@
 Cargo.lock
 !enclave/runtime/Cargo.lock
 !enclave/parent-runtime/Cargo.lock
+!proofs/settlement/Cargo.lock
+!proofs/settlement/methods/guest/Cargo.lock
 
 # IDE
 .vscode/

@@ -1,0 +1,11 @@
+[package]
+name = "layrs-settlement-proof-methods"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[build-dependencies]
+risc0-build = "=2.2.0"
+
+[package.metadata.risc0]
+methods = ["guest"]

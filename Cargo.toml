@@ -104,6 +104,7 @@ aws-lc-rs = "1.16"
 hmac = "0.12"
 tokio-rustls = "0.26"
 webpki-roots = "1"
+layrs-settlement-proof-core = { path = "proofs/settlement/core" }
 
 [dev-dependencies]
 criterion = "0.5"
