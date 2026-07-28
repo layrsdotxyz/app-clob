@@ -159,17 +159,21 @@ jobs:
           no_output_timeout: 15m
           command: |
             smoke_dir=$(mktemp -d)
-            chmod 0777 "$smoke_dir"
             docker run --rm \
               --entrypoint /opt/risc0/bin/r0vm \
               layrs-zk-proof-worker:${CIRCLE_SHA1:-local} \
               --version
-            docker run --rm \
+            smoke_container=$(docker create \
               --entrypoint /app/bin/layrs-settlement-proof-host \
-              -v "$PWD/proofs/settlement/fixtures/layrs-v3-zen-15m-1785196800.json:/input.json:ro" \
-              -v "$smoke_dir:/out" \
               layrs-zk-proof-worker:${CIRCLE_SHA1:-local} \
-              /input.json /out
+              /tmp/input.json /tmp/out)
+            cleanup_smoke() { docker rm -f "$smoke_container" >/dev/null 2>&1 || true; }
+            trap cleanup_smoke EXIT
+            docker cp \
+              proofs/settlement/fixtures/layrs-v3-zen-15m-1785196800.json \
+              "$smoke_container:/tmp/input.json"
+            docker start --attach "$smoke_container"
+            docker cp "$smoke_container:/tmp/out/." "$smoke_dir/"
             (
               cd "$smoke_dir"
               printf '%s  %s\n' \
