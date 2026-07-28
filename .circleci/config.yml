@@ -9,6 +9,20 @@ parameters:
     default: "false"
 
 commands:
+  install-node:
+    steps:
+      - run:
+          name: Install Node.js 24
+          command: |
+            if command -v node >/dev/null 2>&1; then
+              node --version
+              npm --version
+              exit 0
+            fi
+            curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+            sudo apt-get install -y nodejs
+            node --version
+            npm --version
   install-aws-cli:
     steps:
       - run:
@@ -33,6 +47,7 @@ jobs:
     working_directory: ~/project
     steps:
       - checkout
+      - install-node
       - restore_cache:
           keys:
             - cargo-v1-{{ checksum "Cargo.lock" }}
@@ -98,6 +113,7 @@ jobs:
     working_directory: ~/project
     steps:
       - checkout
+      - install-node
       - restore_cache:
           keys:
             - cargo-v1-{{ checksum "Cargo.lock" }}
