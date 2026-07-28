@@ -1,4 +1,4 @@
-FROM public.ecr.aws/docker/library/node@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d AS builder
+FROM public.ecr.aws/docker/library/node@sha256:1c78323e27e7aff8ac92377845119cd52ac3d3b22e197b3b14e8eb64af387f8c AS builder
 
 ARG RUST_TOOLCHAIN=1.94.1
 ARG RISC0_RUST_TOOLCHAIN=1.97.0
@@ -29,7 +29,7 @@ RUN cargo build --locked --release \
     && npm ci --omit=dev --ignore-scripts \
       --prefix proofs/settlement/zkverify
 
-FROM public.ecr.aws/docker/library/node@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d AS runtime
+FROM public.ecr.aws/docker/library/node@sha256:1c78323e27e7aff8ac92377845119cd52ac3d3b22e197b3b14e8eb64af387f8c AS runtime
 
 ENV NODE_ENV=production \
     RISC0_HOME=/opt/risc0 \
@@ -37,11 +37,16 @@ ENV NODE_ENV=production \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+    && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3t64 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 1001 proof-worker
 
 COPY --from=builder --chown=1001:1001 /root/.risc0 /opt/risc0
+RUN ln -s /opt/risc0/extensions/v2.2.0-cargo-risczero-x86_64-unknown-linux-gnu/r0vm \
+      /opt/risc0/bin/r0vm \
+    && ln -s /opt/risc0/extensions/v2.2.0-cargo-risczero-x86_64-unknown-linux-gnu/cargo-risczero \
+      /opt/risc0/bin/cargo-risczero
 COPY --from=builder --chown=1001:1001 /build/proofs/settlement/target/release/layrs-settlement-proof-host /app/bin/layrs-settlement-proof-host
 COPY --from=builder --chown=1001:1001 /build/proofs/settlement/worker/node_modules /app/worker/node_modules
 COPY --from=builder --chown=1001:1001 /build/proofs/settlement/worker/core.mjs /app/worker/core.mjs
