@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "validated-ready-for-activation",
+  "releaseId": "df3c45d582a2d3cabdaf64353fab6a6476213af1",
+  "sourceCommit": "df3c45d582a2d3cabdaf64353fab6a6476213af1",
+  "packerSourceCommit": "df3c45d582a2d3cabdaf64353fab6a6476213af1",
+  "snapshotCompatibilityBase": "2b85c2aaa6143395e69c5deea2f7423356a15cd0",
+  "snapshotApproval": "enclave/snapshot-migrations/2026-07-28-resolution-proof-equivalence.md",
+  "region": "us-east-1",
+  "amiId": "ami-02bebc01da96ec775",
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/df3c45d582a2d3cabdaf64353fab6a6476213af1",
+  "artifacts": {
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/df3c45d582a2d3cabdaf64353fab6a6476213af1/layrsv2-clob.eif",
+      "versionId": "o8gEKmLGfh2sNar2cjU0CPUyVrwXavj0",
+      "sizeBytes": 40861497,
+      "sha384": "dca7ef2a9cd3ad61665576ad953b0f4616560a8f1c0d978e122628b592e11e7680b4f7516364adca771c0501a8a10c15"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/df3c45d582a2d3cabdaf64353fab6a6476213af1/layrs-enclave-parent",
+      "versionId": "QsZnu3x1pPt4CmTB1bcJ3MprRfEabyDU",
+      "sizeBytes": 1157840,
+      "sha384": "5f1b32b70b543f85f4b6f76e5f1bdc0324894e2e6a997b8cab94e7668b88b9158380790e9e3eb41769830cc44a525a20"
+    },
+    "measurements": {
+      "path": "build/layrsv2-clob-measurements.json",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/df3c45d582a2d3cabdaf64353fab6a6476213af1/layrsv2-clob-measurements.json",
+      "versionId": "uDiEPRhv.EdNgE6r45TBV2JwWmUQoq3R",
+      "sizeBytes": 402,
+      "sha384": "9c591a24af912072bee1a51bf79de7d1621fd026eb636d2ce3d76173a3226a133f6b613bfcf026e0ab6f6cb9af7a3455"
+    },
+    "checksums": {
+      "path": "build/layrsv2-host-artifacts.sha384",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/df3c45d582a2d3cabdaf64353fab6a6476213af1/layrsv2-host-artifacts.sha384",
+      "versionId": "8sbwC8bAmU1EVAWmxV3Gnk0Ay83yLZBT",
+      "sizeBytes": 246,
+      "sha384": "b9223900e5596e42a4fab4de7a5fb7da40a4261786cb3d3e30a33bd48c4b76e584a08ea910595d64001a9e648d20741e"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "8b894a91bbfcef711610d76d9ddf142dab6f01c201fb0447a2073affe80464e067f92dceba34b5eee6e3c090ecfdd1d7",
+    "pcr1": "0343b056cd8485ca7890ddd833476d78460aed2aa161548e4e26bedf321726696257d623e8805f3f605946b3d8b0c6aa",
+    "pcr2": "9eb5c3b77981d6f8890cd6c9b266797c16024039a6c0cea7106268a76f4adfc5ddc060b738189529740e6536b43d800a"
+  },
+  "objectLock": {
+    "mode": "COMPLIANCE",
+    "retainUntil": "2026-08-27T10:36:52Z"
+  },
+  "signature": null,
+  "signatureNote": "EIF identity is enforced through pinned PCR0 and KMS attestation policy; release authorization is separately signed by the compiled operator key."
+}
