@@ -155,6 +155,31 @@ jobs:
           no_output_timeout: 60m
           command: docker build --file Dockerfile.zk-proof-worker --tag layrs-zk-proof-worker:${CIRCLE_SHA1:-local} .
       - run:
+          name: Settlement proof worker runtime smoke
+          no_output_timeout: 15m
+          command: |
+            smoke_dir=$(mktemp -d)
+            chmod 0777 "$smoke_dir"
+            docker run --rm \
+              --entrypoint /opt/risc0/bin/r0vm \
+              layrs-zk-proof-worker:${CIRCLE_SHA1:-local} \
+              --version
+            docker run --rm \
+              --entrypoint /app/bin/layrs-settlement-proof-host \
+              -v "$PWD/proofs/settlement/fixtures/layrs-v3-zen-15m-1785196800.json:/input.json:ro" \
+              -v "$smoke_dir:/out" \
+              layrs-zk-proof-worker:${CIRCLE_SHA1:-local} \
+              /input.json /out
+            (
+              cd "$smoke_dir"
+              printf '%s  %s\n' \
+                e3cd4db4c81a68ed75a903a55c20e659b5fa5f7a3670ea75651b63b1b631aa67 output.json \
+                9a7ab21b3b41f1bb8a29d3d41d92f256c98f013986b6cc082ebf0a0fbf2bc3b6 public-inputs.bin \
+                | sha256sum --check
+              test -s artifact.json
+              test -s proof.cbor
+            )
+      - run:
           name: Enclave runtime tests
           command: cargo test --locked --manifest-path enclave/runtime/Cargo.toml
       - run:
