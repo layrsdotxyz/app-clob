@@ -11,8 +11,9 @@ use super::{
     AccountBucket, AccountKey, BookOrder, ClaimPayout, CompleteSetDirection,
     CompleteSetTransaction, CoreError, CoreResult, EnclaveReceipt, EncryptedJournal,
     EncryptedJournalRecord, EncryptedSnapshot, ExternalFlowDirection, ExternalFlowTransaction,
-    JournalKey, Ledger, LedgerTransaction, MatchResult, OrderAction, OrderStatus, Outcome,
-    PriceTimeBook, ReceiptSigner, SessionGuard, SignedSessionRequest, Transfer, PRICE_SCALE,
+    Fill, JournalKey, Ledger, LedgerTransaction, MatchResult, MatchType, OrderAction, OrderStatus,
+    Outcome, PriceTimeBook, ReceiptSigner, SessionGuard, SignedSessionRequest, Transfer,
+    PRICE_SCALE,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1995,27 +1996,48 @@ impl PrivateTradingCore {
                             .as_ref()
                             .is_some_and(|accepted| accepted.status != OrderStatus::Rejected)
                         {
-                            let transfers = settlement_transfers(
-                                &self.books,
-                                &books,
-                                market,
-                                &order,
-                                &match_result,
-                            )?;
-                            apply_fill_cost_basis(
-                                &self.ledger,
-                                &self.books,
-                                &books,
-                                market,
-                                &order,
-                                &match_result,
-                                &mut position_cost_basis,
-                            )?;
-                            ledger.apply(LedgerTransaction {
-                                idempotency_key: format!("order:{}", command.idempotency_key),
-                                business_reference: command.command_id.clone(),
-                                transfers,
-                            })?;
+                            if match_result
+                                .fills
+                                .iter()
+                                .all(|fill| fill.match_type == MatchType::Normal)
+                            {
+                                // Preserve the exact legacy transition (including one ledger
+                                // sequence increment) so old NORMAL-only journal replay remains
+                                // byte-for-byte stable after the complete-set feature ships.
+                                let transfers = settlement_transfers(
+                                    &self.books,
+                                    &books,
+                                    market,
+                                    &order,
+                                    &match_result,
+                                )?;
+                                apply_fill_cost_basis(
+                                    &self.ledger,
+                                    &self.books,
+                                    &books,
+                                    market,
+                                    &order,
+                                    &match_result,
+                                    &mut position_cost_basis,
+                                )?;
+                                ledger.apply(LedgerTransaction {
+                                    idempotency_key: format!("order:{}", command.idempotency_key),
+                                    business_reference: command.command_id.clone(),
+                                    transfers,
+                                })?;
+                            } else {
+                                apply_complete_set_match_settlement(
+                                    &mut ledger,
+                                    &self.books,
+                                    &books,
+                                    market,
+                                    &order,
+                                    &match_result,
+                                    &mut position_cost_basis,
+                                    &command.idempotency_key,
+                                    &command.command_id,
+                                )?;
+                            }
                         }
                         audit_drafts = native_audit_drafts(&order, &match_result, market)?;
                         CommandResult::Order {
@@ -2565,6 +2587,438 @@ fn settlement_transfers(
     Ok(transfers)
 }
 
+/// Settles a match result containing at least one complete-set fill. The engine
+/// mutates a command-local ledger clone, so these individually idempotent
+/// transitions are committed to enclave state and journaled only if every leg
+/// succeeds.
+#[allow(clippy::too_many_arguments)]
+fn apply_complete_set_match_settlement(
+    ledger: &mut Ledger,
+    prior_books: &BTreeMap<String, PriceTimeBook>,
+    next_books: &BTreeMap<String, PriceTimeBook>,
+    market: &MarketConfig,
+    incoming: &BookOrder,
+    result: &MatchResult,
+    cost_basis: &mut BTreeMap<PositionKey, u128>,
+    command_idempotency_key: &str,
+    business_reference: &str,
+) -> CoreResult<()> {
+    let incoming_cash_hold = cash_hold(incoming, &market.settlement_asset);
+    let incoming_claim_hold = claim_hold(incoming);
+    let initial_notional_micros = notional(incoming.price_micros, incoming.quantity_micros)?;
+    let initial_notional = settlement_atomic(market, initial_notional_micros)?;
+    let reserve = match incoming.action {
+        OrderAction::Buy => Transfer {
+            from: available(&incoming.private_user_id, &market.settlement_asset),
+            to: incoming_cash_hold.clone(),
+            amount: initial_notional
+                .checked_add(settlement_atomic(
+                    market,
+                    ceil_bps(initial_notional_micros, 20)?,
+                )?)
+                .ok_or(CoreError::UnbalancedTransaction)?,
+        },
+        OrderAction::Sell => Transfer {
+            from: claim_position(incoming),
+            to: incoming_claim_hold.clone(),
+            amount: incoming.quantity_micros,
+        },
+    };
+    ledger.apply(LedgerTransaction {
+        idempotency_key: format!("order:{command_idempotency_key}:reserve"),
+        business_reference: business_reference.into(),
+        transfers: vec![reserve],
+    })?;
+
+    let next_book = next_books
+        .get(&incoming.market_id)
+        .ok_or_else(|| CoreError::InvalidOrder("book disappeared during settlement".into()))?;
+    let prior_book = prior_books.get(&incoming.market_id);
+    let mut incoming_cash_used = 0u128;
+    let mut incoming_claim_used = 0u128;
+
+    for fill in &result.fills {
+        let maker = prior_book
+            .and_then(|book| book.order(fill.maker_order_id))
+            .or_else(|| next_book.order(fill.maker_order_id))
+            .ok_or_else(|| CoreError::InvalidOrder("maker order missing".into()))?
+            .clone();
+        match fill.match_type {
+            MatchType::Normal => {
+                let single_fill = MatchResult {
+                    accepted_order: result.accepted_order.clone(),
+                    fills: vec![fill.clone()],
+                    cancelled_remainder_micros: 0,
+                };
+                apply_fill_cost_basis(
+                    ledger,
+                    prior_books,
+                    next_books,
+                    market,
+                    incoming,
+                    &single_fill,
+                    cost_basis,
+                )?;
+
+                let fill_notional_micros = notional(fill.price_micros, fill.quantity_micros)?;
+                let fill_notional = settlement_atomic(market, fill_notional_micros)?;
+                let taker_fee = settlement_atomic(market, ceil_bps(fill_notional_micros, 20)?)?;
+                let mut transfers = Vec::with_capacity(3);
+                match incoming.action {
+                    OrderAction::Buy => {
+                        transfers.push(Transfer {
+                            from: incoming_cash_hold.clone(),
+                            to: available(&maker.private_user_id, &market.settlement_asset),
+                            amount: fill_notional,
+                        });
+                        if taker_fee > 0 {
+                            transfers.push(Transfer {
+                                from: incoming_cash_hold.clone(),
+                                to: fee_revenue(&market.settlement_asset),
+                                amount: taker_fee,
+                            });
+                        }
+                        transfers.push(Transfer {
+                            from: claim_hold(&maker),
+                            to: claim_position_for(
+                                &incoming.private_user_id,
+                                &incoming.market_id,
+                                incoming.outcome,
+                            ),
+                            amount: fill.quantity_micros,
+                        });
+                        incoming_cash_used = incoming_cash_used
+                            .checked_add(fill_notional)
+                            .and_then(|value| value.checked_add(taker_fee))
+                            .ok_or(CoreError::UnbalancedTransaction)?;
+                    }
+                    OrderAction::Sell => {
+                        let seller_proceeds = fill_notional
+                            .checked_sub(taker_fee)
+                            .ok_or(CoreError::UnbalancedTransaction)?;
+                        if seller_proceeds > 0 {
+                            transfers.push(Transfer {
+                                from: cash_hold(&maker, &market.settlement_asset),
+                                to: available(&incoming.private_user_id, &market.settlement_asset),
+                                amount: seller_proceeds,
+                            });
+                        }
+                        if taker_fee > 0 {
+                            transfers.push(Transfer {
+                                from: cash_hold(&maker, &market.settlement_asset),
+                                to: fee_revenue(&market.settlement_asset),
+                                amount: taker_fee,
+                            });
+                        }
+                        transfers.push(Transfer {
+                            from: incoming_claim_hold.clone(),
+                            to: claim_position_for(
+                                &maker.private_user_id,
+                                &incoming.market_id,
+                                incoming.outcome,
+                            ),
+                            amount: fill.quantity_micros,
+                        });
+                        incoming_claim_used = incoming_claim_used
+                            .checked_add(fill.quantity_micros)
+                            .ok_or(CoreError::UnbalancedTransaction)?;
+                    }
+                }
+                ledger.apply(LedgerTransaction {
+                    idempotency_key: format!(
+                        "order:{command_idempotency_key}:normal:{}",
+                        fill.sequence
+                    ),
+                    business_reference: business_reference.into(),
+                    transfers,
+                })?;
+            }
+            MatchType::Mint => {
+                if incoming.action != OrderAction::Buy
+                    || maker.action != OrderAction::Buy
+                    || incoming.outcome == maker.outcome
+                {
+                    return Err(CoreError::InvalidOrder(
+                        "invalid complete-set mint match".into(),
+                    ));
+                }
+                let amounts = complete_set_fill_amounts(market, fill)?;
+                let mut funding = vec![
+                    Transfer {
+                        from: cash_hold(&maker, &market.settlement_asset),
+                        to: available(&maker.private_user_id, &market.settlement_asset),
+                        amount: amounts.maker_atomic,
+                    },
+                    Transfer {
+                        from: incoming_cash_hold.clone(),
+                        to: available(&maker.private_user_id, &market.settlement_asset),
+                        amount: amounts.taker_atomic,
+                    },
+                ];
+                if amounts.taker_fee_atomic > 0 {
+                    funding.push(Transfer {
+                        from: incoming_cash_hold.clone(),
+                        to: fee_revenue(&market.settlement_asset),
+                        amount: amounts.taker_fee_atomic,
+                    });
+                }
+                ledger.apply(LedgerTransaction {
+                    idempotency_key: format!(
+                        "order:{command_idempotency_key}:mint-fund:{}",
+                        fill.sequence
+                    ),
+                    business_reference: business_reference.into(),
+                    transfers: funding,
+                })?;
+                ledger.apply_complete_set(CompleteSetTransaction {
+                    idempotency_key: format!(
+                        "order:{command_idempotency_key}:mint-set:{}",
+                        fill.sequence
+                    ),
+                    owner: maker.private_user_id.clone(),
+                    market_id: incoming.market_id.clone(),
+                    settlement_asset: market.settlement_asset.clone(),
+                    quantity_micros: fill.quantity_micros,
+                    collateral_amount_atomic: amounts.collateral_atomic,
+                    direction: CompleteSetDirection::Mint,
+                })?;
+                ledger.apply(LedgerTransaction {
+                    idempotency_key: format!(
+                        "order:{command_idempotency_key}:mint-claim:{}",
+                        fill.sequence
+                    ),
+                    business_reference: business_reference.into(),
+                    transfers: vec![Transfer {
+                        from: claim_position_for(
+                            &maker.private_user_id,
+                            &incoming.market_id,
+                            incoming.outcome,
+                        ),
+                        to: claim_position_for(
+                            &incoming.private_user_id,
+                            &incoming.market_id,
+                            incoming.outcome,
+                        ),
+                        amount: fill.quantity_micros,
+                    }],
+                })?;
+                add_basis(
+                    cost_basis,
+                    position_key(&maker.private_user_id, &incoming.market_id, maker.outcome),
+                    amounts.maker_atomic,
+                )?;
+                add_basis(
+                    cost_basis,
+                    position_key(
+                        &incoming.private_user_id,
+                        &incoming.market_id,
+                        incoming.outcome,
+                    ),
+                    amounts.taker_atomic,
+                )?;
+                incoming_cash_used = incoming_cash_used
+                    .checked_add(amounts.taker_atomic)
+                    .and_then(|value| value.checked_add(amounts.taker_fee_atomic))
+                    .ok_or(CoreError::UnbalancedTransaction)?;
+            }
+            MatchType::Merge => {
+                if incoming.action != OrderAction::Sell
+                    || maker.action != OrderAction::Sell
+                    || incoming.outcome == maker.outcome
+                {
+                    return Err(CoreError::InvalidOrder(
+                        "invalid complete-set merge match".into(),
+                    ));
+                }
+                let amounts = complete_set_fill_amounts(market, fill)?;
+                let taker_proceeds = amounts
+                    .taker_atomic
+                    .checked_sub(amounts.taker_fee_atomic)
+                    .ok_or(CoreError::UnbalancedTransaction)?;
+
+                reduce_basis_for_held_quantity(
+                    ledger,
+                    cost_basis,
+                    position_key(&maker.private_user_id, &incoming.market_id, maker.outcome),
+                    &maker.private_user_id,
+                    &incoming.market_id,
+                    maker.outcome,
+                    fill.quantity_micros,
+                )?;
+                reduce_basis_for_held_quantity(
+                    ledger,
+                    cost_basis,
+                    position_key(
+                        &incoming.private_user_id,
+                        &incoming.market_id,
+                        incoming.outcome,
+                    ),
+                    &incoming.private_user_id,
+                    &incoming.market_id,
+                    incoming.outcome,
+                    fill.quantity_micros,
+                )?;
+
+                ledger.apply(LedgerTransaction {
+                    idempotency_key: format!(
+                        "order:{command_idempotency_key}:merge-claims:{}",
+                        fill.sequence
+                    ),
+                    business_reference: business_reference.into(),
+                    transfers: vec![
+                        Transfer {
+                            from: claim_hold(&maker),
+                            to: claim_position_for(
+                                &maker.private_user_id,
+                                &incoming.market_id,
+                                maker.outcome,
+                            ),
+                            amount: fill.quantity_micros,
+                        },
+                        Transfer {
+                            from: incoming_claim_hold.clone(),
+                            to: claim_position_for(
+                                &maker.private_user_id,
+                                &incoming.market_id,
+                                incoming.outcome,
+                            ),
+                            amount: fill.quantity_micros,
+                        },
+                    ],
+                })?;
+                ledger.apply_complete_set(CompleteSetTransaction {
+                    idempotency_key: format!(
+                        "order:{command_idempotency_key}:merge-set:{}",
+                        fill.sequence
+                    ),
+                    owner: maker.private_user_id.clone(),
+                    market_id: incoming.market_id.clone(),
+                    settlement_asset: market.settlement_asset.clone(),
+                    quantity_micros: fill.quantity_micros,
+                    collateral_amount_atomic: amounts.collateral_atomic,
+                    direction: CompleteSetDirection::Burn,
+                })?;
+                let mut payout = Vec::with_capacity(2);
+                if taker_proceeds > 0 {
+                    payout.push(Transfer {
+                        from: available(&maker.private_user_id, &market.settlement_asset),
+                        to: available(&incoming.private_user_id, &market.settlement_asset),
+                        amount: taker_proceeds,
+                    });
+                }
+                if amounts.taker_fee_atomic > 0 {
+                    payout.push(Transfer {
+                        from: available(&maker.private_user_id, &market.settlement_asset),
+                        to: fee_revenue(&market.settlement_asset),
+                        amount: amounts.taker_fee_atomic,
+                    });
+                }
+                if payout.is_empty() {
+                    return Err(CoreError::ZeroAmount);
+                }
+                ledger.apply(LedgerTransaction {
+                    idempotency_key: format!(
+                        "order:{command_idempotency_key}:merge-payout:{}",
+                        fill.sequence
+                    ),
+                    business_reference: business_reference.into(),
+                    transfers: payout,
+                })?;
+                incoming_claim_used = incoming_claim_used
+                    .checked_add(fill.quantity_micros)
+                    .ok_or(CoreError::UnbalancedTransaction)?;
+            }
+        }
+    }
+
+    let accepted = result
+        .accepted_order
+        .as_ref()
+        .ok_or_else(|| CoreError::InvalidOrder("missing accepted order".into()))?;
+    let refund = match incoming.action {
+        OrderAction::Buy => {
+            let initially_reserved = initial_notional
+                .checked_add(settlement_atomic(
+                    market,
+                    ceil_bps(initial_notional_micros, 20)?,
+                )?)
+                .ok_or(CoreError::UnbalancedTransaction)?;
+            let desired_hold = settlement_atomic(
+                market,
+                notional(incoming.price_micros, accepted.remaining_micros)?,
+            )?;
+            let amount = initially_reserved
+                .checked_sub(incoming_cash_used)
+                .and_then(|value| value.checked_sub(desired_hold))
+                .ok_or(CoreError::UnbalancedTransaction)?;
+            (
+                incoming_cash_hold,
+                available(&incoming.private_user_id, &market.settlement_asset),
+                amount,
+            )
+        }
+        OrderAction::Sell => {
+            let desired_hold = accepted.remaining_micros;
+            let amount = incoming
+                .quantity_micros
+                .checked_sub(incoming_claim_used)
+                .and_then(|value| value.checked_sub(desired_hold))
+                .ok_or(CoreError::UnbalancedTransaction)?;
+            (incoming_claim_hold, claim_position(incoming), amount)
+        }
+    };
+    if refund.2 > 0 {
+        ledger.apply(LedgerTransaction {
+            idempotency_key: format!("order:{command_idempotency_key}:refund"),
+            business_reference: business_reference.into(),
+            transfers: vec![Transfer {
+                from: refund.0,
+                to: refund.1,
+                amount: refund.2,
+            }],
+        })?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompleteSetFillAmounts {
+    collateral_atomic: u128,
+    maker_atomic: u128,
+    taker_atomic: u128,
+    taker_fee_atomic: u128,
+}
+
+fn complete_set_fill_amounts(
+    market: &MarketConfig,
+    fill: &Fill,
+) -> CoreResult<CompleteSetFillAmounts> {
+    let collateral_atomic = settlement_atomic(market, fill.quantity_micros)?;
+    let maker_atomic =
+        settlement_atomic(market, notional(fill.price_micros, fill.quantity_micros)?)?;
+    let taker_atomic = collateral_atomic
+        .checked_sub(maker_atomic)
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    if maker_atomic == 0 || taker_atomic == 0 {
+        return Err(CoreError::InvalidOrder(
+            "complete-set fill is below settlement precision".into(),
+        ));
+    }
+    let taker_notional_micros = notional(fill.taker_price_micros(), fill.quantity_micros)?;
+    let taker_fee_atomic = settlement_atomic(market, ceil_bps(taker_notional_micros, 20)?)?;
+    if taker_fee_atomic > taker_atomic {
+        return Err(CoreError::InvalidOrder(
+            "complete-set fee exceeds taker proceeds".into(),
+        ));
+    }
+    Ok(CompleteSetFillAmounts {
+        collateral_atomic,
+        maker_atomic,
+        taker_atomic,
+        taker_fee_atomic,
+    })
+}
+
 fn apply_fill_cost_basis(
     ledger: &Ledger,
     prior_books: &BTreeMap<String, PriceTimeBook>,
@@ -2766,6 +3220,10 @@ fn cancellation_transfers(market: &MarketConfig, order: &BookOrder) -> CoreResul
 
 fn available(owner: &str, asset: &str) -> AccountKey {
     AccountKey::new(owner, AccountBucket::UserAvailable, asset)
+}
+
+fn fee_revenue(asset: &str) -> AccountKey {
+    AccountKey::new("layrs", AccountBucket::FeeRevenue, asset)
 }
 
 fn market_collateral(market_id: &str, asset: &str) -> AccountKey {
@@ -3039,7 +3497,11 @@ fn native_audit_drafts(
         .fills
         .iter()
         .map(|fill| {
-            let fill_notional = notional(fill.price_micros, fill.quantity_micros)?;
+            // The audit rail records the incoming taker's execution price.
+            // For complete-set fills this is the exact complement of the
+            // resting maker price, while NORMAL remains unchanged.
+            let taker_price_micros = fill.taker_price_micros();
+            let fill_notional = notional(taker_price_micros, fill.quantity_micros)?;
             let (buyer, seller) = match incoming.action {
                 OrderAction::Buy => (
                     fill.taker_private_user_id.clone(),
@@ -3057,7 +3519,7 @@ fn native_audit_drafts(
                 buyer_private_user_id: buyer,
                 seller_private_user_id: seller,
                 quantity_atomic: fill.quantity_micros,
-                price_micros: fill.price_micros,
+                price_micros: taker_price_micros,
                 fee_atomic: settlement_atomic(market, ceil_bps(fill_notional, 20)?)?,
                 nonce: fill.sequence,
             })
