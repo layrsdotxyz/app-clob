@@ -30,10 +30,17 @@ struct ProofArtifact {
 
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
-    let input_path = PathBuf::from(
-        args.next()
-            .ok_or_else(|| anyhow!("usage: host <input.json> <output-dir>"))?,
-    );
+    let first = args
+        .next()
+        .ok_or_else(|| anyhow!("usage: host <input.json> <output-dir> | host --image-id"))?;
+    if first == "--image-id" {
+        if args.next().is_some() {
+            return Err(anyhow!("unexpected extra arguments"));
+        }
+        println!("{}", image_id_hex());
+        return Ok(());
+    }
+    let input_path = PathBuf::from(first);
     let output_dir = PathBuf::from(
         args.next()
             .ok_or_else(|| anyhow!("usage: host <input.json> <output-dir>"))?,

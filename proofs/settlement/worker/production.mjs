@@ -40,6 +40,7 @@ const ARTIFACT_FILES = [
   "artifact.json",
 ];
 const ABI = [
+  "function imageId() view returns (bytes32)",
   "function attestation(bytes32 marketIdHash) view returns (bytes32 settlementCommitment,bytes32 journalHash,bytes32 zkVerifyLeaf,bytes32 proofArtifactHash,bytes32 zkVerifyTransactionHash,uint256 aggregationId,int64 openingMedianE8,int64 closingMedianE8,uint8 outcome,uint64 attestedAt)",
   "function attestSettlement(bytes publicJournal,uint256 aggregationId,bytes32[] merklePath,uint256 leafCount,uint256 index,bytes32 proofArtifactHash,bytes32 zkVerifyTransactionHash) returns (bytes32 marketIdHash)",
   "event SettlementAttested(bytes32 indexed marketIdHash,bytes32 indexed settlementCommitment,bytes32 indexed zkVerifyLeaf,uint256 aggregationId,bytes32 journalHash,bytes32 proofArtifactHash,bytes32 zkVerifyTransactionHash,int64 openingMedianE8,int64 closingMedianE8,uint8 outcome)",
@@ -102,7 +103,12 @@ async function claim(database) {
         WHERE status IN ('PENDING','PROVED','SUBMITTED')
           AND next_attempt_at <= now()
           AND (lease_until IS NULL OR lease_until < now())
-        ORDER BY next_attempt_at,created_at
+        ORDER BY CASE status
+                   WHEN 'SUBMITTED' THEN 0
+                   WHEN 'PROVED' THEN 1
+                   ELSE 2
+                 END,
+                 next_attempt_at,created_at
         FOR UPDATE SKIP LOCKED
         LIMIT 1
      )
@@ -545,6 +551,16 @@ async function main() {
   if ((await chain.provider.getCode(chain.registry)) === "0x") {
     throw new Error("ZK_SETTLEMENT_REGISTRY_NOT_DEPLOYED");
   }
+  const host = required("LAYRSV2_ZK_PROOF_HOST_PATH");
+  const { stdout: imageIdOutput } = await execFileAsync(host, ["--image-id"], {
+    timeout: 30_000,
+    maxBuffer: 1_024,
+  });
+  const hostImageId = hex32(imageIdOutput.trim(), "hostImageId");
+  const registryImageId = hex32(await chain.contract.imageId(), "registryImageId");
+  if (hostImageId !== registryImageId) {
+    throw new Error("ZK_SETTLEMENT_REGISTRY_IMAGE_ID_MISMATCH");
+  }
   let stopping = false;
   const stop = () => { stopping = true; };
   process.once("SIGTERM", stop);
@@ -552,6 +568,7 @@ async function main() {
   log("zk_settlement_proof_worker_ready", {
     proofProgramVersion: PROOF_PROGRAM_VERSION,
     registry: chain.registry,
+    imageId: hostImageId,
     signer: chain.signer.address,
   });
   try {

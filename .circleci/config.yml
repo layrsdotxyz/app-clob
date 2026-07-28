@@ -163,6 +163,12 @@ jobs:
               --entrypoint /opt/risc0/bin/r0vm \
               layrs-zk-proof-worker:${CIRCLE_SHA1:-local} \
               --version
+            test "$(
+              docker run --rm \
+                --entrypoint /app/bin/layrs-settlement-proof-host \
+                layrs-zk-proof-worker:${CIRCLE_SHA1:-local} \
+                --image-id
+            )" = "0x563cc7ea1bdf5583d07234d48a198b41e348ac51bd4c8ae028652974284746dc"
             smoke_container=$(docker create \
               --entrypoint /app/bin/layrs-settlement-proof-host \
               layrs-zk-proof-worker:${CIRCLE_SHA1:-local} \
