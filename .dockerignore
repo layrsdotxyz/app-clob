@@ -3,6 +3,9 @@
 .env
 .env.*
 target
+proofs/settlement/target
+proofs/settlement/worker/node_modules
+proofs/settlement/zkverify/node_modules
 **/target
 build
 coverage

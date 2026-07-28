@@ -36,12 +36,13 @@ pub mod decimal_u128 {
 // unused-import error.
 #[allow(unused_imports)]
 pub use engine::{
-    command_request_hash, polymarket_resolution_signing_payload, resolution_signing_payload,
-    AuditFillStatement, BootstrapExecutionState, BootstrapExecutionView, BootstrapVenueIntent,
-    BoundaryEvidence, CommandResult, CoreResponse, MarketConfig, MarketExecution, MarketResolution,
-    PolymarketRedemptionIntent, PolymarketResolutionStatement, PortfolioSnapshot, PrivateBalance,
-    PrivatePosition, PrivateTradingCore, ResolutionEvidence, ResolutionOutcome,
-    ResolutionStatement, SignedAuditFillArtifact, SignedPolymarketResolution, SignedResolution,
+    command_request_hash, derive_resolution_outcome, polymarket_resolution_signing_payload,
+    resolution_signing_payload, AuditFillStatement, BootstrapExecutionState,
+    BootstrapExecutionView, BootstrapVenueIntent, BoundaryEvidence, CommandResult, CoreResponse,
+    MarketConfig, MarketExecution, MarketResolution, PolymarketRedemptionIntent,
+    PolymarketResolutionStatement, PortfolioSnapshot, PrivateBalance, PrivatePosition,
+    PrivateTradingCore, ResolutionEvidence, ResolutionOutcome, ResolutionStatement,
+    SignedAuditFillArtifact, SignedPolymarketResolution, SignedResolution,
     SignedResolutionEvidence, SystemResponse, UserCommand, UserCommandAction,
     WithdrawalAuthorization, WithdrawalIntent,
 };

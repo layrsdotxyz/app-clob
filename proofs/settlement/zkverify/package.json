@@ -1,0 +1,15 @@
+{
+  "name": "@layrshq/settlement-proof-zkverify",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "submit": "node submit-proof.mjs"
+  },
+  "dependencies": {
+    "zkverifyjs": "3.1.0"
+  }
+}

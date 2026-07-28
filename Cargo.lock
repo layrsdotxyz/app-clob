@@ -2949,6 +2949,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac",
+ "layrs-settlement-proof-core",
  "light-poseidon",
  "mini-redis",
  "num-bigint",
@@ -2982,6 +2983,14 @@ dependencies = [
  "webpki-roots 1.0.9",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "layrs-settlement-proof-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sha2",
 ]
 
 [[package]]

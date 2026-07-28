@@ -1,9 +1,99 @@
 version: 2.1
 
+parameters:
+  ci-profile:
+    type: string
+    default: "fast"
+  deploy-production:
+    type: string
+    default: "false"
+
+commands:
+  install-aws-cli:
+    steps:
+      - run:
+          name: Install AWS CLI
+          command: |
+            if command -v aws >/dev/null 2>&1; then
+              aws --version
+              exit 0
+            fi
+            sudo apt-get update
+            sudo apt-get install -y curl unzip
+            tmp_dir="$(mktemp -d)"
+            curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "$tmp_dir/awscliv2.zip"
+            unzip -q "$tmp_dir/awscliv2.zip" -d "$tmp_dir"
+            sudo "$tmp_dir/aws/install" --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli --update
+
 jobs:
-  clob-ci:
+  clob-fast-ci:
     docker:
-      - image: cimg/rust:1.92.0
+      - image: cimg/rust:1.94.1
+    resource_class: large
+    working_directory: ~/project
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - cargo-v1-{{ checksum "Cargo.lock" }}
+            - cargo-v1-
+      - run:
+          name: Install rustfmt and clippy
+          command: rustup component add rustfmt clippy
+      - run:
+          name: Enclave snapshot compatibility guard
+          command: |
+            git fetch --no-tags origin main:refs/remotes/origin/main || true
+            base="$(git merge-base origin/main HEAD 2>/dev/null || git rev-parse HEAD^)"
+            scripts/check-enclave-snapshot-compatibility.sh --base "$base" --mode ci
+      - run:
+          name: Format check
+          command: cargo fmt --check
+      - run:
+          name: Cargo check
+          command: cargo check --all-targets --locked
+      - run:
+          name: Fast library tests
+          command: cargo test --locked --lib
+      - run:
+          name: Settlement proof core
+          command: cargo test --locked --manifest-path proofs/settlement/core/Cargo.toml
+      - run:
+          name: Settlement proof host input-policy tests
+          command: RISC0_SKIP_BUILD=1 cargo test --locked --manifest-path proofs/settlement/host/Cargo.toml
+      - run:
+          name: Enclave settlement equivalence
+          command: cargo test --locked --test settlement_equivalence
+      - run:
+          name: zkVerify submitter dependency audit
+          command: npm audit --omit=dev --audit-level=high --prefix proofs/settlement/zkverify
+      - run:
+          name: Settlement proof worker tests and dependency audit
+          command: |
+            npm ci --ignore-scripts --prefix proofs/settlement/worker
+            npm test --prefix proofs/settlement/worker
+            npm audit --omit=dev --audit-level=high --prefix proofs/settlement/worker
+      - run:
+          name: Strict clippy
+          command: >-
+            cargo clippy --all-targets --locked -- -D warnings
+            -A dead-code
+            -A clippy::too-many-arguments
+            -A clippy::type-complexity
+            -A clippy::large-enum-variant
+            -A clippy::needless-range-loop
+            -A clippy::empty-line-after-doc-comments
+            -A clippy::wrong-self-convention
+            -A clippy::enum-variant-names
+      - save_cache:
+          key: cargo-v1-{{ checksum "Cargo.lock" }}
+          paths:
+            - ~/.cargo
+            - target
+
+  clob-full-ci:
+    docker:
+      - image: cimg/rust:1.94.1
     resource_class: large
     working_directory: ~/project
     steps:
@@ -30,6 +120,30 @@ jobs:
       - run:
           name: Workspace tests
           command: cargo test --locked
+      - run:
+          name: Settlement proof core
+          command: cargo test --locked --manifest-path proofs/settlement/core/Cargo.toml
+      - run:
+          name: Settlement proof host input-policy tests
+          command: RISC0_SKIP_BUILD=1 cargo test --locked --manifest-path proofs/settlement/host/Cargo.toml
+      - run:
+          name: Enclave settlement equivalence
+          command: cargo test --locked --test settlement_equivalence
+      - run:
+          name: zkVerify submitter dependency audit
+          command: npm audit --omit=dev --audit-level=high --prefix proofs/settlement/zkverify
+      - run:
+          name: Settlement proof worker tests and dependency audit
+          command: |
+            npm ci --ignore-scripts --prefix proofs/settlement/worker
+            npm test --prefix proofs/settlement/worker
+            npm audit --omit=dev --audit-level=high --prefix proofs/settlement/worker
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run:
+          name: Settlement proof worker container build
+          no_output_timeout: 60m
+          command: docker build --file Dockerfile.zk-proof-worker --tag layrs-zk-proof-worker:${CIRCLE_SHA1:-local} .
       - run:
           name: Enclave runtime tests
           command: cargo test --locked --manifest-path enclave/runtime/Cargo.toml
@@ -63,7 +177,59 @@ jobs:
             - ~/.cargo
             - target
 
+  deploy-zk-proof-worker:
+    docker:
+      - image: cimg/node:24.13
+    resource_class: large
+    working_directory: ~/project
+    steps:
+      - checkout
+      - install-aws-cli
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run:
+          name: Publish immutable settlement proof worker
+          no_output_timeout: 60m
+          command: deployment/circleci-deploy-zk-proof-worker.sh
+      - store_artifacts:
+          path: deployment/releases
+          destination: zk-proof-worker-releases
+
 workflows:
-  clob:
+  clob-fast:
+    when:
+      and:
+        - not:
+            equal: ["true", << pipeline.parameters.deploy-production >>]
+        - not:
+            equal: ["full", << pipeline.parameters.ci-profile >>]
     jobs:
-      - clob-ci
+      - clob-fast-ci
+  clob-full:
+    when:
+      and:
+        - not:
+            equal: ["true", << pipeline.parameters.deploy-production >>]
+        - equal: ["full", << pipeline.parameters.ci-profile >>]
+    jobs:
+      - clob-full-ci
+  clob-production:
+    when:
+      equal: ["true", << pipeline.parameters.deploy-production >>]
+    jobs:
+      - clob-full-ci
+      - approve-production-deploy:
+          type: approval
+          requires:
+            - clob-full-ci
+          filters:
+            branches:
+              only: main
+      - deploy-zk-proof-worker:
+          requires:
+            - approve-production-deploy
+          context:
+            - layrsv2-production-deploy
+          filters:
+            branches:
+              only: main

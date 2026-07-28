@@ -1,0 +1,19 @@
+{
+  "name": "@layrshq/settlement-proof-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node production.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "3.1096.0",
+    "ethers": "6.17.0",
+    "pg": "8.16.3",
+    "zkverifyjs": "3.1.0"
+  }
+}

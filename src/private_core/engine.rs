@@ -123,6 +123,20 @@ pub enum ResolutionOutcome {
     Push,
 }
 
+pub fn derive_resolution_outcome(
+    opening_median_e8: i64,
+    closing_median_e8: i64,
+) -> ResolutionOutcome {
+    match layrs_settlement_proof_core::derive_resolution_outcome(
+        opening_median_e8,
+        closing_median_e8,
+    ) {
+        layrs_settlement_proof_core::ResolutionOutcome::Up => ResolutionOutcome::Up,
+        layrs_settlement_proof_core::ResolutionOutcome::Down => ResolutionOutcome::Down,
+        layrs_settlement_proof_core::ResolutionOutcome::Push => ResolutionOutcome::Push,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoundaryEvidence {
     pub window_start_micros: i64,
@@ -1107,17 +1121,10 @@ impl PrivateTradingCore {
             .get(&signed.statement.market_id)
             .ok_or_else(|| CoreError::InvalidResolution("unknown market".into()))?;
         validate_resolution(market, &signed, self.oracle_public_key, now_millis)?;
-        let outcome = if signed.statement.closing.median_price_e8
-            > signed.statement.opening.median_price_e8
-        {
-            ResolutionOutcome::Up
-        } else if signed.statement.closing.median_price_e8
-            < signed.statement.opening.median_price_e8
-        {
-            ResolutionOutcome::Down
-        } else {
-            ResolutionOutcome::Push
-        };
+        let outcome = derive_resolution_outcome(
+            signed.statement.opening.median_price_e8,
+            signed.statement.closing.median_price_e8,
+        );
         let resolution = MarketResolution {
             outcome,
             evidence: ResolutionEvidence::PythHistoricalMedian {
@@ -1440,16 +1447,10 @@ impl PrivateTradingCore {
         match evidence {
             SignedResolutionEvidence::Pyth(signed) => {
                 validate_resolution(market, signed, self.oracle_public_key, now_millis)?;
-                let derived = match signed
-                    .statement
-                    .closing
-                    .median_price_e8
-                    .cmp(&signed.statement.opening.median_price_e8)
-                {
-                    std::cmp::Ordering::Greater => ResolutionOutcome::Up,
-                    std::cmp::Ordering::Less => ResolutionOutcome::Down,
-                    std::cmp::Ordering::Equal => ResolutionOutcome::Push,
-                };
+                let derived = derive_resolution_outcome(
+                    signed.statement.opening.median_price_e8,
+                    signed.statement.closing.median_price_e8,
+                );
                 if signed.statement.market_id != market_id || derived != outcome {
                     return Err(CoreError::InvalidResolution(
                         "on-chain outcome does not match Pyth evidence".into(),
