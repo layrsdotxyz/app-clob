@@ -29,8 +29,15 @@ for candidate_doc in "${migration_docs[@]}"; do
   [[ "$candidate_base" =~ ^[0-9a-f]{40}$ ]] || continue
   git fetch --no-tags origin "$candidate_base" || true
   git cat-file -e "${candidate_base}^{commit}" 2>/dev/null || continue
-  git merge-base --is-ancestor "$candidate_base" HEAD || continue
-  candidate_distance="$(git rev-list --count "${candidate_base}..HEAD")"
+  # Production EIFs are cut from immutable release branches, so the exact
+  # deployed commit need not be an ancestor of main. The compatibility checker
+  # deliberately supports both linear and divergent histories; retain that
+  # property here instead of silently substituting main's merge base.
+  if git merge-base --is-ancestor "$candidate_base" HEAD; then
+    candidate_distance="$(git rev-list --count "${candidate_base}..HEAD")"
+  else
+    candidate_distance="$(git rev-list --count "${candidate_base}...HEAD")"
+  fi
   if [[ -z "$selected_distance" || "$candidate_distance" -lt "$selected_distance" ]]; then
     selected_doc="$candidate_doc"
     declared_base="$candidate_base"
@@ -39,7 +46,7 @@ for candidate_doc in "${migration_docs[@]}"; do
 done
 
 if [[ -z "$selected_doc" ]]; then
-  echo "No changed migration document identifies an available ancestor release commit." >&2
+  echo "No changed migration document identifies an available release commit." >&2
   exit 1
 fi
 
