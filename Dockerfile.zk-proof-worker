@@ -28,15 +28,22 @@ RUN cargo build --locked --release \
       --prefix proofs/settlement/worker \
     && npm ci --omit=dev --ignore-scripts \
       --prefix proofs/settlement/zkverify
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends musl-tools \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup target add x86_64-unknown-linux-musl \
+    && cargo build --locked --release \
+      --target x86_64-unknown-linux-musl \
+      --manifest-path proofs/settlement/host/Cargo.toml
 
-FROM gcr.io/distroless/nodejs24-debian13@sha256:af85d11ce7ef10172855a6e3649e3e8125b1b9e3ca41849ec2918036f05cb212 AS runtime
+FROM gcr.io/distroless/nodejs24-debian12@sha256:14d42e2511532589a7c7e01a753667a74fcc96266e137e8125006b87b0c32d0a AS runtime
 
 ENV NODE_ENV=production \
     PATH=/opt/risc0/bin:${PATH}
 WORKDIR /app
 
 COPY --from=builder --chown=65532:65532 /root/.risc0/extensions/v2.2.0-cargo-risczero-x86_64-unknown-linux-gnu/r0vm /opt/risc0/bin/r0vm
-COPY --from=builder --chown=65532:65532 /build/proofs/settlement/target/release/layrs-settlement-proof-host /app/bin/layrs-settlement-proof-host
+COPY --from=builder --chown=65532:65532 /build/proofs/settlement/target/x86_64-unknown-linux-musl/release/layrs-settlement-proof-host /app/bin/layrs-settlement-proof-host
 COPY --from=builder --chown=65532:65532 /build/proofs/settlement/worker/node_modules /app/worker/node_modules
 COPY --from=builder --chown=65532:65532 /build/proofs/settlement/worker/core.mjs /app/worker/core.mjs
 COPY --from=builder --chown=65532:65532 /build/proofs/settlement/worker/production.mjs /app/worker/production.mjs
