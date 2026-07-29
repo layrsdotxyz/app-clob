@@ -68,6 +68,7 @@ enum WireRequest {
     Encrypted {
         client_public_key: [u8; 32],
         nonce: [u8; 12],
+        #[serde(with = "serde_bytes")]
         ciphertext: Vec<u8>,
     },
 }
@@ -82,6 +83,7 @@ enum WireResponse {
     },
     Encrypted {
         nonce: [u8; 12],
+        #[serde(with = "serde_bytes")]
         ciphertext: Vec<u8>,
         journal_artifacts: Vec<EncryptedJournalRecord>,
         snapshot_artifacts: Vec<EncryptedSnapshot>,
@@ -555,7 +557,7 @@ async fn serve_connection(
     state: Arc<Mutex<EnclaveState>>,
 ) -> io::Result<()> {
     let frame = read_frame(&mut stream).await?;
-    let request: WireRequest = serde_json::from_slice(&frame)
+    let request: WireRequest = serde_cbor::from_slice(&frame)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let response = match request {
         WireRequest::Attestation { nonce } => create_attestation(&state, nonce).await,
@@ -565,7 +567,7 @@ async fn serve_connection(
             ciphertext,
         } => handle_encrypted(&state, client_public_key, nonce, ciphertext).await,
     };
-    let encoded = serde_json::to_vec(&response)
+    let encoded = serde_cbor::to_vec(&response)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     write_frame(&mut stream, &encoded).await
 }

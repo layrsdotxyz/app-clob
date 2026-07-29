@@ -51,6 +51,7 @@ enum WireRequest {
     Encrypted {
         client_public_key: [u8; 32],
         nonce: [u8; 12],
+        #[serde(with = "serde_bytes")]
         ciphertext: Vec<u8>,
     },
 }
@@ -65,6 +66,7 @@ enum WireResponse {
     },
     Encrypted {
         nonce: [u8; 12],
+        #[serde(with = "serde_bytes")]
         ciphertext: Vec<u8>,
         journal_artifacts: Vec<EncryptedJournalRecord>,
         snapshot_artifacts: Vec<EncryptedSnapshot>,
@@ -304,7 +306,12 @@ async fn exchange(state: &AppState, request: WireRequest) -> Result<WireResponse
         let mut stream = VsockStream::connect(VsockAddr::new(state.enclave_cid, VSOCK_PORT))
             .await
             .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "ENCLAVE_UNAVAILABLE"))?;
-        let encoded = serde_json::to_vec(&request)
+        // The HTTP envelope is JSON, but the private parent-to-enclave hop must
+        // remain compact. JSON expands Vec<u8> into decimal arrays and caused a
+        // valid production checkpoint to exceed the bounded 64 MiB vsock frame.
+        // CBOR preserves the same tagged WireRequest while serde_bytes keeps
+        // byte vectors compact instead of expanding them into decimal arrays.
+        let encoded = serde_cbor::to_vec(&request)
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "ENCODE_FAILED"))?;
         write_frame(&mut stream, &encoded)
             .await
@@ -312,7 +319,7 @@ async fn exchange(state: &AppState, request: WireRequest) -> Result<WireResponse
         let response = read_frame(&mut stream)
             .await
             .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "VSOCK_READ_FAILED"))?;
-        serde_json::from_slice(&response)
+        serde_cbor::from_slice(&response)
             .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "INVALID_ENCLAVE_RESPONSE"))
     })
     .await
@@ -349,11 +356,32 @@ fn decode_fixed<const N: usize>(value: &str, code: &'static str) -> Result<[u8; 
 
 #[cfg(test)]
 mod tests {
-    use super::MAX_FRAME_BYTES;
+    use super::{WireRequest, MAX_FRAME_BYTES};
 
     #[test]
     fn relay_frame_limit_supports_checkpoint_restore_payloads() {
         const { assert!(MAX_FRAME_BYTES >= 64 * 1024 * 1024) };
+    }
+
+    #[test]
+    fn vsock_wire_encoding_does_not_expand_checkpoint_ciphertext() {
+        let ciphertext = vec![0xabu8; 20 * 1024 * 1024];
+        let request = WireRequest::Encrypted {
+            client_public_key: [7; 32],
+            nonce: [9; 12],
+            ciphertext,
+        };
+        let encoded = serde_cbor::to_vec(&request).expect("wire request encodes");
+        assert!(encoded.len() < 21 * 1024 * 1024);
+        assert!(encoded.len() < MAX_FRAME_BYTES);
+        let decoded: WireRequest = serde_cbor::from_slice(&encoded).expect("wire request decodes");
+        match decoded {
+            WireRequest::Encrypted { ciphertext, .. } => {
+                assert_eq!(ciphertext.len(), 20 * 1024 * 1024);
+                assert_eq!(ciphertext[0], 0xab);
+            }
+            _ => panic!("unexpected wire request variant"),
+        }
     }
 }
 
