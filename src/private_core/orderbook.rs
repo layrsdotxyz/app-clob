@@ -53,6 +53,12 @@ pub enum MatchType {
     Merge,
 }
 
+impl MatchType {
+    fn is_normal(&self) -> bool {
+        matches!(self, Self::Normal)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BookOrder {
     pub order_id: Uuid,
@@ -133,7 +139,7 @@ pub struct Fill {
     /// for MINT/MERGE it is the opposite outcome.
     pub outcome: Outcome,
     /// Defaults to NORMAL so pre-complete-set journal records remain readable.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "MatchType::is_normal")]
     pub match_type: MatchType,
     pub maker_order_id: Uuid,
     pub taker_order_id: Uuid,

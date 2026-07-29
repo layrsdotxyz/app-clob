@@ -9,6 +9,31 @@ use proptest::prelude::*;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+#[test]
+fn normal_fill_retains_the_legacy_serialized_shape() {
+    let fill = Fill {
+        fill_id: Uuid::from_u128(1),
+        market_id: "layrs:v3:ZEN:15m:1785300300".to_owned(),
+        outcome: Outcome::Up,
+        match_type: MatchType::Normal,
+        maker_order_id: Uuid::from_u128(2),
+        taker_order_id: Uuid::from_u128(3),
+        maker_private_user_id: "maker".to_owned(),
+        taker_private_user_id: "taker".to_owned(),
+        price_micros: 400_000,
+        quantity_micros: 1_000_000,
+        sequence: 4,
+    };
+
+    let value = serde_json::to_value(&fill).expect("serialize normal fill");
+    assert!(
+        value.get("match_type").is_none(),
+        "NORMAL must preserve the pre-feature journal/state-root wire shape"
+    );
+    let restored: Fill = serde_json::from_value(value).expect("restore legacy-shaped fill");
+    assert_eq!(restored, fill);
+}
+
 const MARKET_ID: &str = "layrs:v3:ZEN:15m:2000";
 const ONE_ZEN: u128 = 1_000_000_000_000_000_000;
 
