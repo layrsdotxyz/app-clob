@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "validated-ready-for-activation",
+  "releaseId": "69b6752b34f2fe966a41c4131fda556d4a2c16d6",
+  "sourceCommit": "69b6752b34f2fe966a41c4131fda556d4a2c16d6",
+  "sourceBranch": "main",
+  "snapshotCompatibilityBase": "2b85c2aaa6143395e69c5deea2f7423356a15cd0",
+  "snapshotApproval": "enclave/snapshot-migrations/2026-07-29-order-fill-history.md",
+  "region": "us-east-1",
+  "amiId": "ami-02017f6b04fab84c2",
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/69b6752b34f2fe966a41c4131fda556d4a2c16d6",
+  "artifacts": {
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/69b6752b34f2fe966a41c4131fda556d4a2c16d6/layrsv2-clob.eif",
+      "versionId": "JpS8j5quUGl49DaUul__M5IIAbSde3ad",
+      "sizeBytes": 41065785,
+      "sha384": "fc6b2e758f80e2dee2543266817bfda931abdcd8dd4318f906b2bd3c42fa8b842b384b14c9311a82dcfeb8de482b8ae2"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/69b6752b34f2fe966a41c4131fda556d4a2c16d6/layrs-enclave-parent",
+      "versionId": "jvbZ3sFDjoCwytpM8cbjgFG6TX9jY5bm",
+      "sizeBytes": 1229824,
+      "sha384": "3475d4ccc895d98a4bfcd329fa4ca854b9f6b35af678f467b5deb627c2f12eff331c23c34a9059da3b4da3b02d3009dc"
+    },
+    "measurements": {
+      "path": "build/layrsv2-clob-measurements.json",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/69b6752b34f2fe966a41c4131fda556d4a2c16d6/layrsv2-clob-measurements.json",
+      "versionId": "OCTLEnh_4RtSRTipgryzN9U5E9FIH.51",
+      "sizeBytes": 402,
+      "sha384": "6438c81731e000446fd94351be5bee31e4add704c05acbc1ef6bb1018ccfe15453cef9a5fd2e1fbd7b81dc5b300311c5"
+    },
+    "checksums": {
+      "path": "build/layrsv2-host-artifacts.sha384",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/69b6752b34f2fe966a41c4131fda556d4a2c16d6/layrsv2-host-artifacts.sha384",
+      "versionId": "S7vvexzaSQLhTfAvg4iKGjX8OcZIC3HB",
+      "sizeBytes": 246,
+      "sha384": "22182f6455bb10e8585502a799cfd75185803e4ab99e6138c278001f10e5f317c16b1de39bb3fa73175a99abdfc001fd"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "148193f6b42e209e54d908c63d80fa5d6fb8562c495fa268f0fca31e2d06bdbfa56c94fd5016ddfb44fc8997061b547d",
+    "pcr1": "0343b056cd8485ca7890ddd833476d78460aed2aa161548e4e26bedf321726696257d623e8805f3f605946b3d8b0c6aa",
+    "pcr2": "de35f4d6e7288fa0e5dd51e05050a4514080805d789cadce001f1d254745837349751f15e1a2117a19a8c1a164181459"
+  },
+  "objectLock": {
+    "mode": "COMPLIANCE",
+    "retainUntilAtLeast": "2026-08-30T00:00:00+00:00"
+  },
+  "activation": null,
+  "signature": null,
+  "signatureNote": "Candidate preserves the compact bounded-CBOR checkpoint transport and migrates snapshots from the exact production source lineage at 2b85c2aaa6143395e69c5deea2f7423356a15cd0. Compatibility verification reproduces the historical orderbook root without filled_micros and the historical checkpoint root without private_rewards before deterministic migration. Later-mainline legacy snapshots remain supported, journal-chain verification is not weakened, and unreconstructable partially-filled FAK/FOK orders remain fail-closed. Activation remains gated on exact PCR and manifest rotation, successful snapshot provisioning, controlled fill/cancel/history canaries, and post-cutover reconciliation."
+}
