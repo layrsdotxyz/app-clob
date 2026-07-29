@@ -1,12 +1,12 @@
 {
   "schemaVersion": 1,
-  "releaseStatus": "measured-staged-awaiting-activation",
+  "releaseStatus": "validated-ready-for-activation",
   "releaseId": "cb0347c3b51702ec507b3d6832cb08d840065855",
   "sourceCommit": "cb0347c3b51702ec507b3d6832cb08d840065855",
   "snapshotCompatibilityBase": "df3c45d582a2d3cabdaf64353fab6a6476213af1",
   "snapshotApproval": "enclave/snapshot-migrations/2026-07-29-complete-set-matching.md",
   "region": "us-east-1",
-  "amiId": null,
+  "amiId": "ami-0f5aad7b40854c7db",
   "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
   "artifactPrefix": "enclave-releases/cb0347c3b51702ec507b3d6832cb08d840065855",
   "artifacts": {
@@ -50,5 +50,5 @@
     "retainUntilAtLeast": "2026-08-27T19:32:07.432000+00:00"
   },
   "signature": null,
-  "signatureNote": "Staged measured artifact only. Production activation still requires AMI bake, signed release manifest, PCR/KMS rotation, passive replay, canaries and owner approval."
+  "signatureNote": "EIF identity is enforced through pinned PCR0 and KMS attestation policy. The AMI was baked from the exact COMPLIANCE-locked versioned artifacts. Production activation remains gated on coordinated PCR rotation, snapshot replay parity and complete-set canaries."
 }
