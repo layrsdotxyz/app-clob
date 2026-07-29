@@ -129,7 +129,10 @@ jobs:
           command: cargo check --all-targets --locked
       - run:
           name: Workspace tests
-          command: cargo test --locked
+          # Several legacy service tests share process-global state. Running the
+          # full release gate serially keeps the same test coverage while
+          # preventing nondeterministic SIGSEGVs from concurrent test teardown.
+          command: cargo test --locked -- --test-threads=1
       - run:
           name: Settlement proof core
           command: cargo test --locked --manifest-path proofs/settlement/core/Cargo.toml
