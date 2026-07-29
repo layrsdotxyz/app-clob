@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "releaseStatus": "validated-ready-for-activation",
+  "releaseStatus": "active-production",
   "releaseId": "d9970ab2afa98ca5449271f56f177b250d470646",
   "sourceCommit": "d9970ab2afa98ca5449271f56f177b250d470646",
   "sourceBranch": "release/complete-set-livebase-20260729",
@@ -50,6 +50,16 @@
     "mode": "COMPLIANCE",
     "retainUntilAtLeast": "2026-08-28T05:42:02+00:00"
   },
+  "activation": {
+    "activatedAt": "2026-07-29T06:05:50.519Z",
+    "backendReleaseCommit": "19e646fcc7ffc6fba60d573b7653a1832272a1af",
+    "tradingReleaseCommit": "5d1371f",
+    "operatorCoordinatorProvisioned": true,
+    "snapshotReplay": "succeeded-without-reset",
+    "signedManifestVerified": true,
+    "browserAttestationVerified": true,
+    "rollingMarketPcrAligned": true
+  },
   "signature": null,
-  "signatureNote": "This forward-repair EIF is built from the exact active production snapshot base plus complete-set matching. Legacy NORMAL fill serialization remains byte-for-byte compatible; MINT and MERGE carry an explicit match type. Activation remains gated on coordinated PCR rotation, successful snapshot replay, and live complete-set canaries."
+  "signatureNote": "This production EIF was built from the exact active production snapshot base plus complete-set matching. Legacy NORMAL fill serialization remains byte-for-byte compatible; MINT and MERGE carry an explicit match type. The coordinated PCR rotation, production snapshot replay, signed-manifest verification, browser attestation verification, and rolling-market PCR alignment succeeded. A live user-funds MINT/MERGE canary remains separately gated on controlled test users holding ZEN."
 }
