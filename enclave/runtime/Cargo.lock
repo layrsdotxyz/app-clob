@@ -1165,6 +1165,8 @@ dependencies = [
  "rand 0.8.7",
  "rust_decimal",
  "serde",
+ "serde_bytes",
+ "serde_cbor",
  "serde_json",
  "sha2",
  "thiserror",

@@ -23,6 +23,8 @@ hex = "0.4"
 layrs-settlement-proof-core = { path = "../../proofs/settlement/core" }
 rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
+serde_bytes = "0.11"
+serde_cbor = "0.11"
 serde_json = "1.0"
 sha2 = "0.10"
 thiserror = "1.0"
