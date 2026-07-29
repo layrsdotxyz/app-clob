@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "validated-ready-for-activation",
+  "releaseId": "a17846cc26a891396a9a2c803813cc4322414056",
+  "sourceCommit": "a17846cc26a891396a9a2c803813cc4322414056",
+  "sourceBranch": "main",
+  "snapshotCompatibilityBase": "abdf6843f8dd7173b0f3b88e797ab3af65422bb3",
+  "snapshotApproval": "enclave/snapshot-migrations/2026-07-29-order-fill-history.md",
+  "region": "us-east-1",
+  "amiId": "ami-0107509a1c13f2489",
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/a17846cc26a891396a9a2c803813cc4322414056",
+  "artifacts": {
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/a17846cc26a891396a9a2c803813cc4322414056/layrsv2-clob.eif",
+      "versionId": "d3eoAyDEO5kHEhswSnDC4HXnU.NWffo8",
+      "sizeBytes": 41061177,
+      "sha384": "47fd06288af126aa887fbc0a34c545a8fa00e8f5d4980874290004ea97bc14694d935252561babd76b2d02d144f8298a"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/a17846cc26a891396a9a2c803813cc4322414056/layrs-enclave-parent",
+      "versionId": "8xlD3ASq3ltxFN.z.Jr33upKLciCyEP5",
+      "sizeBytes": 1229824,
+      "sha384": "3475d4ccc895d98a4bfcd329fa4ca854b9f6b35af678f467b5deb627c2f12eff331c23c34a9059da3b4da3b02d3009dc"
+    },
+    "measurements": {
+      "path": "build/layrsv2-clob-measurements.json",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/a17846cc26a891396a9a2c803813cc4322414056/layrsv2-clob-measurements.json",
+      "versionId": "dxFdwhhdDu22f5tgwwMI4F7pv_sXWQg_",
+      "sizeBytes": 402,
+      "sha384": "2121740472f28428fec0cefe8520aa76a26314dcf62fc75abde4fb14c3e35cce4d46ef12847d95eeab0bfeead6f77dc0"
+    },
+    "checksums": {
+      "path": "build/layrsv2-host-artifacts.sha384",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/a17846cc26a891396a9a2c803813cc4322414056/layrsv2-host-artifacts.sha384",
+      "versionId": "pJHJnznXKUVHlOuAa4kzlbjZsdNyF_oq",
+      "sizeBytes": 246,
+      "sha384": "e51e6811f1e7003ad3dc4d915b2ce57560945a2f3d4ed2a642062a39b4907b26e385a99ed610886dee2b8a9d44f24255"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "e32a107f7ee6f78446308a5f20cf0ab3086e6ea4d44bf6b3e58d021fad91ec8d5469263edadb04d39e31dd6cb910c728",
+    "pcr1": "0343b056cd8485ca7890ddd833476d78460aed2aa161548e4e26bedf321726696257d623e8805f3f605946b3d8b0c6aa",
+    "pcr2": "4c4b5272a5c77a7ed72ad792dc8856321ff703228c78b7d1ce5efd26ffa66b6d4d1298c386d268640d848990d42b31d2"
+  },
+  "objectLock": {
+    "mode": "COMPLIANCE",
+    "retainUntilAtLeast": "2026-08-30T00:00:00+00:00"
+  },
+  "activation": null,
+  "signature": null,
+  "signatureNote": "Candidate preserves the compact bounded-CBOR checkpoint transport and adds exact legacy orderbook-root verification before deterministic migration of filled_micros. Historical FILLED, GTC and GTD orders are reconstructed without weakening journal-chain verification; unreconstructable partially-filled FAK/FOK orders remain fail-closed. Activation remains gated on frozen order intake, exact PCR and manifest rotation, successful snapshot provisioning, replay parity, controlled fill/cancel canaries, and post-cutover reconciliation."
+}
