@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "validated-ready-for-activation",
+  "releaseId": "fd87118c0ef74dbe66a1aca1ddd8f7b299969e0f",
+  "sourceCommit": "fd87118c0ef74dbe66a1aca1ddd8f7b299969e0f",
+  "sourceBranch": "main",
+  "snapshotCompatibilityBase": "abdf6843f8dd7173b0f3b88e797ab3af65422bb3",
+  "snapshotApproval": "enclave/snapshot-migrations/2026-07-29-order-fill-history.md",
+  "region": "us-east-1",
+  "amiId": "ami-060451c7a84a9b5fe",
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/fd87118c0ef74dbe66a1aca1ddd8f7b299969e0f",
+  "artifacts": {
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/fd87118c0ef74dbe66a1aca1ddd8f7b299969e0f/layrsv2-clob.eif",
+      "versionId": "dIAisuSeFdUw808_Potf32.7MhpvDoEA",
+      "sizeBytes": 41028921,
+      "sha384": "1fbf4b3cab16c41a589c7f1c2ace5031168fab72743174f8988abd4b6a3ef90090925ce6578b5affe16d5c17f128b8b3"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/fd87118c0ef74dbe66a1aca1ddd8f7b299969e0f/layrs-enclave-parent",
+      "versionId": "egQSB7f91epacB4oGQZ7LRzXYUb0NoxA",
+      "sizeBytes": 1229824,
+      "sha384": "3475d4ccc895d98a4bfcd329fa4ca854b9f6b35af678f467b5deb627c2f12eff331c23c34a9059da3b4da3b02d3009dc"
+    },
+    "measurements": {
+      "path": "build/layrsv2-clob-measurements.json",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/fd87118c0ef74dbe66a1aca1ddd8f7b299969e0f/layrsv2-clob-measurements.json",
+      "versionId": "Qk3t0Q4SGk2puh8822ydHPmlGcuC6.K7",
+      "sizeBytes": 402,
+      "sha384": "78dfcb5d81c8aea598a4c52598def7b796cc6edebe293408795a1a1c2092d139d79336fe0f96f2dbafd3b8c0e1a969bc"
+    },
+    "checksums": {
+      "path": "build/layrsv2-host-artifacts.sha384",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/fd87118c0ef74dbe66a1aca1ddd8f7b299969e0f/layrsv2-host-artifacts.sha384",
+      "versionId": "bZoPwIZeqnzuaXMPenSUS4D0WHLWBQDN",
+      "sizeBytes": 246,
+      "sha384": "c427331324f309a3b18549fe7d4c966b1f761729ad8b367389bebd4c67504678800f2d608345bab918a830022aa536dd"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "9f62a46357cf7b52c555a4484a0913ed38c0fece5deea7d7990d2ca92a00a3b0b5baf8f01fcfd6d8ea150db09bc7b2e8",
+    "pcr1": "0343b056cd8485ca7890ddd833476d78460aed2aa161548e4e26bedf321726696257d623e8805f3f605946b3d8b0c6aa",
+    "pcr2": "c9611c2ab77f0a8cbf56746976fc926b01f5a158ad654f31ce7be33d2a4a3cf3a21898f58cac12b74979f3efbbcaea94"
+  },
+  "objectLock": {
+    "mode": "COMPLIANCE",
+    "retainUntilAtLeast": "2026-08-28T09:10:16+00:00"
+  },
+  "activation": null,
+  "signature": null,
+  "signatureNote": "Candidate preserves the 6575f29 ledger, matching, and snapshot-state semantics while replacing only the parent-to-enclave outer wire representation with bounded CBOR byte strings. This prevents checkpoint ciphertext from expanding into JSON numeric arrays above the 64 MiB vsock frame limit. Activation remains gated on frozen order intake, exact PCR and manifest rotation, successful snapshot provisioning, replay parity, controlled fill/cancel canaries, and post-cutover reconciliation."
+}
