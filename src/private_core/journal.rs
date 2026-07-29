@@ -40,7 +40,6 @@ pub struct EncryptedJournalRecord {
     pub nonce: [u8; 12],
     pub prior_record_hash: [u8; 32],
     pub state_root: [u8; 32],
-    #[serde(with = "serde_bytes")]
     pub ciphertext: Vec<u8>,
     pub record_hash: [u8; 32],
 }
@@ -51,7 +50,6 @@ pub struct EncryptedSnapshot {
     pub journal_head: [u8; 32],
     pub state_root: [u8; 32],
     pub nonce: [u8; 12],
-    #[serde(with = "serde_bytes")]
     pub ciphertext: Vec<u8>,
     pub ciphertext_hash: [u8; 32],
 }
