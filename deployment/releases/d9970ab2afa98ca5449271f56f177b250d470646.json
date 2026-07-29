@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "validated-ready-for-activation",
+  "releaseId": "d9970ab2afa98ca5449271f56f177b250d470646",
+  "sourceCommit": "d9970ab2afa98ca5449271f56f177b250d470646",
+  "sourceBranch": "release/complete-set-livebase-20260729",
+  "snapshotCompatibilityBase": "df3c45d582a2d3cabdaf64353fab6a6476213af1",
+  "snapshotApproval": "enclave/snapshot-migrations/2026-07-29-complete-set-matching.md",
+  "region": "us-east-1",
+  "amiId": "ami-04184138408cf4a2f",
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/d9970ab2afa98ca5449271f56f177b250d470646",
+  "artifacts": {
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/d9970ab2afa98ca5449271f56f177b250d470646/layrsv2-clob.eif",
+      "versionId": "K.YJO4uZK9NJ5V0LrhWVQI3U0h3o9eoK",
+      "sizeBytes": 40893753,
+      "sha384": "9a496146fe3501069b9d3a78ca6e550d329cf7b43c4713b7321461c647394705528cd4d84343b8a05025f11a4e771e67"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/d9970ab2afa98ca5449271f56f177b250d470646/layrs-enclave-parent",
+      "versionId": "CKb0FGd.fnit9sVIc5S53YOjT1v.5XA9",
+      "sizeBytes": 1157840,
+      "sha384": "5f1b32b70b543f85f4b6f76e5f1bdc0324894e2e6a997b8cab94e7668b88b9158380790e9e3eb41769830cc44a525a20"
+    },
+    "measurements": {
+      "path": "build/layrsv2-clob-measurements.json",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/d9970ab2afa98ca5449271f56f177b250d470646/layrsv2-clob-measurements.json",
+      "versionId": "gnTRhebwcDyXa_MI8wxPefFJt69bZq9C",
+      "sizeBytes": 402,
+      "sha384": "ed15ac1413f18429e71a13c2604d2780e738706c807494ab0fe4940b0f2acdc780ae67d7b1fb2c8dcd5632a9d0821c59"
+    },
+    "checksums": {
+      "path": "build/layrsv2-host-artifacts.sha384",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/d9970ab2afa98ca5449271f56f177b250d470646/layrsv2-host-artifacts.sha384",
+      "versionId": "qVkR1bNdFmLVjM1c9F3pWGp1NityHfiJ",
+      "sizeBytes": 246,
+      "sha384": "531f2d17c52b6015d23aaa2717aa27c08193094636cd7a5eb0ea6d364f9e0b59eb2a3395a49cccadfc94f60d4751244f"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "9d82377e029ff24eb1e15a3267bcefbcffe8e7bb3fbd24227a23f977d307a63ec843d1e179803409ec3f342187e52016",
+    "pcr1": "0343b056cd8485ca7890ddd833476d78460aed2aa161548e4e26bedf321726696257d623e8805f3f605946b3d8b0c6aa",
+    "pcr2": "abe07a949781c27e74cd1c8a3a05e04d873bc402e2388413bffb21303666aa77d659a5e0aebed936149707c4d968c5aa"
+  },
+  "objectLock": {
+    "mode": "COMPLIANCE",
+    "retainUntilAtLeast": "2026-08-28T05:42:02+00:00"
+  },
+  "signature": null,
+  "signatureNote": "This forward-repair EIF is built from the exact active production snapshot base plus complete-set matching. Legacy NORMAL fill serialization remains byte-for-byte compatible; MINT and MERGE carry an explicit match type. Activation remains gated on coordinated PCR rotation, successful snapshot replay, and live complete-set canaries."
+}
