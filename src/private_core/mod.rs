@@ -89,6 +89,8 @@ pub enum CoreError {
     JournalCrypto,
     #[error("journal chain mismatch")]
     JournalChainMismatch,
+    #[error("snapshot requires an explicit historical fill migration")]
+    SnapshotMigrationRequired,
     #[error("unknown or revoked private session")]
     UnknownSession,
     #[error("private session signature is invalid")]

@@ -20,10 +20,26 @@ truthful without reconstructing private journal contents in the browser.
 
 ## State compatibility
 
-The field uses a Serde default of zero. Existing snapshots therefore restore
-without transformation and all existing open orders begin with zero historical
-fills unless their pre-cutover fill quantity is reconstructed during the
-controlled replay check. New matches update the field deterministically.
+The field uses a Serde default so existing snapshot plaintext remains
+decodable. Decoding alone is not sufficient: adding the field also changes the
+canonical book bytes committed into the private-core state root.
+
+The measured migration therefore:
+
+1. Computes and verifies the exact pre-`filled_micros` book serialization
+   against the snapshot's committed state root.
+2. Rejects the snapshot if neither the current nor the exact legacy root
+   matches.
+3. Reconstructs cumulative fills deterministically:
+   - `FILLED` orders use their original quantity;
+   - GTC/GTD orders use `quantity - remaining`;
+   - rejected and unfilled cancelled FAK/FOK orders use zero.
+4. Fails closed with `SnapshotMigrationRequired` for a historical partially
+   filled FAK/FOK order because its discarded remainder cannot be inferred
+   truthfully.
+
+The legacy-root path is used only during restore. All snapshots and state roots
+emitted after migration include `filled_micros`.
 
 No ledger account, hold, position, collateral, fee, withdrawal, resolution, or
 reward balance is changed by this field. It is order-history state only.
@@ -32,7 +48,8 @@ reward balance is changed by this field. It is order-history state only.
 
 1. Freeze new order submission and drain in-flight commands.
 2. Retain the immutable pre-cutover snapshot and journal head.
-3. Restore the snapshot into the candidate EIF and verify its state root.
+3. Restore the snapshot into the candidate EIF, verify its exact legacy state
+   root and reconstruct deterministic cumulative fills.
 4. Require the pre-cutover book to contain no partially-filled active order.
    If one exists, cancel it through the normal authenticated path and reconcile
    its position, released hold, and signed fill artifacts before proceeding.
@@ -42,6 +59,10 @@ reward balance is changed by this field. It is order-history state only.
    replay state roots.
 7. Rotate PCR0, the signed release manifest, and KMS attestation policy as one
    release before capped traffic resumes.
+
+The release gate includes
+`restores_legacy_book_root_and_reconstructs_deterministic_fill_history` and
+`rejects_legacy_fak_partial_fill_that_cannot_be_reconstructed`.
 
 ## Rollback plan
 

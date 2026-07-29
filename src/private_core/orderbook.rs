@@ -178,6 +178,52 @@ fn opposite_outcome(outcome: Outcome) -> Outcome {
     }
 }
 
+#[cfg(test)]
+mod legacy_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_book_bytes_match_the_pre_fill_history_schema_exactly() {
+        let order_id = Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap();
+        let market_id = "layrs:v3:ZEN:15m:legacy-golden";
+        let mut book = PriceTimeBook::default();
+        book.submit(
+            BookOrder::with_id(
+                order_id,
+                "usr_golden",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                400_000,
+                1_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+            1_000,
+        )
+        .unwrap();
+        let books = BTreeMap::from([(market_id.to_owned(), book)]);
+        let encoded = String::from_utf8(serialize_legacy_books(&books).unwrap()).unwrap();
+
+        assert_eq!(
+            encoded,
+            concat!(
+                "{\"layrs:v3:ZEN:15m:legacy-golden\":{\"orders\":{",
+                "\"11111111-2222-4333-8444-555555555555\":{",
+                "\"order_id\":\"11111111-2222-4333-8444-555555555555\",",
+                "\"private_user_id\":\"usr_golden\",",
+                "\"market_id\":\"layrs:v3:ZEN:15m:legacy-golden\",",
+                "\"outcome\":\"UP\",\"action\":\"BUY\",\"price_micros\":400000,",
+                "\"quantity_micros\":\"1000000\",\"remaining_micros\":\"1000000\",",
+                "\"time_in_force\":\"GTC\",\"expires_at_millis\":null,",
+                "\"sequence\":1,\"status\":\"OPEN\"}},",
+                "\"active\":[\"11111111-2222-4333-8444-555555555555\"],",
+                "\"sequence\":1}}"
+            )
+        );
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatchResult {
     pub accepted_order: Option<BookOrder>,
@@ -193,7 +239,110 @@ pub struct PriceTimeBook {
     sequence: u64,
 }
 
+#[derive(Serialize)]
+struct LegacyBookOrder<'a> {
+    order_id: &'a Uuid,
+    private_user_id: &'a str,
+    market_id: &'a str,
+    outcome: Outcome,
+    action: OrderAction,
+    price_micros: u64,
+    #[serde(with = "super::decimal_u128")]
+    quantity_micros: u128,
+    #[serde(with = "super::decimal_u128")]
+    remaining_micros: u128,
+    time_in_force: TimeInForce,
+    expires_at_millis: Option<i64>,
+    sequence: u64,
+    status: OrderStatus,
+}
+
+#[derive(Serialize)]
+struct LegacyPriceTimeBook<'a> {
+    orders: BTreeMap<&'a Uuid, LegacyBookOrder<'a>>,
+    active: &'a BTreeSet<Uuid>,
+    sequence: u64,
+}
+
+/// Serializes the exact pre-`filled_micros` book shape used in the committed
+/// state root. This is intentionally private to snapshot migration; live state
+/// roots always include cumulative fill history.
+pub(crate) fn serialize_legacy_books(
+    books: &BTreeMap<String, PriceTimeBook>,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let legacy: BTreeMap<&str, LegacyPriceTimeBook<'_>> = books
+        .iter()
+        .map(|(market_id, book)| {
+            let orders = book
+                .orders
+                .iter()
+                .map(|(order_id, order)| {
+                    (
+                        order_id,
+                        LegacyBookOrder {
+                            order_id: &order.order_id,
+                            private_user_id: &order.private_user_id,
+                            market_id: &order.market_id,
+                            outcome: order.outcome,
+                            action: order.action,
+                            price_micros: order.price_micros,
+                            quantity_micros: order.quantity_micros,
+                            remaining_micros: order.remaining_micros,
+                            time_in_force: order.time_in_force,
+                            expires_at_millis: order.expires_at_millis,
+                            sequence: order.sequence,
+                            status: order.status,
+                        },
+                    )
+                })
+                .collect();
+            (
+                market_id.as_str(),
+                LegacyPriceTimeBook {
+                    orders,
+                    active: &book.active,
+                    sequence: book.sequence,
+                },
+            )
+        })
+        .collect();
+    serde_json::to_vec(&legacy)
+}
+
 impl PriceTimeBook {
+    /// Reconstructs cumulative fill history when restoring a snapshot produced
+    /// before `filled_micros` existed. FAK/FOK partial fills cannot be inferred
+    /// after their remainder was discarded, so those snapshots fail closed
+    /// instead of publishing invented history.
+    pub(crate) fn migrate_legacy_fill_history(&mut self) -> CoreResult<()> {
+        for order in self.orders.values_mut() {
+            if order.filled_micros != 0 {
+                continue;
+            }
+            order.filled_micros = match order.status {
+                OrderStatus::Filled => order.quantity_micros,
+                OrderStatus::PartiallyFilled
+                    if matches!(order.time_in_force, TimeInForce::Fak | TimeInForce::Fok) =>
+                {
+                    return Err(CoreError::SnapshotMigrationRequired);
+                }
+                OrderStatus::Open | OrderStatus::PartiallyFilled | OrderStatus::Cancelled
+                    if matches!(order.time_in_force, TimeInForce::Gtc | TimeInForce::Gtd) =>
+                {
+                    order
+                        .quantity_micros
+                        .checked_sub(order.remaining_micros)
+                        .ok_or(CoreError::JournalChainMismatch)?
+                }
+                OrderStatus::Rejected | OrderStatus::Cancelled => 0,
+                OrderStatus::Open | OrderStatus::PartiallyFilled => {
+                    return Err(CoreError::SnapshotMigrationRequired);
+                }
+            };
+        }
+        Ok(())
+    }
+
     pub fn submit(&mut self, mut incoming: BookOrder, now_millis: i64) -> CoreResult<MatchResult> {
         self.validate(&incoming, now_millis)?;
         if self.orders.contains_key(&incoming.order_id) {
