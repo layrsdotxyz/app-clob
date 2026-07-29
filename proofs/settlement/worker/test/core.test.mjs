@@ -5,6 +5,7 @@ import {
   artifactPrefix,
   buildProofInput,
   classifyFailure,
+  proofLeaseRecoveryStatus,
   retryDelaySeconds,
 } from "../core.mjs";
 
@@ -60,4 +61,11 @@ test("artifact keys bind market, version, and settlement", () => {
   const second = artifactPrefix("market-b", `0x${"11".repeat(32)}`);
   assert.notEqual(first, second);
   assert.match(first, /layrs\.zk\.settlement\.v1/);
+});
+
+test("expired proof leases recover without ambiguous resubmission", () => {
+  assert.equal(proofLeaseRecoveryStatus("PROVING"), "PENDING");
+  assert.equal(proofLeaseRecoveryStatus("ATTESTING"), "SUBMITTED");
+  assert.equal(proofLeaseRecoveryStatus("SUBMITTING"), "MANUAL_REVIEW");
+  assert.equal(proofLeaseRecoveryStatus("ATTESTED"), null);
 });

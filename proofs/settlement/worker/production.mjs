@@ -134,6 +134,39 @@ async function claim(database) {
   return result.rows[0] ? { ...result.rows[0], owner } : null;
 }
 
+async function recoverExpiredLeases(database) {
+  const result = await database.query(
+    `UPDATE layrsv2.zk_settlement_proof_jobs
+        SET status=CASE status
+              WHEN 'PROVING' THEN 'PENDING'
+              WHEN 'SUBMITTING' THEN 'MANUAL_REVIEW'
+              WHEN 'ATTESTING' THEN 'SUBMITTED'
+              ELSE status
+            END,
+            next_attempt_at=CASE
+              WHEN status IN ('PROVING','ATTESTING') THEN now()
+              ELSE next_attempt_at
+            END,
+            lease_owner=NULL,
+            lease_until=NULL,
+            last_error_code=CASE
+              WHEN status='SUBMITTING' THEN 'PROOF_SUBMISSION_LEASE_EXPIRED_AMBIGUOUS'
+              ELSE 'PROOF_LEASE_EXPIRED_RECOVERED'
+            END,
+            updated_at=now()
+      WHERE status IN ('PROVING','SUBMITTING','ATTESTING')
+        AND lease_until < now()
+    RETURNING market_id,status,last_error_code`,
+  );
+  for (const row of result.rows) {
+    log("zk_settlement_proof_lease_recovered", {
+      marketId: row.market_id,
+      status: row.status,
+      code: row.last_error_code,
+    });
+  }
+}
+
 async function heartbeat(database, job) {
   const result = await database.query(
     `UPDATE layrsv2.zk_settlement_proof_jobs
@@ -572,6 +605,7 @@ async function main() {
     signer: chain.signer.address,
   });
   try {
+    await recoverExpiredLeases(database);
     await auditBacklog(database);
     while (!stopping) {
       const job = await claim(database);

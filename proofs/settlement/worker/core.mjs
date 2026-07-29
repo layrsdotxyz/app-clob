@@ -4,6 +4,11 @@ export const PROOF_PROGRAM_VERSION = "layrs.zk.settlement.v1";
 export const PROOF_INPUT_MAX_BYTES = 128 * 1024;
 export const PROOF_LEASE_MILLIS = 2 * 60 * 60 * 1000;
 export const PROOF_MAX_ATTEMPTS = 8;
+export const PROOF_LEASE_RECOVERY = Object.freeze({
+  PROVING: "PENDING",
+  SUBMITTING: "MANUAL_REVIEW",
+  ATTESTING: "SUBMITTED",
+});
 const OBSERVATION_DOMAIN = Buffer.from(
   "6c617972732e7a6b2e626f756e646172792d6f62736572766174696f6e732e763100",
   "hex",
@@ -107,6 +112,10 @@ function signedI64(value) {
 export function retryDelaySeconds(attempt) {
   if (!Number.isSafeInteger(attempt) || attempt < 1) throw new Error("INVALID_ATTEMPT");
   return Math.min(3_600, 2 ** Math.min(attempt + 3, 12));
+}
+
+export function proofLeaseRecoveryStatus(status) {
+  return PROOF_LEASE_RECOVERY[status] ?? null;
 }
 
 export function classifyFailure(error, attempt) {
