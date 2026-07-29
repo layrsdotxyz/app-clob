@@ -365,6 +365,14 @@ fn mint_then_merge_conserves_collateral_and_charges_only_the_taker() {
     assert_eq!(mint_result.fills[0].match_type, MatchType::Mint);
     assert_eq!(mint_result.fills[0].taker_price_micros(), 600_000);
     assert_eq!(mint.audit_fills[0].statement.price_micros, 600_000);
+    assert_eq!(
+        mint.audit_fills[0].statement.outcome.as_deref(),
+        Some("DOWN")
+    );
+    assert_eq!(
+        mint.audit_fills[0].statement.match_type.as_deref(),
+        Some("MINT")
+    );
 
     let collateral = market_collateral();
     let fee = AccountKey::new("layrs", AccountBucket::FeeRevenue, "ZEN");
@@ -421,6 +429,14 @@ fn mint_then_merge_conserves_collateral_and_charges_only_the_taker() {
     assert_eq!(merge_result.fills[0].match_type, MatchType::Merge);
     assert_eq!(merge_result.fills[0].taker_price_micros(), 600_000);
     assert_eq!(merge.audit_fills[0].statement.price_micros, 600_000);
+    assert_eq!(
+        merge.audit_fills[0].statement.outcome.as_deref(),
+        Some("DOWN")
+    );
+    assert_eq!(
+        merge.audit_fills[0].statement.match_type.as_deref(),
+        Some("MERGE")
+    );
 
     assert_eq!(core.balance(&collateral), 0);
     assert_eq!(core.balance(&claim(&up_owner, Outcome::Up)), 0);

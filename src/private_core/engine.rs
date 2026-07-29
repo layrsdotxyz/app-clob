@@ -304,6 +304,12 @@ pub struct AuditFillStatement {
     pub seller_one_time_pseudonym: String,
     pub quantity_atomic: String,
     pub price_micros: u64,
+    /// Privacy-safe public quote metadata. Optional so audit artifacts created
+    /// before the quote-feed cutover remain verifiable byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_type: Option<String>,
     pub fee_atomic: String,
     pub nonce: String,
 }
@@ -400,6 +406,8 @@ struct AuditFillDraft {
     seller_private_user_id: String,
     quantity_atomic: u128,
     price_micros: u64,
+    outcome: String,
+    match_type: String,
     fee_atomic: u128,
     nonce: u64,
 }
@@ -1874,6 +1882,8 @@ impl PrivateTradingCore {
             seller_private_user_id,
             quantity_atomic: quantity,
             price_micros: fill_price_micros,
+            outcome: outcome_name(execution.view.outcome).into(),
+            match_type: "NORMAL".into(),
             fee_atomic: taker_fee,
             nonce: next_sequence,
         };
@@ -3636,6 +3646,13 @@ fn native_audit_drafts(
                 seller_private_user_id: seller,
                 quantity_atomic: fill.quantity_micros,
                 price_micros: taker_price_micros,
+                outcome: outcome_name(fill.outcome).into(),
+                match_type: match fill.match_type {
+                    MatchType::Normal => "NORMAL",
+                    MatchType::Mint => "MINT",
+                    MatchType::Merge => "MERGE",
+                }
+                .into(),
                 fee_atomic: settlement_atomic(market, ceil_bps(fill_notional, 20)?)?,
                 nonce: fill.sequence,
             })
@@ -3708,6 +3725,8 @@ fn signed_audit_fills(
                 ),
                 quantity_atomic: draft.quantity_atomic.to_string(),
                 price_micros: draft.price_micros,
+                outcome: Some(draft.outcome),
+                match_type: Some(draft.match_type),
                 fee_atomic: draft.fee_atomic.to_string(),
                 nonce: draft.nonce.to_string(),
             };
@@ -3986,7 +4005,10 @@ fn validate_withdrawal(
     destination: &str,
 ) -> CoreResult<()> {
     if amount == 0
-        || !matches!((chain, asset), ("base", "USDC") | ("horizen", "ZEN"))
+        || !matches!(
+            (chain, asset),
+            ("base", "USDC") | ("base", "ZEN") | ("horizen", "ZEN")
+        )
         || !destination.starts_with("0x")
         || destination.len() != 42
         || !destination[2..]
@@ -4117,7 +4139,10 @@ fn withdrawal_reservation_marker(
 ) -> CoreResult<String> {
     if session_id.is_empty()
         || session_id.len() > 128
-        || !matches!((chain, asset), ("base", "USDC") | ("horizen", "ZEN"))
+        || !matches!(
+            (chain, asset),
+            ("base", "USDC") | ("base", "ZEN") | ("horizen", "ZEN")
+        )
         || !amount_atomic.bytes().all(|byte| byte.is_ascii_digit())
     {
         return Err(CoreError::InvalidOrder(

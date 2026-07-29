@@ -501,6 +501,8 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
     assert_eq!(audit.statement.chain, "horizen");
     assert_eq!(audit.statement.market_id, market_id);
     assert_eq!(audit.statement.price_micros, 400_000);
+    assert_eq!(audit.statement.outcome.as_deref(), Some("UP"));
+    assert_eq!(audit.statement.match_type.as_deref(), Some("NORMAL"));
     assert_eq!(audit.statement.quantity_atomic, "1000000");
     assert_ne!(
         audit.statement.buyer_one_time_pseudonym,
@@ -717,6 +719,7 @@ fn native_clob_partial_fill_locks_remainder_and_cancel_releases_once() {
             assert_eq!(result.fills.len(), 1);
             let accepted = result.accepted_order.unwrap();
             assert_eq!(accepted.status, OrderStatus::PartiallyFilled);
+            assert_eq!(accepted.filled_micros, 400_000);
             assert_eq!(accepted.remaining_micros, 600_000);
             accepted
         }
@@ -1647,6 +1650,76 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
             "USDC"
         )),
         0
+    );
+}
+
+#[test]
+fn base_zen_bridge_back_withdrawal_is_reserved_and_authorized_by_the_enclave() {
+    let user = SigningKey::from_bytes(&[42u8; 32]);
+    let journal_key = [43u8; 32];
+    let identity_commitment = [44u8; 32];
+    let private_user = derived_private_user(journal_key, identity_commitment);
+    let mut core = PrivateTradingCore::new(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([45u8; 48]),
+    );
+    core.register_session(
+        "sys:session:base-zen-withdrawal".into(),
+        "session:base-zen-withdrawal".into(),
+        identity_commitment,
+        user.verifying_key().to_bytes(),
+        10_000,
+        1_000,
+    )
+    .unwrap();
+    core.apply_user_external_flow(
+        "sys:deposit:base-zen-withdrawal".into(),
+        identity_commitment,
+        "ZEN".into(),
+        AccountBucket::UserAvailable,
+        1_000_000_000_000_000_000,
+        ExternalFlowDirection::Inflow,
+        [46u8; 32],
+        1_100,
+    )
+    .unwrap();
+
+    let response = execute_signed_response(
+        &mut core,
+        &user,
+        "session:base-zen-withdrawal",
+        1,
+        "cmd:base-zen-withdrawal",
+        UserCommandAction::RequestWithdrawal {
+            withdrawal_id: uuid::Uuid::from_u128(47),
+            chain: "base".into(),
+            asset: "ZEN".into(),
+            amount_atomic: 1_000_000_000_000_000_000,
+            destination: "0x1111111111111111111111111111111111111111".into(),
+        },
+        1_200,
+    );
+    let authorization = response.withdrawal_authorization.unwrap();
+
+    assert_eq!(authorization.intent.chain, "base");
+    assert_eq!(authorization.intent.asset, "ZEN");
+    core.validate_withdrawal_intent(&authorization.intent)
+        .unwrap();
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &private_user,
+            AccountBucket::UserAvailable,
+            "ZEN"
+        )),
+        0
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &private_user,
+            AccountBucket::UserWithdrawalHold,
+            "ZEN"
+        )),
+        1_000_000_000_000_000_000
     );
 }
 

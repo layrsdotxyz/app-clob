@@ -247,6 +247,16 @@ fn validate_fill(artifact: &SignedAuditFillArtifact) -> Result<ValidatedFill, St
     if statement.protocol_version != "layrs.audit-fill.v1" {
         return Err("INVALID_AUDIT_PROTOCOL".into());
     }
+    if !matches!(
+        statement.outcome.as_deref(),
+        None | Some("UP") | Some("DOWN")
+    ) || !matches!(
+        statement.match_type.as_deref(),
+        None | Some("NORMAL") | Some("MINT") | Some("MERGE")
+    ) || statement.outcome.is_some() != statement.match_type.is_some()
+    {
+        return Err("INVALID_AUDIT_QUOTE_METADATA".into());
+    }
     let market = fixed_bytes::<32>(&statement.market_id_bytes32, "INVALID_MARKET_ID")?;
     if market != keccak256(statement.market_id.as_bytes()) {
         return Err("MARKET_ID_HASH_MISMATCH".into());
@@ -399,6 +409,8 @@ mod tests {
                 seller_one_time_pseudonym: "0x2222222222222222222222222222222222222222".into(),
                 quantity_atomic: "1000000".into(),
                 price_micros: 510000,
+                outcome: Some("UP".into()),
+                match_type: Some("NORMAL".into()),
                 fee_atomic: "102".into(),
                 nonce: "7".into(),
             },

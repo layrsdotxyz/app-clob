@@ -64,6 +64,12 @@ pub struct BookOrder {
     pub price_micros: u64,
     #[serde(with = "super::decimal_u128")]
     pub quantity_micros: u128,
+    /// Cumulative executed quantity. This is persisted explicitly because a
+    /// cancelled FAK/FOK remainder is no longer represented by
+    /// `remaining_micros`, so `quantity - remaining` is not a safe fill
+    /// calculation for historical orders.
+    #[serde(default, with = "super::decimal_u128")]
+    pub filled_micros: u128,
     #[serde(with = "super::decimal_u128")]
     pub remaining_micros: u128,
     pub time_in_force: TimeInForce,
@@ -116,6 +122,7 @@ impl BookOrder {
             action,
             price_micros,
             quantity_micros,
+            filled_micros: 0,
             remaining_micros: quantity_micros,
             time_in_force,
             expires_at_millis,
@@ -218,7 +225,15 @@ impl PriceTimeBook {
                 .expect("active candidate must exist");
             let quantity = incoming.remaining_micros.min(maker.remaining_micros);
             incoming.remaining_micros -= quantity;
+            incoming.filled_micros = incoming
+                .filled_micros
+                .checked_add(quantity)
+                .ok_or_else(|| CoreError::InvalidOrder("filled quantity overflow".into()))?;
             maker.remaining_micros -= quantity;
+            maker.filled_micros = maker
+                .filled_micros
+                .checked_add(quantity)
+                .ok_or_else(|| CoreError::InvalidOrder("filled quantity overflow".into()))?;
             maker.status = if maker.remaining_micros == 0 {
                 OrderStatus::Filled
             } else {
