@@ -1,6 +1,6 @@
 use clob_service::private_core::{
     command_request_hash, signing_payload, AccountBucket, AccountKey, BookOrder, CommandResult,
-    ExternalFlowDirection, JournalKey, MarketConfig, MarketExecution, MatchType, OrderAction,
+    ExternalFlowDirection, Fill, JournalKey, MarketConfig, MarketExecution, MatchType, OrderAction,
     OrderStatus, Outcome, PriceTimeBook, PrivateTradingCore, ReceiptSigner, SessionRequest,
     SignedSessionRequest, TimeInForce, UserCommand, UserCommandAction,
 };
