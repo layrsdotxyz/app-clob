@@ -1,7 +1,8 @@
 use clob_service::private_core::{
-    command_request_hash, signing_payload, AccountBucket, AccountKey, BookOrder, CommandResult,
-    ExternalFlowDirection, JournalKey, MarketConfig, MarketExecution, MatchType, OrderAction,
-    OrderStatus, Outcome, PriceTimeBook, PrivateTradingCore, ReceiptSigner, SessionRequest,
+    command_request_hash, resolution_signing_payload, signing_payload, AccountBucket, AccountKey,
+    BookOrder, BoundaryEvidence, CommandResult, ExternalFlowDirection, JournalKey, MarketConfig,
+    MarketExecution, MatchType, OrderAction, OrderStatus, Outcome, PriceTimeBook,
+    PrivateTradingCore, ReceiptSigner, ResolutionStatement, SessionRequest, SignedResolution,
     SignedSessionRequest, TimeInForce, UserCommand, UserCommandAction,
 };
 use ed25519_dalek::{Signer, SigningKey};
@@ -382,6 +383,20 @@ fn mint_then_merge_conserves_collateral_and_charges_only_the_taker() {
     assert_eq!(core.balance(&claim(&up_owner, Outcome::Down)), 0);
     assert_eq!(core.balance(&claim(&down_owner, Outcome::Up)), 0);
     assert_eq!(core.balance(&fee), 1_200_000_000_000_000);
+    let readiness = core.market_settlement_readiness(MARKET_ID, 1_075).unwrap();
+    assert_eq!(readiness.collateral_atomic, ONE_ZEN);
+    assert_eq!(readiness.up_liability_atomic, ONE_ZEN);
+    assert_eq!(readiness.down_liability_atomic, ONE_ZEN);
+    assert_eq!(readiness.push_liability_atomic, ONE_ZEN);
+    assert_eq!(readiness.active_order_count, 0);
+    assert!(
+        readiness.cancellation_ready,
+        "cancellation failed: {:?}",
+        readiness.cancellation_error
+    );
+    assert!(readiness.up_solvent);
+    assert!(readiness.down_solvent);
+    assert!(readiness.push_solvent);
 
     execute(
         &mut core,
@@ -580,6 +595,105 @@ proptest! {
     }
 }
 
+#[test]
+fn live_shape_partial_mint_is_ready_for_resolution_after_cancelling_remainder() {
+    let (mut core, up_key, down_key, up_owner, down_owner) = configured_core();
+    execute(
+        &mut core,
+        &up_key,
+        "session:up",
+        1,
+        "cmd:live-shape-maker",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::with_id(
+                Uuid::from_u128(700),
+                "ignored",
+                MARKET_ID,
+                Outcome::Up,
+                OrderAction::Buy,
+                150_000,
+                1_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_000,
+    );
+    let mint = execute(
+        &mut core,
+        &down_key,
+        "session:down",
+        1,
+        "cmd:live-shape-taker",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::with_id(
+                Uuid::from_u128(701),
+                "ignored",
+                MARKET_ID,
+                Outcome::Down,
+                OrderAction::Buy,
+                850_000,
+                588_235,
+                TimeInForce::Fok,
+                None,
+            ),
+        },
+        1_050,
+    );
+    assert_eq!(
+        order_result(&mint.result).fills[0].match_type,
+        MatchType::Mint
+    );
+
+    let readiness = core.market_settlement_readiness(MARKET_ID, 2_001).unwrap();
+    assert_eq!(readiness.active_order_count, 1);
+    assert!(
+        readiness.cancellation_ready,
+        "cancellation failed: {:?}",
+        readiness.cancellation_error
+    );
+    assert_eq!(readiness.up_claim_quantity_micros, 588_235);
+    assert_eq!(readiness.down_claim_quantity_micros, 588_235);
+    assert_eq!(readiness.collateral_atomic, 588_235_000_000_000_000);
+    assert_eq!(readiness.down_liability_atomic, readiness.collateral_atomic);
+    assert!(readiness.up_solvent);
+    assert!(readiness.down_solvent);
+    assert!(readiness.push_solvent);
+
+    let oracle = SigningKey::from_bytes(&[39u8; 32]);
+    let boundary = |end: i64, price: i64, marker: u8| BoundaryEvidence {
+        window_start_micros: end * 1_000 - 5_000_000,
+        window_end_micros: end * 1_000,
+        median_price_e8: price,
+        sample_count: 25,
+        minimum_publisher_count: 3,
+        signed_payload_commitment: [marker; 32],
+    };
+    let statement = ResolutionStatement {
+        market_id: MARKET_ID.into(),
+        oracle_feed_id: 245,
+        opening: boundary(900, 1_000_000_000, 40),
+        closing: boundary(2_000, 900_000_000, 41),
+        issued_at_millis: 2_001,
+    };
+    let signature = oracle
+        .sign(&resolution_signing_payload(&statement).unwrap())
+        .to_bytes()
+        .to_vec();
+    core.resolve_market(
+        "sys:resolve:live-shape".into(),
+        SignedResolution {
+            statement,
+            signature,
+        },
+        2_001,
+    )
+    .unwrap();
+    assert!(core.market_resolution(MARKET_ID).is_some());
+    assert_eq!(core.balance(&claim(&up_owner, Outcome::Up)), 0);
+    assert_eq!(core.balance(&claim(&down_owner, Outcome::Down)), 0);
+}
+
 fn configured_core() -> (PrivateTradingCore, SigningKey, SigningKey, String, String) {
     let journal_key = [31u8; 32];
     let up_key = SigningKey::from_bytes(&[32u8; 32]);
@@ -588,10 +702,13 @@ fn configured_core() -> (PrivateTradingCore, SigningKey, SigningKey, String, Str
     let down_commitment = [35u8; 32];
     let up_owner = derived_private_user(journal_key, up_commitment);
     let down_owner = derived_private_user(journal_key, down_commitment);
-    let mut core = PrivateTradingCore::new(
+    let oracle = SigningKey::from_bytes(&[39u8; 32]);
+    let mut core = PrivateTradingCore::new_with_oracle(
         JournalKey::from_bytes(journal_key),
         ReceiptSigner::generate([36u8; 48]),
-    );
+        oracle.verifying_key().to_bytes(),
+    )
+    .unwrap();
     core.register_market(
         "sys:market:complete-set".into(),
         MarketConfig {
