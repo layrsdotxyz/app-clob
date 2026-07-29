@@ -423,6 +423,24 @@ impl Ledger {
             .collect()
     }
 
+    /// Returns claims that resolution must consume. This remains enclave-local:
+    /// callers may aggregate it for diagnostics but must never expose owners.
+    /// Order holds are included because resolution first cancels every resting
+    /// order and returns those claims to the corresponding position account.
+    pub fn claims_for_market(&self, market_id: &str) -> Vec<(AccountKey, u128)> {
+        self.balances
+            .iter()
+            .filter(|(account, amount)| {
+                (account.bucket == AccountBucket::UserPosition
+                    || (account.bucket == AccountBucket::UserOrderHold
+                        && account.asset.starts_with("CLAIM:")))
+                    && account.market_id.as_deref() == Some(market_id)
+                    && **amount > 0
+            })
+            .map(|(account, amount)| (account.clone(), *amount))
+            .collect()
+    }
+
     pub fn balances_for_owner(&self, owner: &str) -> Vec<(AccountKey, u128)> {
         self.balances
             .iter()
