@@ -1,7 +1,7 @@
 # 2026-07-29 — explicit cumulative order fill history
 
 SNAPSHOT_SCHEMA_CHANGE_APPROVED: true
-BASE_RELEASE_COMMIT: abdf6843f8dd7173b0f3b88e797ab3af65422bb3
+BASE_RELEASE_COMMIT: 2b85c2aaa6143395e69c5deea2f7423356a15cd0
 PRODUCTION_REPLAY_PLAN: true
 ROLLBACK_PLAN: true
 
@@ -24,17 +24,23 @@ The field uses a Serde default so existing snapshot plaintext remains
 decodable. Decoding alone is not sufficient: adding the field also changes the
 canonical book bytes committed into the private-core state root.
 
-The measured migration therefore:
+The production checkpoint was emitted by release
+`2b85c2aaa6143395e69c5deea2f7423356a15cd0`. That release also predates
+private reward accounting, so its state root does not contain a serialized
+`private_rewards` component. The measured migration therefore:
 
 1. Computes and verifies the exact pre-`filled_micros` book serialization
    against the snapshot's committed state root.
-2. Rejects the snapshot if neither the current nor the exact legacy root
-   matches.
-3. Reconstructs cumulative fills deterministically:
+2. Reproduces both the later complete-set lineage and the exact production
+   lineage, including omission of the not-yet-existent private reward
+   component.
+3. Rejects the snapshot if the current root and both approved legacy roots
+   fail to match.
+4. Reconstructs cumulative fills deterministically:
    - `FILLED` orders use their original quantity;
    - GTC/GTD orders use `quantity - remaining`;
    - rejected and unfilled cancelled FAK/FOK orders use zero.
-4. Fails closed with `SnapshotMigrationRequired` for a historical partially
+5. Fails closed with `SnapshotMigrationRequired` for a historical partially
    filled FAK/FOK order because its discarded remainder cannot be inferred
    truthfully.
 
@@ -62,13 +68,14 @@ reward balance is changed by this field. It is order-history state only.
 
 The release gate includes
 `restores_legacy_book_root_and_reconstructs_deterministic_fill_history` and
+`restores_actual_production_lineage_without_private_reward_root` and
 `rejects_legacy_fak_partial_fill_that_cannot_be_reconstructed`.
 
 ## Rollback plan
 
 Before accepting any command on the candidate EIF, restore the retained
 pre-cutover snapshot and the
-`abdf6843f8dd7173b0f3b88e797ab3af65422bb3` release/PCR allowlist.
+`2b85c2aaa6143395e69c5deea2f7423356a15cd0` release/PCR allowlist.
 
 After accepting commands, freeze trading and retain the candidate snapshot and
 journal. Roll back only after reconciling post-cutover orders, holds, positions,

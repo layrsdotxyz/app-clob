@@ -673,6 +673,53 @@ impl PrivateTradingCore {
         )
     }
 
+    #[cfg(test)]
+    pub fn export_production_legacy_snapshot_for_test(&self) -> CoreResult<EncryptedSnapshot> {
+        let (journal_sequence, _) = self.journal.chain_head();
+        if journal_sequence != self.sequence {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        let mut value = serde_json::to_value(CoreStateSnapshot {
+            ledger: self.ledger.clone(),
+            books: self.books.clone(),
+            markets: self.markets.clone(),
+            sessions: self.sessions.clone(),
+            processed_hashes: processed_hashes(&self.processed),
+            system_keys: self.system_keys.clone(),
+            position_cost_basis: self
+                .position_cost_basis
+                .iter()
+                .map(|(key, value)| (key.clone(), *value))
+                .collect(),
+            resolutions: self.resolutions.clone(),
+            oracle_public_key: self.oracle_public_key,
+            bootstrap_executions: self.bootstrap_executions.clone(),
+            private_rewards: self.private_rewards.clone(),
+            trading_frozen: self.trading_frozen,
+            sequence: self.sequence,
+        })
+        .map_err(|_| CoreError::JournalCrypto)?;
+        remove_json_field(&mut value, "filled_micros");
+        remove_json_field(&mut value, "private_rewards");
+        self.journal.seal_snapshot(
+            production_legacy_state_root(
+                &self.ledger,
+                &self.books,
+                &self.markets,
+                &self.sessions,
+                &processed_hashes(&self.processed),
+                &self.system_keys,
+                &self.position_cost_basis,
+                &self.resolutions,
+                &self.oracle_public_key,
+                &self.bootstrap_executions,
+                self.trading_frozen,
+                self.sequence,
+            ),
+            &value,
+        )
+    }
+
     pub fn restore_encrypted_snapshot(
         journal_key: JournalKey,
         receipt_signer: ReceiptSigner,
@@ -734,7 +781,21 @@ impl PrivateTradingCore {
                 state.trading_frozen,
                 state.sequence,
             );
-            if legacy_root != snapshot.state_root {
+            let production_legacy_root = production_legacy_state_root(
+                &state.ledger,
+                &state.books,
+                &state.markets,
+                &state.sessions,
+                &processed_hashes(&processed),
+                &state.system_keys,
+                &position_cost_basis,
+                &state.resolutions,
+                &state.oracle_public_key,
+                &state.bootstrap_executions,
+                state.trading_frozen,
+                state.sequence,
+            );
+            if legacy_root != snapshot.state_root && production_legacy_root != snapshot.state_root {
                 return Err(CoreError::JournalChainMismatch);
             }
             for book in state.books.values_mut() {
@@ -4221,6 +4282,50 @@ fn legacy_state_root(
     )
 }
 
+/// Reproduces the state-root layout used by production release
+/// `2b85c2aaa6143395e69c5deea2f7423356a15cd0`. That release predates both
+/// cumulative fill history and private reward accounting, so neither field may
+/// be introduced while verifying its encrypted checkpoint.
+#[allow(clippy::too_many_arguments)]
+fn production_legacy_state_root(
+    ledger: &Ledger,
+    books: &BTreeMap<String, PriceTimeBook>,
+    markets: &BTreeMap<String, MarketConfig>,
+    sessions: &SessionGuard,
+    processed: &BTreeMap<String, [u8; 32]>,
+    system_keys: &BTreeSet<String>,
+    position_cost_basis: &BTreeMap<PositionKey, u128>,
+    resolutions: &BTreeMap<String, MarketResolution>,
+    oracle_public_key: &Option<[u8; 32]>,
+    bootstrap_executions: &BTreeMap<Uuid, BootstrapExecution>,
+    trading_frozen: bool,
+    sequence: u64,
+) -> [u8; 32] {
+    let mut hash = Keccak::v256();
+    hash.update(b"layrs.private-trading-core.v1\0");
+    hash.update(&sequence.to_be_bytes());
+    hash.update(&[u8::from(trading_frozen)]);
+    hash.update(&ledger.state_root());
+    for value in [
+        serialize_legacy_books(books),
+        serde_json::to_vec(markets),
+        serde_json::to_vec(sessions),
+        serde_json::to_vec(processed),
+        serde_json::to_vec(system_keys),
+        serde_json::to_vec(&position_cost_basis.iter().collect::<Vec<_>>()),
+        serde_json::to_vec(resolutions),
+        serde_json::to_vec(oracle_public_key),
+        serde_json::to_vec(bootstrap_executions),
+    ] {
+        let encoded = value.expect("production legacy state serialization cannot fail");
+        hash.update(&(encoded.len() as u64).to_be_bytes());
+        hash.update(&encoded);
+    }
+    let mut output = [0u8; 32];
+    hash.finalize(&mut output);
+    output
+}
+
 #[allow(clippy::too_many_arguments)]
 fn state_root_with_serialized_books(
     ledger: &Ledger,
@@ -4377,6 +4482,67 @@ mod snapshot_migration_tests {
         assert!(orders
             .iter()
             .all(|order| order.filled_micros == order.quantity_micros));
+    }
+
+    #[test]
+    fn restores_actual_production_lineage_without_private_reward_root() {
+        let journal_key = JournalKey::from_bytes([207u8; 32]);
+        let mut core =
+            PrivateTradingCore::new(journal_key.clone(), ReceiptSigner::generate([208u8; 48]));
+        let mut book = PriceTimeBook::default();
+        let market_id = "layrs:v3:ZEN:15m:production-legacy-root";
+        book.submit(
+            BookOrder::new(
+                "maker",
+                market_id,
+                Outcome::Down,
+                OrderAction::Sell,
+                600_000,
+                2_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+            1_000,
+        )
+        .unwrap();
+        book.submit(
+            BookOrder::new(
+                "taker",
+                market_id,
+                Outcome::Down,
+                OrderAction::Buy,
+                600_000,
+                1_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+            1_001,
+        )
+        .unwrap();
+        core.books.insert(market_id.into(), book);
+
+        let current_root = core.state_root();
+        let production = core.export_production_legacy_snapshot_for_test().unwrap();
+        assert_ne!(production.state_root, current_root);
+
+        let restored = PrivateTradingCore::restore_encrypted_snapshot(
+            journal_key,
+            ReceiptSigner::generate([209u8; 48]),
+            &production,
+            0,
+        )
+        .unwrap();
+        assert_eq!(restored.state_root(), current_root);
+        let maker = restored.books[market_id]
+            .orders_for_owner("maker")
+            .pop()
+            .unwrap();
+        let taker = restored.books[market_id]
+            .orders_for_owner("taker")
+            .pop()
+            .unwrap();
+        assert_eq!(maker.filled_micros, 1_000_000);
+        assert_eq!(taker.filled_micros, 1_000_000);
     }
 
     #[test]
