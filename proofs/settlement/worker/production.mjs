@@ -30,6 +30,11 @@ import {
   retryDelaySeconds,
   sha256,
 } from "./core.mjs";
+import {
+  HORIZEN_DOMAIN_ID,
+  expectedZkVerifyLeaf,
+  requireDestinationAggregationReady,
+} from "./destination.mjs";
 
 const execFileAsync = promisify(execFile);
 const ARTIFACT_FILES = [
@@ -41,9 +46,13 @@ const ARTIFACT_FILES = [
 ];
 const ABI = [
   "function imageId() view returns (bytes32)",
+  "function zkVerify() view returns (address)",
   "function attestation(bytes32 marketIdHash) view returns (bytes32 settlementCommitment,bytes32 journalHash,bytes32 zkVerifyLeaf,bytes32 proofArtifactHash,bytes32 zkVerifyTransactionHash,uint256 aggregationId,int64 openingMedianE8,int64 closingMedianE8,uint8 outcome,uint64 attestedAt)",
   "function attestSettlement(bytes publicJournal,uint256 aggregationId,bytes32[] merklePath,uint256 leafCount,uint256 index,bytes32 proofArtifactHash,bytes32 zkVerifyTransactionHash) returns (bytes32 marketIdHash)",
   "event SettlementAttested(bytes32 indexed marketIdHash,bytes32 indexed settlementCommitment,bytes32 indexed zkVerifyLeaf,uint256 aggregationId,bytes32 journalHash,bytes32 proofArtifactHash,bytes32 zkVerifyTransactionHash,int64 openingMedianE8,int64 closingMedianE8,uint8 outcome)",
+];
+const AGGREGATION_ABI = [
+  "function verifyProofAggregation(uint256 domainId,uint256 aggregationId,bytes32 leaf,bytes32[] merklePath,uint256 leafCount,uint256 index) view returns (bool)",
 ];
 
 function required(name) {
@@ -377,6 +386,7 @@ async function attest(database, s3, bucket, job, directory, chain) {
   const merklePath = evidence.merklePath?.proof;
   const leafCount = Number(evidence.merklePath?.numberOfLeaves);
   const index = Number(evidence.merklePath?.leafIndex);
+  const evidenceLeaf = hex32(evidence.merklePath?.leaf, "zkVerify leaf");
   if (
     !Number.isSafeInteger(aggregationId) ||
     !Number.isSafeInteger(leafCount) ||
@@ -410,6 +420,22 @@ async function attest(database, s3, bucket, job, directory, chain) {
     transactionHash = event.transactionHash;
     blockNumber = event.blockNumber;
   } else {
+    const registryImageId = hex32(await chain.contract.imageId(), "registryImageId");
+    const expectedLeaf = expectedZkVerifyLeaf(journal, registryImageId);
+    if (expectedLeaf !== evidenceLeaf) {
+      throw new Error("HORIZEN_ATTESTATION_LEAF_MISMATCH");
+    }
+    const zkVerifyAddress = getAddress(await chain.contract.zkVerify());
+    const zkVerify = new Contract(zkVerifyAddress, AGGREGATION_ABI, chain.provider);
+    const destinationReady = await zkVerify.verifyProofAggregation(
+      HORIZEN_DOMAIN_ID,
+      aggregationId,
+      evidenceLeaf,
+      merklePath.map((entry) => hex32(entry, "merklePath")),
+      leafCount,
+      index,
+    );
+    requireDestinationAggregationReady(destinationReady);
     const transaction = await chain.contract.attestSettlement(
       hexlify(journal),
       aggregationId,

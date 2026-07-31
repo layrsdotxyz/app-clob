@@ -46,6 +46,7 @@ COPY --from=builder --chown=65532:65532 /root/.risc0/extensions/v2.2.0-cargo-ris
 COPY --from=builder --chown=65532:65532 /build/proofs/settlement/target/x86_64-unknown-linux-musl/release/layrs-settlement-proof-host /app/bin/layrs-settlement-proof-host
 COPY --from=builder --chown=65532:65532 /build/proofs/settlement/worker/node_modules /app/worker/node_modules
 COPY --from=builder --chown=65532:65532 /build/proofs/settlement/worker/core.mjs /app/worker/core.mjs
+COPY --from=builder --chown=65532:65532 /build/proofs/settlement/worker/destination.mjs /app/worker/destination.mjs
 COPY --from=builder --chown=65532:65532 /build/proofs/settlement/worker/production.mjs /app/worker/production.mjs
 COPY --from=builder --chown=65532:65532 /build/proofs/settlement/zkverify/node_modules /app/zkverify/node_modules
 COPY --from=builder --chown=65532:65532 /build/proofs/settlement/zkverify/submit-proof.mjs /app/zkverify/submit-proof.mjs
