@@ -1,12 +1,16 @@
 # 2026-08-01 — signed private-command receipts
 
 SNAPSHOT_SCHEMA_CHANGE_APPROVED: true
-BASE_RELEASE_COMMIT: 77d8809d02a30b8454debfba59b8b5a8d9d6e85f
+BASE_RELEASE_COMMIT: 89c37af2b21c9cc0acc1a2bc7403dc8b80f17f97
 PRODUCTION_REPLAY_PLAN: true
 ROLLBACK_PLAN: true
 
 Release owner: Layrs protocol owner, who explicitly prioritized user-verifiable
 receipts for resting and cancelled orders and privacy-safe public root batching.
+
+The production EIF at the start of this release was built from
+`77d8809d02a30b8454debfba59b8b5a8d9d6e85f`; the approval marker above records
+the exact Git comparison base required by the release compatibility guard.
 
 ## Change
 
