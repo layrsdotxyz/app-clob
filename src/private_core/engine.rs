@@ -2287,7 +2287,7 @@ impl PrivateTradingCore {
         }
         if self.trading_frozen
             && matches!(
-                command.action,
+                &command.action,
                 UserCommandAction::SubmitOrder { .. } | UserCommandAction::CompleteSet { .. }
             )
         {
@@ -2670,6 +2670,16 @@ impl PrivateTradingCore {
         let receipt = self.receipt_signer.sign(
             command.command_id,
             command.idempotency_key.clone(),
+            Some(expected_hash),
+            Some(matches!(
+                command.action,
+                UserCommandAction::SubmitOrder { .. }
+                    | UserCommandAction::CancelOrder { .. }
+                    | UserCommandAction::CompleteSet { .. }
+                    | UserCommandAction::RequestRewardClaim { .. }
+                    | UserCommandAction::CancelBootstrap { .. }
+                    | UserCommandAction::RequestWithdrawal { .. }
+            )),
             next_sequence,
             prior_root,
             next_root,
@@ -2780,6 +2790,8 @@ impl PrivateTradingCore {
         let receipt = self.receipt_signer.sign(
             command_id.into(),
             idempotency_key,
+            None,
+            None,
             self.sequence,
             prior_root,
             state_root,

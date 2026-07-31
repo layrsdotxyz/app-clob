@@ -475,25 +475,32 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
         },
         1_100,
     );
+    let buy_action = UserCommandAction::SubmitOrder {
+        order: BookOrder::new(
+            "usr_alice",
+            market_id,
+            Outcome::Up,
+            OrderAction::Buy,
+            400_000,
+            1_000_000,
+            TimeInForce::Fak,
+            None,
+        ),
+    };
     let fill_response = execute_signed_response(
         &mut core,
         &alice,
         "session:1",
         1,
         "cmd:buy",
-        UserCommandAction::SubmitOrder {
-            order: BookOrder::new(
-                "usr_alice",
-                market_id,
-                Outcome::Up,
-                OrderAction::Buy,
-                400_000,
-                1_000_000,
-                TimeInForce::Fak,
-                None,
-            ),
-        },
+        buy_action.clone(),
         1_200,
+    );
+    assert_eq!(fill_response.receipt.protocol_version, "layrs.v2");
+    assert_eq!(fill_response.receipt.publication_eligible, Some(true));
+    assert_eq!(
+        fill_response.receipt.command_commitment_sha256,
+        Some(command_request_hash("cmd:buy", "idem:cmd:buy", &buy_action).unwrap())
     );
     assert!(matches!(fill_response.result, CommandResult::Order { .. }));
     assert_eq!(fill_response.audit_fills.len(), 1);
@@ -1541,6 +1548,36 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
         UserCommandAction::Portfolio,
         1_200,
     );
+    assert_eq!(portfolio.receipt.protocol_version, "layrs.v2");
+    assert_eq!(portfolio.receipt.publication_eligible, Some(false));
+    assert_eq!(
+        portfolio.receipt.command_commitment_sha256,
+        Some(
+            command_request_hash(
+                "cmd:portfolio",
+                "idem:cmd:portfolio",
+                &UserCommandAction::Portfolio,
+            )
+            .unwrap()
+        ),
+    );
+    let mut portfolio_signed_payload = portfolio.receipt.clone();
+    let portfolio_signature = std::mem::take(&mut portfolio_signed_payload.signature);
+    VerifyingKey::from_bytes(&receipt_public_key)
+        .unwrap()
+        .verify(
+            &serde_json::to_vec(&portfolio_signed_payload).unwrap(),
+            &Signature::from_slice(&portfolio_signature).unwrap(),
+        )
+        .unwrap();
+    portfolio_signed_payload.command_commitment_sha256 = Some([0xff; 32]);
+    assert!(VerifyingKey::from_bytes(&receipt_public_key)
+        .unwrap()
+        .verify(
+            &serde_json::to_vec(&portfolio_signed_payload).unwrap(),
+            &Signature::from_slice(&portfolio_signature).unwrap(),
+        )
+        .is_err());
     match portfolio.result {
         CommandResult::Portfolio { snapshot } => {
             assert_eq!(snapshot.balances.len(), 1);
@@ -1564,6 +1601,8 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
         },
         1_300,
     );
+    assert_eq!(response.receipt.protocol_version, "layrs.v2");
+    assert_eq!(response.receipt.publication_eligible, Some(true));
     let authorization = response.withdrawal_authorization.unwrap();
     assert_eq!(authorization.intent.receipt_id, response.receipt.receipt_id);
     assert_eq!(
