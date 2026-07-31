@@ -244,6 +244,17 @@ pub struct EnclaveReceipt {
     pub receipt_id: String,
     pub command_id: String,
     pub idempotency_key: String,
+    /// SHA-256 commitment to the exact authenticated user command accepted by
+    /// the enclave. Historical v1 system receipts omit it; user-command v2
+    /// receipts always include it so a user can verify the action privately
+    /// without publishing the order or cancellation payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_commitment_sha256: Option<[u8; 32]>,
+    /// Whether this receipt represents a state-changing private command and is
+    /// therefore eligible for privacy-safe public root batching. Read-only
+    /// portfolio/status receipts remain user-verifiable but are never anchored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_eligible: Option<bool>,
     pub enclave_sequence: u64,
     pub prior_state_root: [u8; 32],
     pub state_root: [u8; 32],
@@ -282,14 +293,25 @@ impl ReceiptSigner {
         &self,
         command_id: String,
         idempotency_key: String,
+        command_commitment_sha256: Option<[u8; 32]>,
+        publication_eligible: Option<bool>,
         enclave_sequence: u64,
         prior_state_root: [u8; 32],
         state_root: [u8; 32],
         journal_hash: [u8; 32],
         occurred_at_millis: i64,
     ) -> EnclaveReceipt {
+        assert_eq!(
+            command_commitment_sha256.is_some(),
+            publication_eligible.is_some(),
+            "receipt command commitment and publication policy must be versioned together"
+        );
         let mut receipt = EnclaveReceipt {
-            protocol_version: "layrs.v1".into(),
+            protocol_version: if command_commitment_sha256.is_some() {
+                "layrs.v2".into()
+            } else {
+                "layrs.v1".into()
+            },
             receipt_id: deterministic_receipt_id(
                 &command_id,
                 &idempotency_key,
@@ -298,6 +320,8 @@ impl ReceiptSigner {
             ),
             command_id,
             idempotency_key,
+            command_commitment_sha256,
+            publication_eligible,
             enclave_sequence,
             prior_state_root,
             state_root,
