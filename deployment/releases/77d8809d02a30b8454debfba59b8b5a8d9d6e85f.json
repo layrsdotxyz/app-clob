@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "validated-ready-for-activation",
+  "releaseId": "77d8809d02a30b8454debfba59b8b5a8d9d6e85f",
+  "sourceCommit": "77d8809d02a30b8454debfba59b8b5a8d9d6e85f",
+  "sourceBranch": "hotfix/resolution-readiness-20260730",
+  "snapshotCompatibilityBase": "69b6752b34f2fe966a41c4131fda556d4a2c16d6",
+  "snapshotApproval": "enclave/snapshot-migrations/2026-07-30-resolution-readiness.md",
+  "region": "us-east-1",
+  "amiId": "ami-0cb7a3f6cc8fd5f0b",
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/77d8809d02a30b8454debfba59b8b5a8d9d6e85f",
+  "artifacts": {
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/77d8809d02a30b8454debfba59b8b5a8d9d6e85f/layrsv2-clob.eif",
+      "versionId": "s9JFKU9XK75x8ClV.kzENHXalaUAVii2",
+      "sizeBytes": 41095993,
+      "sha384": "64e17a93911488cdbbd86c2a13eed8b64b0b4ef5e67ff080ae92d397987d1ca51c77071ac02271effee277f39af79633"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/77d8809d02a30b8454debfba59b8b5a8d9d6e85f/layrs-enclave-parent",
+      "versionId": "Cg2wvcfYCHuqIen_mS1bCh3idls1jKhG",
+      "sizeBytes": 1229824,
+      "sha384": "28c3b36b86b69da74c5fa9d56c9286d021084fcaa189585ce5607dc2a4fb867bb7966037f4ad9be6f5bcc94d0f90a3fe"
+    },
+    "measurements": {
+      "path": "build/layrsv2-clob-measurements.json",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/77d8809d02a30b8454debfba59b8b5a8d9d6e85f/layrsv2-clob-measurements.json",
+      "versionId": "FK.xKyMmlvlr7t5T8YmXUvnTneI8C5us",
+      "sizeBytes": 402,
+      "sha384": "cd21af8e6514463eb79fff7fc39cf35d4f1294d10cf306ce2237d326e29401fd44626d5ab9d1043375c8a200317756b4"
+    },
+    "checksums": {
+      "path": "build/layrsv2-host-artifacts.sha384",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/77d8809d02a30b8454debfba59b8b5a8d9d6e85f/layrsv2-host-artifacts.sha384",
+      "versionId": "UFiu357W_PCP2B9kMAmDbUge.BPnVsS3",
+      "sizeBytes": 246,
+      "sha384": "1805046c2b2a9a79a0a4ad6a304056a76a28d61369f14dc125441942c01fa29eac44042c5a88b5765935c392d1e96e8c"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "6b4f958a33f5def69ffcebb69ebaf6017c9d191c19f14bf37b29bf369ceb183188f55bf5309a2b25e0d9366b7be59c14",
+    "pcr1": "0343b056cd8485ca7890ddd833476d78460aed2aa161548e4e26bedf321726696257d623e8805f3f605946b3d8b0c6aa",
+    "pcr2": "2686a9c95f0d5534819a6133eb9e791a36c34aee6d939cc54fb433de18657f172690bd44f9abacb74fdabc2ac55de30e"
+  },
+  "objectLock": {
+    "mode": "COMPLIANCE",
+    "retainUntilAtLeast": "2026-08-30T00:00:00+00:00"
+  },
+  "activation": null,
+  "signature": null,
+  "signatureNote": "Candidate is a snapshot-compatible hotfix from the currently deployed release. It changes complete-set residual cancellation arithmetic and adds a cloned-state resolution-readiness query without changing serialized state, state-root material, journal AAD, snapshot AAD or receipt semantics. Activation remains gated on exact PCR and signed manifest rotation, successful snapshot replay, readiness preflight, controlled settlement retry and post-cutover reconciliation."
+}

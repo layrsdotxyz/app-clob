@@ -274,6 +274,31 @@ pub struct PortfolioSnapshot {
     pub as_of_millis: i64,
 }
 
+/// Privacy-safe aggregate preflight for a market settlement. It deliberately
+/// excludes owners, orders, balances and position mappings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketSettlementReadiness {
+    pub market_id: String,
+    #[serde(with = "super::decimal_u128")]
+    pub collateral_atomic: u128,
+    #[serde(with = "super::decimal_u128")]
+    pub up_claim_quantity_micros: u128,
+    #[serde(with = "super::decimal_u128")]
+    pub down_claim_quantity_micros: u128,
+    #[serde(with = "super::decimal_u128")]
+    pub up_liability_atomic: u128,
+    #[serde(with = "super::decimal_u128")]
+    pub down_liability_atomic: u128,
+    #[serde(with = "super::decimal_u128")]
+    pub push_liability_atomic: u128,
+    pub active_order_count: usize,
+    pub cancellation_ready: bool,
+    pub cancellation_error: Option<String>,
+    pub up_solvent: bool,
+    pub down_solvent: bool,
+    pub push_solvent: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WithdrawalIntent {
     pub protocol_version: String,
@@ -595,6 +620,97 @@ impl PrivateTradingCore {
     /// original response.
     pub fn market_resolution(&self, market_id: &str) -> Option<MarketResolution> {
         self.resolutions.get(market_id).cloned()
+    }
+
+    pub fn market_settlement_readiness(
+        &self,
+        market_id: &str,
+        now_millis: i64,
+    ) -> CoreResult<MarketSettlementReadiness> {
+        let market = self
+            .markets
+            .get(market_id)
+            .ok_or_else(|| CoreError::InvalidResolution("unknown market".into()))?;
+        let mut ledger = self.ledger.clone();
+        let mut books = self.books.clone();
+        let mut active_order_count = 0usize;
+        let mut cancellation_error = None;
+        if let Some(book) = books.get_mut(market_id) {
+            let cancelled = book.cancel_all(market_id);
+            active_order_count = cancelled.len();
+            match cancellation_transfers(&ledger, book, market, &cancelled) {
+                Ok(releases) if !releases.is_empty() => {
+                    if let Err(error) = ledger.apply(LedgerTransaction {
+                        idempotency_key: format!(
+                            "diagnostic-resolution-cancel:{market_id}:{now_millis}"
+                        ),
+                        business_reference: market_id.into(),
+                        transfers: releases,
+                    }) {
+                        cancellation_error = Some(error.to_string());
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => cancellation_error = Some(error.to_string()),
+            }
+        }
+        let mut claims = BTreeMap::<(String, Outcome), u128>::new();
+        for (account, quantity) in ledger.claims_for_market(market_id) {
+            let outcome = match account.outcome.as_deref() {
+                Some("UP") => Outcome::Up,
+                Some("DOWN") => Outcome::Down,
+                _ => {
+                    return Err(CoreError::InvalidResolution(
+                        "invalid claim outcome in ledger".into(),
+                    ));
+                }
+            };
+            let entry = claims.entry((account.owner, outcome)).or_default();
+            *entry = entry
+                .checked_add(quantity)
+                .ok_or(CoreError::UnbalancedTransaction)?;
+        }
+        let mut up_claim_quantity_micros = 0u128;
+        let mut down_claim_quantity_micros = 0u128;
+        let mut push_claim_quantity_micros = 0u128;
+        for ((_, outcome), quantity) in claims {
+            match outcome {
+                Outcome::Up => {
+                    up_claim_quantity_micros = up_claim_quantity_micros
+                        .checked_add(quantity)
+                        .ok_or(CoreError::UnbalancedTransaction)?;
+                }
+                Outcome::Down => {
+                    down_claim_quantity_micros = down_claim_quantity_micros
+                        .checked_add(quantity)
+                        .ok_or(CoreError::UnbalancedTransaction)?;
+                }
+            }
+            push_claim_quantity_micros = push_claim_quantity_micros
+                .checked_add(quantity / 2)
+                .ok_or(CoreError::UnbalancedTransaction)?;
+        }
+        let up_liability_atomic = settlement_atomic(market, up_claim_quantity_micros)?;
+        let down_liability_atomic = settlement_atomic(market, down_claim_quantity_micros)?;
+        let push_liability_atomic = settlement_atomic(market, push_claim_quantity_micros)?;
+        let collateral_atomic =
+            ledger.balance(&market_collateral(market_id, &market.settlement_asset));
+        let cancellation_ready = cancellation_error.is_none();
+        Ok(MarketSettlementReadiness {
+            market_id: market_id.into(),
+            collateral_atomic,
+            up_claim_quantity_micros,
+            down_claim_quantity_micros,
+            up_liability_atomic,
+            down_liability_atomic,
+            push_liability_atomic,
+            active_order_count,
+            cancellation_ready,
+            cancellation_error,
+            up_solvent: cancellation_ready && collateral_atomic >= up_liability_atomic,
+            down_solvent: cancellation_ready && collateral_atomic >= down_liability_atomic,
+            push_solvent: cancellation_ready && collateral_atomic >= push_liability_atomic,
+        })
     }
 
     pub fn export_encrypted_snapshot(&self) -> CoreResult<EncryptedSnapshot> {
@@ -1396,10 +1512,7 @@ impl PrivateTradingCore {
         let mut position_cost_basis = self.position_cost_basis.clone();
         if let Some(book) = books.get_mut(&market.market_id) {
             let cancelled = book.cancel_all(&market.market_id);
-            let mut releases = Vec::with_capacity(cancelled.len());
-            for order in &cancelled {
-                releases.extend(cancellation_transfers(market, order)?);
-            }
+            let releases = cancellation_transfers(&ledger, book, market, &cancelled)?;
             if !releases.is_empty() {
                 ledger.apply(LedgerTransaction {
                     idempotency_key: format!("resolution-cancel:{idempotency_key}"),
@@ -2332,7 +2445,8 @@ impl PrivateTradingCore {
                     .get_mut(market_id)
                     .ok_or_else(|| CoreError::InvalidOrder("order book does not exist".into()))?;
                 let order = book.cancel(*order_id, &private_user_id)?;
-                let transfers = cancellation_transfers(market, &order)?;
+                let transfers =
+                    cancellation_transfers(&ledger, book, market, std::slice::from_ref(&order))?;
                 ledger.apply(LedgerTransaction {
                     idempotency_key: format!("cancel:{}", command.idempotency_key),
                     business_reference: command.command_id.clone(),
@@ -3454,23 +3568,76 @@ fn position_key(owner: &str, market_id: &str, outcome: Outcome) -> PositionKey {
     }
 }
 
-fn cancellation_transfers(market: &MarketConfig, order: &BookOrder) -> CoreResult<Vec<Transfer>> {
-    let transfer = match order.action {
-        OrderAction::Buy => Transfer {
-            from: cash_hold(order, &market.settlement_asset),
-            to: available(&order.private_user_id, &market.settlement_asset),
-            amount: settlement_atomic(
-                market,
-                notional(order.price_micros, order.remaining_micros)?,
-            )?,
-        },
-        OrderAction::Sell => Transfer {
-            from: claim_hold(order),
-            to: claim_position(order),
-            amount: order.remaining_micros,
-        },
-    };
-    Ok(vec![transfer])
+fn cancellation_transfers(
+    ledger: &Ledger,
+    book: &PriceTimeBook,
+    market: &MarketConfig,
+    cancelled: &[BookOrder],
+) -> CoreResult<Vec<Transfer>> {
+    let mut buckets = BTreeMap::<AccountKey, AccountKey>::new();
+    for order in cancelled {
+        let (hold, destination) = match order.action {
+            OrderAction::Buy => (
+                cash_hold(order, &market.settlement_asset),
+                available(&order.private_user_id, &market.settlement_asset),
+            ),
+            OrderAction::Sell => (claim_hold(order), claim_position(order)),
+        };
+        if let Some(existing) = buckets.insert(hold, destination.clone()) {
+            if existing != destination {
+                return Err(CoreError::UnbalancedTransaction);
+            }
+        }
+    }
+    let mut transfers = Vec::with_capacity(buckets.len());
+    for (hold, destination) in buckets {
+        let action = if hold.asset == market.settlement_asset {
+            OrderAction::Buy
+        } else {
+            OrderAction::Sell
+        };
+        let outcome = match hold.outcome.as_deref() {
+            Some("UP") => Outcome::Up,
+            Some("DOWN") => Outcome::Down,
+            _ => return Err(CoreError::UnbalancedTransaction),
+        };
+        let required_remaining = book
+            .orders_for_owner(&hold.owner)
+            .into_iter()
+            .filter(|remaining| {
+                remaining.market_id == market.market_id
+                    && remaining.outcome == outcome
+                    && remaining.action == action
+                    && matches!(
+                        remaining.status,
+                        OrderStatus::Open | OrderStatus::PartiallyFilled
+                    )
+            })
+            .try_fold(0u128, |total, remaining| {
+                let required = match action {
+                    OrderAction::Buy => settlement_atomic(
+                        market,
+                        notional(remaining.price_micros, remaining.remaining_micros)?,
+                    )?,
+                    OrderAction::Sell => remaining.remaining_micros,
+                };
+                total
+                    .checked_add(required)
+                    .ok_or(CoreError::UnbalancedTransaction)
+            })?;
+        let amount = ledger
+            .balance(&hold)
+            .checked_sub(required_remaining)
+            .ok_or(CoreError::InsufficientBalance)?;
+        if amount > 0 {
+            transfers.push(Transfer {
+                from: hold,
+                to: destination,
+                amount,
+            });
+        }
+    }
+    Ok(transfers)
 }
 
 fn available(owner: &str, asset: &str) -> AccountKey {

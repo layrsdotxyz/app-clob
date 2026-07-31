@@ -208,6 +208,10 @@ enum OperatorCommand {
     ResolutionStatus {
         market_id: String,
     },
+    ResolutionReadiness {
+        market_id: String,
+        now_millis: i64,
+    },
     TradingFreezeStatus,
     AggregateDepth {
         market_id: String,
@@ -415,6 +419,9 @@ enum PlainResponse {
     },
     ResolutionStatus {
         resolution: Option<clob_service::private_core::MarketResolution>,
+    },
+    ResolutionReadiness {
+        readiness: clob_service::private_core::MarketSettlementReadiness,
     },
     TradingFreezeStatus {
         frozen: bool,
@@ -1459,6 +1466,16 @@ async fn dispatch_operator(
                 .ok_or_else(|| "NOT_PROVISIONED".to_string())?
                 .market_resolution(&market_id),
         }),
+        OperatorCommand::ResolutionReadiness {
+            market_id,
+            now_millis,
+        } => state
+            .core
+            .as_ref()
+            .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+            .market_settlement_readiness(&market_id, now_millis)
+            .map(|readiness| PlainResponse::ResolutionReadiness { readiness })
+            .map_err(|error| error.to_string()),
         OperatorCommand::TradingFreezeStatus => Ok(PlainResponse::TradingFreezeStatus {
             frozen: state
                 .core
@@ -1773,6 +1790,7 @@ async fn dispatch_operator(
                 | OperatorCommand::BootstrapExecutionStatus { .. }
                 | OperatorCommand::MarketStatus { .. }
                 | OperatorCommand::ResolutionStatus { .. }
+                | OperatorCommand::ResolutionReadiness { .. }
                 | OperatorCommand::TradingFreezeStatus
                 | OperatorCommand::AggregateDepth { .. }
                 | OperatorCommand::ReconcileBootstrap { .. } => unreachable!(),
