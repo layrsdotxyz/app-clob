@@ -2553,9 +2553,12 @@ impl PrivateTradingCore {
             result: result.clone(),
         };
         let record = self.journal.append(next_root, &journal_value)?;
-        let receipt = self.receipt_signer.sign(
+        let result_hash = command_result_hash(&result)?;
+        let receipt = self.receipt_signer.sign_user(
             command.command_id,
             command.idempotency_key.clone(),
+            expected_hash,
+            result_hash,
             next_sequence,
             prior_root,
             next_root,
@@ -2693,6 +2696,18 @@ pub fn command_request_hash(
     hash.update(command_id.as_bytes());
     hash.update((idempotency_key.len() as u32).to_be_bytes());
     hash.update(idempotency_key.as_bytes());
+    hash.update(encoded);
+    Ok(hash.finalize().into())
+}
+
+/// Commits the exact private command result returned to the authenticated
+/// client. The length prefix makes the domain framing unambiguous and is
+/// deliberately mirrored by the browser verifier.
+pub fn command_result_hash(result: &CommandResult) -> CoreResult<[u8; 32]> {
+    let encoded = serde_json::to_vec(result).map_err(|_| CoreError::RequestHashMismatch)?;
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.user-result.v1\0");
+    hash.update((encoded.len() as u32).to_be_bytes());
     hash.update(encoded);
     Ok(hash.finalize().into())
 }

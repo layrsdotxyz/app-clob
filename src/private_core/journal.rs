@@ -244,6 +244,13 @@ pub struct EnclaveReceipt {
     pub receipt_id: String,
     pub command_id: String,
     pub idempotency_key: String,
+    /// Present on authenticated user-command receipts. These commitments bind
+    /// the signed state transition to the exact encrypted request and private
+    /// result without revealing either value to the host or public chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_hash: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_hash: Option<[u8; 32]>,
     pub enclave_sequence: u64,
     pub prior_state_root: [u8; 32],
     pub state_root: [u8; 32],
@@ -288,8 +295,63 @@ impl ReceiptSigner {
         journal_hash: [u8; 32],
         occurred_at_millis: i64,
     ) -> EnclaveReceipt {
+        self.sign_internal(
+            "layrs.v1",
+            command_id,
+            idempotency_key,
+            None,
+            None,
+            enclave_sequence,
+            prior_state_root,
+            state_root,
+            journal_hash,
+            occurred_at_millis,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_user(
+        &self,
+        command_id: String,
+        idempotency_key: String,
+        request_hash: [u8; 32],
+        result_hash: [u8; 32],
+        enclave_sequence: u64,
+        prior_state_root: [u8; 32],
+        state_root: [u8; 32],
+        journal_hash: [u8; 32],
+        occurred_at_millis: i64,
+    ) -> EnclaveReceipt {
+        self.sign_internal(
+            "layrs.v2",
+            command_id,
+            idempotency_key,
+            Some(request_hash),
+            Some(result_hash),
+            enclave_sequence,
+            prior_state_root,
+            state_root,
+            journal_hash,
+            occurred_at_millis,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sign_internal(
+        &self,
+        protocol_version: &str,
+        command_id: String,
+        idempotency_key: String,
+        request_hash: Option<[u8; 32]>,
+        result_hash: Option<[u8; 32]>,
+        enclave_sequence: u64,
+        prior_state_root: [u8; 32],
+        state_root: [u8; 32],
+        journal_hash: [u8; 32],
+        occurred_at_millis: i64,
+    ) -> EnclaveReceipt {
         let mut receipt = EnclaveReceipt {
-            protocol_version: "layrs.v1".into(),
+            protocol_version: protocol_version.into(),
             receipt_id: deterministic_receipt_id(
                 &command_id,
                 &idempotency_key,
@@ -298,6 +360,8 @@ impl ReceiptSigner {
             ),
             command_id,
             idempotency_key,
+            request_hash,
+            result_hash,
             enclave_sequence,
             prior_state_root,
             state_root,
@@ -372,4 +436,115 @@ fn hash_record(
     hash.update(root);
     hash.update(ciphertext);
     hash.finalize().into()
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    fn signed_payload(receipt: &EnclaveReceipt) -> Vec<u8> {
+        let mut unsigned = receipt.clone();
+        unsigned.signature.clear();
+        serde_json::to_vec(&unsigned).expect("receipt serialization")
+    }
+
+    fn verify(receipt: &EnclaveReceipt, key: [u8; 32]) -> bool {
+        let Ok(key) = VerifyingKey::from_bytes(&key) else {
+            return false;
+        };
+        let Ok(signature) = Signature::try_from(receipt.signature.as_slice()) else {
+            return false;
+        };
+        key.verify(&signed_payload(receipt), &signature).is_ok()
+    }
+
+    #[test]
+    fn user_receipt_binds_request_result_and_measurement() {
+        let signer = ReceiptSigner::from_seed([7u8; 32], [9u8; 48]);
+        let receipt = signer.sign_user(
+            "command-1".into(),
+            "idempotency-1".into(),
+            [11u8; 32],
+            [12u8; 32],
+            42,
+            [13u8; 32],
+            [14u8; 32],
+            [15u8; 32],
+            1_785_000_000_000,
+        );
+
+        assert_eq!(receipt.protocol_version, "layrs.v2");
+        assert_eq!(receipt.request_hash, Some([11u8; 32]));
+        assert_eq!(receipt.result_hash, Some([12u8; 32]));
+        assert_eq!(receipt.enclave_measurement_sha384, vec![9u8; 48]);
+        assert!(verify(&receipt, signer.verifying_key()));
+    }
+
+    #[test]
+    fn user_receipt_rejects_request_result_and_state_tampering() {
+        let signer = ReceiptSigner::from_seed([17u8; 32], [19u8; 48]);
+        let receipt = signer.sign_user(
+            "command-2".into(),
+            "idempotency-2".into(),
+            [21u8; 32],
+            [22u8; 32],
+            77,
+            [23u8; 32],
+            [24u8; 32],
+            [25u8; 32],
+            1_785_000_000_001,
+        );
+
+        for mutate in [
+            |value: &mut EnclaveReceipt| value.request_hash = Some([31u8; 32]),
+            |value: &mut EnclaveReceipt| value.result_hash = Some([32u8; 32]),
+            |value: &mut EnclaveReceipt| value.state_root = [33u8; 32],
+            |value: &mut EnclaveReceipt| value.enclave_sequence += 1,
+        ] {
+            let mut tampered = receipt.clone();
+            mutate(&mut tampered);
+            assert!(!verify(&tampered, signer.verifying_key()));
+        }
+    }
+
+    #[test]
+    fn user_receipt_is_deterministic_for_identical_inputs() {
+        let left = ReceiptSigner::from_seed([41u8; 32], [42u8; 48]);
+        let right = ReceiptSigner::from_seed([41u8; 32], [42u8; 48]);
+        let sign = |signer: &ReceiptSigner| {
+            signer.sign_user(
+                "command-3".into(),
+                "idempotency-3".into(),
+                [43u8; 32],
+                [44u8; 32],
+                101,
+                [45u8; 32],
+                [46u8; 32],
+                [47u8; 32],
+                1_785_000_000_002,
+            )
+        };
+
+        assert_eq!(sign(&left), sign(&right));
+    }
+
+    #[test]
+    fn legacy_receipt_remains_v1_without_private_commitments() {
+        let signer = ReceiptSigner::from_seed([51u8; 32], [52u8; 48]);
+        let receipt = signer.sign(
+            "system-command".into(),
+            "system-idempotency".into(),
+            2,
+            [53u8; 32],
+            [54u8; 32],
+            [55u8; 32],
+            1_785_000_000_003,
+        );
+
+        assert_eq!(receipt.protocol_version, "layrs.v1");
+        assert!(receipt.request_hash.is_none());
+        assert!(receipt.result_hash.is_none());
+        assert!(verify(&receipt, signer.verifying_key()));
+    }
 }

@@ -394,7 +394,7 @@ enum PlainResponse {
         expected_redemption_amount_atomic: String,
     },
     User {
-        response: CoreResponse,
+        response: Box<CoreResponse>,
     },
     Depth {
         bids: Vec<(u64, String)>,
@@ -755,7 +755,9 @@ async fn dispatch(state: &mut EnclaveState, request: PlainRequest) -> PlainRespo
                     .ok_or_else(|| "CHAIN_SIGNER_NOT_PROVISIONED".to_string())?;
                 response.reward_claim_authorization = Some(signer.sign_reward_claim(intent)?);
             }
-            Ok(PlainResponse::User { response })
+            Ok(PlainResponse::User {
+                response: Box::new(response),
+            })
         })(),
         PlainRequest::AggregateDepth {
             market_id,

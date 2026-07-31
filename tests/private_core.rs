@@ -714,6 +714,9 @@ fn native_clob_partial_fill_locks_remainder_and_cancel_releases_once() {
         },
         1_100,
     );
+    assert_eq!(buy_response.receipt.protocol_version, "layrs.v2");
+    assert!(buy_response.receipt.request_hash.is_some());
+    assert!(buy_response.receipt.result_hash.is_some());
     let resting_buy = match buy_response.result {
         CommandResult::Order { result } => {
             assert_eq!(result.fills.len(), 1);
@@ -773,7 +776,7 @@ fn native_clob_partial_fill_locks_remainder_and_cancel_releases_once() {
     );
     assert_eq!(overdraw.unwrap_err(), CoreError::InsufficientBalance);
 
-    execute_signed(
+    let cancel_response = execute_signed_response(
         &mut core,
         &alice,
         "session:alice",
@@ -785,6 +788,13 @@ fn native_clob_partial_fill_locks_remainder_and_cancel_releases_once() {
         },
         1_200,
     );
+    assert_eq!(cancel_response.receipt.protocol_version, "layrs.v2");
+    assert!(cancel_response.receipt.request_hash.is_some());
+    assert!(cancel_response.receipt.result_hash.is_some());
+    assert!(matches!(
+        cancel_response.result,
+        CommandResult::Cancelled { .. }
+    ));
     assert_eq!(core.balance(&alice_cash_hold), 0);
     assert_eq!(
         core.balance(&AccountKey::new(
