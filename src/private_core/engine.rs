@@ -57,6 +57,14 @@ pub struct MarketConfig {
 pub enum MarketExecution {
     #[default]
     NativeClob,
+    /// Native private-CLOB execution with an externally observable binary
+    /// condition used only as resolution evidence. No venue fill or venue
+    /// redemption is part of the user trade or payout path.
+    NativeExactCondition {
+        condition_id: String,
+        up_outcome_index: u8,
+        down_outcome_index: u8,
+    },
     PolymarketBootstrap {
         condition_id: String,
         up_token_id: String,
@@ -187,9 +195,25 @@ pub struct SignedPolymarketResolution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExactConditionResolutionStatement {
+    pub market_id: String,
+    pub condition_id: String,
+    pub outcome: ResolutionOutcome,
+    pub evidence_hash: [u8; 32],
+    pub issued_at_millis: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedExactConditionResolution {
+    pub statement: ExactConditionResolutionStatement,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "signed", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SignedResolutionEvidence {
     Pyth(SignedResolution),
+    ExactCondition(SignedExactConditionResolution),
     Polymarket(SignedPolymarketResolution),
 }
 
@@ -201,6 +225,9 @@ pub enum ResolutionEvidence {
     },
     PolymarketExactCondition {
         statement: PolymarketResolutionStatement,
+    },
+    PublicExactCondition {
+        statement: ExactConditionResolutionStatement,
     },
 }
 
@@ -1485,6 +1512,27 @@ impl PrivateTradingCore {
         self.commit_market_resolution(idempotency_key, resolution, now_millis)
     }
 
+    pub fn resolve_exact_condition_market(
+        &mut self,
+        idempotency_key: String,
+        signed: SignedExactConditionResolution,
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        let market = self
+            .markets
+            .get(&signed.statement.market_id)
+            .ok_or_else(|| CoreError::InvalidResolution("unknown market".into()))?;
+        validate_exact_condition_resolution(market, &signed, self.oracle_public_key, now_millis)?;
+        let resolution = MarketResolution {
+            outcome: signed.statement.outcome,
+            evidence: ResolutionEvidence::PublicExactCondition {
+                statement: signed.statement,
+            },
+        };
+        self.commit_market_resolution(idempotency_key, resolution, now_millis)
+    }
+
     fn commit_market_resolution(
         &mut self,
         idempotency_key: String,
@@ -1494,6 +1542,7 @@ impl PrivateTradingCore {
         let market_id = match &resolution.evidence {
             ResolutionEvidence::PythHistoricalMedian { statement } => &statement.market_id,
             ResolutionEvidence::PolymarketExactCondition { statement } => &statement.market_id,
+            ResolutionEvidence::PublicExactCondition { statement } => &statement.market_id,
         };
         let market = self
             .markets
@@ -1782,6 +1831,19 @@ impl PrivateTradingCore {
                 if signed.statement.market_id != market_id || derived != outcome {
                     return Err(CoreError::InvalidResolution(
                         "on-chain outcome does not match Pyth evidence".into(),
+                    ));
+                }
+            }
+            SignedResolutionEvidence::ExactCondition(signed) => {
+                validate_exact_condition_resolution(
+                    market,
+                    signed,
+                    self.oracle_public_key,
+                    now_millis,
+                )?;
+                if signed.statement.market_id != market_id || signed.statement.outcome != outcome {
+                    return Err(CoreError::InvalidResolution(
+                        "on-chain outcome does not match exact-condition evidence".into(),
                     ));
                 }
             }
@@ -2321,7 +2383,7 @@ impl PrivateTradingCore {
                     &order,
                 )?;
                 match &market.execution {
-                    MarketExecution::NativeClob => {
+                    MarketExecution::NativeClob | MarketExecution::NativeExactCondition { .. } => {
                         let book = books.entry(order.market_id.clone()).or_default();
                         let match_result = book.submit(order.clone(), now_millis)?;
                         if match_result
@@ -4128,6 +4190,21 @@ fn validate_market(market: &MarketConfig, now_millis: i64) -> CoreResult<()> {
             ));
         }
     }
+    if let MarketExecution::NativeExactCondition {
+        condition_id,
+        up_outcome_index,
+        down_outcome_index,
+    } = &market.execution
+    {
+        if market.settlement_asset != "USDC"
+            || !valid_hex32(condition_id)
+            || up_outcome_index == down_outcome_index
+        {
+            return Err(CoreError::InvalidOrder(
+                "invalid native exact-condition mapping".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -4135,9 +4212,10 @@ fn valid_market_namespace(market_id: &str) -> bool {
     market_id.starts_with("layrs:v1:")
         || market_id.starts_with("layrs:v2:")
         || market_id.starts_with("layrs:v3:")
-        || ["SPORTS", "ESPORTS", "POLITICS"]
-            .iter()
-            .any(|category| market_id.starts_with(&format!("layrs:v4:{category}:")))
+        || ["SPORTS", "ESPORTS", "POLITICS"].iter().any(|category| {
+            market_id.starts_with(&format!("layrs:v4:{category}:"))
+                || market_id.starts_with(&format!("layrs:v5:{category}:"))
+        })
 }
 
 fn valid_hex32(value: &str) -> bool {
@@ -4232,6 +4310,44 @@ fn validate_polymarket_resolution(
     .map_err(|_| CoreError::InvalidOracleSignature)
 }
 
+fn validate_exact_condition_resolution(
+    market: &MarketConfig,
+    signed: &SignedExactConditionResolution,
+    oracle_public_key: Option<[u8; 32]>,
+    now_millis: i64,
+) -> CoreResult<()> {
+    let MarketExecution::NativeExactCondition { condition_id, .. } = &market.execution else {
+        return Err(CoreError::InvalidResolution(
+            "exact-condition resolution is valid only for native exact-condition markets".into(),
+        ));
+    };
+    let statement = &signed.statement;
+    if now_millis < market.closes_at_millis
+        || statement.market_id != market.market_id
+        || &statement.condition_id != condition_id
+        || statement.evidence_hash == [0u8; 32]
+        || statement.issued_at_millis < market.closes_at_millis
+        || statement.issued_at_millis > now_millis + 30_000
+    {
+        return Err(CoreError::InvalidResolution(
+            "exact-condition resolution timing, condition, or evidence is invalid".into(),
+        ));
+    }
+    let key =
+        VerifyingKey::from_bytes(&oracle_public_key.ok_or(CoreError::InvalidOracleSignature)?)
+            .map_err(|_| CoreError::InvalidOracleSignature)?;
+    let signature_bytes: [u8; 64] = signed
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| CoreError::InvalidOracleSignature)?;
+    key.verify(
+        &exact_condition_resolution_signing_payload(statement)?,
+        &Signature::from_bytes(&signature_bytes),
+    )
+    .map_err(|_| CoreError::InvalidOracleSignature)
+}
+
 fn validate_boundary(boundary: &BoundaryEvidence, target_millis: i64) -> CoreResult<()> {
     let target_micros = target_millis
         .checked_mul(1_000)
@@ -4267,6 +4383,18 @@ pub fn polymarket_resolution_signing_payload(
         .map_err(|_| CoreError::InvalidResolution("cannot encode resolution".into()))?;
     let mut payload = Vec::with_capacity(encoded.len() + 48);
     payload.extend_from_slice(b"layrs.polymarket-resolution.v1\0");
+    payload.extend_from_slice(&(encoded.len() as u64).to_be_bytes());
+    payload.extend_from_slice(&encoded);
+    Ok(payload)
+}
+
+pub fn exact_condition_resolution_signing_payload(
+    statement: &ExactConditionResolutionStatement,
+) -> CoreResult<Vec<u8>> {
+    let encoded = serde_json::to_vec(statement)
+        .map_err(|_| CoreError::InvalidResolution("cannot encode resolution".into()))?;
+    let mut payload = Vec::with_capacity(encoded.len() + 48);
+    payload.extend_from_slice(b"layrs.exact-condition-resolution.v1\0");
     payload.extend_from_slice(&(encoded.len() as u64).to_be_bytes());
     payload.extend_from_slice(&encoded);
     Ok(payload)

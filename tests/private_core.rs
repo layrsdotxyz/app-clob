@@ -396,6 +396,41 @@ fn private_core_accepts_signed_v4_event_market_ids_with_exact_polymarket_mapping
 }
 
 #[test]
+fn private_core_accepts_v5_native_event_markets_without_venue_execution() {
+    let mut core = PrivateTradingCore::new(
+        JournalKey::from_bytes([47u8; 32]),
+        ReceiptSigner::generate([48u8; 48]),
+    );
+
+    core.register_market(
+        "sys:market:v5:sports:1".into(),
+        MarketConfig {
+            market_id: "layrs:v5:SPORTS:arsenal-chelsea:abababababababab".into(),
+            settlement_asset: "USDC".into(),
+            settlement_decimals: 6,
+            public_settlement_chain: Some("horizen".into()),
+            opens_at_millis: 900,
+            closes_at_millis: 2_000,
+            minimum_quantity_micros: 1,
+            maximum_quantity_micros: 10_000_000,
+            minimum_order_notional_micros: 1_000_000,
+            maximum_order_notional_micros: 10_000_000,
+            maximum_user_position_micros: 10_000_000,
+            maximum_pending_bootstrap_notional_micros: 100_000_000,
+            tick_size_micros: 1_000,
+            oracle_feed_id: 1,
+            execution: MarketExecution::NativeExactCondition {
+                condition_id: format!("0x{}", "ab".repeat(32)),
+                up_outcome_index: 0,
+                down_outcome_index: 1,
+            },
+        },
+        800,
+    )
+    .unwrap();
+}
+
+#[test]
 fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
     let oracle = SigningKey::from_bytes(&[11u8; 32]);
     let alice = SigningKey::from_bytes(&[12u8; 32]);
