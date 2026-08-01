@@ -1,9 +1,11 @@
 use clob_service::private_core::{
-    command_request_hash, resolution_signing_payload, signing_payload, AccountBucket, AccountKey,
-    BookOrder, BoundaryEvidence, CommandResult, ExternalFlowDirection, JournalKey, MarketConfig,
+    command_request_hash, exact_condition_resolution_signing_payload, resolution_signing_payload,
+    signing_payload, AccountBucket, AccountKey, BookOrder, BoundaryEvidence, CommandResult,
+    ExactConditionResolutionStatement, ExternalFlowDirection, JournalKey, MarketConfig,
     MarketExecution, MatchType, OrderAction, OrderStatus, Outcome, PriceTimeBook,
-    PrivateTradingCore, ReceiptSigner, ResolutionStatement, SessionRequest, SignedResolution,
-    SignedSessionRequest, TimeInForce, UserCommand, UserCommandAction,
+    PrivateTradingCore, ReceiptSigner, ResolutionOutcome, ResolutionStatement, SessionRequest,
+    SignedExactConditionResolution, SignedResolution, SignedSessionRequest, TimeInForce,
+    UserCommand, UserCommandAction,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use proptest::prelude::*;
@@ -490,6 +492,242 @@ fn mint_then_merge_conserves_collateral_and_charges_only_the_taker() {
 }
 
 #[test]
+fn native_exact_condition_market_resolves_from_existing_collateral_without_venue_inflow() {
+    let (mut core, up_key, down_key, up_owner, down_owner) = configured_exact_condition_core();
+    execute(
+        &mut core,
+        &up_key,
+        "session:up",
+        1,
+        "cmd:exact-up",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::with_id(
+                Uuid::from_u128(210),
+                "ignored",
+                MARKET_ID,
+                Outcome::Up,
+                OrderAction::Buy,
+                400_000,
+                1_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_000,
+    );
+    let crossed = execute(
+        &mut core,
+        &down_key,
+        "session:down",
+        1,
+        "cmd:exact-down",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::with_id(
+                Uuid::from_u128(211),
+                "ignored",
+                MARKET_ID,
+                Outcome::Down,
+                OrderAction::Buy,
+                600_000,
+                1_000_000,
+                TimeInForce::Fok,
+                None,
+            ),
+        },
+        1_050,
+    );
+    assert_eq!(
+        order_result(&crossed.result).fills[0].match_type,
+        MatchType::Mint
+    );
+    assert_eq!(core.balance(&market_collateral_usdc()), 1_000_000);
+
+    let statement = ExactConditionResolutionStatement {
+        market_id: MARKET_ID.into(),
+        condition_id: format!("0x{}", "22".repeat(32)),
+        outcome: ResolutionOutcome::Up,
+        evidence_hash: [70u8; 32],
+        issued_at_millis: 2_100,
+    };
+    let oracle = SigningKey::from_bytes(&ORACLE_KEY);
+    let signature = oracle
+        .sign(&exact_condition_resolution_signing_payload(&statement).unwrap())
+        .to_bytes()
+        .to_vec();
+    core.resolve_exact_condition_market(
+        "sys:resolve:exact".into(),
+        SignedExactConditionResolution {
+            statement,
+            signature,
+        },
+        2_100,
+    )
+    .unwrap();
+
+    assert_eq!(core.balance(&market_collateral_usdc()), 0);
+    assert_eq!(core.balance(&claim(&up_owner, Outcome::Up)), 0);
+    assert_eq!(core.balance(&claim(&down_owner, Outcome::Down)), 0);
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &up_owner,
+            AccountBucket::UserAvailable,
+            "USDC"
+        )),
+        1_570_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &down_owner,
+            AccountBucket::UserAvailable,
+            "USDC"
+        )),
+        398_800
+    );
+    let fee = AccountKey::new("layrs", AccountBucket::FeeRevenue, "USDC");
+    assert_eq!(core.balance(&fee), 31_200);
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &up_owner,
+            AccountBucket::UserAvailable,
+            "USDC"
+        )) + core.balance(&AccountKey::new(
+            &down_owner,
+            AccountBucket::UserAvailable,
+            "USDC"
+        )) + core.balance(&fee)
+            + core.balance(&market_collateral_usdc()),
+        2_000_000
+    );
+}
+
+#[test]
+fn native_exact_condition_rejects_wrong_condition_and_tampered_outcome_without_mutation() {
+    let (mut wrong_condition_core, _, _, _, _) = configured_exact_condition_core();
+    let oracle = SigningKey::from_bytes(&ORACLE_KEY);
+    let wrong_condition = ExactConditionResolutionStatement {
+        market_id: MARKET_ID.into(),
+        condition_id: format!("0x{}", "23".repeat(32)),
+        outcome: ResolutionOutcome::Up,
+        evidence_hash: [71u8; 32],
+        issued_at_millis: 2_100,
+    };
+    let signature = oracle
+        .sign(&exact_condition_resolution_signing_payload(&wrong_condition).unwrap())
+        .to_bytes()
+        .to_vec();
+    assert!(wrong_condition_core
+        .resolve_exact_condition_market(
+            "sys:resolve:wrong-condition".into(),
+            SignedExactConditionResolution {
+                statement: wrong_condition,
+                signature,
+            },
+            2_100,
+        )
+        .is_err());
+    assert!(wrong_condition_core.market_resolution(MARKET_ID).is_none());
+
+    let (mut tampered_core, _, _, _, _) = configured_exact_condition_core();
+    let signed_up = ExactConditionResolutionStatement {
+        market_id: MARKET_ID.into(),
+        condition_id: format!("0x{}", "22".repeat(32)),
+        outcome: ResolutionOutcome::Up,
+        evidence_hash: [72u8; 32],
+        issued_at_millis: 2_100,
+    };
+    let signature = oracle
+        .sign(&exact_condition_resolution_signing_payload(&signed_up).unwrap())
+        .to_bytes()
+        .to_vec();
+    let tampered = ExactConditionResolutionStatement {
+        outcome: ResolutionOutcome::Down,
+        ..signed_up
+    };
+    assert!(tampered_core
+        .resolve_exact_condition_market(
+            "sys:resolve:tampered".into(),
+            SignedExactConditionResolution {
+                statement: tampered,
+                signature,
+            },
+            2_100,
+        )
+        .is_err());
+    assert!(tampered_core.market_resolution(MARKET_ID).is_none());
+}
+
+#[test]
+fn two_internal_market_maker_identities_can_stress_native_usdc_without_privileged_credit() {
+    let (mut core, up_key, down_key, up_owner, down_owner) =
+        configured_exact_condition_core_with_balance(500_000_000);
+    for index in 0u64..30 {
+        execute(
+            &mut core,
+            &up_key,
+            "session:up",
+            index + 1,
+            &format!("cmd:mm-up:{index}"),
+            UserCommandAction::SubmitOrder {
+                order: BookOrder::with_id(
+                    Uuid::from_u128(1_000 + u128::from(index)),
+                    "ignored",
+                    MARKET_ID,
+                    Outcome::Up,
+                    OrderAction::Buy,
+                    400_000,
+                    1_000_000,
+                    TimeInForce::Gtc,
+                    None,
+                ),
+            },
+            1_000 + index as i64,
+        );
+        let crossed = execute(
+            &mut core,
+            &down_key,
+            "session:down",
+            index + 1,
+            &format!("cmd:mm-down:{index}"),
+            UserCommandAction::SubmitOrder {
+                order: BookOrder::with_id(
+                    Uuid::from_u128(2_000 + u128::from(index)),
+                    "ignored",
+                    MARKET_ID,
+                    Outcome::Down,
+                    OrderAction::Buy,
+                    600_000,
+                    1_000_000,
+                    TimeInForce::Fok,
+                    None,
+                ),
+            },
+            1_050 + index as i64,
+        );
+        assert_eq!(order_result(&crossed.result).fills.len(), 1);
+        assert_eq!(
+            order_result(&crossed.result).fills[0].match_type,
+            MatchType::Mint
+        );
+    }
+
+    let collateral = market_collateral_usdc();
+    let fee = AccountKey::new("layrs", AccountBucket::FeeRevenue, "USDC");
+    let up_available = AccountKey::new(&up_owner, AccountBucket::UserAvailable, "USDC");
+    let down_available = AccountKey::new(&down_owner, AccountBucket::UserAvailable, "USDC");
+    assert_eq!(core.balance(&collateral), 30_000_000);
+    assert_eq!(core.balance(&fee), 36_000);
+    assert_eq!(core.balance(&claim(&up_owner, Outcome::Up)), 30_000_000);
+    assert_eq!(core.balance(&claim(&down_owner, Outcome::Down)), 30_000_000);
+    assert_eq!(
+        core.balance(&up_available)
+            + core.balance(&down_available)
+            + core.balance(&collateral)
+            + core.balance(&fee),
+        1_000_000_000
+    );
+}
+
+#[test]
 fn complementary_mint_at_live_prices_remains_fully_collateralized_through_resolution() {
     let (mut core, up_key, down_key, up_owner, down_owner) = configured_core();
     let quantity_micros = 588_235;
@@ -861,6 +1099,85 @@ fn configured_core() -> (PrivateTradingCore, SigningKey, SigningKey, String, Str
     (core, up_key, down_key, up_owner, down_owner)
 }
 
+fn configured_exact_condition_core() -> (PrivateTradingCore, SigningKey, SigningKey, String, String)
+{
+    configured_exact_condition_core_with_balance(1_000_000)
+}
+
+fn configured_exact_condition_core_with_balance(
+    initial_balance_atomic: u128,
+) -> (PrivateTradingCore, SigningKey, SigningKey, String, String) {
+    let journal_key = [31u8; 32];
+    let up_key = SigningKey::from_bytes(&[32u8; 32]);
+    let down_key = SigningKey::from_bytes(&[33u8; 32]);
+    let up_commitment = [34u8; 32];
+    let down_commitment = [35u8; 32];
+    let up_owner = derived_private_user(journal_key, up_commitment);
+    let down_owner = derived_private_user(journal_key, down_commitment);
+    let oracle = SigningKey::from_bytes(&ORACLE_KEY);
+    let mut core = PrivateTradingCore::new_with_oracle(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([36u8; 48]),
+        oracle.verifying_key().to_bytes(),
+    )
+    .unwrap();
+    core.register_market(
+        "sys:market:exact-condition".into(),
+        MarketConfig {
+            market_id: MARKET_ID.into(),
+            settlement_asset: "USDC".into(),
+            settlement_decimals: 6,
+            public_settlement_chain: Some("horizen".into()),
+            opens_at_millis: 900,
+            closes_at_millis: 2_000,
+            minimum_quantity_micros: 1,
+            maximum_quantity_micros: 100_000_000,
+            minimum_order_notional_micros: 1,
+            maximum_order_notional_micros: 10_000_000,
+            maximum_user_position_micros: 100_000_000,
+            maximum_pending_bootstrap_notional_micros: 100_000_000,
+            tick_size_micros: 100,
+            // The core market envelope retains a non-zero feed slot for schema
+            // compatibility; exact-condition resolution ignores it and verifies
+            // the signed condition/evidence tuple instead.
+            oracle_feed_id: 245,
+            execution: MarketExecution::NativeExactCondition {
+                condition_id: format!("0x{}", "22".repeat(32)),
+                up_outcome_index: 0,
+                down_outcome_index: 1,
+            },
+        },
+        800,
+    )
+    .unwrap();
+    for (label, key, commitment, evidence) in [
+        ("up", &up_key, up_commitment, [37u8; 32]),
+        ("down", &down_key, down_commitment, [38u8; 32]),
+    ] {
+        core.register_session(
+            format!("sys:session:{label}"),
+            format!("session:{label}"),
+            commitment,
+            key.verifying_key().to_bytes(),
+            3_000,
+            850,
+        )
+        .unwrap();
+        core.apply_user_external_flow(
+            format!("sys:deposit:{label}"),
+            commitment,
+            "USDC".into(),
+            AccountBucket::UserAvailable,
+            initial_balance_atomic,
+            ExternalFlowDirection::Inflow,
+            evidence,
+            875,
+        )
+        .unwrap();
+    }
+    (core, up_key, down_key, up_owner, down_owner)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute(
     core: &mut PrivateTradingCore,
@@ -910,6 +1227,12 @@ fn claim(owner: &str, outcome: Outcome) -> AccountKey {
 
 fn market_collateral() -> AccountKey {
     let mut account = AccountKey::new("layrs", AccountBucket::MarketCollateral, "ZEN");
+    account.market_id = Some(MARKET_ID.into());
+    account
+}
+
+fn market_collateral_usdc() -> AccountKey {
+    let mut account = AccountKey::new("layrs", AccountBucket::MarketCollateral, "USDC");
     account.market_id = Some(MARKET_ID.into());
     account
 }

@@ -24,12 +24,13 @@ use clob_service::polymarket_enclave::{
     VenueConfirmation, VenueOrderIntent, VenueRedemptionTransactionIntent, VenueSide,
 };
 use clob_service::private_core::{
-    polymarket_resolution_signing_payload, resolution_signing_payload, AccountKey,
-    BootstrapExecutionState, CommandResult, CoreResponse, EnclaveReceipt, EncryptedJournalRecord,
-    EncryptedSnapshot, ExternalFlowDirection, JournalKey, MarketConfig, MarketExecution,
+    exact_condition_resolution_signing_payload, polymarket_resolution_signing_payload,
+    resolution_signing_payload, AccountKey, BootstrapExecutionState, CommandResult, CoreResponse,
+    EnclaveReceipt, EncryptedJournalRecord, EncryptedSnapshot, ExactConditionResolutionStatement,
+    ExternalFlowDirection, JournalKey, MarketConfig, MarketExecution,
     PolymarketResolutionStatement, PrivateTradingCore, ReceiptSigner, ResolutionStatement,
-    SignedAuditFillArtifact, SignedPolymarketResolution, SignedResolution,
-    SignedResolutionEvidence, SystemResponse, UserCommand, UserCommandAction,
+    SignedAuditFillArtifact, SignedExactConditionResolution, SignedPolymarketResolution,
+    SignedResolution, SignedResolutionEvidence, SystemResponse, UserCommand, UserCommandAction,
     WithdrawalAuthorization,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -292,6 +293,11 @@ enum OperatorCommand {
         signed: SignedResolution,
         now_millis: i64,
     },
+    ResolveExactConditionMarket {
+        idempotency_key: String,
+        signed: SignedExactConditionResolution,
+        now_millis: i64,
+    },
     ResolvePolymarketMarket {
         idempotency_key: String,
         signed: SignedPolymarketResolution,
@@ -327,6 +333,7 @@ enum OperatorCommand {
 )]
 enum UnsignedResolutionEvidence {
     Pyth(ResolutionStatement),
+    ExactCondition(ExactConditionResolutionStatement),
     Polymarket(PolymarketResolutionStatement),
 }
 
@@ -1260,6 +1267,18 @@ async fn dispatch_operator(
                     });
                     (market_id, outcome, signed)
                 }
+                UnsignedResolutionEvidence::ExactCondition(statement) => {
+                    let outcome = statement.outcome;
+                    let payload = exact_condition_resolution_signing_payload(&statement)
+                        .map_err(|error| error.to_string())?;
+                    let market_id = statement.market_id.clone();
+                    let signed =
+                        SignedResolutionEvidence::ExactCondition(SignedExactConditionResolution {
+                            statement,
+                            signature: signer.sign_resolution_payload(&payload),
+                        });
+                    (market_id, outcome, signed)
+                }
                 UnsignedResolutionEvidence::Polymarket(statement) => {
                     let outcome = statement.outcome;
                     let payload = polymarket_resolution_signing_payload(&statement)
@@ -1754,6 +1773,11 @@ async fn dispatch_operator(
                     signed,
                     now_millis,
                 } => core.resolve_market(idempotency_key, signed, now_millis),
+                OperatorCommand::ResolveExactConditionMarket {
+                    idempotency_key,
+                    signed,
+                    now_millis,
+                } => core.resolve_exact_condition_market(idempotency_key, signed, now_millis),
                 OperatorCommand::ResolvePolymarketMarket {
                     idempotency_key,
                     signed,
