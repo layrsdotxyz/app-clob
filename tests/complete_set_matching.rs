@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 const MARKET_ID: &str = "layrs:v3:ZEN:15m:2000";
 const ONE_ZEN: u128 = 1_000_000_000_000_000_000;
+const ORACLE_KEY: [u8; 32] = [39u8; 32];
 
 #[test]
 fn complementary_buy_boundary_partial_and_fok_semantics_are_deterministic() {
@@ -485,6 +486,107 @@ fn mint_then_merge_conserves_collateral_and_charges_only_the_taker() {
         )) + core.balance(&fee)
             + core.balance(&collateral),
         2 * ONE_ZEN
+    );
+}
+
+#[test]
+fn complementary_mint_at_live_prices_remains_fully_collateralized_through_resolution() {
+    let (mut core, up_key, down_key, up_owner, down_owner) = configured_core();
+    let quantity_micros = 588_235;
+
+    execute(
+        &mut core,
+        &up_key,
+        "session:up",
+        1,
+        "cmd:live-mint-maker",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::with_id(
+                Uuid::from_u128(104),
+                "ignored",
+                MARKET_ID,
+                Outcome::Up,
+                OrderAction::Buy,
+                150_000,
+                quantity_micros,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_000,
+    );
+    execute(
+        &mut core,
+        &down_key,
+        "session:down",
+        1,
+        "cmd:live-mint-taker",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::with_id(
+                Uuid::from_u128(105),
+                "ignored",
+                MARKET_ID,
+                Outcome::Down,
+                OrderAction::Buy,
+                850_000,
+                quantity_micros,
+                TimeInForce::Fok,
+                None,
+            ),
+        },
+        1_050,
+    );
+
+    assert_eq!(core.balance(&market_collateral()), 588_235_000_000_000_000);
+    assert_eq!(
+        core.balance(&claim(&up_owner, Outcome::Up)),
+        quantity_micros
+    );
+    assert_eq!(
+        core.balance(&claim(&down_owner, Outcome::Down)),
+        quantity_micros
+    );
+
+    let boundary = |end: i64, price: i64, marker: u8| BoundaryEvidence {
+        window_start_micros: end * 1_000 - 5_000_000,
+        window_end_micros: end * 1_000,
+        median_price_e8: price,
+        sample_count: 25,
+        minimum_publisher_count: 3,
+        signed_payload_commitment: [marker; 32],
+    };
+    let statement = ResolutionStatement {
+        market_id: MARKET_ID.into(),
+        oracle_feed_id: 245,
+        opening: boundary(900, 410_000_000, 40),
+        closing: boundary(2_000, 400_000_000, 41),
+        issued_at_millis: 2_100,
+    };
+    let oracle = SigningKey::from_bytes(&ORACLE_KEY);
+    let signature = oracle
+        .sign(&resolution_signing_payload(&statement).unwrap())
+        .to_bytes()
+        .to_vec();
+    core.resolve_market(
+        "sys:resolve:live-mint".into(),
+        SignedResolution {
+            statement,
+            signature,
+        },
+        2_100,
+    )
+    .unwrap();
+
+    assert_eq!(core.balance(&market_collateral()), 0);
+    assert_eq!(core.balance(&claim(&up_owner, Outcome::Up)), 0);
+    assert_eq!(core.balance(&claim(&down_owner, Outcome::Down)), 0);
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &down_owner,
+            AccountBucket::UserAvailable,
+            "ZEN"
+        )),
+        1_082_824_200_000_000_000
     );
 }
 
