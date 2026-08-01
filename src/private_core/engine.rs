@@ -4083,9 +4083,7 @@ fn market_id_bytes32(market_id: &str) -> String {
 }
 
 fn validate_market(market: &MarketConfig, now_millis: i64) -> CoreResult<()> {
-    if !(market.market_id.starts_with("layrs:v1:")
-        || market.market_id.starts_with("layrs:v2:")
-        || market.market_id.starts_with("layrs:v3:"))
+    if !valid_market_namespace(&market.market_id)
         || !matches!(
             (market.settlement_asset.as_str(), market.settlement_decimals),
             ("USDC", 6) | ("ZEN", 18)
@@ -4131,6 +4129,15 @@ fn validate_market(market: &MarketConfig, now_millis: i64) -> CoreResult<()> {
         }
     }
     Ok(())
+}
+
+fn valid_market_namespace(market_id: &str) -> bool {
+    market_id.starts_with("layrs:v1:")
+        || market_id.starts_with("layrs:v2:")
+        || market_id.starts_with("layrs:v3:")
+        || ["SPORTS", "ESPORTS", "POLITICS"]
+            .iter()
+            .any(|category| market_id.starts_with(&format!("layrs:v4:{category}:")))
 }
 
 fn valid_hex32(value: &str) -> bool {
