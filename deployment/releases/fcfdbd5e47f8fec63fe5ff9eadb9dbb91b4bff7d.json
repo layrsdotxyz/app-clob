@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "validated-ready-for-activation",
+  "releaseId": "fcfdbd5e47f8fec63fe5ff9eadb9dbb91b4bff7d",
+  "sourceCommit": "fcfdbd5e47f8fec63fe5ff9eadb9dbb91b4bff7d",
+  "sourceBranch": "main",
+  "snapshotCompatibilityBase": "a326e0c3f3edd7a03f0e564c33d6b813408cf3ad",
+  "snapshotApproval": null,
+  "region": "us-east-1",
+  "amiId": "ami-02b9dbe183e981acd",
+  "amiSnapshotId": "snap-07130aedb76089583",
+  "amiDeregistrationProtection": "enabled-without-cooldown",
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/fcfdbd5e47f8fec63fe5ff9eadb9dbb91b4bff7d",
+  "artifacts": {
+    "sourceArchive": {
+      "path": "source.tar.gz",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/fcfdbd5e47f8fec63fe5ff9eadb9dbb91b4bff7d/source.tar.gz",
+      "versionId": "4Rgxmi6NFut6lEPEMMl9ZfqVlBR4o_61",
+      "sizeBytes": 503870,
+      "sha384": "5ba89892ddd19527c8683416eecb9f35959a98a2668672898afde568a5d71b4c82dc4b8d66bffec66091c6f60bebe8fb"
+    },
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/fcfdbd5e47f8fec63fe5ff9eadb9dbb91b4bff7d/layrsv2-clob.eif",
+      "versionId": "2iolUj43IEY7M6E2TkqWDWamefXO55nj",
+      "sizeBytes": 41102916,
+      "sha384": "faa740e982a6fca6a80a4b7342f48d6606c6092ceab0aa0fbab01551d6ee2e6649b02bcb80e0b8fd40aaa76e0e9e8b59"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/fcfdbd5e47f8fec63fe5ff9eadb9dbb91b4bff7d/layrs-enclave-parent",
+      "versionId": "S9NxxM5F5zX.LTDuyO95oDOtqjM6VQ93",
+      "sizeBytes": 1234256,
+      "sha384": "2b7180ad0e664a4eac5087780d144249eef872ce71a565ee1a2453b8dc4da840fb0e50a814dd70bbf89cc88c5eb5190a"
+    },
+    "measurements": {
+      "path": "build/layrsv2-clob-measurements.json",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/fcfdbd5e47f8fec63fe5ff9eadb9dbb91b4bff7d/layrsv2-clob-measurements.json",
+      "versionId": "RAwoYuqM1DRhEky1rff91IvDQy2_bEFC",
+      "sizeBytes": 402,
+      "sha384": "5edb6f01e4cbf30d95423d95c0fb3785e097deb28e4998b2535c7d2c344657c31e716e6fb798d3d6ea0c39b4e0e34e62"
+    },
+    "checksums": {
+      "path": "build/layrsv2-host-artifacts.sha384",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/fcfdbd5e47f8fec63fe5ff9eadb9dbb91b4bff7d/layrsv2-host-artifacts.sha384",
+      "versionId": "UTCjKNUFrNwWJQkDWNk0pLNNpysjk4i4",
+      "sizeBytes": 246,
+      "sha384": "8e8c9f3c06b502b5e975f28547aed90db6a565e46835c49af73a78f6d4c77cd91897eea0ede1b82249252e8d73021c85"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "0a7645f364d01582e5cccd234d2a6fb5e3cf06f21c51e9afc0ca04d9e63619729f797b7767d0fe9baa135174ad72fec8",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "b0852e41fd0bad8b99fcb6e6bc2d1987ba491fbdff92be3a81763af9a977826232f6f7444c51a64f83c0f076272c06b6"
+  },
+  "objectLock": {
+    "mode": "COMPLIANCE",
+    "retainUntilAtLeast": "2026-08-31T11:50:55+00:00"
+  },
+  "activation": null,
+  "signature": null,
+  "signatureNote": "Candidate is a snapshot-compatible fail-closed execution guard. It changes no private-core state shape, state-root material, journal encoding, ledger accounting, matching, settlement, or receipt semantics. A POLYMARKET_BOOTSTRAP submit is rejected before hold mutation when sealed external execution capability is absent. Activation remains gated on exact PCR and signed manifest rotation, successful snapshot provisioning, native ZEN canaries, external-market rejection canaries, reconciliation, DLQ and alarm checks."
+}
