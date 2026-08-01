@@ -21,10 +21,16 @@ source "amazon-ebs" "layrsv2_enclave_parent" {
   ssh_username                              = "ec2-user"
   ami_name                                  = "layrsv2-enclave-parent-${var.release_id}"
   ami_description                           = "Layrs v2 Nitro enclave parent ${var.release_id}"
+  encrypt_boot                              = true
+  kms_key_id                                = "alias/aws/ebs"
   ena_support                               = true
   imds_support                              = "v2.0"
   ssh_clear_authorized_keys                 = true
   temporary_security_group_source_public_ip = true
+  deregistration_protection {
+    enabled       = true
+    with_cooldown = true
+  }
   source_ami_filter {
     filters = {
       name                = "al2023-ami-2023.*-x86_64"
