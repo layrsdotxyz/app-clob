@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "validated-ready-for-activation",
+  "releaseId": "3e401fa2b3abedfcf6e8ab2e51143e1d779bb7c5",
+  "sourceCommit": "3e401fa2b3abedfcf6e8ab2e51143e1d779bb7c5",
+  "sourceBranch": "main",
+  "snapshotCompatibilityBase": "fcfdbd5e47f8fec63fe5ff9eadb9dbb91b4bff7d",
+  "snapshotApproval": "enclave/snapshot-migrations/2026-08-01-native-exact-condition-markets.md",
+  "region": "us-east-1",
+  "amiId": "ami-09fb68890821049ac",
+  "amiSnapshotId": "snap-0f33c4b49ef9b6363",
+  "amiDeregistrationProtection": "enabled-without-cooldown",
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/3e401fa2b3abedfcf6e8ab2e51143e1d779bb7c5",
+  "artifacts": {
+    "sourceArchive": {
+      "path": "source.tar.gz",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/3e401fa2b3abedfcf6e8ab2e51143e1d779bb7c5/source.tar.gz",
+      "versionId": "uJoDnFIhZH03DfGBo3Xa1qxCe90F6w8Z",
+      "sizeBytes": 508474,
+      "sha384": "4e4ce5644e2f186cecda5bb35e1d7db24d9abad759e1859462a1e2e73f8e09a04be4ae8800eef5a3b0e54c2268172c9b"
+    },
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/3e401fa2b3abedfcf6e8ab2e51143e1d779bb7c5/layrsv2-clob.eif",
+      "versionId": "pHoKsYrtBz3LbthYDrcZvn3elz70.rk9",
+      "sizeBytes": 41143360,
+      "sha384": "5c5cc926af831536d3e5ee2f273d7566a42ef7ec3562b2a882098cc7eba6b16de1e0dcecc0e304ba91d7cb9e6b923d0a"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/3e401fa2b3abedfcf6e8ab2e51143e1d779bb7c5/layrs-enclave-parent",
+      "versionId": "nXFYtuqJoPChNoVwn.14HZ_i5bJbEd9Y",
+      "sizeBytes": 1234256,
+      "sha384": "d578c7c29702f7bb4dce4394e5713db3824006fe3026030a293a797d5cba77be3cbe2198615a5d44639b7cb81892cb0a"
+    },
+    "measurements": {
+      "path": "build/layrsv2-clob-measurements.json",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/3e401fa2b3abedfcf6e8ab2e51143e1d779bb7c5/layrsv2-clob-measurements.json",
+      "versionId": "tg1RCLxSAgUAGX6fTNUCGISpD9FCfl9z",
+      "sizeBytes": 402,
+      "sha384": "0cdc11d9dab02d13ee8ddd4a5d80ed07323abe5aab569d1cba838d6592c79c1b5e418a9bceac05bd390cf04ababcd364"
+    },
+    "checksums": {
+      "path": "build/layrsv2-host-artifacts.sha384",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/3e401fa2b3abedfcf6e8ab2e51143e1d779bb7c5/layrsv2-host-artifacts.sha384",
+      "versionId": "xJGRGJYtfy4r.dmLJFDQW.1PD5lCHZbl",
+      "sizeBytes": 246,
+      "sha384": "92b1410e13bc5efe6586b94cd63153459cf97c200fa8be1a8be5360d83c636ce235c000d1ce4dd05825337f838671127"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "ecdae992d0426498338869eee5fcf76c08214dd58624d7405fe0e9ce2ad894266003587b58a082eaef5facb309c92ef2",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "230a08f91c85ec8e0695fbb695d4b4cd0a4010ad41ae668253baaa1833730e6222ffe6eb97d889e43b8365f91f9da952"
+  },
+  "objectLock": {
+    "mode": "COMPLIANCE",
+    "retainUntilAtLeast": "2026-08-31T14:36:21+00:00"
+  },
+  "activation": null,
+  "signature": null,
+  "signatureNote": "Candidate adds approved native P2P exact-condition SPORTS, ESPORTS and POLITICS markets under the signed v5 namespace. Matching, complete-set accounting, fee, withdrawal and signed-receipt semantics remain deterministic and fail closed. Activation remains gated on exact PCR and signed-manifest rotation, snapshot replay parity, Base-USDC custody reconciliation, native complementary-order canaries, settlement/audit publication, DLQ and alarm checks."
+}
