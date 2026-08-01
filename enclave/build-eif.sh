@@ -14,7 +14,15 @@ fi
 image_tag=${LAYRS_ENCLAVE_IMAGE_TAG:-layrsv2-clob-enclave:local}
 output_eif=${LAYRS_EIF_OUTPUT:-build/layrsv2-clob.eif}
 measurement_file=${LAYRS_MEASUREMENT_OUTPUT:-build/layrsv2-clob-measurements.json}
+nitro_cli_artifacts=${NITRO_CLI_ARTIFACTS:-/usr/share/nitro_enclaves/blobs}
 mkdir -p "$(dirname "${output_eif}")" "$(dirname "${measurement_file}")"
+
+if [[ ! -d ${nitro_cli_artifacts} ]]; then
+  echo "Nitro CLI artifacts directory does not exist: ${nitro_cli_artifacts}" >&2
+  exit 1
+fi
+
+export NITRO_CLI_ARTIFACTS=${nitro_cli_artifacts}
 
 docker build \
   --file enclave/Dockerfile \

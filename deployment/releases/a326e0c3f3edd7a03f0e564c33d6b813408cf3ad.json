@@ -1,0 +1,63 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "validated-ready-for-activation",
+  "releaseId": "a326e0c3f3edd7a03f0e564c33d6b813408cf3ad",
+  "sourceCommit": "a326e0c3f3edd7a03f0e564c33d6b813408cf3ad",
+  "sourceBranch": "main",
+  "snapshotCompatibilityBase": "37b3b35fd3c0700dddbeae91a2d9be3039d89438",
+  "snapshotApproval": "enclave/snapshot-migrations/2026-08-01-signed-event-market-namespace.md",
+  "region": "us-east-1",
+  "amiId": "ami-03c2a5180a638cee4",
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/a326e0c3f3edd7a03f0e564c33d6b813408cf3ad",
+  "artifacts": {
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/a326e0c3f3edd7a03f0e564c33d6b813408cf3ad/layrsv2-clob.eif",
+      "versionId": "Utk222WG3vOVHBQ.MD_IVwYhnuONz.rY",
+      "sizeBytes": 41102404,
+      "sha384": "21b93d1f9f699b80ad2e6fea8a14ebf94e9801f315105adfbcedd6a1110e679dff4bdbf8e9bdca053b252ce174bf217d"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/a326e0c3f3edd7a03f0e564c33d6b813408cf3ad/layrs-enclave-parent",
+      "versionId": "bpT7DgRTMx2d_7G7xBXQneNQPf8mcsV3",
+      "sizeBytes": 1234256,
+      "sha384": "2b7180ad0e664a4eac5087780d144249eef872ce71a565ee1a2453b8dc4da840fb0e50a814dd70bbf89cc88c5eb5190a"
+    },
+    "measurements": {
+      "path": "build/layrsv2-clob-measurements.json",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/a326e0c3f3edd7a03f0e564c33d6b813408cf3ad/layrsv2-clob-measurements.json",
+      "versionId": "KLqoW.GFHm20TtO_bLY3N40D1trp8UdY",
+      "sizeBytes": 402,
+      "sha384": "0d9a85affd18c8282f912b18663846f24d3ca0484d5b136a3f2a83efbd5782566f847e878423a88d31c6b77cabf9eef0"
+    },
+    "checksums": {
+      "path": "build/layrsv2-host-artifacts.sha384",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/a326e0c3f3edd7a03f0e564c33d6b813408cf3ad/layrsv2-host-artifacts.sha384",
+      "versionId": "7ooZiK_4krN9Tzvlj1b19nivm5drnXT8",
+      "sizeBytes": 246,
+      "sha384": "33ff41c4623837b7b8e8b2aac83ac7214a20990c218d6abcec1da11b81596241d6c91fe7874b16b5a68cab4b0176ca47"
+    },
+    "sourceArchive": {
+      "path": "source.tar.gz",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/a326e0c3f3edd7a03f0e564c33d6b813408cf3ad/source.tar.gz",
+      "versionId": "Iwk1AD3xUGy6s8T7UZeM6cRjKoGlTz5F",
+      "sizeBytes": 501921,
+      "sha384": "8f48d7fd943c48cbda3b86db8cd32045de151c4f2d24f894e61418a952499c7becd21b9b49b442e195fa66724c5533ee"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "63f6fbb11f1bcecff581b53287dac66a1ee9b7de31b57299185950bfb715d999511d6a2e0b56d8818d53c60e1f8302cf",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "95736d9b5ed8a80b67c4785f2af407025173865881fa0219152759909523500fedf65b26d08286d5025fad3063fee482"
+  },
+  "objectLock": {
+    "mode": "COMPLIANCE",
+    "retainUntilAtLeast": "2026-08-31T05:31:00+00:00"
+  },
+  "activation": null,
+  "signature": null,
+  "signatureNote": "Candidate adds only the explicitly approved signed v4 SPORTS, ESPORTS and POLITICS market namespaces. Existing snapshot, journal, state-root, matching, collateral, fee, withdrawal, resolution and signed-receipt semantics remain unchanged. Activation remains gated on exact snapshot replay parity, approved PCR and signed-manifest rotation, deterministic category registration canaries, Base-USDC custody reconciliation and rollback readiness."
+}
