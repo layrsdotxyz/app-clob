@@ -636,7 +636,7 @@ impl PrivateTradingCore {
         let mut active_order_count = 0usize;
         let mut cancellation_error = None;
         if let Some(book) = books.get_mut(market_id) {
-            let cancelled = book.cancel_all(market_id);
+            let cancelled = book.cancel_all(market_id, now_millis);
             active_order_count = cancelled.len();
             match cancellation_transfers(&ledger, book, market, &cancelled) {
                 Ok(releases) if !releases.is_empty() => {
@@ -1511,7 +1511,7 @@ impl PrivateTradingCore {
         let mut books = self.books.clone();
         let mut position_cost_basis = self.position_cost_basis.clone();
         if let Some(book) = books.get_mut(&market.market_id) {
-            let cancelled = book.cancel_all(&market.market_id);
+            let cancelled = book.cancel_all(&market.market_id, now_millis);
             let releases = cancellation_transfers(&ledger, book, market, &cancelled)?;
             if !releases.is_empty() {
                 ledger.apply(LedgerTransaction {
@@ -2444,7 +2444,7 @@ impl PrivateTradingCore {
                 let book = books
                     .get_mut(market_id)
                     .ok_or_else(|| CoreError::InvalidOrder("order book does not exist".into()))?;
-                let order = book.cancel(*order_id, &private_user_id)?;
+                let order = book.cancel(*order_id, &private_user_id, now_millis)?;
                 let transfers =
                     cancellation_transfers(&ledger, book, market, std::slice::from_ref(&order))?;
                 ledger.apply(LedgerTransaction {

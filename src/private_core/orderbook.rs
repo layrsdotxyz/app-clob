@@ -74,6 +74,14 @@ pub struct BookOrder {
     pub remaining_micros: u128,
     pub time_in_force: TimeInForce,
     pub expires_at_millis: Option<i64>,
+    /// Enclave-observed placement time. Older persisted orders deserialize as
+    /// zero and omit the field when reserialized, preserving legacy snapshots.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub created_at_millis: i64,
+    /// Last fill/cancellation time. It equals `created_at_millis` until the
+    /// order changes state.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub updated_at_millis: i64,
     pub sequence: u64,
     pub status: OrderStatus,
 }
@@ -126,6 +134,8 @@ impl BookOrder {
             remaining_micros: quantity_micros,
             time_in_force,
             expires_at_millis,
+            created_at_millis: 0,
+            updated_at_millis: 0,
             sequence: 0,
             status: OrderStatus::Open,
         }
@@ -182,6 +192,26 @@ fn opposite_outcome(outcome: Outcome) -> Outcome {
 mod legacy_snapshot_tests {
     use super::*;
 
+    fn order(
+        order_id: u128,
+        owner: &str,
+        outcome: Outcome,
+        action: OrderAction,
+        price_micros: u64,
+    ) -> BookOrder {
+        BookOrder::with_id(
+            Uuid::from_u128(order_id),
+            owner,
+            "layrs:v3:ZEN:15m:timestamp-test",
+            outcome,
+            action,
+            price_micros,
+            1_000_000,
+            TimeInForce::Gtc,
+            None,
+        )
+    }
+
     #[test]
     fn legacy_book_bytes_match_the_pre_fill_history_schema_exactly() {
         let order_id = Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap();
@@ -221,6 +251,54 @@ mod legacy_snapshot_tests {
                 "\"sequence\":1}}"
             )
         );
+    }
+
+    #[test]
+    fn placement_and_cancellation_times_are_recorded_without_changing_creation_time() {
+        let mut book = PriceTimeBook::default();
+        let order_id = Uuid::from_u128(1);
+
+        book.submit(
+            order(1, "usr_owner", Outcome::Up, OrderAction::Buy, 400_000),
+            1_000,
+        )
+        .unwrap();
+        let placed = book.order(order_id).unwrap();
+        assert_eq!(placed.created_at_millis, 1_000);
+        assert_eq!(placed.updated_at_millis, 1_000);
+
+        let cancelled = book.cancel(order_id, "usr_owner", 2_000).unwrap();
+        assert_eq!(cancelled.created_at_millis, 1_000);
+        assert_eq!(cancelled.updated_at_millis, 2_000);
+        assert_eq!(cancelled.status, OrderStatus::Cancelled);
+    }
+
+    #[test]
+    fn fills_update_maker_and_taker_times_deterministically() {
+        let mut book = PriceTimeBook::default();
+        let maker_id = Uuid::from_u128(1);
+        let taker_id = Uuid::from_u128(2);
+
+        book.submit(
+            order(1, "usr_maker", Outcome::Up, OrderAction::Sell, 400_000),
+            1_000,
+        )
+        .unwrap();
+        book.submit(
+            order(2, "usr_taker", Outcome::Up, OrderAction::Buy, 400_000),
+            2_000,
+        )
+        .unwrap();
+
+        let maker = book.order(maker_id).unwrap();
+        assert_eq!(maker.created_at_millis, 1_000);
+        assert_eq!(maker.updated_at_millis, 2_000);
+        assert_eq!(maker.status, OrderStatus::Filled);
+
+        let taker = book.order(taker_id).unwrap();
+        assert_eq!(taker.created_at_millis, 2_000);
+        assert_eq!(taker.updated_at_millis, 2_000);
+        assert_eq!(taker.status, OrderStatus::Filled);
     }
 }
 
@@ -345,6 +423,10 @@ impl PriceTimeBook {
 
     pub fn submit(&mut self, mut incoming: BookOrder, now_millis: i64) -> CoreResult<MatchResult> {
         self.validate(&incoming, now_millis)?;
+        if incoming.created_at_millis == 0 {
+            incoming.created_at_millis = now_millis;
+        }
+        incoming.updated_at_millis = now_millis;
         if self.orders.contains_key(&incoming.order_id) {
             return Err(CoreError::InvalidOrder("duplicate order id".into()));
         }
@@ -383,6 +465,7 @@ impl PriceTimeBook {
                 .filled_micros
                 .checked_add(quantity)
                 .ok_or_else(|| CoreError::InvalidOrder("filled quantity overflow".into()))?;
+            maker.updated_at_millis = now_millis;
             maker.status = if maker.remaining_micros == 0 {
                 OrderStatus::Filled
             } else {
@@ -445,7 +528,12 @@ impl PriceTimeBook {
         })
     }
 
-    pub fn cancel(&mut self, order_id: Uuid, private_user_id: &str) -> CoreResult<BookOrder> {
+    pub fn cancel(
+        &mut self,
+        order_id: Uuid,
+        private_user_id: &str,
+        now_millis: i64,
+    ) -> CoreResult<BookOrder> {
         let order = self
             .orders
             .get_mut(&order_id)
@@ -460,6 +548,7 @@ impl PriceTimeBook {
             return Err(CoreError::InvalidOrder("order is not cancellable".into()));
         }
         order.status = OrderStatus::Cancelled;
+        order.updated_at_millis = now_millis;
         self.active.remove(&order_id);
         Ok(order.clone())
     }
@@ -512,7 +601,7 @@ impl PriceTimeBook {
             .collect()
     }
 
-    pub fn cancel_all(&mut self, market_id: &str) -> Vec<BookOrder> {
+    pub fn cancel_all(&mut self, market_id: &str, now_millis: i64) -> Vec<BookOrder> {
         let ids: Vec<Uuid> = self
             .active
             .iter()
@@ -523,6 +612,7 @@ impl PriceTimeBook {
         for id in ids {
             if let Some(order) = self.orders.get_mut(&id) {
                 order.status = OrderStatus::Cancelled;
+                order.updated_at_millis = now_millis;
                 cancelled.push(order.clone());
             }
             self.active.remove(&id);
@@ -669,4 +759,8 @@ fn is_expired(order: &BookOrder, now_millis: i64) -> bool {
     order
         .expires_at_millis
         .is_some_and(|expiry| expiry <= now_millis)
+}
+
+fn is_zero_i64(value: &i64) -> bool {
+    *value == 0
 }
