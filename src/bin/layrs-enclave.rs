@@ -26,10 +26,11 @@ use clob_service::polymarket_enclave::{
 use clob_service::private_core::{
     polymarket_resolution_signing_payload, resolution_signing_payload, AccountKey,
     BootstrapExecutionState, CommandResult, CoreResponse, EnclaveReceipt, EncryptedJournalRecord,
-    EncryptedSnapshot, ExternalFlowDirection, JournalKey, MarketConfig,
+    EncryptedSnapshot, ExternalFlowDirection, JournalKey, MarketConfig, MarketExecution,
     PolymarketResolutionStatement, PrivateTradingCore, ReceiptSigner, ResolutionStatement,
     SignedAuditFillArtifact, SignedPolymarketResolution, SignedResolution,
-    SignedResolutionEvidence, SystemResponse, UserCommand, WithdrawalAuthorization,
+    SignedResolutionEvidence, SystemResponse, UserCommand, UserCommandAction,
+    WithdrawalAuthorization,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use openssl::{
@@ -747,6 +748,11 @@ async fn dispatch(state: &mut EnclaveState, request: PlainRequest) -> PlainRespo
             command,
             now_millis,
         } => (|| -> Result<PlainResponse, String> {
+            let core = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?;
+            ensure_market_execution_available(core, &command.action, state.polymarket.is_some())?;
             let mut response = state
                 .core
                 .as_mut()
@@ -789,6 +795,32 @@ async fn dispatch(state: &mut EnclaveState, request: PlainRequest) -> PlainRespo
             }),
     };
     result.unwrap_or_else(|code| PlainResponse::Error { code })
+}
+
+fn is_polymarket_execution(execution: &MarketExecution) -> bool {
+    matches!(execution, MarketExecution::PolymarketBootstrap { .. })
+}
+
+fn ensure_market_execution_available(
+    core: &PrivateTradingCore,
+    action: &UserCommandAction,
+    polymarket_ready: bool,
+) -> Result<(), String> {
+    let UserCommandAction::SubmitOrder { order } = action else {
+        return Ok(());
+    };
+    let market = core.market_config(&order.market_id);
+    if !polymarket_ready
+        && market
+            .as_ref()
+            .is_some_and(|config| is_polymarket_execution(&config.execution))
+    {
+        // Reject before PrivateTradingCore::execute reserves cash or claim
+        // collateral. A missing external-venue bundle must never turn into
+        // an indefinitely pending user hold.
+        return Err("POLYMARKET_OPERATOR_UNAVAILABLE".to_string());
+    }
+    Ok(())
 }
 
 async fn dispatch_operator(
@@ -2293,6 +2325,83 @@ mod tests {
     #[test]
     fn relay_frame_limit_supports_checkpoint_restore_payloads() {
         const { assert!(MAX_FRAME_BYTES >= 64 * 1024 * 1024) };
+    }
+
+    #[test]
+    fn external_execution_readiness_gate_targets_only_polymarket_markets() {
+        assert!(!is_polymarket_execution(&MarketExecution::NativeClob));
+        assert!(is_polymarket_execution(
+            &MarketExecution::PolymarketBootstrap {
+                condition_id: "0xcondition".into(),
+                up_token_id: "1".into(),
+                down_token_id: "2".into(),
+                up_outcome_index: 0,
+                down_outcome_index: 1,
+                neg_risk: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn unavailable_polymarket_rejects_before_creating_a_user_hold() {
+        use clob_service::private_core::{
+            BookOrder, JournalKey, OrderAction, Outcome, TimeInForce,
+        };
+
+        let mut core = PrivateTradingCore::new(
+            JournalKey::from_bytes([81u8; 32]),
+            ReceiptSigner::generate([82u8; 48]),
+        );
+        let market_id = "layrs:v4:SPORTS:readiness-gate:abababababababab";
+        core.register_market(
+            "sys:market:readiness-gate".into(),
+            MarketConfig {
+                market_id: market_id.into(),
+                settlement_asset: "USDC".into(),
+                settlement_decimals: 6,
+                public_settlement_chain: Some("horizen".into()),
+                opens_at_millis: 900,
+                closes_at_millis: 2_000,
+                minimum_quantity_micros: 1,
+                maximum_quantity_micros: 10_000_000,
+                minimum_order_notional_micros: 1_000_000,
+                maximum_order_notional_micros: 10_000_000,
+                maximum_user_position_micros: 10_000_000,
+                maximum_pending_bootstrap_notional_micros: 100_000_000,
+                tick_size_micros: 1_000,
+                oracle_feed_id: 1,
+                execution: MarketExecution::PolymarketBootstrap {
+                    condition_id: format!("0x{}", "ab".repeat(32)),
+                    up_token_id: "1".into(),
+                    down_token_id: "2".into(),
+                    up_outcome_index: 0,
+                    down_outcome_index: 1,
+                    neg_risk: false,
+                },
+            },
+            800,
+        )
+        .expect("register market");
+        let action = UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "private-user",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                500_000,
+                2_000_000,
+                TimeInForce::Fok,
+                None,
+            ),
+        };
+        let root_before = core.state_root();
+
+        assert_eq!(
+            ensure_market_execution_available(&core, &action, false),
+            Err("POLYMARKET_OPERATOR_UNAVAILABLE".into())
+        );
+        assert_eq!(core.state_root(), root_before);
+        assert!(ensure_market_execution_available(&core, &action, true).is_ok());
     }
 
     #[test]
