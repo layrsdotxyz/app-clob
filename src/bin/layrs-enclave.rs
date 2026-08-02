@@ -370,6 +370,7 @@ enum PlainResponse {
         state: &'static str,
         verifier_public_key: Option<[u8; 32]>,
         bridge_approval_signers: Option<std::collections::BTreeMap<String, String>>,
+        reward_claim_signers: Option<std::collections::BTreeMap<String, String>>,
     },
     AuditSignerStatus {
         state: &'static str,
@@ -1075,6 +1076,10 @@ async fn dispatch_operator(
                 .chain_signer
                 .as_ref()
                 .map(EnclaveChainSigner::bridge_approval_signers),
+            reward_claim_signers: state
+                .chain_signer
+                .as_ref()
+                .map(EnclaveChainSigner::reward_claim_signers),
         }),
         OperatorCommand::BeginChainSignerProvision {
             kms_key_id,
@@ -1171,6 +1176,10 @@ async fn dispatch_operator(
                     .chain_signer
                     .as_ref()
                     .map(EnclaveChainSigner::bridge_approval_signers),
+                reward_claim_signers: state
+                    .chain_signer
+                    .as_ref()
+                    .map(EnclaveChainSigner::reward_claim_signers),
             })
         }
         OperatorCommand::SignPoolWithdrawal {
