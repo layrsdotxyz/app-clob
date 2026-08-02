@@ -239,6 +239,16 @@ impl EnclaveChainSigner {
             .collect()
     }
 
+    /// Returns only public EVM claim-signer addresses. Deployment automation
+    /// uses this to verify that the enclave and governance agree on the signer
+    /// before claims are enabled; private key material remains enclave-only.
+    pub fn reward_claim_signers(&self) -> BTreeMap<String, String> {
+        self.reward_claim_domains
+            .iter()
+            .map(|(chain, domain)| (chain.clone(), format!("{:#x}", domain.wallet.address())))
+            .collect()
+    }
+
     pub fn sign_reward_claim(
         &self,
         intent: &crate::private_core::RewardClaimIntent,
@@ -685,6 +695,50 @@ mod tests {
             assert_eq!(address.len(), 42);
         }
         assert_ne!(signers["base"], signers["horizen"]);
+    }
+
+    #[test]
+    fn exposes_only_public_reward_claim_signer_addresses() {
+        let signer = EnclaveChainSigner::new(ChainSignerBundle {
+            resolution_private_key_hex:
+                "0x4f3edf983ac63ad7c7f9a2f8b7f3fb6d84ff79d59bf393ae7d4bc0f6f1a5c06d".into(),
+            reward_claim_domains: vec![RewardClaimDomainSecret {
+                chain: "base".into(),
+                chain_id: 8_453,
+                distributor_address: "0x379ecef96fb0021e05364df91844ce1b9cd2e6dc".into(),
+                private_key_hex:
+                    "0x5555555555555555555555555555555555555555555555555555555555555555".into(),
+            }],
+            domains: vec![
+                ChainSignerDomainSecret {
+                    chain: "base".into(),
+                    chain_id: 8_453,
+                    asset: "USDC".into(),
+                    pool_address: "0x1111111111111111111111111111111111111111".into(),
+                    eoa_private_key_hex:
+                        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d".into(),
+                    admin_oracle_address: "0x4444444444444444444444444444444444444444".into(),
+                    oracle_private_key_hex:
+                        "0x0dbbe8e4e7a7e1bfa5fd84f122539111716f10a741f14e20511e097c620c4681".into(),
+                },
+                ChainSignerDomainSecret {
+                    chain: "horizen".into(),
+                    chain_id: 26_514,
+                    asset: "ZEN".into(),
+                    pool_address: "0x2222222222222222222222222222222222222222".into(),
+                    eoa_private_key_hex:
+                        "0x8b3a350cf5c34c9194ca3a545d9c34e9e00f4d10b423f7594c35c3bb2d95b42f".into(),
+                    admin_oracle_address: "0x5555555555555555555555555555555555555555".into(),
+                    oracle_private_key_hex:
+                        "0x47e179ec197488593b187f80a00eb0da91f1b9d9e85bc7b52cda8535144f2381".into(),
+                },
+            ],
+        })
+        .unwrap();
+        let addresses = signer.reward_claim_signers();
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(addresses["base"].len(), 42);
+        assert_eq!(addresses, signer.reward_claim_signers());
     }
 
     #[tokio::test]
