@@ -4212,10 +4212,12 @@ fn valid_market_namespace(market_id: &str) -> bool {
     market_id.starts_with("layrs:v1:")
         || market_id.starts_with("layrs:v2:")
         || market_id.starts_with("layrs:v3:")
-        || ["SPORTS", "ESPORTS", "POLITICS"].iter().any(|category| {
-            market_id.starts_with(&format!("layrs:v4:{category}:"))
-                || market_id.starts_with(&format!("layrs:v5:{category}:"))
-        })
+        || ["SPORTS", "ESPORTS", "POLITICS", "MACRO"]
+            .iter()
+            .any(|category| {
+                market_id.starts_with(&format!("layrs:v4:{category}:"))
+                    || market_id.starts_with(&format!("layrs:v5:{category}:"))
+            })
 }
 
 fn valid_hex32(value: &str) -> bool {
