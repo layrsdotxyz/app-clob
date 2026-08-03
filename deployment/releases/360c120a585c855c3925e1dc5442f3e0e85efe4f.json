@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "validated-ready-for-activation",
+  "releaseId": "360c120a585c855c3925e1dc5442f3e0e85efe4f",
+  "sourceCommit": "360c120a585c855c3925e1dc5442f3e0e85efe4f",
+  "sourceBranch": "main",
+  "snapshotCompatibilityBase": "a9c5c2e544e594118429d27f987cd67058ec976a",
+  "snapshotApproval": "enclave/snapshot-migrations/2026-08-03-native-macro-market-namespace.md",
+  "region": "us-east-1",
+  "amiId": "ami-039c8d9d8479112f7",
+  "amiSnapshotId": "snap-02da8847bc4abbec1",
+  "amiDeregistrationProtection": "enabled-with-cooldown",
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/360c120a585c855c3925e1dc5442f3e0e85efe4f",
+  "artifacts": {
+    "sourceArchive": {
+      "path": "source.tar.gz",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/360c120a585c855c3925e1dc5442f3e0e85efe4f/source.tar.gz",
+      "versionId": "fT5IRyBAW7nqocklZkcdQIUNDJms8IU6",
+      "sizeBytes": 512258,
+      "sha384": "962f698359b042cbd322d121438a2db76fa2b6c3cb17c4155832420050fc9d95e8d3216ba61cf5ab60f905f1ca089885"
+    },
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/360c120a585c855c3925e1dc5442f3e0e85efe4f/layrsv2-clob.eif",
+      "versionId": "uPaP6glTdfFhX1vOXnkT3RgSLA6Nq2Ix",
+      "sizeBytes": 41151555,
+      "sha384": "7b38eb1d49adf9170d63e91106275898fef849b9e4f7281046ff168317a032ce137829d8f502e006303bf181be905442"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/360c120a585c855c3925e1dc5442f3e0e85efe4f/layrs-enclave-parent",
+      "versionId": "JVkIiwk012peG14VF8fpQsgWGfv08P.v",
+      "sizeBytes": 1234256,
+      "sha384": "d578c7c29702f7bb4dce4394e5713db3824006fe3026030a293a797d5cba77be3cbe2198615a5d44639b7cb81892cb0a"
+    },
+    "measurements": {
+      "path": "build/layrsv2-clob-measurements.json",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/360c120a585c855c3925e1dc5442f3e0e85efe4f/layrsv2-clob-measurements.json",
+      "versionId": "TgfoG0qFoeX7ueM3L3vIVJC1lCAhx8hJ",
+      "sizeBytes": 402,
+      "sha384": "5d442fe494de036a8eecf7613f5fe96c10e8b8c1926e514611abfaa115b020c3c380e0b57c9eea1c0501dc115c7d607c"
+    },
+    "checksums": {
+      "path": "build/layrsv2-host-artifacts.sha384",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/360c120a585c855c3925e1dc5442f3e0e85efe4f/layrsv2-host-artifacts.sha384",
+      "versionId": "Gdu2hao2ukPSBZtjLwddocjvs0QONc_w",
+      "sizeBytes": 246,
+      "sha384": "5a5c61415e015860b96a8d9a5a4216f6fdb04d038aabb43ed094f6c94de076dadbabf41960ef63ea22a2bb10e03afef6"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "7fcbf6f36d6750be227c9bd1231f9bf2f7d5ef6cd65f2bc5dcc742976056dd7dd273c4fc0f608672cdc2542e4a9c4d01",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "5c5d4035a5161989e0972000cace27b6c1ef7336e4af3e65a6c9e542507a18cc4196b525e72537558ab832186b1b28a6"
+  },
+  "objectLock": {
+    "mode": "COMPLIANCE",
+    "retainUntilAtLeast": "2026-09-02T16:53:45+00:00"
+  },
+  "activation": null,
+  "signature": null,
+  "signatureNote": "Candidate admits reviewed FRED-backed MACRO identifiers to the existing native exact-condition CLOB without changing snapshot, journal, ledger, order, fill, receipt, or resolution encodings. Activation remains gated on exact snapshot replay, signed-manifest and PCR rotation, coordinator provisioning, one macro registration canary, DLQ and alarm reconciliation, and rollback fencing."
+}
