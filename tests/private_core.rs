@@ -1801,6 +1801,60 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
 }
 
 #[test]
+fn registration_receipt_is_publication_eligible_private_and_identity_unique() {
+    let receipt_signer = ReceiptSigner::generate([71u8; 48]);
+    let receipt_public_key = receipt_signer.verifying_key();
+    let mut core = PrivateTradingCore::new(JournalKey::from_bytes([72u8; 32]), receipt_signer);
+    let identity = [73u8; 32];
+    let first_key = SigningKey::from_bytes(&[74u8; 32]);
+    let second_key = SigningKey::from_bytes(&[75u8; 32]);
+
+    let first = core
+        .register_session(
+            "registration:first".into(),
+            "session:registration:first".into(),
+            identity,
+            first_key.verifying_key().to_bytes(),
+            20_000,
+            1_000,
+        )
+        .unwrap();
+    let second = core
+        .register_session(
+            "registration:second".into(),
+            "session:registration:second".into(),
+            identity,
+            second_key.verifying_key().to_bytes(),
+            20_000,
+            1_100,
+        )
+        .unwrap();
+
+    assert_eq!(first.receipt.protocol_version, "layrs.v2");
+    assert_eq!(first.receipt.publication_eligible, Some(true));
+    assert!(first.receipt.command_commitment_sha256.is_some());
+    let first_evidence = first.registration_evidence.unwrap();
+    let second_evidence = second.registration_evidence.unwrap();
+    assert_ne!(first_evidence.commitment, second_evidence.commitment);
+    assert_eq!(first_evidence.nullifier, second_evidence.nullifier);
+    assert_eq!(first.evidence_commitment, Some(first_evidence.commitment));
+    assert!(!serde_json::to_vec(&first_evidence)
+        .unwrap()
+        .windows(identity.len())
+        .any(|window| window == identity));
+
+    let mut signed_payload = first.receipt.clone();
+    let signature = std::mem::take(&mut signed_payload.signature);
+    VerifyingKey::from_bytes(&receipt_public_key)
+        .unwrap()
+        .verify(
+            &serde_json::to_vec(&signed_payload).unwrap(),
+            &Signature::from_slice(&signature).unwrap(),
+        )
+        .unwrap();
+}
+
+#[test]
 fn base_zen_bridge_back_withdrawal_is_reserved_and_authorized_by_the_enclave() {
     let user = SigningKey::from_bytes(&[42u8; 32]);
     let journal_key = [43u8; 32];
