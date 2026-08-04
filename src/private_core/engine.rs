@@ -448,6 +448,14 @@ pub struct SystemResponse {
     pub audit_fills: Vec<SignedAuditFillArtifact>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_commitment: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_evidence: Option<RegistrationEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistrationEvidence {
+    pub commitment: [u8; 32],
+    pub nullifier: [u8; 32],
 }
 
 #[derive(Debug, Clone)]
@@ -1139,18 +1147,30 @@ impl PrivateTradingCore {
             public_key,
             expires_at_millis,
         };
+        let command_commitment = system_command_commitment(&entry)?;
+        let registration_evidence = registration_evidence(identity_commitment, public_key);
         let record = self.journal.append(next_root, &entry)?;
         self.sessions = sessions;
         self.system_keys = keys;
         self.sequence = next_sequence;
-        Ok(self.system_response(
-            "register-session",
+        let receipt = self.receipt_signer.sign(
+            "register-session".into(),
             idempotency_key,
+            Some(command_commitment),
+            Some(true),
+            next_sequence,
             prior_root,
             next_root,
-            record,
+            record.record_hash,
             now_millis,
-        ))
+        );
+        Ok(SystemResponse {
+            receipt,
+            encrypted_record: record,
+            audit_fills: Vec::new(),
+            evidence_commitment: Some(registration_evidence.commitment),
+            registration_evidence: Some(registration_evidence),
+        })
     }
 
     pub fn apply_external_flow(
@@ -2865,7 +2885,36 @@ impl PrivateTradingCore {
             encrypted_record,
             audit_fills: Vec::new(),
             evidence_commitment: None,
+            registration_evidence: None,
         }
+    }
+}
+
+fn system_command_commitment(command: &JournaledSystemCommand) -> CoreResult<[u8; 32]> {
+    let encoded = serde_json::to_vec(command).map_err(|_| CoreError::RequestHashMismatch)?;
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.system-command.v1\0");
+    hash.update((encoded.len() as u64).to_be_bytes());
+    hash.update(encoded);
+    Ok(hash.finalize().into())
+}
+
+fn registration_evidence(
+    identity_commitment: [u8; 32],
+    public_key: [u8; 32],
+) -> RegistrationEvidence {
+    let mut commitment = Sha256::new();
+    commitment.update(b"layrs.registration-commitment.v1\0");
+    commitment.update(identity_commitment);
+    commitment.update(public_key);
+
+    let mut nullifier = Sha256::new();
+    nullifier.update(b"layrs.registration-nullifier.v1\0");
+    nullifier.update(identity_commitment);
+
+    RegistrationEvidence {
+        commitment: commitment.finalize().into(),
+        nullifier: nullifier.finalize().into(),
     }
 }
 
