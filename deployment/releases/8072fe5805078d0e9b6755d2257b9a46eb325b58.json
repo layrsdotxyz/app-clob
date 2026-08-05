@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "validated-ready-for-activation",
+  "releaseId": "8072fe5805078d0e9b6755d2257b9a46eb325b58",
+  "sourceCommit": "8072fe5805078d0e9b6755d2257b9a46eb325b58",
+  "sourceBranch": "main",
+  "snapshotCompatibilityBase": "369558fbc3d14245619ad502c5258b453945f3bb",
+  "snapshotApproval": "enclave/snapshot-migrations/2026-08-05-taskon-order-qualification.md",
+  "region": "us-east-1",
+  "amiId": "ami-091c1678a8df195aa",
+  "amiSnapshotId": "snap-0b1db11fe7b8f17f8",
+  "amiDeregistrationProtection": "enabled-with-cooldown",
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/8072fe5805078d0e9b6755d2257b9a46eb325b58",
+  "artifacts": {
+    "sourceArchive": {
+      "path": "source.tar.gz",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/8072fe5805078d0e9b6755d2257b9a46eb325b58/source.tar.gz",
+      "versionId": "m6IpBipSgbpwM.tdc0btccYYC2q1Ab97",
+      "sizeBytes": 516755,
+      "sha384": "01c34d5dac874efc594d65612ec5a3611358c5ab4967331773c21d0a11e297c7939dfaa974c8c83bf3a3323daedc3e56"
+    },
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/8072fe5805078d0e9b6755d2257b9a46eb325b58/layrsv2-clob.eif",
+      "versionId": "Ok4IV8B1AEXDVrclMVDbMp4_tzv0b7dk",
+      "sizeBytes": 41167937,
+      "sha384": "8bbb6f91ab9357dae6071a721cd41bc0186d3c256c50c407f643793904628c4559dea13a69ea0ed0701998ccc67dae76"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/8072fe5805078d0e9b6755d2257b9a46eb325b58/layrs-enclave-parent",
+      "versionId": "1LovmrNwRihCVZNC1MEH84LpvIQNzoq0",
+      "sizeBytes": 1259536,
+      "sha384": "5911f4e91fe3565db53d4898911f37f8abc4df5d9ca111c397695e655c22f38d261f00447b2bdd40929a4b870479b4f8"
+    },
+    "measurements": {
+      "path": "build/layrsv2-clob-measurements.json",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/8072fe5805078d0e9b6755d2257b9a46eb325b58/layrsv2-clob-measurements.json",
+      "versionId": "TUUdtPZUcQWQXJYE15zgMkryUg62cfbk",
+      "sizeBytes": 402,
+      "sha384": "1fec0ec86384cd7a24adbc121aaf3114bb711a070221ad2d8a0ca3507d2627666eeccb3ec1489a73198bb00c45901461"
+    },
+    "checksums": {
+      "path": "build/layrsv2-host-artifacts.sha384",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/8072fe5805078d0e9b6755d2257b9a46eb325b58/layrsv2-host-artifacts.sha384",
+      "versionId": "WiiNMNFZDyLwdHTo.wzqCN5eE88JCy.v",
+      "sizeBytes": 246,
+      "sha384": "e35b4ee5fc2b796eb3a305edf0b88f51e96f1b6173f1690ab03a845f388d1201cd4be2951a44e743b8d133092a2e1c1a"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "61c6af998a435ea48e6d110e5ead545a37d3a322bf96ab8ae4743a27d00e9b835fd6a160a36455c59a2f0ab3ae9ab6b6",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "be892d19f092c538a2d5dd4efc42fc042c7d071f2acabd1e5bcabee4f3269ecb16f48cbb0522d0748eac5c2c81633c36"
+  },
+  "objectLock": {
+    "mode": "COMPLIANCE",
+    "retainUntilAtLeast": "2026-09-04T13:06:27+00:00"
+  },
+  "activation": null,
+  "signature": null,
+  "signatureNote": "Candidate adds privacy-safe TaskOn order-qualification statements bound to signed enclave receipts without adding persisted private snapshot fields. Activation is gated on exact replay from release 369558fbc3d14245619ad502c5258b453945f3bb, signed-manifest and PCR rotation, coordinator provisioning, legitimate signup/deposit/order canaries, TaskOn verification and counter readback, DLQ/alarm reconciliation, and rollback fencing."
+}
