@@ -30,8 +30,8 @@ use clob_service::private_core::{
     ExternalFlowDirection, JournalKey, MarketConfig, MarketExecution,
     PolymarketResolutionStatement, PrivateTradingCore, ReceiptSigner, ResolutionStatement,
     SignedAuditFillArtifact, SignedExactConditionResolution, SignedPolymarketResolution,
-    SignedResolution, SignedResolutionEvidence, SystemResponse, UserCommand, UserCommandAction,
-    WithdrawalAuthorization,
+    SignedResolution, SignedResolutionEvidence, SignedTaskQualificationArtifact, SystemResponse,
+    UserCommand, UserCommandAction, WithdrawalAuthorization,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use openssl::{
@@ -91,6 +91,7 @@ enum WireResponse {
         snapshot_artifacts: Vec<EncryptedSnapshot>,
         receipt_artifacts: Vec<EnclaveReceipt>,
         audit_artifacts: Vec<SignedAuditFillArtifact>,
+        task_artifacts: Vec<SignedTaskQualificationArtifact>,
     },
     Error {
         code: &'static str,
@@ -711,6 +712,10 @@ async fn handle_encrypted(
         } => response.audit_fills.clone(),
         _ => Vec::new(),
     };
+    let task_artifacts = match &response {
+        PlainResponse::User { response } => response.task_qualifications.clone(),
+        _ => Vec::new(),
+    };
     let encoded = match serde_json::to_vec(&response) {
         Ok(value) => value,
         Err(_) => {
@@ -735,6 +740,7 @@ async fn handle_encrypted(
             snapshot_artifacts,
             receipt_artifacts,
             audit_artifacts,
+            task_artifacts,
         },
         Err(_) => WireResponse::Error {
             code: "ENCRYPTION_FAILED",

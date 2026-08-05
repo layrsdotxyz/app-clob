@@ -45,8 +45,9 @@ pub use engine::{
     PolymarketResolutionStatement, PortfolioSnapshot, PrivateBalance, PrivatePosition,
     PrivateTradingCore, ResolutionEvidence, ResolutionOutcome, ResolutionStatement,
     SignedAuditFillArtifact, SignedExactConditionResolution, SignedPolymarketResolution,
-    SignedResolution, SignedResolutionEvidence, SystemResponse, UserCommand, UserCommandAction,
-    WithdrawalAuthorization, WithdrawalIntent,
+    SignedResolution, SignedResolutionEvidence, SignedTaskQualificationArtifact, SystemResponse,
+    TaskQualificationStatement, UserCommand, UserCommandAction, WithdrawalAuthorization,
+    WithdrawalIntent,
 };
 pub use journal::{
     EnclaveReceipt, EncryptedJournal, EncryptedJournalRecord, EncryptedSnapshot, JournalKey,

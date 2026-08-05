@@ -438,6 +438,8 @@ pub struct CoreResponse {
     pub reward_claim_authorization: Option<RewardClaimAuthorization>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audit_fills: Vec<SignedAuditFillArtifact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_qualifications: Vec<SignedTaskQualificationArtifact>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -471,6 +473,33 @@ struct AuditFillDraft {
     match_type: String,
     fee_atomic: u128,
     nonce: u64,
+}
+
+/// Privacy-minimized evidence that an encrypted order was accepted by the attested core.
+///
+/// The statement deliberately omits the user, market, side, outcome and limit price. The
+/// commitment binds those private fields inside the enclave, while the public notional is the
+/// minimum disclosure required for an external quest verifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskQualificationStatement {
+    pub protocol_version: String,
+    pub event_type: String,
+    pub order_commitment: [u8; 32],
+    pub settlement_asset: String,
+    #[serde(with = "super::decimal_u128")]
+    pub asset_notional_micros: u128,
+    #[serde(with = "super::decimal_u128")]
+    pub filled_quantity_micros: u128,
+    pub occurred_at_millis: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedTaskQualificationArtifact {
+    pub statement: TaskQualificationStatement,
+    pub receipt_id: String,
+    pub state_root: [u8; 32],
+    pub receipt_public_key: [u8; 32],
+    pub signature: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2386,6 +2415,12 @@ impl PrivateTradingCore {
         let mut private_rewards = self.private_rewards.clone();
         let mut system_keys = self.system_keys.clone();
         let mut audit_drafts = Vec::new();
+        let task_order_commitment = match &command.action {
+            UserCommandAction::SubmitOrder { order } => {
+                Some(private_order_commitment(order, &private_user_id))
+            }
+            _ => None,
+        };
         let result = match &command.action {
             UserCommandAction::SubmitOrder { order } => {
                 let mut order = order.clone();
@@ -2804,6 +2839,15 @@ impl PrivateTradingCore {
             &receipt,
             audit_drafts,
         )?;
+        let task_qualifications = signed_task_qualifications(
+            &self.receipt_signer,
+            &receipt,
+            &command.action,
+            &result,
+            &self.markets,
+            task_order_commitment,
+            now_millis,
+        )?;
         let response = CoreResponse {
             result,
             receipt,
@@ -2811,6 +2855,7 @@ impl PrivateTradingCore {
             withdrawal_authorization,
             reward_claim_authorization: None,
             audit_fills,
+            task_qualifications,
         };
         self.ledger = ledger;
         self.books = books;
@@ -4161,6 +4206,84 @@ fn signed_audit_fills(
             Ok(artifact)
         })
         .collect()
+}
+
+fn signed_task_qualifications(
+    signer: &ReceiptSigner,
+    receipt: &EnclaveReceipt,
+    action: &UserCommandAction,
+    result: &CommandResult,
+    markets: &BTreeMap<String, MarketConfig>,
+    order_commitment: Option<[u8; 32]>,
+    now_millis: i64,
+) -> CoreResult<Vec<SignedTaskQualificationArtifact>> {
+    let UserCommandAction::SubmitOrder { order } = action else {
+        return Ok(Vec::new());
+    };
+    let accepted = match result {
+        CommandResult::Order { result } => result
+            .accepted_order
+            .as_ref()
+            .is_some_and(|accepted| accepted.status != OrderStatus::Rejected),
+        CommandResult::BootstrapPending { .. } => true,
+        _ => false,
+    };
+    if !accepted {
+        return Ok(Vec::new());
+    }
+    let market = markets
+        .get(&order.market_id)
+        .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
+    let asset_notional_micros = notional(order.price_micros, order.quantity_micros)?;
+    let filled_quantity_micros = match result {
+        CommandResult::Order { result } => result.fills.iter().try_fold(0u128, |total, fill| {
+            total
+                .checked_add(fill.quantity_micros)
+                .ok_or(CoreError::UnbalancedTransaction)
+        })?,
+        _ => 0,
+    };
+    let statement = TaskQualificationStatement {
+        protocol_version: "layrs.task-qualification.v1".into(),
+        event_type: "ORDER_ACCEPTED".into(),
+        order_commitment: order_commitment
+            .ok_or_else(|| CoreError::InvalidOrder("missing private order commitment".into()))?,
+        settlement_asset: market.settlement_asset.clone(),
+        asset_notional_micros,
+        filled_quantity_micros,
+        occurred_at_millis: now_millis,
+    };
+    let mut artifact = SignedTaskQualificationArtifact {
+        statement,
+        receipt_id: receipt.receipt_id.clone(),
+        state_root: receipt.state_root,
+        receipt_public_key: signer.verifying_key(),
+        signature: Vec::new(),
+    };
+    artifact.signature =
+        signer.sign_domain_payload(b"layrs.task-qualification-artifact.v1\0", &artifact);
+    Ok(vec![artifact])
+}
+
+fn private_order_commitment(order: &BookOrder, private_user_id: &str) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.private-order-commitment.v1\0");
+    hash.update(order.order_id.as_bytes());
+    hash.update((private_user_id.len() as u32).to_be_bytes());
+    hash.update(private_user_id.as_bytes());
+    hash.update((order.market_id.len() as u32).to_be_bytes());
+    hash.update(order.market_id.as_bytes());
+    hash.update([match order.outcome {
+        Outcome::Up => 0,
+        Outcome::Down => 1,
+    }]);
+    hash.update([match order.action {
+        OrderAction::Buy => 0,
+        OrderAction::Sell => 1,
+    }]);
+    hash.update(order.price_micros.to_be_bytes());
+    hash.update(order.quantity_micros.to_be_bytes());
+    hash.finalize().into()
 }
 
 fn one_time_pseudonym(

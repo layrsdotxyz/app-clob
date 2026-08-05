@@ -634,6 +634,33 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
         .unwrap()
         .verify(&payload, &Signature::from_slice(&signature).unwrap())
         .unwrap();
+    assert_eq!(fill_response.task_qualifications.len(), 1);
+    let task = &fill_response.task_qualifications[0];
+    assert_eq!(task.statement.event_type, "ORDER_ACCEPTED");
+    assert_eq!(task.statement.settlement_asset, "ZEN");
+    assert_eq!(task.statement.asset_notional_micros, 400_000);
+    assert_eq!(task.statement.filled_quantity_micros, 1_000_000);
+    assert_eq!(task.receipt_id, fill_response.receipt.receipt_id);
+    let serialized_task = serde_json::to_string(task).unwrap();
+    for private_value in ["usr_", market_id, "BUY", "UP"] {
+        assert!(
+            !serialized_task.contains(private_value),
+            "task qualification leaked private order field: {private_value}"
+        );
+    }
+    let mut unsigned_task = task.clone();
+    let task_signature = std::mem::take(&mut unsigned_task.signature);
+    let encoded_task = serde_json::to_vec(&unsigned_task).unwrap();
+    let mut task_payload = b"layrs.task-qualification-artifact.v1\0".to_vec();
+    task_payload.extend_from_slice(&(encoded_task.len() as u32).to_be_bytes());
+    task_payload.extend_from_slice(&encoded_task);
+    VerifyingKey::from_bytes(&task.receipt_public_key)
+        .unwrap()
+        .verify(
+            &task_payload,
+            &Signature::from_slice(&task_signature).unwrap(),
+        )
+        .unwrap();
     if let CommandResult::Order { result } = &fill_response.result {
         assert!(result
             .fills

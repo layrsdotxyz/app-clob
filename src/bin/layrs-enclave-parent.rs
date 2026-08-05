@@ -10,6 +10,7 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use clob_service::private_core::{
     EnclaveReceipt, EncryptedJournalRecord, EncryptedSnapshot, SignedAuditFillArtifact,
+    SignedTaskQualificationArtifact,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -72,6 +73,7 @@ enum WireResponse {
         snapshot_artifacts: Vec<EncryptedSnapshot>,
         receipt_artifacts: Vec<EnclaveReceipt>,
         audit_artifacts: Vec<SignedAuditFillArtifact>,
+        task_artifacts: Vec<SignedTaskQualificationArtifact>,
     },
     Error {
         code: String,
@@ -112,6 +114,7 @@ struct PrivateResponseEnvelope {
     snapshot_artifacts: Vec<EncryptedSnapshot>,
     receipt_artifacts: Vec<EnclaveReceipt>,
     audit_artifacts: Vec<SignedAuditFillArtifact>,
+    task_artifacts: Vec<SignedTaskQualificationArtifact>,
 }
 
 #[tokio::main]
@@ -276,6 +279,7 @@ async fn relay(State(state): State<AppState>, Json(envelope): Json<PrivateEnvelo
             snapshot_artifacts,
             receipt_artifacts,
             audit_artifacts,
+            task_artifacts,
         }) => Json(PrivateResponseEnvelope {
             protocol_version: "layrs.v1",
             client_public_key: envelope.client_public_key,
@@ -285,6 +289,7 @@ async fn relay(State(state): State<AppState>, Json(envelope): Json<PrivateEnvelo
             snapshot_artifacts,
             receipt_artifacts,
             audit_artifacts,
+            task_artifacts,
         })
         .into_response(),
         Ok(WireResponse::Error { code }) => {
