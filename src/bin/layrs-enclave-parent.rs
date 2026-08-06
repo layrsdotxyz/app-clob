@@ -26,13 +26,13 @@ use tower_http::{
 };
 
 // Provisioning restores the latest encrypted private-core snapshot through the same
-// ciphertext-only relay used by ordinary private commands. The snapshot object is
-// compact at rest in S3, but the current JSON wire encoding expands byte arrays
-// substantially before the parent forwards the frame over vsock. A 1 MiB cap was
-// enough for early alpha state and then failed closed once rolling markets and
-// sessions pushed the restore envelope over the limit. Keep this high enough for
-// production checkpoint growth while still bounded for the private internal origin.
+// ciphertext-only relay used by ordinary private commands. Keep the decoded frame
+// bounded independently from the HTTP JSON envelope: base64 expands a maximum-sized
+// ciphertext by 4/3 before Axum decodes it. Conflating the two limits caused a valid
+// ~51 MiB checkpoint to be rejected at the HTTP boundary even though it fit inside
+// the 64 MiB parent-to-enclave CBOR frame.
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const MAX_HTTP_BODY_BYTES: usize = 96 * 1024 * 1024;
 const VSOCK_PORT: u32 = 5_003;
 const EGRESS_VSOCK_PORT: u32 = 5_004;
 const EGRESS_PREFACE: &[u8] = b"LAYRS_EGRESS_V1\n";
@@ -143,7 +143,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/v1/attestation", get(attestation))
         .route("/v1/private/relay", post(relay))
-        .layer(DefaultBodyLimit::max(MAX_FRAME_BYTES))
+        .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .layer(TimeoutLayer::new(Duration::from_secs(12)))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::new(
@@ -361,11 +361,18 @@ fn decode_fixed<const N: usize>(value: &str, code: &'static str) -> Result<[u8; 
 
 #[cfg(test)]
 mod tests {
-    use super::{WireRequest, MAX_FRAME_BYTES};
+    use super::{WireRequest, MAX_FRAME_BYTES, MAX_HTTP_BODY_BYTES};
 
     #[test]
     fn relay_frame_limit_supports_checkpoint_restore_payloads() {
         const { assert!(MAX_FRAME_BYTES >= 64 * 1024 * 1024) };
+    }
+
+    #[test]
+    fn http_limit_covers_base64_expansion_of_maximum_ciphertext() {
+        const BASE64_BYTES: usize = MAX_FRAME_BYTES.div_ceil(3) * 4;
+        const JSON_ENVELOPE_HEADROOM: usize = 4 * 1024;
+        const { assert!(MAX_HTTP_BODY_BYTES >= BASE64_BYTES + JSON_ENVELOPE_HEADROOM) };
     }
 
     #[test]
