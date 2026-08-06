@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "validated-ready-for-activation",
+  "releaseId": "9be6f0d17dc016033e15cf30582372f10624fb15",
+  "sourceCommit": "9be6f0d17dc016033e15cf30582372f10624fb15",
+  "sourceBranch": "main",
+  "snapshotCompatibilityBase": "8072fe5805078d0e9b6755d2257b9a46eb325b58",
+  "snapshotApproval": "enclave/snapshot-migrations/2026-08-06-binance-zen-resolution.md",
+  "region": "us-east-1",
+  "amiId": "ami-0c2d04400be674573",
+  "amiSnapshotId": "snap-0af71f71c4b61c730",
+  "amiDeregistrationProtection": "enabled-with-cooldown",
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/9be6f0d17dc016033e15cf30582372f10624fb15",
+  "artifacts": {
+    "sourceArchive": {
+      "path": "source.tar.gz",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/9be6f0d17dc016033e15cf30582372f10624fb15/source.tar.gz",
+      "versionId": "u4batMqKUcl90wmLgMh9UYh0dZDgfcjT",
+      "sizeBytes": 521623,
+      "sha384": "39ecb20a557d18455f76ac7d930ac6aea327b56ac183afcf55a44657518a86774e6cf11bfbbf5247cf93f185e78f74cf"
+    },
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/9be6f0d17dc016033e15cf30582372f10624fb15/layrsv2-clob.eif",
+      "versionId": "M1nUwudquFhShhlSkX68hbL2FjkRMLhW",
+      "sizeBytes": 41227329,
+      "sha384": "f2d97ebd7121694863f545514141184c645116453b51d454032e8a1e9b64f9a4ade7555056dde2c6f3f3f4b148468a93"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/9be6f0d17dc016033e15cf30582372f10624fb15/layrs-enclave-parent",
+      "versionId": "Zo4jSlk9kcccHUj_yDA.6XLrrPbmNi.q",
+      "sizeBytes": 1259536,
+      "sha384": "b30781b18f861507da779bcac8346774f5dfcd1766069419bb0b110e92adb58ae6ba66777cf6451e0a5cac33ce125f55"
+    },
+    "measurements": {
+      "path": "build/layrsv2-clob-measurements.json",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/9be6f0d17dc016033e15cf30582372f10624fb15/layrsv2-clob-measurements.json",
+      "versionId": "VZphlChvqYydbJr_Cj3x.Yfcx9U49gXR",
+      "sizeBytes": 402,
+      "sha384": "0f4035cd0e43fbda3d4e17b6090fac0f2a752965b2a13c6f0eb4aa982502843998d64ae39b9f578b67ba3057431a7643"
+    },
+    "checksums": {
+      "path": "build/layrsv2-host-artifacts.sha384",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/9be6f0d17dc016033e15cf30582372f10624fb15/layrsv2-host-artifacts.sha384",
+      "versionId": "b.9Br9kOB52I2Y0GjbzhBV_b3P2gtvqr",
+      "sizeBytes": 246,
+      "sha384": "c776167a70ef3af12221cb8f757c3df5c7a07d84914f2d4a18b1e0764675b2f1b8633be4a67f54f9b2fc1b72ce1591bb"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "9d25640f44c0c05b01b03f40e826893ad1833d46509d5cf62bd54a1e5029eacb17648abd1476a94a9304f4211d7294a0",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "46f5856b0bf9e2381fe2c5df696825f2be1d63993186e087258288470413a46d665ad476a3758d855dcabb9e20d33138"
+  },
+  "objectLock": {
+    "mode": "COMPLIANCE",
+    "retainUntilAtLeast": "2026-09-05T06:59:46+00:00"
+  },
+  "activation": null,
+  "signature": null,
+  "signatureNote": "Candidate adds Binance Spot ZEN/USDT five-completed-one-second-candle resolution with independent REST and captured-WebSocket evidence, deterministic enclave verification, and a signed timeout refund. Activation is gated on exact replay from release 8072fe5805078d0e9b6755d2257b9a46eb325b58, signed-manifest and PCR rotation, coordinator provisioning, Binance source canaries, Horizen resolution publication, AppSync transition, legacy-Pyth recovery, and DLQ/alarm reconciliation."
+}
