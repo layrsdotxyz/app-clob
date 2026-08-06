@@ -176,6 +176,47 @@ pub struct SignedResolution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BinanceBoundaryEvidence {
+    pub window_start_millis: i64,
+    pub window_end_millis: i64,
+    pub median_price_e8: i64,
+    pub sample_count: u16,
+    pub evidence_path_count: u16,
+    pub evidence_commitment: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BinanceResolutionStatement {
+    pub market_id: String,
+    pub oracle_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opening: Option<BinanceBoundaryEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closing: Option<BinanceBoundaryEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<ResolutionOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opening_boundary_millis: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closing_boundary_millis: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_millis: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_boundaries: Vec<String>,
+    pub issued_at_millis: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedBinanceResolution {
+    pub statement: BinanceResolutionStatement,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolymarketResolutionStatement {
     pub market_id: String,
     pub condition_id: String,
@@ -213,6 +254,7 @@ pub struct SignedExactConditionResolution {
 #[serde(tag = "type", content = "signed", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SignedResolutionEvidence {
     Pyth(SignedResolution),
+    Binance(SignedBinanceResolution),
     ExactCondition(SignedExactConditionResolution),
     Polymarket(SignedPolymarketResolution),
 }
@@ -222,6 +264,9 @@ pub enum SignedResolutionEvidence {
 pub enum ResolutionEvidence {
     PythHistoricalMedian {
         statement: ResolutionStatement,
+    },
+    BinanceSpotKlineMedian {
+        statement: BinanceResolutionStatement,
     },
     PolymarketExactCondition {
         statement: PolymarketResolutionStatement,
@@ -1540,6 +1585,28 @@ impl PrivateTradingCore {
         self.commit_market_resolution(idempotency_key, resolution, now_millis)
     }
 
+    pub fn resolve_binance_market(
+        &mut self,
+        idempotency_key: String,
+        signed: SignedBinanceResolution,
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        let market = self
+            .markets
+            .get(&signed.statement.market_id)
+            .ok_or_else(|| CoreError::InvalidResolution("unknown market".into()))?;
+        let outcome =
+            validate_binance_resolution(market, &signed, self.oracle_public_key, now_millis)?;
+        let resolution = MarketResolution {
+            outcome,
+            evidence: ResolutionEvidence::BinanceSpotKlineMedian {
+                statement: signed.statement,
+            },
+        };
+        self.commit_market_resolution(idempotency_key, resolution, now_millis)
+    }
+
     pub fn resolve_polymarket_market(
         &mut self,
         idempotency_key: String,
@@ -1590,6 +1657,7 @@ impl PrivateTradingCore {
     ) -> CoreResult<SystemResponse> {
         let market_id = match &resolution.evidence {
             ResolutionEvidence::PythHistoricalMedian { statement } => &statement.market_id,
+            ResolutionEvidence::BinanceSpotKlineMedian { statement } => &statement.market_id,
             ResolutionEvidence::PolymarketExactCondition { statement } => &statement.market_id,
             ResolutionEvidence::PublicExactCondition { statement } => &statement.market_id,
         };
@@ -1880,6 +1948,19 @@ impl PrivateTradingCore {
                 if signed.statement.market_id != market_id || derived != outcome {
                     return Err(CoreError::InvalidResolution(
                         "on-chain outcome does not match Pyth evidence".into(),
+                    ));
+                }
+            }
+            SignedResolutionEvidence::Binance(signed) => {
+                let derived = validate_binance_resolution(
+                    market,
+                    signed,
+                    self.oracle_public_key,
+                    now_millis,
+                )?;
+                if signed.statement.market_id != market_id || derived != outcome {
+                    return Err(CoreError::InvalidResolution(
+                        "on-chain outcome does not match Binance evidence".into(),
                     ));
                 }
             }
@@ -4384,6 +4465,7 @@ fn valid_market_namespace(market_id: &str) -> bool {
     market_id.starts_with("layrs:v1:")
         || market_id.starts_with("layrs:v2:")
         || market_id.starts_with("layrs:v3:")
+        || market_id.starts_with("layrs:v4:ZEN:")
         || ["SPORTS", "ESPORTS", "POLITICS", "MACRO"]
             .iter()
             .any(|category| {
@@ -4442,6 +4524,119 @@ fn validate_resolution(
         &Signature::from_bytes(&signature_bytes),
     )
     .map_err(|_| CoreError::InvalidOracleSignature)
+}
+
+const BINANCE_ORACLE_FEED_ID: u64 = 9001;
+const BINANCE_ORACLE_SOURCE: &str = "BINANCE_SPOT_ZENUSDT_1S_V1";
+const BINANCE_FALLBACK_DELAY_MILLIS: i64 = 120_000;
+
+fn validate_binance_resolution(
+    market: &MarketConfig,
+    signed: &SignedBinanceResolution,
+    oracle_public_key: Option<[u8; 32]>,
+    now_millis: i64,
+) -> CoreResult<ResolutionOutcome> {
+    if !matches!(market.execution, MarketExecution::NativeClob)
+        || market.oracle_feed_id != BINANCE_ORACLE_FEED_ID
+    {
+        return Err(CoreError::InvalidResolution(
+            "Binance boundary resolution is valid only for Binance native markets".into(),
+        ));
+    }
+    let statement = &signed.statement;
+    if now_millis < market.closes_at_millis
+        || statement.market_id != market.market_id
+        || statement.oracle_source != BINANCE_ORACLE_SOURCE
+        || statement.issued_at_millis < market.closes_at_millis
+        || statement.issued_at_millis > now_millis + 30_000
+    {
+        return Err(CoreError::InvalidResolution(
+            "Binance resolution timing or identity is invalid".into(),
+        ));
+    }
+    let outcome = match (&statement.opening, &statement.closing) {
+        (Some(opening), Some(closing)) => {
+            if statement.fallback.is_some()
+                || statement.reason.is_some()
+                || statement.outcome.is_some()
+                || statement.opening_boundary_millis.is_some()
+                || statement.closing_boundary_millis.is_some()
+                || statement.deadline_millis.is_some()
+                || !statement.missing_boundaries.is_empty()
+            {
+                return Err(CoreError::InvalidResolution(
+                    "Binance primary evidence contains fallback fields".into(),
+                ));
+            }
+            validate_binance_boundary(opening, market.opens_at_millis)?;
+            validate_binance_boundary(closing, market.closes_at_millis)?;
+            derive_resolution_outcome(opening.median_price_e8, closing.median_price_e8)
+        }
+        (None, None) => {
+            let expected_deadline = market
+                .closes_at_millis
+                .checked_add(BINANCE_FALLBACK_DELAY_MILLIS)
+                .ok_or_else(|| CoreError::InvalidResolution("fallback deadline overflow".into()))?;
+            let missing = statement.missing_boundaries.as_slice();
+            if statement.fallback.as_deref() != Some("PUSH_REFUND")
+                || statement.reason.as_deref() != Some("BINANCE_EVIDENCE_TIMEOUT")
+                || statement.outcome != Some(ResolutionOutcome::Push)
+                || statement.opening_boundary_millis != Some(market.opens_at_millis)
+                || statement.closing_boundary_millis != Some(market.closes_at_millis)
+                || statement.deadline_millis != Some(expected_deadline)
+                || statement.issued_at_millis != expected_deadline
+                || now_millis < expected_deadline
+                || missing.is_empty()
+                || missing.len() > 2
+                || missing
+                    .iter()
+                    .any(|value| value != "OPENING" && value != "CLOSING")
+                || (missing.len() == 2 && missing[0] == missing[1])
+            {
+                return Err(CoreError::InvalidResolution(
+                    "Binance timeout fallback is invalid".into(),
+                ));
+            }
+            ResolutionOutcome::Push
+        }
+        _ => {
+            return Err(CoreError::InvalidResolution(
+                "Binance resolution has incomplete boundary evidence".into(),
+            ))
+        }
+    };
+    let key =
+        VerifyingKey::from_bytes(&oracle_public_key.ok_or(CoreError::InvalidOracleSignature)?)
+            .map_err(|_| CoreError::InvalidOracleSignature)?;
+    let signature_bytes: [u8; 64] = signed
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| CoreError::InvalidOracleSignature)?;
+    key.verify(
+        &binance_resolution_signing_payload(statement)?,
+        &Signature::from_bytes(&signature_bytes),
+    )
+    .map_err(|_| CoreError::InvalidOracleSignature)?;
+    Ok(outcome)
+}
+
+fn validate_binance_boundary(
+    boundary: &BinanceBoundaryEvidence,
+    target_millis: i64,
+) -> CoreResult<()> {
+    if boundary.window_end_millis != target_millis
+        || boundary.window_start_millis != target_millis - 5_000
+        || boundary.sample_count != 5
+        || boundary.evidence_path_count < 2
+        || boundary.median_price_e8 <= 0
+        || boundary.evidence_commitment == [0u8; 32]
+    {
+        return Err(CoreError::InvalidResolution(
+            "Binance boundary does not satisfy the five-sample dual-evidence policy".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_polymarket_resolution(
@@ -4545,6 +4740,18 @@ pub fn resolution_signing_payload(statement: &ResolutionStatement) -> CoreResult
         .map_err(|_| CoreError::InvalidResolution("cannot encode resolution".into()))?;
     let mut payload = Vec::with_capacity(encoded.len() + 40);
     payload.extend_from_slice(b"layrs.pyth-resolution.v1\0");
+    payload.extend_from_slice(&(encoded.len() as u64).to_be_bytes());
+    payload.extend_from_slice(&encoded);
+    Ok(payload)
+}
+
+pub fn binance_resolution_signing_payload(
+    statement: &BinanceResolutionStatement,
+) -> CoreResult<Vec<u8>> {
+    let encoded = serde_json::to_vec(statement)
+        .map_err(|_| CoreError::InvalidResolution("cannot encode Binance resolution".into()))?;
+    let mut payload = Vec::with_capacity(encoded.len() + 48);
+    payload.extend_from_slice(b"layrs.binance-resolution.v1\0");
     payload.extend_from_slice(&(encoded.len() as u64).to_be_bytes());
     payload.extend_from_slice(&encoded);
     Ok(payload)

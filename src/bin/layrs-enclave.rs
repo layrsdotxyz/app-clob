@@ -24,14 +24,16 @@ use clob_service::polymarket_enclave::{
     VenueConfirmation, VenueOrderIntent, VenueRedemptionTransactionIntent, VenueSide,
 };
 use clob_service::private_core::{
-    exact_condition_resolution_signing_payload, polymarket_resolution_signing_payload,
-    resolution_signing_payload, AccountKey, BootstrapExecutionState, CommandResult, CoreResponse,
+    binance_resolution_signing_payload, exact_condition_resolution_signing_payload,
+    polymarket_resolution_signing_payload, resolution_signing_payload, AccountKey,
+    BinanceResolutionStatement, BootstrapExecutionState, CommandResult, CoreResponse,
     EnclaveReceipt, EncryptedJournalRecord, EncryptedSnapshot, ExactConditionResolutionStatement,
     ExternalFlowDirection, JournalKey, MarketConfig, MarketExecution,
     PolymarketResolutionStatement, PrivateTradingCore, ReceiptSigner, ResolutionStatement,
-    SignedAuditFillArtifact, SignedExactConditionResolution, SignedPolymarketResolution,
-    SignedResolution, SignedResolutionEvidence, SignedTaskQualificationArtifact, SystemResponse,
-    UserCommand, UserCommandAction, WithdrawalAuthorization,
+    SignedAuditFillArtifact, SignedBinanceResolution, SignedExactConditionResolution,
+    SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence,
+    SignedTaskQualificationArtifact, SystemResponse, UserCommand, UserCommandAction,
+    WithdrawalAuthorization,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use openssl::{
@@ -294,6 +296,11 @@ enum OperatorCommand {
         signed: SignedResolution,
         now_millis: i64,
     },
+    ResolveBinanceMarket {
+        idempotency_key: String,
+        signed: SignedBinanceResolution,
+        now_millis: i64,
+    },
     ResolveExactConditionMarket {
         idempotency_key: String,
         signed: SignedExactConditionResolution,
@@ -334,6 +341,7 @@ enum OperatorCommand {
 )]
 enum UnsignedResolutionEvidence {
     Pyth(ResolutionStatement),
+    Binance(BinanceResolutionStatement),
     ExactCondition(ExactConditionResolutionStatement),
     Polymarket(PolymarketResolutionStatement),
 }
@@ -1282,6 +1290,32 @@ async fn dispatch_operator(
                     });
                     (market_id, outcome, signed)
                 }
+                UnsignedResolutionEvidence::Binance(statement) => {
+                    let market_id = statement.market_id.clone();
+                    let payload = binance_resolution_signing_payload(&statement)
+                        .map_err(|error| error.to_string())?;
+                    let outcome = if let Some(outcome) = statement.outcome {
+                        outcome
+                    } else {
+                        let opening = statement
+                            .opening
+                            .as_ref()
+                            .ok_or_else(|| "INVALID_BINANCE_RESOLUTION_EVIDENCE".to_string())?;
+                        let closing = statement
+                            .closing
+                            .as_ref()
+                            .ok_or_else(|| "INVALID_BINANCE_RESOLUTION_EVIDENCE".to_string())?;
+                        clob_service::private_core::derive_resolution_outcome(
+                            opening.median_price_e8,
+                            closing.median_price_e8,
+                        )
+                    };
+                    let signed = SignedResolutionEvidence::Binance(SignedBinanceResolution {
+                        statement,
+                        signature: signer.sign_resolution_payload(&payload),
+                    });
+                    (market_id, outcome, signed)
+                }
                 UnsignedResolutionEvidence::ExactCondition(statement) => {
                     let outcome = statement.outcome;
                     let payload = exact_condition_resolution_signing_payload(&statement)
@@ -1788,6 +1822,11 @@ async fn dispatch_operator(
                     signed,
                     now_millis,
                 } => core.resolve_market(idempotency_key, signed, now_millis),
+                OperatorCommand::ResolveBinanceMarket {
+                    idempotency_key,
+                    signed,
+                    now_millis,
+                } => core.resolve_binance_market(idempotency_key, signed, now_millis),
                 OperatorCommand::ResolveExactConditionMarket {
                     idempotency_key,
                     signed,

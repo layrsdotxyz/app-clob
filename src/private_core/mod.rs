@@ -37,15 +37,17 @@ pub mod decimal_u128 {
 // unused-import error.
 #[allow(unused_imports)]
 pub use engine::{
-    command_request_hash, derive_resolution_outcome, exact_condition_resolution_signing_payload,
-    polymarket_resolution_signing_payload, resolution_signing_payload, AuditFillStatement,
-    BootstrapExecutionState, BootstrapExecutionView, BootstrapVenueIntent, BoundaryEvidence,
-    CommandResult, CoreResponse, ExactConditionResolutionStatement, MarketConfig, MarketExecution,
-    MarketResolution, MarketSettlementReadiness, PolymarketRedemptionIntent,
-    PolymarketResolutionStatement, PortfolioSnapshot, PrivateBalance, PrivatePosition,
-    PrivateTradingCore, ResolutionEvidence, ResolutionOutcome, ResolutionStatement,
-    SignedAuditFillArtifact, SignedExactConditionResolution, SignedPolymarketResolution,
-    SignedResolution, SignedResolutionEvidence, SignedTaskQualificationArtifact, SystemResponse,
+    binance_resolution_signing_payload, command_request_hash, derive_resolution_outcome,
+    exact_condition_resolution_signing_payload, polymarket_resolution_signing_payload,
+    resolution_signing_payload, AuditFillStatement, BinanceBoundaryEvidence,
+    BinanceResolutionStatement, BootstrapExecutionState, BootstrapExecutionView,
+    BootstrapVenueIntent, BoundaryEvidence, CommandResult, CoreResponse,
+    ExactConditionResolutionStatement, MarketConfig, MarketExecution, MarketResolution,
+    MarketSettlementReadiness, PolymarketRedemptionIntent, PolymarketResolutionStatement,
+    PortfolioSnapshot, PrivateBalance, PrivatePosition, PrivateTradingCore, ResolutionEvidence,
+    ResolutionOutcome, ResolutionStatement, SignedAuditFillArtifact, SignedBinanceResolution,
+    SignedExactConditionResolution, SignedPolymarketResolution, SignedResolution,
+    SignedResolutionEvidence, SignedTaskQualificationArtifact, SystemResponse,
     TaskQualificationStatement, UserCommand, UserCommandAction, WithdrawalAuthorization,
     WithdrawalIntent,
 };
