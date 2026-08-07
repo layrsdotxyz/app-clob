@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "validated-ready-for-activation",
+  "releaseId": "3cfc092022b04c6502a69d7ce8474fc45bb9a20c",
+  "sourceCommit": "3cfc092022b04c6502a69d7ce8474fc45bb9a20c",
+  "sourceBranch": "main",
+  "snapshotCompatibilityBase": "7b10f77b66423594d026730c38407510dfc80b06",
+  "snapshotApproval": "enclave/snapshot-migrations/2026-08-07-multi-asset-native-markets.md",
+  "region": "us-east-1",
+  "amiId": "ami-0dba573f1a22068c7",
+  "amiSnapshotId": "snap-0232e6753095d6e5f",
+  "amiDeregistrationProtection": "enabled-with-cooldown",
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/3cfc092022b04c6502a69d7ce8474fc45bb9a20c",
+  "artifacts": {
+    "sourceArchive": {
+      "path": "source.tar.gz",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/3cfc092022b04c6502a69d7ce8474fc45bb9a20c/source.tar.gz",
+      "versionId": "ivNQKKa7CSPlV.Uvm288Jz2.YB02_O8X",
+      "sizeBytes": 524869,
+      "sha384": "b2e28a9c693e632f4b28c4733899e09db4e764464110ef723e024806af26c659177a158a4dd4bc1f309c9c729a907792"
+    },
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/3cfc092022b04c6502a69d7ce8474fc45bb9a20c/layrsv2-clob.eif",
+      "versionId": "W9EUL7psAQPxsfSUrypJIbiR8MzZOj6Y",
+      "sizeBytes": 41230913,
+      "sha384": "0495946bf02a6121b85699dec2da45850ff8b0fc748646abc31bd53419bb30640fabac4762e397cb716d9fdc152e5546"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/3cfc092022b04c6502a69d7ce8474fc45bb9a20c/layrs-enclave-parent",
+      "versionId": "Tm_GwYqETYGtQ01qVJSlFIUGIeimZDFf",
+      "sizeBytes": 1259536,
+      "sha384": "74869665138effa081cd49e22d9955dedc2ac48acf8ecabac9a72583d10fc83d2d712477f83e4fa17b3dcfa904bd13cd"
+    },
+    "measurements": {
+      "path": "build/layrsv2-clob-measurements.json",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/3cfc092022b04c6502a69d7ce8474fc45bb9a20c/layrsv2-clob-measurements.json",
+      "versionId": "P3Nog0E5n97hncbxKcWzODkbz3tDh7tf",
+      "sizeBytes": 402,
+      "sha384": "2c8d638b182e14a4acf9546c08ad2a9d2ac456efee8b41a03d88bb228062b0173a4e96d718c5a0c0cfc0d28c26c77816"
+    },
+    "checksums": {
+      "path": "build/layrsv2-host-artifacts.sha384",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/3cfc092022b04c6502a69d7ce8474fc45bb9a20c/layrsv2-host-artifacts.sha384",
+      "versionId": "4kx_yAdT8R2wPhAt2IiJU5hKFonmR9ej",
+      "sizeBytes": 246,
+      "sha384": "4127cf3c7b6a6b86219275b16e9a07e319fc95737dd0e6bdf143b6967ef7a4b91288ff7812c57a6cde5c6af325157f37"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "7da053c930d5c3ddddca85d89910db1034aa5df48038ba73ab1e8c05ac1289a563579e98629a398a176f88008f8b2dec",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "45a27d1bdb40482214d7517704a88aa342f8a14c6ebfbbc4762b1779628e3afc3b0795c25a16950b0fe17220df5d1c0a"
+  },
+  "objectLock": {
+    "mode": "COMPLIANCE",
+    "retainUntilAtLeast": "2026-09-06T19:05:34+00:00"
+  },
+  "activation": null,
+  "signature": null,
+  "signatureNote": "Candidate adds deterministic native multi-asset recurring market support for ZEN, BTC, ETH, SOL, ZEC and HYPE; durable event-market provisioning; Binance and Kraken spot evidence verification; and legacy Binance ZEN source compatibility. Activation is gated on signed-manifest and PCR rotation, coordinator provisioning, live source canaries, Horizen registration and resolution publication, AppSync transitions, and DLQ/alarm reconciliation."
+}
