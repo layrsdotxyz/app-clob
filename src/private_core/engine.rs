@@ -4422,6 +4422,15 @@ fn validate_market(market: &MarketConfig, now_millis: i64) -> CoreResult<()> {
             "invalid market configuration".into(),
         ));
     }
+    if matches!(market.execution, MarketExecution::NativeClob) {
+        if let Some(expected_feed_id) = recurring_market_feed_id(&market.market_id) {
+            if market.oracle_feed_id != expected_feed_id {
+                return Err(CoreError::InvalidOrder(
+                    "market namespace does not match oracle feed".into(),
+                ));
+            }
+        }
+    }
     if let MarketExecution::PolymarketBootstrap {
         condition_id,
         up_token_id,
@@ -4461,11 +4470,37 @@ fn validate_market(market: &MarketConfig, now_millis: i64) -> CoreResult<()> {
     Ok(())
 }
 
+fn recurring_market_feed_id(market_id: &str) -> Option<u64> {
+    if market_id.starts_with("layrs:v4:ZEN:") {
+        return Some(9001);
+    }
+    let parts: Vec<&str> = market_id.split(':').collect();
+    if parts.len() != 6 || parts[0] != "layrs" || parts[1] != "v5" {
+        return None;
+    }
+    match parts[2] {
+        "ZEN" => Some(9001),
+        "BTC" => Some(9002),
+        "ETH" => Some(9003),
+        "SOL" => Some(9004),
+        "ZEC" => Some(9005),
+        "HYPE" => Some(9006),
+        _ => None,
+    }
+}
+
 fn valid_market_namespace(market_id: &str) -> bool {
     market_id.starts_with("layrs:v1:")
         || market_id.starts_with("layrs:v2:")
         || market_id.starts_with("layrs:v3:")
         || market_id.starts_with("layrs:v4:ZEN:")
+        || ["BTC", "ETH", "SOL", "ZEN", "ZEC", "HYPE"]
+            .iter()
+            .any(|asset| {
+                ["ZEN", "USDC"].iter().any(|collateral| {
+                    market_id.starts_with(&format!("layrs:v5:{asset}:{collateral}:"))
+                })
+            })
         || ["SPORTS", "ESPORTS", "POLITICS", "MACRO"]
             .iter()
             .any(|category| {
@@ -4526,9 +4561,26 @@ fn validate_resolution(
     .map_err(|_| CoreError::InvalidOracleSignature)
 }
 
-const BINANCE_ORACLE_FEED_ID: u64 = 9001;
-const BINANCE_ORACLE_SOURCE: &str = "BINANCE_SPOT_ZENUSDT_1S_V1";
 const BINANCE_FALLBACK_DELAY_MILLIS: i64 = 120_000;
+
+fn spot_oracle_source_matches(feed_id: u64, source: &str) -> bool {
+    match feed_id {
+        // The first measured Binance release used the longer SPOT-prefixed
+        // source name while the production manifest profile used the shorter
+        // canonical name. Both identify the same immutable ZENUSDT v1
+        // evidence format and must remain replay-compatible.
+        9001 => matches!(
+            source,
+            "BINANCE_ZENUSDT_1S_V1" | "BINANCE_SPOT_ZENUSDT_1S_V1"
+        ),
+        9002 => source == "BINANCE_BTCUSDT_1S_V1",
+        9003 => source == "BINANCE_ETHUSDT_1S_V1",
+        9004 => source == "BINANCE_SOLUSDT_1S_V1",
+        9005 => source == "BINANCE_ZECUSDT_1S_V1",
+        9006 => source == "KRAKEN_HYPEUSD_1S_V1",
+        _ => false,
+    }
+}
 
 fn validate_binance_resolution(
     market: &MarketConfig,
@@ -4536,17 +4588,19 @@ fn validate_binance_resolution(
     oracle_public_key: Option<[u8; 32]>,
     now_millis: i64,
 ) -> CoreResult<ResolutionOutcome> {
-    if !matches!(market.execution, MarketExecution::NativeClob)
-        || market.oracle_feed_id != BINANCE_ORACLE_FEED_ID
-    {
+    if !spot_oracle_source_matches(market.oracle_feed_id, &signed.statement.oracle_source) {
         return Err(CoreError::InvalidResolution(
-            "Binance boundary resolution is valid only for Binance native markets".into(),
+            "spot boundary resolution is valid only for approved native markets".into(),
+        ));
+    }
+    if !matches!(market.execution, MarketExecution::NativeClob) {
+        return Err(CoreError::InvalidResolution(
+            "spot boundary resolution requires the native CLOB".into(),
         ));
     }
     let statement = &signed.statement;
     if now_millis < market.closes_at_millis
         || statement.market_id != market.market_id
-        || statement.oracle_source != BINANCE_ORACLE_SOURCE
         || statement.issued_at_millis < market.closes_at_millis
         || statement.issued_at_millis > now_millis + 30_000
     {

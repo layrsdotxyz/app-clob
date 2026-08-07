@@ -30,6 +30,13 @@ fn market(oracle_feed_id: u64) -> MarketConfig {
     }
 }
 
+fn v5_market(market_id: &str, oracle_feed_id: u64) -> MarketConfig {
+    MarketConfig {
+        market_id: market_id.into(),
+        ..market(oracle_feed_id)
+    }
+}
+
 fn core(oracle: &SigningKey, marker: u8, oracle_feed_id: u64) -> PrivateTradingCore {
     let mut core = PrivateTradingCore::new_with_oracle(
         JournalKey::from_bytes([marker; 32]),
@@ -137,14 +144,16 @@ fn rejects_single_path_wrong_feed_and_signature_tampering() {
         .unwrap_err();
     assert!(matches!(error, CoreError::InvalidResolution(_)));
 
-    let error = core(&oracle, 35, 245)
-        .resolve_binance_market(
-            "resolve:wrong-feed".into(),
-            sign(&oracle, primary_statement()),
-            CLOSES_AT + 1_000,
-        )
+    let mut wrong_feed_core = PrivateTradingCore::new_with_oracle(
+        JournalKey::from_bytes([35; 32]),
+        ReceiptSigner::generate([36; 48]),
+        oracle.verifying_key().to_bytes(),
+    )
+    .unwrap();
+    let error = wrong_feed_core
+        .register_market("register:wrong-feed".into(), market(245), OPENS_AT - 1)
         .unwrap_err();
-    assert!(matches!(error, CoreError::InvalidResolution(_)));
+    assert!(matches!(error, CoreError::InvalidOrder(_)));
 
     let mut signed = sign(&oracle, primary_statement());
     signed.statement.closing.as_mut().unwrap().median_price_e8 += 1;
@@ -211,4 +220,45 @@ fn identical_evidence_replays_to_identical_state() {
         first.market_resolution(MARKET_ID),
         second.market_resolution(MARKET_ID)
     );
+}
+
+#[test]
+fn binds_every_v5_asset_namespace_to_its_approved_spot_feed() {
+    let oracle = SigningKey::from_bytes(&[51; 32]);
+    for (index, (asset, feed_id)) in [
+        ("ZEN", 9001),
+        ("BTC", 9002),
+        ("ETH", 9003),
+        ("SOL", 9004),
+        ("ZEC", 9005),
+        ("HYPE", 9006),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut core = PrivateTradingCore::new_with_oracle(
+            JournalKey::from_bytes([60 + index as u8; 32]),
+            ReceiptSigner::generate([70 + index as u8; 48]),
+            oracle.verifying_key().to_bytes(),
+        )
+        .unwrap();
+        let id = format!("layrs:v5:{asset}:ZEN:1h:1784678400");
+        core.register_market(
+            format!("register:{asset}"),
+            v5_market(&id, *feed_id),
+            OPENS_AT - 1,
+        )
+        .unwrap();
+        assert!(matches!(
+            core.register_market(
+                format!("wrong:{asset}"),
+                v5_market(
+                    &format!("layrs:v5:{asset}:USDC:1h:1784682000"),
+                    if *feed_id == 9001 { 9002 } else { 9001 }
+                ),
+                OPENS_AT - 1
+            ),
+            Err(CoreError::InvalidOrder(_))
+        ));
+    }
 }

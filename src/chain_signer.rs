@@ -570,13 +570,34 @@ impl EnclaveChainSigner {
 
 fn valid_market_id(value: &str) -> bool {
     let parts: Vec<&str> = value.split(':').collect();
-    parts.len() == 5
+    let legacy = parts.len() == 5
         && parts[0] == "layrs"
-        && parts[1] == "v1"
+        && matches!(parts[1], "v1" | "v2" | "v3" | "v4")
         && matches!(parts[2], "BTC" | "ETH" | "SOL" | "ZEN")
         && matches!(parts[3], "15m" | "1h" | "4h" | "1d" | "1w" | "1mo")
         && parts[4].len() == 10
-        && parts[4].bytes().all(|byte| byte.is_ascii_digit())
+        && parts[4].bytes().all(|byte| byte.is_ascii_digit());
+    let native_v5 = parts.len() == 6
+        && parts[0] == "layrs"
+        && parts[1] == "v5"
+        && matches!(parts[2], "BTC" | "ETH" | "SOL" | "ZEN" | "ZEC" | "HYPE")
+        && matches!(parts[3], "ZEN" | "USDC")
+        && matches!(parts[4], "5m" | "15m" | "1h" | "4h" | "1d" | "1w" | "1mo")
+        && parts[5].len() == 10
+        && parts[5].bytes().all(|byte| byte.is_ascii_digit());
+    let event = parts.len() == 5
+        && parts[0] == "layrs"
+        && matches!(parts[1], "v4" | "v5")
+        && matches!(parts[2], "SPORTS" | "ESPORTS" | "POLITICS" | "MACRO")
+        && parts[3].len() >= 2
+        && parts[3].len() <= 48
+        && parts[3].bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || (byte == b'-' && index > 0)
+        })
+        && !parts[3].ends_with('-')
+        && parts[4].len() == 16
+        && parts[4].bytes().all(|byte| byte.is_ascii_hexdigit());
+    legacy || native_v5 || event
 }
 
 fn parse_reward_claim_domains(
@@ -844,6 +865,25 @@ mod tests {
             "0x5555555555555555555555555555555555555555"
         );
         assert!(signed.raw_transaction_hex.starts_with("0x02"));
+    }
+
+    #[test]
+    fn accepts_canonical_recurring_and_event_resolution_market_ids() {
+        assert!(valid_market_id("layrs:v5:BTC:ZEN:1h:1800000000"));
+        assert!(valid_market_id("layrs:v5:HYPE:USDC:5m:1800000000"));
+        assert!(valid_market_id(
+            "layrs:v5:ESPORTS:glyph-playtime:abababababababab"
+        ));
+        assert!(valid_market_id(
+            "layrs:v5:SPORTS:arsenal-chelsea:0123456789abcdef"
+        ));
+        assert!(!valid_market_id("layrs:v5:BTC:ZEN:2h:1800000000"));
+        assert!(!valid_market_id(
+            "layrs:v5:ESPORTS:-glyph-playtime:abababababababab"
+        ));
+        assert!(!valid_market_id(
+            "layrs:v5:ESPORTS:glyph-playtime:zzzzzzzzzzzzzzzz"
+        ));
     }
 
     #[test]
