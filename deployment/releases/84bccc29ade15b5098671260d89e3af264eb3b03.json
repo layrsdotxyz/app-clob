@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "validated-ready-for-activation",
+  "releaseId": "84bccc29ade15b5098671260d89e3af264eb3b03",
+  "sourceCommit": "84bccc29ade15b5098671260d89e3af264eb3b03",
+  "sourceBranch": "main",
+  "snapshotCompatibilityBase": "3cfc092022b04c6502a69d7ce8474fc45bb9a20c",
+  "snapshotApproval": null,
+  "region": "us-east-1",
+  "amiId": "ami-0877112c35998dc84",
+  "amiSnapshotId": "snap-0cd489ffe89ece219",
+  "amiDeregistrationProtection": "enabled-with-cooldown",
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/84bccc29ade15b5098671260d89e3af264eb3b03",
+  "artifacts": {
+    "sourceArchive": {
+      "path": "source.tar.gz",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/84bccc29ade15b5098671260d89e3af264eb3b03/source.tar.gz",
+      "versionId": "FTVahHSYhjpUtdDnyrnkRpXdf2jjHkbN",
+      "sizeBytes": 526533,
+      "sha384": "2b21a0a6f57aa1501b174dd5d658dd91c6922435ed585ed40e2ea10981b04821e61130d43630f4152881a6c59b7ce4e4"
+    },
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/84bccc29ade15b5098671260d89e3af264eb3b03/layrsv2-clob.eif",
+      "versionId": "7wPrJe6RO__.ltxSRst0wu7XHGCWpvca",
+      "sizeBytes": 41230913,
+      "sha384": "744b6e7121abdbfcd83c0de3f150ecb5b6cff0f83ab4b993045ac5245585ace3c9cb8e52edefcd33d520f3bde16b8b5f"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/84bccc29ade15b5098671260d89e3af264eb3b03/layrs-enclave-parent",
+      "versionId": "pZq_AomrLADKjXOd0gaQkH8yobNvHfr8",
+      "sizeBytes": 1349568,
+      "sha384": "a770e2ca220c004c76c12097c62c9e895107c529aa6e1947b8236cc9de02911afaea189df43c20e1195ff599e5329f87"
+    },
+    "measurements": {
+      "path": "build/layrsv2-clob-measurements.json",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/84bccc29ade15b5098671260d89e3af264eb3b03/layrsv2-clob-measurements.json",
+      "versionId": "lsq02.vTgUhXBFMgOP8wnAD71QNspE13",
+      "sizeBytes": 402,
+      "sha384": "e3f88ead5e91de3bf1516a930de2ae9a8a5266829ad894649cc3a29995cdae501482ad321c39e5aabefbdcf3fcf3225d"
+    },
+    "checksums": {
+      "path": "build/layrsv2-host-artifacts.sha384",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/84bccc29ade15b5098671260d89e3af264eb3b03/layrsv2-host-artifacts.sha384",
+      "versionId": "MmNiPkR.mC4fZjp2WI6I684Wa38BKrXm",
+      "sizeBytes": 246,
+      "sha384": "abe9f09cba4916000e9dff4a77417b964ab8bc8a899ccbff38e436297869000242656753ad2548237df2508ad791f2e7"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "33a925917b6d2711d9e8f66a06b3f1b05da88822509a317dbf5fe9edd4892f4ef670a63c617dd743b7383ba3468b533e",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "5d955545b11dfd9031e0bcd085b8f1e95a5ffe64ecb6ede20859cf84b950a18ab13f433ce5fd6efaa0fb75c9a46e0e6d"
+  },
+  "objectLock": {
+    "mode": "COMPLIANCE",
+    "retainUntilAtLeast": "2026-09-10T01:44:33+00:00"
+  },
+  "activation": null,
+  "signature": null,
+  "signatureNote": "Transport-only release increases bounded enclave frame and parent HTTP limits so the durable production checkpoint can be restored without changing private-core state, journal, or snapshot schemas. Activation remains gated on signed-manifest and PCR rotation, single-writer cutover, checkpoint reconciliation, attestation, private-session recovery, funded certification, and clean soak."
+}
