@@ -2121,6 +2121,221 @@ fn private_rewards_accrue_cumulatively_and_authorize_only_the_bound_account() {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[test]
+fn expired_market_rejects_position_close_but_allows_unfilled_hold_release() {
+    let alice = SigningKey::from_bytes(&[121u8; 32]);
+    let bob = SigningKey::from_bytes(&[122u8; 32]);
+    let journal_key = [123u8; 32];
+    let mut core = PrivateTradingCore::new(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([124u8; 48]),
+    );
+    let market_id = "layrs:v3:ZEN:15m:2000";
+    core.register_market(
+        "sys:market:resolution-guard".into(),
+        MarketConfig {
+            market_id: market_id.into(),
+            settlement_asset: "ZEN".into(),
+            settlement_decimals: 18,
+            public_settlement_chain: Some("horizen".into()),
+            opens_at_millis: 900,
+            closes_at_millis: 2_000,
+            minimum_quantity_micros: 1,
+            maximum_quantity_micros: 10_000_000,
+            minimum_order_notional_micros: 1,
+            maximum_order_notional_micros: 10_000_000,
+            maximum_user_position_micros: 10_000_000,
+            maximum_pending_bootstrap_notional_micros: 100_000_000,
+            tick_size_micros: 1_000,
+            oracle_feed_id: 245,
+            execution: MarketExecution::NativeClob,
+        },
+        800,
+    )
+    .unwrap();
+
+    let alice_commitment = [125u8; 32];
+    let bob_commitment = [126u8; 32];
+    for (label, key, commitment) in [
+        ("alice", &alice, alice_commitment),
+        ("bob", &bob, bob_commitment),
+    ] {
+        core.register_session(
+            format!("sys:session:resolution-guard:{label}"),
+            format!("session:resolution-guard:{label}"),
+            commitment,
+            key.verifying_key().to_bytes(),
+            3_000,
+            850,
+        )
+        .unwrap();
+        core.apply_user_external_flow(
+            format!("sys:deposit:resolution-guard:{label}"),
+            commitment,
+            "ZEN".into(),
+            AccountBucket::UserAvailable,
+            1_000_000_000_000_000_000,
+            ExternalFlowDirection::Inflow,
+            [label.as_bytes()[0]; 32],
+            875,
+        )
+        .unwrap();
+    }
+
+    execute_signed(
+        &mut core,
+        &bob,
+        "session:resolution-guard:bob",
+        1,
+        "cmd:resolution-guard:mint",
+        UserCommandAction::CompleteSet {
+            market_id: market_id.into(),
+            quantity_micros: 1_000_000,
+            direction: CompleteSetDirection::Mint,
+        },
+        1_000,
+    );
+    let ask_response = execute_signed_response(
+        &mut core,
+        &bob,
+        "session:resolution-guard:bob",
+        2,
+        "cmd:resolution-guard:ask",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Sell,
+                500_000,
+                1_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_100,
+    );
+    let filled_ask_id = match ask_response.result {
+        CommandResult::Order { result } => result.accepted_order.unwrap().order_id,
+        _ => panic!("expected resting ask response"),
+    };
+    execute_signed(
+        &mut core,
+        &alice,
+        "session:resolution-guard:alice",
+        1,
+        "cmd:resolution-guard:buy",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                500_000,
+                1_000_000,
+                TimeInForce::Fak,
+                None,
+            ),
+        },
+        1_200,
+    );
+    let resting_response = execute_signed_response(
+        &mut core,
+        &alice,
+        "session:resolution-guard:alice",
+        2,
+        "cmd:resolution-guard:resting",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Down,
+                OrderAction::Buy,
+                100_000,
+                1_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_300,
+    );
+    let resting_order = match resting_response.result {
+        CommandResult::Order { result } => result.accepted_order.unwrap(),
+        _ => panic!("expected resting order response"),
+    };
+    assert_eq!(resting_order.status, OrderStatus::Open);
+
+    let alice_owner = derived_private_user(journal_key, alice_commitment);
+    let up_position = AccountKey::position(
+        &alice_owner,
+        format!("CLAIM:{market_id}:UP"),
+        market_id,
+        "UP",
+    );
+    assert_eq!(core.balance(&up_position), 1_000_000);
+
+    let cancel_filled_trade = execute_signed_result(
+        &mut core,
+        &bob,
+        "session:resolution-guard:bob",
+        3,
+        "cmd:resolution-guard:cancel-filled",
+        UserCommandAction::CancelOrder {
+            market_id: market_id.into(),
+            order_id: filled_ask_id,
+        },
+        2_100,
+    );
+    assert!(matches!(
+        cancel_filled_trade.unwrap_err(),
+        CoreError::InvalidOrder(message) if message == "order is not cancellable"
+    ));
+
+    let close_after_expiry = execute_signed_result(
+        &mut core,
+        &alice,
+        "session:resolution-guard:alice",
+        3,
+        "cmd:resolution-guard:late-close",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Sell,
+                500_000,
+                1_000_000,
+                TimeInForce::Fak,
+                None,
+            ),
+        },
+        2_100,
+    );
+    assert_eq!(
+        close_after_expiry.unwrap_err(),
+        CoreError::InvalidOrder("market is not open".into())
+    );
+    assert_eq!(core.balance(&up_position), 1_000_000);
+
+    let cancel_response = execute_signed_response(
+        &mut core,
+        &alice,
+        "session:resolution-guard:alice",
+        3,
+        "cmd:resolution-guard:release-unfilled",
+        UserCommandAction::CancelOrder {
+            market_id: market_id.into(),
+            order_id: resting_order.order_id,
+        },
+        2_100,
+    );
+    assert!(matches!(
+        cancel_response.result,
+        CommandResult::Cancelled { .. }
+    ));
+    assert_eq!(core.balance(&up_position), 1_000_000);
+}
+
 fn execute_signed(
     core: &mut PrivateTradingCore,
     key: &SigningKey,
