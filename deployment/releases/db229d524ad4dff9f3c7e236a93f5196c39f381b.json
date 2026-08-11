@@ -7,8 +7,9 @@
   "snapshotCompatibilityBase": "84bccc29ade15b5098671260d89e3af264eb3b03",
   "snapshotApproval": "enclave/snapshot-migrations/2026-08-11-compressed-snapshot-envelope.md",
   "region": "us-east-1",
-  "amiId": "ami-075a6978ead7facc2",
-  "amiSnapshotId": "snap-099a035d8d08bbdf4",
+  "packerSourceCommit": "4fe4f673104ca43d886a07ad11379e8080a29ca3",
+  "amiId": "ami-0ec03c51d3a3be2cb",
+  "amiSnapshotId": "snap-0d8c99dec2d5d20b8",
   "amiDeregistrationProtection": "enabled-with-cooldown",
   "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
   "artifactPrefix": "enclave-releases/db229d524ad4dff9f3c7e236a93f5196c39f381b",
@@ -61,5 +62,5 @@
   },
   "activation": null,
   "signature": null,
-  "signatureNote": "Candidate introduces versioned bounded compression inside the authenticated snapshot plaintext while retaining legacy snapshot decoding, then limits parent concurrency and adds an enclave liveness watchdog. Activation remains gated on exact PCR and signed-manifest rotation, legacy snapshot replay parity, first compressed checkpoint persistence, controlled order and withdrawal canaries, reconciliation, and zero-regression worker restoration."
+  "signatureNote": "Candidate introduces versioned bounded compression inside the authenticated snapshot plaintext while retaining legacy snapshot decoding, then limits parent concurrency and adds an enclave liveness watchdog. The final parent AMI was baked from the watchdog bootstrap fix at packerSourceCommit while reusing the immutable release EIF and parent binary, so PCR0 is unchanged. Activation remains gated on exact PCR and signed-manifest verification, legacy snapshot replay parity, first compressed checkpoint persistence, controlled order and withdrawal canaries, reconciliation, and zero-regression worker restoration."
 }
