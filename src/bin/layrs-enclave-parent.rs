@@ -21,8 +21,8 @@ use tokio::{
 };
 use tokio_vsock::{VsockAddr, VsockListener, VsockStream, VMADDR_CID_ANY};
 use tower_http::{
-    request_id::MakeRequestUuid, request_id::PropagateRequestIdLayer,
-    request_id::SetRequestIdLayer, timeout::TimeoutLayer,
+    compression::CompressionLayer, request_id::MakeRequestUuid,
+    request_id::PropagateRequestIdLayer, request_id::SetRequestIdLayer, timeout::TimeoutLayer,
 };
 
 // Provisioning restores the latest encrypted private-core snapshot through the same
@@ -144,6 +144,13 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/attestation", get(attestation))
         .route("/v1/private/relay", post(relay))
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
+        // Snapshot artifacts are ciphertext and are serialized as JSON byte
+        // arrays on the parent boundary. Compression prevents a valid private
+        // command from filling the parent-to-API socket or exceeding the API's
+        // ten-second relay deadline as the encrypted journal grows. Undici and
+        // browsers negotiate and decode gzip transparently; the wire schema is
+        // deliberately unchanged and the enclave/EIF is not involved.
+        .layer(CompressionLayer::new())
         .layer(TimeoutLayer::new(Duration::from_secs(12)))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::new(
