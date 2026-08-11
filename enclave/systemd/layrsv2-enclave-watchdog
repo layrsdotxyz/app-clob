@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if /usr/bin/nitro-cli describe-enclaves \
+  | /usr/bin/grep -q '"EnclaveCID": 16' \
+  && /usr/bin/nitro-cli describe-enclaves \
+  | /usr/bin/grep -q '"State": "RUNNING"'; then
+  exit 0
+fi
+
+/usr/bin/systemctl restart layrsv2-enclave.service
+/usr/bin/systemctl restart layrsv2-enclave-parent.service

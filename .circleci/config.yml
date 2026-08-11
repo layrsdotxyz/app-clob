@@ -97,12 +97,6 @@ jobs:
             -A clippy::empty-line-after-doc-comments
             -A clippy::wrong-self-convention
             -A clippy::enum-variant-names
-      - save_cache:
-          key: cargo-v1-{{ checksum "Cargo.lock" }}
-          paths:
-            - ~/.cargo
-            - target
-
   clob-full-ci:
     docker:
       - image: cimg/rust:1.94.1

@@ -83,6 +83,18 @@ build {
     destination = "/tmp/layrsv2-enclave-parent.service"
   }
   provisioner "file" {
+    source      = "enclave/systemd/layrsv2-enclave-watchdog.service"
+    destination = "/tmp/layrsv2-enclave-watchdog.service"
+  }
+  provisioner "file" {
+    source      = "enclave/systemd/layrsv2-enclave-watchdog.timer"
+    destination = "/tmp/layrsv2-enclave-watchdog.timer"
+  }
+  provisioner "file" {
+    source      = "enclave/systemd/layrsv2-enclave-watchdog"
+    destination = "/tmp/layrsv2-enclave-watchdog"
+  }
+  provisioner "file" {
     source      = "enclave/allocator.yaml"
     destination = "/tmp/allocator.yaml"
   }
@@ -96,8 +108,11 @@ build {
       "sudo install -o root -g root -m 0600 /tmp/layrsv2-clob.eif /opt/layrsv2/layrsv2-clob.eif",
       "sudo install -o root -g root -m 0644 /tmp/layrsv2-enclave.service /etc/systemd/system/layrsv2-enclave.service",
       "sudo install -o root -g root -m 0644 /tmp/layrsv2-enclave-parent.service /etc/systemd/system/layrsv2-enclave-parent.service",
+      "sudo install -o root -g root -m 0644 /tmp/layrsv2-enclave-watchdog.service /etc/systemd/system/layrsv2-enclave-watchdog.service",
+      "sudo install -o root -g root -m 0644 /tmp/layrsv2-enclave-watchdog.timer /etc/systemd/system/layrsv2-enclave-watchdog.timer",
+      "sudo install -o root -g root -m 0755 /tmp/layrsv2-enclave-watchdog /opt/layrsv2/layrsv2-enclave-watchdog",
       "sudo install -o root -g root -m 0644 /tmp/allocator.yaml /etc/nitro_enclaves/allocator.yaml",
-      "sudo systemctl enable nitro-enclaves-allocator.service layrsv2-enclave.service layrsv2-enclave-parent.service",
+      "sudo systemctl enable nitro-enclaves-allocator.service layrsv2-enclave.service layrsv2-enclave-parent.service layrsv2-enclave-watchdog.timer",
       "sudo dnf clean all"
     ]
   }

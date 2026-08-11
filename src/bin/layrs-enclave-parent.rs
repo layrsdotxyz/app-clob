@@ -1,4 +1,9 @@
-use std::{io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    io,
+    net::{Shutdown, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     extract::{DefaultBodyLimit, Query, State},
@@ -36,6 +41,8 @@ const MAX_HTTP_BODY_BYTES: usize = 384 * 1024 * 1024;
 const VSOCK_PORT: u32 = 5_003;
 const EGRESS_VSOCK_PORT: u32 = 5_004;
 const EGRESS_PREFACE: &[u8] = b"LAYRS_EGRESS_V1\n";
+const ENCLAVE_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const ENCLAVE_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Clone)]
 struct AppState {
@@ -124,7 +131,10 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("LAYRS_ENCLAVE_CID must be a non-reserved CID".into());
     }
     let port = optional_u16("PORT", 8_443)?;
-    let concurrency = optional_usize("LAYRS_PARENT_MAX_CONCURRENCY", 256)?;
+    // Enclave state transitions are serialized behind a single mutex. A large
+    // parent-side queue cannot increase throughput; it only turns one slow
+    // checkpoint into hundreds of doomed requests and can exhaust enclave memory.
+    let concurrency = optional_usize("LAYRS_PARENT_MAX_CONCURRENCY", 8)?;
     let egress_listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, EGRESS_VSOCK_PORT))?;
     let egress_permits = Arc::new(Semaphore::new(concurrency.min(64)));
     tokio::spawn(run_egress_proxy(
@@ -137,10 +147,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         permits: Arc::new(Semaphore::new(concurrency)),
     };
     let app = Router::new()
-        .route(
-            "/healthz",
-            get(|| async { Json(serde_json::json!({ "status": "ok" })) }),
-        )
+        .route("/healthz", get(healthz))
         .route("/v1/attestation", get(attestation))
         .route("/v1/private/relay", post(relay))
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
@@ -317,7 +324,7 @@ async fn exchange(state: &AppState, request: WireRequest) -> Result<WireResponse
         .permits
         .try_acquire()
         .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "PARENT_SATURATED"))?;
-    timeout(Duration::from_secs(10), async {
+    timeout(ENCLAVE_EXCHANGE_TIMEOUT, async {
         let mut stream = VsockStream::connect(VsockAddr::new(state.enclave_cid, VSOCK_PORT))
             .await
             .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "ENCLAVE_UNAVAILABLE"))?;
@@ -339,6 +346,21 @@ async fn exchange(state: &AppState, request: WireRequest) -> Result<WireResponse
     })
     .await
     .map_err(|_| ApiError::new(StatusCode::GATEWAY_TIMEOUT, "ENCLAVE_TIMEOUT"))?
+}
+
+async fn healthz(State(state): State<AppState>) -> Response {
+    match timeout(
+        ENCLAVE_CONNECT_TIMEOUT,
+        VsockStream::connect(VsockAddr::new(state.enclave_cid, VSOCK_PORT)),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => {
+            let _ = stream.shutdown(Shutdown::Both);
+            Json(serde_json::json!({ "status": "ok", "enclave": "reachable" })).into_response()
+        }
+        _ => gateway_error(StatusCode::SERVICE_UNAVAILABLE, "ENCLAVE_UNAVAILABLE").into_response(),
+    }
 }
 
 async fn read_frame(stream: &mut VsockStream) -> io::Result<Vec<u8>> {
@@ -371,11 +393,17 @@ fn decode_fixed<const N: usize>(value: &str, code: &'static str) -> Result<[u8; 
 
 #[cfg(test)]
 mod tests {
-    use super::{WireRequest, MAX_FRAME_BYTES, MAX_HTTP_BODY_BYTES};
+    use super::{WireRequest, ENCLAVE_EXCHANGE_TIMEOUT, MAX_FRAME_BYTES, MAX_HTTP_BODY_BYTES};
 
     #[test]
     fn relay_frame_limit_supports_checkpoint_restore_payloads() {
         const { assert!(MAX_FRAME_BYTES >= 256 * 1024 * 1024) };
+    }
+
+    #[test]
+    fn exchange_timeout_remains_bounded_below_http_deadline() {
+        assert!(ENCLAVE_EXCHANGE_TIMEOUT.as_secs() > 10);
+        assert!(ENCLAVE_EXCHANGE_TIMEOUT.as_secs() < 120);
     }
 
     #[test]

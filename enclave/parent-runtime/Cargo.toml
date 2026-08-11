@@ -34,6 +34,7 @@ tokio-vsock = "0.7.2"
 tower-http = { version = "0.5", features = ["compression-gzip", "request-id", "timeout"] }
 uuid = { version = "1.10", features = ["v4", "v5", "serde"] }
 zeroize = { version = "1.8", features = ["derive"] }
+zstd = "0.13"
 
 [profile.release]
 opt-level = 3
