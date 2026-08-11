@@ -28,11 +28,11 @@ use tower_http::{
 // Provisioning restores the latest encrypted private-core snapshot through the same
 // ciphertext-only relay used by ordinary private commands. Keep the decoded frame
 // bounded independently from the HTTP JSON envelope: base64 expands a maximum-sized
-// ciphertext by 4/3 before Axum decodes it. Conflating the two limits caused a valid
-// ~51 MiB checkpoint to be rejected at the HTTP boundary even though it fit inside
-// the 64 MiB parent-to-enclave CBOR frame.
-const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
-const MAX_HTTP_BODY_BYTES: usize = 96 * 1024 * 1024;
+// ciphertext by 4/3 before Axum decodes it. Production checkpoint JSON currently
+// reaches about 91 MiB before outer envelope expansion, so keep a finite internal
+// bound with matching HTTP headroom rather than failing recovery as state grows.
+const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
+const MAX_HTTP_BODY_BYTES: usize = 384 * 1024 * 1024;
 const VSOCK_PORT: u32 = 5_003;
 const EGRESS_VSOCK_PORT: u32 = 5_004;
 const EGRESS_PREFACE: &[u8] = b"LAYRS_EGRESS_V1\n";
@@ -151,7 +151,10 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // browsers negotiate and decode gzip transparently; the wire schema is
         // deliberately unchanged and the enclave/EIF is not involved.
         .layer(CompressionLayer::new())
-        .layer(TimeoutLayer::new(Duration::from_secs(12)))
+        // Restore requests carry the durable encrypted checkpoint and may require
+        // materially longer than an ordinary command. Public callers retain their
+        // own shorter deadline; this internal relay stays bounded at two minutes.
+        .layer(TimeoutLayer::new(Duration::from_secs(120)))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::new(
             header::HeaderName::from_static("x-request-id"),
@@ -372,7 +375,7 @@ mod tests {
 
     #[test]
     fn relay_frame_limit_supports_checkpoint_restore_payloads() {
-        const { assert!(MAX_FRAME_BYTES >= 64 * 1024 * 1024) };
+        const { assert!(MAX_FRAME_BYTES >= 256 * 1024 * 1024) };
     }
 
     #[test]

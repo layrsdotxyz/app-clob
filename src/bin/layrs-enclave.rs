@@ -58,8 +58,9 @@ use zeroize::Zeroize;
 const PORT: u32 = 5_003;
 // Must match or exceed the parent relay cap. Provisioning restores encrypted
 // checkpoints over this vsock channel; JSON byte-array encoding expands a
-// ~1 MiB archived snapshot into a multi-MiB operator command.
-const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+// archived snapshots into materially larger operator commands. Keep this aligned
+// with the bounded parent relay so a valid durable checkpoint is recoverable.
+const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 const MAX_TRANSPORT_REPLAY_ENTRIES: usize = 262_144;
 const MAX_OPERATOR_REPLAY_ENTRIES: usize = 100_000;
 
@@ -2402,7 +2403,7 @@ mod tests {
 
     #[test]
     fn relay_frame_limit_supports_checkpoint_restore_payloads() {
-        const { assert!(MAX_FRAME_BYTES >= 64 * 1024 * 1024) };
+        const { assert!(MAX_FRAME_BYTES >= 256 * 1024 * 1024) };
     }
 
     #[test]
