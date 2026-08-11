@@ -8,6 +8,7 @@ ExecStart=/opt/layrsv2/layrsv2-enclave-watchdog
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
+ReadWritePaths=/var/log/nitro_enclaves
 ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
