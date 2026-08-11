@@ -1933,11 +1933,6 @@ impl PrivateTradingCore {
             .markets
             .get(market_id)
             .ok_or_else(|| CoreError::InvalidResolution("unknown market".into()))?;
-        if self.resolutions.contains_key(market_id) {
-            return Err(CoreError::InvalidResolution(
-                "market is already resolved".into(),
-            ));
-        }
         match evidence {
             SignedResolutionEvidence::Pyth(signed) => {
                 validate_resolution(market, signed, self.oracle_public_key, now_millis)?;
@@ -1985,6 +1980,46 @@ impl PrivateTradingCore {
                     ));
                 }
             }
+        }
+        if let Some(committed) = self.resolutions.get(market_id) {
+            let evidence_matches = match (&committed.evidence, evidence) {
+                (
+                    ResolutionEvidence::PythHistoricalMedian {
+                        statement: committed,
+                    },
+                    SignedResolutionEvidence::Pyth(candidate),
+                ) => committed == &candidate.statement,
+                (
+                    ResolutionEvidence::BinanceSpotKlineMedian {
+                        statement: committed,
+                    },
+                    SignedResolutionEvidence::Binance(candidate),
+                ) => committed == &candidate.statement,
+                (
+                    ResolutionEvidence::PublicExactCondition {
+                        statement: committed,
+                    },
+                    SignedResolutionEvidence::ExactCondition(candidate),
+                ) => committed == &candidate.statement,
+                (
+                    ResolutionEvidence::PolymarketExactCondition {
+                        statement: committed,
+                    },
+                    SignedResolutionEvidence::Polymarket(candidate),
+                ) => committed == &candidate.statement,
+                _ => false,
+            };
+            if committed.outcome != outcome || !evidence_matches {
+                return Err(CoreError::InvalidResolution(
+                    "resolution evidence conflicts with committed resolution".into(),
+                ));
+            }
+            // Signing and publishing evidence are intentionally retryable after
+            // the ledger commit. A lost response must not strand the public
+            // projection in RESOLUTION_PENDING. Only valid evidence containing
+            // the exact statement and outcome already committed by the enclave
+            // may be re-authorized.
+            return Ok(());
         }
         Ok(())
     }

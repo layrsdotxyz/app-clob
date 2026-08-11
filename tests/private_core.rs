@@ -5,8 +5,8 @@ use clob_service::private_core::{
     LedgerTransaction, MarketConfig, MarketExecution, OrderAction, OrderStatus, Outcome,
     PolymarketResolutionStatement, PriceTimeBook, PrivateTradingCore, ReceiptSigner,
     ResolutionOutcome, ResolutionStatement, SessionGuard, SessionRequest,
-    SignedPolymarketResolution, SignedResolution, SignedSessionRequest, TimeInForce, Transfer,
-    UserCommand, UserCommandAction,
+    SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence, SignedSessionRequest,
+    TimeInForce, Transfer, UserCommand, UserCommandAction,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
@@ -1398,6 +1398,36 @@ fn resolution_cannot_double_credit_and_dust_fees_stay_conservative() {
         0
     );
     let root_after_first_resolution = core.state_root();
+    core.validate_onchain_resolution_authorization(
+        market_id,
+        ResolutionOutcome::Up,
+        &SignedResolutionEvidence::Pyth(signed.clone()),
+        4_200,
+    )
+    .unwrap();
+
+    let mut conflicting_statement = signed.statement.clone();
+    conflicting_statement.closing.median_price_e8 = 102;
+    let conflicting_signature = oracle
+        .sign(&resolution_signing_payload(&conflicting_statement).unwrap())
+        .to_bytes()
+        .to_vec();
+    let conflicting = SignedResolution {
+        statement: conflicting_statement,
+        signature: conflicting_signature,
+    };
+    let conflict = core.validate_onchain_resolution_authorization(
+        market_id,
+        ResolutionOutcome::Up,
+        &SignedResolutionEvidence::Pyth(conflicting),
+        4_200,
+    );
+    assert!(matches!(
+        conflict.unwrap_err(),
+        CoreError::InvalidResolution(message)
+            if message == "resolution evidence conflicts with committed resolution"
+    ));
+
     let second_resolution = core.resolve_market("sys:resolve:dust-again".into(), signed, 4_200);
     assert!(matches!(
         second_resolution.unwrap_err(),
