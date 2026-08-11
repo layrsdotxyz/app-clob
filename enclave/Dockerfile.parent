@@ -10,5 +10,5 @@ FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca
 COPY --from=builder --chown=nonroot:nonroot /build/enclave/parent-runtime/target/release/layrs-enclave-parent /usr/local/bin/layrs-enclave-parent
 USER nonroot:nonroot
 EXPOSE 8443
-ENV PORT=8443 LAYRS_ENCLAVE_CID=16 LAYRS_PARENT_MAX_CONCURRENCY=8
+ENV PORT=8443 LAYRS_ENCLAVE_CID=16 LAYRS_PARENT_MAX_CONCURRENCY=8 LAYRS_PARENT_MAX_WAITERS=32 LAYRS_PARENT_QUEUE_WAIT_MILLIS=3000
 ENTRYPOINT ["/usr/local/bin/layrs-enclave-parent"]

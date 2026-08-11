@@ -10,6 +10,8 @@ Group=layrsv2
 Environment=PORT=8443
 Environment=LAYRS_ENCLAVE_CID=16
 Environment=LAYRS_PARENT_MAX_CONCURRENCY=8
+Environment=LAYRS_PARENT_MAX_WAITERS=32
+Environment=LAYRS_PARENT_QUEUE_WAIT_MILLIS=3000
 ExecStart=/opt/layrsv2/layrs-enclave-parent
 Restart=always
 RestartSec=2
