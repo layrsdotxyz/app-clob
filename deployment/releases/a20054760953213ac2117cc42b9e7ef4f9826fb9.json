@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "validated-ready-for-activation",
+  "releaseId": "a20054760953213ac2117cc42b9e7ef4f9826fb9",
+  "sourceCommit": "a20054760953213ac2117cc42b9e7ef4f9826fb9",
+  "sourceBranch": "main",
+  "snapshotCompatibilityBase": "db229d524ad4dff9f3c7e236a93f5196c39f381b",
+  "snapshotApproval": "enclave/snapshot-migrations/2026-08-11-idempotent-resolution-evidence.md",
+  "region": "us-east-1",
+  "packerSourceCommit": "a20054760953213ac2117cc42b9e7ef4f9826fb9",
+  "amiId": "ami-0b772ee38ec7aad7a",
+  "amiSnapshotId": "snap-0ec3b9544c73996fa",
+  "amiDeregistrationProtection": "enabled-with-cooldown",
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/a20054760953213ac2117cc42b9e7ef4f9826fb9",
+  "artifacts": {
+    "sourceArchive": {
+      "path": "source.tar.gz",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/a20054760953213ac2117cc42b9e7ef4f9826fb9/source.tar.gz",
+      "versionId": "R7OqXSJE0TWOQLXvaeIrX_0DbGOlm4wP",
+      "sizeBytes": 533610,
+      "sha384": "eaa14e74dcd9a3ae01c7178ff943ca78bfb7fce93341f54a12086a56519db56009799b856dfce3bf55c7320c0ba4e9ec"
+    },
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/a20054760953213ac2117cc42b9e7ef4f9826fb9/layrsv2-clob.eif",
+      "versionId": "Xc.zZdt.lf3GUTQENjbGfoq.O73HfG1a",
+      "sizeBytes": 42161729,
+      "sha384": "1325809d27fb6920c88812052d785a5c180a3a6a921d5fc9d7adf8175667225ddf29be156c734827d5a41d3bbdc57fe3"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/a20054760953213ac2117cc42b9e7ef4f9826fb9/layrs-enclave-parent",
+      "versionId": "2RSCkLcn8isg84L1KU3wcaBAPKpwSSjk",
+      "sizeBytes": 1352896,
+      "sha384": "f41abd89eab68297bb690b1fee99231979c2a135306d25276fbfdf638e20d0c6b99e728df503ae0b6a051dc3eb9f3feb"
+    },
+    "measurements": {
+      "path": "build/layrsv2-clob-measurements.json",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/a20054760953213ac2117cc42b9e7ef4f9826fb9/layrsv2-clob-measurements.json",
+      "versionId": "lgu3xAr.DkxS0AyVonzIj8peVyV3dng5",
+      "sizeBytes": 402,
+      "sha384": "94b7d3f78a097e5b1c5e2773623b33a3741ea921b7e5cb66833d77106cad59a7907874f21f2f374e729b741d628a7c23"
+    },
+    "checksums": {
+      "path": "build/layrsv2-host-artifacts.sha384",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/a20054760953213ac2117cc42b9e7ef4f9826fb9/layrsv2-host-artifacts.sha384",
+      "versionId": "q4pWekcRJkrOb8yNEJllXyAoZBa0J4RC",
+      "sizeBytes": 246,
+      "sha384": "e9abb38d3ecf7e73e8807513021c4812a950ffc547b6696095bb64282868ed592f6a4abcdff86f7e9d9c0e8c88be8d95"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "0cb873a3e599bb84fbd3f2cae7ee8830484a692d529c1bc89195c517f2041572a75c5089453bd2a62ba92885ecff5495",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "ae6e90bf61df54eca6144f3c9829f837cc603b46220f1679ff5c0a3f3bb9183b5559673c576853c55ca1cd6472f79dea"
+  },
+  "objectLock": {
+    "mode": "COMPLIANCE",
+    "retainUntilAtLeast": "2026-09-10T14:01:20+00:00"
+  },
+  "activation": null,
+  "signature": null,
+  "signatureNote": "Candidate makes resolution authorization idempotent only for an already committed outcome whose signed typed evidence exactly matches the immutable committed statement. Conflicting outcomes or evidence remain rejected. The release preserves snapshot compatibility with db229d524ad4dff9f3c7e236a93f5196c39f381b. Activation remains gated on exact PCR and signed-manifest rotation, legacy snapshot replay, single-writer coordinator replacement, recovery of affected resolution jobs, funded settlement and withdrawal canaries, UI portfolio certification, reconciliation, and a clean DLQ/alarm soak."
+}
