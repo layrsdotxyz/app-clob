@@ -36,6 +36,16 @@ pub struct SessionGuard {
 }
 
 impl SessionGuard {
+    /// Removes sessions that can no longer authorize a command. This keeps the
+    /// authenticated enclave state bounded by active sessions instead of every
+    /// browser session ever issued.
+    pub fn prune_expired(&mut self, now_millis: i64) {
+        self.registered
+            .retain(|_, session| session.expires_at_millis > now_millis);
+        self.last_sequences
+            .retain(|session_id, _| self.registered.contains_key(session_id));
+    }
+
     pub fn register(
         &mut self,
         session_id: String,
@@ -119,6 +129,38 @@ impl SessionGuard {
         if let Some(session) = self.registered.get_mut(session_id) {
             session.revoked = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionGuard;
+    use ed25519_dalek::SigningKey;
+
+    #[test]
+    fn expired_sessions_and_sequences_are_pruned_without_removing_active_sessions() {
+        let mut guard = SessionGuard::default();
+        let key_a = SigningKey::from_bytes(&[1; 32]).verifying_key().to_bytes();
+        let key_b = SigningKey::from_bytes(&[2; 32]).verifying_key().to_bytes();
+        let key_c = SigningKey::from_bytes(&[3; 32]).verifying_key().to_bytes();
+        guard
+            .register("expired".into(), "user-a".into(), key_a, 2_000, 1_000)
+            .unwrap();
+        guard
+            .register("active".into(), "user-b".into(), key_b, 4_000, 1_000)
+            .unwrap();
+        guard.last_sequences.insert("expired".into(), 9);
+        guard.last_sequences.insert("active".into(), 4);
+
+        guard.prune_expired(2_000);
+
+        assert!(!guard.registered.contains_key("expired"));
+        assert!(!guard.last_sequences.contains_key("expired"));
+        assert!(guard.registered.contains_key("active"));
+        assert_eq!(guard.last_sequences.get("active"), Some(&4));
+        guard
+            .register("expired".into(), "user-c".into(), key_c, 5_000, 2_000)
+            .unwrap();
     }
 }
 

@@ -588,6 +588,7 @@ enum JournaledSystemCommand {
         identity_commitment: [u8; 32],
         public_key: [u8; 32],
         expires_at_millis: i64,
+        now_millis: i64,
     },
     ExternalFlow {
         idempotency_key: String,
@@ -1188,6 +1189,7 @@ impl PrivateTradingCore {
         self.validate_new_system_key(&idempotency_key)?;
         let prior_root = self.state_root();
         let mut sessions = self.sessions.clone();
+        sessions.prune_expired(now_millis);
         let private_user_id = derive_private_user_id(&self.identity_key, &identity_commitment);
         sessions.register(
             session_id.clone(),
@@ -1220,6 +1222,7 @@ impl PrivateTradingCore {
             identity_commitment,
             public_key,
             expires_at_millis,
+            now_millis,
         };
         let command_commitment = system_command_commitment(&entry)?;
         let registration_evidence = registration_evidence(identity_commitment, public_key);

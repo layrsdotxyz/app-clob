@@ -45,6 +45,7 @@ pub struct EncryptedJournalRecord {
     pub nonce: [u8; 12],
     pub prior_record_hash: [u8; 32],
     pub state_root: [u8; 32],
+    #[serde(with = "serde_bytes")]
     pub ciphertext: Vec<u8>,
     pub record_hash: [u8; 32],
 }
@@ -55,8 +56,32 @@ pub struct EncryptedSnapshot {
     pub journal_head: [u8; 32],
     pub state_root: [u8; 32],
     pub nonce: [u8; 12],
+    #[serde(with = "serde_bytes")]
     pub ciphertext: Vec<u8>,
     pub ciphertext_hash: [u8; 32],
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::EncryptedSnapshot;
+
+    #[test]
+    fn snapshot_ciphertext_is_compact_on_the_internal_cbor_wire() {
+        let ciphertext = vec![0xabu8; 7 * 1024 * 1024];
+        let snapshot = EncryptedSnapshot {
+            sequence: 99_960,
+            journal_head: [1; 32],
+            state_root: [2; 32],
+            nonce: [3; 12],
+            ciphertext,
+            ciphertext_hash: [4; 32],
+        };
+        let encoded = serde_cbor::to_vec(&snapshot).unwrap();
+        assert!(encoded.len() < 7 * 1024 * 1024 + 512);
+        let decoded: EncryptedSnapshot = serde_cbor::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, snapshot);
+        assert!(serde_json::to_value(&snapshot).unwrap()["ciphertext"].is_array());
+    }
 }
 
 pub struct EncryptedJournal {
