@@ -132,6 +132,18 @@ impl SessionGuard {
     }
 }
 
+pub fn signing_payload(request: &SessionRequest) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(96 + request.session_id.len());
+    payload.extend_from_slice(b"layrs.private-session.v1\0");
+    payload.extend_from_slice(&(request.session_id.len() as u32).to_be_bytes());
+    payload.extend_from_slice(request.session_id.as_bytes());
+    payload.extend_from_slice(&request.sequence.to_be_bytes());
+    payload.extend_from_slice(&request.issued_at_millis.to_be_bytes());
+    payload.extend_from_slice(&request.expires_at_millis.to_be_bytes());
+    payload.extend_from_slice(&request.request_hash);
+    payload
+}
+
 #[cfg(test)]
 mod tests {
     use super::SessionGuard;
@@ -162,16 +174,4 @@ mod tests {
             .register("expired".into(), "user-c".into(), key_c, 5_000, 2_000)
             .unwrap();
     }
-}
-
-pub fn signing_payload(request: &SessionRequest) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(96 + request.session_id.len());
-    payload.extend_from_slice(b"layrs.private-session.v1\0");
-    payload.extend_from_slice(&(request.session_id.len() as u32).to_be_bytes());
-    payload.extend_from_slice(request.session_id.as_bytes());
-    payload.extend_from_slice(&request.sequence.to_be_bytes());
-    payload.extend_from_slice(&request.issued_at_millis.to_be_bytes());
-    payload.extend_from_slice(&request.expires_at_millis.to_be_bytes());
-    payload.extend_from_slice(&request.request_hash);
-    payload
 }
