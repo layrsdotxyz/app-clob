@@ -476,7 +476,8 @@ pub enum CommandResult {
 pub struct CoreResponse {
     pub result: CommandResult,
     pub receipt: EnclaveReceipt,
-    pub encrypted_record: EncryptedJournalRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_record: Option<EncryptedJournalRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub withdrawal_authorization: Option<WithdrawalAuthorization>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2506,6 +2507,14 @@ impl PrivateTradingCore {
         if command.session.request.request_hash != expected_hash {
             return Err(CoreError::RequestHashMismatch);
         }
+        if matches!(
+            command.action,
+            UserCommandAction::Portfolio
+                | UserCommandAction::Rewards
+                | UserCommandAction::BootstrapStatus { .. }
+        ) {
+            return self.execute_readonly(command, expected_hash, now_millis);
+        }
         if let Some(processed) = self.processed.get(&command.idempotency_key) {
             if processed.request_hash != expected_hash {
                 return Err(CoreError::DuplicateCommand);
@@ -2970,7 +2979,7 @@ impl PrivateTradingCore {
         let response = CoreResponse {
             result,
             receipt,
-            encrypted_record: record,
+            encrypted_record: Some(record),
             withdrawal_authorization,
             reward_claim_authorization: None,
             audit_fills,
@@ -2992,6 +3001,67 @@ impl PrivateTradingCore {
             },
         );
         Ok(response)
+    }
+
+    fn execute_readonly(
+        &self,
+        command: UserCommand,
+        expected_hash: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<CoreResponse> {
+        if self.processed.contains_key(&command.idempotency_key) {
+            return Err(CoreError::DuplicateCommand);
+        }
+        let private_user_id = self
+            .sessions
+            .verify_signed_readonly(&command.session, now_millis)?;
+        let result = match &command.action {
+            UserCommandAction::Portfolio => CommandResult::Portfolio {
+                snapshot: portfolio_snapshot(
+                    &self.ledger,
+                    &self.books,
+                    &self.position_cost_basis,
+                    &private_user_id,
+                    now_millis,
+                ),
+            },
+            UserCommandAction::Rewards => CommandResult::Rewards {
+                entitlements: self.private_rewards.entitlements(&private_user_id),
+            },
+            UserCommandAction::BootstrapStatus { execution_id } => {
+                let execution = self
+                    .bootstrap_executions
+                    .get(execution_id)
+                    .filter(|execution| execution.private_user_id == private_user_id)
+                    .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
+                CommandResult::BootstrapStatus {
+                    execution: execution.view.clone(),
+                }
+            }
+            _ => return Err(CoreError::InvalidOrder("command is not read-only".into())),
+        };
+        let root = self.state_root();
+        let journal_hash = read_only_response_hash(&command, &result, root)?;
+        let receipt = self.receipt_signer.sign(
+            command.command_id,
+            command.idempotency_key,
+            Some(expected_hash),
+            Some(false),
+            self.sequence,
+            root,
+            root,
+            journal_hash,
+            now_millis,
+        );
+        Ok(CoreResponse {
+            result,
+            receipt,
+            encrypted_record: None,
+            withdrawal_authorization: None,
+            reward_claim_authorization: None,
+            audit_fills: Vec::new(),
+            task_qualifications: Vec::new(),
+        })
     }
 
     pub fn aggregate_depth(
@@ -5001,6 +5071,20 @@ fn processed_hashes(processed: &BTreeMap<String, ProcessedCommand>) -> BTreeMap<
         .iter()
         .map(|(key, value)| (key.clone(), value.request_hash))
         .collect()
+}
+
+fn read_only_response_hash(
+    command: &UserCommand,
+    result: &CommandResult,
+    state_root: [u8; 32],
+) -> CoreResult<[u8; 32]> {
+    let encoded =
+        serde_json::to_vec(&(command, result)).map_err(|_| CoreError::RequestHashMismatch)?;
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.read-only-response.v1\0");
+    hash.update(state_root);
+    hash.update(encoded);
+    Ok(hash.finalize().into())
 }
 
 #[allow(clippy::too_many_arguments)]

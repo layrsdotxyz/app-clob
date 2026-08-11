@@ -677,7 +677,7 @@ async fn handle_encrypted(
     // These sidecars contain only AEAD ciphertext and its integrity/chain metadata. They let the
     // untrusted parent persist state transitions without learning the encrypted response body.
     let journal_artifacts = match &response {
-        PlainResponse::User { response } => vec![response.encrypted_record.clone()],
+        PlainResponse::User { response } => response.encrypted_record.clone().into_iter().collect(),
         PlainResponse::System { response } => vec![response.encrypted_record.clone()],
         PlainResponse::PoolWithdrawalSigned {
             response: Some(response),

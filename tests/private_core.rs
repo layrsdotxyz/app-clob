@@ -1704,6 +1704,9 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
     )
     .unwrap();
 
+    let root_before_portfolio = core.state_root();
+    let snapshot_before_portfolio = core.export_encrypted_snapshot().unwrap();
+
     let portfolio = execute_signed_response(
         &mut core,
         &user,
@@ -1715,6 +1718,14 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
     );
     assert_eq!(portfolio.receipt.protocol_version, "layrs.v2");
     assert_eq!(portfolio.receipt.publication_eligible, Some(false));
+    assert!(portfolio.encrypted_record.is_none());
+    assert_eq!(portfolio.receipt.prior_state_root, root_before_portfolio);
+    assert_eq!(portfolio.receipt.state_root, root_before_portfolio);
+    assert_eq!(core.state_root(), root_before_portfolio);
+    assert_eq!(
+        core.export_encrypted_snapshot().unwrap().sequence,
+        snapshot_before_portfolio.sequence
+    );
     assert_eq!(
         portfolio.receipt.command_commitment_sha256,
         Some(
@@ -1768,6 +1779,7 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
     );
     assert_eq!(response.receipt.protocol_version, "layrs.v2");
     assert_eq!(response.receipt.publication_eligible, Some(true));
+    assert!(response.encrypted_record.is_some());
     let authorization = response.withdrawal_authorization.unwrap();
     assert_eq!(authorization.intent.receipt_id, response.receipt.receipt_id);
     assert_eq!(

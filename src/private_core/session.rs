@@ -78,6 +78,25 @@ impl SessionGuard {
         signed: &SignedSessionRequest,
         now_millis: i64,
     ) -> CoreResult<String> {
+        let private_user_id = self.verify_signed(signed, now_millis)?;
+        self.accept(&signed.request, now_millis)?;
+        Ok(private_user_id)
+    }
+
+    /// Authenticates a read-only request without advancing durable session state.
+    /// Transport replay protection still rejects a duplicated encrypted envelope,
+    /// while a subsequent mutating command may safely use any greater sequence.
+    pub fn verify_signed_readonly(
+        &self,
+        signed: &SignedSessionRequest,
+        now_millis: i64,
+    ) -> CoreResult<String> {
+        let private_user_id = self.verify_signed(signed, now_millis)?;
+        self.validate_sequence(&signed.request, now_millis)?;
+        Ok(private_user_id)
+    }
+
+    fn verify_signed(&self, signed: &SignedSessionRequest, now_millis: i64) -> CoreResult<String> {
         let registered = self
             .registered
             .get(&signed.request.session_id)
@@ -99,12 +118,17 @@ impl SessionGuard {
         verifying_key
             .verify(&signing_payload(&signed.request), &signature)
             .map_err(|_| CoreError::InvalidSessionSignature)?;
-        let private_user_id = registered.private_user_id.clone();
-        self.accept(&signed.request, now_millis)?;
-        Ok(private_user_id)
+        Ok(registered.private_user_id.clone())
     }
 
     pub fn accept(&mut self, request: &SessionRequest, now_millis: i64) -> CoreResult<()> {
+        self.validate_sequence(request, now_millis)?;
+        self.last_sequences
+            .insert(request.session_id.clone(), request.sequence);
+        Ok(())
+    }
+
+    fn validate_sequence(&self, request: &SessionRequest, now_millis: i64) -> CoreResult<()> {
         if request.expires_at_millis <= now_millis
             || request.issued_at_millis > now_millis + 30_000
             || request.session_id.is_empty()
@@ -119,8 +143,6 @@ impl SessionGuard {
         if request.sequence == 0 || request.sequence <= last {
             return Err(CoreError::ReplayedSequence);
         }
-        self.last_sequences
-            .insert(request.session_id.clone(), request.sequence);
         Ok(())
     }
 
