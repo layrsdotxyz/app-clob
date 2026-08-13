@@ -208,11 +208,8 @@ jobs:
           name: Install cargo-audit
           command: cargo install cargo-audit --locked
       - run:
-          name: Audit production EIF dependencies
-          command: cargo audit --file enclave/runtime/Cargo.lock
-      - run:
-          name: Audit production parent dependencies
-          command: cargo audit --file enclave/parent-runtime/Cargo.lock
+          name: Audit production enclave dependencies
+          command: ./scripts/audit-enclave-dependencies.sh
       - save_cache:
           key: cargo-v1-{{ checksum "Cargo.lock" }}
           paths:
