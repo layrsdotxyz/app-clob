@@ -1,9 +1,9 @@
 use clob_service::private_core::{
     command_request_hash, polymarket_resolution_signing_payload, resolution_signing_payload,
     signing_payload, AccountBucket, AccountKey, BookOrder, BoundaryEvidence, CommandResult,
-    CompleteSetDirection, CoreError, EncryptedJournal, ExternalFlowDirection, JournalKey, Ledger,
-    LedgerTransaction, MarketConfig, MarketExecution, OrderAction, OrderStatus, Outcome,
-    PolymarketResolutionStatement, PriceTimeBook, PrivateTradingCore, ReceiptSigner,
+    CompleteSetDirection, CoreError, EncryptedJournal, ExternalFlowDirection, FeeProfileId,
+    JournalKey, Ledger, LedgerTransaction, MarketConfig, MarketExecution, OrderAction, OrderStatus,
+    Outcome, PolymarketResolutionStatement, PriceTimeBook, PrivateTradingCore, ReceiptSigner,
     ResolutionOutcome, ResolutionStatement, SessionGuard, SessionRequest,
     SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence, SignedSessionRequest,
     TimeInForce, Transfer, UserCommand, UserCommandAction,
@@ -291,8 +291,10 @@ fn legacy_market_config_keeps_public_settlement_chain_out_of_snapshot_wire_shape
     });
     let market: MarketConfig = serde_json::from_value(raw).unwrap();
     assert_eq!(market.public_settlement_chain, None);
+    assert_eq!(market.fee_profile_id, FeeProfileId::LegacyProfitV1);
     let encoded = serde_json::to_value(&market).unwrap();
     assert!(encoded.get("public_settlement_chain").is_none());
+    assert!(encoded.get("fee_profile_id").is_none());
 }
 
 #[test]
@@ -319,6 +321,7 @@ fn private_core_accepts_v2_rolling_market_ids() {
             maximum_pending_bootstrap_notional_micros: 100_000_000,
             tick_size_micros: 1_000,
             oracle_feed_id: 245,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
             execution: MarketExecution::NativeClob,
         },
         800,
@@ -350,6 +353,7 @@ fn private_core_accepts_v3_rolling_market_ids() {
             maximum_pending_bootstrap_notional_micros: 100_000_000,
             tick_size_micros: 1_000,
             oracle_feed_id: 245,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
             execution: MarketExecution::NativeClob,
         },
         800,
@@ -381,6 +385,7 @@ fn private_core_accepts_signed_v4_event_market_ids_with_exact_polymarket_mapping
             maximum_pending_bootstrap_notional_micros: 100_000_000,
             tick_size_micros: 1_000,
             oracle_feed_id: 1,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
             execution: MarketExecution::PolymarketBootstrap {
                 condition_id: format!("0x{}", "ab".repeat(32)),
                 up_token_id: "1".into(),
@@ -419,6 +424,7 @@ fn private_core_accepts_v5_native_event_markets_without_venue_execution() {
             maximum_pending_bootstrap_notional_micros: 100_000_000,
             tick_size_micros: 1_000,
             oracle_feed_id: 1,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
             execution: MarketExecution::NativeExactCondition {
                 condition_id: format!("0x{}", "ab".repeat(32)),
                 up_outcome_index: 0,
@@ -454,6 +460,7 @@ fn private_core_accepts_v5_native_macro_markets_without_venue_execution() {
             maximum_pending_bootstrap_notional_micros: 100_000_000,
             tick_size_micros: 1_000,
             oracle_feed_id: 1,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
             execution: MarketExecution::NativeExactCondition {
                 condition_id: format!("0x{}", "ab".repeat(32)),
                 up_outcome_index: 0,
@@ -495,6 +502,7 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
             maximum_pending_bootstrap_notional_micros: 100_000_000,
             tick_size_micros: 1_000,
             oracle_feed_id: 245,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
             execution: clob_service::private_core::MarketExecution::NativeClob,
         },
         800,
@@ -766,6 +774,7 @@ fn native_clob_partial_fill_locks_remainder_and_cancel_releases_once() {
             maximum_pending_bootstrap_notional_micros: 100_000_000,
             tick_size_micros: 1_000,
             oracle_feed_id: 245,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
             execution: MarketExecution::NativeClob,
         },
         800,
@@ -999,6 +1008,7 @@ fn rolling_zen_markets_handle_many_small_multi_user_trades_cancellation_and_lock
                 maximum_pending_bootstrap_notional_micros: 100_000_000,
                 tick_size_micros: 1_000,
                 oracle_feed_id: 245,
+                fee_profile_id: FeeProfileId::LegacyProfitV1,
                 execution: MarketExecution::NativeClob,
             },
             800,
@@ -1302,6 +1312,7 @@ fn resolution_cannot_double_credit_and_dust_fees_stay_conservative() {
             maximum_pending_bootstrap_notional_micros: 100_000_000,
             tick_size_micros: 100,
             oracle_feed_id: 1,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
             execution: MarketExecution::NativeClob,
         },
         800,
@@ -1441,6 +1452,142 @@ fn resolution_cannot_double_credit_and_dust_fees_stay_conservative() {
 }
 
 #[test]
+fn category_fee_profiles_settle_usdc_and_zen_through_the_full_ledger_path() {
+    let cases = [
+        (
+            "USDC",
+            6u8,
+            FeeProfileId::MacroV1,
+            1_500_000u128,
+            198_500_000u128,
+        ),
+        (
+            "ZEN",
+            18u8,
+            FeeProfileId::CryptoV1,
+            2_000_000_000_000_000_000u128,
+            198_000_000_000_000_000_000u128,
+        ),
+    ];
+    for (index, (asset, decimals, profile, expected_fee, expected_available)) in
+        cases.into_iter().enumerate()
+    {
+        let marker = 180u8 + index as u8 * 10;
+        let oracle = SigningKey::from_bytes(&[marker; 32]);
+        let user = SigningKey::from_bytes(&[marker + 1; 32]);
+        let journal_key = [marker + 2; 32];
+        let commitment = [marker + 3; 32];
+        let owner = derived_private_user(journal_key, commitment);
+        let mut core = PrivateTradingCore::new_with_oracle(
+            JournalKey::from_bytes(journal_key),
+            ReceiptSigner::generate([marker + 4; 48]),
+            oracle.verifying_key().to_bytes(),
+        )
+        .unwrap();
+        let market_id = format!("layrs:v3:{asset}:15m:category-fee-{index}");
+        core.register_market(
+            format!("sys:market:category-fee:{index}"),
+            MarketConfig {
+                market_id: market_id.clone(),
+                settlement_asset: asset.into(),
+                settlement_decimals: decimals,
+                public_settlement_chain: Some("horizen".into()),
+                opens_at_millis: 900,
+                closes_at_millis: 4_000,
+                minimum_quantity_micros: 1,
+                maximum_quantity_micros: 1_000_000_000,
+                minimum_order_notional_micros: 1,
+                maximum_order_notional_micros: 1_000_000_000,
+                maximum_user_position_micros: 1_000_000_000,
+                maximum_pending_bootstrap_notional_micros: 1_000_000_000,
+                tick_size_micros: 1_000,
+                oracle_feed_id: 245,
+                fee_profile_id: profile,
+                execution: MarketExecution::NativeClob,
+            },
+            800,
+        )
+        .unwrap();
+        core.register_session(
+            format!("sys:session:category-fee:{index}"),
+            format!("session:category-fee:{index}"),
+            commitment,
+            user.verifying_key().to_bytes(),
+            5_000,
+            850,
+        )
+        .unwrap();
+        let scale = 10u128.pow(decimals as u32 - 6);
+        core.apply_user_external_flow(
+            format!("sys:deposit:category-fee:{index}"),
+            commitment,
+            asset.into(),
+            AccountBucket::UserAvailable,
+            200_000_000u128 * scale,
+            ExternalFlowDirection::Inflow,
+            [marker + 5; 32],
+            875,
+        )
+        .unwrap();
+        execute_signed(
+            &mut core,
+            &user,
+            &format!("session:category-fee:{index}"),
+            1,
+            &format!("cmd:category-fee:mint:{index}"),
+            UserCommandAction::CompleteSet {
+                market_id: market_id.clone(),
+                quantity_micros: 100_000_000,
+                direction: CompleteSetDirection::Mint,
+            },
+            1_000,
+        );
+
+        let boundary = |end: i64, price: i64, evidence_marker: u8| BoundaryEvidence {
+            window_start_micros: end * 1_000 - 5_000_000,
+            window_end_micros: end * 1_000,
+            median_price_e8: price,
+            sample_count: 25,
+            minimum_publisher_count: 3,
+            signed_payload_commitment: [evidence_marker; 32],
+        };
+        let statement = ResolutionStatement {
+            market_id: market_id.clone(),
+            oracle_feed_id: 245,
+            opening: boundary(900, 100, marker + 6),
+            closing: boundary(4_000, 101, marker + 7),
+            issued_at_millis: 4_100,
+        };
+        let signature = oracle
+            .sign(&resolution_signing_payload(&statement).unwrap())
+            .to_bytes()
+            .to_vec();
+        core.resolve_market(
+            format!("sys:resolve:category-fee:{index}"),
+            SignedResolution {
+                statement,
+                signature,
+            },
+            4_100,
+        )
+        .unwrap();
+
+        assert_eq!(
+            core.balance(&AccountKey::new(
+                &owner,
+                AccountBucket::UserAvailable,
+                asset
+            )),
+            expected_available,
+        );
+        assert_eq!(
+            core.balance(&AccountKey::new("layrs", AccountBucket::FeeRevenue, asset)),
+            expected_fee,
+        );
+    }
+}
+
+#[test]
 fn polymarket_bootstrap_never_credits_an_unconfirmed_fill() {
     let oracle = SigningKey::from_bytes(&[40u8; 32]);
     let user = SigningKey::from_bytes(&[41u8; 32]);
@@ -1471,6 +1618,7 @@ fn polymarket_bootstrap_never_credits_an_unconfirmed_fill() {
             maximum_pending_bootstrap_notional_micros: 100_000_000,
             tick_size_micros: 1_000,
             oracle_feed_id: 1,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
             execution: MarketExecution::PolymarketBootstrap {
                 condition_id: format!("0x{}", "11".repeat(32)),
                 up_token_id: "123456789".into(),
@@ -2419,6 +2567,7 @@ fn expired_market_rejects_position_close_but_allows_unfilled_hold_release() {
             maximum_pending_bootstrap_notional_micros: 100_000_000,
             tick_size_micros: 1_000,
             oracle_feed_id: 245,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
             execution: MarketExecution::NativeClob,
         },
         800,

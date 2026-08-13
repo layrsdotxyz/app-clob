@@ -1,7 +1,7 @@
 use clob_service::private_core::{
     binance_resolution_signing_payload, BinanceBoundaryEvidence, BinanceResolutionStatement,
-    CoreError, JournalKey, MarketConfig, MarketExecution, PrivateTradingCore, ReceiptSigner,
-    ResolutionEvidence, ResolutionOutcome, SignedBinanceResolution,
+    CoreError, FeeProfileId, JournalKey, MarketConfig, MarketExecution, PrivateTradingCore,
+    ReceiptSigner, ResolutionEvidence, ResolutionOutcome, SignedBinanceResolution,
 };
 use ed25519_dalek::{Signer, SigningKey};
 
@@ -26,6 +26,7 @@ fn market(oracle_feed_id: u64) -> MarketConfig {
         maximum_pending_bootstrap_notional_micros: 100_000_000,
         tick_size_micros: 1_000,
         oracle_feed_id,
+        fee_profile_id: FeeProfileId::LegacyProfitV1,
         execution: MarketExecution::NativeClob,
     }
 }
