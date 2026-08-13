@@ -246,6 +246,14 @@ enum OperatorCommand {
         expires_at_millis: i64,
         now_millis: i64,
     },
+    RegisterTransferAccount {
+        idempotency_key: String,
+        identity_commitment: [u8; 32],
+        now_millis: i64,
+    },
+    TransferAccountStatus {
+        identity_commitment: [u8; 32],
+    },
     ExternalFlow {
         idempotency_key: String,
         account: AccountKey,
@@ -394,6 +402,10 @@ enum PlainResponse {
     },
     System {
         response: SystemResponse,
+    },
+    TransferAccountStatus {
+        transfer_account: String,
+        registered: bool,
     },
     PoolWithdrawalSigned {
         transaction: PoolWithdrawalTransaction,
@@ -1579,6 +1591,19 @@ async fn dispatch_operator(
             .market_settlement_readiness(&market_id, now_millis)
             .map(|readiness| PlainResponse::ResolutionReadiness { readiness })
             .map_err(|error| error.to_string()),
+        OperatorCommand::TransferAccountStatus {
+            identity_commitment,
+        } => {
+            let status = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .transfer_account_status(identity_commitment);
+            Ok(PlainResponse::TransferAccountStatus {
+                transfer_account: status.transfer_account,
+                registered: status.registered,
+            })
+        }
         OperatorCommand::TradingFreezeStatus => Ok(PlainResponse::TradingFreezeStatus {
             frozen: state
                 .core
@@ -1737,6 +1762,13 @@ async fn dispatch_operator(
                     expires_at_millis,
                     now_millis,
                 ),
+                OperatorCommand::RegisterTransferAccount {
+                    idempotency_key,
+                    identity_commitment,
+                    now_millis,
+                } => {
+                    core.register_transfer_account(idempotency_key, identity_commitment, now_millis)
+                }
                 OperatorCommand::ExternalFlow {
                     idempotency_key,
                     account,
@@ -1904,6 +1936,7 @@ async fn dispatch_operator(
                 | OperatorCommand::MarketStatus { .. }
                 | OperatorCommand::ResolutionStatus { .. }
                 | OperatorCommand::ResolutionReadiness { .. }
+                | OperatorCommand::TransferAccountStatus { .. }
                 | OperatorCommand::TradingFreezeStatus
                 | OperatorCommand::AggregateDepth { .. }
                 | OperatorCommand::ReconcileBootstrap { .. } => unreachable!(),

@@ -321,6 +321,13 @@ pub enum UserCommandAction {
         amount_atomic: u128,
         destination: String,
     },
+    TransferFunds {
+        transfer_id: Uuid,
+        recipient_account: String,
+        asset: String,
+        #[serde(with = "super::decimal_u128")]
+        amount_atomic: u128,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -470,6 +477,13 @@ pub enum CommandResult {
         amount_atomic: u128,
         destination: String,
     },
+    FundsTransferred {
+        transfer_id: Uuid,
+        recipient_account: String,
+        asset: String,
+        #[serde(with = "super::decimal_u128")]
+        amount_atomic: u128,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -498,6 +512,14 @@ pub struct SystemResponse {
     pub evidence_commitment: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_evidence: Option<RegistrationEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_account: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferAccountStatus {
+    pub transfer_account: String,
+    pub registered: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -590,6 +612,10 @@ enum JournaledSystemCommand {
         public_key: [u8; 32],
         expires_at_millis: i64,
         now_millis: i64,
+    },
+    RegisterTransferAccount {
+        idempotency_key: String,
+        identity_commitment: [u8; 32],
     },
     ExternalFlow {
         idempotency_key: String,
@@ -1248,7 +1274,74 @@ impl PrivateTradingCore {
             audit_fills: Vec::new(),
             evidence_commitment: Some(registration_evidence.commitment),
             registration_evidence: Some(registration_evidence),
+            transfer_account: None,
         })
+    }
+
+    /// Registers an opaque, stable receive handle for an enclave-local user.
+    ///
+    /// This is deliberately a separate journal command from session registration:
+    /// historical REGISTER_SESSION records therefore retain their exact state roots.
+    /// The handle is deterministically bound to the eligibility identity commitment,
+    /// and the binding lives in the already-committed system key set.
+    pub fn register_transfer_account(
+        &mut self,
+        idempotency_key: String,
+        identity_commitment: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        let prior_root = self.state_root();
+        let private_user_id = derive_private_user_id(&self.identity_key, &identity_commitment);
+        let transfer_account = derive_transfer_account(&identity_commitment);
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        keys.insert(transfer_account_marker(&transfer_account, &private_user_id));
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &self.ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::RegisterTransferAccount {
+            idempotency_key: idempotency_key.clone(),
+            identity_commitment,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        let mut response = self.system_response(
+            "register-transfer-account",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        );
+        response.transfer_account = Some(transfer_account);
+        Ok(response)
+    }
+
+    pub fn transfer_account_status(&self, identity_commitment: [u8; 32]) -> TransferAccountStatus {
+        let private_user_id = derive_private_user_id(&self.identity_key, &identity_commitment);
+        let transfer_account = derive_transfer_account(&identity_commitment);
+        TransferAccountStatus {
+            registered: self.system_keys.contains(&transfer_account_marker(
+                &transfer_account,
+                &private_user_id,
+            )),
+            transfer_account,
+        }
     }
 
     pub fn apply_external_flow(
@@ -2887,6 +2980,44 @@ impl PrivateTradingCore {
                     destination: destination.clone(),
                 }
             }
+            UserCommandAction::TransferFunds {
+                transfer_id,
+                recipient_account,
+                asset,
+                amount_atomic,
+            } => {
+                validate_private_transfer(recipient_account, asset, *amount_atomic)?;
+                let recipient_private_user_id =
+                    resolve_transfer_account(&system_keys, recipient_account)?;
+                if recipient_private_user_id == private_user_id {
+                    return Err(CoreError::InvalidOrder(
+                        "sender and recipient must be different".into(),
+                    ));
+                }
+                ledger.apply(LedgerTransaction {
+                    idempotency_key: format!("private-transfer:{}", command.idempotency_key),
+                    business_reference: transfer_id.to_string(),
+                    transfers: vec![Transfer {
+                        from: AccountKey::new(
+                            &private_user_id,
+                            AccountBucket::UserAvailable,
+                            asset,
+                        ),
+                        to: AccountKey::new(
+                            recipient_private_user_id,
+                            AccountBucket::UserAvailable,
+                            asset,
+                        ),
+                        amount: *amount_atomic,
+                    }],
+                })?;
+                CommandResult::FundsTransferred {
+                    transfer_id: *transfer_id,
+                    recipient_account: recipient_account.clone(),
+                    asset: asset.clone(),
+                    amount_atomic: *amount_atomic,
+                }
+            }
         };
 
         let mut processed_hash_map = processed_hashes(&self.processed);
@@ -2924,6 +3055,7 @@ impl PrivateTradingCore {
                     | UserCommandAction::RequestRewardClaim { .. }
                     | UserCommandAction::CancelBootstrap { .. }
                     | UserCommandAction::RequestWithdrawal { .. }
+                    | UserCommandAction::TransferFunds { .. }
             )),
             next_sequence,
             prior_root,
@@ -3120,6 +3252,7 @@ impl PrivateTradingCore {
             audit_fills: Vec::new(),
             evidence_commitment: None,
             registration_evidence: None,
+            transfer_account: None,
         }
     }
 }
@@ -5002,6 +5135,62 @@ fn validate_withdrawal(
             .all(|value| value.is_ascii_hexdigit())
     {
         return Err(CoreError::InvalidOrder("invalid withdrawal request".into()));
+    }
+    Ok(())
+}
+
+fn derive_transfer_account(identity_commitment: &[u8; 32]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.private-transfer-account.v1\0");
+    hash.update(identity_commitment);
+    format!("layrs_{}", hex::encode(hash.finalize()))
+}
+
+fn transfer_account_marker(transfer_account: &str, private_user_id: &str) -> String {
+    format!("private-transfer-account:{transfer_account}:{private_user_id}")
+}
+
+fn resolve_transfer_account(
+    system_keys: &BTreeSet<String>,
+    transfer_account: &str,
+) -> CoreResult<String> {
+    let prefix = format!("private-transfer-account:{transfer_account}:");
+    let mut matches = system_keys
+        .range(prefix.clone()..)
+        .take_while(|key| key.starts_with(&prefix));
+    let marker = matches
+        .next()
+        .ok_or_else(|| CoreError::InvalidOrder("unknown transfer account".into()))?;
+    if matches.next().is_some() {
+        return Err(CoreError::InvalidOrder("ambiguous transfer account".into()));
+    }
+    let private_user_id = marker[prefix.len()..].to_string();
+    if !private_user_id.starts_with("usr_") || private_user_id.len() != 68 {
+        return Err(CoreError::InvalidOrder(
+            "invalid transfer account binding".into(),
+        ));
+    }
+    Ok(private_user_id)
+}
+
+fn validate_private_transfer(
+    recipient_account: &str,
+    asset: &str,
+    amount_atomic: u128,
+) -> CoreResult<()> {
+    let account_suffix = recipient_account.strip_prefix("layrs_");
+    if amount_atomic == 0
+        || !matches!(asset, "USDC" | "ZEN")
+        || account_suffix.is_none_or(|suffix| {
+            suffix.len() != 64
+                || !suffix
+                    .bytes()
+                    .all(|value| value.is_ascii_digit() || (b'a'..=b'f').contains(&value))
+        })
+    {
+        return Err(CoreError::InvalidOrder(
+            "invalid private transfer request".into(),
+        ));
     }
     Ok(())
 }

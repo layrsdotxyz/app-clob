@@ -1924,6 +1924,277 @@ fn registration_receipt_is_publication_eligible_private_and_identity_unique() {
 }
 
 #[test]
+fn private_user_transfer_is_registered_atomic_available_only_and_replay_safe() {
+    let sender_key = SigningKey::from_bytes(&[81u8; 32]);
+    let recipient_key = SigningKey::from_bytes(&[82u8; 32]);
+    let journal_key = [83u8; 32];
+    let sender_identity = [84u8; 32];
+    let recipient_identity = [85u8; 32];
+    let sender_private_user = derived_private_user(journal_key, sender_identity);
+    let recipient_private_user = derived_private_user(journal_key, recipient_identity);
+    let mut core = PrivateTradingCore::new(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([86u8; 48]),
+    );
+
+    core.register_session(
+        "sys:session:transfer:sender".into(),
+        "session:transfer:sender".into(),
+        sender_identity,
+        sender_key.verifying_key().to_bytes(),
+        20_000,
+        1_000,
+    )
+    .unwrap();
+    core.register_session(
+        "sys:session:transfer:recipient".into(),
+        "session:transfer:recipient".into(),
+        recipient_identity,
+        recipient_key.verifying_key().to_bytes(),
+        20_000,
+        1_010,
+    )
+    .unwrap();
+    assert!(!core.transfer_account_status(sender_identity).registered);
+    let sender_account = core
+        .register_transfer_account("sys:transfer-account:sender".into(), sender_identity, 1_020)
+        .unwrap()
+        .transfer_account
+        .unwrap();
+    let recipient_account = core
+        .register_transfer_account(
+            "sys:transfer-account:recipient".into(),
+            recipient_identity,
+            1_030,
+        )
+        .unwrap()
+        .transfer_account
+        .unwrap();
+    assert_eq!(
+        core.transfer_account_status(sender_identity)
+            .transfer_account,
+        sender_account
+    );
+    assert!(core.transfer_account_status(sender_identity).registered);
+    assert!(core.transfer_account_status(recipient_identity).registered);
+    assert!(sender_account.starts_with("layrs_"));
+    assert_ne!(sender_account, recipient_account);
+
+    core.apply_user_external_flow(
+        "sys:deposit:transfer:sender".into(),
+        sender_identity,
+        "USDC".into(),
+        AccountBucket::UserAvailable,
+        10_000_000,
+        ExternalFlowDirection::Inflow,
+        [87u8; 32],
+        1_040,
+    )
+    .unwrap();
+    // Reserve part of the balance. A private transfer must never consume it.
+    execute_signed_response(
+        &mut core,
+        &sender_key,
+        "session:transfer:sender",
+        1,
+        "cmd:transfer:reserve",
+        UserCommandAction::RequestWithdrawal {
+            withdrawal_id: uuid::Uuid::from_u128(88),
+            chain: "base".into(),
+            asset: "USDC".into(),
+            amount_atomic: 2_000_000,
+            destination: "0x1111111111111111111111111111111111111111".into(),
+        },
+        1_050,
+    );
+
+    let transfer_id = uuid::Uuid::from_u128(89);
+    let action = UserCommandAction::TransferFunds {
+        transfer_id,
+        recipient_account: recipient_account.clone(),
+        asset: "USDC".into(),
+        amount_atomic: 6_000_000,
+    };
+    let command_id = "cmd:transfer:success";
+    let idempotency_key = format!("idem:{command_id}");
+    let request_hash = command_request_hash(command_id, &idempotency_key, &action).unwrap();
+    let request = SessionRequest {
+        session_id: "session:transfer:sender".into(),
+        sequence: 2,
+        issued_at_millis: 1_060,
+        expires_at_millis: 2_900,
+        request_hash,
+    };
+    let command = UserCommand {
+        command_id: command_id.into(),
+        idempotency_key,
+        session: SignedSessionRequest {
+            signature: sender_key
+                .sign(&signing_payload(&request))
+                .to_bytes()
+                .to_vec(),
+            request,
+        },
+        action,
+    };
+    let first = core.execute(command.clone(), 1_060).unwrap();
+    let replay = core.execute(command, 1_061).unwrap();
+    assert_eq!(first, replay);
+    assert!(first.receipt.publication_eligible == Some(true));
+    assert!(matches!(
+        first.result,
+        CommandResult::FundsTransferred {
+            transfer_id: id,
+            amount_atomic: 6_000_000,
+            ..
+        } if id == transfer_id
+    ));
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &sender_private_user,
+            AccountBucket::UserAvailable,
+            "USDC"
+        )),
+        2_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &sender_private_user,
+            AccountBucket::UserWithdrawalHold,
+            "USDC"
+        )),
+        2_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &recipient_private_user,
+            AccountBucket::UserAvailable,
+            "USDC"
+        )),
+        6_000_000
+    );
+
+    let root_before_failure = core.state_root();
+    let insufficient = execute_signed_result(
+        &mut core,
+        &sender_key,
+        "session:transfer:sender",
+        3,
+        "cmd:transfer:insufficient",
+        UserCommandAction::TransferFunds {
+            transfer_id: uuid::Uuid::from_u128(90),
+            recipient_account: recipient_account.clone(),
+            asset: "USDC".into(),
+            amount_atomic: 2_000_001,
+        },
+        1_070,
+    );
+    assert_eq!(insufficient.unwrap_err(), CoreError::InsufficientBalance);
+    assert_eq!(core.state_root(), root_before_failure);
+
+    let self_transfer = execute_signed_result(
+        &mut core,
+        &sender_key,
+        "session:transfer:sender",
+        3,
+        "cmd:transfer:self",
+        UserCommandAction::TransferFunds {
+            transfer_id: uuid::Uuid::from_u128(91),
+            recipient_account: sender_account,
+            asset: "USDC".into(),
+            amount_atomic: 1,
+        },
+        1_080,
+    );
+    assert_eq!(
+        self_transfer.unwrap_err(),
+        CoreError::InvalidOrder("sender and recipient must be different".into())
+    );
+
+    let unknown = execute_signed_result(
+        &mut core,
+        &sender_key,
+        "session:transfer:sender",
+        3,
+        "cmd:transfer:unknown",
+        UserCommandAction::TransferFunds {
+            transfer_id: uuid::Uuid::from_u128(92),
+            recipient_account: format!("layrs_{}", "00".repeat(32)),
+            asset: "USDC".into(),
+            amount_atomic: 1,
+        },
+        1_090,
+    );
+    assert_eq!(
+        unknown.unwrap_err(),
+        CoreError::InvalidOrder("unknown transfer account".into())
+    );
+
+    for (id, suffix, recipient, asset, amount) in [
+        (93, "zero", recipient_account.clone(), "USDC".to_string(), 0),
+        (
+            94,
+            "asset",
+            recipient_account.clone(),
+            "WETH".to_string(),
+            1,
+        ),
+        (
+            95,
+            "canonical",
+            recipient_account.to_uppercase(),
+            "USDC".to_string(),
+            1,
+        ),
+    ] {
+        let root = core.state_root();
+        let invalid = execute_signed_result(
+            &mut core,
+            &sender_key,
+            "session:transfer:sender",
+            3,
+            &format!("cmd:transfer:{suffix}"),
+            UserCommandAction::TransferFunds {
+                transfer_id: uuid::Uuid::from_u128(id),
+                recipient_account: recipient,
+                asset,
+                amount_atomic: amount,
+            },
+            1_100,
+        );
+        assert_eq!(
+            invalid.unwrap_err(),
+            CoreError::InvalidOrder("invalid private transfer request".into())
+        );
+        assert_eq!(core.state_root(), root);
+    }
+
+    let snapshot = core.export_encrypted_snapshot().unwrap();
+    let restored = PrivateTradingCore::restore_encrypted_snapshot(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([93u8; 48]),
+        &snapshot,
+        snapshot.sequence,
+    )
+    .unwrap();
+    assert!(restored.transfer_account_status(sender_identity).registered);
+    assert!(
+        restored
+            .transfer_account_status(recipient_identity)
+            .registered
+    );
+    assert_eq!(restored.state_root(), core.state_root());
+    assert_eq!(
+        restored.balance(&AccountKey::new(
+            &recipient_private_user,
+            AccountBucket::UserAvailable,
+            "USDC"
+        )),
+        6_000_000
+    );
+}
+
+#[test]
 fn base_zen_bridge_back_withdrawal_is_reserved_and_authorized_by_the_enclave() {
     let user = SigningKey::from_bytes(&[42u8; 32]);
     let journal_key = [43u8; 32];
