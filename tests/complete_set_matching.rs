@@ -1,8 +1,8 @@
 use clob_service::private_core::{
     command_request_hash, exact_condition_resolution_signing_payload, resolution_signing_payload,
     signing_payload, AccountBucket, AccountKey, BookOrder, BoundaryEvidence, CommandResult,
-    ExactConditionResolutionStatement, ExternalFlowDirection, JournalKey, MarketConfig,
-    MarketExecution, MatchType, OrderAction, OrderStatus, Outcome, PriceTimeBook,
+    ExactConditionResolutionStatement, ExternalFlowDirection, FeeProfileId, JournalKey,
+    MarketConfig, MarketExecution, MatchType, OrderAction, OrderStatus, Outcome, PriceTimeBook,
     PrivateTradingCore, ReceiptSigner, ResolutionOutcome, ResolutionStatement, SessionRequest,
     SignedExactConditionResolution, SignedResolution, SignedSessionRequest, TimeInForce,
     UserCommand, UserCommandAction,
@@ -1066,6 +1066,7 @@ fn configured_core() -> (PrivateTradingCore, SigningKey, SigningKey, String, Str
             maximum_pending_bootstrap_notional_micros: 100_000_000,
             tick_size_micros: 100,
             oracle_feed_id: 245,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
             execution: MarketExecution::NativeClob,
         },
         800,
@@ -1141,6 +1142,7 @@ fn configured_exact_condition_core_with_balance(
             // compatibility; exact-condition resolution ignores it and verifies
             // the signed condition/evidence tuple instead.
             oracle_feed_id: 245,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
             execution: MarketExecution::NativeExactCondition {
                 condition_id: format!("0x{}", "22".repeat(32)),
                 up_outcome_index: 0,

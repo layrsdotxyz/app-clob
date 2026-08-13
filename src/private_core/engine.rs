@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ethers_core::types::U256;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -47,9 +48,76 @@ pub struct MarketConfig {
     pub maximum_pending_bootstrap_notional_micros: u128,
     pub tick_size_micros: u64,
     pub oracle_feed_id: u64,
+    /// Immutable settlement-fee policy selected by the signed market release.
+    /// Older snapshots and releases intentionally default to the legacy policy.
+    #[serde(default, skip_serializing_if = "FeeProfileId::is_legacy")]
+    pub fee_profile_id: FeeProfileId,
     /// Determines where price discovery happens. The default preserves the native ZEN CLOB.
     #[serde(default)]
     pub execution: MarketExecution,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FeeProfileId {
+    #[default]
+    LegacyProfitV1,
+    CryptoV1,
+    MacroV1,
+    FinanceV1,
+    PoliticsV1,
+    SportsV1,
+    EsportsV1,
+    WeatherV1,
+    TechnologyV1,
+    ScienceV1,
+    CultureV1,
+    BusinessV1,
+    GeopoliticsV1,
+    GeneralV1,
+}
+
+impl FeeProfileId {
+    fn is_legacy(&self) -> bool {
+        matches!(self, Self::LegacyProfitV1)
+    }
+
+    fn parameters(self) -> Option<FeeProfileParameters> {
+        let parameters = match self {
+            Self::LegacyProfitV1 => return None,
+            Self::CryptoV1 => FeeProfileParameters::new(800, 100, 400),
+            Self::MacroV1 | Self::FinanceV1 => FeeProfileParameters::new(600, 100, 300),
+            Self::PoliticsV1
+            | Self::WeatherV1
+            | Self::TechnologyV1
+            | Self::ScienceV1
+            | Self::CultureV1
+            | Self::BusinessV1
+            | Self::GeneralV1 => FeeProfileParameters::new(500, 100, 250),
+            Self::SportsV1 | Self::EsportsV1 => FeeProfileParameters::new(400, 100, 200),
+            Self::GeopoliticsV1 => FeeProfileParameters::new(300, 100, 150),
+        };
+        Some(parameters)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FeeProfileParameters {
+    curve_coefficient_bps: u128,
+    stake_floor_bps: u128,
+    stake_cap_bps: u128,
+    profit_cap_bps: u128,
+}
+
+impl FeeProfileParameters {
+    const fn new(curve_coefficient_bps: u128, stake_floor_bps: u128, stake_cap_bps: u128) -> Self {
+        Self {
+            curve_coefficient_bps,
+            stake_floor_bps,
+            stake_cap_bps,
+            profit_cap_bps: 500,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1807,11 +1875,12 @@ impl PrivateTradingCore {
                 _ => 0,
             };
             let gross = settlement_atomic(market, gross_micros)?;
-            let winning_fee = if matches!(outcome, ResolutionOutcome::Push) {
-                0
-            } else {
-                ceil_bps(gross.saturating_sub(basis), 500)?
-            };
+            let winning_fee = settlement_winning_fee(
+                market.fee_profile_id,
+                basis,
+                gross,
+                matches!(outcome, ResolutionOutcome::Push),
+            )?;
             total_gross_payout = total_gross_payout
                 .checked_add(gross)
                 .ok_or(CoreError::UnbalancedTransaction)?;
@@ -4399,6 +4468,67 @@ fn ceil_bps(amount: u128, bps: u128) -> CoreResult<u128> {
         .ok_or(CoreError::UnbalancedTransaction)
 }
 
+fn floor_bps(amount: u128, bps: u128) -> CoreResult<u128> {
+    amount
+        .checked_mul(bps)
+        .map(|value| value / 10_000)
+        .ok_or(CoreError::UnbalancedTransaction)
+}
+
+fn settlement_winning_fee(
+    profile_id: FeeProfileId,
+    executed_stake_atomic: u128,
+    gross_payout_atomic: u128,
+    is_push: bool,
+) -> CoreResult<u128> {
+    if is_push || gross_payout_atomic <= executed_stake_atomic {
+        return Ok(0);
+    }
+    let profit = gross_payout_atomic - executed_stake_atomic;
+    let Some(profile) = profile_id.parameters() else {
+        return ceil_bps(profit, 500);
+    };
+
+    // curve = q * coefficient * p * (1-p), where q is gross payout and
+    // p = executed stake / gross payout. U256 is already in the locked EIF
+    // dependency closure. Reduce the BPS fraction first; because stake and
+    // profit sum to gross, their product is at most gross^2/4 and the reduced
+    // numerator multiplier (at most three for the governed profiles) fits
+    // exactly in U256 for the complete u128 input domain.
+    let divisor = gcd(profile.curve_coefficient_bps, 10_000);
+    let coefficient_numerator = profile.curve_coefficient_bps / divisor;
+    let coefficient_denominator = 10_000 / divisor;
+    let numerator = U256::from(executed_stake_atomic)
+        .checked_mul(U256::from(profit))
+        .and_then(|value| value.checked_mul(U256::from(coefficient_numerator)))
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    let denominator = U256::from(gross_payout_atomic)
+        .checked_mul(U256::from(coefficient_denominator))
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    let curve_fee_u256 = numerator
+        .checked_add(denominator - U256::one())
+        .map(|value| value / denominator)
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    if curve_fee_u256 > U256::from(u128::MAX) {
+        return Err(CoreError::UnbalancedTransaction);
+    }
+    let curve_fee = curve_fee_u256.as_u128();
+    let stake_floor = ceil_bps(executed_stake_atomic, profile.stake_floor_bps)?;
+    let stake_cap = floor_bps(executed_stake_atomic, profile.stake_cap_bps)?;
+    let profit_cap = floor_bps(profit, profile.profit_cap_bps)?;
+
+    Ok(curve_fee.max(stake_floor).min(stake_cap).min(profit_cap))
+}
+
+fn gcd(mut left: u128, mut right: u128) -> u128 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
 fn native_audit_drafts(
     incoming: &BookOrder,
     result: &MatchResult,
@@ -5479,6 +5609,122 @@ fn remove_json_field(value: &mut serde_json::Value, field: &str) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod category_fee_tests {
+    use super::*;
+
+    const GROSS: u128 = 100_000_000;
+
+    #[test]
+    fn legacy_profile_preserves_five_percent_profit_fee() {
+        assert_eq!(
+            settlement_winning_fee(FeeProfileId::LegacyProfitV1, 80_000_000, GROSS, false).unwrap(),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn category_profiles_follow_curve_and_caps_at_representative_prices() {
+        let vectors = [
+            // profile, stake, expected fee
+            (FeeProfileId::CryptoV1, 50_000_000, 2_000_000),
+            (FeeProfileId::MacroV1, 50_000_000, 1_500_000),
+            (FeeProfileId::SportsV1, 50_000_000, 1_000_000),
+            (FeeProfileId::EsportsV1, 50_000_000, 1_000_000),
+            (FeeProfileId::GeneralV1, 50_000_000, 1_250_000),
+            (FeeProfileId::CryptoV1, 80_000_000, 1_000_000),
+            (FeeProfileId::MacroV1, 80_000_000, 960_000),
+            (FeeProfileId::SportsV1, 80_000_000, 800_000),
+            (FeeProfileId::CryptoV1, 20_000_000, 800_000),
+            (FeeProfileId::MacroV1, 20_000_000, 600_000),
+            (FeeProfileId::SportsV1, 20_000_000, 400_000),
+            // The five-percent-profit safety cap overrides the one-percent
+            // stake target for near-certain winners.
+            (FeeProfileId::CryptoV1, 95_000_000, 250_000),
+        ];
+        for (profile, stake, expected) in vectors {
+            assert_eq!(
+                settlement_winning_fee(profile, stake, GROSS, false).unwrap(),
+                expected,
+                "unexpected fee for {profile:?} at stake {stake}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_performance_fee_is_charged_on_loss_break_even_or_push() {
+        for profile in [FeeProfileId::LegacyProfitV1, FeeProfileId::CryptoV1] {
+            assert_eq!(settlement_winning_fee(profile, GROSS, 0, false).unwrap(), 0);
+            assert_eq!(
+                settlement_winning_fee(profile, GROSS, GROSS, false).unwrap(),
+                0
+            );
+            assert_eq!(
+                settlement_winning_fee(profile, 20_000_000, GROSS, true).unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn configured_profiles_never_exceed_stake_or_profit_caps() {
+        let profiles = [
+            FeeProfileId::CryptoV1,
+            FeeProfileId::MacroV1,
+            FeeProfileId::FinanceV1,
+            FeeProfileId::PoliticsV1,
+            FeeProfileId::SportsV1,
+            FeeProfileId::EsportsV1,
+            FeeProfileId::WeatherV1,
+            FeeProfileId::TechnologyV1,
+            FeeProfileId::ScienceV1,
+            FeeProfileId::CultureV1,
+            FeeProfileId::BusinessV1,
+            FeeProfileId::GeopoliticsV1,
+            FeeProfileId::GeneralV1,
+        ];
+        for gross in [1u128, 10, 1_000_000, 1_000_000_000_000, u64::MAX as u128] {
+            for price_bps in 1u128..10_000 {
+                let stake = gross.saturating_mul(price_bps) / 10_000;
+                if stake == 0 || stake >= gross {
+                    continue;
+                }
+                let profit = gross - stake;
+                for profile in profiles {
+                    let fee = settlement_winning_fee(profile, stake, gross, false).unwrap();
+                    let parameters = profile.parameters().unwrap();
+                    assert!(fee <= floor_bps(stake, parameters.stake_cap_bps).unwrap());
+                    assert!(fee <= floor_bps(profit, parameters.profit_cap_bps).unwrap());
+                    assert!(fee <= gross);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn calculation_is_deterministic_across_repeated_runs() {
+        let expected = settlement_winning_fee(
+            FeeProfileId::CryptoV1,
+            12_345_678_901_234_567,
+            98_765_432_109_876_543,
+            false,
+        )
+        .unwrap();
+        for _ in 0..1_000 {
+            assert_eq!(
+                settlement_winning_fee(
+                    FeeProfileId::CryptoV1,
+                    12_345_678_901_234_567,
+                    98_765_432_109_876_543,
+                    false,
+                )
+                .unwrap(),
+                expected
+            );
+        }
     }
 }
 

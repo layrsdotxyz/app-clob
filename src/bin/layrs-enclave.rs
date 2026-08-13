@@ -2399,6 +2399,7 @@ async fn write_frame(stream: &mut VsockStream, value: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clob_service::private_core::FeeProfileId;
 
     #[test]
     fn replay_cache_rejects_duplicate_keys() {
@@ -2482,6 +2483,7 @@ mod tests {
                 maximum_pending_bootstrap_notional_micros: 100_000_000,
                 tick_size_micros: 1_000,
                 oracle_feed_id: 1,
+                fee_profile_id: FeeProfileId::LegacyProfitV1,
                 execution: MarketExecution::PolymarketBootstrap {
                     condition_id: format!("0x{}", "ab".repeat(32)),
                     up_token_id: "1".into(),
