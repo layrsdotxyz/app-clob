@@ -75,6 +75,20 @@ pub enum FeeProfileId {
     BusinessV1,
     GeopoliticsV1,
     GeneralV1,
+    PolymarketCryptoV2,
+    PolymarketMacroV2,
+    PolymarketFinanceV2,
+    PolymarketPoliticsV2,
+    PolymarketSportsV2,
+    PolymarketEsportsV2,
+    PolymarketWeatherV2,
+    PolymarketTechnologyV2,
+    PolymarketMentionsV2,
+    PolymarketScienceV2,
+    PolymarketCultureV2,
+    PolymarketBusinessV2,
+    PolymarketGeneralV2,
+    PolymarketGeopoliticsV2,
 }
 
 impl FeeProfileId {
@@ -96,8 +110,47 @@ impl FeeProfileId {
             | Self::GeneralV1 => FeeProfileParameters::new(500, 100, 250),
             Self::SportsV1 | Self::EsportsV1 => FeeProfileParameters::new(400, 100, 200),
             Self::GeopoliticsV1 => FeeProfileParameters::new(300, 100, 150),
+            Self::PolymarketCryptoV2
+            | Self::PolymarketMacroV2
+            | Self::PolymarketFinanceV2
+            | Self::PolymarketPoliticsV2
+            | Self::PolymarketSportsV2
+            | Self::PolymarketEsportsV2
+            | Self::PolymarketWeatherV2
+            | Self::PolymarketTechnologyV2
+            | Self::PolymarketMentionsV2
+            | Self::PolymarketScienceV2
+            | Self::PolymarketCultureV2
+            | Self::PolymarketBusinessV2
+            | Self::PolymarketGeneralV2
+            | Self::PolymarketGeopoliticsV2 => return None,
         };
         Some(parameters)
+    }
+
+    fn taker_curve_rate_bps(self) -> Option<u128> {
+        match self {
+            Self::PolymarketCryptoV2 => Some(700),
+            Self::PolymarketMacroV2
+            | Self::PolymarketWeatherV2
+            | Self::PolymarketScienceV2
+            | Self::PolymarketCultureV2
+            | Self::PolymarketGeneralV2 => Some(500),
+            // Esports inherits Sports economics until Polymarket publishes a
+            // distinct Esports schedule.
+            Self::PolymarketSportsV2 | Self::PolymarketEsportsV2 => Some(500),
+            Self::PolymarketFinanceV2
+            | Self::PolymarketPoliticsV2
+            | Self::PolymarketTechnologyV2
+            | Self::PolymarketMentionsV2
+            | Self::PolymarketBusinessV2 => Some(400),
+            Self::PolymarketGeopoliticsV2 => Some(0),
+            _ => None,
+        }
+    }
+
+    fn has_polymarket_taker_fees(self) -> bool {
+        self.taker_curve_rate_bps().is_some()
     }
 }
 
@@ -2359,9 +2412,10 @@ impl PrivateTradingCore {
 
         let mut ledger = self.ledger.clone();
         let mut position_cost_basis = self.position_cost_basis.clone();
+        let mut private_rewards = self.private_rewards.clone();
         let quantity = execution.view.quantity_micros;
         let fill_notional = notional(fill_price_micros, quantity)?;
-        let taker_fee = ceil_bps(fill_notional, 20)?;
+        let taker_fee = taker_fee_micros(market.fee_profile_id, quantity, fill_price_micros)?;
         let claim = claim_asset(&execution.view.market_id, execution.view.outcome);
         let inventory = venue_inventory(&execution.view.market_id, execution.view.outcome, &claim);
         let pool = AccountKey::new("layrs", AccountBucket::PoolCash, &market.settlement_asset);
@@ -2522,6 +2576,17 @@ impl PrivateTradingCore {
             fee_atomic: taker_fee,
             nonce: next_sequence,
         };
+        let (reward_chain, reward_token) = reward_rail(market)?;
+        private_rewards.record_fill(
+            &execution.private_user_id,
+            None,
+            reward_chain,
+            reward_token,
+            quantity,
+            taker_fee,
+            0,
+            now_millis,
+        )?;
 
         let mut keys = self.system_keys.clone();
         keys.insert(idempotency_key.clone());
@@ -2536,7 +2601,7 @@ impl PrivateTradingCore {
             &self.resolutions,
             &self.oracle_public_key,
             &executions,
-            &self.private_rewards,
+            &private_rewards,
             self.trading_frozen,
             next_sequence,
         );
@@ -2550,6 +2615,7 @@ impl PrivateTradingCore {
         self.ledger = ledger;
         self.position_cost_basis = position_cost_basis;
         self.bootstrap_executions = executions;
+        self.private_rewards = private_rewards;
         self.system_keys = keys;
         self.sequence = next_sequence;
         let mut response = self.system_response(
@@ -2778,6 +2844,12 @@ impl PrivateTradingCore {
                                     &command.command_id,
                                 )?;
                             }
+                            record_native_fill_economics(
+                                &mut private_rewards,
+                                market,
+                                &match_result,
+                                now_millis,
+                            )?;
                         }
                         audit_drafts = native_audit_drafts(&order, &match_result, market)?;
                         CommandResult::Order {
@@ -3387,9 +3459,10 @@ fn settlement_transfers(
             from: available(&incoming.private_user_id, &market.settlement_asset),
             to: incoming_cash_hold.clone(),
             amount: initial_notional
-                .checked_add(settlement_atomic(
+                .checked_add(maximum_buy_taker_fee_atomic(
                     market,
-                    ceil_bps(initial_notional_micros, 20)?,
+                    incoming.quantity_micros,
+                    incoming.price_micros,
                 )?)
                 .ok_or(CoreError::UnbalancedTransaction)?,
         }),
@@ -3413,7 +3486,7 @@ fn settlement_transfers(
             .ok_or_else(|| CoreError::InvalidOrder("maker order missing".into()))?;
         let fill_notional_micros = notional(fill.price_micros, fill.quantity_micros)?;
         let fill_notional = settlement_atomic(market, fill_notional_micros)?;
-        let taker_fee = settlement_atomic(market, ceil_bps(fill_notional_micros, 20)?)?;
+        let taker_fee = taker_fee_atomic(market, fill.quantity_micros, fill.taker_price_micros())?;
         let (buyer, seller, buyer_hold, seller_hold) = match incoming.action {
             OrderAction::Buy => (
                 incoming,
@@ -3475,9 +3548,10 @@ fn settlement_transfers(
     match incoming.action {
         OrderAction::Buy => {
             let initially_reserved = initial_notional
-                .checked_add(settlement_atomic(
+                .checked_add(maximum_buy_taker_fee_atomic(
                     market,
-                    ceil_bps(initial_notional_micros, 20)?,
+                    incoming.quantity_micros,
+                    incoming.price_micros,
                 )?)
                 .ok_or(CoreError::UnbalancedTransaction)?;
             let desired_hold = settlement_atomic(
@@ -3540,9 +3614,10 @@ fn apply_complete_set_match_settlement(
             from: available(&incoming.private_user_id, &market.settlement_asset),
             to: incoming_cash_hold.clone(),
             amount: initial_notional
-                .checked_add(settlement_atomic(
+                .checked_add(maximum_buy_taker_fee_atomic(
                     market,
-                    ceil_bps(initial_notional_micros, 20)?,
+                    incoming.quantity_micros,
+                    incoming.price_micros,
                 )?)
                 .ok_or(CoreError::UnbalancedTransaction)?,
         },
@@ -3590,7 +3665,8 @@ fn apply_complete_set_match_settlement(
 
                 let fill_notional_micros = notional(fill.price_micros, fill.quantity_micros)?;
                 let fill_notional = settlement_atomic(market, fill_notional_micros)?;
-                let taker_fee = settlement_atomic(market, ceil_bps(fill_notional_micros, 20)?)?;
+                let taker_fee =
+                    taker_fee_atomic(market, fill.quantity_micros, fill.taker_price_micros())?;
                 let mut transfers = Vec::with_capacity(3);
                 match incoming.action {
                     OrderAction::Buy => {
@@ -3866,9 +3942,10 @@ fn apply_complete_set_match_settlement(
     let refund = match incoming.action {
         OrderAction::Buy => {
             let initially_reserved = initial_notional
-                .checked_add(settlement_atomic(
+                .checked_add(maximum_buy_taker_fee_atomic(
                     market,
-                    ceil_bps(initial_notional_micros, 20)?,
+                    incoming.quantity_micros,
+                    incoming.price_micros,
                 )?)
                 .ok_or(CoreError::UnbalancedTransaction)?;
             let desired_hold = settlement_atomic(
@@ -3932,8 +4009,8 @@ fn complete_set_fill_amounts(
             "complete-set fill is below settlement precision".into(),
         ));
     }
-    let taker_notional_micros = notional(fill.taker_price_micros(), fill.quantity_micros)?;
-    let taker_fee_atomic = settlement_atomic(market, ceil_bps(taker_notional_micros, 20)?)?;
+    let taker_fee_atomic =
+        taker_fee_atomic(market, fill.quantity_micros, fill.taker_price_micros())?;
     if taker_fee_atomic > taker_atomic {
         return Err(CoreError::InvalidOrder(
             "complete-set fee exceeds taker proceeds".into(),
@@ -4253,7 +4330,11 @@ fn bootstrap_reservation(order: &BookOrder, market: &MarketConfig) -> CoreResult
         OrderAction::Buy => {
             let maximum_notional = notional(order.price_micros, order.quantity_micros)?;
             settlement_atomic(market, maximum_notional)?
-                .checked_add(settlement_atomic(market, ceil_bps(maximum_notional, 20)?)?)
+                .checked_add(maximum_buy_taker_fee_atomic(
+                    market,
+                    order.quantity_micros,
+                    order.price_micros,
+                )?)
                 .ok_or(CoreError::UnbalancedTransaction)
         }
         OrderAction::Sell => Ok(order.quantity_micros),
@@ -4475,12 +4556,166 @@ fn floor_bps(amount: u128, bps: u128) -> CoreResult<u128> {
         .ok_or(CoreError::UnbalancedTransaction)
 }
 
+/// Returns the taker fee in six-decimal settlement micros. V2 policies use
+/// the Polymarket curve C * rate * p * (1-p); historical policies retain the
+/// deployed 20 bps notional fee so open markets cannot change economics after
+/// an enclave rotation.
+fn taker_fee_micros(
+    profile_id: FeeProfileId,
+    quantity_micros: u128,
+    price_micros: u64,
+) -> CoreResult<u128> {
+    let price = u128::from(price_micros);
+    if price == 0 || price >= PRICE_SCALE {
+        return Err(CoreError::InvalidOrder(
+            "fee price must be strictly between zero and one".into(),
+        ));
+    }
+    let Some(rate_bps) = profile_id.taker_curve_rate_bps() else {
+        return ceil_bps(notional(price_micros, quantity_micros)?, 20);
+    };
+    if rate_bps == 0 || quantity_micros == 0 {
+        return Ok(0);
+    }
+
+    let denominator = U256::from(PRICE_SCALE)
+        .checked_mul(U256::from(PRICE_SCALE))
+        .and_then(|value| value.checked_mul(U256::from(10_000u128)))
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    let numerator = U256::from(quantity_micros)
+        .checked_mul(U256::from(price))
+        .and_then(|value| value.checked_mul(U256::from(PRICE_SCALE - price)))
+        .and_then(|value| value.checked_mul(U256::from(rate_bps)))
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    // Polymarket rounds settlement-asset fees to five decimal places. The
+    // private core represents one settlement unit with six decimals before
+    // converting into the asset's native precision, so one fee quantum is ten
+    // micros. Round half-up to that quantum; amounts below half a quantum
+    // become zero and the smallest non-zero fee is 0.00001 settlement units.
+    const FEE_QUANTUM_MICROS: u128 = 10;
+    let quantum_denominator = denominator
+        .checked_mul(U256::from(FEE_QUANTUM_MICROS))
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    let half_quantum = denominator
+        .checked_mul(U256::from(FEE_QUANTUM_MICROS / 2))
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    let fee_quanta = numerator
+        .checked_add(half_quantum)
+        .map(|value| value / quantum_denominator)
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    let fee = fee_quanta
+        .checked_mul(U256::from(FEE_QUANTUM_MICROS))
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    if fee > U256::from(u128::MAX) {
+        return Err(CoreError::UnbalancedTransaction);
+    }
+    Ok(fee.as_u128())
+}
+
+fn taker_fee_atomic(
+    market: &MarketConfig,
+    quantity_micros: u128,
+    price_micros: u64,
+) -> CoreResult<u128> {
+    settlement_atomic(
+        market,
+        taker_fee_micros(market.fee_profile_id, quantity_micros, price_micros)?,
+    )
+}
+
+/// A buy order can execute at any price at or below its limit. The curve peaks
+/// at 50c, so reserve against that peak whenever the executable range includes
+/// it. Resting remainder needs no fee reserve because it becomes maker
+/// liquidity and makers pay zero under V2.
+fn maximum_buy_taker_fee_atomic(
+    market: &MarketConfig,
+    quantity_micros: u128,
+    limit_price_micros: u64,
+) -> CoreResult<u128> {
+    let reserve_price = if market.fee_profile_id.has_polymarket_taker_fees()
+        && limit_price_micros >= (PRICE_SCALE / 2) as u64
+    {
+        (PRICE_SCALE / 2) as u64
+    } else {
+        limit_price_micros
+    };
+    taker_fee_atomic(market, quantity_micros, reserve_price)
+}
+
+fn maker_rebate_bps(profile_id: FeeProfileId) -> u128 {
+    match profile_id {
+        FeeProfileId::PolymarketCryptoV2 => 2_000,
+        FeeProfileId::PolymarketSportsV2 | FeeProfileId::PolymarketEsportsV2 => 1_500,
+        FeeProfileId::PolymarketMacroV2
+        | FeeProfileId::PolymarketFinanceV2
+        | FeeProfileId::PolymarketPoliticsV2
+        | FeeProfileId::PolymarketWeatherV2
+        | FeeProfileId::PolymarketTechnologyV2
+        | FeeProfileId::PolymarketMentionsV2
+        | FeeProfileId::PolymarketScienceV2
+        | FeeProfileId::PolymarketCultureV2
+        | FeeProfileId::PolymarketBusinessV2
+        | FeeProfileId::PolymarketGeneralV2 => 2_500,
+        FeeProfileId::PolymarketGeopoliticsV2 | FeeProfileId::LegacyProfitV1 => 0,
+        FeeProfileId::CryptoV1
+        | FeeProfileId::MacroV1
+        | FeeProfileId::FinanceV1
+        | FeeProfileId::PoliticsV1
+        | FeeProfileId::SportsV1
+        | FeeProfileId::EsportsV1
+        | FeeProfileId::WeatherV1
+        | FeeProfileId::TechnologyV1
+        | FeeProfileId::ScienceV1
+        | FeeProfileId::CultureV1
+        | FeeProfileId::BusinessV1
+        | FeeProfileId::GeopoliticsV1
+        | FeeProfileId::GeneralV1 => 0,
+    }
+}
+
+fn reward_rail(market: &MarketConfig) -> CoreResult<(&'static str, &'static str)> {
+    match market.settlement_asset.as_str() {
+        "USDC" => Ok(("base", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913")),
+        "ZEN" => Ok(("horizen", "0x57da2d504bf8b83ef304759d9f2648522d7a9280")),
+        _ => Err(CoreError::InvalidOrder(
+            "unsupported private reward rail".into(),
+        )),
+    }
+}
+
+fn record_native_fill_economics(
+    rewards: &mut PrivateRewardBook,
+    market: &MarketConfig,
+    result: &MatchResult,
+    occurred_at_millis: i64,
+) -> CoreResult<()> {
+    let (chain, reward_token) = reward_rail(market)?;
+    for fill in &result.fills {
+        let taker_fee = taker_fee_atomic(market, fill.quantity_micros, fill.taker_price_micros())?;
+        let maker_rebate = floor_bps(taker_fee, maker_rebate_bps(market.fee_profile_id))?;
+        rewards.record_fill(
+            &fill.taker_private_user_id,
+            Some(&fill.maker_private_user_id),
+            chain,
+            reward_token,
+            fill.quantity_micros,
+            taker_fee,
+            maker_rebate,
+            occurred_at_millis,
+        )?;
+    }
+    Ok(())
+}
+
 fn settlement_winning_fee(
     profile_id: FeeProfileId,
     executed_stake_atomic: u128,
     gross_payout_atomic: u128,
     is_push: bool,
 ) -> CoreResult<u128> {
+    if profile_id.has_polymarket_taker_fees() {
+        return Ok(0);
+    }
     if is_push || gross_payout_atomic <= executed_stake_atomic {
         return Ok(0);
     }
@@ -4543,7 +4778,6 @@ fn native_audit_drafts(
             // For complete-set fills this is the exact complement of the
             // resting maker price, while NORMAL remains unchanged.
             let taker_price_micros = fill.taker_price_micros();
-            let fill_notional = notional(taker_price_micros, fill.quantity_micros)?;
             let (buyer, seller) = match incoming.action {
                 OrderAction::Buy => (
                     fill.taker_private_user_id.clone(),
@@ -4569,7 +4803,7 @@ fn native_audit_drafts(
                     MatchType::Merge => "MERGE",
                 }
                 .into(),
-                fee_atomic: settlement_atomic(market, ceil_bps(fill_notional, 20)?)?,
+                fee_atomic: taker_fee_atomic(market, fill.quantity_micros, taker_price_micros)?,
                 nonce: fill.sequence,
             })
         })
@@ -5725,6 +5959,98 @@ mod category_fee_tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn polymarket_v2_profiles_cover_every_supported_category() {
+        let vectors = [
+            (FeeProfileId::PolymarketCryptoV2, 700),
+            (FeeProfileId::PolymarketMacroV2, 500),
+            (FeeProfileId::PolymarketFinanceV2, 400),
+            (FeeProfileId::PolymarketPoliticsV2, 400),
+            (FeeProfileId::PolymarketSportsV2, 500),
+            (FeeProfileId::PolymarketEsportsV2, 500),
+            (FeeProfileId::PolymarketWeatherV2, 500),
+            (FeeProfileId::PolymarketTechnologyV2, 400),
+            (FeeProfileId::PolymarketMentionsV2, 400),
+            (FeeProfileId::PolymarketScienceV2, 500),
+            (FeeProfileId::PolymarketCultureV2, 500),
+            (FeeProfileId::PolymarketBusinessV2, 400),
+            (FeeProfileId::PolymarketGeneralV2, 500),
+            (FeeProfileId::PolymarketGeopoliticsV2, 0),
+        ];
+
+        for (profile, expected_rate_bps) in vectors {
+            assert!(profile.has_polymarket_taker_fees());
+            assert_eq!(profile.taker_curve_rate_bps(), Some(expected_rate_bps));
+            assert_eq!(profile.parameters(), None);
+            assert_eq!(settlement_winning_fee(profile, 10, 100, false).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn polymarket_v2_curve_matches_public_fee_vectors() {
+        const ONE_HUNDRED_SHARES: u128 = 100_000_000;
+        let vectors = [
+            (FeeProfileId::PolymarketCryptoV2, 1_750_000),
+            (FeeProfileId::PolymarketSportsV2, 1_250_000),
+            (FeeProfileId::PolymarketFinanceV2, 1_000_000),
+            (FeeProfileId::PolymarketMacroV2, 1_250_000),
+            (FeeProfileId::PolymarketGeopoliticsV2, 0),
+        ];
+
+        for (profile, expected_at_fifty_cents) in vectors {
+            assert_eq!(
+                taker_fee_micros(profile, ONE_HUNDRED_SHARES, 500_000).unwrap(),
+                expected_at_fifty_cents,
+                "unexpected 50c fee for {profile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn polymarket_v2_curve_is_symmetric_and_peaks_at_fifty_cents() {
+        const SHARES: u128 = 123_456_789;
+        for profile in [
+            FeeProfileId::PolymarketCryptoV2,
+            FeeProfileId::PolymarketMacroV2,
+            FeeProfileId::PolymarketSportsV2,
+            FeeProfileId::PolymarketTechnologyV2,
+        ] {
+            let low = taker_fee_micros(profile, SHARES, 10_000).unwrap();
+            let high = taker_fee_micros(profile, SHARES, 990_000).unwrap();
+            let middle = taker_fee_micros(profile, SHARES, 500_000).unwrap();
+            assert_eq!(low, high, "curve is not symmetric for {profile:?}");
+            assert!(middle >= low, "curve does not peak at 50c for {profile:?}");
+        }
+    }
+
+    #[test]
+    fn polymarket_v2_fee_rounds_to_five_decimal_places() {
+        assert_eq!(
+            taker_fee_micros(FeeProfileId::PolymarketCryptoV2, 100_000_000, 10_000).unwrap(),
+            69_300
+        );
+        assert_eq!(
+            taker_fee_micros(FeeProfileId::PolymarketCryptoV2, 1, 10_000).unwrap(),
+            0
+        );
+        assert_eq!(
+            taker_fee_micros(FeeProfileId::PolymarketCryptoV2, 100, 500_000).unwrap(),
+            0
+        );
+        assert_eq!(
+            taker_fee_micros(FeeProfileId::PolymarketCryptoV2, 1_000, 500_000).unwrap(),
+            20
+        );
+    }
+
+    #[test]
+    fn legacy_taker_fee_remains_twenty_basis_points_of_notional() {
+        assert_eq!(
+            taker_fee_micros(FeeProfileId::LegacyProfitV1, 100_000_000, 500_000).unwrap(),
+            100_000
+        );
     }
 }
 
