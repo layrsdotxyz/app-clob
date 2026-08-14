@@ -1,4 +1,4 @@
-stages: [fast, full, mirror]
+stages: [fast, full, deploy, mirror]
 
 workflow:
   rules:
@@ -60,11 +60,33 @@ clob-full:
     - command -v cargo-audit >/dev/null || cargo install cargo-audit --locked
     - ./scripts/audit-enclave-dependencies.sh
 
+deploy-zk-proof-worker:
+  stage: deploy
+  tags: [layrs, deploy, x86]
+  interruptible: false
+  needs: [clob-full]
+  resource_group: production-zk-proof-worker
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+  variables:
+    LAYRSV2_AWS_ROLE_ARN: arn:aws:iam::255638996474:role/layrsv2-production-deployer
+    LAYRSV2_PRIMARY_REGION: us-east-1
+    LAYRSV2_ENVIRONMENT: production
+  script:
+    - deployment/deploy-zk-proof-worker.sh
+  artifacts:
+    when: always
+    expire_in: 90 days
+    paths:
+      - deployment/releases/zk-proof-worker-${CI_COMMIT_SHA}.json
+  environment:
+    name: production-zk-proof-worker
+
 mirror-github:
   stage: mirror
   tags: [layrs, deploy, x86]
   interruptible: false
-  needs: [clob-full]
+  needs: [deploy-zk-proof-worker]
   resource_group: github-mirror-app-clob
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
