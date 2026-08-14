@@ -357,6 +357,10 @@ enum UnsignedResolutionEvidence {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+// Keep the authenticated wire schema byte-for-byte stable. Boxing the operator
+// envelope would change the request representation for no runtime benefit in
+// this short-lived decode path, so acknowledge the Rust 1.94 size lint here.
+#[allow(clippy::large_enum_variant)]
 enum PlainRequest {
     Operator {
         envelope: OperatorEnvelope,

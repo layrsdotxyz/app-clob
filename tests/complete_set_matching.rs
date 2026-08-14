@@ -1034,7 +1034,106 @@ fn live_shape_partial_mint_is_ready_for_resolution_after_cancelling_remainder() 
     assert_eq!(core.balance(&claim(&down_owner, Outcome::Down)), 0);
 }
 
+#[test]
+fn polymarket_curve_fee_and_maker_rebate_are_private_and_conserved_on_mint() {
+    let (mut core, up_key, down_key, _, _) =
+        configured_core_with_profile(FeeProfileId::PolymarketCryptoV2);
+    execute(
+        &mut core,
+        &up_key,
+        "session:up",
+        1,
+        "cmd:v2-rebate-maker",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::with_id(
+                Uuid::from_u128(799),
+                "ignored",
+                MARKET_ID,
+                Outcome::Up,
+                OrderAction::Buy,
+                400_000,
+                1_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_000,
+    );
+    let taker_fill = execute(
+        &mut core,
+        &down_key,
+        "session:down",
+        1,
+        "cmd:v2-rebate-taker",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::with_id(
+                Uuid::from_u128(800),
+                "ignored",
+                MARKET_ID,
+                Outcome::Down,
+                OrderAction::Buy,
+                600_000,
+                1_000_000,
+                TimeInForce::Fok,
+                None,
+            ),
+        },
+        1_050,
+    );
+    assert_eq!(
+        order_result(&taker_fill.result).fills[0].match_type,
+        MatchType::Mint
+    );
+    assert_eq!(
+        taker_fill.audit_fills[0].statement.fee_atomic,
+        "16800000000000000"
+    );
+
+    let maker_rewards = execute(
+        &mut core,
+        &up_key,
+        "session:up",
+        2,
+        "cmd:v2-maker-rewards",
+        UserCommandAction::Rewards,
+        1_100,
+    );
+    let taker_rewards = execute(
+        &mut core,
+        &down_key,
+        "session:down",
+        2,
+        "cmd:v2-taker-rewards",
+        UserCommandAction::Rewards,
+        1_100,
+    );
+    let CommandResult::Rewards { entitlements } = maker_rewards.result else {
+        panic!("expected maker rewards");
+    };
+    assert_eq!(entitlements.len(), 1);
+    assert_eq!(entitlements[0].cumulative_amount_atomic, "3360000000000000");
+    assert_eq!(
+        entitlements[0].cumulative_maker_rebate_atomic,
+        "3360000000000000"
+    );
+    let CommandResult::Rewards { entitlements } = taker_rewards.result else {
+        panic!("expected taker rewards");
+    };
+    assert_eq!(entitlements.len(), 1);
+    assert_eq!(entitlements[0].cumulative_amount_atomic, "0");
+    assert_eq!(
+        entitlements[0].cumulative_taker_fees_atomic,
+        "16800000000000000"
+    );
+}
+
 fn configured_core() -> (PrivateTradingCore, SigningKey, SigningKey, String, String) {
+    configured_core_with_profile(FeeProfileId::LegacyProfitV1)
+}
+
+fn configured_core_with_profile(
+    fee_profile_id: FeeProfileId,
+) -> (PrivateTradingCore, SigningKey, SigningKey, String, String) {
     let journal_key = [31u8; 32];
     let up_key = SigningKey::from_bytes(&[32u8; 32]);
     let down_key = SigningKey::from_bytes(&[33u8; 32]);
@@ -1066,7 +1165,7 @@ fn configured_core() -> (PrivateTradingCore, SigningKey, SigningKey, String, Str
             maximum_pending_bootstrap_notional_micros: 100_000_000,
             tick_size_micros: 100,
             oracle_feed_id: 245,
-            fee_profile_id: FeeProfileId::LegacyProfitV1,
+            fee_profile_id,
             execution: MarketExecution::NativeClob,
         },
         800,
