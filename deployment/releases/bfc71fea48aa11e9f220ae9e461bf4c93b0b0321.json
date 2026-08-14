@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "validated-ready-for-activation",
+  "releaseId": "bfc71fea48aa11e9f220ae9e461bf4c93b0b0321",
+  "sourceCommit": "bfc71fea48aa11e9f220ae9e461bf4c93b0b0321",
+  "sourceBranch": "main",
+  "snapshotCompatibilityBase": "a711f808b66ee70fcef30b17e35ad230fb29fa45",
+  "snapshotApproval": "enclave/snapshot-migrations/2026-08-14-polymarket-fees-and-private-rewards.md",
+  "region": "us-east-1",
+  "packerSourceCommit": "bfc71fea48aa11e9f220ae9e461bf4c93b0b0321",
+  "amiId": "ami-04368105d3708199c",
+  "amiSnapshotId": "snap-055a16444ce153528",
+  "amiDeregistrationProtection": "enabled-with-cooldown",
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/bfc71fea48aa11e9f220ae9e461bf4c93b0b0321",
+  "artifacts": {
+    "sourceArchive": {
+      "path": "source.tar.gz",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/bfc71fea48aa11e9f220ae9e461bf4c93b0b0321/source.tar.gz",
+      "versionId": "8dqewhYsUl2eov2LNpEv1UB5E0W8xeRc",
+      "sizeBytes": 556752,
+      "sha384": "c9661b8d67e236c910d960708a21dcff621ad44a0f678aadaede1dcc8dd1ebb7ecf9e632195cbecb556317bae257a57b"
+    },
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/bfc71fea48aa11e9f220ae9e461bf4c93b0b0321/layrsv2-clob.eif",
+      "versionId": "ACjQj5FfkIF0yXpYUJq_l.HyaiQASi39",
+      "sizeBytes": 42266689,
+      "sha384": "c1f460b8773500c457c26b9bdb689012f087125f0f1e12845956ff4da4f9a083f8f909a78fb16f6509db4ea989733ac5"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/bfc71fea48aa11e9f220ae9e461bf4c93b0b0321/layrs-enclave-parent",
+      "versionId": "wGanwrjbU6MKWSyXbZrtTC6FbIVXrR1H",
+      "sizeBytes": 1362376,
+      "sha384": "2fc8185a132856d8bb71d955c4cdfba2dcea78144ff82fa1f9052749a2c3947e75bdbb3e6672ca2f72b1bf4a58e67283"
+    },
+    "measurements": {
+      "path": "build/layrsv2-clob-measurements.json",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/bfc71fea48aa11e9f220ae9e461bf4c93b0b0321/layrsv2-clob-measurements.json",
+      "versionId": "b6NlnCNf6UKgXFJ8EJBP9AylRYSM5khQ",
+      "sizeBytes": 402,
+      "sha384": "b7bc59ad364d8936f76785ff3c813f81e563374815b1867f5cf7ae787b7f2cff2052f714698375217862a53812f775f4"
+    },
+    "checksums": {
+      "path": "build/layrsv2-host-artifacts.sha384",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/bfc71fea48aa11e9f220ae9e461bf4c93b0b0321/layrsv2-host-artifacts.sha384",
+      "versionId": "JEBpKFG05LDyBqUCQPetIOBxANQXEnWt",
+      "sizeBytes": 246,
+      "sha384": "ddbb6bbcd1051ad14d9d63d81be99c55d0bd7b13a3cd2fed175cf85a8a3c60ab7d9be7c176c7cf016ff3c2b4d9567279"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "a36068da25ffd2d80cc8f10c4b0abc3d9ad6aa5be2ca5217b8f681e8cf4595f01349dd0f0471256108fdc5c1a702789f",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "166a3c1ece4fb976a19cc8e5e27260123e259838d91d21cac1910546a6c20944e171f48a6fb560bff11982abe46cced4"
+  },
+  "objectLock": {
+    "mode": "COMPLIANCE",
+    "retainUntilAtLeast": "2026-09-13T11:06:45.285000+00:00"
+  },
+  "activation": null,
+  "signature": null,
+  "signatureNote": "Candidate adds immutable Polymarket-style V2 fee profiles, deterministic curve fees, encrypted maker-rebate and retrospective reward accounting, and dual-chain cumulative claim authorization. Activation remains gated on exact PCR and signed-manifest rotation, snapshot replay parity, governed Base and Horizen claim rails, six-account funded USDC and ZEN canaries, exact principal reconciliation and a nonblocking 48-hour production soak."
+}
