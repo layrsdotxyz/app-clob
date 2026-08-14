@@ -99,6 +99,10 @@ mirror-github:
       GITHUB_MIRROR_TOKEN=$(aws secretsmanager get-secret-value --region us-east-1 --secret-id layrs/gitlab/github-mirror-token --query SecretString --output text)
       helper='!f() { printf "%s\n" username=x-access-token "password=$GITHUB_MIRROR_TOKEN"; }; f'
       remote="https://github.com/layrsHQ/${CI_PROJECT_NAME}.git"
-      git -c credential.helper= -c "credential.helper=$helper" push "$remote" "${CI_COMMIT_SHA}:refs/heads/${CI_DEFAULT_BRANCH}"
+      current_sha=$(git -c credential.helper= -c "credential.helper=$helper" ls-remote "$remote" "refs/heads/${CI_DEFAULT_BRANCH}" | awk '{print $1}')
+      test -n "$current_sha"
+      git -c credential.helper= -c "credential.helper=$helper" \
+        push --force-with-lease="refs/heads/${CI_DEFAULT_BRANCH}:${current_sha}" \
+        "$remote" "${CI_COMMIT_SHA}:refs/heads/${CI_DEFAULT_BRANCH}"
       test "$(git -c credential.helper= -c "credential.helper=$helper" ls-remote "$remote" "refs/heads/${CI_DEFAULT_BRANCH}" | awk '{print $1}')" = "$CI_COMMIT_SHA"
       unset GITHUB_MIRROR_TOKEN
