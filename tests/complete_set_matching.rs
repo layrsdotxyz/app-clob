@@ -168,6 +168,126 @@ fn complementary_buy_boundary_partial_and_fok_semantics_are_deterministic() {
 }
 
 #[test]
+fn complementary_rounding_dust_does_not_poison_a_price_level() {
+    let now = 1_000;
+    let mut book = PriceTimeBook::default();
+    let dust_maker_id = Uuid::from_u128(5);
+    let clean_maker_id = Uuid::from_u128(6);
+
+    book.submit(
+        BookOrder::with_id(
+            dust_maker_id,
+            "up-maker-one",
+            MARKET_ID,
+            Outcome::Up,
+            OrderAction::Buy,
+            350_000,
+            2_857_143,
+            TimeInForce::Gtc,
+            None,
+        ),
+        now,
+    )
+    .unwrap();
+    let first = book
+        .submit(
+            BookOrder::with_id(
+                Uuid::from_u128(7),
+                "down-taker-one",
+                MARKET_ID,
+                Outcome::Down,
+                OrderAction::Buy,
+                650_000,
+                2_857_142,
+                TimeInForce::Fak,
+                None,
+            ),
+            now + 1,
+        )
+        .unwrap();
+    assert_eq!(first.fills.len(), 1);
+    assert_eq!(first.fills[0].quantity_micros, 2_857_142);
+    assert_eq!(book.order(dust_maker_id).unwrap().remaining_micros, 1);
+
+    book.submit(
+        BookOrder::with_id(
+            clean_maker_id,
+            "up-maker-two",
+            MARKET_ID,
+            Outcome::Up,
+            OrderAction::Buy,
+            350_000,
+            2_500_000,
+            TimeInForce::Gtc,
+            None,
+        ),
+        now + 2,
+    )
+    .unwrap();
+    let second_order = BookOrder::with_id(
+        Uuid::from_u128(8),
+        "down-taker-two",
+        MARKET_ID,
+        Outcome::Down,
+        OrderAction::Buy,
+        650_000,
+        2_500_000,
+        TimeInForce::Fok,
+        None,
+    );
+    let before_second = book.clone();
+    let second = book.submit(second_order.clone(), now + 3).unwrap();
+
+    assert_eq!(second.fills.len(), 1);
+    assert_eq!(second.fills[0].maker_order_id, clean_maker_id);
+    assert_eq!(second.fills[0].quantity_micros, 2_500_000);
+    assert_eq!(book.order(dust_maker_id).unwrap().remaining_micros, 1);
+
+    let mut replay = before_second;
+    assert_eq!(second, replay.submit(second_order, now + 3).unwrap());
+}
+
+#[test]
+fn fok_ignores_complete_set_quantity_that_cannot_split_at_settlement_precision() {
+    let now = 1_000;
+    let mut book = PriceTimeBook::default();
+    book.submit(
+        BookOrder::with_id(
+            Uuid::from_u128(9),
+            "high-price-maker",
+            MARKET_ID,
+            Outcome::Up,
+            OrderAction::Buy,
+            650_000,
+            2,
+            TimeInForce::Gtc,
+            None,
+        ),
+        now,
+    )
+    .unwrap();
+
+    let result = book
+        .submit(
+            BookOrder::with_id(
+                Uuid::from_u128(11),
+                "complementary-taker",
+                MARKET_ID,
+                Outcome::Down,
+                OrderAction::Buy,
+                350_000,
+                2,
+                TimeInForce::Fok,
+                None,
+            ),
+            now + 1,
+        )
+        .unwrap();
+    assert!(result.fills.is_empty());
+    assert_eq!(result.accepted_order.unwrap().status, OrderStatus::Rejected);
+}
+
+#[test]
 fn complementary_self_trade_is_prevented_across_outcomes() {
     let mut book = PriceTimeBook::default();
     book.submit(

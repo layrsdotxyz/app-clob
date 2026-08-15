@@ -455,6 +455,11 @@ impl PriceTimeBook {
                 .get_mut(&candidate.order_id)
                 .expect("active candidate must exist");
             let quantity = incoming.remaining_micros.min(maker.remaining_micros);
+            if candidate.match_type != MatchType::Normal
+                && quantity < minimum_complete_set_quantity_micros(maker.price_micros)
+            {
+                continue;
+            }
             incoming.remaining_micros -= quantity;
             incoming.filled_micros = incoming
                 .filled_micros
@@ -644,10 +649,21 @@ impl PriceTimeBook {
     }
 
     fn executable_quantity(&self, incoming: &BookOrder, now_millis: i64) -> u128 {
-        self.matching_candidates(incoming, now_millis)
-            .iter()
-            .map(|candidate| self.orders[&candidate.order_id].remaining_micros)
-            .sum()
+        let mut remaining = incoming.remaining_micros;
+        for candidate in self.matching_candidates(incoming, now_millis) {
+            if remaining == 0 {
+                break;
+            }
+            let maker = &self.orders[&candidate.order_id];
+            let quantity = remaining.min(maker.remaining_micros);
+            if candidate.match_type != MatchType::Normal
+                && quantity < minimum_complete_set_quantity_micros(maker.price_micros)
+            {
+                continue;
+            }
+            remaining -= quantity;
+        }
+        incoming.remaining_micros - remaining
     }
 
     /// Returns one deterministic queue spanning direct and complete-set
@@ -667,6 +683,12 @@ impl PriceTimeBook {
                     return None;
                 }
                 let match_type = classify_match(incoming, resting)?;
+                if match_type != MatchType::Normal
+                    && incoming.remaining_micros.min(resting.remaining_micros)
+                        < minimum_complete_set_quantity_micros(resting.price_micros)
+                {
+                    return None;
+                }
                 Some(MatchCandidate {
                     order_id: resting.order_id,
                     match_type,
@@ -731,6 +753,17 @@ fn match_type_priority(match_type: MatchType) -> u8 {
         MatchType::Mint => 1,
         MatchType::Merge => 2,
     }
+}
+
+/// Small complete-set fills can be impossible to split between both sides
+/// after the protocol's six-decimal price/quantity calculation. For a maker
+/// price `p`, this is the smallest quantity `q` for which
+/// `ceil(p * q / PRICE_SCALE) < q`, leaving at least one settlement micro for
+/// the complementary taker leg. Orders below this bound may still execute as
+/// NORMAL transfers; they are skipped only as MINT/MERGE candidates.
+fn minimum_complete_set_quantity_micros(price_micros: u64) -> u128 {
+    let complement = PRICE_SCALE - u128::from(price_micros);
+    PRICE_SCALE.div_ceil(complement)
 }
 
 fn deterministic_fill_id(
