@@ -1,0 +1,49 @@
+stages:
+  - test
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS'
+      when: never
+    - if: '$CI_COMMIT_BRANCH'
+
+default:
+  tags: [layrs, full, x86]
+  interruptible: true
+  before_script:
+    - rustc --version
+    - cargo --version
+    - rustup component add rustfmt clippy
+    - |
+      used=$(df --output=pcent "$CI_PROJECT_DIR" | tail -1 | tr -dc '0-9')
+      test "$used" -lt 85
+  cache:
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - .cargo-home/registry/
+      - .cargo-home/git/
+      - target/
+
+clob-release-gate:
+  stage: test
+  variables:
+    CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
+    CARGO_TERM_COLOR: always
+  script:
+    - scripts/run-enclave-snapshot-ci-guard.sh
+    - cargo fmt --check
+    - cargo check --all-targets --locked
+    - cargo test --locked --all-targets -- --test-threads=1
+    - >-
+      cargo clippy --all-targets --locked -- -D warnings
+      -A dead-code
+      -A clippy::too-many-arguments
+      -A clippy::type-complexity
+      -A clippy::large-enum-variant
+      -A clippy::needless-range-loop
+      -A clippy::empty-line-after-doc-comments
+      -A clippy::wrong-self-convention
+      -A clippy::enum-variant-names
