@@ -1,5 +1,4 @@
-stages:
-  - test
+stages: [fast, full, deploy, mirror]
 
 workflow:
   rules:
@@ -9,34 +8,33 @@ workflow:
     - if: '$CI_COMMIT_BRANCH'
 
 default:
-  tags: [layrs, full, x86]
   interruptible: true
+  tags: [layrs, fast, x86]
   before_script:
+    - export PATH="/home/gitlab-runner/.cargo/bin:$PATH"
+    - export RUSTUP_HOME=/home/gitlab-runner/.rustup
+    - export CARGO_HOME="$CI_PROJECT_DIR/.cargo-cache"
     - rustc --version
     - cargo --version
-    - rustup component add rustfmt clippy
-    - |
-      used=$(df --output=pcent "$CI_PROJECT_DIR" | tail -1 | tr -dc '0-9')
-      test "$used" -lt 85
   cache:
-    key:
-      files:
-        - Cargo.lock
-    paths:
-      - .cargo-home/registry/
-      - .cargo-home/git/
-      - target/
+    key: { files: [Cargo.lock] }
+    paths: [.cargo-cache/registry/, .cargo-cache/git/]
 
-clob-release-gate:
-  stage: test
-  variables:
-    CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
-    CARGO_TERM_COLOR: always
+clob-fast:
+  stage: fast
+  timeout: 90m
   script:
     - scripts/run-enclave-snapshot-ci-guard.sh
     - cargo fmt --check
     - cargo check --all-targets --locked
-    - cargo test --locked --all-targets -- --test-threads=1
+    - cargo test --locked --lib
+    - cargo test --locked --manifest-path proofs/settlement/core/Cargo.toml
+    - RISC0_SKIP_BUILD=1 cargo test --locked --manifest-path proofs/settlement/host/Cargo.toml
+    - cargo test --locked --test settlement_equivalence
+    - npm audit --omit=dev --audit-level=high --prefix proofs/settlement/zkverify
+    - npm ci --ignore-scripts --prefix proofs/settlement/worker
+    - npm test --prefix proofs/settlement/worker
+    - npm audit --omit=dev --audit-level=high --prefix proofs/settlement/worker
     - >-
       cargo clippy --all-targets --locked -- -D warnings
       -A dead-code
@@ -47,3 +45,64 @@ clob-release-gate:
       -A clippy::empty-line-after-doc-comments
       -A clippy::wrong-self-convention
       -A clippy::enum-variant-names
+
+clob-full:
+  stage: full
+  timeout: 2h
+  needs: [clob-fast]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  script:
+    - cargo test --locked -- --test-threads=1
+    - cargo test --locked --manifest-path enclave/runtime/Cargo.toml
+    - cargo test --locked --manifest-path enclave/parent-runtime/Cargo.toml
+    - docker build --file Dockerfile.zk-proof-worker --tag "layrs-zk-proof-worker:${CI_COMMIT_SHA}" .
+    - docker run --rm --entrypoint /opt/risc0/bin/r0vm "layrs-zk-proof-worker:${CI_COMMIT_SHA}" --version
+    - command -v cargo-audit >/dev/null || cargo install cargo-audit --locked
+    - ./scripts/audit-enclave-dependencies.sh
+
+deploy-zk-proof-worker:
+  stage: deploy
+  tags: [layrs, deploy, x86]
+  interruptible: false
+  needs: [clob-full]
+  resource_group: production-zk-proof-worker
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+  variables:
+    LAYRSV2_AWS_ROLE_ARN: arn:aws:iam::255638996474:role/layrsv2-production-deployer
+    LAYRSV2_PRIMARY_REGION: us-east-1
+    LAYRSV2_ENVIRONMENT: production
+  script:
+    - deployment/deploy-zk-proof-worker.sh
+  artifacts:
+    when: always
+    expire_in: 90 days
+    paths:
+      - deployment/releases/zk-proof-worker-${CI_COMMIT_SHA}.json
+  environment:
+    name: production-zk-proof-worker
+
+mirror-github:
+  stage: mirror
+  tags: [layrs, deploy, x86]
+  interruptible: false
+  needs: [deploy-zk-proof-worker]
+  resource_group: github-mirror-app-clob
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+  before_script: []
+  script:
+    - |
+      export GITHUB_MIRROR_TOKEN
+      GITHUB_MIRROR_TOKEN=$(aws secretsmanager get-secret-value --region us-east-1 --secret-id layrs/gitlab/github-mirror-token --query SecretString --output text)
+      helper='!f() { printf "%s\n" username=x-access-token "password=$GITHUB_MIRROR_TOKEN"; }; f'
+      remote="https://github.com/layrsHQ/${CI_PROJECT_NAME}.git"
+      current_sha=$(git -c credential.helper= -c "credential.helper=$helper" ls-remote "$remote" "refs/heads/${CI_DEFAULT_BRANCH}" | awk '{print $1}')
+      test -n "$current_sha"
+      git -c credential.helper= -c "credential.helper=$helper" \
+        push --force-with-lease="refs/heads/${CI_DEFAULT_BRANCH}:${current_sha}" \
+        "$remote" "${CI_COMMIT_SHA}:refs/heads/${CI_DEFAULT_BRANCH}"
+      test "$(git -c credential.helper= -c "credential.helper=$helper" ls-remote "$remote" "refs/heads/${CI_DEFAULT_BRANCH}" | awk '{print $1}')" = "$CI_COMMIT_SHA"
+      unset GITHUB_MIRROR_TOKEN
