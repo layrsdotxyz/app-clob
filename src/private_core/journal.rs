@@ -6,9 +6,14 @@ use ed25519_dalek::{Signer, SigningKey};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::io::{Cursor, Read};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::{CoreError, CoreResult};
+
+const SNAPSHOT_ZSTD_MAGIC: &[u8] = b"layrs.snapshot.zstd.v1\0";
+const MAX_SNAPSHOT_PLAINTEXT_BYTES: u64 = 512 * 1024 * 1024;
+const SNAPSHOT_ZSTD_LEVEL: i32 = 1;
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct JournalKey([u8; 32]);
@@ -40,6 +45,7 @@ pub struct EncryptedJournalRecord {
     pub nonce: [u8; 12],
     pub prior_record_hash: [u8; 32],
     pub state_root: [u8; 32],
+    #[serde(with = "serde_bytes")]
     pub ciphertext: Vec<u8>,
     pub record_hash: [u8; 32],
 }
@@ -50,8 +56,32 @@ pub struct EncryptedSnapshot {
     pub journal_head: [u8; 32],
     pub state_root: [u8; 32],
     pub nonce: [u8; 12],
+    #[serde(with = "serde_bytes")]
     pub ciphertext: Vec<u8>,
     pub ciphertext_hash: [u8; 32],
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::EncryptedSnapshot;
+
+    #[test]
+    fn snapshot_ciphertext_is_compact_on_the_internal_cbor_wire() {
+        let ciphertext = vec![0xabu8; 7 * 1024 * 1024];
+        let snapshot = EncryptedSnapshot {
+            sequence: 99_960,
+            journal_head: [1; 32],
+            state_root: [2; 32],
+            nonce: [3; 12],
+            ciphertext,
+            ciphertext_hash: [4; 32],
+        };
+        let encoded = serde_cbor::to_vec(&snapshot).unwrap();
+        assert!(encoded.len() < 7 * 1024 * 1024 + 512);
+        let decoded: EncryptedSnapshot = serde_cbor::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, snapshot);
+        assert!(serde_json::to_value(&snapshot).unwrap()["ciphertext"].is_array());
+    }
 }
 
 pub struct EncryptedJournal {
@@ -186,17 +216,23 @@ impl EncryptedJournal {
         OsRng.fill_bytes(&mut nonce);
         let aad = snapshot_associated_data(self.sequence, &self.head, &state_root);
         let mut plaintext = serde_json::to_vec(value).map_err(|_| CoreError::JournalCrypto)?;
+        let mut compressed = zstd::stream::encode_all(Cursor::new(&plaintext), SNAPSHOT_ZSTD_LEVEL)
+            .map_err(|_| CoreError::JournalCrypto)?;
+        let mut sealed_plaintext = Vec::with_capacity(SNAPSHOT_ZSTD_MAGIC.len() + compressed.len());
+        sealed_plaintext.extend_from_slice(SNAPSHOT_ZSTD_MAGIC);
+        sealed_plaintext.append(&mut compressed);
+        plaintext.zeroize();
         let result = self
             .cipher
             .encrypt(
                 Nonce::from_slice(&nonce),
                 Payload {
-                    msg: &plaintext,
+                    msg: &sealed_plaintext,
                     aad: &aad,
                 },
             )
             .map_err(|_| CoreError::JournalCrypto);
-        plaintext.zeroize();
+        sealed_plaintext.zeroize();
         let ciphertext = result?;
         let ciphertext_hash = Sha256::digest(&ciphertext).into();
         Ok(EncryptedSnapshot {
@@ -232,9 +268,98 @@ impl EncryptedJournal {
                 },
             )
             .map_err(|_| CoreError::JournalCrypto)?;
-        let value = serde_json::from_slice(&plaintext).map_err(|_| CoreError::JournalCrypto);
+        let value = if let Some(compressed) = plaintext.strip_prefix(SNAPSHOT_ZSTD_MAGIC) {
+            let mut decoded = decode_snapshot_payload(compressed, MAX_SNAPSHOT_PLAINTEXT_BYTES)?;
+            let result = serde_json::from_slice(&decoded).map_err(|_| CoreError::JournalCrypto);
+            decoded.zeroize();
+            result
+        } else {
+            // Backward compatibility is required for the immutable pre-compression
+            // checkpoints already archived in production. Their authenticated
+            // plaintext begins directly with the legacy JSON document.
+            serde_json::from_slice(&plaintext).map_err(|_| CoreError::JournalCrypto)
+        };
         plaintext.zeroize();
         value
+    }
+}
+
+fn decode_snapshot_payload(compressed: &[u8], maximum: u64) -> CoreResult<Vec<u8>> {
+    let decoder = zstd::stream::read::Decoder::new(Cursor::new(compressed))
+        .map_err(|_| CoreError::JournalCrypto)?;
+    let mut decoded = Vec::new();
+    decoder
+        .take(maximum + 1)
+        .read_to_end(&mut decoded)
+        .map_err(|_| CoreError::JournalCrypto)?;
+    if decoded.len() as u64 > maximum {
+        decoded.zeroize();
+        return Err(CoreError::JournalCrypto);
+    }
+    Ok(decoded)
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+    struct RepetitiveSnapshot {
+        markets: Vec<String>,
+    }
+
+    #[test]
+    fn compressed_snapshot_round_trips_and_materially_reduces_ciphertext() {
+        let journal = EncryptedJournal::new(JournalKey::from_bytes([7; 32]));
+        let value = RepetitiveSnapshot {
+            markets: (0..20_000)
+                .map(|index| format!("layrs:v5:ZEN:15m:fixed-prefix-{:05}", index % 100))
+                .collect(),
+        };
+        let json_bytes = serde_json::to_vec(&value).unwrap();
+        let snapshot = journal.seal_snapshot([9; 32], &value).unwrap();
+        assert!(snapshot.ciphertext.len() < json_bytes.len() / 5);
+        let restored: RepetitiveSnapshot = journal.open_snapshot(&snapshot).unwrap();
+        assert_eq!(restored, value);
+    }
+
+    #[test]
+    fn legacy_uncompressed_snapshot_remains_restorable() {
+        let journal = EncryptedJournal::new(JournalKey::from_bytes([8; 32]));
+        let value = RepetitiveSnapshot {
+            markets: vec!["legacy".into()],
+        };
+        let plaintext = serde_json::to_vec(&value).unwrap();
+        let nonce = [3; 12];
+        let state_root = [4; 32];
+        let aad = snapshot_associated_data(0, &[0; 32], &state_root);
+        let ciphertext = journal
+            .cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &plaintext,
+                    aad: &aad,
+                },
+            )
+            .unwrap();
+        let snapshot = EncryptedSnapshot {
+            sequence: 0,
+            journal_head: [0; 32],
+            state_root,
+            nonce,
+            ciphertext_hash: Sha256::digest(&ciphertext).into(),
+            ciphertext,
+        };
+        let restored: RepetitiveSnapshot = journal.open_snapshot(&snapshot).unwrap();
+        assert_eq!(restored, value);
+    }
+
+    #[test]
+    fn decompression_limit_rejects_oversized_plaintext() {
+        let input = vec![0x41; 4096];
+        let compressed = zstd::stream::encode_all(Cursor::new(&input), 1).unwrap();
+        assert!(decode_snapshot_payload(&compressed, 1024).is_err());
     }
 }
 

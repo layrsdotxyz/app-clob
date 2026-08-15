@@ -58,11 +58,52 @@ pub(crate) struct RewardEntry {
     #[serde(with = "super::decimal_u128")]
     cumulative_accrued: u128,
     claim_account: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "is_zero_u128",
+        with = "super::decimal_u128"
+    )]
+    cumulative_maker_rebate: u128,
+    #[serde(
+        default,
+        skip_serializing_if = "is_zero_u128",
+        with = "super::decimal_u128"
+    )]
+    cumulative_taker_fees: u128,
+    #[serde(
+        default,
+        skip_serializing_if = "is_zero_u128",
+        with = "super::decimal_u128"
+    )]
+    cumulative_maker_volume_micros: u128,
+    #[serde(
+        default,
+        skip_serializing_if = "is_zero_u128",
+        with = "super::decimal_u128"
+    )]
+    cumulative_taker_volume_micros: u128,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PrivateRewardBook {
     entries: BTreeMap<String, RewardEntry>,
+    /// Daily, owner-private fee attribution makes later retrospective reward
+    /// programs possible without changing historical fills or exposing the
+    /// user-to-order relationship outside the enclave.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    daily_attributions: BTreeMap<String, DailyFeeAttribution>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct DailyFeeAttribution {
+    #[serde(with = "super::decimal_u128")]
+    maker_volume_micros: u128,
+    #[serde(with = "super::decimal_u128")]
+    taker_volume_micros: u128,
+    #[serde(with = "super::decimal_u128")]
+    taker_fees_atomic: u128,
+    #[serde(with = "super::decimal_u128")]
+    maker_rebate_atomic: u128,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +112,10 @@ pub struct PrivateRewardEntitlement {
     pub reward_token: String,
     pub cumulative_amount_atomic: String,
     pub claim_account: Option<String>,
+    pub cumulative_maker_rebate_atomic: String,
+    pub cumulative_taker_fees_atomic: String,
+    pub cumulative_maker_volume_micros: String,
+    pub cumulative_taker_volume_micros: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +140,97 @@ pub struct RewardClaimAuthorization {
 }
 
 impl PrivateRewardBook {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_fill(
+        &mut self,
+        taker_owner: &str,
+        maker_owner: Option<&str>,
+        chain: &str,
+        reward_token: &str,
+        quantity_micros: u128,
+        taker_fee_atomic: u128,
+        maker_rebate_atomic: u128,
+        occurred_at_millis: i64,
+    ) -> CoreResult<()> {
+        if quantity_micros == 0 || occurred_at_millis < 0 {
+            return Err(CoreError::InvalidOrder(
+                "invalid private fee attribution".into(),
+            ));
+        }
+        if maker_owner.is_none() && maker_rebate_atomic != 0 {
+            return Err(CoreError::InvalidOrder(
+                "maker rebate requires a maker".into(),
+            ));
+        }
+        if maker_rebate_atomic > taker_fee_atomic {
+            return Err(CoreError::InvalidOrder(
+                "maker rebate exceeds taker fee".into(),
+            ));
+        }
+        let day = occurred_at_millis / 86_400_000;
+        let taker_key = reward_key(taker_owner, chain, reward_token)?;
+        let taker_entry = self.entries.entry(taker_key.encoded()).or_default();
+        taker_entry.cumulative_taker_fees = checked_add(
+            taker_entry.cumulative_taker_fees,
+            taker_fee_atomic,
+            "taker fee attribution overflow",
+        )?;
+        taker_entry.cumulative_taker_volume_micros = checked_add(
+            taker_entry.cumulative_taker_volume_micros,
+            quantity_micros,
+            "taker volume attribution overflow",
+        )?;
+        let taker_daily = self
+            .daily_attributions
+            .entry(format!("{}:{day}", taker_key.encoded()))
+            .or_default();
+        taker_daily.taker_fees_atomic = checked_add(
+            taker_daily.taker_fees_atomic,
+            taker_fee_atomic,
+            "daily taker fee attribution overflow",
+        )?;
+        taker_daily.taker_volume_micros = checked_add(
+            taker_daily.taker_volume_micros,
+            quantity_micros,
+            "daily taker volume attribution overflow",
+        )?;
+
+        if let Some(maker_owner) = maker_owner {
+            let maker_key = reward_key(maker_owner, chain, reward_token)?;
+            let maker_entry = self.entries.entry(maker_key.encoded()).or_default();
+            maker_entry.cumulative_maker_rebate = checked_add(
+                maker_entry.cumulative_maker_rebate,
+                maker_rebate_atomic,
+                "maker rebate attribution overflow",
+            )?;
+            maker_entry.cumulative_accrued = checked_add(
+                maker_entry.cumulative_accrued,
+                maker_rebate_atomic,
+                "maker reward accrual overflow",
+            )?;
+            maker_entry.cumulative_maker_volume_micros = checked_add(
+                maker_entry.cumulative_maker_volume_micros,
+                quantity_micros,
+                "maker volume attribution overflow",
+            )?;
+            let maker_daily = self
+                .daily_attributions
+                .entry(format!("{}:{day}", maker_key.encoded()))
+                .or_default();
+            maker_daily.maker_rebate_atomic = checked_add(
+                maker_daily.maker_rebate_atomic,
+                maker_rebate_atomic,
+                "daily maker rebate attribution overflow",
+            )?;
+            maker_daily.maker_volume_micros = checked_add(
+                maker_daily.maker_volume_micros,
+                quantity_micros,
+                "daily maker volume attribution overflow",
+            )?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn accrue(
         &mut self,
         owner: &str,
@@ -119,7 +255,12 @@ impl PrivateRewardBook {
             .iter()
             .filter_map(|(key, entry)| {
                 let parsed = RewardKey::decode(key)?;
-                if parsed.owner != owner || entry.cumulative_accrued == 0 {
+                if parsed.owner != owner
+                    || (entry.cumulative_accrued == 0
+                        && entry.cumulative_taker_fees == 0
+                        && entry.cumulative_maker_volume_micros == 0
+                        && entry.cumulative_taker_volume_micros == 0)
+                {
                     return None;
                 }
                 Some((parsed, entry))
@@ -129,6 +270,10 @@ impl PrivateRewardBook {
                 reward_token: key.reward_token,
                 cumulative_amount_atomic: entry.cumulative_accrued.to_string(),
                 claim_account: entry.claim_account.clone(),
+                cumulative_maker_rebate_atomic: entry.cumulative_maker_rebate.to_string(),
+                cumulative_taker_fees_atomic: entry.cumulative_taker_fees.to_string(),
+                cumulative_maker_volume_micros: entry.cumulative_maker_volume_micros.to_string(),
+                cumulative_taker_volume_micros: entry.cumulative_taker_volume_micros.to_string(),
             })
             .collect()
     }
@@ -185,6 +330,15 @@ impl PrivateRewardBook {
             context_hash,
         })
     }
+}
+
+fn checked_add(left: u128, right: u128, message: &str) -> CoreResult<u128> {
+    left.checked_add(right)
+        .ok_or_else(|| CoreError::InvalidOrder(message.into()))
+}
+
+fn is_zero_u128(value: &u128) -> bool {
+    *value == 0
 }
 
 fn reward_key(owner: &str, chain: &str, reward_token: &str) -> CoreResult<RewardKey> {
@@ -307,5 +461,49 @@ mod tests {
         assert_eq!(book.entitlements(USER_ONE).len(), 1);
         assert_eq!(book.entitlements(USER_TWO).len(), 1);
         assert_eq!(book.entitlements(USER_MISSING).len(), 0);
+    }
+
+    #[test]
+    fn fill_economics_credit_only_the_maker_and_preserve_private_fee_history() {
+        let mut book = PrivateRewardBook::default();
+        book.record_fill(
+            USER_ONE,
+            Some(USER_TWO),
+            "base",
+            TOKEN,
+            2_000_000,
+            35_000,
+            7_000,
+            1_786_700_700_000,
+        )
+        .unwrap();
+        let taker = &book.entitlements(USER_ONE)[0];
+        assert_eq!(taker.cumulative_amount_atomic, "0");
+        assert_eq!(taker.cumulative_taker_fees_atomic, "35000");
+        assert_eq!(taker.cumulative_taker_volume_micros, "2000000");
+        let maker = &book.entitlements(USER_TWO)[0];
+        assert_eq!(maker.cumulative_amount_atomic, "7000");
+        assert_eq!(maker.cumulative_maker_rebate_atomic, "7000");
+        assert_eq!(maker.cumulative_maker_volume_micros, "2000000");
+        assert_eq!(book.daily_attributions.len(), 2);
+    }
+
+    #[test]
+    fn empty_daily_attribution_preserves_the_historical_serialized_shape() {
+        let book = PrivateRewardBook::default();
+        assert_eq!(serde_json::to_string(&book).unwrap(), r#"{"entries":{}}"#);
+    }
+
+    #[test]
+    fn fill_economics_reject_invalid_or_unfunded_rebates() {
+        let mut book = PrivateRewardBook::default();
+        assert!(matches!(
+            book.record_fill(USER_ONE, None, "base", TOKEN, 1, 10, 1, 1),
+            Err(CoreError::InvalidOrder(_))
+        ));
+        assert!(matches!(
+            book.record_fill(USER_ONE, Some(USER_TWO), "base", TOKEN, 1, 10, 11, 1),
+            Err(CoreError::InvalidOrder(_))
+        ));
     }
 }

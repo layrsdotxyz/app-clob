@@ -1,4 +1,9 @@
-use std::{io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    io,
+    net::{Shutdown, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     extract::{DefaultBodyLimit, Query, State},
@@ -16,31 +21,36 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::Semaphore,
+    sync::{OwnedSemaphorePermit, Semaphore},
     time::timeout,
 };
 use tokio_vsock::{VsockAddr, VsockListener, VsockStream, VMADDR_CID_ANY};
 use tower_http::{
-    request_id::MakeRequestUuid, request_id::PropagateRequestIdLayer,
-    request_id::SetRequestIdLayer, timeout::TimeoutLayer,
+    compression::CompressionLayer, request_id::MakeRequestUuid,
+    request_id::PropagateRequestIdLayer, request_id::SetRequestIdLayer, timeout::TimeoutLayer,
 };
 
 // Provisioning restores the latest encrypted private-core snapshot through the same
 // ciphertext-only relay used by ordinary private commands. Keep the decoded frame
 // bounded independently from the HTTP JSON envelope: base64 expands a maximum-sized
-// ciphertext by 4/3 before Axum decodes it. Conflating the two limits caused a valid
-// ~51 MiB checkpoint to be rejected at the HTTP boundary even though it fit inside
-// the 64 MiB parent-to-enclave CBOR frame.
-const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
-const MAX_HTTP_BODY_BYTES: usize = 96 * 1024 * 1024;
+// ciphertext by 4/3 before Axum decodes it. Production checkpoint JSON currently
+// reaches about 91 MiB before outer envelope expansion, so keep a finite internal
+// bound with matching HTTP headroom rather than failing recovery as state grows.
+const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
+const MAX_HTTP_BODY_BYTES: usize = 384 * 1024 * 1024;
 const VSOCK_PORT: u32 = 5_003;
 const EGRESS_VSOCK_PORT: u32 = 5_004;
 const EGRESS_PREFACE: &[u8] = b"LAYRS_EGRESS_V1\n";
+const ENCLAVE_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const ENCLAVE_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(90);
+const DEFAULT_PARENT_QUEUE_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Clone)]
 struct AppState {
     enclave_cid: u32,
     permits: Arc<Semaphore>,
+    waiting_permits: Arc<Semaphore>,
+    queue_wait: Duration,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -124,7 +134,19 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("LAYRS_ENCLAVE_CID must be a non-reserved CID".into());
     }
     let port = optional_u16("PORT", 8_443)?;
-    let concurrency = optional_usize("LAYRS_PARENT_MAX_CONCURRENCY", 256)?;
+    // Enclave state transitions are serialized behind a single mutex. A large
+    // parent-side queue cannot increase throughput; it only turns one slow
+    // checkpoint into hundreds of doomed requests and can exhaust enclave memory.
+    let concurrency = optional_usize("LAYRS_PARENT_MAX_CONCURRENCY", 8)?;
+    // Smooth short portfolio/readback bursts without turning the HTTP parent
+    // into an unbounded in-memory queue while the enclave serializes state.
+    let maximum_waiters = optional_usize("LAYRS_PARENT_MAX_WAITERS", 32)?;
+    let queue_wait = Duration::from_millis(optional_u64(
+        "LAYRS_PARENT_QUEUE_WAIT_MILLIS",
+        DEFAULT_PARENT_QUEUE_WAIT.as_millis() as u64,
+        100,
+        10_000,
+    )?);
     let egress_listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, EGRESS_VSOCK_PORT))?;
     let egress_permits = Arc::new(Semaphore::new(concurrency.min(64)));
     tokio::spawn(run_egress_proxy(
@@ -135,16 +157,25 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         enclave_cid: cid,
         permits: Arc::new(Semaphore::new(concurrency)),
+        waiting_permits: Arc::new(Semaphore::new(maximum_waiters)),
+        queue_wait,
     };
     let app = Router::new()
-        .route(
-            "/healthz",
-            get(|| async { Json(serde_json::json!({ "status": "ok" })) }),
-        )
+        .route("/healthz", get(healthz))
         .route("/v1/attestation", get(attestation))
         .route("/v1/private/relay", post(relay))
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
-        .layer(TimeoutLayer::new(Duration::from_secs(12)))
+        // Snapshot artifacts are ciphertext and are serialized as JSON byte
+        // arrays on the parent boundary. Compression prevents a valid private
+        // command from filling the parent-to-API socket or exceeding the API's
+        // ten-second relay deadline as the encrypted journal grows. Undici and
+        // browsers negotiate and decode gzip transparently; the wire schema is
+        // deliberately unchanged and the enclave/EIF is not involved.
+        .layer(CompressionLayer::new())
+        // Restore requests carry the durable encrypted checkpoint and may require
+        // materially longer than an ordinary command. Public callers retain their
+        // own shorter deadline; this internal relay stays bounded at two minutes.
+        .layer(TimeoutLayer::new(Duration::from_secs(120)))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::new(
             header::HeaderName::from_static("x-request-id"),
@@ -303,11 +334,8 @@ async fn relay(State(state): State<AppState>, Json(envelope): Json<PrivateEnvelo
 }
 
 async fn exchange(state: &AppState, request: WireRequest) -> Result<WireResponse, ApiError> {
-    let _permit = state
-        .permits
-        .try_acquire()
-        .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "PARENT_SATURATED"))?;
-    timeout(Duration::from_secs(10), async {
+    let _permit = acquire_exchange_permit(state).await?;
+    timeout(ENCLAVE_EXCHANGE_TIMEOUT, async {
         let mut stream = VsockStream::connect(VsockAddr::new(state.enclave_cid, VSOCK_PORT))
             .await
             .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "ENCLAVE_UNAVAILABLE"))?;
@@ -329,6 +357,34 @@ async fn exchange(state: &AppState, request: WireRequest) -> Result<WireResponse
     })
     .await
     .map_err(|_| ApiError::new(StatusCode::GATEWAY_TIMEOUT, "ENCLAVE_TIMEOUT"))?
+}
+
+async fn acquire_exchange_permit(state: &AppState) -> Result<OwnedSemaphorePermit, ApiError> {
+    if let Ok(permit) = Arc::clone(&state.permits).try_acquire_owned() {
+        return Ok(permit);
+    }
+    let _waiting = Arc::clone(&state.waiting_permits)
+        .try_acquire_owned()
+        .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "PARENT_SATURATED"))?;
+    timeout(state.queue_wait, Arc::clone(&state.permits).acquire_owned())
+        .await
+        .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "PARENT_SATURATED"))?
+        .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "PARENT_UNAVAILABLE"))
+}
+
+async fn healthz(State(state): State<AppState>) -> Response {
+    match timeout(
+        ENCLAVE_CONNECT_TIMEOUT,
+        VsockStream::connect(VsockAddr::new(state.enclave_cid, VSOCK_PORT)),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => {
+            let _ = stream.shutdown(Shutdown::Both);
+            Json(serde_json::json!({ "status": "ok", "enclave": "reachable" })).into_response()
+        }
+        _ => gateway_error(StatusCode::SERVICE_UNAVAILABLE, "ENCLAVE_UNAVAILABLE").into_response(),
+    }
 }
 
 async fn read_frame(stream: &mut VsockStream) -> io::Result<Vec<u8>> {
@@ -361,11 +417,24 @@ fn decode_fixed<const N: usize>(value: &str, code: &'static str) -> Result<[u8; 
 
 #[cfg(test)]
 mod tests {
-    use super::{WireRequest, MAX_FRAME_BYTES, MAX_HTTP_BODY_BYTES};
+    use std::{sync::Arc, time::Duration};
+
+    use tokio::sync::Semaphore;
+
+    use super::{
+        acquire_exchange_permit, AppState, WireRequest, ENCLAVE_EXCHANGE_TIMEOUT, MAX_FRAME_BYTES,
+        MAX_HTTP_BODY_BYTES,
+    };
 
     #[test]
     fn relay_frame_limit_supports_checkpoint_restore_payloads() {
-        const { assert!(MAX_FRAME_BYTES >= 64 * 1024 * 1024) };
+        const { assert!(MAX_FRAME_BYTES >= 256 * 1024 * 1024) };
+    }
+
+    #[test]
+    fn exchange_timeout_remains_bounded_below_http_deadline() {
+        assert!(ENCLAVE_EXCHANGE_TIMEOUT.as_secs() > 10);
+        assert!(ENCLAVE_EXCHANGE_TIMEOUT.as_secs() < 120);
     }
 
     #[test]
@@ -395,6 +464,40 @@ mod tests {
             _ => panic!("unexpected wire request variant"),
         }
     }
+
+    #[tokio::test]
+    async fn short_parent_bursts_wait_for_an_exchange_permit() {
+        let state = AppState {
+            enclave_cid: 16,
+            permits: Arc::new(Semaphore::new(1)),
+            waiting_permits: Arc::new(Semaphore::new(1)),
+            queue_wait: Duration::from_millis(100),
+        };
+        let occupied = Arc::clone(&state.permits).acquire_owned().await.unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            drop(occupied);
+        });
+        assert!(acquire_exchange_permit(&state).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn parent_wait_queue_remains_bounded() {
+        let state = AppState {
+            enclave_cid: 16,
+            permits: Arc::new(Semaphore::new(1)),
+            waiting_permits: Arc::new(Semaphore::new(1)),
+            queue_wait: Duration::from_millis(10),
+        };
+        let _occupied = Arc::clone(&state.permits).acquire_owned().await.unwrap();
+        let _waiting = Arc::clone(&state.waiting_permits)
+            .acquire_owned()
+            .await
+            .unwrap();
+        let error = acquire_exchange_permit(&state).await.unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.code, "PARENT_SATURATED");
+    }
 }
 
 fn decode_bounded(
@@ -423,6 +526,18 @@ fn optional_u16(name: &str, default: u16) -> Result<u16, Box<dyn std::error::Err
 fn optional_usize(name: &str, default: usize) -> Result<usize, Box<dyn std::error::Error>> {
     let value = std::env::var(name).map_or(Ok(default), |value| value.parse())?;
     if value == 0 || value > 4_096 {
+        return Err(format!("invalid {name}").into());
+    }
+    Ok(value)
+}
+fn optional_u64(
+    name: &str,
+    default: u64,
+    minimum: u64,
+    maximum: u64,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let value = std::env::var(name).map_or(Ok(default), |value| value.parse())?;
+    if value < minimum || value > maximum {
         return Err(format!("invalid {name}").into());
     }
     Ok(value)

@@ -1,12 +1,12 @@
 use clob_service::private_core::{
     command_request_hash, polymarket_resolution_signing_payload, resolution_signing_payload,
     signing_payload, AccountBucket, AccountKey, BookOrder, BoundaryEvidence, CommandResult,
-    CompleteSetDirection, CoreError, EncryptedJournal, ExternalFlowDirection, JournalKey, Ledger,
-    LedgerTransaction, MarketConfig, MarketExecution, OrderAction, OrderStatus, Outcome,
-    PolymarketResolutionStatement, PriceTimeBook, PrivateTradingCore, ReceiptSigner,
+    CompleteSetDirection, CoreError, EncryptedJournal, ExternalFlowDirection, FeeProfileId,
+    JournalKey, Ledger, LedgerTransaction, MarketConfig, MarketExecution, OrderAction, OrderStatus,
+    Outcome, PolymarketResolutionStatement, PriceTimeBook, PrivateTradingCore, ReceiptSigner,
     ResolutionOutcome, ResolutionStatement, SessionGuard, SessionRequest,
-    SignedPolymarketResolution, SignedResolution, SignedSessionRequest, TimeInForce, Transfer,
-    UserCommand, UserCommandAction,
+    SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence, SignedSessionRequest,
+    TimeInForce, Transfer, UserCommand, UserCommandAction,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
@@ -291,8 +291,10 @@ fn legacy_market_config_keeps_public_settlement_chain_out_of_snapshot_wire_shape
     });
     let market: MarketConfig = serde_json::from_value(raw).unwrap();
     assert_eq!(market.public_settlement_chain, None);
+    assert_eq!(market.fee_profile_id, FeeProfileId::LegacyProfitV1);
     let encoded = serde_json::to_value(&market).unwrap();
     assert!(encoded.get("public_settlement_chain").is_none());
+    assert!(encoded.get("fee_profile_id").is_none());
 }
 
 #[test]
@@ -319,6 +321,7 @@ fn private_core_accepts_v2_rolling_market_ids() {
             maximum_pending_bootstrap_notional_micros: 100_000_000,
             tick_size_micros: 1_000,
             oracle_feed_id: 245,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
             execution: MarketExecution::NativeClob,
         },
         800,
@@ -350,6 +353,7 @@ fn private_core_accepts_v3_rolling_market_ids() {
             maximum_pending_bootstrap_notional_micros: 100_000_000,
             tick_size_micros: 1_000,
             oracle_feed_id: 245,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
             execution: MarketExecution::NativeClob,
         },
         800,
@@ -381,6 +385,7 @@ fn private_core_accepts_signed_v4_event_market_ids_with_exact_polymarket_mapping
             maximum_pending_bootstrap_notional_micros: 100_000_000,
             tick_size_micros: 1_000,
             oracle_feed_id: 1,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
             execution: MarketExecution::PolymarketBootstrap {
                 condition_id: format!("0x{}", "ab".repeat(32)),
                 up_token_id: "1".into(),
@@ -419,6 +424,7 @@ fn private_core_accepts_v5_native_event_markets_without_venue_execution() {
             maximum_pending_bootstrap_notional_micros: 100_000_000,
             tick_size_micros: 1_000,
             oracle_feed_id: 1,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
             execution: MarketExecution::NativeExactCondition {
                 condition_id: format!("0x{}", "ab".repeat(32)),
                 up_outcome_index: 0,
@@ -454,6 +460,7 @@ fn private_core_accepts_v5_native_macro_markets_without_venue_execution() {
             maximum_pending_bootstrap_notional_micros: 100_000_000,
             tick_size_micros: 1_000,
             oracle_feed_id: 1,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
             execution: MarketExecution::NativeExactCondition {
                 condition_id: format!("0x{}", "ab".repeat(32)),
                 up_outcome_index: 0,
@@ -495,6 +502,7 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
             maximum_pending_bootstrap_notional_micros: 100_000_000,
             tick_size_micros: 1_000,
             oracle_feed_id: 245,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
             execution: clob_service::private_core::MarketExecution::NativeClob,
         },
         800,
@@ -766,6 +774,7 @@ fn native_clob_partial_fill_locks_remainder_and_cancel_releases_once() {
             maximum_pending_bootstrap_notional_micros: 100_000_000,
             tick_size_micros: 1_000,
             oracle_feed_id: 245,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
             execution: MarketExecution::NativeClob,
         },
         800,
@@ -999,6 +1008,7 @@ fn rolling_zen_markets_handle_many_small_multi_user_trades_cancellation_and_lock
                 maximum_pending_bootstrap_notional_micros: 100_000_000,
                 tick_size_micros: 1_000,
                 oracle_feed_id: 245,
+                fee_profile_id: FeeProfileId::LegacyProfitV1,
                 execution: MarketExecution::NativeClob,
             },
             800,
@@ -1272,6 +1282,99 @@ fn rolling_zen_markets_handle_many_small_multi_user_trades_cancellation_and_lock
 }
 
 #[test]
+fn public_depth_hides_thin_levels_buckets_size_and_clears_at_market_close() {
+    let journal_key = [211u8; 32];
+    let mut core = PrivateTradingCore::new(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([212u8; 48]),
+    );
+    let market_id = "layrs:v5:BTC:USDC:15m:3";
+    core.register_market(
+        "sys:market:privacy-depth".into(),
+        MarketConfig {
+            market_id: market_id.into(),
+            settlement_asset: "USDC".into(),
+            settlement_decimals: 6,
+            public_settlement_chain: Some("base".into()),
+            opens_at_millis: 1_000,
+            closes_at_millis: 3_000,
+            minimum_quantity_micros: 1,
+            maximum_quantity_micros: 100_000_000,
+            minimum_order_notional_micros: 1,
+            maximum_order_notional_micros: 100_000_000,
+            maximum_user_position_micros: 100_000_000,
+            maximum_pending_bootstrap_notional_micros: 100_000_000,
+            tick_size_micros: 10_000,
+            oracle_feed_id: 9002,
+            fee_profile_id: FeeProfileId::PolymarketCryptoV2,
+            execution: MarketExecution::NativeClob,
+        },
+        900,
+    )
+    .unwrap();
+
+    let users = [
+        (SigningKey::from_bytes(&[213u8; 32]), [214u8; 32]),
+        (SigningKey::from_bytes(&[215u8; 32]), [216u8; 32]),
+        (SigningKey::from_bytes(&[217u8; 32]), [218u8; 32]),
+    ];
+    for (index, (key, commitment)) in users.iter().enumerate() {
+        let session_id = format!("session:privacy-depth:{index}");
+        core.register_session(
+            format!("sys:session:privacy-depth:{index}"),
+            session_id.clone(),
+            *commitment,
+            key.verifying_key().to_bytes(),
+            10_000,
+            925 + index as i64,
+        )
+        .unwrap();
+        core.apply_user_external_flow(
+            format!("sys:deposit:privacy-depth:{index}"),
+            *commitment,
+            "USDC".into(),
+            AccountBucket::UserAvailable,
+            10_000_000,
+            ExternalFlowDirection::Inflow,
+            *commitment,
+            950 + index as i64,
+        )
+        .unwrap();
+        execute_signed(
+            &mut core,
+            key,
+            &session_id,
+            1,
+            &format!("cmd:privacy-depth:{index}"),
+            UserCommandAction::SubmitOrder {
+                order: BookOrder::new(
+                    "ignored",
+                    market_id,
+                    Outcome::Up,
+                    OrderAction::Buy,
+                    150_000,
+                    6_666_667,
+                    TimeInForce::Gtc,
+                    None,
+                ),
+            },
+            1_100 + index as i64,
+        );
+
+        let (bids, _) = core.aggregate_depth(market_id, Outcome::Up, 1_500, 1_000_000);
+        if index < 2 {
+            assert!(bids.is_empty(), "one or two owners must remain private");
+        } else {
+            assert_eq!(bids, vec![(150_000, 20_000_000)]);
+        }
+    }
+
+    let (closed_bids, closed_asks) = core.aggregate_depth(market_id, Outcome::Up, 3_000, 1_000_000);
+    assert!(closed_bids.is_empty());
+    assert!(closed_asks.is_empty());
+}
+
+#[test]
 fn resolution_cannot_double_credit_and_dust_fees_stay_conservative() {
     let oracle = SigningKey::from_bytes(&[71u8; 32]);
     let user = SigningKey::from_bytes(&[72u8; 32]);
@@ -1302,6 +1405,7 @@ fn resolution_cannot_double_credit_and_dust_fees_stay_conservative() {
             maximum_pending_bootstrap_notional_micros: 100_000_000,
             tick_size_micros: 100,
             oracle_feed_id: 1,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
             execution: MarketExecution::NativeClob,
         },
         800,
@@ -1398,6 +1502,36 @@ fn resolution_cannot_double_credit_and_dust_fees_stay_conservative() {
         0
     );
     let root_after_first_resolution = core.state_root();
+    core.validate_onchain_resolution_authorization(
+        market_id,
+        ResolutionOutcome::Up,
+        &SignedResolutionEvidence::Pyth(signed.clone()),
+        4_200,
+    )
+    .unwrap();
+
+    let mut conflicting_statement = signed.statement.clone();
+    conflicting_statement.closing.median_price_e8 = 102;
+    let conflicting_signature = oracle
+        .sign(&resolution_signing_payload(&conflicting_statement).unwrap())
+        .to_bytes()
+        .to_vec();
+    let conflicting = SignedResolution {
+        statement: conflicting_statement,
+        signature: conflicting_signature,
+    };
+    let conflict = core.validate_onchain_resolution_authorization(
+        market_id,
+        ResolutionOutcome::Up,
+        &SignedResolutionEvidence::Pyth(conflicting),
+        4_200,
+    );
+    assert!(matches!(
+        conflict.unwrap_err(),
+        CoreError::InvalidResolution(message)
+            if message == "resolution evidence conflicts with committed resolution"
+    ));
+
     let second_resolution = core.resolve_market("sys:resolve:dust-again".into(), signed, 4_200);
     assert!(matches!(
         second_resolution.unwrap_err(),
@@ -1408,6 +1542,142 @@ fn resolution_cannot_double_credit_and_dust_fees_stay_conservative() {
         core.balance(&AccountKey::new("layrs", AccountBucket::FeeRevenue, "USDC")),
         1
     );
+}
+
+#[test]
+fn category_fee_profiles_settle_usdc_and_zen_through_the_full_ledger_path() {
+    let cases = [
+        (
+            "USDC",
+            6u8,
+            FeeProfileId::MacroV1,
+            1_500_000u128,
+            198_500_000u128,
+        ),
+        (
+            "ZEN",
+            18u8,
+            FeeProfileId::CryptoV1,
+            2_000_000_000_000_000_000u128,
+            198_000_000_000_000_000_000u128,
+        ),
+    ];
+    for (index, (asset, decimals, profile, expected_fee, expected_available)) in
+        cases.into_iter().enumerate()
+    {
+        let marker = 180u8 + index as u8 * 10;
+        let oracle = SigningKey::from_bytes(&[marker; 32]);
+        let user = SigningKey::from_bytes(&[marker + 1; 32]);
+        let journal_key = [marker + 2; 32];
+        let commitment = [marker + 3; 32];
+        let owner = derived_private_user(journal_key, commitment);
+        let mut core = PrivateTradingCore::new_with_oracle(
+            JournalKey::from_bytes(journal_key),
+            ReceiptSigner::generate([marker + 4; 48]),
+            oracle.verifying_key().to_bytes(),
+        )
+        .unwrap();
+        let market_id = format!("layrs:v3:{asset}:15m:category-fee-{index}");
+        core.register_market(
+            format!("sys:market:category-fee:{index}"),
+            MarketConfig {
+                market_id: market_id.clone(),
+                settlement_asset: asset.into(),
+                settlement_decimals: decimals,
+                public_settlement_chain: Some("horizen".into()),
+                opens_at_millis: 900,
+                closes_at_millis: 4_000,
+                minimum_quantity_micros: 1,
+                maximum_quantity_micros: 1_000_000_000,
+                minimum_order_notional_micros: 1,
+                maximum_order_notional_micros: 1_000_000_000,
+                maximum_user_position_micros: 1_000_000_000,
+                maximum_pending_bootstrap_notional_micros: 1_000_000_000,
+                tick_size_micros: 1_000,
+                oracle_feed_id: 245,
+                fee_profile_id: profile,
+                execution: MarketExecution::NativeClob,
+            },
+            800,
+        )
+        .unwrap();
+        core.register_session(
+            format!("sys:session:category-fee:{index}"),
+            format!("session:category-fee:{index}"),
+            commitment,
+            user.verifying_key().to_bytes(),
+            5_000,
+            850,
+        )
+        .unwrap();
+        let scale = 10u128.pow(decimals as u32 - 6);
+        core.apply_user_external_flow(
+            format!("sys:deposit:category-fee:{index}"),
+            commitment,
+            asset.into(),
+            AccountBucket::UserAvailable,
+            200_000_000u128 * scale,
+            ExternalFlowDirection::Inflow,
+            [marker + 5; 32],
+            875,
+        )
+        .unwrap();
+        execute_signed(
+            &mut core,
+            &user,
+            &format!("session:category-fee:{index}"),
+            1,
+            &format!("cmd:category-fee:mint:{index}"),
+            UserCommandAction::CompleteSet {
+                market_id: market_id.clone(),
+                quantity_micros: 100_000_000,
+                direction: CompleteSetDirection::Mint,
+            },
+            1_000,
+        );
+
+        let boundary = |end: i64, price: i64, evidence_marker: u8| BoundaryEvidence {
+            window_start_micros: end * 1_000 - 5_000_000,
+            window_end_micros: end * 1_000,
+            median_price_e8: price,
+            sample_count: 25,
+            minimum_publisher_count: 3,
+            signed_payload_commitment: [evidence_marker; 32],
+        };
+        let statement = ResolutionStatement {
+            market_id: market_id.clone(),
+            oracle_feed_id: 245,
+            opening: boundary(900, 100, marker + 6),
+            closing: boundary(4_000, 101, marker + 7),
+            issued_at_millis: 4_100,
+        };
+        let signature = oracle
+            .sign(&resolution_signing_payload(&statement).unwrap())
+            .to_bytes()
+            .to_vec();
+        core.resolve_market(
+            format!("sys:resolve:category-fee:{index}"),
+            SignedResolution {
+                statement,
+                signature,
+            },
+            4_100,
+        )
+        .unwrap();
+
+        assert_eq!(
+            core.balance(&AccountKey::new(
+                &owner,
+                AccountBucket::UserAvailable,
+                asset
+            )),
+            expected_available,
+        );
+        assert_eq!(
+            core.balance(&AccountKey::new("layrs", AccountBucket::FeeRevenue, asset)),
+            expected_fee,
+        );
+    }
 }
 
 #[test]
@@ -1441,6 +1711,7 @@ fn polymarket_bootstrap_never_credits_an_unconfirmed_fill() {
             maximum_pending_bootstrap_notional_micros: 100_000_000,
             tick_size_micros: 1_000,
             oracle_feed_id: 1,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
             execution: MarketExecution::PolymarketBootstrap {
                 condition_id: format!("0x{}", "11".repeat(32)),
                 up_token_id: "123456789".into(),
@@ -1674,6 +1945,9 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
     )
     .unwrap();
 
+    let root_before_portfolio = core.state_root();
+    let snapshot_before_portfolio = core.export_encrypted_snapshot().unwrap();
+
     let portfolio = execute_signed_response(
         &mut core,
         &user,
@@ -1685,6 +1959,14 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
     );
     assert_eq!(portfolio.receipt.protocol_version, "layrs.v2");
     assert_eq!(portfolio.receipt.publication_eligible, Some(false));
+    assert!(portfolio.encrypted_record.is_none());
+    assert_eq!(portfolio.receipt.prior_state_root, root_before_portfolio);
+    assert_eq!(portfolio.receipt.state_root, root_before_portfolio);
+    assert_eq!(core.state_root(), root_before_portfolio);
+    assert_eq!(
+        core.export_encrypted_snapshot().unwrap().sequence,
+        snapshot_before_portfolio.sequence
+    );
     assert_eq!(
         portfolio.receipt.command_commitment_sha256,
         Some(
@@ -1738,6 +2020,7 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
     );
     assert_eq!(response.receipt.protocol_version, "layrs.v2");
     assert_eq!(response.receipt.publication_eligible, Some(true));
+    assert!(response.encrypted_record.is_some());
     let authorization = response.withdrawal_authorization.unwrap();
     assert_eq!(authorization.intent.receipt_id, response.receipt.receipt_id);
     assert_eq!(
@@ -1879,6 +2162,277 @@ fn registration_receipt_is_publication_eligible_private_and_identity_unique() {
             &Signature::from_slice(&signature).unwrap(),
         )
         .unwrap();
+}
+
+#[test]
+fn private_user_transfer_is_registered_atomic_available_only_and_replay_safe() {
+    let sender_key = SigningKey::from_bytes(&[81u8; 32]);
+    let recipient_key = SigningKey::from_bytes(&[82u8; 32]);
+    let journal_key = [83u8; 32];
+    let sender_identity = [84u8; 32];
+    let recipient_identity = [85u8; 32];
+    let sender_private_user = derived_private_user(journal_key, sender_identity);
+    let recipient_private_user = derived_private_user(journal_key, recipient_identity);
+    let mut core = PrivateTradingCore::new(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([86u8; 48]),
+    );
+
+    core.register_session(
+        "sys:session:transfer:sender".into(),
+        "session:transfer:sender".into(),
+        sender_identity,
+        sender_key.verifying_key().to_bytes(),
+        20_000,
+        1_000,
+    )
+    .unwrap();
+    core.register_session(
+        "sys:session:transfer:recipient".into(),
+        "session:transfer:recipient".into(),
+        recipient_identity,
+        recipient_key.verifying_key().to_bytes(),
+        20_000,
+        1_010,
+    )
+    .unwrap();
+    assert!(!core.transfer_account_status(sender_identity).registered);
+    let sender_account = core
+        .register_transfer_account("sys:transfer-account:sender".into(), sender_identity, 1_020)
+        .unwrap()
+        .transfer_account
+        .unwrap();
+    let recipient_account = core
+        .register_transfer_account(
+            "sys:transfer-account:recipient".into(),
+            recipient_identity,
+            1_030,
+        )
+        .unwrap()
+        .transfer_account
+        .unwrap();
+    assert_eq!(
+        core.transfer_account_status(sender_identity)
+            .transfer_account,
+        sender_account
+    );
+    assert!(core.transfer_account_status(sender_identity).registered);
+    assert!(core.transfer_account_status(recipient_identity).registered);
+    assert!(sender_account.starts_with("layrs_"));
+    assert_ne!(sender_account, recipient_account);
+
+    core.apply_user_external_flow(
+        "sys:deposit:transfer:sender".into(),
+        sender_identity,
+        "USDC".into(),
+        AccountBucket::UserAvailable,
+        10_000_000,
+        ExternalFlowDirection::Inflow,
+        [87u8; 32],
+        1_040,
+    )
+    .unwrap();
+    // Reserve part of the balance. A private transfer must never consume it.
+    execute_signed_response(
+        &mut core,
+        &sender_key,
+        "session:transfer:sender",
+        1,
+        "cmd:transfer:reserve",
+        UserCommandAction::RequestWithdrawal {
+            withdrawal_id: uuid::Uuid::from_u128(88),
+            chain: "base".into(),
+            asset: "USDC".into(),
+            amount_atomic: 2_000_000,
+            destination: "0x1111111111111111111111111111111111111111".into(),
+        },
+        1_050,
+    );
+
+    let transfer_id = uuid::Uuid::from_u128(89);
+    let action = UserCommandAction::TransferFunds {
+        transfer_id,
+        recipient_account: recipient_account.clone(),
+        asset: "USDC".into(),
+        amount_atomic: 6_000_000,
+    };
+    let command_id = "cmd:transfer:success";
+    let idempotency_key = format!("idem:{command_id}");
+    let request_hash = command_request_hash(command_id, &idempotency_key, &action).unwrap();
+    let request = SessionRequest {
+        session_id: "session:transfer:sender".into(),
+        sequence: 2,
+        issued_at_millis: 1_060,
+        expires_at_millis: 2_900,
+        request_hash,
+    };
+    let command = UserCommand {
+        command_id: command_id.into(),
+        idempotency_key,
+        session: SignedSessionRequest {
+            signature: sender_key
+                .sign(&signing_payload(&request))
+                .to_bytes()
+                .to_vec(),
+            request,
+        },
+        action,
+    };
+    let first = core.execute(command.clone(), 1_060).unwrap();
+    let replay = core.execute(command, 1_061).unwrap();
+    assert_eq!(first, replay);
+    assert!(first.receipt.publication_eligible == Some(true));
+    assert!(matches!(
+        first.result,
+        CommandResult::FundsTransferred {
+            transfer_id: id,
+            amount_atomic: 6_000_000,
+            ..
+        } if id == transfer_id
+    ));
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &sender_private_user,
+            AccountBucket::UserAvailable,
+            "USDC"
+        )),
+        2_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &sender_private_user,
+            AccountBucket::UserWithdrawalHold,
+            "USDC"
+        )),
+        2_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &recipient_private_user,
+            AccountBucket::UserAvailable,
+            "USDC"
+        )),
+        6_000_000
+    );
+
+    let root_before_failure = core.state_root();
+    let insufficient = execute_signed_result(
+        &mut core,
+        &sender_key,
+        "session:transfer:sender",
+        3,
+        "cmd:transfer:insufficient",
+        UserCommandAction::TransferFunds {
+            transfer_id: uuid::Uuid::from_u128(90),
+            recipient_account: recipient_account.clone(),
+            asset: "USDC".into(),
+            amount_atomic: 2_000_001,
+        },
+        1_070,
+    );
+    assert_eq!(insufficient.unwrap_err(), CoreError::InsufficientBalance);
+    assert_eq!(core.state_root(), root_before_failure);
+
+    let self_transfer = execute_signed_result(
+        &mut core,
+        &sender_key,
+        "session:transfer:sender",
+        3,
+        "cmd:transfer:self",
+        UserCommandAction::TransferFunds {
+            transfer_id: uuid::Uuid::from_u128(91),
+            recipient_account: sender_account,
+            asset: "USDC".into(),
+            amount_atomic: 1,
+        },
+        1_080,
+    );
+    assert_eq!(
+        self_transfer.unwrap_err(),
+        CoreError::InvalidOrder("sender and recipient must be different".into())
+    );
+
+    let unknown = execute_signed_result(
+        &mut core,
+        &sender_key,
+        "session:transfer:sender",
+        3,
+        "cmd:transfer:unknown",
+        UserCommandAction::TransferFunds {
+            transfer_id: uuid::Uuid::from_u128(92),
+            recipient_account: format!("layrs_{}", "00".repeat(32)),
+            asset: "USDC".into(),
+            amount_atomic: 1,
+        },
+        1_090,
+    );
+    assert_eq!(
+        unknown.unwrap_err(),
+        CoreError::InvalidOrder("unknown transfer account".into())
+    );
+
+    for (id, suffix, recipient, asset, amount) in [
+        (93, "zero", recipient_account.clone(), "USDC".to_string(), 0),
+        (
+            94,
+            "asset",
+            recipient_account.clone(),
+            "WETH".to_string(),
+            1,
+        ),
+        (
+            95,
+            "canonical",
+            recipient_account.to_uppercase(),
+            "USDC".to_string(),
+            1,
+        ),
+    ] {
+        let root = core.state_root();
+        let invalid = execute_signed_result(
+            &mut core,
+            &sender_key,
+            "session:transfer:sender",
+            3,
+            &format!("cmd:transfer:{suffix}"),
+            UserCommandAction::TransferFunds {
+                transfer_id: uuid::Uuid::from_u128(id),
+                recipient_account: recipient,
+                asset,
+                amount_atomic: amount,
+            },
+            1_100,
+        );
+        assert_eq!(
+            invalid.unwrap_err(),
+            CoreError::InvalidOrder("invalid private transfer request".into())
+        );
+        assert_eq!(core.state_root(), root);
+    }
+
+    let snapshot = core.export_encrypted_snapshot().unwrap();
+    let restored = PrivateTradingCore::restore_encrypted_snapshot(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([93u8; 48]),
+        &snapshot,
+        snapshot.sequence,
+    )
+    .unwrap();
+    assert!(restored.transfer_account_status(sender_identity).registered);
+    assert!(
+        restored
+            .transfer_account_status(recipient_identity)
+            .registered
+    );
+    assert_eq!(restored.state_root(), core.state_root());
+    assert_eq!(
+        restored.balance(&AccountKey::new(
+            &recipient_private_user,
+            AccountBucket::UserAvailable,
+            "USDC"
+        )),
+        6_000_000
+    );
 }
 
 #[test]
@@ -2079,6 +2633,222 @@ fn private_rewards_accrue_cumulatively_and_authorize_only_the_bound_account() {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[test]
+fn expired_market_rejects_position_close_but_allows_unfilled_hold_release() {
+    let alice = SigningKey::from_bytes(&[121u8; 32]);
+    let bob = SigningKey::from_bytes(&[122u8; 32]);
+    let journal_key = [123u8; 32];
+    let mut core = PrivateTradingCore::new(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([124u8; 48]),
+    );
+    let market_id = "layrs:v3:ZEN:15m:2000";
+    core.register_market(
+        "sys:market:resolution-guard".into(),
+        MarketConfig {
+            market_id: market_id.into(),
+            settlement_asset: "ZEN".into(),
+            settlement_decimals: 18,
+            public_settlement_chain: Some("horizen".into()),
+            opens_at_millis: 900,
+            closes_at_millis: 2_000,
+            minimum_quantity_micros: 1,
+            maximum_quantity_micros: 10_000_000,
+            minimum_order_notional_micros: 1,
+            maximum_order_notional_micros: 10_000_000,
+            maximum_user_position_micros: 10_000_000,
+            maximum_pending_bootstrap_notional_micros: 100_000_000,
+            tick_size_micros: 1_000,
+            oracle_feed_id: 245,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
+            execution: MarketExecution::NativeClob,
+        },
+        800,
+    )
+    .unwrap();
+
+    let alice_commitment = [125u8; 32];
+    let bob_commitment = [126u8; 32];
+    for (label, key, commitment) in [
+        ("alice", &alice, alice_commitment),
+        ("bob", &bob, bob_commitment),
+    ] {
+        core.register_session(
+            format!("sys:session:resolution-guard:{label}"),
+            format!("session:resolution-guard:{label}"),
+            commitment,
+            key.verifying_key().to_bytes(),
+            3_000,
+            850,
+        )
+        .unwrap();
+        core.apply_user_external_flow(
+            format!("sys:deposit:resolution-guard:{label}"),
+            commitment,
+            "ZEN".into(),
+            AccountBucket::UserAvailable,
+            1_000_000_000_000_000_000,
+            ExternalFlowDirection::Inflow,
+            [label.as_bytes()[0]; 32],
+            875,
+        )
+        .unwrap();
+    }
+
+    execute_signed(
+        &mut core,
+        &bob,
+        "session:resolution-guard:bob",
+        1,
+        "cmd:resolution-guard:mint",
+        UserCommandAction::CompleteSet {
+            market_id: market_id.into(),
+            quantity_micros: 1_000_000,
+            direction: CompleteSetDirection::Mint,
+        },
+        1_000,
+    );
+    let ask_response = execute_signed_response(
+        &mut core,
+        &bob,
+        "session:resolution-guard:bob",
+        2,
+        "cmd:resolution-guard:ask",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Sell,
+                500_000,
+                1_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_100,
+    );
+    let filled_ask_id = match ask_response.result {
+        CommandResult::Order { result } => result.accepted_order.unwrap().order_id,
+        _ => panic!("expected resting ask response"),
+    };
+    execute_signed(
+        &mut core,
+        &alice,
+        "session:resolution-guard:alice",
+        1,
+        "cmd:resolution-guard:buy",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                500_000,
+                1_000_000,
+                TimeInForce::Fak,
+                None,
+            ),
+        },
+        1_200,
+    );
+    let resting_response = execute_signed_response(
+        &mut core,
+        &alice,
+        "session:resolution-guard:alice",
+        2,
+        "cmd:resolution-guard:resting",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Down,
+                OrderAction::Buy,
+                100_000,
+                1_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_300,
+    );
+    let resting_order = match resting_response.result {
+        CommandResult::Order { result } => result.accepted_order.unwrap(),
+        _ => panic!("expected resting order response"),
+    };
+    assert_eq!(resting_order.status, OrderStatus::Open);
+
+    let alice_owner = derived_private_user(journal_key, alice_commitment);
+    let up_position = AccountKey::position(
+        &alice_owner,
+        format!("CLAIM:{market_id}:UP"),
+        market_id,
+        "UP",
+    );
+    assert_eq!(core.balance(&up_position), 1_000_000);
+
+    let cancel_filled_trade = execute_signed_result(
+        &mut core,
+        &bob,
+        "session:resolution-guard:bob",
+        3,
+        "cmd:resolution-guard:cancel-filled",
+        UserCommandAction::CancelOrder {
+            market_id: market_id.into(),
+            order_id: filled_ask_id,
+        },
+        2_100,
+    );
+    assert!(matches!(
+        cancel_filled_trade.unwrap_err(),
+        CoreError::InvalidOrder(message) if message == "order is not cancellable"
+    ));
+
+    let close_after_expiry = execute_signed_result(
+        &mut core,
+        &alice,
+        "session:resolution-guard:alice",
+        3,
+        "cmd:resolution-guard:late-close",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Sell,
+                500_000,
+                1_000_000,
+                TimeInForce::Fak,
+                None,
+            ),
+        },
+        2_100,
+    );
+    assert_eq!(
+        close_after_expiry.unwrap_err(),
+        CoreError::InvalidOrder("market is not open".into())
+    );
+    assert_eq!(core.balance(&up_position), 1_000_000);
+
+    let cancel_response = execute_signed_response(
+        &mut core,
+        &alice,
+        "session:resolution-guard:alice",
+        3,
+        "cmd:resolution-guard:release-unfilled",
+        UserCommandAction::CancelOrder {
+            market_id: market_id.into(),
+            order_id: resting_order.order_id,
+        },
+        2_100,
+    );
+    assert!(matches!(
+        cancel_response.result,
+        CommandResult::Cancelled { .. }
+    ));
+    assert_eq!(core.balance(&up_position), 1_000_000);
+}
+
 fn execute_signed(
     core: &mut PrivateTradingCore,
     key: &SigningKey,

@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "validated-ready-for-activation",
+  "releaseId": "a711f808b66ee70fcef30b17e35ad230fb29fa45",
+  "sourceCommit": "a711f808b66ee70fcef30b17e35ad230fb29fa45",
+  "sourceBranch": "main",
+  "snapshotCompatibilityBase": "048c3370e533c32dc82e04efe17ee200b11c4a89",
+  "snapshotApproval": "enclave/snapshot-migrations/2026-08-14-category-fee-profiles.md",
+  "region": "us-east-1",
+  "packerSourceCommit": "a711f808b66ee70fcef30b17e35ad230fb29fa45",
+  "amiId": "ami-0c9f0b3022e2a7595",
+  "amiSnapshotId": "snap-01d0c17fb975229b9",
+  "amiDeregistrationProtection": "enabled-with-cooldown",
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/a711f808b66ee70fcef30b17e35ad230fb29fa45",
+  "artifacts": {
+    "sourceArchive": {
+      "path": "source.tar.gz",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/a711f808b66ee70fcef30b17e35ad230fb29fa45/source.tar.gz",
+      "versionId": "fLtK.DplTKlm.BX8HZM3VECnPx3eb854",
+      "sizeBytes": 550202,
+      "sha384": "df693911f131a139c916d7c0fbfeb6cbb9b879a51842501961bf1f00ec10614c04e6f00abb796652c1833768dd06773a"
+    },
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/a711f808b66ee70fcef30b17e35ad230fb29fa45/layrsv2-clob.eif",
+      "versionId": "gk4UR9Tj8SjSoQym1IdgSXK2zIIjSDVf",
+      "sizeBytes": 42227777,
+      "sha384": "ddc73e37474ee06104afab1f85eac4a60567b29043efcca87f07a5914732abe083eb145da69d1b493314f3812234530a"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/a711f808b66ee70fcef30b17e35ad230fb29fa45/layrs-enclave-parent",
+      "versionId": "k7l8DqAoDWFRMGzUg8gGUYaRiwBRilFT",
+      "sizeBytes": 1362376,
+      "sha384": "2fc8185a132856d8bb71d955c4cdfba2dcea78144ff82fa1f9052749a2c3947e75bdbb3e6672ca2f72b1bf4a58e67283"
+    },
+    "measurements": {
+      "path": "build/layrsv2-clob-measurements.json",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/a711f808b66ee70fcef30b17e35ad230fb29fa45/layrsv2-clob-measurements.json",
+      "versionId": "WLdbE3HCUeRb1qcagOP22xI7LfdEvJWf",
+      "sizeBytes": 402,
+      "sha384": "4b4199e1fecd3a4174011ea66a38a141263a4f2fced1f022bf3b8bbcb2f0f827dd816d256119cf40ba5993c8a3ee310d"
+    },
+    "checksums": {
+      "path": "build/layrsv2-host-artifacts.sha384",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/a711f808b66ee70fcef30b17e35ad230fb29fa45/layrsv2-host-artifacts.sha384",
+      "versionId": "lFW3iujC8TNG18K9MYY_WXQz7ugt.93M",
+      "sizeBytes": 246,
+      "sha384": "8157437244b5985a808d4273ba8466300df096da7e225fc364e3042e15b30946462fd42761c7e51dec669a8a86640654"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "f10e633950c35f160cde197bf5c0a4f5bd0a201b7515e0d13ad8792523a1589e86b8713600a100be4662b09c1ca89921",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "fa160f92006776310ea9bcc6c0e077aa634a5a9b1cc3df0443ec7dfbedf522d75e931d7edf158df41b4abb46c71ef137"
+  },
+  "objectLock": {
+    "mode": "COMPLIANCE",
+    "retainUntilAtLeast": "2026-09-13T22:34:52+00:00"
+  },
+  "activation": null,
+  "signature": null,
+  "signatureNote": "Candidate introduces versioned category fee profiles with deterministic fixed-point settlement arithmetic. Existing markets retain the legacy five-percent-of-profit profile; only newly signed market releases carry a category profile. Activation remains gated on exact PCR and signed-manifest rotation, single-writer snapshot replay, funded ZEN and USDC settlement canaries, exact participant-principal reconciliation, and a clean queue/alarm soak."
+}

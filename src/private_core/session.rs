@@ -36,6 +36,16 @@ pub struct SessionGuard {
 }
 
 impl SessionGuard {
+    /// Removes sessions that can no longer authorize a command. This keeps the
+    /// authenticated enclave state bounded by active sessions instead of every
+    /// browser session ever issued.
+    pub fn prune_expired(&mut self, now_millis: i64) {
+        self.registered
+            .retain(|_, session| session.expires_at_millis > now_millis);
+        self.last_sequences
+            .retain(|session_id, _| self.registered.contains_key(session_id));
+    }
+
     pub fn register(
         &mut self,
         session_id: String,
@@ -68,6 +78,25 @@ impl SessionGuard {
         signed: &SignedSessionRequest,
         now_millis: i64,
     ) -> CoreResult<String> {
+        let private_user_id = self.verify_signed(signed, now_millis)?;
+        self.accept(&signed.request, now_millis)?;
+        Ok(private_user_id)
+    }
+
+    /// Authenticates a read-only request without advancing durable session state.
+    /// Transport replay protection still rejects a duplicated encrypted envelope,
+    /// while a subsequent mutating command may safely use any greater sequence.
+    pub fn verify_signed_readonly(
+        &self,
+        signed: &SignedSessionRequest,
+        now_millis: i64,
+    ) -> CoreResult<String> {
+        let private_user_id = self.verify_signed(signed, now_millis)?;
+        self.validate_sequence(&signed.request, now_millis)?;
+        Ok(private_user_id)
+    }
+
+    fn verify_signed(&self, signed: &SignedSessionRequest, now_millis: i64) -> CoreResult<String> {
         let registered = self
             .registered
             .get(&signed.request.session_id)
@@ -89,12 +118,17 @@ impl SessionGuard {
         verifying_key
             .verify(&signing_payload(&signed.request), &signature)
             .map_err(|_| CoreError::InvalidSessionSignature)?;
-        let private_user_id = registered.private_user_id.clone();
-        self.accept(&signed.request, now_millis)?;
-        Ok(private_user_id)
+        Ok(registered.private_user_id.clone())
     }
 
     pub fn accept(&mut self, request: &SessionRequest, now_millis: i64) -> CoreResult<()> {
+        self.validate_sequence(request, now_millis)?;
+        self.last_sequences
+            .insert(request.session_id.clone(), request.sequence);
+        Ok(())
+    }
+
+    fn validate_sequence(&self, request: &SessionRequest, now_millis: i64) -> CoreResult<()> {
         if request.expires_at_millis <= now_millis
             || request.issued_at_millis > now_millis + 30_000
             || request.session_id.is_empty()
@@ -109,8 +143,6 @@ impl SessionGuard {
         if request.sequence == 0 || request.sequence <= last {
             return Err(CoreError::ReplayedSequence);
         }
-        self.last_sequences
-            .insert(request.session_id.clone(), request.sequence);
         Ok(())
     }
 
@@ -132,4 +164,36 @@ pub fn signing_payload(request: &SessionRequest) -> Vec<u8> {
     payload.extend_from_slice(&request.expires_at_millis.to_be_bytes());
     payload.extend_from_slice(&request.request_hash);
     payload
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionGuard;
+    use ed25519_dalek::SigningKey;
+
+    #[test]
+    fn expired_sessions_and_sequences_are_pruned_without_removing_active_sessions() {
+        let mut guard = SessionGuard::default();
+        let key_a = SigningKey::from_bytes(&[1; 32]).verifying_key().to_bytes();
+        let key_b = SigningKey::from_bytes(&[2; 32]).verifying_key().to_bytes();
+        let key_c = SigningKey::from_bytes(&[3; 32]).verifying_key().to_bytes();
+        guard
+            .register("expired".into(), "user-a".into(), key_a, 2_000, 1_000)
+            .unwrap();
+        guard
+            .register("active".into(), "user-b".into(), key_b, 4_000, 1_000)
+            .unwrap();
+        guard.last_sequences.insert("expired".into(), 9);
+        guard.last_sequences.insert("active".into(), 4);
+
+        guard.prune_expired(2_000);
+
+        assert!(!guard.registered.contains_key("expired"));
+        assert!(!guard.last_sequences.contains_key("expired"));
+        assert!(guard.registered.contains_key("active"));
+        assert_eq!(guard.last_sequences.get("active"), Some(&4));
+        guard
+            .register("expired".into(), "user-c".into(), key_c, 5_000, 2_000)
+            .unwrap();
+    }
 }

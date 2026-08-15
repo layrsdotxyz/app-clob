@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "validated-ready-for-activation",
+  "releaseId": "048c3370e533c32dc82e04efe17ee200b11c4a89",
+  "sourceCommit": "048c3370e533c32dc82e04efe17ee200b11c4a89",
+  "sourceBranch": "main",
+  "snapshotCompatibilityBase": "c5f017a19a09ef12c7e48529edcbad2b10c8d0ed",
+  "snapshotApproval": "enclave/snapshot-migrations/2026-08-13-private-user-balance-transfer.md",
+  "region": "us-east-1",
+  "packerSourceCommit": "048c3370e533c32dc82e04efe17ee200b11c4a89",
+  "amiId": "ami-089802d69286a90d2",
+  "amiSnapshotId": "snap-05f0da5128b39de9f",
+  "amiDeregistrationProtection": "enabled-with-cooldown",
+  "artifactBucket": "layrsv2-production-255638996474-us-east-1-immutable",
+  "artifactPrefix": "enclave-releases/048c3370e533c32dc82e04efe17ee200b11c4a89",
+  "artifacts": {
+    "sourceArchive": {
+      "path": "source.tar.gz",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/048c3370e533c32dc82e04efe17ee200b11c4a89/source.tar.gz",
+      "versionId": "iqTpsNpy445HlXiFlLcYJmcQKh.U41Tz",
+      "sizeBytes": 545200,
+      "sha384": "09c3ce2678761e096b112189e59aac6a6aeeda96ba64061ffa0cc4b276ed333b5be18cba14a47f75478fcc4ff6bb3916"
+    },
+    "enclaveImage": {
+      "path": "build/layrsv2-clob.eif",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/048c3370e533c32dc82e04efe17ee200b11c4a89/layrsv2-clob.eif",
+      "versionId": "1lzWELhs8aheK0VYCCB_odE_4s5XSpWl",
+      "sizeBytes": 42216001,
+      "sha384": "4897e77a86c84122f4f66cde81bbc6c737b948cd3cd2433b3ad122c29c9a091e1cc68508f0a2547eb388f173c2a89d6e"
+    },
+    "parentBinary": {
+      "path": "build/layrs-enclave-parent",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/048c3370e533c32dc82e04efe17ee200b11c4a89/layrs-enclave-parent",
+      "versionId": "w51VQrbiv4ULwyfl8Yv75EUvtdeSFA4X",
+      "sizeBytes": 1362376,
+      "sha384": "e15bf543a8fc5cdeaa57c8fe1745f73a7f519e7b359291a7bb29188f3ff3d8a7d29da95ae1380fc57aed9526ba53f706"
+    },
+    "measurements": {
+      "path": "build/layrsv2-clob-measurements.json",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/048c3370e533c32dc82e04efe17ee200b11c4a89/layrsv2-clob-measurements.json",
+      "versionId": "l5ZCaybUwU2W62T0azxsUunoREGFzytm",
+      "sizeBytes": 402,
+      "sha384": "e7f5034873b8444a3389dc38531ded25f41ff47856c41b6a02e6705b6ad9e4c3389ca00cd4db9efef630b97d55f7c95d"
+    },
+    "checksums": {
+      "path": "build/layrsv2-host-artifacts.sha384",
+      "s3Uri": "s3://layrsv2-production-255638996474-us-east-1-immutable/enclave-releases/048c3370e533c32dc82e04efe17ee200b11c4a89/layrsv2-host-artifacts.sha384",
+      "versionId": "kUn8phV7pNaHHT.h71DaLX_y6enS_54O",
+      "sizeBytes": 246,
+      "sha384": "56c1522139fe0aaa51235eeab8ecd5febc11827114f6d36f6ceb041188cabf11791bfa9a2392ed8d060abf1748b5620e"
+    }
+  },
+  "measurements": {
+    "hashAlgorithm": "SHA384",
+    "pcr0": "f621e0521fe29dd6a11f2ad7d217203f77f32be151fd87941b2e00ecaa892770d63900752254884eba340951f69cbcdf",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "9f1d45d44e6614b4102ee311d3077f7bec742a846c9737145cae2d4599bab993f11e1d1dd972c5f826dd56deda82829f"
+  },
+  "objectLock": {
+    "mode": "COMPLIANCE",
+    "retainUntilAtLeast": "2026-09-12T12:44:01+00:00"
+  },
+  "activation": null,
+  "signature": null,
+  "signatureNote": "Candidate adds a deterministic, journaled private user-to-user transfer account and atomic available-balance transfer for USDC and ZEN, preserving held funds, command idempotency, snapshot replay and TEE receipt publication. Activation remains gated on exact PCR and signed-manifest rotation, single-writer enclave replacement, funded transfer canary, exact participant-principal reconciliation and a clean queue/alarm soak."
+}

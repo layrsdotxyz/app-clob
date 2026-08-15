@@ -1,0 +1,19 @@
+[Unit]
+Description=Layrs v2 Nitro enclave process watchdog
+After=nitro-enclaves-allocator.service layrsv2-enclave.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/layrsv2/layrsv2-enclave-watchdog
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/log/nitro_enclaves
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+TimeoutStartSec=30

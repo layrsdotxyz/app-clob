@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ethers_core::types::U256;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -19,6 +20,12 @@ use super::{
     Outcome, PriceTimeBook, ReceiptSigner, SessionGuard, SignedSessionRequest, Transfer,
     PRICE_SCALE,
 };
+
+/// Public depth is deliberately less precise than the enclave's private book.
+/// A level must contain liquidity from at least this many independent private
+/// owners before it can leave the enclave. This prevents a thin public level
+/// from acting as an oracle for one user's exact order size and arrival time.
+const MIN_PUBLIC_DEPTH_DISTINCT_OWNERS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketConfig {
@@ -47,9 +54,129 @@ pub struct MarketConfig {
     pub maximum_pending_bootstrap_notional_micros: u128,
     pub tick_size_micros: u64,
     pub oracle_feed_id: u64,
+    /// Immutable settlement-fee policy selected by the signed market release.
+    /// Older snapshots and releases intentionally default to the legacy policy.
+    #[serde(default, skip_serializing_if = "FeeProfileId::is_legacy")]
+    pub fee_profile_id: FeeProfileId,
     /// Determines where price discovery happens. The default preserves the native ZEN CLOB.
     #[serde(default)]
     pub execution: MarketExecution,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FeeProfileId {
+    #[default]
+    LegacyProfitV1,
+    CryptoV1,
+    MacroV1,
+    FinanceV1,
+    PoliticsV1,
+    SportsV1,
+    EsportsV1,
+    WeatherV1,
+    TechnologyV1,
+    ScienceV1,
+    CultureV1,
+    BusinessV1,
+    GeopoliticsV1,
+    GeneralV1,
+    PolymarketCryptoV2,
+    PolymarketMacroV2,
+    PolymarketFinanceV2,
+    PolymarketPoliticsV2,
+    PolymarketSportsV2,
+    PolymarketEsportsV2,
+    PolymarketWeatherV2,
+    PolymarketTechnologyV2,
+    PolymarketMentionsV2,
+    PolymarketScienceV2,
+    PolymarketCultureV2,
+    PolymarketBusinessV2,
+    PolymarketGeneralV2,
+    PolymarketGeopoliticsV2,
+}
+
+impl FeeProfileId {
+    fn is_legacy(&self) -> bool {
+        matches!(self, Self::LegacyProfitV1)
+    }
+
+    fn parameters(self) -> Option<FeeProfileParameters> {
+        let parameters = match self {
+            Self::LegacyProfitV1 => return None,
+            Self::CryptoV1 => FeeProfileParameters::new(800, 100, 400),
+            Self::MacroV1 | Self::FinanceV1 => FeeProfileParameters::new(600, 100, 300),
+            Self::PoliticsV1
+            | Self::WeatherV1
+            | Self::TechnologyV1
+            | Self::ScienceV1
+            | Self::CultureV1
+            | Self::BusinessV1
+            | Self::GeneralV1 => FeeProfileParameters::new(500, 100, 250),
+            Self::SportsV1 | Self::EsportsV1 => FeeProfileParameters::new(400, 100, 200),
+            Self::GeopoliticsV1 => FeeProfileParameters::new(300, 100, 150),
+            Self::PolymarketCryptoV2
+            | Self::PolymarketMacroV2
+            | Self::PolymarketFinanceV2
+            | Self::PolymarketPoliticsV2
+            | Self::PolymarketSportsV2
+            | Self::PolymarketEsportsV2
+            | Self::PolymarketWeatherV2
+            | Self::PolymarketTechnologyV2
+            | Self::PolymarketMentionsV2
+            | Self::PolymarketScienceV2
+            | Self::PolymarketCultureV2
+            | Self::PolymarketBusinessV2
+            | Self::PolymarketGeneralV2
+            | Self::PolymarketGeopoliticsV2 => return None,
+        };
+        Some(parameters)
+    }
+
+    fn taker_curve_rate_bps(self) -> Option<u128> {
+        match self {
+            Self::PolymarketCryptoV2 => Some(700),
+            Self::PolymarketMacroV2
+            | Self::PolymarketWeatherV2
+            | Self::PolymarketScienceV2
+            | Self::PolymarketCultureV2
+            | Self::PolymarketGeneralV2 => Some(500),
+            // Esports inherits Sports economics until Polymarket publishes a
+            // distinct Esports schedule.
+            Self::PolymarketSportsV2 | Self::PolymarketEsportsV2 => Some(500),
+            Self::PolymarketFinanceV2
+            | Self::PolymarketPoliticsV2
+            | Self::PolymarketTechnologyV2
+            | Self::PolymarketMentionsV2
+            | Self::PolymarketBusinessV2 => Some(400),
+            Self::PolymarketGeopoliticsV2 => Some(0),
+            _ => None,
+        }
+    }
+
+    fn has_polymarket_taker_fees(self) -> bool {
+        self.taker_curve_rate_bps().is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FeeProfileParameters {
+    curve_coefficient_bps: u128,
+    stake_floor_bps: u128,
+    stake_cap_bps: u128,
+    profit_cap_bps: u128,
+}
+
+impl FeeProfileParameters {
+    const fn new(curve_coefficient_bps: u128, stake_floor_bps: u128, stake_cap_bps: u128) -> Self {
+        Self {
+            curve_coefficient_bps,
+            stake_floor_bps,
+            stake_cap_bps,
+            profit_cap_bps: 500,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -321,6 +448,13 @@ pub enum UserCommandAction {
         amount_atomic: u128,
         destination: String,
     },
+    TransferFunds {
+        transfer_id: Uuid,
+        recipient_account: String,
+        asset: String,
+        #[serde(with = "super::decimal_u128")]
+        amount_atomic: u128,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -470,13 +604,21 @@ pub enum CommandResult {
         amount_atomic: u128,
         destination: String,
     },
+    FundsTransferred {
+        transfer_id: Uuid,
+        recipient_account: String,
+        asset: String,
+        #[serde(with = "super::decimal_u128")]
+        amount_atomic: u128,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoreResponse {
     pub result: CommandResult,
     pub receipt: EnclaveReceipt,
-    pub encrypted_record: EncryptedJournalRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_record: Option<EncryptedJournalRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub withdrawal_authorization: Option<WithdrawalAuthorization>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -497,6 +639,14 @@ pub struct SystemResponse {
     pub evidence_commitment: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_evidence: Option<RegistrationEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_account: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferAccountStatus {
+    pub transfer_account: String,
+    pub registered: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -588,6 +738,11 @@ enum JournaledSystemCommand {
         identity_commitment: [u8; 32],
         public_key: [u8; 32],
         expires_at_millis: i64,
+        now_millis: i64,
+    },
+    RegisterTransferAccount {
+        idempotency_key: String,
+        identity_commitment: [u8; 32],
     },
     ExternalFlow {
         idempotency_key: String,
@@ -1188,6 +1343,7 @@ impl PrivateTradingCore {
         self.validate_new_system_key(&idempotency_key)?;
         let prior_root = self.state_root();
         let mut sessions = self.sessions.clone();
+        sessions.prune_expired(now_millis);
         let private_user_id = derive_private_user_id(&self.identity_key, &identity_commitment);
         sessions.register(
             session_id.clone(),
@@ -1220,6 +1376,7 @@ impl PrivateTradingCore {
             identity_commitment,
             public_key,
             expires_at_millis,
+            now_millis,
         };
         let command_commitment = system_command_commitment(&entry)?;
         let registration_evidence = registration_evidence(identity_commitment, public_key);
@@ -1244,7 +1401,74 @@ impl PrivateTradingCore {
             audit_fills: Vec::new(),
             evidence_commitment: Some(registration_evidence.commitment),
             registration_evidence: Some(registration_evidence),
+            transfer_account: None,
         })
+    }
+
+    /// Registers an opaque, stable receive handle for an enclave-local user.
+    ///
+    /// This is deliberately a separate journal command from session registration:
+    /// historical REGISTER_SESSION records therefore retain their exact state roots.
+    /// The handle is deterministically bound to the eligibility identity commitment,
+    /// and the binding lives in the already-committed system key set.
+    pub fn register_transfer_account(
+        &mut self,
+        idempotency_key: String,
+        identity_commitment: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        let prior_root = self.state_root();
+        let private_user_id = derive_private_user_id(&self.identity_key, &identity_commitment);
+        let transfer_account = derive_transfer_account(&identity_commitment);
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        keys.insert(transfer_account_marker(&transfer_account, &private_user_id));
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &self.ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::RegisterTransferAccount {
+            idempotency_key: idempotency_key.clone(),
+            identity_commitment,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        let mut response = self.system_response(
+            "register-transfer-account",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        );
+        response.transfer_account = Some(transfer_account);
+        Ok(response)
+    }
+
+    pub fn transfer_account_status(&self, identity_commitment: [u8; 32]) -> TransferAccountStatus {
+        let private_user_id = derive_private_user_id(&self.identity_key, &identity_commitment);
+        let transfer_account = derive_transfer_account(&identity_commitment);
+        TransferAccountStatus {
+            registered: self.system_keys.contains(&transfer_account_marker(
+                &transfer_account,
+                &private_user_id,
+            )),
+            transfer_account,
+        }
     }
 
     pub fn apply_external_flow(
@@ -1710,11 +1934,12 @@ impl PrivateTradingCore {
                 _ => 0,
             };
             let gross = settlement_atomic(market, gross_micros)?;
-            let winning_fee = if matches!(outcome, ResolutionOutcome::Push) {
-                0
-            } else {
-                ceil_bps(gross.saturating_sub(basis), 500)?
-            };
+            let winning_fee = settlement_winning_fee(
+                market.fee_profile_id,
+                basis,
+                gross,
+                matches!(outcome, ResolutionOutcome::Push),
+            )?;
             total_gross_payout = total_gross_payout
                 .checked_add(gross)
                 .ok_or(CoreError::UnbalancedTransaction)?;
@@ -1933,11 +2158,6 @@ impl PrivateTradingCore {
             .markets
             .get(market_id)
             .ok_or_else(|| CoreError::InvalidResolution("unknown market".into()))?;
-        if self.resolutions.contains_key(market_id) {
-            return Err(CoreError::InvalidResolution(
-                "market is already resolved".into(),
-            ));
-        }
         match evidence {
             SignedResolutionEvidence::Pyth(signed) => {
                 validate_resolution(market, signed, self.oracle_public_key, now_millis)?;
@@ -1985,6 +2205,46 @@ impl PrivateTradingCore {
                     ));
                 }
             }
+        }
+        if let Some(committed) = self.resolutions.get(market_id) {
+            let evidence_matches = match (&committed.evidence, evidence) {
+                (
+                    ResolutionEvidence::PythHistoricalMedian {
+                        statement: committed,
+                    },
+                    SignedResolutionEvidence::Pyth(candidate),
+                ) => committed == &candidate.statement,
+                (
+                    ResolutionEvidence::BinanceSpotKlineMedian {
+                        statement: committed,
+                    },
+                    SignedResolutionEvidence::Binance(candidate),
+                ) => committed == &candidate.statement,
+                (
+                    ResolutionEvidence::PublicExactCondition {
+                        statement: committed,
+                    },
+                    SignedResolutionEvidence::ExactCondition(candidate),
+                ) => committed == &candidate.statement,
+                (
+                    ResolutionEvidence::PolymarketExactCondition {
+                        statement: committed,
+                    },
+                    SignedResolutionEvidence::Polymarket(candidate),
+                ) => committed == &candidate.statement,
+                _ => false,
+            };
+            if committed.outcome != outcome || !evidence_matches {
+                return Err(CoreError::InvalidResolution(
+                    "resolution evidence conflicts with committed resolution".into(),
+                ));
+            }
+            // Signing and publishing evidence are intentionally retryable after
+            // the ledger commit. A lost response must not strand the public
+            // projection in RESOLUTION_PENDING. Only valid evidence containing
+            // the exact statement and outcome already committed by the enclave
+            // may be re-authorized.
+            return Ok(());
         }
         Ok(())
     }
@@ -2158,9 +2418,10 @@ impl PrivateTradingCore {
 
         let mut ledger = self.ledger.clone();
         let mut position_cost_basis = self.position_cost_basis.clone();
+        let mut private_rewards = self.private_rewards.clone();
         let quantity = execution.view.quantity_micros;
         let fill_notional = notional(fill_price_micros, quantity)?;
-        let taker_fee = ceil_bps(fill_notional, 20)?;
+        let taker_fee = taker_fee_micros(market.fee_profile_id, quantity, fill_price_micros)?;
         let claim = claim_asset(&execution.view.market_id, execution.view.outcome);
         let inventory = venue_inventory(&execution.view.market_id, execution.view.outcome, &claim);
         let pool = AccountKey::new("layrs", AccountBucket::PoolCash, &market.settlement_asset);
@@ -2321,6 +2582,17 @@ impl PrivateTradingCore {
             fee_atomic: taker_fee,
             nonce: next_sequence,
         };
+        let (reward_chain, reward_token) = reward_rail(market)?;
+        private_rewards.record_fill(
+            &execution.private_user_id,
+            None,
+            reward_chain,
+            reward_token,
+            quantity,
+            taker_fee,
+            0,
+            now_millis,
+        )?;
 
         let mut keys = self.system_keys.clone();
         keys.insert(idempotency_key.clone());
@@ -2335,7 +2607,7 @@ impl PrivateTradingCore {
             &self.resolutions,
             &self.oracle_public_key,
             &executions,
-            &self.private_rewards,
+            &private_rewards,
             self.trading_frozen,
             next_sequence,
         );
@@ -2349,6 +2621,7 @@ impl PrivateTradingCore {
         self.ledger = ledger;
         self.position_cost_basis = position_cost_basis;
         self.bootstrap_executions = executions;
+        self.private_rewards = private_rewards;
         self.system_keys = keys;
         self.sequence = next_sequence;
         let mut response = self.system_response(
@@ -2468,6 +2741,14 @@ impl PrivateTradingCore {
         if command.session.request.request_hash != expected_hash {
             return Err(CoreError::RequestHashMismatch);
         }
+        if matches!(
+            command.action,
+            UserCommandAction::Portfolio
+                | UserCommandAction::Rewards
+                | UserCommandAction::BootstrapStatus { .. }
+        ) {
+            return self.execute_readonly(command, expected_hash, now_millis);
+        }
         if let Some(processed) = self.processed.get(&command.idempotency_key) {
             if processed.request_hash != expected_hash {
                 return Err(CoreError::DuplicateCommand);
@@ -2569,6 +2850,12 @@ impl PrivateTradingCore {
                                     &command.command_id,
                                 )?;
                             }
+                            record_native_fill_economics(
+                                &mut private_rewards,
+                                market,
+                                &match_result,
+                                now_millis,
+                            )?;
                         }
                         audit_drafts = native_audit_drafts(&order, &match_result, market)?;
                         CommandResult::Order {
@@ -2840,6 +3127,44 @@ impl PrivateTradingCore {
                     destination: destination.clone(),
                 }
             }
+            UserCommandAction::TransferFunds {
+                transfer_id,
+                recipient_account,
+                asset,
+                amount_atomic,
+            } => {
+                validate_private_transfer(recipient_account, asset, *amount_atomic)?;
+                let recipient_private_user_id =
+                    resolve_transfer_account(&system_keys, recipient_account)?;
+                if recipient_private_user_id == private_user_id {
+                    return Err(CoreError::InvalidOrder(
+                        "sender and recipient must be different".into(),
+                    ));
+                }
+                ledger.apply(LedgerTransaction {
+                    idempotency_key: format!("private-transfer:{}", command.idempotency_key),
+                    business_reference: transfer_id.to_string(),
+                    transfers: vec![Transfer {
+                        from: AccountKey::new(
+                            &private_user_id,
+                            AccountBucket::UserAvailable,
+                            asset,
+                        ),
+                        to: AccountKey::new(
+                            recipient_private_user_id,
+                            AccountBucket::UserAvailable,
+                            asset,
+                        ),
+                        amount: *amount_atomic,
+                    }],
+                })?;
+                CommandResult::FundsTransferred {
+                    transfer_id: *transfer_id,
+                    recipient_account: recipient_account.clone(),
+                    asset: asset.clone(),
+                    amount_atomic: *amount_atomic,
+                }
+            }
         };
 
         let mut processed_hash_map = processed_hashes(&self.processed);
@@ -2877,6 +3202,7 @@ impl PrivateTradingCore {
                     | UserCommandAction::RequestRewardClaim { .. }
                     | UserCommandAction::CancelBootstrap { .. }
                     | UserCommandAction::RequestWithdrawal { .. }
+                    | UserCommandAction::TransferFunds { .. }
             )),
             next_sequence,
             prior_root,
@@ -2932,7 +3258,7 @@ impl PrivateTradingCore {
         let response = CoreResponse {
             result,
             receipt,
-            encrypted_record: record,
+            encrypted_record: Some(record),
             withdrawal_authorization,
             reward_claim_authorization: None,
             audit_fills,
@@ -2956,6 +3282,67 @@ impl PrivateTradingCore {
         Ok(response)
     }
 
+    fn execute_readonly(
+        &self,
+        command: UserCommand,
+        expected_hash: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<CoreResponse> {
+        if self.processed.contains_key(&command.idempotency_key) {
+            return Err(CoreError::DuplicateCommand);
+        }
+        let private_user_id = self
+            .sessions
+            .verify_signed_readonly(&command.session, now_millis)?;
+        let result = match &command.action {
+            UserCommandAction::Portfolio => CommandResult::Portfolio {
+                snapshot: portfolio_snapshot(
+                    &self.ledger,
+                    &self.books,
+                    &self.position_cost_basis,
+                    &private_user_id,
+                    now_millis,
+                ),
+            },
+            UserCommandAction::Rewards => CommandResult::Rewards {
+                entitlements: self.private_rewards.entitlements(&private_user_id),
+            },
+            UserCommandAction::BootstrapStatus { execution_id } => {
+                let execution = self
+                    .bootstrap_executions
+                    .get(execution_id)
+                    .filter(|execution| execution.private_user_id == private_user_id)
+                    .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
+                CommandResult::BootstrapStatus {
+                    execution: execution.view.clone(),
+                }
+            }
+            _ => return Err(CoreError::InvalidOrder("command is not read-only".into())),
+        };
+        let root = self.state_root();
+        let journal_hash = read_only_response_hash(&command, &result, root)?;
+        let receipt = self.receipt_signer.sign(
+            command.command_id,
+            command.idempotency_key,
+            Some(expected_hash),
+            Some(false),
+            self.sequence,
+            root,
+            root,
+            journal_hash,
+            now_millis,
+        );
+        Ok(CoreResponse {
+            result,
+            receipt,
+            encrypted_record: None,
+            withdrawal_authorization: None,
+            reward_claim_authorization: None,
+            audit_fills: Vec::new(),
+            task_qualifications: Vec::new(),
+        })
+    }
+
     pub fn aggregate_depth(
         &self,
         market_id: &str,
@@ -2963,6 +3350,14 @@ impl PrivateTradingCore {
         now_millis: i64,
         minimum_level_quantity_micros: u128,
     ) -> (Vec<(u64, u128)>, Vec<(u64, u128)>) {
+        let Some(market) = self.markets.get(market_id) else {
+            return (Vec::new(), Vec::new());
+        };
+        // No closed-market liquidity is public, even if GTC orders remain in
+        // the private book awaiting the deterministic lifecycle cancellation.
+        if now_millis < market.opens_at_millis || now_millis >= market.closes_at_millis {
+            return (Vec::new(), Vec::new());
+        }
         self.books.get(market_id).map_or_else(
             || (Vec::new(), Vec::new()),
             |book| {
@@ -2970,8 +3365,18 @@ impl PrivateTradingCore {
                 let filter = |levels: Vec<(u64, u128, usize)>| {
                     levels
                         .into_iter()
-                        .filter(|(_, quantity, _)| *quantity >= minimum_level_quantity_micros)
-                        .map(|(price, quantity, _)| (price, quantity))
+                        .filter(|(_, quantity, distinct_owners)| {
+                            *quantity >= minimum_level_quantity_micros
+                                && *distinct_owners >= MIN_PUBLIC_DEPTH_DISTINCT_OWNERS
+                        })
+                        .filter_map(|(price, quantity, _)| {
+                            // Publish only whole privacy buckets. Observers see
+                            // a bounded range, never the enclave's exact size.
+                            let bucketed = quantity
+                                .checked_div(minimum_level_quantity_micros)?
+                                .checked_mul(minimum_level_quantity_micros)?;
+                            (bucketed > 0).then_some((price, bucketed))
+                        })
                         .collect()
                 };
                 (filter(bids), filter(asks))
@@ -3012,6 +3417,7 @@ impl PrivateTradingCore {
             audit_fills: Vec::new(),
             evidence_commitment: None,
             registration_evidence: None,
+            transfer_account: None,
         }
     }
 }
@@ -3077,9 +3483,10 @@ fn settlement_transfers(
             from: available(&incoming.private_user_id, &market.settlement_asset),
             to: incoming_cash_hold.clone(),
             amount: initial_notional
-                .checked_add(settlement_atomic(
+                .checked_add(maximum_buy_taker_fee_atomic(
                     market,
-                    ceil_bps(initial_notional_micros, 20)?,
+                    incoming.quantity_micros,
+                    incoming.price_micros,
                 )?)
                 .ok_or(CoreError::UnbalancedTransaction)?,
         }),
@@ -3103,7 +3510,7 @@ fn settlement_transfers(
             .ok_or_else(|| CoreError::InvalidOrder("maker order missing".into()))?;
         let fill_notional_micros = notional(fill.price_micros, fill.quantity_micros)?;
         let fill_notional = settlement_atomic(market, fill_notional_micros)?;
-        let taker_fee = settlement_atomic(market, ceil_bps(fill_notional_micros, 20)?)?;
+        let taker_fee = taker_fee_atomic(market, fill.quantity_micros, fill.taker_price_micros())?;
         let (buyer, seller, buyer_hold, seller_hold) = match incoming.action {
             OrderAction::Buy => (
                 incoming,
@@ -3165,9 +3572,10 @@ fn settlement_transfers(
     match incoming.action {
         OrderAction::Buy => {
             let initially_reserved = initial_notional
-                .checked_add(settlement_atomic(
+                .checked_add(maximum_buy_taker_fee_atomic(
                     market,
-                    ceil_bps(initial_notional_micros, 20)?,
+                    incoming.quantity_micros,
+                    incoming.price_micros,
                 )?)
                 .ok_or(CoreError::UnbalancedTransaction)?;
             let desired_hold = settlement_atomic(
@@ -3230,9 +3638,10 @@ fn apply_complete_set_match_settlement(
             from: available(&incoming.private_user_id, &market.settlement_asset),
             to: incoming_cash_hold.clone(),
             amount: initial_notional
-                .checked_add(settlement_atomic(
+                .checked_add(maximum_buy_taker_fee_atomic(
                     market,
-                    ceil_bps(initial_notional_micros, 20)?,
+                    incoming.quantity_micros,
+                    incoming.price_micros,
                 )?)
                 .ok_or(CoreError::UnbalancedTransaction)?,
         },
@@ -3280,7 +3689,8 @@ fn apply_complete_set_match_settlement(
 
                 let fill_notional_micros = notional(fill.price_micros, fill.quantity_micros)?;
                 let fill_notional = settlement_atomic(market, fill_notional_micros)?;
-                let taker_fee = settlement_atomic(market, ceil_bps(fill_notional_micros, 20)?)?;
+                let taker_fee =
+                    taker_fee_atomic(market, fill.quantity_micros, fill.taker_price_micros())?;
                 let mut transfers = Vec::with_capacity(3);
                 match incoming.action {
                     OrderAction::Buy => {
@@ -3556,9 +3966,10 @@ fn apply_complete_set_match_settlement(
     let refund = match incoming.action {
         OrderAction::Buy => {
             let initially_reserved = initial_notional
-                .checked_add(settlement_atomic(
+                .checked_add(maximum_buy_taker_fee_atomic(
                     market,
-                    ceil_bps(initial_notional_micros, 20)?,
+                    incoming.quantity_micros,
+                    incoming.price_micros,
                 )?)
                 .ok_or(CoreError::UnbalancedTransaction)?;
             let desired_hold = settlement_atomic(
@@ -3622,8 +4033,8 @@ fn complete_set_fill_amounts(
             "complete-set fill is below settlement precision".into(),
         ));
     }
-    let taker_notional_micros = notional(fill.taker_price_micros(), fill.quantity_micros)?;
-    let taker_fee_atomic = settlement_atomic(market, ceil_bps(taker_notional_micros, 20)?)?;
+    let taker_fee_atomic =
+        taker_fee_atomic(market, fill.quantity_micros, fill.taker_price_micros())?;
     if taker_fee_atomic > taker_atomic {
         return Err(CoreError::InvalidOrder(
             "complete-set fee exceeds taker proceeds".into(),
@@ -3943,7 +4354,11 @@ fn bootstrap_reservation(order: &BookOrder, market: &MarketConfig) -> CoreResult
         OrderAction::Buy => {
             let maximum_notional = notional(order.price_micros, order.quantity_micros)?;
             settlement_atomic(market, maximum_notional)?
-                .checked_add(settlement_atomic(market, ceil_bps(maximum_notional, 20)?)?)
+                .checked_add(maximum_buy_taker_fee_atomic(
+                    market,
+                    order.quantity_micros,
+                    order.price_micros,
+                )?)
                 .ok_or(CoreError::UnbalancedTransaction)
         }
         OrderAction::Sell => Ok(order.quantity_micros),
@@ -4158,6 +4573,221 @@ fn ceil_bps(amount: u128, bps: u128) -> CoreResult<u128> {
         .ok_or(CoreError::UnbalancedTransaction)
 }
 
+fn floor_bps(amount: u128, bps: u128) -> CoreResult<u128> {
+    amount
+        .checked_mul(bps)
+        .map(|value| value / 10_000)
+        .ok_or(CoreError::UnbalancedTransaction)
+}
+
+/// Returns the taker fee in six-decimal settlement micros. V2 policies use
+/// the Polymarket curve C * rate * p * (1-p); historical policies retain the
+/// deployed 20 bps notional fee so open markets cannot change economics after
+/// an enclave rotation.
+fn taker_fee_micros(
+    profile_id: FeeProfileId,
+    quantity_micros: u128,
+    price_micros: u64,
+) -> CoreResult<u128> {
+    let price = u128::from(price_micros);
+    if price == 0 || price >= PRICE_SCALE {
+        return Err(CoreError::InvalidOrder(
+            "fee price must be strictly between zero and one".into(),
+        ));
+    }
+    let Some(rate_bps) = profile_id.taker_curve_rate_bps() else {
+        return ceil_bps(notional(price_micros, quantity_micros)?, 20);
+    };
+    if rate_bps == 0 || quantity_micros == 0 {
+        return Ok(0);
+    }
+
+    let denominator = U256::from(PRICE_SCALE)
+        .checked_mul(U256::from(PRICE_SCALE))
+        .and_then(|value| value.checked_mul(U256::from(10_000u128)))
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    let numerator = U256::from(quantity_micros)
+        .checked_mul(U256::from(price))
+        .and_then(|value| value.checked_mul(U256::from(PRICE_SCALE - price)))
+        .and_then(|value| value.checked_mul(U256::from(rate_bps)))
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    // Polymarket rounds settlement-asset fees to five decimal places. The
+    // private core represents one settlement unit with six decimals before
+    // converting into the asset's native precision, so one fee quantum is ten
+    // micros. Round half-up to that quantum; amounts below half a quantum
+    // become zero and the smallest non-zero fee is 0.00001 settlement units.
+    const FEE_QUANTUM_MICROS: u128 = 10;
+    let quantum_denominator = denominator
+        .checked_mul(U256::from(FEE_QUANTUM_MICROS))
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    let half_quantum = denominator
+        .checked_mul(U256::from(FEE_QUANTUM_MICROS / 2))
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    let fee_quanta = numerator
+        .checked_add(half_quantum)
+        .map(|value| value / quantum_denominator)
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    let fee = fee_quanta
+        .checked_mul(U256::from(FEE_QUANTUM_MICROS))
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    if fee > U256::from(u128::MAX) {
+        return Err(CoreError::UnbalancedTransaction);
+    }
+    Ok(fee.as_u128())
+}
+
+fn taker_fee_atomic(
+    market: &MarketConfig,
+    quantity_micros: u128,
+    price_micros: u64,
+) -> CoreResult<u128> {
+    settlement_atomic(
+        market,
+        taker_fee_micros(market.fee_profile_id, quantity_micros, price_micros)?,
+    )
+}
+
+/// A buy order can execute at any price at or below its limit. The curve peaks
+/// at 50c, so reserve against that peak whenever the executable range includes
+/// it. Resting remainder needs no fee reserve because it becomes maker
+/// liquidity and makers pay zero under V2.
+fn maximum_buy_taker_fee_atomic(
+    market: &MarketConfig,
+    quantity_micros: u128,
+    limit_price_micros: u64,
+) -> CoreResult<u128> {
+    let reserve_price = if market.fee_profile_id.has_polymarket_taker_fees()
+        && limit_price_micros >= (PRICE_SCALE / 2) as u64
+    {
+        (PRICE_SCALE / 2) as u64
+    } else {
+        limit_price_micros
+    };
+    taker_fee_atomic(market, quantity_micros, reserve_price)
+}
+
+fn maker_rebate_bps(profile_id: FeeProfileId) -> u128 {
+    match profile_id {
+        FeeProfileId::PolymarketCryptoV2 => 2_000,
+        FeeProfileId::PolymarketSportsV2 | FeeProfileId::PolymarketEsportsV2 => 1_500,
+        FeeProfileId::PolymarketMacroV2
+        | FeeProfileId::PolymarketFinanceV2
+        | FeeProfileId::PolymarketPoliticsV2
+        | FeeProfileId::PolymarketWeatherV2
+        | FeeProfileId::PolymarketTechnologyV2
+        | FeeProfileId::PolymarketMentionsV2
+        | FeeProfileId::PolymarketScienceV2
+        | FeeProfileId::PolymarketCultureV2
+        | FeeProfileId::PolymarketBusinessV2
+        | FeeProfileId::PolymarketGeneralV2 => 2_500,
+        FeeProfileId::PolymarketGeopoliticsV2 | FeeProfileId::LegacyProfitV1 => 0,
+        FeeProfileId::CryptoV1
+        | FeeProfileId::MacroV1
+        | FeeProfileId::FinanceV1
+        | FeeProfileId::PoliticsV1
+        | FeeProfileId::SportsV1
+        | FeeProfileId::EsportsV1
+        | FeeProfileId::WeatherV1
+        | FeeProfileId::TechnologyV1
+        | FeeProfileId::ScienceV1
+        | FeeProfileId::CultureV1
+        | FeeProfileId::BusinessV1
+        | FeeProfileId::GeopoliticsV1
+        | FeeProfileId::GeneralV1 => 0,
+    }
+}
+
+fn reward_rail(market: &MarketConfig) -> CoreResult<(&'static str, &'static str)> {
+    match market.settlement_asset.as_str() {
+        "USDC" => Ok(("base", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913")),
+        "ZEN" => Ok(("horizen", "0x57da2d504bf8b83ef304759d9f2648522d7a9280")),
+        _ => Err(CoreError::InvalidOrder(
+            "unsupported private reward rail".into(),
+        )),
+    }
+}
+
+fn record_native_fill_economics(
+    rewards: &mut PrivateRewardBook,
+    market: &MarketConfig,
+    result: &MatchResult,
+    occurred_at_millis: i64,
+) -> CoreResult<()> {
+    let (chain, reward_token) = reward_rail(market)?;
+    for fill in &result.fills {
+        let taker_fee = taker_fee_atomic(market, fill.quantity_micros, fill.taker_price_micros())?;
+        let maker_rebate = floor_bps(taker_fee, maker_rebate_bps(market.fee_profile_id))?;
+        rewards.record_fill(
+            &fill.taker_private_user_id,
+            Some(&fill.maker_private_user_id),
+            chain,
+            reward_token,
+            fill.quantity_micros,
+            taker_fee,
+            maker_rebate,
+            occurred_at_millis,
+        )?;
+    }
+    Ok(())
+}
+
+fn settlement_winning_fee(
+    profile_id: FeeProfileId,
+    executed_stake_atomic: u128,
+    gross_payout_atomic: u128,
+    is_push: bool,
+) -> CoreResult<u128> {
+    if profile_id.has_polymarket_taker_fees() {
+        return Ok(0);
+    }
+    if is_push || gross_payout_atomic <= executed_stake_atomic {
+        return Ok(0);
+    }
+    let profit = gross_payout_atomic - executed_stake_atomic;
+    let Some(profile) = profile_id.parameters() else {
+        return ceil_bps(profit, 500);
+    };
+
+    // curve = q * coefficient * p * (1-p), where q is gross payout and
+    // p = executed stake / gross payout. U256 is already in the locked EIF
+    // dependency closure. Reduce the BPS fraction first; because stake and
+    // profit sum to gross, their product is at most gross^2/4 and the reduced
+    // numerator multiplier (at most three for the governed profiles) fits
+    // exactly in U256 for the complete u128 input domain.
+    let divisor = gcd(profile.curve_coefficient_bps, 10_000);
+    let coefficient_numerator = profile.curve_coefficient_bps / divisor;
+    let coefficient_denominator = 10_000 / divisor;
+    let numerator = U256::from(executed_stake_atomic)
+        .checked_mul(U256::from(profit))
+        .and_then(|value| value.checked_mul(U256::from(coefficient_numerator)))
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    let denominator = U256::from(gross_payout_atomic)
+        .checked_mul(U256::from(coefficient_denominator))
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    let curve_fee_u256 = numerator
+        .checked_add(denominator - U256::one())
+        .map(|value| value / denominator)
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    if curve_fee_u256 > U256::from(u128::MAX) {
+        return Err(CoreError::UnbalancedTransaction);
+    }
+    let curve_fee = curve_fee_u256.as_u128();
+    let stake_floor = ceil_bps(executed_stake_atomic, profile.stake_floor_bps)?;
+    let stake_cap = floor_bps(executed_stake_atomic, profile.stake_cap_bps)?;
+    let profit_cap = floor_bps(profit, profile.profit_cap_bps)?;
+
+    Ok(curve_fee.max(stake_floor).min(stake_cap).min(profit_cap))
+}
+
+fn gcd(mut left: u128, mut right: u128) -> u128 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
 fn native_audit_drafts(
     incoming: &BookOrder,
     result: &MatchResult,
@@ -4172,7 +4802,6 @@ fn native_audit_drafts(
             // For complete-set fills this is the exact complement of the
             // resting maker price, while NORMAL remains unchanged.
             let taker_price_micros = fill.taker_price_micros();
-            let fill_notional = notional(taker_price_micros, fill.quantity_micros)?;
             let (buyer, seller) = match incoming.action {
                 OrderAction::Buy => (
                     fill.taker_private_user_id.clone(),
@@ -4198,7 +4827,7 @@ fn native_audit_drafts(
                     MatchType::Merge => "MERGE",
                 }
                 .into(),
-                fee_atomic: settlement_atomic(market, ceil_bps(fill_notional, 20)?)?,
+                fee_atomic: taker_fee_atomic(market, fill.quantity_micros, taker_price_micros)?,
                 nonce: fill.sequence,
             })
         })
@@ -4898,6 +5527,62 @@ fn validate_withdrawal(
     Ok(())
 }
 
+fn derive_transfer_account(identity_commitment: &[u8; 32]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.private-transfer-account.v1\0");
+    hash.update(identity_commitment);
+    format!("layrs_{}", hex::encode(hash.finalize()))
+}
+
+fn transfer_account_marker(transfer_account: &str, private_user_id: &str) -> String {
+    format!("private-transfer-account:{transfer_account}:{private_user_id}")
+}
+
+fn resolve_transfer_account(
+    system_keys: &BTreeSet<String>,
+    transfer_account: &str,
+) -> CoreResult<String> {
+    let prefix = format!("private-transfer-account:{transfer_account}:");
+    let mut matches = system_keys
+        .range(prefix.clone()..)
+        .take_while(|key| key.starts_with(&prefix));
+    let marker = matches
+        .next()
+        .ok_or_else(|| CoreError::InvalidOrder("unknown transfer account".into()))?;
+    if matches.next().is_some() {
+        return Err(CoreError::InvalidOrder("ambiguous transfer account".into()));
+    }
+    let private_user_id = marker[prefix.len()..].to_string();
+    if !private_user_id.starts_with("usr_") || private_user_id.len() != 68 {
+        return Err(CoreError::InvalidOrder(
+            "invalid transfer account binding".into(),
+        ));
+    }
+    Ok(private_user_id)
+}
+
+fn validate_private_transfer(
+    recipient_account: &str,
+    asset: &str,
+    amount_atomic: u128,
+) -> CoreResult<()> {
+    let account_suffix = recipient_account.strip_prefix("layrs_");
+    if amount_atomic == 0
+        || !matches!(asset, "USDC" | "ZEN")
+        || account_suffix.is_none_or(|suffix| {
+            suffix.len() != 64
+                || !suffix
+                    .bytes()
+                    .all(|value| value.is_ascii_digit() || (b'a'..=b'f').contains(&value))
+        })
+    {
+        return Err(CoreError::InvalidOrder(
+            "invalid private transfer request".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn derive_private_user_id(identity_key: &[u8; 32], commitment: &[u8; 32]) -> String {
     let mut hash = Sha256::new();
     hash.update(b"layrs.private-user-id.v1\0");
@@ -4963,6 +5648,20 @@ fn processed_hashes(processed: &BTreeMap<String, ProcessedCommand>) -> BTreeMap<
         .iter()
         .map(|(key, value)| (key.clone(), value.request_hash))
         .collect()
+}
+
+fn read_only_response_hash(
+    command: &UserCommand,
+    result: &CommandResult,
+    state_root: [u8; 32],
+) -> CoreResult<[u8; 32]> {
+    let encoded =
+        serde_json::to_vec(&(command, result)).map_err(|_| CoreError::RequestHashMismatch)?;
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.read-only-response.v1\0");
+    hash.update(state_root);
+    hash.update(encoded);
+    Ok(hash.finalize().into())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5168,6 +5867,214 @@ fn remove_json_field(value: &mut serde_json::Value, field: &str) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod category_fee_tests {
+    use super::*;
+
+    const GROSS: u128 = 100_000_000;
+
+    #[test]
+    fn legacy_profile_preserves_five_percent_profit_fee() {
+        assert_eq!(
+            settlement_winning_fee(FeeProfileId::LegacyProfitV1, 80_000_000, GROSS, false).unwrap(),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn category_profiles_follow_curve_and_caps_at_representative_prices() {
+        let vectors = [
+            // profile, stake, expected fee
+            (FeeProfileId::CryptoV1, 50_000_000, 2_000_000),
+            (FeeProfileId::MacroV1, 50_000_000, 1_500_000),
+            (FeeProfileId::SportsV1, 50_000_000, 1_000_000),
+            (FeeProfileId::EsportsV1, 50_000_000, 1_000_000),
+            (FeeProfileId::GeneralV1, 50_000_000, 1_250_000),
+            (FeeProfileId::CryptoV1, 80_000_000, 1_000_000),
+            (FeeProfileId::MacroV1, 80_000_000, 960_000),
+            (FeeProfileId::SportsV1, 80_000_000, 800_000),
+            (FeeProfileId::CryptoV1, 20_000_000, 800_000),
+            (FeeProfileId::MacroV1, 20_000_000, 600_000),
+            (FeeProfileId::SportsV1, 20_000_000, 400_000),
+            // The five-percent-profit safety cap overrides the one-percent
+            // stake target for near-certain winners.
+            (FeeProfileId::CryptoV1, 95_000_000, 250_000),
+        ];
+        for (profile, stake, expected) in vectors {
+            assert_eq!(
+                settlement_winning_fee(profile, stake, GROSS, false).unwrap(),
+                expected,
+                "unexpected fee for {profile:?} at stake {stake}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_performance_fee_is_charged_on_loss_break_even_or_push() {
+        for profile in [FeeProfileId::LegacyProfitV1, FeeProfileId::CryptoV1] {
+            assert_eq!(settlement_winning_fee(profile, GROSS, 0, false).unwrap(), 0);
+            assert_eq!(
+                settlement_winning_fee(profile, GROSS, GROSS, false).unwrap(),
+                0
+            );
+            assert_eq!(
+                settlement_winning_fee(profile, 20_000_000, GROSS, true).unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn configured_profiles_never_exceed_stake_or_profit_caps() {
+        let profiles = [
+            FeeProfileId::CryptoV1,
+            FeeProfileId::MacroV1,
+            FeeProfileId::FinanceV1,
+            FeeProfileId::PoliticsV1,
+            FeeProfileId::SportsV1,
+            FeeProfileId::EsportsV1,
+            FeeProfileId::WeatherV1,
+            FeeProfileId::TechnologyV1,
+            FeeProfileId::ScienceV1,
+            FeeProfileId::CultureV1,
+            FeeProfileId::BusinessV1,
+            FeeProfileId::GeopoliticsV1,
+            FeeProfileId::GeneralV1,
+        ];
+        for gross in [1u128, 10, 1_000_000, 1_000_000_000_000, u64::MAX as u128] {
+            for price_bps in 1u128..10_000 {
+                let stake = gross.saturating_mul(price_bps) / 10_000;
+                if stake == 0 || stake >= gross {
+                    continue;
+                }
+                let profit = gross - stake;
+                for profile in profiles {
+                    let fee = settlement_winning_fee(profile, stake, gross, false).unwrap();
+                    let parameters = profile.parameters().unwrap();
+                    assert!(fee <= floor_bps(stake, parameters.stake_cap_bps).unwrap());
+                    assert!(fee <= floor_bps(profit, parameters.profit_cap_bps).unwrap());
+                    assert!(fee <= gross);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn calculation_is_deterministic_across_repeated_runs() {
+        let expected = settlement_winning_fee(
+            FeeProfileId::CryptoV1,
+            12_345_678_901_234_567,
+            98_765_432_109_876_543,
+            false,
+        )
+        .unwrap();
+        for _ in 0..1_000 {
+            assert_eq!(
+                settlement_winning_fee(
+                    FeeProfileId::CryptoV1,
+                    12_345_678_901_234_567,
+                    98_765_432_109_876_543,
+                    false,
+                )
+                .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn polymarket_v2_profiles_cover_every_supported_category() {
+        let vectors = [
+            (FeeProfileId::PolymarketCryptoV2, 700),
+            (FeeProfileId::PolymarketMacroV2, 500),
+            (FeeProfileId::PolymarketFinanceV2, 400),
+            (FeeProfileId::PolymarketPoliticsV2, 400),
+            (FeeProfileId::PolymarketSportsV2, 500),
+            (FeeProfileId::PolymarketEsportsV2, 500),
+            (FeeProfileId::PolymarketWeatherV2, 500),
+            (FeeProfileId::PolymarketTechnologyV2, 400),
+            (FeeProfileId::PolymarketMentionsV2, 400),
+            (FeeProfileId::PolymarketScienceV2, 500),
+            (FeeProfileId::PolymarketCultureV2, 500),
+            (FeeProfileId::PolymarketBusinessV2, 400),
+            (FeeProfileId::PolymarketGeneralV2, 500),
+            (FeeProfileId::PolymarketGeopoliticsV2, 0),
+        ];
+
+        for (profile, expected_rate_bps) in vectors {
+            assert!(profile.has_polymarket_taker_fees());
+            assert_eq!(profile.taker_curve_rate_bps(), Some(expected_rate_bps));
+            assert_eq!(profile.parameters(), None);
+            assert_eq!(settlement_winning_fee(profile, 10, 100, false).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn polymarket_v2_curve_matches_public_fee_vectors() {
+        const ONE_HUNDRED_SHARES: u128 = 100_000_000;
+        let vectors = [
+            (FeeProfileId::PolymarketCryptoV2, 1_750_000),
+            (FeeProfileId::PolymarketSportsV2, 1_250_000),
+            (FeeProfileId::PolymarketFinanceV2, 1_000_000),
+            (FeeProfileId::PolymarketMacroV2, 1_250_000),
+            (FeeProfileId::PolymarketGeopoliticsV2, 0),
+        ];
+
+        for (profile, expected_at_fifty_cents) in vectors {
+            assert_eq!(
+                taker_fee_micros(profile, ONE_HUNDRED_SHARES, 500_000).unwrap(),
+                expected_at_fifty_cents,
+                "unexpected 50c fee for {profile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn polymarket_v2_curve_is_symmetric_and_peaks_at_fifty_cents() {
+        const SHARES: u128 = 123_456_789;
+        for profile in [
+            FeeProfileId::PolymarketCryptoV2,
+            FeeProfileId::PolymarketMacroV2,
+            FeeProfileId::PolymarketSportsV2,
+            FeeProfileId::PolymarketTechnologyV2,
+        ] {
+            let low = taker_fee_micros(profile, SHARES, 10_000).unwrap();
+            let high = taker_fee_micros(profile, SHARES, 990_000).unwrap();
+            let middle = taker_fee_micros(profile, SHARES, 500_000).unwrap();
+            assert_eq!(low, high, "curve is not symmetric for {profile:?}");
+            assert!(middle >= low, "curve does not peak at 50c for {profile:?}");
+        }
+    }
+
+    #[test]
+    fn polymarket_v2_fee_rounds_to_five_decimal_places() {
+        assert_eq!(
+            taker_fee_micros(FeeProfileId::PolymarketCryptoV2, 100_000_000, 10_000).unwrap(),
+            69_300
+        );
+        assert_eq!(
+            taker_fee_micros(FeeProfileId::PolymarketCryptoV2, 1, 10_000).unwrap(),
+            0
+        );
+        assert_eq!(
+            taker_fee_micros(FeeProfileId::PolymarketCryptoV2, 100, 500_000).unwrap(),
+            0
+        );
+        assert_eq!(
+            taker_fee_micros(FeeProfileId::PolymarketCryptoV2, 1_000, 500_000).unwrap(),
+            20
+        );
+    }
+
+    #[test]
+    fn legacy_taker_fee_remains_twenty_basis_points_of_notional() {
+        assert_eq!(
+            taker_fee_micros(FeeProfileId::LegacyProfitV1, 100_000_000, 500_000).unwrap(),
+            100_000
+        );
     }
 }
 
