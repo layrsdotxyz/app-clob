@@ -1282,6 +1282,99 @@ fn rolling_zen_markets_handle_many_small_multi_user_trades_cancellation_and_lock
 }
 
 #[test]
+fn public_depth_hides_thin_levels_buckets_size_and_clears_at_market_close() {
+    let journal_key = [211u8; 32];
+    let mut core = PrivateTradingCore::new(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([212u8; 48]),
+    );
+    let market_id = "layrs:v5:BTC:USDC:15m:3";
+    core.register_market(
+        "sys:market:privacy-depth".into(),
+        MarketConfig {
+            market_id: market_id.into(),
+            settlement_asset: "USDC".into(),
+            settlement_decimals: 6,
+            public_settlement_chain: Some("base".into()),
+            opens_at_millis: 1_000,
+            closes_at_millis: 3_000,
+            minimum_quantity_micros: 1,
+            maximum_quantity_micros: 100_000_000,
+            minimum_order_notional_micros: 1,
+            maximum_order_notional_micros: 100_000_000,
+            maximum_user_position_micros: 100_000_000,
+            maximum_pending_bootstrap_notional_micros: 100_000_000,
+            tick_size_micros: 10_000,
+            oracle_feed_id: 9002,
+            fee_profile_id: FeeProfileId::PolymarketCryptoV2,
+            execution: MarketExecution::NativeClob,
+        },
+        900,
+    )
+    .unwrap();
+
+    let users = [
+        (SigningKey::from_bytes(&[213u8; 32]), [214u8; 32]),
+        (SigningKey::from_bytes(&[215u8; 32]), [216u8; 32]),
+        (SigningKey::from_bytes(&[217u8; 32]), [218u8; 32]),
+    ];
+    for (index, (key, commitment)) in users.iter().enumerate() {
+        let session_id = format!("session:privacy-depth:{index}");
+        core.register_session(
+            format!("sys:session:privacy-depth:{index}"),
+            session_id.clone(),
+            *commitment,
+            key.verifying_key().to_bytes(),
+            10_000,
+            925 + index as i64,
+        )
+        .unwrap();
+        core.apply_user_external_flow(
+            format!("sys:deposit:privacy-depth:{index}"),
+            *commitment,
+            "USDC".into(),
+            AccountBucket::UserAvailable,
+            10_000_000,
+            ExternalFlowDirection::Inflow,
+            *commitment,
+            950 + index as i64,
+        )
+        .unwrap();
+        execute_signed(
+            &mut core,
+            key,
+            &session_id,
+            1,
+            &format!("cmd:privacy-depth:{index}"),
+            UserCommandAction::SubmitOrder {
+                order: BookOrder::new(
+                    "ignored",
+                    market_id,
+                    Outcome::Up,
+                    OrderAction::Buy,
+                    150_000,
+                    6_666_667,
+                    TimeInForce::Gtc,
+                    None,
+                ),
+            },
+            1_100 + index as i64,
+        );
+
+        let (bids, _) = core.aggregate_depth(market_id, Outcome::Up, 1_500, 1_000_000);
+        if index < 2 {
+            assert!(bids.is_empty(), "one or two owners must remain private");
+        } else {
+            assert_eq!(bids, vec![(150_000, 20_000_000)]);
+        }
+    }
+
+    let (closed_bids, closed_asks) = core.aggregate_depth(market_id, Outcome::Up, 3_000, 1_000_000);
+    assert!(closed_bids.is_empty());
+    assert!(closed_asks.is_empty());
+}
+
+#[test]
 fn resolution_cannot_double_credit_and_dust_fees_stay_conservative() {
     let oracle = SigningKey::from_bytes(&[71u8; 32]);
     let user = SigningKey::from_bytes(&[72u8; 32]);

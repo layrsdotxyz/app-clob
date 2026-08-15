@@ -21,6 +21,12 @@ use super::{
     PRICE_SCALE,
 };
 
+/// Public depth is deliberately less precise than the enclave's private book.
+/// A level must contain liquidity from at least this many independent private
+/// owners before it can leave the enclave. This prevents a thin public level
+/// from acting as an oracle for one user's exact order size and arrival time.
+const MIN_PUBLIC_DEPTH_DISTINCT_OWNERS: usize = 3;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketConfig {
     pub market_id: String,
@@ -3344,6 +3350,14 @@ impl PrivateTradingCore {
         now_millis: i64,
         minimum_level_quantity_micros: u128,
     ) -> (Vec<(u64, u128)>, Vec<(u64, u128)>) {
+        let Some(market) = self.markets.get(market_id) else {
+            return (Vec::new(), Vec::new());
+        };
+        // No closed-market liquidity is public, even if GTC orders remain in
+        // the private book awaiting the deterministic lifecycle cancellation.
+        if now_millis < market.opens_at_millis || now_millis >= market.closes_at_millis {
+            return (Vec::new(), Vec::new());
+        }
         self.books.get(market_id).map_or_else(
             || (Vec::new(), Vec::new()),
             |book| {
@@ -3351,8 +3365,18 @@ impl PrivateTradingCore {
                 let filter = |levels: Vec<(u64, u128, usize)>| {
                     levels
                         .into_iter()
-                        .filter(|(_, quantity, _)| *quantity >= minimum_level_quantity_micros)
-                        .map(|(price, quantity, _)| (price, quantity))
+                        .filter(|(_, quantity, distinct_owners)| {
+                            *quantity >= minimum_level_quantity_micros
+                                && *distinct_owners >= MIN_PUBLIC_DEPTH_DISTINCT_OWNERS
+                        })
+                        .filter_map(|(price, quantity, _)| {
+                            // Publish only whole privacy buckets. Observers see
+                            // a bounded range, never the enclave's exact size.
+                            let bucketed = quantity
+                                .checked_div(minimum_level_quantity_micros)?
+                                .checked_mul(minimum_level_quantity_micros)?;
+                            (bucketed > 0).then_some((price, bucketed))
+                        })
                         .collect()
                 };
                 (filter(bids), filter(asks))

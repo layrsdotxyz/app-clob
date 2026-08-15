@@ -564,8 +564,8 @@ impl PriceTimeBook {
         outcome: Outcome,
         now_millis: i64,
     ) -> (Vec<(u64, u128, usize)>, Vec<(u64, u128, usize)>) {
-        let mut bids: BTreeMap<u64, (u128, usize)> = BTreeMap::new();
-        let mut asks: BTreeMap<u64, (u128, usize)> = BTreeMap::new();
+        let mut bids: BTreeMap<u64, (u128, BTreeSet<&str>)> = BTreeMap::new();
+        let mut asks: BTreeMap<u64, (u128, BTreeSet<&str>)> = BTreeMap::new();
         for order_id in &self.active {
             let order = &self.orders[order_id];
             if order.market_id != market_id
@@ -580,16 +580,16 @@ impl PriceTimeBook {
             };
             let level = side.entry(order.price_micros).or_default();
             level.0 += order.remaining_micros;
-            level.1 += 1;
+            level.1.insert(order.private_user_id.as_str());
         }
         let bids = bids
             .into_iter()
             .rev()
-            .map(|(price, (size, count))| (price, size, count))
+            .map(|(price, (size, owners))| (price, size, owners.len()))
             .collect();
         let asks = asks
             .into_iter()
-            .map(|(price, (size, count))| (price, size, count))
+            .map(|(price, (size, owners))| (price, size, owners.len()))
             .collect();
         (bids, asks)
     }
