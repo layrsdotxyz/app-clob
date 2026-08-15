@@ -1155,9 +1155,9 @@ fn live_shape_partial_mint_is_ready_for_resolution_after_cancelling_remainder() 
 }
 
 #[test]
-fn polymarket_curve_fee_and_maker_rebate_are_private_and_conserved_on_mint() {
+fn layrs_curve_fee_and_maker_rebate_are_private_and_conserved_on_mint() {
     let (mut core, up_key, down_key, _, _) =
-        configured_core_with_profile(FeeProfileId::PolymarketCryptoV2);
+        configured_core_with_profile(FeeProfileId::LayrsCryptoV2);
     execute(
         &mut core,
         &up_key,
