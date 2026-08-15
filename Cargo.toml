@@ -98,6 +98,7 @@ openssl = { version = "0.10", features = ["vendored"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 sha2 = "0.10"
 zeroize = { version = "1.8", features = ["derive"] }
+zstd = "0.13"
 aws-nitro-enclaves-nsm-api = "0.5.2"
 tokio-vsock = "0.7.2"
 x25519-dalek = { version = "3.0.0", features = ["static_secrets", "getrandom"] }

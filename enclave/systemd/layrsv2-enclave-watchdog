@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+log_dir=/var/log/nitro_enclaves
+log_file="${log_dir}/nitro_enclaves.log"
+/usr/bin/install -d -o root -g root -m 0755 "${log_dir}"
+if [[ ! -e "${log_file}" ]]; then
+  /usr/bin/install -o root -g root -m 0644 /dev/null "${log_file}"
+fi
+
+description=$(/usr/bin/nitro-cli describe-enclaves 2>/dev/null || true)
+if /usr/bin/grep -q '"EnclaveCID": 16' <<<"${description}" \
+  && /usr/bin/grep -q '"State": "RUNNING"' <<<"${description}"; then
+  if /usr/bin/systemctl is-active --quiet layrsv2-enclave-parent.service; then
+    exit 0
+  fi
+  /usr/bin/systemctl restart layrsv2-enclave-parent.service
+  exit 0
+fi
+
+/usr/bin/systemctl restart layrsv2-enclave.service
+/usr/bin/systemctl restart layrsv2-enclave-parent.service

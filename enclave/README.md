@@ -59,11 +59,16 @@ enclave never accepts a wallet address as a private ledger owner.
 Before building, the production runtime lock must pass its independent advisory gate:
 
 ```sh
-cargo audit --file enclave/runtime/Cargo.lock
-cargo audit --file enclave/parent-runtime/Cargo.lock
+./scripts/audit-enclave-dependencies.sh
 cargo test --locked --manifest-path enclave/runtime/Cargo.toml
 cargo test --locked --manifest-path enclave/parent-runtime/Cargo.toml
 ```
+
+The audit script permits `RUSTSEC-2026-0235` only while `rkyv` is absent from the runtime's
+active dependency graph. `rust_decimal` declares `rkyv` as an optional feature, which causes Cargo
+to record it in the lockfile even though the production enclave does not compile or link it. The
+script fails closed if a future dependency or feature activates `rkyv`; the exception must then be
+removed and the dependency upgraded before release.
 
 Build on a Nitro-enabled Linux host:
 

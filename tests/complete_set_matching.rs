@@ -1,8 +1,8 @@
 use clob_service::private_core::{
     command_request_hash, exact_condition_resolution_signing_payload, resolution_signing_payload,
     signing_payload, AccountBucket, AccountKey, BookOrder, BoundaryEvidence, CommandResult,
-    ExactConditionResolutionStatement, ExternalFlowDirection, JournalKey, MarketConfig,
-    MarketExecution, MatchType, OrderAction, OrderStatus, Outcome, PriceTimeBook,
+    ExactConditionResolutionStatement, ExternalFlowDirection, FeeProfileId, JournalKey,
+    MarketConfig, MarketExecution, MatchType, OrderAction, OrderStatus, Outcome, PriceTimeBook,
     PrivateTradingCore, ReceiptSigner, ResolutionOutcome, ResolutionStatement, SessionRequest,
     SignedExactConditionResolution, SignedResolution, SignedSessionRequest, TimeInForce,
     UserCommand, UserCommandAction,
@@ -165,6 +165,126 @@ fn complementary_buy_boundary_partial_and_fok_semantics_are_deterministic() {
         )
         .unwrap();
     assert_eq!(partial, replayed);
+}
+
+#[test]
+fn complementary_rounding_dust_does_not_poison_a_price_level() {
+    let now = 1_000;
+    let mut book = PriceTimeBook::default();
+    let dust_maker_id = Uuid::from_u128(5);
+    let clean_maker_id = Uuid::from_u128(6);
+
+    book.submit(
+        BookOrder::with_id(
+            dust_maker_id,
+            "up-maker-one",
+            MARKET_ID,
+            Outcome::Up,
+            OrderAction::Buy,
+            350_000,
+            2_857_143,
+            TimeInForce::Gtc,
+            None,
+        ),
+        now,
+    )
+    .unwrap();
+    let first = book
+        .submit(
+            BookOrder::with_id(
+                Uuid::from_u128(7),
+                "down-taker-one",
+                MARKET_ID,
+                Outcome::Down,
+                OrderAction::Buy,
+                650_000,
+                2_857_142,
+                TimeInForce::Fak,
+                None,
+            ),
+            now + 1,
+        )
+        .unwrap();
+    assert_eq!(first.fills.len(), 1);
+    assert_eq!(first.fills[0].quantity_micros, 2_857_142);
+    assert_eq!(book.order(dust_maker_id).unwrap().remaining_micros, 1);
+
+    book.submit(
+        BookOrder::with_id(
+            clean_maker_id,
+            "up-maker-two",
+            MARKET_ID,
+            Outcome::Up,
+            OrderAction::Buy,
+            350_000,
+            2_500_000,
+            TimeInForce::Gtc,
+            None,
+        ),
+        now + 2,
+    )
+    .unwrap();
+    let second_order = BookOrder::with_id(
+        Uuid::from_u128(8),
+        "down-taker-two",
+        MARKET_ID,
+        Outcome::Down,
+        OrderAction::Buy,
+        650_000,
+        2_500_000,
+        TimeInForce::Fok,
+        None,
+    );
+    let before_second = book.clone();
+    let second = book.submit(second_order.clone(), now + 3).unwrap();
+
+    assert_eq!(second.fills.len(), 1);
+    assert_eq!(second.fills[0].maker_order_id, clean_maker_id);
+    assert_eq!(second.fills[0].quantity_micros, 2_500_000);
+    assert_eq!(book.order(dust_maker_id).unwrap().remaining_micros, 1);
+
+    let mut replay = before_second;
+    assert_eq!(second, replay.submit(second_order, now + 3).unwrap());
+}
+
+#[test]
+fn fok_ignores_complete_set_quantity_that_cannot_split_at_settlement_precision() {
+    let now = 1_000;
+    let mut book = PriceTimeBook::default();
+    book.submit(
+        BookOrder::with_id(
+            Uuid::from_u128(9),
+            "high-price-maker",
+            MARKET_ID,
+            Outcome::Up,
+            OrderAction::Buy,
+            650_000,
+            2,
+            TimeInForce::Gtc,
+            None,
+        ),
+        now,
+    )
+    .unwrap();
+
+    let result = book
+        .submit(
+            BookOrder::with_id(
+                Uuid::from_u128(11),
+                "complementary-taker",
+                MARKET_ID,
+                Outcome::Down,
+                OrderAction::Buy,
+                350_000,
+                2,
+                TimeInForce::Fok,
+                None,
+            ),
+            now + 1,
+        )
+        .unwrap();
+    assert!(result.fills.is_empty());
+    assert_eq!(result.accepted_order.unwrap().status, OrderStatus::Rejected);
 }
 
 #[test]
@@ -1034,7 +1154,106 @@ fn live_shape_partial_mint_is_ready_for_resolution_after_cancelling_remainder() 
     assert_eq!(core.balance(&claim(&down_owner, Outcome::Down)), 0);
 }
 
+#[test]
+fn polymarket_curve_fee_and_maker_rebate_are_private_and_conserved_on_mint() {
+    let (mut core, up_key, down_key, _, _) =
+        configured_core_with_profile(FeeProfileId::PolymarketCryptoV2);
+    execute(
+        &mut core,
+        &up_key,
+        "session:up",
+        1,
+        "cmd:v2-rebate-maker",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::with_id(
+                Uuid::from_u128(799),
+                "ignored",
+                MARKET_ID,
+                Outcome::Up,
+                OrderAction::Buy,
+                400_000,
+                1_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_000,
+    );
+    let taker_fill = execute(
+        &mut core,
+        &down_key,
+        "session:down",
+        1,
+        "cmd:v2-rebate-taker",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::with_id(
+                Uuid::from_u128(800),
+                "ignored",
+                MARKET_ID,
+                Outcome::Down,
+                OrderAction::Buy,
+                600_000,
+                1_000_000,
+                TimeInForce::Fok,
+                None,
+            ),
+        },
+        1_050,
+    );
+    assert_eq!(
+        order_result(&taker_fill.result).fills[0].match_type,
+        MatchType::Mint
+    );
+    assert_eq!(
+        taker_fill.audit_fills[0].statement.fee_atomic,
+        "16800000000000000"
+    );
+
+    let maker_rewards = execute(
+        &mut core,
+        &up_key,
+        "session:up",
+        2,
+        "cmd:v2-maker-rewards",
+        UserCommandAction::Rewards,
+        1_100,
+    );
+    let taker_rewards = execute(
+        &mut core,
+        &down_key,
+        "session:down",
+        2,
+        "cmd:v2-taker-rewards",
+        UserCommandAction::Rewards,
+        1_100,
+    );
+    let CommandResult::Rewards { entitlements } = maker_rewards.result else {
+        panic!("expected maker rewards");
+    };
+    assert_eq!(entitlements.len(), 1);
+    assert_eq!(entitlements[0].cumulative_amount_atomic, "3360000000000000");
+    assert_eq!(
+        entitlements[0].cumulative_maker_rebate_atomic,
+        "3360000000000000"
+    );
+    let CommandResult::Rewards { entitlements } = taker_rewards.result else {
+        panic!("expected taker rewards");
+    };
+    assert_eq!(entitlements.len(), 1);
+    assert_eq!(entitlements[0].cumulative_amount_atomic, "0");
+    assert_eq!(
+        entitlements[0].cumulative_taker_fees_atomic,
+        "16800000000000000"
+    );
+}
+
 fn configured_core() -> (PrivateTradingCore, SigningKey, SigningKey, String, String) {
+    configured_core_with_profile(FeeProfileId::LegacyProfitV1)
+}
+
+fn configured_core_with_profile(
+    fee_profile_id: FeeProfileId,
+) -> (PrivateTradingCore, SigningKey, SigningKey, String, String) {
     let journal_key = [31u8; 32];
     let up_key = SigningKey::from_bytes(&[32u8; 32]);
     let down_key = SigningKey::from_bytes(&[33u8; 32]);
@@ -1066,6 +1285,7 @@ fn configured_core() -> (PrivateTradingCore, SigningKey, SigningKey, String, Str
             maximum_pending_bootstrap_notional_micros: 100_000_000,
             tick_size_micros: 100,
             oracle_feed_id: 245,
+            fee_profile_id,
             execution: MarketExecution::NativeClob,
         },
         800,
@@ -1141,6 +1361,7 @@ fn configured_exact_condition_core_with_balance(
             // compatibility; exact-condition resolution ignores it and verifies
             // the signed condition/evidence tuple instead.
             oracle_feed_id: 245,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
             execution: MarketExecution::NativeExactCondition {
                 condition_id: format!("0x{}", "22".repeat(32)),
                 up_outcome_index: 0,

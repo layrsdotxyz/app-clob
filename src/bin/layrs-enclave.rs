@@ -58,8 +58,9 @@ use zeroize::Zeroize;
 const PORT: u32 = 5_003;
 // Must match or exceed the parent relay cap. Provisioning restores encrypted
 // checkpoints over this vsock channel; JSON byte-array encoding expands a
-// ~1 MiB archived snapshot into a multi-MiB operator command.
-const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+// archived snapshots into materially larger operator commands. Keep this aligned
+// with the bounded parent relay so a valid durable checkpoint is recoverable.
+const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 const MAX_TRANSPORT_REPLAY_ENTRIES: usize = 262_144;
 const MAX_OPERATOR_REPLAY_ENTRIES: usize = 100_000;
 
@@ -245,6 +246,14 @@ enum OperatorCommand {
         expires_at_millis: i64,
         now_millis: i64,
     },
+    RegisterTransferAccount {
+        idempotency_key: String,
+        identity_commitment: [u8; 32],
+        now_millis: i64,
+    },
+    TransferAccountStatus {
+        identity_commitment: [u8; 32],
+    },
     ExternalFlow {
         idempotency_key: String,
         account: AccountKey,
@@ -348,6 +357,10 @@ enum UnsignedResolutionEvidence {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+// Keep the authenticated wire schema byte-for-byte stable. Boxing the operator
+// envelope would change the request representation for no runtime benefit in
+// this short-lived decode path, so acknowledge the Rust 1.94 size lint here.
+#[allow(clippy::large_enum_variant)]
 enum PlainRequest {
     Operator {
         envelope: OperatorEnvelope,
@@ -393,6 +406,10 @@ enum PlainResponse {
     },
     System {
         response: SystemResponse,
+    },
+    TransferAccountStatus {
+        transfer_account: String,
+        registered: bool,
     },
     PoolWithdrawalSigned {
         transaction: PoolWithdrawalTransaction,
@@ -676,7 +693,7 @@ async fn handle_encrypted(
     // These sidecars contain only AEAD ciphertext and its integrity/chain metadata. They let the
     // untrusted parent persist state transitions without learning the encrypted response body.
     let journal_artifacts = match &response {
-        PlainResponse::User { response } => vec![response.encrypted_record.clone()],
+        PlainResponse::User { response } => response.encrypted_record.clone().into_iter().collect(),
         PlainResponse::System { response } => vec![response.encrypted_record.clone()],
         PlainResponse::PoolWithdrawalSigned {
             response: Some(response),
@@ -1578,6 +1595,19 @@ async fn dispatch_operator(
             .market_settlement_readiness(&market_id, now_millis)
             .map(|readiness| PlainResponse::ResolutionReadiness { readiness })
             .map_err(|error| error.to_string()),
+        OperatorCommand::TransferAccountStatus {
+            identity_commitment,
+        } => {
+            let status = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .transfer_account_status(identity_commitment);
+            Ok(PlainResponse::TransferAccountStatus {
+                transfer_account: status.transfer_account,
+                registered: status.registered,
+            })
+        }
         OperatorCommand::TradingFreezeStatus => Ok(PlainResponse::TradingFreezeStatus {
             frozen: state
                 .core
@@ -1736,6 +1766,13 @@ async fn dispatch_operator(
                     expires_at_millis,
                     now_millis,
                 ),
+                OperatorCommand::RegisterTransferAccount {
+                    idempotency_key,
+                    identity_commitment,
+                    now_millis,
+                } => {
+                    core.register_transfer_account(idempotency_key, identity_commitment, now_millis)
+                }
                 OperatorCommand::ExternalFlow {
                     idempotency_key,
                     account,
@@ -1903,6 +1940,7 @@ async fn dispatch_operator(
                 | OperatorCommand::MarketStatus { .. }
                 | OperatorCommand::ResolutionStatus { .. }
                 | OperatorCommand::ResolutionReadiness { .. }
+                | OperatorCommand::TransferAccountStatus { .. }
                 | OperatorCommand::TradingFreezeStatus
                 | OperatorCommand::AggregateDepth { .. }
                 | OperatorCommand::ReconcileBootstrap { .. } => unreachable!(),
@@ -2365,6 +2403,7 @@ async fn write_frame(stream: &mut VsockStream, value: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clob_service::private_core::FeeProfileId;
 
     #[test]
     fn replay_cache_rejects_duplicate_keys() {
@@ -2402,7 +2441,7 @@ mod tests {
 
     #[test]
     fn relay_frame_limit_supports_checkpoint_restore_payloads() {
-        const { assert!(MAX_FRAME_BYTES >= 64 * 1024 * 1024) };
+        const { assert!(MAX_FRAME_BYTES >= 256 * 1024 * 1024) };
     }
 
     #[test]
@@ -2448,6 +2487,7 @@ mod tests {
                 maximum_pending_bootstrap_notional_micros: 100_000_000,
                 tick_size_micros: 1_000,
                 oracle_feed_id: 1,
+                fee_profile_id: FeeProfileId::LegacyProfitV1,
                 execution: MarketExecution::PolymarketBootstrap {
                     condition_id: format!("0x{}", "ab".repeat(32)),
                     up_token_id: "1".into(),
