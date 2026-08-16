@@ -11,9 +11,11 @@ reveal an individual order's effective size or arrival delta.
 
 ## Change
 
-This release changes matching and public-read behavior, but adds no serialized
-field and changes no snapshot, journal, ledger, market, order, fill, receipt or
-state-root schema.
+This release changes matching and public-read behavior and appends Layrs-owned
+V2 fee-profile enum variants. It changes no snapshot, journal, ledger, market,
+order, fill, receipt or state-root field. Historical `POLYMARKET_*_V2` variants
+remain distinct and decode to their original values; new signed releases use
+`LAYRS_*_V2`, so replay never rewrites an existing market's serialized policy.
 
 For MINT and MERGE candidates, the book deterministically skips a quantity that
 cannot allocate at least one settlement micro to each complementary leg. FOK
@@ -60,4 +62,3 @@ all balances, holds, positions, fees, rewards and custody boundaries. Roll back
 only if the retained journal can be replayed by the prior release with the same
 sequence, journal head and state root. Never truncate, edit or reconstruct the
 encrypted journal to force compatibility.
-
