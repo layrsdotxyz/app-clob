@@ -28,7 +28,7 @@ use clob_service::private_core::{
     polymarket_resolution_signing_payload, resolution_signing_payload, AccountKey,
     BinanceResolutionStatement, BootstrapExecutionState, CommandResult, CoreResponse,
     EnclaveReceipt, EncryptedJournalRecord, EncryptedSnapshot, ExactConditionResolutionStatement,
-    ExternalFlowDirection, JournalKey, MarketConfig, MarketExecution,
+    ExternalFlowDirection, JournalKey, MarketConfig, MarketExecution, OrderStatus,
     PolymarketResolutionStatement, PrivateTradingCore, ReceiptSigner, ResolutionStatement,
     SignedAuditFillArtifact, SignedBinanceResolution, SignedExactConditionResolution,
     SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence,
@@ -254,6 +254,22 @@ enum OperatorCommand {
     TransferAccountStatus {
         identity_commitment: [u8; 32],
     },
+    DelegatedPortfolioRead {
+        request_id: uuid::Uuid,
+        identity_commitment: [u8; 32],
+        response_public_key: [u8; 32],
+        projection: DelegatedReadProjection,
+        api_key_id: uuid::Uuid,
+        capability_jti: uuid::Uuid,
+        capability_token_sha256: [u8; 32],
+        capability_environment: String,
+        capability_audience: String,
+        capability_scope: String,
+        issued_at_millis: i64,
+        expires_at_millis: i64,
+        revocation_checked_at_millis: i64,
+        now_millis: i64,
+    },
     ExternalFlow {
         idempotency_key: String,
         account: AccountKey,
@@ -342,6 +358,58 @@ enum OperatorCommand {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum DelegatedReadProjection {
+    Balances,
+    Positions,
+    ActiveOrders,
+}
+
+impl DelegatedReadProjection {
+    fn required_scope(self) -> &'static str {
+        match self {
+            Self::Balances => "balances:read",
+            Self::Positions => "positions:read",
+            Self::ActiveOrders => "orders:read",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Balances => "BALANCES",
+            Self::Positions => "POSITIONS",
+            Self::ActiveOrders => "ACTIVE_ORDERS",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DelegatedReadPlaintext<T> {
+    protocol_version: &'static str,
+    request_id: uuid::Uuid,
+    projection: &'static str,
+    enclave_sequence: String,
+    as_of_millis: i64,
+    items: T,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EncryptedDelegatedRead {
+    protocol_version: &'static str,
+    request_id: uuid::Uuid,
+    projection: &'static str,
+    enclave_sequence: String,
+    as_of_millis: i64,
+    expires_at_millis: i64,
+    ephemeral_public_key: [u8; 32],
+    nonce: [u8; 12],
+    ciphertext: Vec<u8>,
+    ciphertext_sha256: [u8; 32],
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(
     tag = "type",
@@ -410,6 +478,9 @@ enum PlainResponse {
     TransferAccountStatus {
         transfer_account: String,
         registered: bool,
+    },
+    DelegatedPortfolioRead {
+        envelope: EncryptedDelegatedRead,
     },
     PoolWithdrawalSigned {
         transaction: PoolWithdrawalTransaction,
@@ -1608,6 +1679,73 @@ async fn dispatch_operator(
                 registered: status.registered,
             })
         }
+        OperatorCommand::DelegatedPortfolioRead {
+            request_id,
+            identity_commitment,
+            response_public_key,
+            projection,
+            api_key_id,
+            capability_jti,
+            capability_token_sha256,
+            capability_environment,
+            capability_audience,
+            capability_scope,
+            issued_at_millis,
+            expires_at_millis,
+            revocation_checked_at_millis,
+            now_millis,
+        } => {
+            validate_delegated_read_authorization(
+                projection,
+                &capability_environment,
+                &capability_audience,
+                &capability_scope,
+                issued_at_millis,
+                expires_at_millis,
+                revocation_checked_at_millis,
+                now_millis,
+            )?;
+            let core = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?;
+            let snapshot = core.portfolio_snapshot_for_identity(identity_commitment, now_millis);
+            let items = match projection {
+                DelegatedReadProjection::Balances => serde_json::to_value(snapshot.balances),
+                DelegatedReadProjection::Positions => serde_json::to_value(snapshot.positions),
+                DelegatedReadProjection::ActiveOrders => serde_json::to_value(
+                    snapshot
+                        .orders
+                        .into_iter()
+                        .filter(|order| {
+                            matches!(
+                                order.status,
+                                OrderStatus::Open | OrderStatus::PartiallyFilled
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+            }
+            .map_err(|_| "DELEGATED_READ_ENCODING_FAILED".to_string())?;
+            let plaintext = DelegatedReadPlaintext {
+                protocol_version: "layrs.delegated-private-read.v1",
+                request_id,
+                projection: projection.label(),
+                enclave_sequence: core.sequence().to_string(),
+                as_of_millis: snapshot.as_of_millis,
+                items,
+            };
+            let envelope = encrypt_delegated_read(
+                &plaintext,
+                response_public_key,
+                projection,
+                api_key_id,
+                capability_jti,
+                capability_token_sha256,
+                expires_at_millis,
+            )?;
+            Ok(PlainResponse::DelegatedPortfolioRead { envelope })
+        }
         OperatorCommand::TradingFreezeStatus => Ok(PlainResponse::TradingFreezeStatus {
             frozen: state
                 .core
@@ -1941,6 +2079,7 @@ async fn dispatch_operator(
                 | OperatorCommand::ResolutionStatus { .. }
                 | OperatorCommand::ResolutionReadiness { .. }
                 | OperatorCommand::TransferAccountStatus { .. }
+                | OperatorCommand::DelegatedPortfolioRead { .. }
                 | OperatorCommand::TradingFreezeStatus
                 | OperatorCommand::AggregateDepth { .. }
                 | OperatorCommand::ReconcileBootstrap { .. } => unreachable!(),
@@ -2342,6 +2481,145 @@ fn transport_key(secret: &StaticSecret, client_public_key: [u8; 32]) -> [u8; 32]
     hash.finalize().into()
 }
 
+const DELEGATED_READ_MAX_LIFETIME_MILLIS: i64 = 5 * 60_000;
+const DELEGATED_READ_MIN_LIFETIME_MILLIS: i64 = 30_000;
+const DELEGATED_READ_CLOCK_SKEW_MILLIS: i64 = 5_000;
+const DELEGATED_READ_MAX_REVOCATION_AGE_MILLIS: i64 = 10_000;
+
+fn validate_delegated_read_authorization(
+    projection: DelegatedReadProjection,
+    environment: &str,
+    audience: &str,
+    scope: &str,
+    issued_at_millis: i64,
+    expires_at_millis: i64,
+    revocation_checked_at_millis: i64,
+    now_millis: i64,
+) -> Result<(), String> {
+    let expected_audience = match environment {
+        "development" => "https://api-dev.layrs.xyz/mcp",
+        "staging" => "https://api-staging.layrs.xyz/mcp",
+        "production" => "https://api.layrs.xyz/mcp",
+        _ => return Err("DELEGATED_READ_CONTEXT_MISMATCH".into()),
+    };
+    if audience != expected_audience || scope != projection.required_scope() {
+        return Err("DELEGATED_READ_CONTEXT_MISMATCH".into());
+    }
+    let lifetime = expires_at_millis
+        .checked_sub(issued_at_millis)
+        .ok_or_else(|| "DELEGATED_READ_EXPIRED".to_string())?;
+    if !(DELEGATED_READ_MIN_LIFETIME_MILLIS..=DELEGATED_READ_MAX_LIFETIME_MILLIS)
+        .contains(&lifetime)
+        || issued_at_millis > now_millis.saturating_add(DELEGATED_READ_CLOCK_SKEW_MILLIS)
+        || expires_at_millis <= now_millis
+    {
+        return Err("DELEGATED_READ_EXPIRED".into());
+    }
+    if revocation_checked_at_millis < issued_at_millis
+        || revocation_checked_at_millis
+            > now_millis.saturating_add(DELEGATED_READ_CLOCK_SKEW_MILLIS)
+        || now_millis.saturating_sub(revocation_checked_at_millis)
+            > DELEGATED_READ_MAX_REVOCATION_AGE_MILLIS
+    {
+        return Err("DELEGATED_READ_REVOCATION_STALE".into());
+    }
+    Ok(())
+}
+
+fn encrypt_delegated_read<T: Serialize>(
+    plaintext: &DelegatedReadPlaintext<T>,
+    response_public_key: [u8; 32],
+    projection: DelegatedReadProjection,
+    api_key_id: uuid::Uuid,
+    capability_jti: uuid::Uuid,
+    capability_token_sha256: [u8; 32],
+    expires_at_millis: i64,
+) -> Result<EncryptedDelegatedRead, String> {
+    if capability_token_sha256 == [0u8; 32] {
+        return Err("INVALID_DELEGATED_READ_CAPABILITY".into());
+    }
+    let ephemeral_secret = StaticSecret::random();
+    let ephemeral_public_key = PublicKey::from(&ephemeral_secret).to_bytes();
+    let shared = ephemeral_secret.diffie_hellman(&PublicKey::from(response_public_key));
+    if shared.as_bytes() == &[0u8; 32] {
+        return Err("INVALID_DELEGATED_READ_RESPONSE_KEY".into());
+    }
+    let mut key: [u8; 32] = {
+        let mut hash = Sha256::new();
+        hash.update(b"layrs.delegated-private-read.key.v1\0");
+        hash.update(shared.as_bytes());
+        hash.update(plaintext.request_id.as_bytes());
+        hash.update(api_key_id.as_bytes());
+        hash.update(capability_jti.as_bytes());
+        hash.update(capability_token_sha256);
+        hash.update(response_public_key);
+        hash.update(ephemeral_public_key);
+        hash.finalize().into()
+    };
+    let aad = delegated_read_aad(
+        plaintext.request_id,
+        projection,
+        api_key_id,
+        capability_jti,
+        capability_token_sha256,
+        response_public_key,
+        ephemeral_public_key,
+        expires_at_millis,
+    );
+    let mut encoded =
+        serde_json::to_vec(plaintext).map_err(|_| "DELEGATED_READ_ENCODING_FAILED".to_string())?;
+    let cipher = Aes256Gcm::new_from_slice(&key).expect("AES-256 key size is fixed");
+    let mut nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            aes_gcm::aead::Payload {
+                msg: &encoded,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| "DELEGATED_READ_ENCRYPTION_FAILED".to_string())?;
+    encoded.zeroize();
+    key.zeroize();
+    let ciphertext_sha256 = Sha256::digest(&ciphertext).into();
+    Ok(EncryptedDelegatedRead {
+        protocol_version: "layrs.delegated-private-read-envelope.v1",
+        request_id: plaintext.request_id,
+        projection: plaintext.projection,
+        enclave_sequence: plaintext.enclave_sequence.clone(),
+        as_of_millis: plaintext.as_of_millis,
+        expires_at_millis,
+        ephemeral_public_key,
+        nonce,
+        ciphertext,
+        ciphertext_sha256,
+    })
+}
+
+fn delegated_read_aad(
+    request_id: uuid::Uuid,
+    projection: DelegatedReadProjection,
+    api_key_id: uuid::Uuid,
+    capability_jti: uuid::Uuid,
+    capability_token_sha256: [u8; 32],
+    response_public_key: [u8; 32],
+    ephemeral_public_key: [u8; 32],
+    expires_at_millis: i64,
+) -> Vec<u8> {
+    let mut aad = b"layrs.delegated-private-read.aad.v1\0".to_vec();
+    aad.extend_from_slice(request_id.as_bytes());
+    aad.extend_from_slice(projection.label().as_bytes());
+    aad.push(0);
+    aad.extend_from_slice(api_key_id.as_bytes());
+    aad.extend_from_slice(capability_jti.as_bytes());
+    aad.extend_from_slice(&capability_token_sha256);
+    aad.extend_from_slice(&response_public_key);
+    aad.extend_from_slice(&ephemeral_public_key);
+    aad.extend_from_slice(&expires_at_millis.to_be_bytes());
+    aad
+}
+
 fn request_aad(client: &[u8; 32], enclave: &[u8; 32]) -> Vec<u8> {
     let mut aad = b"layrs.enclave-request.v1\0".to_vec();
     aad.extend_from_slice(client);
@@ -2442,6 +2720,153 @@ mod tests {
     #[test]
     fn relay_frame_limit_supports_checkpoint_restore_payloads() {
         const { assert!(MAX_FRAME_BYTES >= 256 * 1024 * 1024) };
+    }
+
+    #[test]
+    fn delegated_read_authorization_is_scope_audience_expiry_and_revocation_bound() {
+        let now = 1_700_000_000_000i64;
+        assert!(validate_delegated_read_authorization(
+            DelegatedReadProjection::Balances,
+            "production",
+            "https://api.layrs.xyz/mcp",
+            "balances:read",
+            now - 1_000,
+            now + 60_000,
+            now,
+            now,
+        )
+        .is_ok());
+        assert_eq!(
+            validate_delegated_read_authorization(
+                DelegatedReadProjection::Positions,
+                "production",
+                "https://api.layrs.xyz/mcp",
+                "balances:read",
+                now - 1_000,
+                now + 60_000,
+                now,
+                now,
+            ),
+            Err("DELEGATED_READ_CONTEXT_MISMATCH".into())
+        );
+        assert_eq!(
+            validate_delegated_read_authorization(
+                DelegatedReadProjection::Balances,
+                "production",
+                "https://api-staging.layrs.xyz/mcp",
+                "balances:read",
+                now - 1_000,
+                now + 60_000,
+                now,
+                now,
+            ),
+            Err("DELEGATED_READ_CONTEXT_MISMATCH".into())
+        );
+        assert_eq!(
+            validate_delegated_read_authorization(
+                DelegatedReadProjection::Balances,
+                "production",
+                "https://api.layrs.xyz/mcp",
+                "balances:read",
+                now - 61_000,
+                now - 1,
+                now - 1_000,
+                now,
+            ),
+            Err("DELEGATED_READ_EXPIRED".into())
+        );
+        assert_eq!(
+            validate_delegated_read_authorization(
+                DelegatedReadProjection::Balances,
+                "production",
+                "https://api.layrs.xyz/mcp",
+                "balances:read",
+                now - 30_000,
+                now + 30_000,
+                now - DELEGATED_READ_MAX_REVOCATION_AGE_MILLIS - 1,
+                now,
+            ),
+            Err("DELEGATED_READ_REVOCATION_STALE".into())
+        );
+    }
+
+    #[test]
+    fn delegated_read_envelope_decrypts_only_with_the_recipient_key_and_bound_context() {
+        let recipient_secret = StaticSecret::random();
+        let recipient_public = PublicKey::from(&recipient_secret).to_bytes();
+        let request_id = uuid::Uuid::from_u128(1);
+        let capability_jti = uuid::Uuid::from_u128(2);
+        let api_key_id = uuid::Uuid::from_u128(3);
+        let capability_digest = [9u8; 32];
+        let expires_at_millis = 1_700_000_060_000;
+        let plaintext = DelegatedReadPlaintext {
+            protocol_version: "layrs.delegated-private-read.v1",
+            request_id,
+            projection: "BALANCES",
+            enclave_sequence: "17".into(),
+            as_of_millis: 1_700_000_000_000,
+            items: serde_json::json!([{"asset":"USDC","amountAtomic":"5000000"}]),
+        };
+        let envelope = encrypt_delegated_read(
+            &plaintext,
+            recipient_public,
+            DelegatedReadProjection::Balances,
+            api_key_id,
+            capability_jti,
+            capability_digest,
+            expires_at_millis,
+        )
+        .expect("envelope");
+        let shared =
+            recipient_secret.diffie_hellman(&PublicKey::from(envelope.ephemeral_public_key));
+        let key: [u8; 32] = {
+            let mut hash = Sha256::new();
+            hash.update(b"layrs.delegated-private-read.key.v1\0");
+            hash.update(shared.as_bytes());
+            hash.update(request_id.as_bytes());
+            hash.update(api_key_id.as_bytes());
+            hash.update(capability_jti.as_bytes());
+            hash.update(capability_digest);
+            hash.update(recipient_public);
+            hash.update(envelope.ephemeral_public_key);
+            hash.finalize().into()
+        };
+        let aad = delegated_read_aad(
+            request_id,
+            DelegatedReadProjection::Balances,
+            api_key_id,
+            capability_jti,
+            capability_digest,
+            recipient_public,
+            envelope.ephemeral_public_key,
+            expires_at_millis,
+        );
+        let decoded = Aes256Gcm::new_from_slice(&key)
+            .unwrap()
+            .decrypt(
+                Nonce::from_slice(&envelope.nonce),
+                aes_gcm::aead::Payload {
+                    msg: &envelope.ciphertext,
+                    aad: &aad,
+                },
+            )
+            .expect("recipient decrypts");
+        let value: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(value["enclaveSequence"], "17");
+        assert_eq!(value["items"][0]["amountAtomic"], "5000000");
+
+        let mut wrong_aad = aad;
+        wrong_aad[0] ^= 1;
+        assert!(Aes256Gcm::new_from_slice(&key)
+            .unwrap()
+            .decrypt(
+                Nonce::from_slice(&envelope.nonce),
+                aes_gcm::aead::Payload {
+                    msg: &envelope.ciphertext,
+                    aad: &wrong_aad
+                },
+            )
+            .is_err());
     }
 
     #[test]
