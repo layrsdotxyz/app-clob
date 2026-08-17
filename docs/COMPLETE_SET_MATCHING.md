@@ -9,6 +9,9 @@ The private native CLOB supports three deterministic match types:
 - `MERGE`: opposite outcomes, both `SELL`. One claim of each outcome is burned
   and the released collateral pays the two sellers.
 
+The unchanged direct-transfer path has dedicated executable evidence in
+[`NORMAL_MATCHING_CERTIFICATION.md`](NORMAL_MATCHING_CERTIFICATION.md).
+
 ## Crossing and execution prices
 
 `PRICE_SCALE` is `1_000_000`.
