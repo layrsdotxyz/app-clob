@@ -2485,6 +2485,9 @@ const DELEGATED_READ_MAX_LIFETIME_MILLIS: i64 = 5 * 60_000;
 const DELEGATED_READ_MIN_LIFETIME_MILLIS: i64 = 30_000;
 const DELEGATED_READ_CLOCK_SKEW_MILLIS: i64 = 5_000;
 const DELEGATED_READ_MAX_REVOCATION_AGE_MILLIS: i64 = 10_000;
+// Reserve the 16-byte GCM tag so the complete ciphertext remains within the
+// public API and Cloudflare 1 MiB response boundary.
+const DELEGATED_READ_MAX_PLAINTEXT_BYTES: usize = 1_048_576 - 16;
 
 fn validate_delegated_read_authorization(
     projection: DelegatedReadProjection,
@@ -2568,20 +2571,24 @@ fn encrypt_delegated_read<T: Serialize>(
     );
     let mut encoded =
         serde_json::to_vec(plaintext).map_err(|_| "DELEGATED_READ_ENCODING_FAILED".to_string())?;
+    if encoded.len() > DELEGATED_READ_MAX_PLAINTEXT_BYTES {
+        encoded.zeroize();
+        key.zeroize();
+        return Err("DELEGATED_READ_RESPONSE_TOO_LARGE".into());
+    }
     let cipher = Aes256Gcm::new_from_slice(&key).expect("AES-256 key size is fixed");
     let mut nonce = [0u8; 12];
     OsRng.fill_bytes(&mut nonce);
-    let ciphertext = cipher
-        .encrypt(
-            Nonce::from_slice(&nonce),
-            aes_gcm::aead::Payload {
-                msg: &encoded,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| "DELEGATED_READ_ENCRYPTION_FAILED".to_string())?;
+    let ciphertext = cipher.encrypt(
+        Nonce::from_slice(&nonce),
+        aes_gcm::aead::Payload {
+            msg: &encoded,
+            aad: &aad,
+        },
+    );
     encoded.zeroize();
     key.zeroize();
+    let ciphertext = ciphertext.map_err(|_| "DELEGATED_READ_ENCRYPTION_FAILED".to_string())?;
     let ciphertext_sha256 = Sha256::digest(&ciphertext).into();
     Ok(EncryptedDelegatedRead {
         protocol_version: "layrs.delegated-private-read-envelope.v1",
@@ -2867,6 +2874,31 @@ mod tests {
                 },
             )
             .is_err());
+    }
+
+    #[test]
+    fn delegated_read_envelope_rejects_an_oversized_private_projection() {
+        let recipient_public = PublicKey::from(&StaticSecret::random()).to_bytes();
+        let plaintext = DelegatedReadPlaintext {
+            protocol_version: "layrs.delegated-private-read.v1",
+            request_id: uuid::Uuid::from_u128(11),
+            projection: "BALANCES",
+            enclave_sequence: "1".into(),
+            as_of_millis: 1_700_000_000_000,
+            items: "x".repeat(DELEGATED_READ_MAX_PLAINTEXT_BYTES),
+        };
+        assert!(matches!(
+            encrypt_delegated_read(
+                &plaintext,
+                recipient_public,
+                DelegatedReadProjection::Balances,
+                uuid::Uuid::from_u128(12),
+                uuid::Uuid::from_u128(13),
+                [14u8; 32],
+                1_700_000_060_000,
+            ),
+            Err(code) if code == "DELEGATED_READ_RESPONSE_TOO_LARGE"
+        ));
     }
 
     #[test]
