@@ -95,8 +95,12 @@ struct EncryptedRequestContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum ExpectedEncryptedAction {
-    SubmitOrder,
-    ReplaceOrder,
+    #[serde(rename = "SUBMIT_ORDER")]
+    Submit,
+    #[serde(rename = "REPLACE_ORDER")]
+    Replace,
+    #[serde(rename = "CANCEL_ORDER")]
+    Cancel,
 }
 
 #[derive(Debug, Serialize)]
@@ -824,9 +828,12 @@ fn validate_request_context(
         return Err(());
     };
     let (actual_action, actual_order_id) = match &command.action {
-        UserCommandAction::SubmitOrder { .. } => (ExpectedEncryptedAction::SubmitOrder, None),
+        UserCommandAction::SubmitOrder { .. } => (ExpectedEncryptedAction::Submit, None),
         UserCommandAction::ReplaceOrder { order_id, .. } => {
-            (ExpectedEncryptedAction::ReplaceOrder, Some(*order_id))
+            (ExpectedEncryptedAction::Replace, Some(*order_id))
+        }
+        UserCommandAction::CancelOrder { order_id, .. } => {
+            (ExpectedEncryptedAction::Cancel, Some(*order_id))
         }
         _ => return Err(()),
     };
@@ -858,8 +865,13 @@ fn validate_user_command_context(
         return Err(());
     }
     match actual_action {
-        ExpectedEncryptedAction::SubmitOrder if context.expected_order_id.is_none() => Ok(()),
-        ExpectedEncryptedAction::ReplaceOrder
+        ExpectedEncryptedAction::Submit if context.expected_order_id.is_none() => Ok(()),
+        ExpectedEncryptedAction::Replace
+            if context.expected_order_id == actual_order_id && actual_order_id.is_some() =>
+        {
+            Ok(())
+        }
+        ExpectedEncryptedAction::Cancel
             if context.expected_order_id == actual_order_id && actual_order_id.is_some() =>
         {
             Ok(())
@@ -2548,14 +2560,14 @@ mod tests {
         let expected_tag = api_session_request_tag("order:create:1234", "session:user-a");
         let context = EncryptedRequestContext {
             idempotency_key: "order:create:1234".into(),
-            expected_action: ExpectedEncryptedAction::SubmitOrder,
+            expected_action: ExpectedEncryptedAction::Submit,
             expected_session_tags: vec![expected_tag],
             expected_order_id: None,
         };
         assert!(validate_user_command_context(
             "order:create:1234",
             "session:user-a",
-            ExpectedEncryptedAction::SubmitOrder,
+            ExpectedEncryptedAction::Submit,
             None,
             &context
         )
@@ -2563,7 +2575,7 @@ mod tests {
         assert!(validate_user_command_context(
             "order:create:5678",
             "session:user-a",
-            ExpectedEncryptedAction::SubmitOrder,
+            ExpectedEncryptedAction::Submit,
             None,
             &context
         )
@@ -2571,7 +2583,7 @@ mod tests {
         assert!(validate_user_command_context(
             "order:create:1234",
             "session:user-b",
-            ExpectedEncryptedAction::SubmitOrder,
+            ExpectedEncryptedAction::Submit,
             None,
             &context
         )
@@ -2579,7 +2591,7 @@ mod tests {
         assert!(validate_user_command_context(
             "order:create:1234",
             "session:user-a",
-            ExpectedEncryptedAction::ReplaceOrder,
+            ExpectedEncryptedAction::Replace,
             Some(Uuid::nil()),
             &context
         )
@@ -2588,7 +2600,7 @@ mod tests {
         let order_id = Uuid::new_v4();
         let replace = EncryptedRequestContext {
             idempotency_key: "order:replace:1234".into(),
-            expected_action: ExpectedEncryptedAction::ReplaceOrder,
+            expected_action: ExpectedEncryptedAction::Replace,
             expected_session_tags: vec![api_session_request_tag(
                 "order:replace:1234",
                 "session:user-a",
@@ -2598,7 +2610,7 @@ mod tests {
         assert!(validate_user_command_context(
             "order:replace:1234",
             "session:user-a",
-            ExpectedEncryptedAction::ReplaceOrder,
+            ExpectedEncryptedAction::Replace,
             Some(order_id),
             &replace,
         )
@@ -2606,9 +2618,43 @@ mod tests {
         assert!(validate_user_command_context(
             "order:replace:1234",
             "session:user-a",
-            ExpectedEncryptedAction::ReplaceOrder,
+            ExpectedEncryptedAction::Replace,
             Some(Uuid::new_v4()),
             &replace,
+        )
+        .is_err());
+
+        let cancel = EncryptedRequestContext {
+            idempotency_key: "order:cancel:1234".into(),
+            expected_action: ExpectedEncryptedAction::Cancel,
+            expected_session_tags: vec![api_session_request_tag(
+                "order:cancel:1234",
+                "session:user-a",
+            )],
+            expected_order_id: Some(order_id),
+        };
+        assert!(validate_user_command_context(
+            "order:cancel:1234",
+            "session:user-a",
+            ExpectedEncryptedAction::Cancel,
+            Some(order_id),
+            &cancel,
+        )
+        .is_ok());
+        assert!(validate_user_command_context(
+            "order:cancel:1234",
+            "session:user-a",
+            ExpectedEncryptedAction::Cancel,
+            Some(Uuid::new_v4()),
+            &cancel,
+        )
+        .is_err());
+        assert!(validate_user_command_context(
+            "order:cancel:1234",
+            "session:user-a",
+            ExpectedEncryptedAction::Replace,
+            Some(order_id),
+            &cancel,
         )
         .is_err());
     }

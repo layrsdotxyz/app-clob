@@ -83,8 +83,12 @@ struct EncryptedRequestContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum ExpectedEncryptedAction {
-    SubmitOrder,
-    ReplaceOrder,
+    #[serde(rename = "SUBMIT_ORDER")]
+    Submit,
+    #[serde(rename = "REPLACE_ORDER")]
+    Replace,
+    #[serde(rename = "CANCEL_ORDER")]
+    Cancel,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -366,8 +370,10 @@ async fn relay(State(state): State<AppState>, Json(envelope): Json<PrivateEnvelo
 fn valid_request_context(context: &EncryptedRequestContext) -> bool {
     valid_idempotency_key(&context.idempotency_key)
         && match context.expected_action {
-            ExpectedEncryptedAction::SubmitOrder => context.expected_order_id.is_none(),
-            ExpectedEncryptedAction::ReplaceOrder => context.expected_order_id.is_some(),
+            ExpectedEncryptedAction::Submit => context.expected_order_id.is_none(),
+            ExpectedEncryptedAction::Replace | ExpectedEncryptedAction::Cancel => {
+                context.expected_order_id.is_some()
+            }
         }
         && (1..=8).contains(&context.expected_session_tags.len())
         && context.expected_session_tags.iter().all(|tag| {
@@ -472,6 +478,7 @@ mod tests {
 
     use base64::Engine;
     use tokio::sync::Semaphore;
+    use uuid::Uuid;
 
     use super::{
         acquire_exchange_permit, valid_idempotency_key, valid_request_context, AppState,
@@ -506,7 +513,7 @@ mod tests {
             ciphertext,
             request_context: Some(EncryptedRequestContext {
                 idempotency_key: "order:create:1234".into(),
-                expected_action: ExpectedEncryptedAction::SubmitOrder,
+                expected_action: ExpectedEncryptedAction::Submit,
                 expected_session_tags: vec![URL_SAFE_NO_PAD.encode([8u8; 32])],
                 expected_order_id: None,
             }),
@@ -533,11 +540,28 @@ mod tests {
         assert!(!valid_idempotency_key(&"x".repeat(129)));
         let valid = EncryptedRequestContext {
             idempotency_key: "order:create:1234".into(),
-            expected_action: ExpectedEncryptedAction::SubmitOrder,
+            expected_action: ExpectedEncryptedAction::Submit,
             expected_session_tags: vec![URL_SAFE_NO_PAD.encode([9u8; 32])],
             expected_order_id: None,
         };
         assert!(valid_request_context(&valid));
+        let cancel = EncryptedRequestContext {
+            idempotency_key: "order:cancel:1234".into(),
+            expected_action: ExpectedEncryptedAction::Cancel,
+            expected_session_tags: vec![URL_SAFE_NO_PAD.encode([8u8; 32])],
+            expected_order_id: Some(Uuid::new_v4()),
+        };
+        assert!(valid_request_context(&cancel));
+        assert_eq!(
+            serde_json::to_value(&cancel).unwrap()["expectedAction"],
+            "CANCEL_ORDER"
+        );
+        assert!(!valid_request_context(&EncryptedRequestContext {
+            idempotency_key: "order:cancel:1234".into(),
+            expected_action: ExpectedEncryptedAction::Cancel,
+            expected_session_tags: vec![URL_SAFE_NO_PAD.encode([8u8; 32])],
+            expected_order_id: None,
+        }));
         assert!(!valid_request_context(&EncryptedRequestContext {
             expected_session_tags: Vec::new(),
             ..valid.clone()

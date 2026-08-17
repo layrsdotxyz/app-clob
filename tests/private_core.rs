@@ -3695,6 +3695,154 @@ fn api_order_replacement_is_atomic_replay_safe_and_releases_exact_collateral() {
     assert_eq!(core.balance(&hold), hold_after);
 }
 
+#[test]
+fn api_order_cancellation_bypasses_placement_freeze_and_releases_hold_once() {
+    let user_key = SigningKey::from_bytes(&[121u8; 32]);
+    let journal_key = [122u8; 32];
+    let commitment = [123u8; 32];
+    let owner = derived_private_user(journal_key, commitment);
+    let market_id = "layrs:v5:BTC:USDC:15m:4000";
+    let mut core = PrivateTradingCore::new(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([124u8; 48]),
+    );
+    core.register_market(
+        "sys:market:cancel-priority".into(),
+        MarketConfig {
+            market_id: market_id.into(),
+            settlement_asset: "USDC".into(),
+            settlement_decimals: 6,
+            public_settlement_chain: Some("horizen".into()),
+            opens_at_millis: 900,
+            closes_at_millis: 4_000,
+            minimum_quantity_micros: 250_000,
+            maximum_quantity_micros: 10_000_000,
+            minimum_order_notional_micros: 250_000,
+            maximum_order_notional_micros: 5_000_000,
+            maximum_user_position_micros: 10_000_000,
+            maximum_pending_bootstrap_notional_micros: 10_000_000,
+            tick_size_micros: 10_000,
+            oracle_feed_id: 9002,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
+            execution: MarketExecution::NativeClob,
+        },
+        800,
+    )
+    .unwrap();
+    core.register_session(
+        "sys:session:cancel-priority".into(),
+        "session:cancel-priority".into(),
+        commitment,
+        user_key.verifying_key().to_bytes(),
+        5_000,
+        850,
+    )
+    .unwrap();
+    core.apply_user_external_flow(
+        "sys:deposit:cancel-priority".into(),
+        commitment,
+        "USDC".into(),
+        AccountBucket::UserAvailable,
+        5_000_000,
+        ExternalFlowDirection::Inflow,
+        [125u8; 32],
+        875,
+    )
+    .unwrap();
+
+    let created = execute_signed_response(
+        &mut core,
+        &user_key,
+        "session:cancel-priority",
+        1,
+        "cmd:cancel-priority-create",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                400_000,
+                2_500_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_000,
+    );
+    let resting = match created.result {
+        CommandResult::Order { result } => result.accepted_order.unwrap(),
+        _ => panic!("expected resting order"),
+    };
+    let available = AccountKey::new(&owner, AccountBucket::UserAvailable, "USDC");
+    let mut hold = AccountKey::new(&owner, AccountBucket::UserOrderHold, "USDC");
+    hold.market_id = Some(market_id.into());
+    hold.outcome = Some("UP".into());
+    assert_eq!(core.balance(&available), 4_000_000);
+    assert_eq!(core.balance(&hold), 1_000_000);
+
+    core.set_trading_freeze(
+        "sys:freeze:cancel-priority".into(),
+        true,
+        [126u8; 32],
+        1_050,
+    )
+    .unwrap();
+    let blocked = execute_signed_result(
+        &mut core,
+        &user_key,
+        "session:cancel-priority",
+        2,
+        "cmd:cancel-priority-blocked-placement",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Down,
+                OrderAction::Buy,
+                400_000,
+                1_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_100,
+    );
+    assert_eq!(blocked.unwrap_err(), CoreError::TradingFrozen);
+
+    let cancel_action = UserCommandAction::CancelOrder {
+        market_id: market_id.into(),
+        order_id: resting.order_id,
+    };
+    let cancelled = execute_signed_response(
+        &mut core,
+        &user_key,
+        "session:cancel-priority",
+        2,
+        "cmd:cancel-priority-release",
+        cancel_action.clone(),
+        1_150,
+    );
+    assert!(matches!(cancelled.result, CommandResult::Cancelled { .. }));
+    assert_eq!(core.balance(&available), 5_000_000);
+    assert_eq!(core.balance(&hold), 0);
+
+    let committed_root = core.state_root();
+    let replay = execute_signed_response(
+        &mut core,
+        &user_key,
+        "session:cancel-priority",
+        2,
+        "cmd:cancel-priority-release",
+        cancel_action,
+        1_150,
+    );
+    assert_eq!(replay.receipt.state_root, cancelled.receipt.state_root);
+    assert_eq!(core.state_root(), committed_root);
+    assert_eq!(core.balance(&available), 5_000_000);
+    assert_eq!(core.balance(&hold), 0);
+}
+
 fn execute_signed(
     core: &mut PrivateTradingCore,
     key: &SigningKey,
