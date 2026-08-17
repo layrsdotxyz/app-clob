@@ -1,7 +1,7 @@
 use clob_service::private_core::{
     command_request_hash, exact_condition_resolution_signing_payload, resolution_signing_payload,
     signing_payload, AccountBucket, AccountKey, BookOrder, BoundaryEvidence, CommandResult,
-    ExactConditionResolutionStatement, ExternalFlowDirection, FeeProfileId, JournalKey,
+    CoreError, ExactConditionResolutionStatement, ExternalFlowDirection, FeeProfileId, JournalKey,
     MarketConfig, MarketExecution, MatchType, OrderAction, OrderStatus, Outcome, PriceTimeBook,
     PrivateTradingCore, ReceiptSigner, ResolutionOutcome, ResolutionStatement, SessionRequest,
     SignedExactConditionResolution, SignedResolution, SignedSessionRequest, TimeInForce,
@@ -1005,16 +1005,255 @@ fn complete_set_command_replay_produces_identical_fill_and_state_root() {
     );
 }
 
+#[test]
+fn better_price_mint_refunds_limit_improvement_and_replays_exactly_once() {
+    let (mut core, up_key, down_key, up_owner, down_owner) =
+        configured_core_with_profile(FeeProfileId::LayrsCryptoV2);
+    let maker_order = BookOrder::with_id(
+        Uuid::from_u128(702),
+        "ignored",
+        MARKET_ID,
+        Outcome::Up,
+        OrderAction::Buy,
+        400_000,
+        1_000_000,
+        TimeInForce::Gtc,
+        None,
+    );
+    execute(
+        &mut core,
+        &up_key,
+        "session:up",
+        1,
+        "cmd:better-price-maker",
+        UserCommandAction::SubmitOrder {
+            order: maker_order.clone(),
+        },
+        1_000,
+    );
+
+    // A resting BUY holds only principal. The temporary taker-fee reserve is
+    // returned when the order becomes maker liquidity.
+    assert_eq!(
+        core.balance(&cash_order_hold(&up_owner, Outcome::Up, "ZEN")),
+        400_000_000_000_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &up_owner,
+            AccountBucket::UserAvailable,
+            "ZEN"
+        )),
+        600_000_000_000_000_000
+    );
+
+    // The DOWN taker is willing to pay 70c but receives the 60c complement
+    // of the resting 40c UP maker. Its unused 10c limit improvement and the
+    // unused portion of the fee reserve must both be returned.
+    let taker_action = UserCommandAction::SubmitOrder {
+        order: BookOrder::with_id(
+            Uuid::from_u128(703),
+            "ignored",
+            MARKET_ID,
+            Outcome::Down,
+            OrderAction::Buy,
+            700_000,
+            1_000_000,
+            TimeInForce::Fok,
+            None,
+        ),
+    };
+    let taker_command = signed_command(
+        &down_key,
+        "session:down",
+        1,
+        "cmd:better-price-taker",
+        taker_action,
+        1_050,
+    );
+    let first = core.execute(taker_command.clone(), 1_050).unwrap();
+    let fill = &order_result(&first.result).fills[0];
+    assert_eq!(fill.match_type, MatchType::Mint);
+    assert_eq!(fill.price_micros, 400_000);
+    assert_eq!(fill.taker_price_micros(), 600_000);
+    assert_eq!(
+        first.audit_fills[0].statement.fee_atomic,
+        "16800000000000000"
+    );
+
+    let fee = AccountKey::new("layrs", AccountBucket::FeeRevenue, "ZEN");
+    let up_available = AccountKey::new(&up_owner, AccountBucket::UserAvailable, "ZEN");
+    let down_available = AccountKey::new(&down_owner, AccountBucket::UserAvailable, "ZEN");
+    assert_eq!(core.balance(&up_available), 600_000_000_000_000_000);
+    assert_eq!(core.balance(&down_available), 383_200_000_000_000_000);
+    assert_eq!(core.balance(&fee), 16_800_000_000_000_000);
+    assert_eq!(core.balance(&market_collateral()), ONE_ZEN);
+    assert_eq!(
+        core.balance(&cash_order_hold(&up_owner, Outcome::Up, "ZEN")),
+        0
+    );
+    assert_eq!(
+        core.balance(&cash_order_hold(&down_owner, Outcome::Down, "ZEN")),
+        0
+    );
+    assert_eq!(
+        core.balance(&up_available)
+            + core.balance(&down_available)
+            + core.balance(&fee)
+            + core.balance(&market_collateral()),
+        2 * ONE_ZEN
+    );
+
+    let root_after_first = core.state_root();
+    let replay = core.execute(taker_command, 1_051).unwrap();
+    assert_eq!(replay, first);
+    assert_eq!(core.state_root(), root_after_first);
+    assert_eq!(core.balance(&fee), 16_800_000_000_000_000);
+}
+
+#[test]
+fn partial_mint_survives_encrypted_snapshot_and_releases_remainder_once() {
+    let (mut core, up_key, down_key, up_owner, down_owner) = configured_core();
+    let maker_order_id = Uuid::from_u128(704);
+    execute(
+        &mut core,
+        &up_key,
+        "session:up",
+        1,
+        "cmd:snapshot-partial-maker",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::with_id(
+                maker_order_id,
+                "ignored",
+                MARKET_ID,
+                Outcome::Up,
+                OrderAction::Buy,
+                400_000,
+                2_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_000,
+    );
+    let partial_action = UserCommandAction::SubmitOrder {
+        order: BookOrder::with_id(
+            Uuid::from_u128(705),
+            "ignored",
+            MARKET_ID,
+            Outcome::Down,
+            OrderAction::Buy,
+            650_000,
+            1_250_000,
+            TimeInForce::Fak,
+            None,
+        ),
+    };
+    let partial_command = signed_command(
+        &down_key,
+        "session:down",
+        1,
+        "cmd:snapshot-partial-taker",
+        partial_action,
+        1_050,
+    );
+    let partial = core.execute(partial_command.clone(), 1_050).unwrap();
+    let result = order_result(&partial.result);
+    assert_eq!(result.fills.len(), 1);
+    assert_eq!(result.fills[0].match_type, MatchType::Mint);
+    assert_eq!(result.fills[0].quantity_micros, 1_250_000);
+    assert_eq!(result.fills[0].taker_price_micros(), 600_000);
+    assert_eq!(result.cancelled_remainder_micros, 0);
+
+    let fee = AccountKey::new("layrs", AccountBucket::FeeRevenue, "ZEN");
+    let up_available = AccountKey::new(&up_owner, AccountBucket::UserAvailable, "ZEN");
+    let down_available = AccountKey::new(&down_owner, AccountBucket::UserAvailable, "ZEN");
+    let maker_hold = cash_order_hold(&up_owner, Outcome::Up, "ZEN");
+    assert_eq!(core.balance(&maker_hold), 300_000_000_000_000_000);
+    assert_eq!(
+        core.balance(&market_collateral()),
+        1_250_000_000_000_000_000
+    );
+    assert_eq!(core.balance(&claim(&up_owner, Outcome::Up)), 1_250_000);
+    assert_eq!(core.balance(&claim(&down_owner, Outcome::Down)), 1_250_000);
+    assert_eq!(core.balance(&fee), 1_500_000_000_000_000);
+    assert_eq!(
+        core.balance(&up_available)
+            + core.balance(&down_available)
+            + core.balance(&maker_hold)
+            + core.balance(&market_collateral())
+            + core.balance(&fee),
+        2 * ONE_ZEN
+    );
+
+    let snapshot = core.export_encrypted_snapshot().unwrap();
+    let snapshot_root = core.state_root();
+    let mut restored = PrivateTradingCore::restore_encrypted_snapshot(
+        JournalKey::from_bytes([31u8; 32]),
+        ReceiptSigner::generate([90u8; 48]),
+        &snapshot,
+        snapshot.sequence,
+    )
+    .unwrap();
+    assert_eq!(restored.state_root(), snapshot_root);
+    assert_eq!(restored.balance(&maker_hold), 300_000_000_000_000_000);
+    assert_eq!(
+        restored
+            .market_settlement_readiness(MARKET_ID, 1_075)
+            .unwrap()
+            .active_order_count,
+        1
+    );
+
+    // Snapshots intentionally retain only processed request hashes. Replaying
+    // a pre-snapshot financial command therefore fails closed and cannot mint
+    // a second set when the response archive is unavailable.
+    let before_replay = restored.state_root();
+    assert_eq!(
+        restored.execute(partial_command, 1_076).unwrap_err(),
+        CoreError::PreviouslyProcessed
+    );
+    assert_eq!(restored.state_root(), before_replay);
+
+    execute(
+        &mut restored,
+        &up_key,
+        "session:up",
+        2,
+        "cmd:snapshot-cancel-maker",
+        UserCommandAction::CancelOrder {
+            market_id: MARKET_ID.into(),
+            order_id: maker_order_id,
+        },
+        1_100,
+    );
+    assert_eq!(restored.balance(&maker_hold), 0);
+    assert_eq!(restored.balance(&up_available), 500_000_000_000_000_000);
+    assert_eq!(
+        restored.balance(&up_available)
+            + restored.balance(&down_available)
+            + restored.balance(&market_collateral())
+            + restored.balance(&fee),
+        2 * ONE_ZEN
+    );
+}
+
 proptest! {
     #[test]
     fn complementary_crossing_is_deterministic_for_valid_prices_and_sizes(
         maker_price in 1u64..999_999,
         price_improvement in 0u64..10_000,
-        quantity in 1u128..10_000_000,
+        quantity_multiple in 1u128..1_000,
     ) {
         let complementary = 1_000_000u64 - maker_price;
         let taker_limit = complementary.saturating_add(price_improvement).min(999_999);
         prop_assume!(taker_limit >= complementary);
+        // Generate only quantities that can allocate at least one settlement
+        // micro to both complementary legs. This mirrors the engine's
+        // settlement-precision guard and prevents invalid dust from being
+        // mistaken for a matching failure.
+        let minimum_quantity = 1_000_000u128.div_ceil(1_000_000u128 - u128::from(maker_price));
+        let quantity = minimum_quantity * quantity_multiple;
         let maker = BookOrder::with_id(
             Uuid::from_u128(500),
             "maker",
@@ -1409,6 +1648,22 @@ fn execute(
     action: UserCommandAction,
     now_millis: i64,
 ) -> clob_service::private_core::CoreResponse {
+    core.execute(
+        signed_command(key, session_id, sequence, command_id, action, now_millis),
+        now_millis,
+    )
+    .unwrap()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn signed_command(
+    key: &SigningKey,
+    session_id: &str,
+    sequence: u64,
+    command_id: &str,
+    action: UserCommandAction,
+    now_millis: i64,
+) -> UserCommand {
     let idempotency_key = format!("idem:{command_id}");
     let request_hash = command_request_hash(command_id, &idempotency_key, &action).unwrap();
     let request = SessionRequest {
@@ -1419,16 +1674,12 @@ fn execute(
         request_hash,
     };
     let signature = key.sign(&signing_payload(&request)).to_bytes().to_vec();
-    core.execute(
-        UserCommand {
-            command_id: command_id.into(),
-            idempotency_key,
-            session: SignedSessionRequest { request, signature },
-            action,
-        },
-        now_millis,
-    )
-    .unwrap()
+    UserCommand {
+        command_id: command_id.into(),
+        idempotency_key,
+        session: SignedSessionRequest { request, signature },
+        action,
+    }
 }
 
 fn order_result(result: &CommandResult) -> &clob_service::private_core::MatchResult {
@@ -1444,6 +1695,16 @@ fn claim(owner: &str, outcome: Outcome) -> AccountKey {
         Outcome::Down => "DOWN",
     };
     AccountKey::position(owner, format!("CLAIM:{MARKET_ID}:{name}"), MARKET_ID, name)
+}
+
+fn cash_order_hold(owner: &str, outcome: Outcome, asset: &str) -> AccountKey {
+    let mut account = AccountKey::new(owner, AccountBucket::UserOrderHold, asset);
+    account.market_id = Some(MARKET_ID.into());
+    account.outcome = Some(match outcome {
+        Outcome::Up => "UP".into(),
+        Outcome::Down => "DOWN".into(),
+    });
+    account
 }
 
 fn market_collateral() -> AccountKey {
