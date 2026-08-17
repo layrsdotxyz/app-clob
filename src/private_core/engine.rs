@@ -465,6 +465,9 @@ pub enum UserCommandAction {
         market_id: String,
         order_id: Uuid,
     },
+    CancelAllOrders {
+        filter: CancelAllOrdersFilter,
+    },
     CompleteSet {
         market_id: String,
         #[serde(with = "super::decimal_u128")]
@@ -501,6 +504,21 @@ pub enum UserCommandAction {
         #[serde(with = "super::decimal_u128")]
         amount_atomic: u128,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CancelAllOrdersFilter {
+    All,
+    Market { market_id: String },
+    Asset { asset: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelledOrderOutcome {
+    pub order_id: Uuid,
+    pub market_id: String,
+    pub status: OrderStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -617,6 +635,9 @@ pub enum CommandResult {
     },
     Cancelled {
         order: BookOrder,
+    },
+    OrdersCancelled {
+        outcomes: Vec<CancelledOrderOutcome>,
     },
     Replaced {
         cancelled: BookOrder,
@@ -3105,6 +3126,87 @@ impl PrivateTradingCore {
                 CommandResult::Cancelled {
                     order: public_order,
                 }
+            }
+            UserCommandAction::CancelAllOrders { filter } => {
+                let market_ids: Vec<String> = match filter {
+                    CancelAllOrdersFilter::All => self.markets.keys().cloned().collect(),
+                    CancelAllOrdersFilter::Market { market_id } => {
+                        if !self.markets.contains_key(market_id) {
+                            return Err(CoreError::InvalidOrder("unknown market".into()));
+                        }
+                        vec![market_id.clone()]
+                    }
+                    CancelAllOrdersFilter::Asset { asset } => {
+                        if asset.is_empty() || asset.len() > 64 || !asset.is_ascii() {
+                            return Err(CoreError::InvalidOrder("invalid asset filter".into()));
+                        }
+                        let matching: Vec<String> = self
+                            .markets
+                            .iter()
+                            .filter(|(_, market)| market.settlement_asset == *asset)
+                            .map(|(market_id, _)| market_id.clone())
+                            .collect();
+                        if matching.is_empty() {
+                            return Err(CoreError::InvalidOrder("unknown asset".into()));
+                        }
+                        matching
+                    }
+                };
+
+                let mut cancelled_by_market = BTreeMap::<String, Vec<BookOrder>>::new();
+                for market_id in market_ids {
+                    let Some(book) = books.get_mut(&market_id) else {
+                        continue;
+                    };
+                    let mut owned: Vec<BookOrder> = book
+                        .orders_for_owner(&private_user_id)
+                        .into_iter()
+                        .filter(|order| {
+                            matches!(
+                                order.status,
+                                OrderStatus::Open | OrderStatus::PartiallyFilled
+                            )
+                        })
+                        .collect();
+                    owned.sort_by_key(|order| (order.sequence, order.order_id));
+                    for order in owned {
+                        let cancelled =
+                            book.cancel(order.order_id, &private_user_id, now_millis)?;
+                        cancelled_by_market
+                            .entry(market_id.clone())
+                            .or_default()
+                            .push(cancelled);
+                    }
+                }
+
+                let mut transfers = Vec::new();
+                let mut outcomes = Vec::new();
+                for (market_id, cancelled) in &cancelled_by_market {
+                    let market = self
+                        .markets
+                        .get(market_id)
+                        .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
+                    let book = books.get(market_id).ok_or_else(|| {
+                        CoreError::InvalidOrder("order book does not exist".into())
+                    })?;
+                    transfers.extend(cancellation_transfers(&ledger, book, market, cancelled)?);
+                    outcomes.extend(cancelled.iter().map(|order| CancelledOrderOutcome {
+                        order_id: order.order_id,
+                        market_id: order.market_id.clone(),
+                        status: order.status,
+                    }));
+                }
+                if !outcomes.is_empty() && transfers.is_empty() {
+                    return Err(CoreError::UnbalancedTransaction);
+                }
+                if !transfers.is_empty() {
+                    ledger.apply(LedgerTransaction {
+                        idempotency_key: format!("cancel-all:{}", command.idempotency_key),
+                        business_reference: command.command_id.clone(),
+                        transfers,
+                    })?;
+                }
+                CommandResult::OrdersCancelled { outcomes }
             }
             UserCommandAction::ReplaceOrder {
                 market_id,

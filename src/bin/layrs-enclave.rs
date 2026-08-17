@@ -101,6 +101,8 @@ enum ExpectedEncryptedAction {
     Replace,
     #[serde(rename = "CANCEL_ORDER")]
     Cancel,
+    #[serde(rename = "CANCEL_ALL_ORDERS")]
+    CancelAll,
 }
 
 #[derive(Debug, Serialize)]
@@ -835,6 +837,7 @@ fn validate_request_context(
         UserCommandAction::CancelOrder { order_id, .. } => {
             (ExpectedEncryptedAction::Cancel, Some(*order_id))
         }
+        UserCommandAction::CancelAllOrders { .. } => (ExpectedEncryptedAction::CancelAll, None),
         _ => return Err(()),
     };
     validate_user_command_context(
@@ -866,6 +869,7 @@ fn validate_user_command_context(
     }
     match actual_action {
         ExpectedEncryptedAction::Submit if context.expected_order_id.is_none() => Ok(()),
+        ExpectedEncryptedAction::CancelAll if context.expected_order_id.is_none() => Ok(()),
         ExpectedEncryptedAction::Replace
             if context.expected_order_id == actual_order_id && actual_order_id.is_some() =>
         {
@@ -2647,6 +2651,32 @@ mod tests {
             ExpectedEncryptedAction::Cancel,
             Some(Uuid::new_v4()),
             &cancel,
+        )
+        .is_err());
+
+        let cancel_all = EncryptedRequestContext {
+            idempotency_key: "orders:cancel-all:1234".into(),
+            expected_action: ExpectedEncryptedAction::CancelAll,
+            expected_session_tags: vec![api_session_request_tag(
+                "orders:cancel-all:1234",
+                "session:user-a",
+            )],
+            expected_order_id: None,
+        };
+        assert!(validate_user_command_context(
+            "orders:cancel-all:1234",
+            "session:user-a",
+            ExpectedEncryptedAction::CancelAll,
+            None,
+            &cancel_all,
+        )
+        .is_ok());
+        assert!(validate_user_command_context(
+            "orders:cancel-all:1234",
+            "session:user-a",
+            ExpectedEncryptedAction::Cancel,
+            Some(order_id),
+            &cancel_all,
         )
         .is_err());
         assert!(validate_user_command_context(

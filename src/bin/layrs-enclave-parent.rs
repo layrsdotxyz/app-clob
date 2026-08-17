@@ -89,6 +89,8 @@ enum ExpectedEncryptedAction {
     Replace,
     #[serde(rename = "CANCEL_ORDER")]
     Cancel,
+    #[serde(rename = "CANCEL_ALL_ORDERS")]
+    CancelAll,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -370,7 +372,9 @@ async fn relay(State(state): State<AppState>, Json(envelope): Json<PrivateEnvelo
 fn valid_request_context(context: &EncryptedRequestContext) -> bool {
     valid_idempotency_key(&context.idempotency_key)
         && match context.expected_action {
-            ExpectedEncryptedAction::Submit => context.expected_order_id.is_none(),
+            ExpectedEncryptedAction::Submit | ExpectedEncryptedAction::CancelAll => {
+                context.expected_order_id.is_none()
+            }
             ExpectedEncryptedAction::Replace | ExpectedEncryptedAction::Cancel => {
                 context.expected_order_id.is_some()
             }
@@ -556,6 +560,21 @@ mod tests {
             serde_json::to_value(&cancel).unwrap()["expectedAction"],
             "CANCEL_ORDER"
         );
+        let cancel_all = EncryptedRequestContext {
+            idempotency_key: "orders:cancel-all:1234".into(),
+            expected_action: ExpectedEncryptedAction::CancelAll,
+            expected_session_tags: vec![URL_SAFE_NO_PAD.encode([7u8; 32])],
+            expected_order_id: None,
+        };
+        assert!(valid_request_context(&cancel_all));
+        assert_eq!(
+            serde_json::to_value(&cancel_all).unwrap()["expectedAction"],
+            "CANCEL_ALL_ORDERS"
+        );
+        assert!(!valid_request_context(&EncryptedRequestContext {
+            expected_order_id: Some(Uuid::new_v4()),
+            ..cancel_all
+        }));
         assert!(!valid_request_context(&EncryptedRequestContext {
             idempotency_key: "order:cancel:1234".into(),
             expected_action: ExpectedEncryptedAction::Cancel,
