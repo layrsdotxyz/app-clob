@@ -74,6 +74,22 @@ pub struct LedgerTransaction {
     pub transfers: Vec<Transfer>,
 }
 
+/// Enclave-private economic legs for one NORMAL fill. The cash side and claim
+/// side use different conserved assets, so each is represented as its own
+/// balanced transfer pair. This type must never leave the encrypted journal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NormalFillPosting {
+    pub fill_id: String,
+    pub buyer_cash_hold: AccountKey,
+    pub seller_available: AccountKey,
+    pub seller_claim_hold: AccountKey,
+    pub buyer_position: AccountKey,
+    pub fee_revenue: AccountKey,
+    pub seller_proceeds_atomic: u128,
+    pub fee_atomic: u128,
+    pub quantity_micros: u128,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppliedLedgerTransaction {
     pub sequence: u64,
@@ -210,6 +226,72 @@ impl Ledger {
         &mut self,
         transaction: LedgerTransaction,
     ) -> CoreResult<AppliedLedgerTransaction> {
+        self.apply_with_replay_keys(transaction, BTreeSet::new())
+    }
+
+    /// Applies a batch of NORMAL fills plus the incoming order's reserve and
+    /// remainder-release legs as one atomic ledger transition. Fill replay is
+    /// bound to enclave-derived fill IDs rather than only the operator command
+    /// key, so a committed fill cannot be posted again under a new request.
+    pub fn apply_normal_fill_settlement(
+        &mut self,
+        transaction: LedgerTransaction,
+        fills: Vec<NormalFillPosting>,
+    ) -> CoreResult<AppliedLedgerTransaction> {
+        if fills.is_empty() {
+            return Err(CoreError::ZeroAmount);
+        }
+
+        let mut unmatched = transaction.transfers.clone();
+        let mut replay_keys = BTreeSet::new();
+        for fill in &fills {
+            validate_normal_fill(fill)?;
+            let replay_key = format!("normal-fill-evidence:{}", fill.fill_id);
+            if !replay_keys.insert(replay_key.clone())
+                || self.applied_idempotency_keys.contains(&replay_key)
+            {
+                return Err(CoreError::DuplicateCommand);
+            }
+
+            consume_transfer(
+                &mut unmatched,
+                &fill.buyer_cash_hold,
+                &fill.seller_available,
+                fill.seller_proceeds_atomic,
+            )?;
+            if fill.fee_atomic > 0 {
+                consume_transfer(
+                    &mut unmatched,
+                    &fill.buyer_cash_hold,
+                    &fill.fee_revenue,
+                    fill.fee_atomic,
+                )?;
+            }
+            consume_transfer(
+                &mut unmatched,
+                &fill.seller_claim_hold,
+                &fill.buyer_position,
+                fill.quantity_micros,
+            )?;
+        }
+
+        // The only non-fill transfers permitted in this transaction are the
+        // already-certified reserve/remainder-release transitions from S03.
+        if unmatched
+            .iter()
+            .any(|transfer| !is_order_hold_transition(transfer))
+        {
+            return Err(CoreError::UnbalancedTransaction);
+        }
+
+        self.apply_with_replay_keys(transaction, replay_keys)
+    }
+
+    fn apply_with_replay_keys(
+        &mut self,
+        transaction: LedgerTransaction,
+        additional_replay_keys: BTreeSet<String>,
+    ) -> CoreResult<AppliedLedgerTransaction> {
         if transaction.transfers.is_empty() {
             return Err(CoreError::UnbalancedTransaction);
         }
@@ -249,6 +331,7 @@ impl Ledger {
             .ok_or(CoreError::UnbalancedTransaction)?;
         self.applied_idempotency_keys
             .insert(transaction.idempotency_key.clone());
+        self.applied_idempotency_keys.extend(additional_replay_keys);
         let state_root = self.state_root();
 
         let postings = transaction
@@ -617,6 +700,106 @@ impl Ledger {
         let mut output = [0u8; 32];
         hash.finalize(&mut output);
         output
+    }
+}
+
+fn validate_normal_fill(fill: &NormalFillPosting) -> CoreResult<()> {
+    if fill.fill_id.is_empty() || fill.quantity_micros == 0 {
+        return Err(CoreError::ZeroAmount);
+    }
+    let cash_debit = fill
+        .seller_proceeds_atomic
+        .checked_add(fill.fee_atomic)
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    if cash_debit == 0 {
+        return Err(CoreError::ZeroAmount);
+    }
+
+    let market_id = fill
+        .buyer_cash_hold
+        .market_id
+        .as_deref()
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    let outcome = fill
+        .buyer_cash_hold
+        .outcome
+        .as_deref()
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    let expected_claim_asset = format!("CLAIM:{market_id}:{outcome}");
+    let valid_accounts = fill.buyer_cash_hold.bucket == AccountBucket::UserOrderHold
+        && fill.seller_available.bucket == AccountBucket::UserAvailable
+        && fill.seller_claim_hold.bucket == AccountBucket::UserOrderHold
+        && fill.buyer_position.bucket == AccountBucket::UserPosition
+        && fill.fee_revenue.bucket == AccountBucket::FeeRevenue
+        && fill.fee_revenue.owner == "layrs"
+        && !fill.buyer_cash_hold.owner.is_empty()
+        && !fill.seller_available.owner.is_empty()
+        && fill.buyer_cash_hold.owner != fill.seller_available.owner
+        && fill.buyer_cash_hold.owner == fill.buyer_position.owner
+        && fill.seller_available.owner == fill.seller_claim_hold.owner
+        && fill.buyer_cash_hold.asset == fill.seller_available.asset
+        && fill.buyer_cash_hold.asset == fill.fee_revenue.asset
+        && fill.seller_claim_hold.asset == expected_claim_asset
+        && fill.buyer_position.asset == expected_claim_asset
+        && fill.seller_claim_hold.market_id.as_deref() == Some(market_id)
+        && fill.buyer_position.market_id.as_deref() == Some(market_id)
+        && fill.seller_claim_hold.outcome.as_deref() == Some(outcome)
+        && fill.buyer_position.outcome.as_deref() == Some(outcome)
+        && fill.seller_available.market_id.is_none()
+        && fill.seller_available.outcome.is_none()
+        && fill.fee_revenue.market_id.is_none()
+        && fill.fee_revenue.outcome.is_none();
+    if !valid_accounts {
+        return Err(CoreError::UnbalancedTransaction);
+    }
+    Ok(())
+}
+
+fn consume_transfer(
+    transfers: &mut Vec<Transfer>,
+    from: &AccountKey,
+    to: &AccountKey,
+    amount: u128,
+) -> CoreResult<()> {
+    if amount == 0 {
+        return Ok(());
+    }
+    let index = transfers
+        .iter()
+        .position(|transfer| {
+            transfer.from == *from && transfer.to == *to && transfer.amount == amount
+        })
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    transfers.remove(index);
+    Ok(())
+}
+
+fn is_order_hold_transition(transfer: &Transfer) -> bool {
+    if transfer.amount == 0
+        || transfer.from.owner != transfer.to.owner
+        || transfer.from.asset != transfer.to.asset
+    {
+        return false;
+    }
+    match (&transfer.from.bucket, &transfer.to.bucket) {
+        (AccountBucket::UserAvailable, AccountBucket::UserOrderHold) => {
+            transfer.from.market_id.is_none()
+                && transfer.from.outcome.is_none()
+                && transfer.to.market_id.is_some()
+                && transfer.to.outcome.is_some()
+        }
+        (AccountBucket::UserOrderHold, AccountBucket::UserAvailable) => {
+            transfer.to.market_id.is_none()
+                && transfer.to.outcome.is_none()
+                && transfer.from.market_id.is_some()
+                && transfer.from.outcome.is_some()
+        }
+        (AccountBucket::UserPosition, AccountBucket::UserOrderHold)
+        | (AccountBucket::UserOrderHold, AccountBucket::UserPosition) => {
+            transfer.from.market_id == transfer.to.market_id
+                && transfer.from.outcome == transfer.to.outcome
+        }
+        _ => false,
     }
 }
 

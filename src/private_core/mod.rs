@@ -59,7 +59,7 @@ pub use journal::{
 pub use ledger::{
     AccountBucket, AccountKey, AppliedLedgerTransaction, ClaimPayout, CompleteSetDirection,
     CompleteSetTransaction, ExternalFlowDirection, ExternalFlowTransaction, Ledger, LedgerPosting,
-    LedgerTransaction, PostingSide, Transfer,
+    LedgerTransaction, NormalFillPosting, PostingSide, Transfer,
 };
 #[allow(unused_imports)]
 pub use orderbook::{

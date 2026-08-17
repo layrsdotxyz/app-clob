@@ -16,9 +16,9 @@ use super::{
     AccountBucket, AccountKey, BookOrder, ClaimPayout, CompleteSetDirection,
     CompleteSetTransaction, CoreError, CoreResult, EnclaveReceipt, EncryptedJournal,
     EncryptedJournalRecord, EncryptedSnapshot, ExternalFlowDirection, ExternalFlowTransaction,
-    Fill, JournalKey, Ledger, LedgerTransaction, MatchResult, MatchType, OrderAction, OrderStatus,
-    Outcome, PriceTimeBook, ReceiptSigner, SessionGuard, SignedSessionRequest, Transfer,
-    PRICE_SCALE,
+    Fill, JournalKey, Ledger, LedgerTransaction, MatchResult, MatchType, NormalFillPosting,
+    OrderAction, OrderStatus, Outcome, PriceTimeBook, ReceiptSigner, SessionGuard,
+    SignedSessionRequest, Transfer, PRICE_SCALE,
 };
 
 /// Public depth is deliberately less precise than the enclave's private book.
@@ -2959,7 +2959,7 @@ impl PrivateTradingCore {
                                 // Preserve the exact legacy transition (including one ledger
                                 // sequence increment) so old NORMAL-only journal replay remains
                                 // byte-for-byte stable after the complete-set feature ships.
-                                let transfers = settlement_transfers(
+                                let (transfers, fill_postings) = settlement_transfers(
                                     &self.books,
                                     &books,
                                     market,
@@ -2975,11 +2975,17 @@ impl PrivateTradingCore {
                                     &match_result,
                                     &mut position_cost_basis,
                                 )?;
-                                ledger.apply(LedgerTransaction {
+                                let transaction = LedgerTransaction {
                                     idempotency_key: format!("order:{}", command.idempotency_key),
                                     business_reference: command.command_id.clone(),
                                     transfers,
-                                })?;
+                                };
+                                if fill_postings.is_empty() {
+                                    ledger.apply(transaction)?;
+                                } else {
+                                    ledger
+                                        .apply_normal_fill_settlement(transaction, fill_postings)?;
+                                }
                             } else {
                                 apply_complete_set_match_settlement(
                                     &mut ledger,
@@ -3615,8 +3621,9 @@ fn settlement_transfers(
     market: &MarketConfig,
     incoming: &BookOrder,
     result: &MatchResult,
-) -> CoreResult<Vec<Transfer>> {
+) -> CoreResult<(Vec<Transfer>, Vec<NormalFillPosting>)> {
     let mut transfers = Vec::new();
+    let mut fill_postings = Vec::new();
     let incoming_cash_hold = cash_hold(incoming, &market.settlement_asset);
     let incoming_claim_hold = claim_hold(incoming);
     let initial_notional_micros = notional(incoming.price_micros, incoming.quantity_micros)?;
@@ -3675,26 +3682,42 @@ fn settlement_transfers(
         } else {
             fill_notional
         };
-        transfers.push(Transfer {
-            from: buyer_hold.clone(),
-            to: available(&seller.private_user_id, &market.settlement_asset),
-            amount: seller_proceeds,
-        });
+        let seller_available = available(&seller.private_user_id, &market.settlement_asset);
+        let buyer_position = claim_position_for(
+            &buyer.private_user_id,
+            &incoming.market_id,
+            incoming.outcome,
+        );
+        let fee_account = fee_revenue(&market.settlement_asset);
+        if seller_proceeds > 0 {
+            transfers.push(Transfer {
+                from: buyer_hold.clone(),
+                to: seller_available.clone(),
+                amount: seller_proceeds,
+            });
+        }
         if taker_fee > 0 {
             transfers.push(Transfer {
-                from: buyer_hold,
-                to: AccountKey::new("layrs", AccountBucket::FeeRevenue, &market.settlement_asset),
+                from: buyer_hold.clone(),
+                to: fee_account.clone(),
                 amount: taker_fee,
             });
         }
         transfers.push(Transfer {
-            from: seller_hold,
-            to: claim_position_for(
-                &buyer.private_user_id,
-                &incoming.market_id,
-                incoming.outcome,
-            ),
+            from: seller_hold.clone(),
+            to: buyer_position.clone(),
             amount: fill.quantity_micros,
+        });
+        fill_postings.push(NormalFillPosting {
+            fill_id: fill.fill_id.to_string(),
+            buyer_cash_hold: buyer_hold,
+            seller_available,
+            seller_claim_hold: seller_hold,
+            buyer_position,
+            fee_revenue: fee_account,
+            seller_proceeds_atomic: seller_proceeds,
+            fee_atomic: taker_fee,
+            quantity_micros: fill.quantity_micros,
         });
         if incoming.action == OrderAction::Buy {
             incoming_cash_used = incoming_cash_used
@@ -3753,7 +3776,7 @@ fn settlement_transfers(
             }
         }
     }
-    Ok(transfers)
+    Ok((transfers, fill_postings))
 }
 
 /// Settles a match result containing at least one complete-set fill. The engine

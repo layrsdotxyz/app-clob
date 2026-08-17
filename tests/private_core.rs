@@ -1178,6 +1178,231 @@ fn native_clob_partial_fill_locks_remainder_and_cancel_releases_once() {
         )),
         799_600_000_000_000_000
     );
+
+    // Fill the seller's remaining UP claim completely. The second order
+    // proves that a prior partial fill plus a later full fill preserve the
+    // collateral account and book the exact buyer position, seller proceeds
+    // and taker fees.
+    execute_signed(
+        &mut core,
+        &bob,
+        "session:bob",
+        3,
+        "cmd:bob-final-ask",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Sell,
+                500_000,
+                600_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_300,
+    );
+    let full_buy_action = UserCommandAction::SubmitOrder {
+        order: BookOrder::new(
+            "ignored",
+            market_id,
+            Outcome::Up,
+            OrderAction::Buy,
+            500_000,
+            600_000,
+            TimeInForce::Gtc,
+            None,
+        ),
+    };
+    let full_fill = execute_signed_response(
+        &mut core,
+        &alice,
+        "session:alice",
+        5,
+        "cmd:alice-full-buy",
+        full_buy_action.clone(),
+        1_350,
+    );
+    assert!(matches!(
+        full_fill.result,
+        CommandResult::Order { ref result }
+            if result.fills.len() == 1
+                && result.accepted_order.as_ref().is_some_and(|order|
+                    order.status == OrderStatus::Filled
+                        && order.remaining_micros == 0
+                        && order.filled_micros == 600_000)
+    ));
+
+    let mut collateral = AccountKey::new("layrs", AccountBucket::MarketCollateral, "ZEN");
+    collateral.market_id = Some(market_id.into());
+    assert_eq!(core.balance(&collateral), 1_000_000_000_000_000_000);
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &alice_owner,
+            AccountBucket::UserAvailable,
+            "ZEN"
+        )),
+        499_000_000_000_000_000
+    );
+    assert_eq!(core.balance(&alice_cash_hold), 0);
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &bob_owner,
+            AccountBucket::UserAvailable,
+            "ZEN"
+        )),
+        500_000_000_000_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new("layrs", AccountBucket::FeeRevenue, "ZEN")),
+        1_000_000_000_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::position(
+            &alice_owner,
+            format!("CLAIM:{market_id}:UP"),
+            market_id,
+            "UP"
+        )),
+        1_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::position(
+            &bob_owner,
+            format!("CLAIM:{market_id}:UP"),
+            market_id,
+            "UP"
+        )),
+        0
+    );
+
+    // Exercise the opposite fee direction: the resting BUY maker funds the
+    // gross notional from its hold, while the incoming SELL taker receives
+    // net proceeds and the fee is split to protocol revenue atomically.
+    execute_signed(
+        &mut core,
+        &bob,
+        "session:bob",
+        4,
+        "cmd:bob-resting-bid",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                500_000,
+                200_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_400,
+    );
+    let sell_taker_action = UserCommandAction::SubmitOrder {
+        order: BookOrder::new(
+            "ignored",
+            market_id,
+            Outcome::Up,
+            OrderAction::Sell,
+            500_000,
+            200_000,
+            TimeInForce::Gtc,
+            None,
+        ),
+    };
+    let sell_taker_fill = execute_signed_response(
+        &mut core,
+        &alice,
+        "session:alice",
+        6,
+        "cmd:alice-sell-taker",
+        sell_taker_action.clone(),
+        1_450,
+    );
+    assert!(matches!(
+        sell_taker_fill.result,
+        CommandResult::Order { ref result }
+            if result.fills.len() == 1
+                && result.accepted_order.as_ref().is_some_and(|order|
+                    order.status == OrderStatus::Filled
+                        && order.remaining_micros == 0
+                        && order.filled_micros == 200_000)
+    ));
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &alice_owner,
+            AccountBucket::UserAvailable,
+            "ZEN"
+        )),
+        598_800_000_000_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &bob_owner,
+            AccountBucket::UserAvailable,
+            "ZEN"
+        )),
+        400_000_000_000_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new("layrs", AccountBucket::FeeRevenue, "ZEN")),
+        1_200_000_000_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::position(
+            &alice_owner,
+            format!("CLAIM:{market_id}:UP"),
+            market_id,
+            "UP"
+        )),
+        800_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::position(
+            &bob_owner,
+            format!("CLAIM:{market_id}:UP"),
+            market_id,
+            "UP"
+        )),
+        200_000
+    );
+    assert_eq!(core.balance(&collateral), 1_000_000_000_000_000_000);
+
+    // A committed response may be lost between the enclave and API. Snapshot
+    // recovery keeps only the processed request hash, so the same signed
+    // command must be reported as previously processed without applying the
+    // fill, fee or position transfer a second time.
+    let snapshot = core.export_encrypted_snapshot().unwrap();
+    let snapshot_sequence = snapshot.sequence;
+    let mut restored = PrivateTradingCore::restore_encrypted_snapshot(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([67u8; 48]),
+        &snapshot,
+        snapshot_sequence,
+    )
+    .unwrap();
+    let restored_root = restored.state_root();
+    let lost_response_retry = execute_signed_result(
+        &mut restored,
+        &alice,
+        "session:alice",
+        6,
+        "cmd:alice-sell-taker",
+        sell_taker_action,
+        1_450,
+    );
+    assert_eq!(
+        lost_response_retry.unwrap_err(),
+        CoreError::PreviouslyProcessed
+    );
+    assert_eq!(restored.state_root(), restored_root);
+    assert_eq!(restored.balance(&collateral), 1_000_000_000_000_000_000);
+    assert_eq!(
+        restored.balance(&AccountKey::new("layrs", AccountBucket::FeeRevenue, "ZEN")),
+        1_200_000_000_000_000
+    );
 }
 
 #[test]
