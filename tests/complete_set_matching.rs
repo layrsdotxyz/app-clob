@@ -1,11 +1,11 @@
 use clob_service::private_core::{
     command_request_hash, exact_condition_resolution_signing_payload, resolution_signing_payload,
     signing_payload, AccountBucket, AccountKey, BookOrder, BoundaryEvidence, CommandResult,
-    ExactConditionResolutionStatement, ExternalFlowDirection, FeeProfileId, JournalKey,
-    MarketConfig, MarketExecution, MatchType, OrderAction, OrderStatus, Outcome, PriceTimeBook,
-    PrivateTradingCore, ReceiptSigner, ResolutionOutcome, ResolutionStatement, SessionRequest,
-    SignedExactConditionResolution, SignedResolution, SignedSessionRequest, TimeInForce,
-    UserCommand, UserCommandAction,
+    CompleteSetDirection, ExactConditionResolutionStatement, ExternalFlowDirection, FeeProfileId,
+    JournalKey, MarketConfig, MarketExecution, MatchType, OrderAction, OrderStatus, Outcome,
+    PriceTimeBook, PrivateTradingCore, ReceiptSigner, ResolutionOutcome, ResolutionStatement,
+    SessionRequest, SignedExactConditionResolution, SignedResolution, SignedSessionRequest,
+    TimeInForce, UserCommand, UserCommandAction,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use proptest::prelude::*;
@@ -1003,6 +1003,367 @@ fn complete_set_command_replay_produces_identical_fill_and_state_root() {
         first.audit_fills[0].statement,
         second.audit_fills[0].statement
     );
+}
+
+#[test]
+fn complementary_mint_self_trade_is_prevented_across_alias_sessions_and_replay() {
+    let (mut core, primary_key, counterparty_key, primary_owner, _) = configured_core();
+    let alias_key = SigningKey::from_bytes(&[40u8; 32]);
+    core.register_session(
+        "sys:session:up-alias".into(),
+        "session:up-alias".into(),
+        [34u8; 32],
+        alias_key.verifying_key().to_bytes(),
+        3_000,
+        850,
+    )
+    .unwrap();
+
+    let maker = execute(
+        &mut core,
+        &primary_key,
+        "session:up",
+        1,
+        "cmd:alias-mint-maker",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::with_id(
+                Uuid::from_u128(9_001),
+                "caller-controlled-maker-alias",
+                MARKET_ID,
+                Outcome::Up,
+                OrderAction::Buy,
+                400_000,
+                500_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_000,
+    );
+    assert!(
+        order_result(&maker.result)
+            .accepted_order
+            .as_ref()
+            .unwrap()
+            .private_user_id
+            .is_empty(),
+        "the private response must not echo either the canonical identity or caller alias"
+    );
+
+    let alias_action = UserCommandAction::SubmitOrder {
+        order: BookOrder::with_id(
+            Uuid::from_u128(9_002),
+            "different-caller-controlled-alias",
+            MARKET_ID,
+            Outcome::Down,
+            OrderAction::Buy,
+            610_000,
+            500_000,
+            TimeInForce::Fak,
+            None,
+        ),
+    };
+    let blocked = execute(
+        &mut core,
+        &alias_key,
+        "session:up-alias",
+        1,
+        "cmd:alias-mint-blocked",
+        alias_action.clone(),
+        1_010,
+    );
+    assert!(order_result(&blocked.result).fills.is_empty());
+    assert_eq!(
+        order_result(&blocked.result).cancelled_remainder_micros,
+        500_000
+    );
+    assert_eq!(core.balance(&market_collateral()), 0);
+    assert_eq!(core.balance(&claim(&primary_owner, Outcome::Up)), 0);
+    assert_eq!(core.balance(&claim(&primary_owner, Outcome::Down)), 0);
+
+    let root_after_block = core.state_root();
+    let replay = execute(
+        &mut core,
+        &alias_key,
+        "session:up-alias",
+        1,
+        "cmd:alias-mint-blocked",
+        alias_action,
+        1_011,
+    );
+    assert_eq!(replay, blocked);
+    assert_eq!(core.state_root(), root_after_block);
+
+    let control = execute(
+        &mut core,
+        &counterparty_key,
+        "session:down",
+        1,
+        "cmd:alias-mint-control",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::with_id(
+                Uuid::from_u128(9_003),
+                "counterparty-alias",
+                MARKET_ID,
+                Outcome::Down,
+                OrderAction::Buy,
+                610_000,
+                500_000,
+                TimeInForce::Fok,
+                None,
+            ),
+        },
+        1_020,
+    );
+    assert_eq!(order_result(&control.result).fills.len(), 1);
+    assert_eq!(
+        order_result(&control.result).fills[0].match_type,
+        MatchType::Mint
+    );
+}
+
+#[test]
+fn complementary_merge_self_trade_is_prevented_across_alias_sessions() {
+    let (mut core, primary_key, counterparty_key, primary_owner, _) = configured_core();
+    let alias_key = SigningKey::from_bytes(&[41u8; 32]);
+    core.register_session(
+        "sys:session:merge-alias".into(),
+        "session:merge-alias".into(),
+        [34u8; 32],
+        alias_key.verifying_key().to_bytes(),
+        3_000,
+        850,
+    )
+    .unwrap();
+
+    for (key, session, command) in [
+        (&primary_key, "session:up", "cmd:primary-complete-set"),
+        (
+            &counterparty_key,
+            "session:down",
+            "cmd:counterparty-complete-set",
+        ),
+    ] {
+        execute(
+            &mut core,
+            key,
+            session,
+            1,
+            command,
+            UserCommandAction::CompleteSet {
+                market_id: MARKET_ID.into(),
+                quantity_micros: 1_000_000,
+                direction: CompleteSetDirection::Mint,
+            },
+            950,
+        );
+    }
+
+    execute(
+        &mut core,
+        &primary_key,
+        "session:up",
+        2,
+        "cmd:alias-merge-maker",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::with_id(
+                Uuid::from_u128(9_011),
+                "maker-alias",
+                MARKET_ID,
+                Outcome::Up,
+                OrderAction::Sell,
+                410_000,
+                1_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_000,
+    );
+    let blocked = execute(
+        &mut core,
+        &alias_key,
+        "session:merge-alias",
+        1,
+        "cmd:alias-merge-blocked",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::with_id(
+                Uuid::from_u128(9_012),
+                "taker-alias",
+                MARKET_ID,
+                Outcome::Down,
+                OrderAction::Sell,
+                580_000,
+                1_000_000,
+                TimeInForce::Fak,
+                None,
+            ),
+        },
+        1_010,
+    );
+    assert!(order_result(&blocked.result).fills.is_empty());
+    assert_eq!(
+        order_result(&blocked.result).cancelled_remainder_micros,
+        1_000_000
+    );
+    assert_eq!(core.balance(&market_collateral()), 2 * ONE_ZEN);
+    assert_eq!(
+        core.balance(&claim(&primary_owner, Outcome::Down)),
+        1_000_000
+    );
+
+    let control = execute(
+        &mut core,
+        &counterparty_key,
+        "session:down",
+        2,
+        "cmd:alias-merge-control",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::with_id(
+                Uuid::from_u128(9_013),
+                "counterparty-alias",
+                MARKET_ID,
+                Outcome::Down,
+                OrderAction::Sell,
+                580_000,
+                1_000_000,
+                TimeInForce::Fok,
+                None,
+            ),
+        },
+        1_020,
+    );
+    assert_eq!(order_result(&control.result).fills.len(), 1);
+    assert_eq!(
+        order_result(&control.result).fills[0].match_type,
+        MatchType::Merge
+    );
+    assert_eq!(core.balance(&market_collateral()), ONE_ZEN);
+}
+
+#[test]
+fn encrypted_snapshot_preserves_canonical_identity_across_alias_sessions() {
+    let journal_key = JournalKey::from_bytes([31u8; 32]);
+    let (mut core, primary_key, _, _, _) = configured_core();
+    let alias_key = SigningKey::from_bytes(&[42u8; 32]);
+    core.register_session(
+        "sys:session:snapshot-alias".into(),
+        "session:snapshot-alias".into(),
+        [34u8; 32],
+        alias_key.verifying_key().to_bytes(),
+        3_000,
+        850,
+    )
+    .unwrap();
+    execute(
+        &mut core,
+        &primary_key,
+        "session:up",
+        1,
+        "cmd:snapshot-stp-maker",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::with_id(
+                Uuid::from_u128(9_021),
+                "pre-snapshot-alias",
+                MARKET_ID,
+                Outcome::Up,
+                OrderAction::Buy,
+                350_000,
+                500_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_000,
+    );
+
+    let snapshot = core.export_encrypted_snapshot().unwrap();
+    let mut restored = PrivateTradingCore::restore_encrypted_snapshot(
+        journal_key,
+        ReceiptSigner::generate([43u8; 48]),
+        &snapshot,
+        snapshot.sequence,
+    )
+    .unwrap();
+    assert_eq!(restored.state_root(), core.state_root());
+
+    let blocked = execute(
+        &mut restored,
+        &alias_key,
+        "session:snapshot-alias",
+        1,
+        "cmd:snapshot-stp-blocked",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::with_id(
+                Uuid::from_u128(9_022),
+                "post-snapshot-alias",
+                MARKET_ID,
+                Outcome::Down,
+                OrderAction::Buy,
+                650_000,
+                500_000,
+                TimeInForce::Fak,
+                None,
+            ),
+        },
+        1_010,
+    );
+    assert!(order_result(&blocked.result).fills.is_empty());
+    assert!(blocked.audit_fills.is_empty());
+    assert_eq!(restored.balance(&market_collateral()), 0);
+}
+
+proptest! {
+    #[test]
+    fn cross_outcome_self_trade_filter_precedes_mint_merge_and_precision_checks(
+        maker_price in 1u64..999_999,
+        improvement in 0u64..10_000,
+        quantity in prop_oneof![Just(1u128), 2u128..10_000_000],
+        is_mint in any::<bool>(),
+    ) {
+        let taker_price = if is_mint {
+            (1_000_000u64 - maker_price)
+                .saturating_add(improvement)
+                .min(999_999)
+        } else {
+            (1_000_000u64 - maker_price).saturating_sub(improvement).max(1)
+        };
+        let action = if is_mint { OrderAction::Buy } else { OrderAction::Sell };
+        let mut book = PriceTimeBook::default();
+        book.submit(
+            BookOrder::with_id(
+                Uuid::from_u128(9_101),
+                "canonical-user",
+                MARKET_ID,
+                Outcome::Up,
+                action,
+                maker_price,
+                quantity,
+                TimeInForce::Gtc,
+                None,
+            ),
+            1_000,
+        ).unwrap();
+        let blocked = book.submit(
+            BookOrder::with_id(
+                Uuid::from_u128(9_102),
+                "canonical-user",
+                MARKET_ID,
+                Outcome::Down,
+                action,
+                taker_price,
+                quantity,
+                TimeInForce::Fak,
+                None,
+            ),
+            1_001,
+        ).unwrap();
+        prop_assert!(blocked.fills.is_empty());
+        prop_assert_eq!(blocked.cancelled_remainder_micros, quantity);
+        let maker = book.order(Uuid::from_u128(9_101)).unwrap();
+        prop_assert_eq!(maker.status, OrderStatus::Open);
+        prop_assert_eq!(maker.remaining_micros, quantity);
+    }
 }
 
 proptest! {
