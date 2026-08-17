@@ -667,6 +667,127 @@ impl Ledger {
         })
     }
 
+    /// Records one finalized pool withdrawal as a balanced reduction of the
+    /// pool asset and the corresponding user-withdrawal liability. A prepared
+    /// or broadcast transaction is not sufficient: `evidence_hash` must bind
+    /// the canonical successful finality event (or the delivered destination
+    /// event for a routed withdrawal).
+    pub fn apply_confirmed_withdrawal(
+        &mut self,
+        transaction: ExternalFlowTransaction,
+    ) -> CoreResult<AppliedLedgerTransaction> {
+        if transaction.amount == 0 || transaction.evidence_hash == [0u8; 32] {
+            return Err(CoreError::ZeroAmount);
+        }
+        if transaction.direction != ExternalFlowDirection::Outflow
+            || transaction.account.bucket != AccountBucket::UserWithdrawalHold
+            || transaction.account.owner.is_empty()
+            || transaction.account.owner == "layrs"
+            || transaction.account.market_id.is_some()
+            || transaction.account.outcome.is_some()
+        {
+            return Err(CoreError::InvalidOrder(
+                "confirmed withdrawal requires an opaque user-withdrawal liability".into(),
+            ));
+        }
+        let evidence_replay_key = format!(
+            "confirmed-withdrawal-evidence:{}",
+            hex::encode(transaction.evidence_hash)
+        );
+        if self.applied_idempotency_keys.contains(&evidence_replay_key) {
+            return Err(CoreError::DuplicateCommand);
+        }
+
+        let pool = AccountKey::new("layrs", AccountBucket::PoolCash, &transaction.account.asset);
+        let prior_state_root = self.state_root();
+        let mut next = self.balances.clone();
+        debit(&mut next, &transaction.account, transaction.amount)?;
+        debit(&mut next, &pool, transaction.amount)?;
+
+        self.balances = next;
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(CoreError::UnbalancedTransaction)?;
+        self.applied_idempotency_keys
+            .insert(evidence_replay_key.clone());
+        let state_root = self.state_root();
+        Ok(AppliedLedgerTransaction {
+            sequence: self.sequence,
+            idempotency_key: evidence_replay_key,
+            business_reference: format!(
+                "confirmed-withdrawal:{}",
+                hex::encode(transaction.evidence_hash)
+            ),
+            prior_state_root,
+            state_root,
+            transfers: Vec::new(),
+            postings: vec![
+                LedgerPosting {
+                    account: transaction.account,
+                    side: PostingSide::Debit,
+                    amount: transaction.amount,
+                },
+                LedgerPosting {
+                    account: pool,
+                    side: PostingSide::Credit,
+                    amount: transaction.amount,
+                },
+            ],
+        })
+    }
+
+    /// Releases a failed withdrawal hold back to the same opaque user's
+    /// available balance. The independent failure evidence is a financial
+    /// replay key, so a committed release cannot be repeated with a different
+    /// operator idempotency key after a lost response.
+    pub fn release_withdrawal(
+        &mut self,
+        idempotency_key: String,
+        evidence_hash: [u8; 32],
+        hold: AccountKey,
+        available: AccountKey,
+        amount: u128,
+    ) -> CoreResult<AppliedLedgerTransaction> {
+        if amount == 0 || evidence_hash == [0u8; 32] {
+            return Err(CoreError::ZeroAmount);
+        }
+        if hold.bucket != AccountBucket::UserWithdrawalHold
+            || available.bucket != AccountBucket::UserAvailable
+            || hold.owner.is_empty()
+            || hold.owner == "layrs"
+            || hold.owner != available.owner
+            || hold.asset != available.asset
+            || hold.market_id.is_some()
+            || hold.outcome.is_some()
+            || available.market_id.is_some()
+            || available.outcome.is_some()
+        {
+            return Err(CoreError::InvalidOrder(
+                "withdrawal release requires matching opaque user accounts".into(),
+            ));
+        }
+        let evidence_replay_key =
+            format!("withdrawal-release-evidence:{}", hex::encode(evidence_hash));
+        if self.applied_idempotency_keys.contains(&evidence_replay_key) {
+            return Err(CoreError::DuplicateCommand);
+        }
+        let mut replay_keys = BTreeSet::new();
+        replay_keys.insert(evidence_replay_key);
+        self.apply_with_replay_keys(
+            LedgerTransaction {
+                idempotency_key,
+                business_reference: format!("withdrawal-release:{}", hex::encode(evidence_hash)),
+                transfers: vec![Transfer {
+                    from: hold,
+                    to: available,
+                    amount,
+                }],
+            },
+            replay_keys,
+        )
+    }
+
     /// Applies a custody boundary movement only after independent chain finality evidence.
     /// Unlike an internal transfer, this deliberately changes the total recognized asset and
     /// must be reconciled one-for-one to the relevant LayrsPool transaction.

@@ -812,6 +812,10 @@ enum JournaledSystemCommand {
         idempotency_key: String,
         flow: ExternalFlowTransaction,
     },
+    ConfirmedWithdrawal {
+        idempotency_key: String,
+        flow: ExternalFlowTransaction,
+    },
     AccrueReward {
         idempotency_key: String,
         identity_commitment: [u8; 32],
@@ -1680,6 +1684,63 @@ impl PrivateTradingCore {
         ))
     }
 
+    fn apply_confirmed_withdrawal(
+        &mut self,
+        idempotency_key: String,
+        account: AccountKey,
+        amount: u128,
+        evidence_hash: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        let prior_root = self.state_root();
+        let flow = ExternalFlowTransaction {
+            idempotency_key: format!("withdrawal:{idempotency_key}"),
+            evidence_hash,
+            account,
+            amount,
+            direction: ExternalFlowDirection::Outflow,
+        };
+        let mut ledger = self.ledger.clone();
+        ledger.apply_confirmed_withdrawal(flow.clone())?;
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::ConfirmedWithdrawal {
+            idempotency_key: idempotency_key.clone(),
+            flow,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.ledger = ledger;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        // Keep the existing receipt command ID stable because the backend's
+        // deterministic archive lookup uses this public protocol identifier.
+        Ok(self.system_response(
+            "external-flow",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn apply_user_external_flow(
         &mut self,
@@ -1712,11 +1773,10 @@ impl PrivateTradingCore {
                     now_millis,
                 ),
             (AccountBucket::UserWithdrawalHold, ExternalFlowDirection::Outflow) => self
-                .apply_external_flow_internal(
+                .apply_confirmed_withdrawal(
                     idempotency_key,
                     account,
                     amount,
-                    direction,
                     evidence_hash,
                     now_millis,
                 ),
@@ -1829,15 +1889,13 @@ impl PrivateTradingCore {
         let owner = derive_private_user_id(&self.identity_key, &identity_commitment);
         let prior_root = self.state_root();
         let mut ledger = self.ledger.clone();
-        ledger.apply(LedgerTransaction {
-            idempotency_key: format!("withdrawal-release:{idempotency_key}"),
-            business_reference: hex::encode(evidence_hash),
-            transfers: vec![Transfer {
-                from: AccountKey::new(&owner, AccountBucket::UserWithdrawalHold, &asset),
-                to: AccountKey::new(owner, AccountBucket::UserAvailable, &asset),
-                amount: amount_atomic,
-            }],
-        })?;
+        ledger.release_withdrawal(
+            format!("withdrawal-release:{idempotency_key}"),
+            evidence_hash,
+            AccountKey::new(&owner, AccountBucket::UserWithdrawalHold, &asset),
+            AccountKey::new(owner, AccountBucket::UserAvailable, &asset),
+            amount_atomic,
+        )?;
         let mut keys = self.system_keys.clone();
         keys.insert(idempotency_key.clone());
         let next_sequence = checked_sequence(self.sequence)?;

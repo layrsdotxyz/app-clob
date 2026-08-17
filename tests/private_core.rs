@@ -2453,6 +2453,9 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
     assert_eq!(response.receipt.protocol_version, "layrs.v2");
     assert_eq!(response.receipt.publication_eligible, Some(true));
     assert!(response.encrypted_record.is_some());
+    let public_receipt = serde_json::to_string(&response.receipt).unwrap();
+    assert!(!public_receipt.contains("0x1111111111111111111111111111111111111111"));
+    assert!(!public_receipt.contains(&hex::encode(identity_commitment)));
     let authorization = response.withdrawal_authorization.unwrap();
     assert_eq!(authorization.intent.receipt_id, response.receipt.receipt_id);
     assert_eq!(
@@ -2539,6 +2542,90 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
             "USDC"
         )),
         0
+    );
+
+    let release_snapshot = core.export_encrypted_snapshot().unwrap();
+    let mut release_restored = PrivateTradingCore::restore_encrypted_snapshot(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([32u8; 48]),
+        &release_snapshot,
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        release_restored
+            .release_user_withdrawal(
+                "sys:withdrawal-release:35:retry".into(),
+                identity_commitment,
+                "USDC".into(),
+                10_000_000,
+                [36u8; 32],
+                1_410,
+            )
+            .unwrap_err(),
+        clob_service::private_core::CoreError::DuplicateCommand
+    );
+
+    execute_signed_response(
+        &mut core,
+        &user,
+        "session:withdrawal",
+        3,
+        "cmd:withdrawal-confirmed",
+        UserCommandAction::RequestWithdrawal {
+            withdrawal_id: uuid::Uuid::from_u128(36),
+            chain: "base".into(),
+            asset: "USDC".into(),
+            amount_atomic: 10_000_000,
+            destination: "0x2222222222222222222222222222222222222222".into(),
+        },
+        1_500,
+    );
+    core.apply_user_external_flow(
+        "withdrawal-final:36".into(),
+        identity_commitment,
+        "USDC".into(),
+        AccountBucket::UserWithdrawalHold,
+        10_000_000,
+        ExternalFlowDirection::Outflow,
+        [38u8; 32],
+        1_600,
+    )
+    .unwrap();
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &private_user,
+            AccountBucket::UserWithdrawalHold,
+            "USDC"
+        )),
+        0
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new("layrs", AccountBucket::PoolCash, "USDC")),
+        40_000_000
+    );
+    let confirmed_snapshot = core.export_encrypted_snapshot().unwrap();
+    let mut confirmed_restored = PrivateTradingCore::restore_encrypted_snapshot(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([32u8; 48]),
+        &confirmed_snapshot,
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        confirmed_restored
+            .apply_user_external_flow(
+                "withdrawal-final:36:retry".into(),
+                identity_commitment,
+                "USDC".into(),
+                AccountBucket::UserWithdrawalHold,
+                10_000_000,
+                ExternalFlowDirection::Outflow,
+                [38u8; 32],
+                1_610,
+            )
+            .unwrap_err(),
+        clob_service::private_core::CoreError::DuplicateCommand
     );
 }
 
