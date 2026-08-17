@@ -2963,6 +2963,12 @@ fn private_rewards_accrue_cumulatively_and_authorize_only_the_bound_account() {
         reward_token.into(),
         100,
         [45u8; 32],
+        [55u8; 32],
+        "trader-reward-v1".into(),
+        "TRADER_REWARD".into(),
+        "layrs-fee-v2".into(),
+        1,
+        "LAYRS_FEE_V2".into(),
         1_100,
     )
     .unwrap();
@@ -2973,6 +2979,12 @@ fn private_rewards_accrue_cumulatively_and_authorize_only_the_bound_account() {
         reward_token.into(),
         25,
         [46u8; 32],
+        [56u8; 32],
+        "trader-reward-v1".into(),
+        "TRADER_REWARD".into(),
+        "layrs-fee-v2".into(),
+        1,
+        "LAYRS_FEE_V2".into(),
         1_200,
     )
     .unwrap();
@@ -3047,6 +3059,44 @@ fn private_rewards_accrue_cumulatively_and_authorize_only_the_bound_account() {
         snapshot.sequence,
     )
     .unwrap();
+    // A scheduler may lose the first response after the enclave committed it.
+    // Retrying under a new transport idempotency key must not double-accrue,
+    // and an altered payload under the same evidence must fail closed.
+    restored
+        .accrue_private_reward(
+            "sys:reward:lost-response-retry".into(),
+            identity_commitment,
+            "base".into(),
+            reward_token.into(),
+            100,
+            [45u8; 32],
+            [55u8; 32],
+            "trader-reward-v1".into(),
+            "TRADER_REWARD".into(),
+            "layrs-fee-v2".into(),
+            1,
+            "LAYRS_FEE_V2".into(),
+            1_550,
+        )
+        .unwrap();
+    assert!(matches!(
+        restored.accrue_private_reward(
+            "sys:reward:conflicting-retry".into(),
+            identity_commitment,
+            "base".into(),
+            reward_token.into(),
+            101,
+            [45u8; 32],
+            [55u8; 32],
+            "trader-reward-v1".into(),
+            "TRADER_REWARD".into(),
+            "layrs-fee-v2".into(),
+            1,
+            "LAYRS_FEE_V2".into(),
+            1_560,
+        ),
+        Err(CoreError::InvalidOrder(message)) if message.contains("immutable accrual")
+    ));
     match execute_signed(
         &mut restored,
         &user,

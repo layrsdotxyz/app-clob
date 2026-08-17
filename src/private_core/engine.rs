@@ -116,6 +116,25 @@ impl FeeProfileId {
         matches!(self, Self::LegacyProfitV1)
     }
 
+    /// Canonical immutable policy family persisted with each private fill.
+    /// The legacy `POLYMARKET_*` enum aliases execute the same governed Layrs
+    /// curve and are deliberately normalized so new evidence never revives the
+    /// obsolete provider-facing policy name.
+    fn fee_policy_version(self) -> &'static str {
+        if self.has_layrs_curve_fees() {
+            "LAYRS_FEE_V2"
+        } else {
+            "LAYRS_FEE_V1"
+        }
+    }
+
+    fn immutable_profile_id(self) -> String {
+        serde_json::to_string(&self)
+            .expect("fee profile enum serialization cannot fail")
+            .trim_matches('"')
+            .replace("POLYMARKET_", "LAYRS_")
+    }
+
     fn parameters(self) -> Option<FeeProfileParameters> {
         let parameters = match self {
             Self::LegacyProfitV1 => return None,
@@ -801,6 +820,12 @@ enum JournaledSystemCommand {
         #[serde(with = "super::decimal_u128")]
         amount_atomic: u128,
         evidence_hash: [u8; 32],
+        source_id_hash: [u8; 32],
+        program_id: String,
+        program_type: String,
+        policy_id: String,
+        policy_version: u32,
+        fee_policy_version: String,
     },
     ReleaseWithdrawal {
         idempotency_key: String,
@@ -1710,6 +1735,12 @@ impl PrivateTradingCore {
         reward_token: String,
         amount_atomic: u128,
         evidence_hash: [u8; 32],
+        source_id_hash: [u8; 32],
+        program_id: String,
+        program_type: String,
+        policy_id: String,
+        policy_version: u32,
+        fee_policy_version: String,
         now_millis: i64,
     ) -> CoreResult<SystemResponse> {
         self.validate_new_system_key(&idempotency_key)?;
@@ -1721,7 +1752,19 @@ impl PrivateTradingCore {
         let owner = derive_private_user_id(&self.identity_key, &identity_commitment);
         let prior_root = self.state_root();
         let mut private_rewards = self.private_rewards.clone();
-        private_rewards.accrue(&owner, &chain, &reward_token, amount_atomic)?;
+        private_rewards.accrue(
+            &owner,
+            &chain,
+            &reward_token,
+            amount_atomic,
+            evidence_hash,
+            source_id_hash,
+            &program_id,
+            &program_type,
+            &policy_id,
+            policy_version,
+            &fee_policy_version,
+        )?;
         let mut keys = self.system_keys.clone();
         keys.insert(idempotency_key.clone());
         let next_sequence = checked_sequence(self.sequence)?;
@@ -1747,6 +1790,12 @@ impl PrivateTradingCore {
             reward_token,
             amount_atomic,
             evidence_hash,
+            source_id_hash,
+            program_id,
+            program_type,
+            policy_id,
+            policy_version,
+            fee_policy_version,
         };
         let record = self.journal.append(next_root, &entry)?;
         self.private_rewards = private_rewards;
@@ -2727,10 +2776,14 @@ impl PrivateTradingCore {
         };
         let (reward_chain, reward_token) = reward_rail(market)?;
         private_rewards.record_fill(
+            &execution_id.to_string(),
             &execution.private_user_id,
             None,
             reward_chain,
             reward_token,
+            market.fee_profile_id.fee_policy_version(),
+            &market.fee_profile_id.immutable_profile_id(),
+            "NORMAL",
             quantity,
             taker_fee,
             0,
@@ -4858,14 +4911,23 @@ fn record_native_fill_economics(
     occurred_at_millis: i64,
 ) -> CoreResult<()> {
     let (chain, reward_token) = reward_rail(market)?;
+    let fee_profile_id = market.fee_profile_id.immutable_profile_id();
     for fill in &result.fills {
         let taker_fee = taker_fee_atomic(market, fill.quantity_micros, fill.taker_price_micros())?;
         let maker_rebate = floor_bps(taker_fee, maker_rebate_bps(market.fee_profile_id))?;
         rewards.record_fill(
+            &fill.fill_id.to_string(),
             &fill.taker_private_user_id,
             Some(&fill.maker_private_user_id),
             chain,
             reward_token,
+            market.fee_profile_id.fee_policy_version(),
+            &fee_profile_id,
+            match fill.match_type {
+                MatchType::Normal => "NORMAL",
+                MatchType::Mint => "MINT",
+                MatchType::Merge => "MERGE",
+            },
             fill.quantity_micros,
             taker_fee,
             maker_rebate,

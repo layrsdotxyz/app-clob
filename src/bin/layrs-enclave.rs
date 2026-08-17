@@ -280,6 +280,12 @@ enum OperatorCommand {
         #[serde(with = "clob_service::private_core::decimal_u128")]
         amount_atomic: u128,
         evidence_hash: [u8; 32],
+        source_id_hash: [u8; 32],
+        program_id: String,
+        program_type: String,
+        policy_id: String,
+        policy_version: u32,
+        fee_policy_version: String,
         now_millis: i64,
     },
     FinalizeWithdrawal {
@@ -1812,6 +1818,12 @@ async fn dispatch_operator(
                     reward_token,
                     amount_atomic,
                     evidence_hash,
+                    source_id_hash,
+                    program_id,
+                    program_type,
+                    policy_id,
+                    policy_version,
+                    fee_policy_version,
                     now_millis,
                 } => core.accrue_private_reward(
                     idempotency_key,
@@ -1820,6 +1832,12 @@ async fn dispatch_operator(
                     reward_token,
                     amount_atomic,
                     evidence_hash,
+                    source_id_hash,
+                    program_id,
+                    program_type,
+                    policy_id,
+                    policy_version,
+                    fee_policy_version,
                     now_millis,
                 ),
                 OperatorCommand::FinalizeWithdrawal {
