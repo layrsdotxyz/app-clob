@@ -47,4 +47,3 @@ claim that their custody posting is complete.
 2. exact atomic balances for USDC and ZEN;
 3. duplicate evidence keys cannot mutate either leg twice; and
 4. invalid direction, account class, or evidence fails before mutation.
-

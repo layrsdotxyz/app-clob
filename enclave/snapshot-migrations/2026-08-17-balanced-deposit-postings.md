@@ -49,4 +49,3 @@ manifest and PCR policy. After the first new deposit command, freeze financial
 mutations and retain the candidate snapshot/journal. Roll back only after the
 new pool-cash leg and user liability reconcile to chain custody; never remove a
 posting or rewrite an encrypted record to regain the prior root.
-
