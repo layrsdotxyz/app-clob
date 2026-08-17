@@ -64,7 +64,23 @@ enum WireRequest {
         nonce: [u8; 12],
         #[serde(with = "serde_bytes")]
         ciphertext: Vec<u8>,
+        #[serde(default)]
+        request_context: Option<EncryptedRequestContext>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EncryptedRequestContext {
+    idempotency_key: String,
+    expected_action: ExpectedEncryptedAction,
+    expected_session_tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ExpectedEncryptedAction {
+    SubmitOrder,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -111,6 +127,8 @@ struct PrivateEnvelope {
     client_public_key: String,
     nonce: String,
     ciphertext: String,
+    #[serde(default)]
+    request_context: Option<EncryptedRequestContext>,
 }
 
 #[derive(Serialize)]
@@ -293,12 +311,20 @@ async fn relay(State(state): State<AppState>, Json(envelope): Json<PrivateEnvelo
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
+    if envelope
+        .request_context
+        .as_ref()
+        .is_some_and(|context| !valid_request_context(context))
+    {
+        return gateway_error(StatusCode::BAD_REQUEST, "INVALID_COMMAND_CONTEXT").into_response();
+    }
     match exchange(
         &state,
         WireRequest::Encrypted {
             client_public_key,
             nonce,
             ciphertext,
+            request_context: envelope.request_context,
         },
     )
     .await
@@ -331,6 +357,16 @@ async fn relay(State(state): State<AppState>, Json(envelope): Json<PrivateEnvelo
         }
         Err(error) => error.into_response(),
     }
+}
+
+fn valid_request_context(context: &EncryptedRequestContext) -> bool {
+    valid_idempotency_key(&context.idempotency_key)
+        && (1..=8).contains(&context.expected_session_tags.len())
+        && context.expected_session_tags.iter().all(|tag| {
+            URL_SAFE_NO_PAD
+                .decode(tag)
+                .is_ok_and(|decoded| decoded.len() == 32)
+        })
 }
 
 async fn exchange(state: &AppState, request: WireRequest) -> Result<WireResponse, ApiError> {
@@ -415,15 +451,24 @@ fn decode_fixed<const N: usize>(value: &str, code: &'static str) -> Result<[u8; 
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, code))
 }
 
+fn valid_idempotency_key(value: &str) -> bool {
+    (8..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-'))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{sync::Arc, time::Duration};
 
+    use base64::Engine;
     use tokio::sync::Semaphore;
 
     use super::{
-        acquire_exchange_permit, AppState, WireRequest, ENCLAVE_EXCHANGE_TIMEOUT, MAX_FRAME_BYTES,
-        MAX_HTTP_BODY_BYTES,
+        acquire_exchange_permit, valid_idempotency_key, valid_request_context, AppState,
+        EncryptedRequestContext, ExpectedEncryptedAction, WireRequest, ENCLAVE_EXCHANGE_TIMEOUT,
+        MAX_FRAME_BYTES, MAX_HTTP_BODY_BYTES, URL_SAFE_NO_PAD,
     };
 
     #[test]
@@ -451,6 +496,11 @@ mod tests {
             client_public_key: [7; 32],
             nonce: [9; 12],
             ciphertext,
+            request_context: Some(EncryptedRequestContext {
+                idempotency_key: "order:create:1234".into(),
+                expected_action: ExpectedEncryptedAction::SubmitOrder,
+                expected_session_tags: vec![URL_SAFE_NO_PAD.encode([8u8; 32])],
+            }),
         };
         let encoded = serde_cbor::to_vec(&request).expect("wire request encodes");
         assert!(encoded.len() < 21 * 1024 * 1024);
@@ -463,6 +513,29 @@ mod tests {
             }
             _ => panic!("unexpected wire request variant"),
         }
+    }
+
+    #[test]
+    fn command_context_idempotency_is_strictly_bounded_and_opaque() {
+        assert!(valid_idempotency_key("order:create:1234"));
+        assert!(!valid_idempotency_key("short"));
+        assert!(!valid_idempotency_key("order.create.1234"));
+        assert!(!valid_idempotency_key("order create 1234"));
+        assert!(!valid_idempotency_key(&"x".repeat(129)));
+        let valid = EncryptedRequestContext {
+            idempotency_key: "order:create:1234".into(),
+            expected_action: ExpectedEncryptedAction::SubmitOrder,
+            expected_session_tags: vec![URL_SAFE_NO_PAD.encode([9u8; 32])],
+        };
+        assert!(valid_request_context(&valid));
+        assert!(!valid_request_context(&EncryptedRequestContext {
+            expected_session_tags: Vec::new(),
+            ..valid.clone()
+        }));
+        assert!(!valid_request_context(&EncryptedRequestContext {
+            expected_session_tags: vec!["not-a-tag".into()],
+            ..valid
+        }));
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@ use aws_nitro_enclaves_nsm_api::{
     api::{Request as NsmRequest, Response as NsmResponse},
     driver::{nsm_exit, nsm_init, nsm_process_request},
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use clob_service::audit_signer::{
     AuditBatchRequest, AuditSignerBundle, EnclaveAuditSigner, SignedAuditSettlementTransaction,
 };
@@ -75,7 +76,23 @@ enum WireRequest {
         nonce: [u8; 12],
         #[serde(with = "serde_bytes")]
         ciphertext: Vec<u8>,
+        #[serde(default)]
+        request_context: Option<EncryptedRequestContext>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EncryptedRequestContext {
+    idempotency_key: String,
+    expected_action: ExpectedEncryptedAction,
+    expected_session_tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ExpectedEncryptedAction {
+    SubmitOrder,
 }
 
 #[derive(Debug, Serialize)]
@@ -607,7 +624,17 @@ async fn serve_connection(
             client_public_key,
             nonce,
             ciphertext,
-        } => handle_encrypted(&state, client_public_key, nonce, ciphertext).await,
+            request_context,
+        } => {
+            handle_encrypted(
+                &state,
+                client_public_key,
+                nonce,
+                ciphertext,
+                request_context,
+            )
+            .await
+        }
     };
     let encoded = serde_cbor::to_vec(&response)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -649,6 +676,7 @@ async fn handle_encrypted(
     client_public_key: [u8; 32],
     nonce: [u8; 12],
     ciphertext: Vec<u8>,
+    request_context: Option<EncryptedRequestContext>,
 ) -> WireResponse {
     let mut state = state.lock().await;
     let mut replay_key = [0u8; 44];
@@ -687,6 +715,14 @@ async fn handle_encrypted(
     if !state.transport_nonces.remember(replay_key) {
         return WireResponse::Error {
             code: "REPLAY_REJECTED",
+        };
+    }
+    // Consume a successfully decrypted transport nonce even when the outer API
+    // context is wrong. This prevents the generic mismatch response becoming
+    // an oracle that can be probed repeatedly against one private command.
+    if validate_request_context(&request, request_context.as_ref()).is_err() {
+        return WireResponse::Error {
+            code: "PRIVATE_COMMAND_CONTEXT_MISMATCH",
         };
     }
     let response = dispatch(&mut state, request).await;
@@ -771,6 +807,53 @@ async fn handle_encrypted(
             code: "ENCRYPTION_FAILED",
         },
     }
+}
+
+fn validate_request_context(
+    request: &PlainRequest,
+    context: Option<&EncryptedRequestContext>,
+) -> Result<(), ()> {
+    let Some(context) = context else {
+        return Ok(());
+    };
+    let PlainRequest::User { command, .. } = request else {
+        return Err(());
+    };
+    validate_user_command_context(
+        &command.idempotency_key,
+        &command.session.request.session_id,
+        matches!(command.action, UserCommandAction::SubmitOrder { .. }),
+        context,
+    )
+}
+
+fn validate_user_command_context(
+    idempotency_key: &str,
+    session_id: &str,
+    is_submit_order: bool,
+    context: &EncryptedRequestContext,
+) -> Result<(), ()> {
+    if idempotency_key != context.idempotency_key
+        || !context
+            .expected_session_tags
+            .iter()
+            .any(|tag| tag == &api_session_request_tag(idempotency_key, session_id))
+    {
+        return Err(());
+    }
+    match context.expected_action {
+        ExpectedEncryptedAction::SubmitOrder if is_submit_order => Ok(()),
+        _ => Err(()),
+    }
+}
+
+fn api_session_request_tag(idempotency_key: &str, session_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"layrs.api-session-context.v1\0");
+    digest.update(idempotency_key.as_bytes());
+    digest.update(b"\0");
+    digest.update(session_id.as_bytes());
+    URL_SAFE_NO_PAD.encode(digest.finalize())
 }
 
 fn serialize_depth(levels: Vec<(u64, u128)>) -> Vec<(u64, String)> {
@@ -2437,6 +2520,44 @@ mod tests {
     fn replay_cache_zero_capacity_fails_closed() {
         let mut cache = ReplayCache::<2>::new(0);
         assert!(!cache.remember([1u8, 1]));
+    }
+
+    #[test]
+    fn api_order_context_binds_inner_idempotency_and_action() {
+        let expected_tag = api_session_request_tag("order:create:1234", "session:user-a");
+        let context = EncryptedRequestContext {
+            idempotency_key: "order:create:1234".into(),
+            expected_action: ExpectedEncryptedAction::SubmitOrder,
+            expected_session_tags: vec![expected_tag],
+        };
+        assert!(validate_user_command_context(
+            "order:create:1234",
+            "session:user-a",
+            true,
+            &context
+        )
+        .is_ok());
+        assert!(validate_user_command_context(
+            "order:create:5678",
+            "session:user-a",
+            true,
+            &context
+        )
+        .is_err());
+        assert!(validate_user_command_context(
+            "order:create:1234",
+            "session:user-b",
+            true,
+            &context
+        )
+        .is_err());
+        assert!(validate_user_command_context(
+            "order:create:1234",
+            "session:user-a",
+            false,
+            &context
+        )
+        .is_err());
     }
 
     #[test]

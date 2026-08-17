@@ -3281,6 +3281,157 @@ fn expired_market_rejects_position_close_but_allows_unfilled_hold_release() {
     assert_eq!(core.balance(&up_position), 1_000_000);
 }
 
+#[test]
+fn api_order_creation_enforces_funded_hold_limits_tif_and_replay() {
+    let user_key = SigningKey::from_bytes(&[101u8; 32]);
+    let journal_key = [102u8; 32];
+    let commitment = [103u8; 32];
+    let owner = derived_private_user(journal_key, commitment);
+    let market_id = "layrs:v5:BTC:USDC:15m:2000";
+    let mut core = PrivateTradingCore::new(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([104u8; 48]),
+    );
+    core.register_market(
+        "sys:market:api-order".into(),
+        MarketConfig {
+            market_id: market_id.into(),
+            settlement_asset: "USDC".into(),
+            settlement_decimals: 6,
+            public_settlement_chain: Some("horizen".into()),
+            opens_at_millis: 900,
+            closes_at_millis: 2_000,
+            minimum_quantity_micros: 250_000,
+            maximum_quantity_micros: 10_000_000,
+            minimum_order_notional_micros: 250_000,
+            maximum_order_notional_micros: 5_000_000,
+            maximum_user_position_micros: 10_000_000,
+            maximum_pending_bootstrap_notional_micros: 10_000_000,
+            tick_size_micros: 10_000,
+            oracle_feed_id: 9002,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
+            execution: MarketExecution::NativeClob,
+        },
+        800,
+    )
+    .unwrap();
+    core.register_session(
+        "sys:session:api-order".into(),
+        "session:api-order".into(),
+        commitment,
+        user_key.verifying_key().to_bytes(),
+        3_000,
+        850,
+    )
+    .unwrap();
+    core.apply_user_external_flow(
+        "sys:deposit:api-order".into(),
+        commitment,
+        "USDC".into(),
+        AccountBucket::UserAvailable,
+        5_000_000,
+        ExternalFlowDirection::Inflow,
+        [105u8; 32],
+        875,
+    )
+    .unwrap();
+
+    let limit = UserCommandAction::SubmitOrder {
+        order: BookOrder::new(
+            "client-placeholder",
+            market_id,
+            Outcome::Up,
+            OrderAction::Buy,
+            400_000,
+            2_500_000,
+            TimeInForce::Gtc,
+            None,
+        ),
+    };
+    let first = execute_signed_response(
+        &mut core,
+        &user_key,
+        "session:api-order",
+        1,
+        "cmd:api-limit",
+        limit.clone(),
+        1_000,
+    );
+    assert!(matches!(first.result, CommandResult::Order { .. }));
+    let available = AccountKey::new(&owner, AccountBucket::UserAvailable, "USDC");
+    let mut hold = AccountKey::new(&owner, AccountBucket::UserOrderHold, "USDC");
+    hold.market_id = Some(market_id.into());
+    hold.outcome = Some("UP".into());
+    assert!(core.balance(&hold) >= 1_000_000);
+    assert_eq!(core.balance(&available) + core.balance(&hold), 5_000_000);
+
+    let committed_root = core.state_root();
+    let replay = execute_signed_response(
+        &mut core,
+        &user_key,
+        "session:api-order",
+        1,
+        "cmd:api-limit",
+        limit,
+        1_000,
+    );
+    assert_eq!(replay.receipt.state_root, first.receipt.state_root);
+    assert_eq!(core.state_root(), committed_root);
+
+    let protected = UserCommandAction::SubmitOrder {
+        order: BookOrder::new(
+            "client-placeholder",
+            market_id,
+            Outcome::Down,
+            OrderAction::Buy,
+            200_000,
+            1_250_000,
+            TimeInForce::Fak,
+            None,
+        ),
+    };
+    let before_protected = core.balance(&available);
+    let result = execute_signed(
+        &mut core,
+        &user_key,
+        "session:api-order",
+        2,
+        "cmd:api-protected",
+        protected,
+        1_100,
+    );
+    let CommandResult::Order { result } = result else {
+        panic!("order result")
+    };
+    assert_eq!(result.cancelled_remainder_micros, 1_250_000);
+    assert!(result.fills.is_empty());
+    assert_eq!(core.balance(&available), before_protected);
+
+    let invalid_root = core.state_root();
+    let invalid = execute_signed_result(
+        &mut core,
+        &user_key,
+        "session:api-order",
+        3,
+        "cmd:api-invalid-tif",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "client-placeholder",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                400_000,
+                1_000_000,
+                TimeInForce::Gtd,
+                None,
+            ),
+        },
+        1_200,
+    );
+    assert!(matches!(invalid, Err(CoreError::InvalidOrder(_))));
+    assert_eq!(core.state_root(), invalid_root);
+}
+
 fn execute_signed(
     core: &mut PrivateTradingCore,
     key: &SigningKey,
