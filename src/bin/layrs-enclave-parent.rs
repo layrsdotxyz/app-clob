@@ -491,18 +491,16 @@ fn valid_request_context(context: &EncryptedRequestContext) -> bool {
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         });
-    let valid_optional_commitment =
-        context.expected_command_commitment.is_none() || valid_commitment;
     valid_idempotency_key(&context.idempotency_key)
         && match context.expected_action {
             ExpectedEncryptedAction::Submit | ExpectedEncryptedAction::CancelAll => {
-                no_order_or_position && no_execution_or_funding && valid_optional_commitment
+                no_order_or_position && no_execution_or_funding && valid_commitment
             }
             ExpectedEncryptedAction::Replace | ExpectedEncryptedAction::Cancel => {
                 context.expected_order_id.is_some()
                     && context.expected_position_id.is_none()
                     && no_execution_or_funding
-                    && valid_optional_commitment
+                    && valid_commitment
             }
             ExpectedEncryptedAction::PreviewPositionClose
             | ExpectedEncryptedAction::ClosePosition => {
@@ -694,7 +692,7 @@ mod tests {
                 expected_execution_id: None,
                 expected_withdrawal_id: None,
                 expected_transfer_id: None,
-                expected_command_commitment: None,
+                expected_command_commitment: Some(format!("0x{}", "77".repeat(32))),
             },
         };
         let encoded = serde_cbor::to_vec(&request).expect("wire request encodes");
@@ -726,9 +724,13 @@ mod tests {
             expected_execution_id: None,
             expected_withdrawal_id: None,
             expected_transfer_id: None,
-            expected_command_commitment: None,
+            expected_command_commitment: Some(format!("0x{}", "99".repeat(32))),
         };
         assert!(valid_request_context(&valid));
+        assert!(!valid_request_context(&EncryptedRequestContext {
+            expected_command_commitment: None,
+            ..valid.clone()
+        }));
         assert!(!valid_request_context(&EncryptedRequestContext {
             expected_command_commitment: Some("not-a-commitment".into()),
             ..valid.clone()
@@ -742,13 +744,27 @@ mod tests {
             expected_execution_id: None,
             expected_withdrawal_id: None,
             expected_transfer_id: None,
-            expected_command_commitment: None,
+            expected_command_commitment: Some(format!("0x{}", "88".repeat(32))),
         };
         assert!(valid_request_context(&cancel));
+        assert!(!valid_request_context(&EncryptedRequestContext {
+            expected_command_commitment: None,
+            ..cancel.clone()
+        }));
         assert_eq!(
             serde_json::to_value(&cancel).unwrap()["expectedAction"],
             "CANCEL_ORDER"
         );
+        let replace = EncryptedRequestContext {
+            idempotency_key: "order:replace:1234".into(),
+            expected_action: ExpectedEncryptedAction::Replace,
+            ..cancel.clone()
+        };
+        assert!(valid_request_context(&replace));
+        assert!(!valid_request_context(&EncryptedRequestContext {
+            expected_command_commitment: None,
+            ..replace
+        }));
         let cancel_all = EncryptedRequestContext {
             idempotency_key: "orders:cancel-all:1234".into(),
             expected_action: ExpectedEncryptedAction::CancelAll,
@@ -758,9 +774,13 @@ mod tests {
             expected_execution_id: None,
             expected_withdrawal_id: None,
             expected_transfer_id: None,
-            expected_command_commitment: None,
+            expected_command_commitment: Some(format!("0x{}", "77".repeat(32))),
         };
         assert!(valid_request_context(&cancel_all));
+        assert!(!valid_request_context(&EncryptedRequestContext {
+            expected_command_commitment: None,
+            ..cancel_all.clone()
+        }));
         assert_eq!(
             serde_json::to_value(&cancel_all).unwrap()["expectedAction"],
             "CANCEL_ALL_ORDERS"
@@ -855,7 +875,7 @@ mod tests {
             expected_execution_id: None,
             expected_withdrawal_id: None,
             expected_transfer_id: None,
-            expected_command_commitment: None,
+            expected_command_commitment: Some(format!("0x{}", "88".repeat(32))),
         }));
         assert!(!valid_request_context(&EncryptedRequestContext {
             expected_session_tags: Vec::new(),

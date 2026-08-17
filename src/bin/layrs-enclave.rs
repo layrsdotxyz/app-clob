@@ -1234,35 +1234,18 @@ fn validate_bound_user_command_context(
         actual_action,
         ExpectedEncryptedAction::PreviewPositionClose | ExpectedEncryptedAction::ClosePosition
     );
-    let commitment_required = position_action
-        || matches!(
-            actual_action,
-            ExpectedEncryptedAction::CompleteSet
-                | ExpectedEncryptedAction::Portfolio
-                | ExpectedEncryptedAction::Rewards
-                | ExpectedEncryptedAction::RequestRewardClaim
-                | ExpectedEncryptedAction::BootstrapStatus
-                | ExpectedEncryptedAction::CancelBootstrap
-                | ExpectedEncryptedAction::RequestWithdrawal
-                | ExpectedEncryptedAction::TransferFunds
-        );
     if position_action && actual_session_tag != Some(computed_session_tag.as_str()) {
         return Err(());
     }
-    if commitment_required || context.expected_command_commitment.is_some() {
-        let Some(expected) = context.expected_command_commitment.as_deref() else {
-            return Err(());
-        };
-        let Some(encoded) = expected.strip_prefix("0x") else {
-            return Err(());
-        };
-        let mut decoded = [0u8; 32];
-        if hex::decode_to_slice(encoded, &mut decoded).is_err()
-            || decoded != actual_command_commitment
-        {
-            return Err(());
-        }
-    } else if actual_session_tag.is_some() {
+    let Some(expected) = context.expected_command_commitment.as_deref() else {
+        return Err(());
+    };
+    let Some(encoded) = expected.strip_prefix("0x") else {
+        return Err(());
+    };
+    let mut decoded = [0u8; 32];
+    if hex::decode_to_slice(encoded, &mut decoded).is_err() || decoded != actual_command_commitment
+    {
         return Err(());
     }
     if context.expected_action != actual_action {
@@ -3046,7 +3029,7 @@ mod tests {
             expected_withdrawal_id: None,
             expected_transfer_id: None,
             expected_session_tags: vec![],
-            expected_command_commitment: None,
+            expected_command_commitment: Some(format!("0x{}", "11".repeat(32))),
         };
 
         assert!(
@@ -3315,7 +3298,7 @@ mod tests {
             expected_execution_id: None,
             expected_withdrawal_id: None,
             expected_transfer_id: None,
-            expected_command_commitment: None,
+            expected_command_commitment: Some(format!("0x{}", "22".repeat(32))),
         };
         assert!(validate_user_command_context(
             "order:create:1234",
@@ -3367,7 +3350,7 @@ mod tests {
             expected_execution_id: None,
             expected_withdrawal_id: None,
             expected_transfer_id: None,
-            expected_command_commitment: None,
+            expected_command_commitment: Some(format!("0x{}", "33".repeat(32))),
         };
         assert!(validate_user_command_context(
             "order:replace:1234",
@@ -3400,7 +3383,7 @@ mod tests {
             expected_execution_id: None,
             expected_withdrawal_id: None,
             expected_transfer_id: None,
-            expected_command_commitment: None,
+            expected_command_commitment: Some(format!("0x{}", "44".repeat(32))),
         };
         assert!(validate_user_command_context(
             "order:cancel:1234",
@@ -3433,7 +3416,7 @@ mod tests {
             expected_execution_id: None,
             expected_withdrawal_id: None,
             expected_transfer_id: None,
-            expected_command_commitment: None,
+            expected_command_commitment: Some(format!("0x{}", "55".repeat(32))),
         };
         assert!(validate_user_command_context(
             "orders:cancel-all:1234",
@@ -3623,6 +3606,78 @@ mod tests {
                 expected_transfer_id,
                 None,
                 [0x56; 32],
+                &context,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn every_order_action_requires_the_exact_command_commitment() {
+        let idempotency_key = "private:order-actions:1234";
+        let session_id = "session:user-a";
+        let session_tag = api_session_request_tag(idempotency_key, session_id);
+        let commitment = [0x66; 32];
+        let order_id = Uuid::new_v4();
+        for (action, expected_order_id) in [
+            (ExpectedEncryptedAction::Submit, None),
+            (ExpectedEncryptedAction::Replace, Some(order_id)),
+            (ExpectedEncryptedAction::Cancel, Some(order_id)),
+            (ExpectedEncryptedAction::CancelAll, None),
+        ] {
+            let context = EncryptedRequestContext {
+                idempotency_key: idempotency_key.into(),
+                expected_action: action,
+                expected_session_tags: vec![session_tag.clone()],
+                expected_order_id,
+                expected_position_id: None,
+                expected_execution_id: None,
+                expected_withdrawal_id: None,
+                expected_transfer_id: None,
+                expected_command_commitment: Some(format!("0x{}", "66".repeat(32))),
+            };
+            assert!(validate_bound_user_command_context(
+                idempotency_key,
+                session_id,
+                action,
+                expected_order_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                commitment,
+                &context,
+            )
+            .is_ok());
+            assert!(validate_bound_user_command_context(
+                idempotency_key,
+                session_id,
+                action,
+                expected_order_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                commitment,
+                &EncryptedRequestContext {
+                    expected_command_commitment: None,
+                    ..context.clone()
+                },
+            )
+            .is_err());
+            assert!(validate_bound_user_command_context(
+                idempotency_key,
+                session_id,
+                action,
+                expected_order_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                [0x67; 32],
                 &context,
             )
             .is_err());
