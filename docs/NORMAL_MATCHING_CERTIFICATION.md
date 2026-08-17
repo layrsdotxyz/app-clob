@@ -65,3 +65,17 @@ the financial core still requires the standard EIF build, measurement,
 signed-manifest approval, pinned-PCR rotation, attestation verification and a
 funded production canary. This certification adds tests and documentation only;
 it does not build or deploy an EIF.
+
+## Verification record
+
+- Implementation/evidence commit: `0432b42`
+- GitLab merge request: `!29`
+- GitLab pipeline: `246`
+- Fast job `569`: snapshot compatibility, formatting, all-target check, library
+  and proof tests, settlement equivalence, npm audits, worker tests and clippy
+  passed.
+- Full job `570`: the complete single-threaded Rust suite, enclave runtime,
+  parent runtime, proof-worker image/runtime check and enclave dependency audit
+  passed.
+- A separate local run used `PROPTEST_CASES=2048` and passed all four dedicated
+  NORMAL certification tests across 2,048 generated BUY/SELL cases.
