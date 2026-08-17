@@ -18,7 +18,7 @@ use super::{
     EncryptedJournalRecord, EncryptedSnapshot, ExternalFlowDirection, ExternalFlowTransaction,
     Fill, JournalKey, Ledger, LedgerTransaction, MatchResult, MatchType, NormalFillPosting,
     OrderAction, OrderStatus, Outcome, PriceTimeBook, ReceiptSigner, SessionGuard,
-    SignedSessionRequest, Transfer, PRICE_SCALE,
+    SignedSessionRequest, TimeInForce, Transfer, PRICE_SCALE,
 };
 
 /// Public depth is deliberately less precise than the enclave's private book.
@@ -468,6 +468,22 @@ pub enum UserCommandAction {
     CancelAllOrders {
         filter: CancelAllOrdersFilter,
     },
+    PreviewPositionClose {
+        position_id: String,
+        market_id: String,
+        outcome: Outcome,
+        #[serde(with = "super::decimal_u128")]
+        quantity_micros: u128,
+        minimum_price_micros: u64,
+    },
+    ClosePosition {
+        position_id: String,
+        market_id: String,
+        outcome: Outcome,
+        #[serde(with = "super::decimal_u128")]
+        quantity_micros: u128,
+        minimum_price_micros: u64,
+    },
     CompleteSet {
         market_id: String,
         #[serde(with = "super::decimal_u128")]
@@ -530,10 +546,26 @@ pub struct PrivateBalance {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrivatePosition {
+    pub position_id: String,
     pub market_id: String,
     pub outcome: String,
     pub quantity_micros: String,
     pub cost_basis_micros: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PositionClosePreview {
+    pub position_id: String,
+    #[serde(with = "super::decimal_u128")]
+    pub quantity_micros: u128,
+    pub minimum_price_micros: u64,
+    pub average_price_micros: u64,
+    #[serde(with = "super::decimal_u128")]
+    pub gross_payout_atomic: u128,
+    #[serde(with = "super::decimal_u128")]
+    pub fee_atomic: u128,
+    #[serde(with = "super::decimal_u128")]
+    pub net_payout_atomic: u128,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -638,6 +670,13 @@ pub enum CommandResult {
     },
     OrdersCancelled {
         outcomes: Vec<CancelledOrderOutcome>,
+    },
+    PositionClosePreview {
+        preview: PositionClosePreview,
+    },
+    PositionClosed {
+        preview: PositionClosePreview,
+        order_id: Uuid,
     },
     Replaced {
         cancelled: BookOrder,
@@ -2918,6 +2957,7 @@ impl PrivateTradingCore {
             command.action,
             UserCommandAction::Portfolio
                 | UserCommandAction::Rewards
+                | UserCommandAction::PreviewPositionClose { .. }
                 | UserCommandAction::BootstrapStatus { .. }
         ) {
             return self.execute_readonly(command, expected_hash, now_millis);
@@ -3208,6 +3248,98 @@ impl PrivateTradingCore {
                 }
                 CommandResult::OrdersCancelled { outcomes }
             }
+            UserCommandAction::PreviewPositionClose { .. } => {
+                return Err(CoreError::InvalidOrder("command is read-only".into()));
+            }
+            UserCommandAction::ClosePosition {
+                position_id,
+                market_id,
+                outcome,
+                quantity_micros,
+                minimum_price_micros,
+            } => {
+                let order_id = position_close_order_id(
+                    &command.command_id,
+                    &command.idempotency_key,
+                    position_id,
+                );
+                let order = position_close_order(
+                    &self.identity_key,
+                    &ledger,
+                    &self.markets,
+                    &self.resolutions,
+                    &private_user_id,
+                    position_id,
+                    market_id,
+                    *outcome,
+                    *quantity_micros,
+                    *minimum_price_micros,
+                    order_id,
+                    now_millis,
+                )?;
+                let market = self
+                    .markets
+                    .get(market_id)
+                    .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
+                if !matches!(
+                    market.execution,
+                    MarketExecution::NativeClob | MarketExecution::NativeExactCondition { .. }
+                ) {
+                    return Err(CoreError::InvalidOrder(
+                        "position close is unavailable for bootstrap execution".into(),
+                    ));
+                }
+                let book = books.entry(market_id.clone()).or_default();
+                let match_result = book.submit(order.clone(), now_millis)?;
+                let preview = position_close_preview(position_id, market, &order, &match_result)?;
+                if match_result
+                    .fills
+                    .iter()
+                    .all(|fill| fill.match_type == MatchType::Normal)
+                {
+                    let (transfers, fill_postings) =
+                        settlement_transfers(&self.books, &books, market, &order, &match_result)?;
+                    apply_fill_cost_basis(
+                        &self.ledger,
+                        &self.books,
+                        &books,
+                        market,
+                        &order,
+                        &match_result,
+                        &mut position_cost_basis,
+                    )?;
+                    let transaction = LedgerTransaction {
+                        idempotency_key: format!("position-close:{}", command.idempotency_key),
+                        business_reference: command.command_id.clone(),
+                        transfers,
+                    };
+                    if fill_postings.is_empty() {
+                        ledger.apply(transaction)?;
+                    } else {
+                        ledger.apply_normal_fill_settlement(transaction, fill_postings)?;
+                    }
+                } else {
+                    apply_complete_set_match_settlement(
+                        &mut ledger,
+                        &self.books,
+                        &books,
+                        market,
+                        &order,
+                        &match_result,
+                        &mut position_cost_basis,
+                        &command.idempotency_key,
+                        &command.command_id,
+                    )?;
+                }
+                record_native_fill_economics(
+                    &mut private_rewards,
+                    market,
+                    &match_result,
+                    now_millis,
+                )?;
+                audit_drafts = native_audit_drafts(&order, &match_result, market)?;
+                CommandResult::PositionClosed { preview, order_id }
+            }
             UserCommandAction::ReplaceOrder {
                 market_id,
                 order_id,
@@ -3421,6 +3553,7 @@ impl PrivateTradingCore {
                     &ledger,
                     &books,
                     &position_cost_basis,
+                    &self.identity_key,
                     &private_user_id,
                     now_millis,
                 ),
@@ -3613,6 +3746,7 @@ impl PrivateTradingCore {
                 UserCommandAction::SubmitOrder { .. }
                     | UserCommandAction::ReplaceOrder { .. }
                     | UserCommandAction::CancelOrder { .. }
+                    | UserCommandAction::ClosePosition { .. }
                     | UserCommandAction::CompleteSet { .. }
                     | UserCommandAction::RequestRewardClaim { .. }
                     | UserCommandAction::CancelBootstrap { .. }
@@ -3715,10 +3849,54 @@ impl PrivateTradingCore {
                     &self.ledger,
                     &self.books,
                     &self.position_cost_basis,
+                    &self.identity_key,
                     &private_user_id,
                     now_millis,
                 ),
             },
+            UserCommandAction::PreviewPositionClose {
+                position_id,
+                market_id,
+                outcome,
+                quantity_micros,
+                minimum_price_micros,
+            } => {
+                let order = position_close_order(
+                    &self.identity_key,
+                    &self.ledger,
+                    &self.markets,
+                    &self.resolutions,
+                    &private_user_id,
+                    position_id,
+                    market_id,
+                    *outcome,
+                    *quantity_micros,
+                    *minimum_price_micros,
+                    position_close_order_id(
+                        &command.command_id,
+                        &command.idempotency_key,
+                        position_id,
+                    ),
+                    now_millis,
+                )?;
+                let market = self
+                    .markets
+                    .get(market_id)
+                    .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
+                if !matches!(
+                    market.execution,
+                    MarketExecution::NativeClob | MarketExecution::NativeExactCondition { .. }
+                ) {
+                    return Err(CoreError::InvalidOrder(
+                        "position close is unavailable for bootstrap execution".into(),
+                    ));
+                }
+                let mut book = self.books.get(market_id).cloned().unwrap_or_default();
+                let match_result = book.submit(order.clone(), now_millis)?;
+                CommandResult::PositionClosePreview {
+                    preview: position_close_preview(position_id, market, &order, &match_result)?,
+                }
+            }
             UserCommandAction::Rewards => CommandResult::Rewards {
                 entitlements: self.private_rewards.entitlements(&private_user_id),
             },
@@ -6038,10 +6216,158 @@ fn derive_private_user_id(identity_key: &[u8; 32], commitment: &[u8; 32]) -> Str
     format!("usr_{}", hex::encode(hash.finalize()))
 }
 
+fn derive_private_position_id(
+    identity_key: &[u8; 32],
+    owner: &str,
+    market_id: &str,
+    outcome: Outcome,
+) -> String {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(identity_key)
+        .expect("identity key has fixed HMAC length");
+    mac.update(b"layrs.private-position-id.v1\0");
+    mac.update(&(owner.len() as u32).to_be_bytes());
+    mac.update(owner.as_bytes());
+    mac.update(&(market_id.len() as u32).to_be_bytes());
+    mac.update(market_id.as_bytes());
+    mac.update(match outcome {
+        Outcome::Up => b"UP",
+        Outcome::Down => b"DOWN",
+    });
+    format!("pos_{}", hex::encode(mac.finalize().into_bytes()))
+}
+
+fn position_close_order_id(command_id: &str, idempotency_key: &str, position_id: &str) -> Uuid {
+    let mut name =
+        Vec::with_capacity(command_id.len() + idempotency_key.len() + position_id.len() + 32);
+    name.extend_from_slice(b"layrs.position-close-order.v1\0");
+    name.extend_from_slice(command_id.as_bytes());
+    name.push(0);
+    name.extend_from_slice(idempotency_key.as_bytes());
+    name.push(0);
+    name.extend_from_slice(position_id.as_bytes());
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, &name)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn position_close_order(
+    identity_key: &[u8; 32],
+    ledger: &Ledger,
+    markets: &BTreeMap<String, MarketConfig>,
+    resolutions: &BTreeMap<String, MarketResolution>,
+    owner: &str,
+    position_id: &str,
+    market_id: &str,
+    outcome: Outcome,
+    quantity_micros: u128,
+    minimum_price_micros: u64,
+    order_id: Uuid,
+    now_millis: i64,
+) -> CoreResult<BookOrder> {
+    let market = markets
+        .get(market_id)
+        .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
+    if resolutions.contains_key(market_id) {
+        return Err(CoreError::InvalidOrder(
+            "market is resolving or resolved".into(),
+        ));
+    }
+    if now_millis >= market.closes_at_millis {
+        return Err(CoreError::InvalidOrder("market is closed".into()));
+    }
+    if now_millis < market.opens_at_millis {
+        return Err(CoreError::InvalidOrder("market is not open".into()));
+    }
+    let expected_position_id = derive_private_position_id(identity_key, owner, market_id, outcome);
+    if position_id != expected_position_id {
+        return Err(CoreError::InvalidOrder("position owner mismatch".into()));
+    }
+    if quantity_micros == 0
+        || ledger.balance(&claim_position_for(owner, market_id, outcome)) < quantity_micros
+    {
+        return Err(CoreError::InsufficientBalance);
+    }
+    let order = BookOrder::with_id(
+        order_id,
+        owner,
+        market_id,
+        outcome,
+        OrderAction::Sell,
+        minimum_price_micros,
+        quantity_micros,
+        TimeInForce::Fok,
+        None,
+    );
+    validate_order_for_market(&order, market, now_millis)?;
+    Ok(order)
+}
+
+fn position_close_preview(
+    position_id: &str,
+    market: &MarketConfig,
+    order: &BookOrder,
+    result: &MatchResult,
+) -> CoreResult<PositionClosePreview> {
+    let accepted = result
+        .accepted_order
+        .as_ref()
+        .ok_or_else(|| CoreError::InvalidOrder("position close result is missing".into()))?;
+    let executed_quantity = result.fills.iter().try_fold(0u128, |total, fill| {
+        total
+            .checked_add(fill.quantity_micros)
+            .ok_or(CoreError::UnbalancedTransaction)
+    })?;
+    if accepted.status != OrderStatus::Filled || executed_quantity != order.quantity_micros {
+        return Err(CoreError::InvalidOrder(
+            "insufficient protected liquidity for position close".into(),
+        ));
+    }
+    let mut weighted_price = 0u128;
+    let mut gross_payout_atomic = 0u128;
+    let mut fee_atomic = 0u128;
+    for fill in &result.fills {
+        let taker_price = fill.taker_price_micros();
+        weighted_price = weighted_price
+            .checked_add(
+                u128::from(taker_price)
+                    .checked_mul(fill.quantity_micros)
+                    .ok_or(CoreError::UnbalancedTransaction)?,
+            )
+            .ok_or(CoreError::UnbalancedTransaction)?;
+        gross_payout_atomic = gross_payout_atomic
+            .checked_add(settlement_atomic(
+                market,
+                notional(taker_price, fill.quantity_micros)?,
+            )?)
+            .ok_or(CoreError::UnbalancedTransaction)?;
+        fee_atomic = fee_atomic
+            .checked_add(taker_fee_atomic(market, fill.quantity_micros, taker_price)?)
+            .ok_or(CoreError::UnbalancedTransaction)?;
+    }
+    let average_price_micros = u64::try_from(weighted_price / executed_quantity)
+        .map_err(|_| CoreError::UnbalancedTransaction)?;
+    if average_price_micros < order.price_micros {
+        return Err(CoreError::InvalidOrder(
+            "position close violated price protection".into(),
+        ));
+    }
+    Ok(PositionClosePreview {
+        position_id: position_id.to_owned(),
+        quantity_micros: executed_quantity,
+        minimum_price_micros: order.price_micros,
+        average_price_micros,
+        gross_payout_atomic,
+        fee_atomic,
+        net_payout_atomic: gross_payout_atomic
+            .checked_sub(fee_atomic)
+            .ok_or(CoreError::UnbalancedTransaction)?,
+    })
+}
+
 fn portfolio_snapshot(
     ledger: &Ledger,
     books: &BTreeMap<String, PriceTimeBook>,
     cost_basis: &BTreeMap<PositionKey, u128>,
+    identity_key: &[u8; 32],
     owner: &str,
     now_millis: i64,
 ) -> PortfolioSnapshot {
@@ -6056,6 +6382,12 @@ fn portfolio_snapshot(
                     Outcome::Down
                 };
                 positions.push(PrivatePosition {
+                    position_id: derive_private_position_id(
+                        identity_key,
+                        owner,
+                        &market_id,
+                        parsed,
+                    ),
                     cost_basis_micros: cost_basis
                         .get(&position_key(owner, &market_id, parsed))
                         .copied()

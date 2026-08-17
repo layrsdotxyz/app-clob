@@ -78,6 +78,8 @@ struct EncryptedRequestContext {
     expected_session_tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_order_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_position_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,6 +93,10 @@ enum ExpectedEncryptedAction {
     Cancel,
     #[serde(rename = "CANCEL_ALL_ORDERS")]
     CancelAll,
+    #[serde(rename = "PREVIEW_POSITION_CLOSE")]
+    PreviewPositionClose,
+    #[serde(rename = "CLOSE_POSITION")]
+    ClosePosition,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -373,10 +379,19 @@ fn valid_request_context(context: &EncryptedRequestContext) -> bool {
     valid_idempotency_key(&context.idempotency_key)
         && match context.expected_action {
             ExpectedEncryptedAction::Submit | ExpectedEncryptedAction::CancelAll => {
-                context.expected_order_id.is_none()
+                context.expected_order_id.is_none() && context.expected_position_id.is_none()
             }
             ExpectedEncryptedAction::Replace | ExpectedEncryptedAction::Cancel => {
-                context.expected_order_id.is_some()
+                context.expected_order_id.is_some() && context.expected_position_id.is_none()
+            }
+            ExpectedEncryptedAction::PreviewPositionClose
+            | ExpectedEncryptedAction::ClosePosition => {
+                context.expected_order_id.is_none()
+                    && context.expected_position_id.as_ref().is_some_and(|value| {
+                        value.len() == 68
+                            && value.starts_with("pos_")
+                            && value[4..].bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
             }
         }
         && (1..=8).contains(&context.expected_session_tags.len())
@@ -520,6 +535,7 @@ mod tests {
                 expected_action: ExpectedEncryptedAction::Submit,
                 expected_session_tags: vec![URL_SAFE_NO_PAD.encode([8u8; 32])],
                 expected_order_id: None,
+                expected_position_id: None,
             }),
         };
         let encoded = serde_cbor::to_vec(&request).expect("wire request encodes");
@@ -547,6 +563,7 @@ mod tests {
             expected_action: ExpectedEncryptedAction::Submit,
             expected_session_tags: vec![URL_SAFE_NO_PAD.encode([9u8; 32])],
             expected_order_id: None,
+            expected_position_id: None,
         };
         assert!(valid_request_context(&valid));
         let cancel = EncryptedRequestContext {
@@ -554,6 +571,7 @@ mod tests {
             expected_action: ExpectedEncryptedAction::Cancel,
             expected_session_tags: vec![URL_SAFE_NO_PAD.encode([8u8; 32])],
             expected_order_id: Some(Uuid::new_v4()),
+            expected_position_id: None,
         };
         assert!(valid_request_context(&cancel));
         assert_eq!(
@@ -565,12 +583,27 @@ mod tests {
             expected_action: ExpectedEncryptedAction::CancelAll,
             expected_session_tags: vec![URL_SAFE_NO_PAD.encode([7u8; 32])],
             expected_order_id: None,
+            expected_position_id: None,
         };
         assert!(valid_request_context(&cancel_all));
         assert_eq!(
             serde_json::to_value(&cancel_all).unwrap()["expectedAction"],
             "CANCEL_ALL_ORDERS"
         );
+        let position_id = format!("pos_{}", "ab".repeat(32));
+        for expected_action in [
+            ExpectedEncryptedAction::PreviewPositionClose,
+            ExpectedEncryptedAction::ClosePosition,
+        ] {
+            let position = EncryptedRequestContext {
+                idempotency_key: "position:close:1234".into(),
+                expected_action,
+                expected_session_tags: vec![URL_SAFE_NO_PAD.encode([6u8; 32])],
+                expected_order_id: None,
+                expected_position_id: Some(position_id.clone()),
+            };
+            assert!(valid_request_context(&position));
+        }
         assert!(!valid_request_context(&EncryptedRequestContext {
             expected_order_id: Some(Uuid::new_v4()),
             ..cancel_all
@@ -580,6 +613,7 @@ mod tests {
             expected_action: ExpectedEncryptedAction::Cancel,
             expected_session_tags: vec![URL_SAFE_NO_PAD.encode([8u8; 32])],
             expected_order_id: None,
+            expected_position_id: None,
         }));
         assert!(!valid_request_context(&EncryptedRequestContext {
             expected_session_tags: Vec::new(),

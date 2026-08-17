@@ -4151,6 +4151,301 @@ fn api_cancel_all_filters_owner_orders_releases_holds_and_replays_once() {
     }
 }
 
+#[test]
+fn api_position_close_previews_and_executes_exact_protected_payout_atomically() {
+    let alice = SigningKey::from_bytes(&[141u8; 32]);
+    let bob = SigningKey::from_bytes(&[142u8; 32]);
+    let oracle = SigningKey::from_bytes(&[143u8; 32]);
+    let journal_key = [144u8; 32];
+    let alice_commitment = [145u8; 32];
+    let bob_commitment = [146u8; 32];
+    let alice_owner = derived_private_user(journal_key, alice_commitment);
+    let market_id = "layrs:v5:BTC:USDC:15m:2500";
+    let mut core = PrivateTradingCore::new_with_oracle(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([147u8; 48]),
+        oracle.verifying_key().to_bytes(),
+    )
+    .unwrap();
+    core.register_market(
+        "sys:market:position-close".into(),
+        MarketConfig {
+            market_id: market_id.into(),
+            settlement_asset: "USDC".into(),
+            settlement_decimals: 6,
+            public_settlement_chain: Some("horizen".into()),
+            opens_at_millis: 900,
+            closes_at_millis: 2_500,
+            minimum_quantity_micros: 250_000,
+            maximum_quantity_micros: 10_000_000,
+            minimum_order_notional_micros: 1,
+            maximum_order_notional_micros: 10_000_000,
+            maximum_user_position_micros: 10_000_000,
+            maximum_pending_bootstrap_notional_micros: 100_000_000,
+            tick_size_micros: 1_000,
+            oracle_feed_id: 9002,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
+            execution: MarketExecution::NativeClob,
+        },
+        800,
+    )
+    .unwrap();
+    for (label, key, commitment) in [
+        ("alice", &alice, alice_commitment),
+        ("bob", &bob, bob_commitment),
+    ] {
+        core.register_session(
+            format!("sys:session:position-close:{label}"),
+            format!("session:position-close:{label}"),
+            commitment,
+            key.verifying_key().to_bytes(),
+            2_900,
+            850,
+        )
+        .unwrap();
+        core.apply_user_external_flow(
+            format!("sys:deposit:position-close:{label}"),
+            commitment,
+            "USDC".into(),
+            AccountBucket::UserAvailable,
+            2_000_000,
+            ExternalFlowDirection::Inflow,
+            [label.as_bytes()[0]; 32],
+            875,
+        )
+        .unwrap();
+    }
+
+    execute_signed(
+        &mut core,
+        &alice,
+        "session:position-close:alice",
+        1,
+        "cmd:position-close:mint",
+        UserCommandAction::CompleteSet {
+            market_id: market_id.into(),
+            quantity_micros: 2_000_000,
+            direction: CompleteSetDirection::Mint,
+        },
+        1_000,
+    );
+    execute_signed(
+        &mut core,
+        &bob,
+        "session:position-close:bob",
+        1,
+        "cmd:position-close:bid",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                400_000,
+                2_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_100,
+    );
+    let portfolio = execute_signed(
+        &mut core,
+        &alice,
+        "session:position-close:alice",
+        2,
+        "cmd:position-close:portfolio",
+        UserCommandAction::Portfolio,
+        1_200,
+    );
+    let CommandResult::Portfolio { snapshot } = portfolio else {
+        panic!("expected portfolio");
+    };
+    let position_id = snapshot
+        .positions
+        .iter()
+        .find(|position| position.market_id == market_id && position.outcome == "UP")
+        .expect("UP position")
+        .position_id
+        .clone();
+    assert!(position_id.starts_with("pos_"));
+    assert_eq!(position_id.len(), 68);
+
+    let preview = execute_signed_response(
+        &mut core,
+        &alice,
+        "session:position-close:alice",
+        2,
+        "cmd:position-close:preview",
+        UserCommandAction::PreviewPositionClose {
+            position_id: position_id.clone(),
+            market_id: market_id.into(),
+            outcome: Outcome::Up,
+            quantity_micros: 2_000_000,
+            minimum_price_micros: 350_000,
+        },
+        1_300,
+    );
+    assert_eq!(preview.receipt.prior_state_root, preview.receipt.state_root);
+    assert_eq!(preview.receipt.publication_eligible, Some(false));
+    let CommandResult::PositionClosePreview { preview: quote } = preview.result else {
+        panic!("expected close preview");
+    };
+    assert_eq!(quote.position_id, position_id);
+    assert_eq!(quote.quantity_micros, 2_000_000);
+    assert_eq!(quote.minimum_price_micros, 350_000);
+    assert_eq!(quote.average_price_micros, 400_000);
+    assert_eq!(quote.gross_payout_atomic, 800_000);
+    assert_eq!(quote.fee_atomic, 1_600);
+    assert_eq!(quote.net_payout_atomic, 798_400);
+    let alice_up = AccountKey::position(
+        &alice_owner,
+        format!("CLAIM:{market_id}:UP"),
+        market_id,
+        "UP",
+    );
+    assert_eq!(core.balance(&alice_up), 2_000_000);
+
+    let insufficient = execute_signed_result(
+        &mut core,
+        &alice,
+        "session:position-close:alice",
+        2,
+        "cmd:position-close:protected",
+        UserCommandAction::PreviewPositionClose {
+            position_id: position_id.clone(),
+            market_id: market_id.into(),
+            outcome: Outcome::Up,
+            quantity_micros: 2_000_000,
+            minimum_price_micros: 450_000,
+        },
+        1_350,
+    );
+    assert!(matches!(
+        insufficient.unwrap_err(),
+        CoreError::InvalidOrder(message)
+            if message == "insufficient protected liquidity for position close"
+    ));
+
+    let close_action = UserCommandAction::ClosePosition {
+        position_id: position_id.clone(),
+        market_id: market_id.into(),
+        outcome: Outcome::Up,
+        quantity_micros: 2_000_000,
+        minimum_price_micros: 350_000,
+    };
+    let closed = execute_signed_response(
+        &mut core,
+        &alice,
+        "session:position-close:alice",
+        2,
+        "cmd:position-close:execute",
+        close_action.clone(),
+        1_400,
+    );
+    assert_eq!(closed.receipt.publication_eligible, Some(true));
+    let CommandResult::PositionClosed {
+        preview: actual,
+        order_id,
+    } = &closed.result
+    else {
+        panic!("expected closed position");
+    };
+    assert_ne!(*order_id, uuid::Uuid::nil());
+    assert_eq!(actual, &quote);
+    assert_eq!(core.balance(&alice_up), 0);
+    let alice_available = AccountKey::new(&alice_owner, AccountBucket::UserAvailable, "USDC");
+    assert_eq!(core.balance(&alice_available), 798_400);
+    let replay = execute_signed_response(
+        &mut core,
+        &alice,
+        "session:position-close:alice",
+        2,
+        "cmd:position-close:execute",
+        close_action.clone(),
+        1_450,
+    );
+    assert_eq!(replay.result, closed.result);
+    assert_eq!(replay.receipt.state_root, closed.receipt.state_root);
+    assert_eq!(core.balance(&alice_available), 798_400);
+
+    let wrong_owner = execute_signed_result(
+        &mut core,
+        &alice,
+        "session:position-close:alice",
+        3,
+        "cmd:position-close:wrong-owner",
+        UserCommandAction::PreviewPositionClose {
+            position_id: format!("pos_{}", "00".repeat(32)),
+            market_id: market_id.into(),
+            outcome: Outcome::Up,
+            quantity_micros: 250_000,
+            minimum_price_micros: 350_000,
+        },
+        1_500,
+    );
+    assert!(matches!(
+        wrong_owner.unwrap_err(),
+        CoreError::InvalidOrder(message) if message == "position owner mismatch"
+    ));
+
+    let closed_market = execute_signed_result(
+        &mut core,
+        &alice,
+        "session:position-close:alice",
+        3,
+        "cmd:position-close:closed-market",
+        close_action.clone(),
+        2_600,
+    );
+    assert!(matches!(
+        closed_market.unwrap_err(),
+        CoreError::InvalidOrder(message) if message == "market is closed"
+    ));
+
+    let boundary = |end: i64, price: i64, marker: u8| BoundaryEvidence {
+        window_start_micros: end * 1_000 - 5_000_000,
+        window_end_micros: end * 1_000,
+        median_price_e8: price,
+        sample_count: 25,
+        minimum_publisher_count: 3,
+        signed_payload_commitment: [marker; 32],
+    };
+    let statement = ResolutionStatement {
+        market_id: market_id.into(),
+        oracle_feed_id: 9002,
+        opening: boundary(900, 1_000_000_000, 151),
+        closing: boundary(2_500, 1_100_000_000, 152),
+        issued_at_millis: 2_700,
+    };
+    let signature = oracle
+        .sign(&resolution_signing_payload(&statement).unwrap())
+        .to_bytes()
+        .to_vec();
+    core.resolve_market(
+        "sys:resolve:position-close".into(),
+        SignedResolution {
+            statement,
+            signature,
+        },
+        2_700,
+    )
+    .unwrap();
+    let resolving = execute_signed_result(
+        &mut core,
+        &alice,
+        "session:position-close:alice",
+        3,
+        "cmd:position-close:resolving",
+        close_action,
+        2_800,
+    );
+    assert!(matches!(
+        resolving.unwrap_err(),
+        CoreError::InvalidOrder(message) if message == "market is resolving or resolved"
+    ));
+}
+
 fn execute_signed(
     core: &mut PrivateTradingCore,
     key: &SigningKey,

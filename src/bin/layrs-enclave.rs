@@ -90,6 +90,8 @@ struct EncryptedRequestContext {
     expected_session_tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_order_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_position_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +105,10 @@ enum ExpectedEncryptedAction {
     Cancel,
     #[serde(rename = "CANCEL_ALL_ORDERS")]
     CancelAll,
+    #[serde(rename = "PREVIEW_POSITION_CLOSE")]
+    PreviewPositionClose,
+    #[serde(rename = "CLOSE_POSITION")]
+    ClosePosition,
 }
 
 #[derive(Debug, Serialize)]
@@ -829,15 +835,27 @@ fn validate_request_context(
     let PlainRequest::User { command, .. } = request else {
         return Err(());
     };
-    let (actual_action, actual_order_id) = match &command.action {
-        UserCommandAction::SubmitOrder { .. } => (ExpectedEncryptedAction::Submit, None),
+    let (actual_action, actual_order_id, actual_position_id) = match &command.action {
+        UserCommandAction::SubmitOrder { .. } => (ExpectedEncryptedAction::Submit, None, None),
         UserCommandAction::ReplaceOrder { order_id, .. } => {
-            (ExpectedEncryptedAction::Replace, Some(*order_id))
+            (ExpectedEncryptedAction::Replace, Some(*order_id), None)
         }
         UserCommandAction::CancelOrder { order_id, .. } => {
-            (ExpectedEncryptedAction::Cancel, Some(*order_id))
+            (ExpectedEncryptedAction::Cancel, Some(*order_id), None)
         }
-        UserCommandAction::CancelAllOrders { .. } => (ExpectedEncryptedAction::CancelAll, None),
+        UserCommandAction::CancelAllOrders { .. } => {
+            (ExpectedEncryptedAction::CancelAll, None, None)
+        }
+        UserCommandAction::PreviewPositionClose { position_id, .. } => (
+            ExpectedEncryptedAction::PreviewPositionClose,
+            None,
+            Some(position_id.as_str()),
+        ),
+        UserCommandAction::ClosePosition { position_id, .. } => (
+            ExpectedEncryptedAction::ClosePosition,
+            None,
+            Some(position_id.as_str()),
+        ),
         _ => return Err(()),
     };
     validate_user_command_context(
@@ -845,6 +863,7 @@ fn validate_request_context(
         &command.session.request.session_id,
         actual_action,
         actual_order_id,
+        actual_position_id,
         context,
     )
 }
@@ -854,6 +873,7 @@ fn validate_user_command_context(
     session_id: &str,
     actual_action: ExpectedEncryptedAction,
     actual_order_id: Option<Uuid>,
+    actual_position_id: Option<&str>,
     context: &EncryptedRequestContext,
 ) -> Result<(), ()> {
     if idempotency_key != context.idempotency_key
@@ -868,15 +888,34 @@ fn validate_user_command_context(
         return Err(());
     }
     match actual_action {
-        ExpectedEncryptedAction::Submit if context.expected_order_id.is_none() => Ok(()),
-        ExpectedEncryptedAction::CancelAll if context.expected_order_id.is_none() => Ok(()),
+        ExpectedEncryptedAction::Submit
+            if context.expected_order_id.is_none() && context.expected_position_id.is_none() =>
+        {
+            Ok(())
+        }
+        ExpectedEncryptedAction::CancelAll
+            if context.expected_order_id.is_none() && context.expected_position_id.is_none() =>
+        {
+            Ok(())
+        }
         ExpectedEncryptedAction::Replace
-            if context.expected_order_id == actual_order_id && actual_order_id.is_some() =>
+            if context.expected_order_id == actual_order_id
+                && actual_order_id.is_some()
+                && context.expected_position_id.is_none() =>
         {
             Ok(())
         }
         ExpectedEncryptedAction::Cancel
-            if context.expected_order_id == actual_order_id && actual_order_id.is_some() =>
+            if context.expected_order_id == actual_order_id
+                && actual_order_id.is_some()
+                && context.expected_position_id.is_none() =>
+        {
+            Ok(())
+        }
+        ExpectedEncryptedAction::PreviewPositionClose | ExpectedEncryptedAction::ClosePosition
+            if context.expected_order_id.is_none()
+                && context.expected_position_id.as_deref() == actual_position_id
+                && actual_position_id.is_some() =>
         {
             Ok(())
         }
@@ -2567,11 +2606,13 @@ mod tests {
             expected_action: ExpectedEncryptedAction::Submit,
             expected_session_tags: vec![expected_tag],
             expected_order_id: None,
+            expected_position_id: None,
         };
         assert!(validate_user_command_context(
             "order:create:1234",
             "session:user-a",
             ExpectedEncryptedAction::Submit,
+            None,
             None,
             &context
         )
@@ -2581,6 +2622,7 @@ mod tests {
             "session:user-a",
             ExpectedEncryptedAction::Submit,
             None,
+            None,
             &context
         )
         .is_err());
@@ -2588,6 +2630,7 @@ mod tests {
             "order:create:1234",
             "session:user-b",
             ExpectedEncryptedAction::Submit,
+            None,
             None,
             &context
         )
@@ -2597,6 +2640,7 @@ mod tests {
             "session:user-a",
             ExpectedEncryptedAction::Replace,
             Some(Uuid::nil()),
+            None,
             &context
         )
         .is_err());
@@ -2610,12 +2654,14 @@ mod tests {
                 "session:user-a",
             )],
             expected_order_id: Some(order_id),
+            expected_position_id: None,
         };
         assert!(validate_user_command_context(
             "order:replace:1234",
             "session:user-a",
             ExpectedEncryptedAction::Replace,
             Some(order_id),
+            None,
             &replace,
         )
         .is_ok());
@@ -2624,6 +2670,7 @@ mod tests {
             "session:user-a",
             ExpectedEncryptedAction::Replace,
             Some(Uuid::new_v4()),
+            None,
             &replace,
         )
         .is_err());
@@ -2636,12 +2683,14 @@ mod tests {
                 "session:user-a",
             )],
             expected_order_id: Some(order_id),
+            expected_position_id: None,
         };
         assert!(validate_user_command_context(
             "order:cancel:1234",
             "session:user-a",
             ExpectedEncryptedAction::Cancel,
             Some(order_id),
+            None,
             &cancel,
         )
         .is_ok());
@@ -2650,6 +2699,7 @@ mod tests {
             "session:user-a",
             ExpectedEncryptedAction::Cancel,
             Some(Uuid::new_v4()),
+            None,
             &cancel,
         )
         .is_err());
@@ -2662,11 +2712,13 @@ mod tests {
                 "session:user-a",
             )],
             expected_order_id: None,
+            expected_position_id: None,
         };
         assert!(validate_user_command_context(
             "orders:cancel-all:1234",
             "session:user-a",
             ExpectedEncryptedAction::CancelAll,
+            None,
             None,
             &cancel_all,
         )
@@ -2676,6 +2728,7 @@ mod tests {
             "session:user-a",
             ExpectedEncryptedAction::Cancel,
             Some(order_id),
+            None,
             &cancel_all,
         )
         .is_err());
@@ -2684,7 +2737,38 @@ mod tests {
             "session:user-a",
             ExpectedEncryptedAction::Replace,
             Some(order_id),
+            None,
             &cancel,
+        )
+        .is_err());
+
+        let position_id = format!("pos_{}", "ab".repeat(32));
+        let close = EncryptedRequestContext {
+            idempotency_key: "position:close:1234".into(),
+            expected_action: ExpectedEncryptedAction::ClosePosition,
+            expected_session_tags: vec![api_session_request_tag(
+                "position:close:1234",
+                "session:user-a",
+            )],
+            expected_order_id: None,
+            expected_position_id: Some(position_id.clone()),
+        };
+        assert!(validate_user_command_context(
+            "position:close:1234",
+            "session:user-a",
+            ExpectedEncryptedAction::ClosePosition,
+            None,
+            Some(&position_id),
+            &close,
+        )
+        .is_ok());
+        assert!(validate_user_command_context(
+            "position:close:1234",
+            "session:user-a",
+            ExpectedEncryptedAction::ClosePosition,
+            None,
+            Some("pos_wrong"),
+            &close,
         )
         .is_err());
     }
