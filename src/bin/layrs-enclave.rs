@@ -100,6 +100,12 @@ struct EncryptedRequestContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_position_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_execution_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_withdrawal_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_transfer_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_command_commitment: Option<String>,
 }
 
@@ -123,6 +129,22 @@ enum ExpectedEncryptedAction {
     PreviewPositionClose,
     #[serde(rename = "CLOSE_POSITION")]
     ClosePosition,
+    #[serde(rename = "COMPLETE_SET")]
+    CompleteSet,
+    #[serde(rename = "PORTFOLIO")]
+    Portfolio,
+    #[serde(rename = "REWARDS")]
+    Rewards,
+    #[serde(rename = "REQUEST_REWARD_CLAIM")]
+    RequestRewardClaim,
+    #[serde(rename = "BOOTSTRAP_STATUS")]
+    BootstrapStatus,
+    #[serde(rename = "CANCEL_BOOTSTRAP")]
+    CancelBootstrap,
+    #[serde(rename = "REQUEST_WITHDRAWAL")]
+    RequestWithdrawal,
+    #[serde(rename = "TRANSFER_FUNDS")]
+    TransferFunds,
 }
 
 #[derive(Debug, Serialize)]
@@ -939,52 +961,160 @@ fn validate_request_context(
             Err(())
         };
     };
-    let (actual_action, actual_order_id, actual_position_id, actual_session_tag) =
-        match &command.action {
-            UserCommandAction::SubmitOrder { .. } => {
-                (ExpectedEncryptedAction::Submit, None, None, None)
-            }
-            UserCommandAction::ReplaceOrder { order_id, .. } => (
-                ExpectedEncryptedAction::Replace,
-                Some(*order_id),
-                None,
-                None,
-            ),
-            UserCommandAction::CancelOrder { order_id, .. } => {
-                (ExpectedEncryptedAction::Cancel, Some(*order_id), None, None)
-            }
-            UserCommandAction::CancelAllOrders { .. } => {
-                (ExpectedEncryptedAction::CancelAll, None, None, None)
-            }
-            UserCommandAction::PreviewPositionClose {
-                position_id,
-                session_tag,
-                ..
-            } => (
-                ExpectedEncryptedAction::PreviewPositionClose,
-                None,
-                Some(position_id.as_str()),
-                Some(session_tag.as_str()),
-            ),
-            UserCommandAction::ClosePosition {
-                position_id,
-                session_tag,
-                ..
-            } => (
-                ExpectedEncryptedAction::ClosePosition,
-                None,
-                Some(position_id.as_str()),
-                Some(session_tag.as_str()),
-            ),
-            _ => return Err(()),
-        };
+    let (
+        actual_action,
+        order_id,
+        position_id,
+        execution_id,
+        withdrawal_id,
+        transfer_id,
+        session_tag,
+    ) = match &command.action {
+        UserCommandAction::SubmitOrder { .. } => (
+            ExpectedEncryptedAction::Submit,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        UserCommandAction::ReplaceOrder { order_id, .. } => (
+            ExpectedEncryptedAction::Replace,
+            Some(*order_id),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        UserCommandAction::CancelOrder { order_id, .. } => (
+            ExpectedEncryptedAction::Cancel,
+            Some(*order_id),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        UserCommandAction::CancelAllOrders { .. } => (
+            ExpectedEncryptedAction::CancelAll,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        UserCommandAction::PreviewPositionClose {
+            position_id,
+            session_tag,
+            ..
+        } => (
+            ExpectedEncryptedAction::PreviewPositionClose,
+            None,
+            Some(position_id.as_str()),
+            None,
+            None,
+            None,
+            Some(session_tag.as_str()),
+        ),
+        UserCommandAction::ClosePosition {
+            position_id,
+            session_tag,
+            ..
+        } => (
+            ExpectedEncryptedAction::ClosePosition,
+            None,
+            Some(position_id.as_str()),
+            None,
+            None,
+            None,
+            Some(session_tag.as_str()),
+        ),
+        UserCommandAction::CompleteSet { .. } => (
+            ExpectedEncryptedAction::CompleteSet,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        UserCommandAction::Portfolio => (
+            ExpectedEncryptedAction::Portfolio,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        UserCommandAction::Rewards => (
+            ExpectedEncryptedAction::Rewards,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        UserCommandAction::RequestRewardClaim { .. } => (
+            ExpectedEncryptedAction::RequestRewardClaim,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        UserCommandAction::BootstrapStatus { execution_id } => (
+            ExpectedEncryptedAction::BootstrapStatus,
+            None,
+            None,
+            Some(*execution_id),
+            None,
+            None,
+            None,
+        ),
+        UserCommandAction::CancelBootstrap { execution_id } => (
+            ExpectedEncryptedAction::CancelBootstrap,
+            None,
+            None,
+            Some(*execution_id),
+            None,
+            None,
+            None,
+        ),
+        UserCommandAction::RequestWithdrawal { withdrawal_id, .. } => (
+            ExpectedEncryptedAction::RequestWithdrawal,
+            None,
+            None,
+            None,
+            Some(*withdrawal_id),
+            None,
+            None,
+        ),
+        UserCommandAction::TransferFunds { transfer_id, .. } => (
+            ExpectedEncryptedAction::TransferFunds,
+            None,
+            None,
+            None,
+            None,
+            Some(*transfer_id),
+            None,
+        ),
+    };
     validate_bound_user_command_context(
         &command.idempotency_key,
         &command.session.request.session_id,
         actual_action,
-        actual_order_id,
-        actual_position_id,
-        actual_session_tag,
+        order_id,
+        position_id,
+        execution_id,
+        withdrawal_id,
+        transfer_id,
+        session_tag,
         command.session.request.request_hash,
         context,
     )
@@ -1077,12 +1207,22 @@ fn validate_bound_user_command_context(
     actual_action: ExpectedEncryptedAction,
     actual_order_id: Option<Uuid>,
     actual_position_id: Option<&str>,
+    actual_execution_id: Option<Uuid>,
+    actual_withdrawal_id: Option<Uuid>,
+    actual_transfer_id: Option<Uuid>,
     actual_session_tag: Option<&str>,
     actual_command_commitment: [u8; 32],
     context: &EncryptedRequestContext,
 ) -> Result<(), ()> {
     let computed_session_tag = api_session_request_tag(idempotency_key, session_id);
     if idempotency_key != context.idempotency_key
+        || !(1..=8).contains(&context.expected_session_tags.len())
+        || context
+            .expected_session_tags
+            .iter()
+            .collect::<HashSet<_>>()
+            .len()
+            != context.expected_session_tags.len()
         || !context
             .expected_session_tags
             .iter()
@@ -1094,10 +1234,22 @@ fn validate_bound_user_command_context(
         actual_action,
         ExpectedEncryptedAction::PreviewPositionClose | ExpectedEncryptedAction::ClosePosition
     );
-    if position_action {
-        if actual_session_tag != Some(computed_session_tag.as_str()) {
-            return Err(());
-        }
+    let commitment_required = position_action
+        || matches!(
+            actual_action,
+            ExpectedEncryptedAction::CompleteSet
+                | ExpectedEncryptedAction::Portfolio
+                | ExpectedEncryptedAction::Rewards
+                | ExpectedEncryptedAction::RequestRewardClaim
+                | ExpectedEncryptedAction::BootstrapStatus
+                | ExpectedEncryptedAction::CancelBootstrap
+                | ExpectedEncryptedAction::RequestWithdrawal
+                | ExpectedEncryptedAction::TransferFunds
+        );
+    if position_action && actual_session_tag != Some(computed_session_tag.as_str()) {
+        return Err(());
+    }
+    if commitment_required || context.expected_command_commitment.is_some() {
         let Some(expected) = context.expected_command_commitment.as_deref() else {
             return Err(());
         };
@@ -1110,46 +1262,67 @@ fn validate_bound_user_command_context(
         {
             return Err(());
         }
-    } else if context.expected_command_commitment.is_some() || actual_session_tag.is_some() {
+    } else if actual_session_tag.is_some() {
         return Err(());
     }
     if context.expected_action != actual_action {
         return Err(());
     }
-    match actual_action {
+    let targets_match = match actual_action {
         ExpectedEncryptedAction::Submit
-            if context.expected_order_id.is_none() && context.expected_position_id.is_none() =>
-        {
-            Ok(())
+        | ExpectedEncryptedAction::CancelAll
+        | ExpectedEncryptedAction::CompleteSet
+        | ExpectedEncryptedAction::Portfolio
+        | ExpectedEncryptedAction::Rewards
+        | ExpectedEncryptedAction::RequestRewardClaim => {
+            context.expected_order_id.is_none()
+                && context.expected_position_id.is_none()
+                && context.expected_execution_id.is_none()
+                && context.expected_withdrawal_id.is_none()
+                && context.expected_transfer_id.is_none()
         }
-        ExpectedEncryptedAction::CancelAll
-            if context.expected_order_id.is_none() && context.expected_position_id.is_none() =>
-        {
-            Ok(())
-        }
-        ExpectedEncryptedAction::Replace
-            if context.expected_order_id == actual_order_id
+        ExpectedEncryptedAction::Replace | ExpectedEncryptedAction::Cancel => {
+            context.expected_order_id == actual_order_id
                 && actual_order_id.is_some()
-                && context.expected_position_id.is_none() =>
-        {
-            Ok(())
+                && context.expected_position_id.is_none()
+                && context.expected_execution_id.is_none()
+                && context.expected_withdrawal_id.is_none()
+                && context.expected_transfer_id.is_none()
         }
-        ExpectedEncryptedAction::Cancel
-            if context.expected_order_id == actual_order_id
-                && actual_order_id.is_some()
-                && context.expected_position_id.is_none() =>
-        {
-            Ok(())
-        }
-        ExpectedEncryptedAction::PreviewPositionClose | ExpectedEncryptedAction::ClosePosition
-            if context.expected_order_id.is_none()
+        ExpectedEncryptedAction::PreviewPositionClose | ExpectedEncryptedAction::ClosePosition => {
+            context.expected_order_id.is_none()
                 && context.expected_position_id.as_deref() == actual_position_id
-                && actual_position_id.is_some() =>
-        {
-            Ok(())
+                && actual_position_id.is_some()
+                && context.expected_execution_id.is_none()
+                && context.expected_withdrawal_id.is_none()
+                && context.expected_transfer_id.is_none()
         }
-        _ => Err(()),
-    }
+        ExpectedEncryptedAction::BootstrapStatus | ExpectedEncryptedAction::CancelBootstrap => {
+            context.expected_order_id.is_none()
+                && context.expected_position_id.is_none()
+                && context.expected_execution_id == actual_execution_id
+                && actual_execution_id.is_some()
+                && context.expected_withdrawal_id.is_none()
+                && context.expected_transfer_id.is_none()
+        }
+        ExpectedEncryptedAction::RequestWithdrawal => {
+            context.expected_order_id.is_none()
+                && context.expected_position_id.is_none()
+                && context.expected_execution_id.is_none()
+                && context.expected_withdrawal_id == actual_withdrawal_id
+                && actual_withdrawal_id.is_some()
+                && context.expected_transfer_id.is_none()
+        }
+        ExpectedEncryptedAction::TransferFunds => {
+            context.expected_order_id.is_none()
+                && context.expected_position_id.is_none()
+                && context.expected_execution_id.is_none()
+                && context.expected_withdrawal_id.is_none()
+                && context.expected_transfer_id == actual_transfer_id
+                && actual_transfer_id.is_some()
+        }
+    };
+    targets_match.then_some(()).ok_or(())
 }
 
 #[cfg(test)]
@@ -1179,6 +1352,9 @@ fn validate_user_command_context(
         actual_action,
         actual_order_id,
         actual_position_id,
+        None,
+        None,
+        None,
         matches!(
             actual_action,
             ExpectedEncryptedAction::PreviewPositionClose | ExpectedEncryptedAction::ClosePosition
@@ -2866,6 +3042,9 @@ mod tests {
             expected_action: ExpectedEncryptedAction::Submit,
             expected_order_id: None,
             expected_position_id: None,
+            expected_execution_id: None,
+            expected_withdrawal_id: None,
+            expected_transfer_id: None,
             expected_session_tags: vec![],
             expected_command_commitment: None,
         };
@@ -3133,6 +3312,9 @@ mod tests {
             expected_session_tags: vec![expected_tag],
             expected_order_id: None,
             expected_position_id: None,
+            expected_execution_id: None,
+            expected_withdrawal_id: None,
+            expected_transfer_id: None,
             expected_command_commitment: None,
         };
         assert!(validate_user_command_context(
@@ -3182,6 +3364,9 @@ mod tests {
             )],
             expected_order_id: Some(order_id),
             expected_position_id: None,
+            expected_execution_id: None,
+            expected_withdrawal_id: None,
+            expected_transfer_id: None,
             expected_command_commitment: None,
         };
         assert!(validate_user_command_context(
@@ -3212,6 +3397,9 @@ mod tests {
             )],
             expected_order_id: Some(order_id),
             expected_position_id: None,
+            expected_execution_id: None,
+            expected_withdrawal_id: None,
+            expected_transfer_id: None,
             expected_command_commitment: None,
         };
         assert!(validate_user_command_context(
@@ -3242,6 +3430,9 @@ mod tests {
             )],
             expected_order_id: None,
             expected_position_id: None,
+            expected_execution_id: None,
+            expected_withdrawal_id: None,
+            expected_transfer_id: None,
             expected_command_commitment: None,
         };
         assert!(validate_user_command_context(
@@ -3282,6 +3473,9 @@ mod tests {
             )],
             expected_order_id: None,
             expected_position_id: Some(position_id.clone()),
+            expected_execution_id: None,
+            expected_withdrawal_id: None,
+            expected_transfer_id: None,
             expected_command_commitment: Some(format!("0x{}", "11".repeat(32))),
         };
         assert!(validate_user_command_context(
@@ -3310,6 +3504,9 @@ mod tests {
             ExpectedEncryptedAction::ClosePosition,
             None,
             Some(&position_id),
+            None,
+            None,
+            None,
             Some(&exact_tag),
             [0x11; 32],
             &close,
@@ -3321,6 +3518,9 @@ mod tests {
             ExpectedEncryptedAction::ClosePosition,
             None,
             Some(&position_id),
+            None,
+            None,
+            None,
             Some("wrong-session-tag"),
             [0x11; 32],
             &close,
@@ -3332,11 +3532,101 @@ mod tests {
             ExpectedEncryptedAction::ClosePosition,
             None,
             Some(&position_id),
+            None,
+            None,
+            None,
             Some(&exact_tag),
             [0x22; 32],
             &close,
         )
         .is_err());
+    }
+
+    #[test]
+    fn every_private_user_action_is_bound_to_commitment_session_and_target() {
+        let idempotency_key = "private:all-actions:1234";
+        let session_id = "session:user-a";
+        let session_tag = api_session_request_tag(idempotency_key, session_id);
+        let commitment = [0x55; 32];
+        let execution_id = Uuid::new_v4();
+        let withdrawal_id = Uuid::new_v4();
+        let transfer_id = Uuid::new_v4();
+        let cases = [
+            (ExpectedEncryptedAction::CompleteSet, None, None, None),
+            (ExpectedEncryptedAction::Portfolio, None, None, None),
+            (ExpectedEncryptedAction::Rewards, None, None, None),
+            (
+                ExpectedEncryptedAction::RequestRewardClaim,
+                None,
+                None,
+                None,
+            ),
+            (
+                ExpectedEncryptedAction::BootstrapStatus,
+                Some(execution_id),
+                None,
+                None,
+            ),
+            (
+                ExpectedEncryptedAction::CancelBootstrap,
+                Some(execution_id),
+                None,
+                None,
+            ),
+            (
+                ExpectedEncryptedAction::RequestWithdrawal,
+                None,
+                Some(withdrawal_id),
+                None,
+            ),
+            (
+                ExpectedEncryptedAction::TransferFunds,
+                None,
+                None,
+                Some(transfer_id),
+            ),
+        ];
+        for (action, expected_execution_id, expected_withdrawal_id, expected_transfer_id) in cases {
+            let context = EncryptedRequestContext {
+                idempotency_key: idempotency_key.into(),
+                expected_action: action,
+                expected_session_tags: vec![session_tag.clone()],
+                expected_order_id: None,
+                expected_position_id: None,
+                expected_execution_id,
+                expected_withdrawal_id,
+                expected_transfer_id,
+                expected_command_commitment: Some(format!("0x{}", "55".repeat(32))),
+            };
+            assert!(validate_bound_user_command_context(
+                idempotency_key,
+                session_id,
+                action,
+                None,
+                None,
+                expected_execution_id,
+                expected_withdrawal_id,
+                expected_transfer_id,
+                None,
+                commitment,
+                &context,
+            )
+            .is_ok());
+            assert!(validate_bound_user_command_context(
+                idempotency_key,
+                session_id,
+                action,
+                None,
+                None,
+                expected_execution_id,
+                expected_withdrawal_id,
+                expected_transfer_id,
+                None,
+                [0x56; 32],
+                &context,
+            )
+            .is_err());
+        }
     }
 
     #[test]

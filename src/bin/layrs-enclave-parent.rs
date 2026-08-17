@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     io,
     net::{Shutdown, SocketAddr},
     sync::Arc,
@@ -86,6 +87,12 @@ struct EncryptedRequestContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_position_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_execution_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_withdrawal_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_transfer_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_command_commitment: Option<String>,
 }
 
@@ -104,6 +111,22 @@ enum ExpectedEncryptedAction {
     PreviewPositionClose,
     #[serde(rename = "CLOSE_POSITION")]
     ClosePosition,
+    #[serde(rename = "COMPLETE_SET")]
+    CompleteSet,
+    #[serde(rename = "PORTFOLIO")]
+    Portfolio,
+    #[serde(rename = "REWARDS")]
+    Rewards,
+    #[serde(rename = "REQUEST_REWARD_CLAIM")]
+    RequestRewardClaim,
+    #[serde(rename = "BOOTSTRAP_STATUS")]
+    BootstrapStatus,
+    #[serde(rename = "CANCEL_BOOTSTRAP")]
+    CancelBootstrap,
+    #[serde(rename = "REQUEST_WITHDRAWAL")]
+    RequestWithdrawal,
+    #[serde(rename = "TRANSFER_FUNDS")]
+    TransferFunds,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -453,39 +476,80 @@ async fn operator_relay(
 }
 
 fn valid_request_context(context: &EncryptedRequestContext) -> bool {
+    let no_order_or_position =
+        context.expected_order_id.is_none() && context.expected_position_id.is_none();
+    let no_execution_or_funding = context.expected_execution_id.is_none()
+        && context.expected_withdrawal_id.is_none()
+        && context.expected_transfer_id.is_none();
+    let valid_commitment = context
+        .expected_command_commitment
+        .as_ref()
+        .is_some_and(|value| {
+            value.len() == 66
+                && value.starts_with("0x")
+                && value[2..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+    let valid_optional_commitment =
+        context.expected_command_commitment.is_none() || valid_commitment;
     valid_idempotency_key(&context.idempotency_key)
         && match context.expected_action {
             ExpectedEncryptedAction::Submit | ExpectedEncryptedAction::CancelAll => {
-                context.expected_order_id.is_none()
-                    && context.expected_position_id.is_none()
-                    && context.expected_command_commitment.is_none()
+                no_order_or_position && no_execution_or_funding && valid_optional_commitment
             }
             ExpectedEncryptedAction::Replace | ExpectedEncryptedAction::Cancel => {
                 context.expected_order_id.is_some()
                     && context.expected_position_id.is_none()
-                    && context.expected_command_commitment.is_none()
+                    && no_execution_or_funding
+                    && valid_optional_commitment
             }
             ExpectedEncryptedAction::PreviewPositionClose
             | ExpectedEncryptedAction::ClosePosition => {
                 context.expected_order_id.is_none()
+                    && no_execution_or_funding
                     && context.expected_position_id.as_ref().is_some_and(|value| {
                         value.len() == 68
                             && value.starts_with("pos_")
                             && value[4..].bytes().all(|byte| byte.is_ascii_hexdigit())
                     })
-                    && context
-                        .expected_command_commitment
-                        .as_ref()
-                        .is_some_and(|value| {
-                            value.len() == 66
-                                && value.starts_with("0x")
-                                && value[2..].bytes().all(|byte| {
-                                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
-                                })
-                        })
+                    && valid_commitment
+            }
+            ExpectedEncryptedAction::CompleteSet
+            | ExpectedEncryptedAction::Portfolio
+            | ExpectedEncryptedAction::Rewards
+            | ExpectedEncryptedAction::RequestRewardClaim => {
+                no_order_or_position && no_execution_or_funding && valid_commitment
+            }
+            ExpectedEncryptedAction::BootstrapStatus | ExpectedEncryptedAction::CancelBootstrap => {
+                no_order_or_position
+                    && context.expected_execution_id.is_some()
+                    && context.expected_withdrawal_id.is_none()
+                    && context.expected_transfer_id.is_none()
+                    && valid_commitment
+            }
+            ExpectedEncryptedAction::RequestWithdrawal => {
+                no_order_or_position
+                    && context.expected_execution_id.is_none()
+                    && context.expected_withdrawal_id.is_some()
+                    && context.expected_transfer_id.is_none()
+                    && valid_commitment
+            }
+            ExpectedEncryptedAction::TransferFunds => {
+                no_order_or_position
+                    && context.expected_execution_id.is_none()
+                    && context.expected_withdrawal_id.is_none()
+                    && context.expected_transfer_id.is_some()
+                    && valid_commitment
             }
         }
         && (1..=8).contains(&context.expected_session_tags.len())
+        && context
+            .expected_session_tags
+            .iter()
+            .collect::<HashSet<_>>()
+            .len()
+            == context.expected_session_tags.len()
         && context.expected_session_tags.iter().all(|tag| {
             URL_SAFE_NO_PAD
                 .decode(tag)
@@ -627,6 +691,9 @@ mod tests {
                 expected_session_tags: vec![URL_SAFE_NO_PAD.encode([8u8; 32])],
                 expected_order_id: None,
                 expected_position_id: None,
+                expected_execution_id: None,
+                expected_withdrawal_id: None,
+                expected_transfer_id: None,
                 expected_command_commitment: None,
             },
         };
@@ -656,15 +723,25 @@ mod tests {
             expected_session_tags: vec![URL_SAFE_NO_PAD.encode([9u8; 32])],
             expected_order_id: None,
             expected_position_id: None,
+            expected_execution_id: None,
+            expected_withdrawal_id: None,
+            expected_transfer_id: None,
             expected_command_commitment: None,
         };
         assert!(valid_request_context(&valid));
+        assert!(!valid_request_context(&EncryptedRequestContext {
+            expected_command_commitment: Some("not-a-commitment".into()),
+            ..valid.clone()
+        }));
         let cancel = EncryptedRequestContext {
             idempotency_key: "order:cancel:1234".into(),
             expected_action: ExpectedEncryptedAction::Cancel,
             expected_session_tags: vec![URL_SAFE_NO_PAD.encode([8u8; 32])],
             expected_order_id: Some(Uuid::new_v4()),
             expected_position_id: None,
+            expected_execution_id: None,
+            expected_withdrawal_id: None,
+            expected_transfer_id: None,
             expected_command_commitment: None,
         };
         assert!(valid_request_context(&cancel));
@@ -678,6 +755,9 @@ mod tests {
             expected_session_tags: vec![URL_SAFE_NO_PAD.encode([7u8; 32])],
             expected_order_id: None,
             expected_position_id: None,
+            expected_execution_id: None,
+            expected_withdrawal_id: None,
+            expected_transfer_id: None,
             expected_command_commitment: None,
         };
         assert!(valid_request_context(&cancel_all));
@@ -696,9 +776,71 @@ mod tests {
                 expected_session_tags: vec![URL_SAFE_NO_PAD.encode([6u8; 32])],
                 expected_order_id: None,
                 expected_position_id: Some(position_id.clone()),
+                expected_execution_id: None,
+                expected_withdrawal_id: None,
+                expected_transfer_id: None,
                 expected_command_commitment: Some(format!("0x{}", "11".repeat(32))),
             };
             assert!(valid_request_context(&position));
+        }
+        for expected_action in [
+            ExpectedEncryptedAction::CompleteSet,
+            ExpectedEncryptedAction::Portfolio,
+            ExpectedEncryptedAction::Rewards,
+            ExpectedEncryptedAction::RequestRewardClaim,
+        ] {
+            assert!(valid_request_context(&EncryptedRequestContext {
+                idempotency_key: "private:read:1234".into(),
+                expected_action,
+                expected_session_tags: vec![URL_SAFE_NO_PAD.encode([5u8; 32])],
+                expected_order_id: None,
+                expected_position_id: None,
+                expected_execution_id: None,
+                expected_withdrawal_id: None,
+                expected_transfer_id: None,
+                expected_command_commitment: Some(format!("0x{}", "22".repeat(32))),
+            }));
+        }
+        let execution_id = Uuid::new_v4();
+        for expected_action in [
+            ExpectedEncryptedAction::BootstrapStatus,
+            ExpectedEncryptedAction::CancelBootstrap,
+        ] {
+            assert!(valid_request_context(&EncryptedRequestContext {
+                idempotency_key: "private:bootstrap:1234".into(),
+                expected_action,
+                expected_session_tags: vec![URL_SAFE_NO_PAD.encode([4u8; 32])],
+                expected_order_id: None,
+                expected_position_id: None,
+                expected_execution_id: Some(execution_id),
+                expected_withdrawal_id: None,
+                expected_transfer_id: None,
+                expected_command_commitment: Some(format!("0x{}", "33".repeat(32))),
+            }));
+        }
+        for (expected_action, expected_withdrawal_id, expected_transfer_id) in [
+            (
+                ExpectedEncryptedAction::RequestWithdrawal,
+                Some(Uuid::new_v4()),
+                None,
+            ),
+            (
+                ExpectedEncryptedAction::TransferFunds,
+                None,
+                Some(Uuid::new_v4()),
+            ),
+        ] {
+            assert!(valid_request_context(&EncryptedRequestContext {
+                idempotency_key: "private:funding:1234".into(),
+                expected_action,
+                expected_session_tags: vec![URL_SAFE_NO_PAD.encode([3u8; 32])],
+                expected_order_id: None,
+                expected_position_id: None,
+                expected_execution_id: None,
+                expected_withdrawal_id,
+                expected_transfer_id,
+                expected_command_commitment: Some(format!("0x{}", "44".repeat(32))),
+            }));
         }
         assert!(!valid_request_context(&EncryptedRequestContext {
             expected_order_id: Some(Uuid::new_v4()),
@@ -710,6 +852,9 @@ mod tests {
             expected_session_tags: vec![URL_SAFE_NO_PAD.encode([8u8; 32])],
             expected_order_id: None,
             expected_position_id: None,
+            expected_execution_id: None,
+            expected_withdrawal_id: None,
+            expected_transfer_id: None,
             expected_command_commitment: None,
         }));
         assert!(!valid_request_context(&EncryptedRequestContext {
