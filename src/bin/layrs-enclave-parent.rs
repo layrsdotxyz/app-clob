@@ -80,6 +80,8 @@ struct EncryptedRequestContext {
     expected_order_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_position_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_command_commitment: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -379,10 +381,14 @@ fn valid_request_context(context: &EncryptedRequestContext) -> bool {
     valid_idempotency_key(&context.idempotency_key)
         && match context.expected_action {
             ExpectedEncryptedAction::Submit | ExpectedEncryptedAction::CancelAll => {
-                context.expected_order_id.is_none() && context.expected_position_id.is_none()
+                context.expected_order_id.is_none()
+                    && context.expected_position_id.is_none()
+                    && context.expected_command_commitment.is_none()
             }
             ExpectedEncryptedAction::Replace | ExpectedEncryptedAction::Cancel => {
-                context.expected_order_id.is_some() && context.expected_position_id.is_none()
+                context.expected_order_id.is_some()
+                    && context.expected_position_id.is_none()
+                    && context.expected_command_commitment.is_none()
             }
             ExpectedEncryptedAction::PreviewPositionClose
             | ExpectedEncryptedAction::ClosePosition => {
@@ -392,6 +398,16 @@ fn valid_request_context(context: &EncryptedRequestContext) -> bool {
                             && value.starts_with("pos_")
                             && value[4..].bytes().all(|byte| byte.is_ascii_hexdigit())
                     })
+                    && context
+                        .expected_command_commitment
+                        .as_ref()
+                        .is_some_and(|value| {
+                            value.len() == 66
+                                && value.starts_with("0x")
+                                && value[2..].bytes().all(|byte| {
+                                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                                })
+                        })
             }
         }
         && (1..=8).contains(&context.expected_session_tags.len())
@@ -536,6 +552,7 @@ mod tests {
                 expected_session_tags: vec![URL_SAFE_NO_PAD.encode([8u8; 32])],
                 expected_order_id: None,
                 expected_position_id: None,
+                expected_command_commitment: None,
             }),
         };
         let encoded = serde_cbor::to_vec(&request).expect("wire request encodes");
@@ -564,6 +581,7 @@ mod tests {
             expected_session_tags: vec![URL_SAFE_NO_PAD.encode([9u8; 32])],
             expected_order_id: None,
             expected_position_id: None,
+            expected_command_commitment: None,
         };
         assert!(valid_request_context(&valid));
         let cancel = EncryptedRequestContext {
@@ -572,6 +590,7 @@ mod tests {
             expected_session_tags: vec![URL_SAFE_NO_PAD.encode([8u8; 32])],
             expected_order_id: Some(Uuid::new_v4()),
             expected_position_id: None,
+            expected_command_commitment: None,
         };
         assert!(valid_request_context(&cancel));
         assert_eq!(
@@ -584,6 +603,7 @@ mod tests {
             expected_session_tags: vec![URL_SAFE_NO_PAD.encode([7u8; 32])],
             expected_order_id: None,
             expected_position_id: None,
+            expected_command_commitment: None,
         };
         assert!(valid_request_context(&cancel_all));
         assert_eq!(
@@ -601,6 +621,7 @@ mod tests {
                 expected_session_tags: vec![URL_SAFE_NO_PAD.encode([6u8; 32])],
                 expected_order_id: None,
                 expected_position_id: Some(position_id.clone()),
+                expected_command_commitment: Some(format!("0x{}", "11".repeat(32))),
             };
             assert!(valid_request_context(&position));
         }
@@ -614,6 +635,7 @@ mod tests {
             expected_session_tags: vec![URL_SAFE_NO_PAD.encode([8u8; 32])],
             expected_order_id: None,
             expected_position_id: None,
+            expected_command_commitment: None,
         }));
         assert!(!valid_request_context(&EncryptedRequestContext {
             expected_session_tags: Vec::new(),

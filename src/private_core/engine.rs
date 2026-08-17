@@ -26,6 +26,10 @@ use super::{
 /// owners before it can leave the enclave. This prevents a thin public level
 /// from acting as an oracle for one user's exact order size and arrival time.
 const MIN_PUBLIC_DEPTH_DISTINCT_OWNERS: usize = 3;
+/// Position-close quotes are deliberately short lived. They commit to the
+/// exact private book state and economics seen by the enclave, so a quote can
+/// neither be replayed after the book moves nor extended by an API client.
+const POSITION_CLOSE_QUOTE_TTL_MILLIS: i64 = 30_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketConfig {
@@ -472,6 +476,7 @@ pub enum UserCommandAction {
         position_id: String,
         market_id: String,
         outcome: Outcome,
+        session_tag: String,
         #[serde(with = "super::decimal_u128")]
         quantity_micros: u128,
         minimum_price_micros: u64,
@@ -480,9 +485,11 @@ pub enum UserCommandAction {
         position_id: String,
         market_id: String,
         outcome: Outcome,
+        session_tag: String,
         #[serde(with = "super::decimal_u128")]
         quantity_micros: u128,
         minimum_price_micros: u64,
+        quote: PositionClosePreview,
     },
     CompleteSet {
         market_id: String,
@@ -566,6 +573,10 @@ pub struct PositionClosePreview {
     pub fee_atomic: u128,
     #[serde(with = "super::decimal_u128")]
     pub net_payout_atomic: u128,
+    pub book_commitment_sha256: [u8; 32],
+    pub book_sequence: u64,
+    pub expires_at_millis: i64,
+    pub quote_commitment_sha256: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1337,6 +1348,50 @@ impl PrivateTradingCore {
 
     pub fn trading_frozen(&self) -> bool {
         self.trading_frozen
+    }
+
+    /// Recovers only a byte-for-byte identical committed position-close command.
+    ///
+    /// This check is intentionally available before a fresh NSM clock read so a
+    /// lost HTTP response can be recovered even during a temporary NSM failure.
+    /// Legacy processed entries without the rooted full-command marker remain
+    /// non-recoverable and return `PreviouslyProcessed`.
+    pub fn recover_exact_position_close(
+        &self,
+        command: &UserCommand,
+    ) -> CoreResult<Option<CoreResponse>> {
+        if !matches!(
+            command.action,
+            UserCommandAction::PreviewPositionClose { .. }
+                | UserCommandAction::ClosePosition { .. }
+        ) {
+            return Ok(None);
+        }
+        let expected_hash = command_request_hash(
+            &command.command_id,
+            &command.idempotency_key,
+            &command.action,
+        )?;
+        if command.session.request.request_hash != expected_hash {
+            return Err(CoreError::RequestHashMismatch);
+        }
+        let Some(processed) = self.processed.get(&command.idempotency_key) else {
+            return Ok(None);
+        };
+        if processed.request_hash != expected_hash {
+            return Err(CoreError::DuplicateCommand);
+        }
+        if !self.system_keys.contains(&processed_command_marker(
+            &command.idempotency_key,
+            full_user_command_commitment(command)?,
+        )) {
+            return Err(CoreError::PreviouslyProcessed);
+        }
+        processed
+            .response
+            .clone()
+            .map(Some)
+            .ok_or(CoreError::PreviouslyProcessed)
     }
 
     pub fn set_trading_freeze(
@@ -2957,7 +3012,6 @@ impl PrivateTradingCore {
             command.action,
             UserCommandAction::Portfolio
                 | UserCommandAction::Rewards
-                | UserCommandAction::PreviewPositionClose { .. }
                 | UserCommandAction::BootstrapStatus { .. }
         ) {
             return self.execute_readonly(command, expected_hash, now_millis);
@@ -2965,6 +3019,12 @@ impl PrivateTradingCore {
         if let Some(processed) = self.processed.get(&command.idempotency_key) {
             if processed.request_hash != expected_hash {
                 return Err(CoreError::DuplicateCommand);
+            }
+            if !self.system_keys.contains(&processed_command_marker(
+                &command.idempotency_key,
+                full_user_command_commitment(&command)?,
+            )) {
+                return Err(CoreError::PreviouslyProcessed);
             }
             return processed
                 .response
@@ -2976,6 +3036,7 @@ impl PrivateTradingCore {
                 &command.action,
                 UserCommandAction::SubmitOrder { .. }
                     | UserCommandAction::ReplaceOrder { .. }
+                    | UserCommandAction::ClosePosition { .. }
                     | UserCommandAction::CompleteSet { .. }
             )
         {
@@ -2991,6 +3052,7 @@ impl PrivateTradingCore {
         let mut bootstrap_executions = self.bootstrap_executions.clone();
         let mut private_rewards = self.private_rewards.clone();
         let mut system_keys = self.system_keys.clone();
+        advance_trusted_time_high_water(&mut system_keys, now_millis)?;
         let mut audit_drafts = Vec::new();
         let task_order_commitment = match &command.action {
             UserCommandAction::SubmitOrder { order } => {
@@ -3248,15 +3310,69 @@ impl PrivateTradingCore {
                 }
                 CommandResult::OrdersCancelled { outcomes }
             }
-            UserCommandAction::PreviewPositionClose { .. } => {
-                return Err(CoreError::InvalidOrder("command is read-only".into()));
+            UserCommandAction::PreviewPositionClose {
+                position_id,
+                market_id,
+                outcome,
+                session_tag: _,
+                quantity_micros,
+                minimum_price_micros,
+            } => {
+                let order = position_close_order(
+                    &self.identity_key,
+                    &ledger,
+                    &self.markets,
+                    &self.resolutions,
+                    &private_user_id,
+                    position_id,
+                    market_id,
+                    *outcome,
+                    *quantity_micros,
+                    *minimum_price_micros,
+                    position_close_order_id(
+                        &command.command_id,
+                        &command.idempotency_key,
+                        position_id,
+                    ),
+                    now_millis,
+                )?;
+                let market = self
+                    .markets
+                    .get(market_id)
+                    .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
+                if !matches!(
+                    market.execution,
+                    MarketExecution::NativeClob | MarketExecution::NativeExactCondition { .. }
+                ) {
+                    return Err(CoreError::InvalidOrder(
+                        "position close is unavailable for bootstrap execution".into(),
+                    ));
+                }
+                let prior_book = books.get(market_id).cloned().unwrap_or_default();
+                let mut book = prior_book.clone();
+                let match_result = book.submit(order.clone(), now_millis)?;
+                CommandResult::PositionClosePreview {
+                    preview: position_close_preview(
+                        &self.identity_key,
+                        &private_user_id,
+                        *outcome,
+                        position_id,
+                        market,
+                        &prior_book,
+                        &order,
+                        &match_result,
+                        now_millis.saturating_add(POSITION_CLOSE_QUOTE_TTL_MILLIS),
+                    )?,
+                }
             }
             UserCommandAction::ClosePosition {
                 position_id,
                 market_id,
                 outcome,
+                session_tag: _,
                 quantity_micros,
                 minimum_price_micros,
+                quote,
             } => {
                 let order_id = position_close_order_id(
                     &command.command_id,
@@ -3289,9 +3405,27 @@ impl PrivateTradingCore {
                         "position close is unavailable for bootstrap execution".into(),
                     ));
                 }
+                let prior_book = books.get(market_id).cloned().unwrap_or_default();
                 let book = books.entry(market_id.clone()).or_default();
                 let match_result = book.submit(order.clone(), now_millis)?;
-                let preview = position_close_preview(position_id, market, &order, &match_result)?;
+                let preview = position_close_preview(
+                    &self.identity_key,
+                    &private_user_id,
+                    *outcome,
+                    position_id,
+                    market,
+                    &prior_book,
+                    &order,
+                    &match_result,
+                    quote.expires_at_millis,
+                )?;
+                // Quote validity is half-open: it is valid strictly before the
+                // enclave-trusted expiry instant and stale at equality.
+                if quote.expires_at_millis <= now_millis || preview != *quote {
+                    return Err(CoreError::InvalidOrder(
+                        "position close quote is stale".into(),
+                    ));
+                }
                 if match_result
                     .fills
                     .iter()
@@ -3714,6 +3848,11 @@ impl PrivateTradingCore {
             }
         };
 
+        system_keys.insert(processed_command_marker(
+            &command.idempotency_key,
+            full_user_command_commitment(&command)?,
+        ));
+
         let mut processed_hash_map = processed_hashes(&self.processed);
         processed_hash_map.insert(command.idempotency_key.clone(), expected_hash);
         let next_sequence = checked_sequence(self.sequence)?;
@@ -3736,7 +3875,12 @@ impl PrivateTradingCore {
             command: command.clone(),
             result: result.clone(),
         };
-        let record = self.journal.append(next_root, &journal_value)?;
+        // Append against a command-local journal clone. Later audit/task
+        // artifact construction remains fallible; assigning this clone only at
+        // the final commit point prevents a failed command from advancing the
+        // journal/time fence without its financial state.
+        let mut journal = self.journal.clone();
+        let record = journal.append(next_root, &journal_value)?;
         let receipt = self.receipt_signer.sign(
             command.command_id,
             command.idempotency_key.clone(),
@@ -3820,6 +3964,7 @@ impl PrivateTradingCore {
         self.bootstrap_executions = bootstrap_executions;
         self.private_rewards = private_rewards;
         self.system_keys = system_keys;
+        self.journal = journal;
         self.sequence = next_sequence;
         self.processed.insert(
             command.idempotency_key,
@@ -3854,49 +3999,6 @@ impl PrivateTradingCore {
                     now_millis,
                 ),
             },
-            UserCommandAction::PreviewPositionClose {
-                position_id,
-                market_id,
-                outcome,
-                quantity_micros,
-                minimum_price_micros,
-            } => {
-                let order = position_close_order(
-                    &self.identity_key,
-                    &self.ledger,
-                    &self.markets,
-                    &self.resolutions,
-                    &private_user_id,
-                    position_id,
-                    market_id,
-                    *outcome,
-                    *quantity_micros,
-                    *minimum_price_micros,
-                    position_close_order_id(
-                        &command.command_id,
-                        &command.idempotency_key,
-                        position_id,
-                    ),
-                    now_millis,
-                )?;
-                let market = self
-                    .markets
-                    .get(market_id)
-                    .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
-                if !matches!(
-                    market.execution,
-                    MarketExecution::NativeClob | MarketExecution::NativeExactCondition { .. }
-                ) {
-                    return Err(CoreError::InvalidOrder(
-                        "position close is unavailable for bootstrap execution".into(),
-                    ));
-                }
-                let mut book = self.books.get(market_id).cloned().unwrap_or_default();
-                let match_result = book.submit(order.clone(), now_millis)?;
-                CommandResult::PositionClosePreview {
-                    preview: position_close_preview(position_id, market, &order, &match_result)?,
-                }
-            }
             UserCommandAction::Rewards => CommandResult::Rewards {
                 entitlements: self.private_rewards.entitlements(&private_user_id),
             },
@@ -6208,6 +6310,67 @@ fn validate_private_transfer(
     Ok(())
 }
 
+const TRUSTED_TIME_HIGH_WATER_PREFIX: &str = "trusted-time-high-water:";
+
+/// Advances the enclave-trusted clock fence in command-local state.
+///
+/// `system_keys` is already encrypted in snapshots, committed by the state root,
+/// and assigned to the live core only after the complete user command succeeds.
+/// Keeping the single high-water marker here therefore makes a failed command
+/// non-consuming while detecting rollback/regression after a restored snapshot.
+fn advance_trusted_time_high_water(
+    system_keys: &mut BTreeSet<String>,
+    now_millis: i64,
+) -> CoreResult<()> {
+    if now_millis < 0 {
+        return Err(CoreError::InvalidOrder(
+            "trusted time is unavailable".into(),
+        ));
+    }
+    let mut matching = system_keys
+        .range(TRUSTED_TIME_HIGH_WATER_PREFIX.to_owned()..)
+        .take_while(|key| key.starts_with(TRUSTED_TIME_HIGH_WATER_PREFIX));
+    let existing = matching.next().cloned();
+    if matching.next().is_some() {
+        return Err(CoreError::RollbackDetected);
+    }
+    if let Some(marker) = existing.as_ref() {
+        let encoded = marker
+            .strip_prefix(TRUSTED_TIME_HIGH_WATER_PREFIX)
+            .ok_or(CoreError::RollbackDetected)?;
+        let high_water = encoded
+            .parse::<i64>()
+            .map_err(|_| CoreError::RollbackDetected)?;
+        if now_millis < high_water {
+            return Err(CoreError::RollbackDetected);
+        }
+        system_keys.remove(marker);
+    }
+    system_keys.insert(format!("{TRUSTED_TIME_HIGH_WATER_PREFIX}{now_millis:020}"));
+    Ok(())
+}
+
+fn full_user_command_commitment(command: &UserCommand) -> CoreResult<[u8; 32]> {
+    let encoded = serde_json::to_vec(command).map_err(|_| CoreError::RequestHashMismatch)?;
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.full-user-command.v1\0");
+    hash.update((encoded.len() as u64).to_be_bytes());
+    hash.update(encoded);
+    Ok(hash.finalize().into())
+}
+
+fn processed_command_marker(idempotency_key: &str, commitment: [u8; 32]) -> String {
+    let mut key_hash = Sha256::new();
+    key_hash.update(b"layrs.processed-command-key.v1\0");
+    key_hash.update((idempotency_key.len() as u32).to_be_bytes());
+    key_hash.update(idempotency_key.as_bytes());
+    format!(
+        "processed-command-commitment:{}:{}",
+        hex::encode(key_hash.finalize()),
+        hex::encode(commitment),
+    )
+}
+
 fn derive_private_user_id(identity_key: &[u8; 32], commitment: &[u8; 32]) -> String {
     let mut hash = Sha256::new();
     hash.update(b"layrs.private-user-id.v1\0");
@@ -6302,10 +6465,15 @@ fn position_close_order(
 }
 
 fn position_close_preview(
+    identity_key: &[u8; 32],
+    owner: &str,
+    outcome: Outcome,
     position_id: &str,
     market: &MarketConfig,
+    prior_book: &PriceTimeBook,
     order: &BookOrder,
     result: &MatchResult,
+    expires_at_millis: i64,
 ) -> CoreResult<PositionClosePreview> {
     let accepted = result
         .accepted_order
@@ -6350,7 +6518,45 @@ fn position_close_preview(
             "position close violated price protection".into(),
         ));
     }
-    Ok(PositionClosePreview {
+    // Commit only to the exact protected liquidity slice consumed by this FOK
+    // close. Hashing the entire private book lets an unrelated dust order or
+    // cancellation invalidate every outstanding quote, creating a cheap DoS.
+    // Each contributing maker's immutable priority plus current executable
+    // state is included, so altering/cancelling any consumed liquidity, or
+    // introducing a better executable level, still changes the commitment.
+    let mut book_hash = Sha256::new();
+    book_hash.update(b"layrs.position-close-executable-slice.v2\0");
+    book_hash.update((market.market_id.len() as u32).to_be_bytes());
+    book_hash.update(market.market_id.as_bytes());
+    book_hash.update((result.fills.len() as u32).to_be_bytes());
+    let mut protected_sequence = 0u64;
+    for fill in &result.fills {
+        let maker = prior_book
+            .order(fill.maker_order_id)
+            .ok_or_else(|| CoreError::InvalidOrder("position close quote is unavailable".into()))?;
+        protected_sequence = protected_sequence.max(maker.sequence);
+        book_hash.update(fill.maker_order_id.as_bytes());
+        book_hash.update([match fill.match_type {
+            MatchType::Normal => 0,
+            MatchType::Mint => 1,
+            MatchType::Merge => 2,
+        }]);
+        book_hash.update([match maker.outcome {
+            Outcome::Up => 0,
+            Outcome::Down => 1,
+        }]);
+        book_hash.update([match maker.action {
+            OrderAction::Buy => 0,
+            OrderAction::Sell => 1,
+        }]);
+        book_hash.update(maker.price_micros.to_be_bytes());
+        book_hash.update(maker.remaining_micros.to_be_bytes());
+        book_hash.update(maker.sequence.to_be_bytes());
+        book_hash.update(maker.expires_at_millis.unwrap_or(i64::MAX).to_be_bytes());
+        book_hash.update(fill.quantity_micros.to_be_bytes());
+    }
+    let book_commitment_sha256: [u8; 32] = book_hash.finalize().into();
+    let mut preview = PositionClosePreview {
         position_id: position_id.to_owned(),
         quantity_micros: executed_quantity,
         minimum_price_micros: order.price_micros,
@@ -6360,7 +6566,48 @@ fn position_close_preview(
         net_payout_atomic: gross_payout_atomic
             .checked_sub(fee_atomic)
             .ok_or(CoreError::UnbalancedTransaction)?,
-    })
+        book_commitment_sha256,
+        // This is the highest maker-priority sequence in the protected slice,
+        // not the mutable whole-book sequence.
+        book_sequence: protected_sequence,
+        expires_at_millis,
+        quote_commitment_sha256: [0u8; 32],
+    };
+    preview.quote_commitment_sha256 =
+        position_close_quote_commitment(identity_key, owner, &market.market_id, outcome, &preview);
+    Ok(preview)
+}
+
+fn position_close_quote_commitment(
+    identity_key: &[u8; 32],
+    owner: &str,
+    market_id: &str,
+    outcome: Outcome,
+    preview: &PositionClosePreview,
+) -> [u8; 32] {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(identity_key)
+        .expect("identity key has fixed HMAC length");
+    mac.update(b"layrs.position-close-quote.v1\0");
+    mac.update(&(owner.len() as u32).to_be_bytes());
+    mac.update(owner.as_bytes());
+    mac.update(&(market_id.len() as u32).to_be_bytes());
+    mac.update(market_id.as_bytes());
+    mac.update(match outcome {
+        Outcome::Up => b"UP",
+        Outcome::Down => b"DOWN",
+    });
+    mac.update(&(preview.position_id.len() as u32).to_be_bytes());
+    mac.update(preview.position_id.as_bytes());
+    mac.update(&preview.quantity_micros.to_be_bytes());
+    mac.update(&preview.minimum_price_micros.to_be_bytes());
+    mac.update(&preview.average_price_micros.to_be_bytes());
+    mac.update(&preview.gross_payout_atomic.to_be_bytes());
+    mac.update(&preview.fee_atomic.to_be_bytes());
+    mac.update(&preview.net_payout_atomic.to_be_bytes());
+    mac.update(&preview.book_commitment_sha256);
+    mac.update(&preview.book_sequence.to_be_bytes());
+    mac.update(&preview.expires_at_millis.to_be_bytes());
+    mac.finalize().into_bytes().into()
 }
 
 fn portfolio_snapshot(
@@ -6590,9 +6837,29 @@ fn state_root_with_serialized_books(
         hash.update(&(encoded.len() as u64).to_be_bytes());
         hash.update(&encoded);
     }
+    // Preserve byte-for-byte legacy roots until the first enclave-trusted user
+    // command installs the clock fence. Thereafter this explicit versioned
+    // domain makes the accepted high-water part of every state root while the
+    // encrypted snapshot continues to persist the marker in `system_keys`.
+    if let Some(high_water) = trusted_time_high_water(system_keys) {
+        hash.update(b"layrs.trusted-time-state.v1\0");
+        hash.update(&high_water.to_be_bytes());
+    }
     let mut output = [0u8; 32];
     hash.finalize(&mut output);
     output
+}
+
+fn trusted_time_high_water(system_keys: &BTreeSet<String>) -> Option<i64> {
+    let mut matching = system_keys
+        .range(TRUSTED_TIME_HIGH_WATER_PREFIX.to_owned()..)
+        .take_while(|key| key.starts_with(TRUSTED_TIME_HIGH_WATER_PREFIX));
+    let value = matching
+        .next()?
+        .strip_prefix(TRUSTED_TIME_HIGH_WATER_PREFIX)?
+        .parse::<i64>()
+        .ok()?;
+    matching.next().is_none().then_some(value)
 }
 
 fn withdrawal_reservation_marker(

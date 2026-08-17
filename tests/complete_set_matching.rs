@@ -800,7 +800,7 @@ fn two_internal_market_maker_identities_can_stress_native_usdc_without_privilege
                     None,
                 ),
             },
-            1_000 + index as i64,
+            1_000 + (index as i64 * 2),
         );
         let crossed = execute(
             &mut core,
@@ -821,7 +821,7 @@ fn two_internal_market_maker_identities_can_stress_native_usdc_without_privilege
                     None,
                 ),
             },
-            1_050 + index as i64,
+            1_001 + (index as i64 * 2),
         );
         assert_eq!(order_result(&crossed.result).fills.len(), 1);
         assert_eq!(

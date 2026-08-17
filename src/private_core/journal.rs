@@ -84,6 +84,7 @@ mod wire_tests {
     }
 }
 
+#[derive(Clone)]
 pub struct EncryptedJournal {
     cipher: Aes256Gcm,
     records: Vec<EncryptedJournalRecord>,

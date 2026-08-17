@@ -9,7 +9,7 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use aws_nitro_enclaves_nsm_api::{
-    api::{Request as NsmRequest, Response as NsmResponse},
+    api::{AttestationDoc, Digest as NsmDigest, Request as NsmRequest, Response as NsmResponse},
     driver::{nsm_exit, nsm_init, nsm_process_request},
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -65,6 +65,8 @@ const PORT: u32 = 5_003;
 const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 const MAX_TRANSPORT_REPLAY_ENTRIES: usize = 262_144;
 const MAX_OPERATOR_REPLAY_ENTRIES: usize = 100_000;
+const TRUSTED_TIME_ATTESTATION_DOMAIN: &[u8] = b"layrs.nsm-trusted-time.v1\0";
+const MIN_PRIVATE_RESPONSE_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
@@ -92,6 +94,8 @@ struct EncryptedRequestContext {
     expected_order_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_position_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_command_commitment: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -741,7 +745,49 @@ async fn handle_encrypted(
             code: "PRIVATE_COMMAND_CONTEXT_MISMATCH",
         };
     }
-    let response = dispatch(&mut state, request).await;
+    // Exact committed position-close retries are recovered before consulting the
+    // clock. This preserves idempotent lost-response recovery during a temporary
+    // NSM failure. A different command sharing the key fails inside ciphertext.
+    let recovered = match &request {
+        PlainRequest::User { command, .. } => state
+            .core
+            .as_ref()
+            .map(|core| core.recover_exact_position_close(command))
+            .transpose(),
+        _ => Ok(None),
+    };
+    let response = match recovered {
+        Ok(Some(Some(mut response))) => {
+            // The original encrypted journal record was already committed. Do
+            // not emit it as a new persistence sidecar on a response recovery.
+            response.encrypted_record = None;
+            PlainResponse::User {
+                response: Box::new(response),
+            }
+        }
+        Ok(_) => {
+            // User-provided wall time is never an authorization input. A fresh
+            // timestamp is obtained directly from the Nitro Secure Module for
+            // every new encrypted user command. The parent cannot delay, rewrite,
+            // replay, or forge this in-enclave NSM exchange.
+            let verified_now_millis = if matches!(request, PlainRequest::User { .. }) {
+                match trusted_nsm_now_millis(state.nsm_fd, &state.enclave_measurement_sha384) {
+                    Ok(value) => Some(value),
+                    Err(()) => {
+                        return WireResponse::Error {
+                            code: "TRUSTED_TIME_UNAVAILABLE",
+                        }
+                    }
+                }
+            } else {
+                None
+            };
+            dispatch(&mut state, request, verified_now_millis).await
+        }
+        Err(error) => PlainResponse::Error {
+            code: error.to_string(),
+        },
+    };
     // These sidecars contain only AEAD ciphertext and its integrity/chain metadata. They let the
     // untrusted parent persist state transitions without learning the encrypted response body.
     let journal_artifacts = match &response {
@@ -793,7 +839,9 @@ async fn handle_encrypted(
         PlainResponse::User { response } => response.task_qualifications.clone(),
         _ => Vec::new(),
     };
-    let encoded = match serde_json::to_vec(&response) {
+    let encoded = match serde_json::to_vec(&response)
+        .and_then(|value| pad_private_response(value).map_err(serde_json::Error::io))
+    {
         Ok(value) => value,
         Err(_) => {
             return WireResponse::Error {
@@ -825,6 +873,29 @@ async fn handle_encrypted(
     }
 }
 
+/// Pads encrypted responses to power-of-two size classes.
+///
+/// JSON permits trailing whitespace, so clients decode the same payload while
+/// an untrusted parent/network observer cannot distinguish private core error
+/// variants by their exact ciphertext length. The minimum class covers every
+/// privacy-safe error response; larger successful responses reveal only a
+/// coarse bounded class rather than individual order/fill/economic fields.
+fn pad_private_response(mut encoded: Vec<u8>) -> io::Result<Vec<u8>> {
+    let padded_len = encoded
+        .len()
+        .max(MIN_PRIVATE_RESPONSE_BYTES)
+        .checked_next_power_of_two()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "private response too large"))?;
+    if padded_len > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "private response too large",
+        ));
+    }
+    encoded.resize(padded_len, b' ');
+    Ok(encoded)
+}
+
 fn validate_request_context(
     request: &PlainRequest,
     context: Option<&EncryptedRequestContext>,
@@ -835,53 +906,178 @@ fn validate_request_context(
     let PlainRequest::User { command, .. } = request else {
         return Err(());
     };
-    let (actual_action, actual_order_id, actual_position_id) = match &command.action {
-        UserCommandAction::SubmitOrder { .. } => (ExpectedEncryptedAction::Submit, None, None),
-        UserCommandAction::ReplaceOrder { order_id, .. } => {
-            (ExpectedEncryptedAction::Replace, Some(*order_id), None)
-        }
-        UserCommandAction::CancelOrder { order_id, .. } => {
-            (ExpectedEncryptedAction::Cancel, Some(*order_id), None)
-        }
-        UserCommandAction::CancelAllOrders { .. } => {
-            (ExpectedEncryptedAction::CancelAll, None, None)
-        }
-        UserCommandAction::PreviewPositionClose { position_id, .. } => (
-            ExpectedEncryptedAction::PreviewPositionClose,
-            None,
-            Some(position_id.as_str()),
-        ),
-        UserCommandAction::ClosePosition { position_id, .. } => (
-            ExpectedEncryptedAction::ClosePosition,
-            None,
-            Some(position_id.as_str()),
-        ),
-        _ => return Err(()),
-    };
-    validate_user_command_context(
+    let (actual_action, actual_order_id, actual_position_id, actual_session_tag) =
+        match &command.action {
+            UserCommandAction::SubmitOrder { .. } => {
+                (ExpectedEncryptedAction::Submit, None, None, None)
+            }
+            UserCommandAction::ReplaceOrder { order_id, .. } => (
+                ExpectedEncryptedAction::Replace,
+                Some(*order_id),
+                None,
+                None,
+            ),
+            UserCommandAction::CancelOrder { order_id, .. } => {
+                (ExpectedEncryptedAction::Cancel, Some(*order_id), None, None)
+            }
+            UserCommandAction::CancelAllOrders { .. } => {
+                (ExpectedEncryptedAction::CancelAll, None, None, None)
+            }
+            UserCommandAction::PreviewPositionClose {
+                position_id,
+                session_tag,
+                ..
+            } => (
+                ExpectedEncryptedAction::PreviewPositionClose,
+                None,
+                Some(position_id.as_str()),
+                Some(session_tag.as_str()),
+            ),
+            UserCommandAction::ClosePosition {
+                position_id,
+                session_tag,
+                ..
+            } => (
+                ExpectedEncryptedAction::ClosePosition,
+                None,
+                Some(position_id.as_str()),
+                Some(session_tag.as_str()),
+            ),
+            _ => return Err(()),
+        };
+    validate_bound_user_command_context(
         &command.idempotency_key,
         &command.session.request.session_id,
         actual_action,
         actual_order_id,
         actual_position_id,
+        actual_session_tag,
+        command.session.request.request_hash,
         context,
     )
 }
 
-fn validate_user_command_context(
+fn trusted_nsm_now_millis(nsm_fd: i32, expected_pcr0: &[u8; 48]) -> Result<i64, ()> {
+    let mut nonce = [0u8; 32];
+    OsRng.fill_bytes(&mut nonce);
+    let response = nsm_process_request(
+        nsm_fd,
+        NsmRequest::Attestation {
+            user_data: Some(TRUSTED_TIME_ATTESTATION_DOMAIN.to_vec().into()),
+            nonce: Some(nonce.to_vec().into()),
+            public_key: None,
+        },
+    );
+    let NsmResponse::Attestation { document } = response else {
+        return Err(());
+    };
+    parse_nsm_attestation_timestamp(
+        &document,
+        &nonce,
+        TRUSTED_TIME_ATTESTATION_DOMAIN,
+        expected_pcr0,
+    )
+}
+
+/// Parses the timestamp from a document returned directly by the NSM device.
+///
+/// The caller must only pass bytes obtained synchronously from
+/// `nsm_process_request`; accepting an arbitrary parent-provided document here
+/// would require full certificate-chain and COSE signature verification. The
+/// fresh nonce and purpose-specific user data additionally bind the document to
+/// this exact clock read and prevent accidental reuse of another attestation.
+fn parse_nsm_attestation_timestamp(
+    document: &[u8],
+    expected_nonce: &[u8],
+    expected_user_data: &[u8],
+    expected_pcr0: &[u8; 48],
+) -> Result<i64, ()> {
+    use serde_cbor::Value;
+
+    let value: Value = serde_cbor::from_slice(document).map_err(|_| ())?;
+    let sign1 = match value {
+        Value::Tag(18, inner) => *inner,
+        _ => return Err(()),
+    };
+    let Value::Array(fields) = sign1 else {
+        return Err(());
+    };
+    if fields.len() != 4 {
+        return Err(());
+    }
+    let Value::Bytes(protected) = &fields[0] else {
+        return Err(());
+    };
+    if !matches!(&fields[1], Value::Map(_)) {
+        return Err(());
+    }
+    let Value::Map(protected) = serde_cbor::from_slice::<Value>(protected).map_err(|_| ())? else {
+        return Err(());
+    };
+    if protected.get(&Value::Integer(1)) != Some(&Value::Integer(-35)) {
+        return Err(());
+    }
+    let Value::Bytes(signature) = &fields[3] else {
+        return Err(());
+    };
+    if signature.is_empty() {
+        return Err(());
+    }
+    let Value::Bytes(payload) = &fields[2] else {
+        return Err(());
+    };
+    let attestation = AttestationDoc::from_binary(payload).map_err(|_| ())?;
+    if attestation.module_id.is_empty()
+        || attestation.digest != NsmDigest::SHA384
+        || attestation.nonce.as_ref().map(|value| value.as_ref()) != Some(expected_nonce)
+        || attestation.user_data.as_ref().map(|value| value.as_ref()) != Some(expected_user_data)
+        || attestation.pcrs.get(&0).map(|value| value.as_ref()) != Some(expected_pcr0.as_slice())
+    {
+        return Err(());
+    }
+    i64::try_from(attestation.timestamp).map_err(|_| ())
+}
+
+fn validate_bound_user_command_context(
     idempotency_key: &str,
     session_id: &str,
     actual_action: ExpectedEncryptedAction,
     actual_order_id: Option<Uuid>,
     actual_position_id: Option<&str>,
+    actual_session_tag: Option<&str>,
+    actual_command_commitment: [u8; 32],
     context: &EncryptedRequestContext,
 ) -> Result<(), ()> {
+    let computed_session_tag = api_session_request_tag(idempotency_key, session_id);
     if idempotency_key != context.idempotency_key
         || !context
             .expected_session_tags
             .iter()
-            .any(|tag| tag == &api_session_request_tag(idempotency_key, session_id))
+            .any(|tag| tag == &computed_session_tag)
     {
+        return Err(());
+    }
+    let position_action = matches!(
+        actual_action,
+        ExpectedEncryptedAction::PreviewPositionClose | ExpectedEncryptedAction::ClosePosition
+    );
+    if position_action {
+        if actual_session_tag != Some(computed_session_tag.as_str()) {
+            return Err(());
+        }
+        let Some(expected) = context.expected_command_commitment.as_deref() else {
+            return Err(());
+        };
+        let Some(encoded) = expected.strip_prefix("0x") else {
+            return Err(());
+        };
+        let mut decoded = [0u8; 32];
+        if hex::decode_to_slice(encoded, &mut decoded).is_err()
+            || decoded != actual_command_commitment
+        {
+            return Err(());
+        }
+    } else if context.expected_command_commitment.is_some() || actual_session_tag.is_some() {
         return Err(());
     }
     if context.expected_action != actual_action {
@@ -923,6 +1119,43 @@ fn validate_user_command_context(
     }
 }
 
+#[cfg(test)]
+fn validate_user_command_context(
+    idempotency_key: &str,
+    session_id: &str,
+    actual_action: ExpectedEncryptedAction,
+    actual_order_id: Option<Uuid>,
+    actual_position_id: Option<&str>,
+    context: &EncryptedRequestContext,
+) -> Result<(), ()> {
+    let session_tag = api_session_request_tag(idempotency_key, session_id);
+    let actual_commitment = context
+        .expected_command_commitment
+        .as_deref()
+        .and_then(|value| value.strip_prefix("0x"))
+        .and_then(|value| {
+            let mut decoded = [0u8; 32];
+            hex::decode_to_slice(value, &mut decoded)
+                .ok()
+                .map(|_| decoded)
+        })
+        .unwrap_or([0u8; 32]);
+    validate_bound_user_command_context(
+        idempotency_key,
+        session_id,
+        actual_action,
+        actual_order_id,
+        actual_position_id,
+        matches!(
+            actual_action,
+            ExpectedEncryptedAction::PreviewPositionClose | ExpectedEncryptedAction::ClosePosition
+        )
+        .then_some(session_tag.as_str()),
+        actual_commitment,
+        context,
+    )
+}
+
 fn api_session_request_tag(idempotency_key: &str, session_id: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(b"layrs.api-session-context.v1\0");
@@ -939,13 +1172,22 @@ fn serialize_depth(levels: Vec<(u64, u128)>) -> Vec<(u64, String)> {
         .collect()
 }
 
-async fn dispatch(state: &mut EnclaveState, request: PlainRequest) -> PlainResponse {
+async fn dispatch(
+    state: &mut EnclaveState,
+    request: PlainRequest,
+    verified_now_millis: Option<i64>,
+) -> PlainResponse {
     let result: Result<PlainResponse, String> = match request {
         PlainRequest::Operator { envelope } => dispatch_operator(state, envelope).await,
         PlainRequest::User {
             command,
-            now_millis,
+            now_millis: untrusted_client_now_millis,
         } => (|| -> Result<PlainResponse, String> {
+            // Read and deliberately discard the client-carried field so the
+            // wire remains backward compatible without ever authorizing time.
+            let _ = untrusted_client_now_millis;
+            let now_millis =
+                verified_now_millis.ok_or_else(|| "TRUSTED_TIME_UNAVAILABLE".to_string())?;
             let core = state
                 .core
                 .as_ref()
@@ -2563,6 +2805,8 @@ async fn write_frame(stream: &mut VsockStream, value: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use clob_service::private_core::FeeProfileId;
+    use serde_cbor::Value;
+    use std::collections::BTreeMap;
 
     #[test]
     fn replay_cache_rejects_duplicate_keys() {
@@ -2598,6 +2842,219 @@ mod tests {
         assert!(!cache.remember([1u8, 1]));
     }
 
+    fn synthetic_nsm_document(
+        nonce: &[u8],
+        user_data: &[u8],
+        pcr0: [u8; 48],
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let mut pcrs = BTreeMap::new();
+        pcrs.insert(0, pcr0.to_vec());
+        wrap_synthetic_attestation(
+            AttestationDoc::new(
+                "synthetic-nsm".into(),
+                NsmDigest::SHA384,
+                timestamp,
+                pcrs,
+                vec![7u8; 32],
+                vec![vec![8u8; 32]],
+                Some(user_data.to_vec()),
+                Some(nonce.to_vec()),
+                None,
+            ),
+            vec![9u8; 96],
+        )
+    }
+
+    fn wrap_synthetic_attestation(attestation: AttestationDoc, signature: Vec<u8>) -> Vec<u8> {
+        let payload = attestation.to_binary();
+        let protected = serde_cbor::to_vec(&Value::Map(BTreeMap::from([(
+            Value::Integer(1),
+            Value::Integer(-35),
+        )])))
+        .unwrap();
+        serde_cbor::to_vec(&Value::Tag(
+            18,
+            Box::new(Value::Array(vec![
+                Value::Bytes(protected),
+                Value::Map(BTreeMap::new()),
+                Value::Bytes(payload),
+                Value::Bytes(signature),
+            ])),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn nsm_time_parser_requires_exact_nonce_domain_pcr_and_es384() {
+        let nonce = [3u8; 32];
+        let pcr0 = [4u8; 48];
+        let document = synthetic_nsm_document(
+            &nonce,
+            TRUSTED_TIME_ATTESTATION_DOMAIN,
+            pcr0,
+            1_787_000_000_123,
+        );
+        assert_eq!(
+            parse_nsm_attestation_timestamp(
+                &document,
+                &nonce,
+                TRUSTED_TIME_ATTESTATION_DOMAIN,
+                &pcr0,
+            ),
+            Ok(1_787_000_000_123),
+        );
+        assert!(parse_nsm_attestation_timestamp(
+            &document,
+            &[5u8; 32],
+            TRUSTED_TIME_ATTESTATION_DOMAIN,
+            &pcr0,
+        )
+        .is_err());
+        assert!(
+            parse_nsm_attestation_timestamp(&document, &nonce, b"wrong-purpose", &pcr0,).is_err()
+        );
+        assert!(parse_nsm_attestation_timestamp(
+            &document,
+            &nonce,
+            TRUSTED_TIME_ATTESTATION_DOMAIN,
+            &[6u8; 48],
+        )
+        .is_err());
+
+        let Value::Tag(18, inner) = serde_cbor::from_slice::<Value>(&document).unwrap() else {
+            panic!("synthetic document must be tagged");
+        };
+        let Value::Array(mut fields) = *inner else {
+            panic!("synthetic document must contain Sign1");
+        };
+        fields[0] = Value::Bytes(
+            serde_cbor::to_vec(&Value::Map(BTreeMap::from([(
+                Value::Integer(1),
+                Value::Integer(-7),
+            )])))
+            .unwrap(),
+        );
+        let wrong_alg =
+            serde_cbor::to_vec(&Value::Tag(18, Box::new(Value::Array(fields)))).unwrap();
+        assert!(parse_nsm_attestation_timestamp(
+            &wrong_alg,
+            &nonce,
+            TRUSTED_TIME_ATTESTATION_DOMAIN,
+            &pcr0,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn nsm_time_parser_rejects_untagged_or_malformed_documents() {
+        let nonce = [3u8; 32];
+        let pcr0 = [4u8; 48];
+        let mut invalid_unprotected = serde_cbor::from_slice::<Value>(&synthetic_nsm_document(
+            &nonce,
+            TRUSTED_TIME_ATTESTATION_DOMAIN,
+            pcr0,
+            1_000,
+        ))
+        .unwrap();
+        let Value::Tag(18, inner) = &mut invalid_unprotected else {
+            panic!("synthetic document must be tagged");
+        };
+        let Value::Array(fields) = inner.as_mut() else {
+            panic!("synthetic document must contain Sign1");
+        };
+        fields[1] = Value::Null;
+        for document in [
+            serde_cbor::to_vec(&Value::Array(Vec::new())).unwrap(),
+            serde_cbor::to_vec(&Value::Tag(18, Box::new(Value::Array(Vec::new())))).unwrap(),
+            serde_cbor::to_vec(&invalid_unprotected).unwrap(),
+            vec![0xff],
+        ] {
+            assert!(parse_nsm_attestation_timestamp(
+                &document,
+                &nonce,
+                TRUSTED_TIME_ATTESTATION_DOMAIN,
+                &pcr0,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn nsm_time_parser_rejects_invalid_attestation_semantics_and_overflow() {
+        let nonce = [3u8; 32];
+        let pcr0 = [4u8; 48];
+        let mut pcrs = BTreeMap::new();
+        pcrs.insert(0, pcr0.to_vec());
+        let attestation = |module_id: &str, digest, timestamp, pcrs: BTreeMap<usize, Vec<u8>>| {
+            AttestationDoc::new(
+                module_id.into(),
+                digest,
+                timestamp,
+                pcrs,
+                vec![7u8; 32],
+                vec![vec![8u8; 32]],
+                Some(TRUSTED_TIME_ATTESTATION_DOMAIN.to_vec()),
+                Some(nonce.to_vec()),
+                None,
+            )
+        };
+        let invalid = [
+            wrap_synthetic_attestation(
+                attestation("", NsmDigest::SHA384, 1_000, pcrs.clone()),
+                vec![9u8; 96],
+            ),
+            wrap_synthetic_attestation(
+                attestation("synthetic-nsm", NsmDigest::SHA256, 1_000, pcrs.clone()),
+                vec![9u8; 96],
+            ),
+            wrap_synthetic_attestation(
+                attestation("synthetic-nsm", NsmDigest::SHA384, 1_000, BTreeMap::new()),
+                vec![9u8; 96],
+            ),
+            wrap_synthetic_attestation(
+                attestation("synthetic-nsm", NsmDigest::SHA384, u64::MAX, pcrs.clone()),
+                vec![9u8; 96],
+            ),
+            wrap_synthetic_attestation(
+                attestation("synthetic-nsm", NsmDigest::SHA384, 1_000, pcrs),
+                Vec::new(),
+            ),
+        ];
+        for document in invalid {
+            assert!(parse_nsm_attestation_timestamp(
+                &document,
+                &nonce,
+                TRUSTED_TIME_ATTESTATION_DOMAIN,
+                &pcr0,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn private_error_responses_have_one_length_class_and_remain_valid_json() {
+        let codes = [
+            "position owner mismatch",
+            "insufficient protected liquidity for position close",
+            "position close quote is stale",
+        ];
+        let encoded = codes.map(|code| {
+            pad_private_response(
+                serde_json::to_vec(&PlainResponse::Error { code: code.into() }).unwrap(),
+            )
+            .unwrap()
+        });
+        assert!(encoded
+            .iter()
+            .all(|value| value.len() == MIN_PRIVATE_RESPONSE_BYTES));
+        for (value, expected) in encoded.iter().zip(codes) {
+            let parsed: serde_json::Value = serde_json::from_slice(value).unwrap();
+            assert_eq!(parsed["type"], "ERROR");
+            assert_eq!(parsed["code"], expected);
+        }
+    }
+
     #[test]
     fn api_order_context_binds_inner_idempotency_and_action() {
         let expected_tag = api_session_request_tag("order:create:1234", "session:user-a");
@@ -2607,6 +3064,7 @@ mod tests {
             expected_session_tags: vec![expected_tag],
             expected_order_id: None,
             expected_position_id: None,
+            expected_command_commitment: None,
         };
         assert!(validate_user_command_context(
             "order:create:1234",
@@ -2655,6 +3113,7 @@ mod tests {
             )],
             expected_order_id: Some(order_id),
             expected_position_id: None,
+            expected_command_commitment: None,
         };
         assert!(validate_user_command_context(
             "order:replace:1234",
@@ -2684,6 +3143,7 @@ mod tests {
             )],
             expected_order_id: Some(order_id),
             expected_position_id: None,
+            expected_command_commitment: None,
         };
         assert!(validate_user_command_context(
             "order:cancel:1234",
@@ -2713,6 +3173,7 @@ mod tests {
             )],
             expected_order_id: None,
             expected_position_id: None,
+            expected_command_commitment: None,
         };
         assert!(validate_user_command_context(
             "orders:cancel-all:1234",
@@ -2752,6 +3213,7 @@ mod tests {
             )],
             expected_order_id: None,
             expected_position_id: Some(position_id.clone()),
+            expected_command_commitment: Some(format!("0x{}", "11".repeat(32))),
         };
         assert!(validate_user_command_context(
             "position:close:1234",
@@ -2768,6 +3230,41 @@ mod tests {
             ExpectedEncryptedAction::ClosePosition,
             None,
             Some("pos_wrong"),
+            &close,
+        )
+        .is_err());
+
+        let exact_tag = api_session_request_tag("position:close:1234", "session:user-a");
+        assert!(validate_bound_user_command_context(
+            "position:close:1234",
+            "session:user-a",
+            ExpectedEncryptedAction::ClosePosition,
+            None,
+            Some(&position_id),
+            Some(&exact_tag),
+            [0x11; 32],
+            &close,
+        )
+        .is_ok());
+        assert!(validate_bound_user_command_context(
+            "position:close:1234",
+            "session:user-a",
+            ExpectedEncryptedAction::ClosePosition,
+            None,
+            Some(&position_id),
+            Some("wrong-session-tag"),
+            [0x11; 32],
+            &close,
+        )
+        .is_err());
+        assert!(validate_bound_user_command_context(
+            "position:close:1234",
+            "session:user-a",
+            ExpectedEncryptedAction::ClosePosition,
+            None,
+            Some(&position_id),
+            Some(&exact_tag),
+            [0x22; 32],
             &close,
         )
         .is_err());
