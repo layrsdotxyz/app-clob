@@ -1325,9 +1325,7 @@ impl PrivateTradingCore {
     ) -> CoreResult<CustodyReconciliationSnapshot> {
         if checkpoint_commitment == [0; 32]
             || chain_finality_commitments.len() != 2
-            || chain_finality_commitments
-                .iter()
-                .any(|value| *value == [0; 32])
+            || chain_finality_commitments.contains(&[0; 32])
             || chain_finality_commitments[0] == chain_finality_commitments[1]
         {
             return Err(CoreError::InvalidOrder(
