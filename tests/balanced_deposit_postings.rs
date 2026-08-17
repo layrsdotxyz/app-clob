@@ -76,6 +76,29 @@ fn duplicate_receipt_key_cannot_credit_pool_or_user_twice() {
 }
 
 #[test]
+fn same_finality_evidence_under_a_different_operator_key_cannot_credit_twice() {
+    let mut ledger = Ledger::default();
+    let user = AccountKey::new("usr_opaque_evidence", AccountBucket::UserAvailable, "USDC");
+    let pool = AccountKey::new("layrs", AccountBucket::PoolCash, "USDC");
+    let first = confirmed_deposit("deposit:operator-key-a", user.clone(), 6_000_000);
+    let second = ExternalFlowTransaction {
+        idempotency_key: "deposit:operator-key-b".into(),
+        ..first.clone()
+    };
+
+    ledger.apply_confirmed_deposit(first).unwrap();
+    let root_after_first = ledger.state_root();
+    assert_eq!(
+        ledger.apply_confirmed_deposit(second).unwrap_err(),
+        CoreError::DuplicateCommand
+    );
+    assert_eq!(ledger.balance(&pool), 6_000_000);
+    assert_eq!(ledger.balance(&user), 6_000_000);
+    assert_eq!(ledger.sequence(), 1);
+    assert_eq!(ledger.state_root(), root_after_first);
+}
+
+#[test]
 fn non_user_or_non_inflow_commands_fail_before_any_mutation() {
     let cases = [
         ExternalFlowTransaction {
@@ -162,6 +185,48 @@ fn credit_deposit_command_commits_both_balances_under_one_private_root() {
     assert_eq!(response.receipt.command_id, "confirmed-deposit");
     assert_eq!(response.receipt.prior_state_root, before);
     assert_eq!(response.receipt.state_root, core.state_root());
+}
+
+#[test]
+fn enclave_rejects_same_deposit_evidence_with_different_system_keys() {
+    let journal_key = [0x41; 32];
+    let commitment = [0x42; 32];
+    let owner = derived_private_user(journal_key, commitment);
+    let user = AccountKey::new(owner, AccountBucket::UserAvailable, "USDC");
+    let pool = AccountKey::new("layrs", AccountBucket::PoolCash, "USDC");
+    let mut core = PrivateTradingCore::new(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([0x43; 48]),
+    );
+    let evidence = [0x44; 32];
+
+    core.apply_user_external_flow(
+        "sys:deposit:operator-a".into(),
+        commitment,
+        "USDC".into(),
+        AccountBucket::UserAvailable,
+        6_000_000,
+        ExternalFlowDirection::Inflow,
+        evidence,
+        1_800_000_000_000,
+    )
+    .unwrap();
+    let root_after_first = core.state_root();
+    let second = core.apply_user_external_flow(
+        "sys:deposit:operator-b".into(),
+        commitment,
+        "USDC".into(),
+        AccountBucket::UserAvailable,
+        6_000_000,
+        ExternalFlowDirection::Inflow,
+        evidence,
+        1_800_000_000_001,
+    );
+
+    assert_eq!(second.unwrap_err(), CoreError::DuplicateCommand);
+    assert_eq!(core.balance(&pool), 6_000_000);
+    assert_eq!(core.balance(&user), 6_000_000);
+    assert_eq!(core.state_root(), root_after_first);
 }
 
 #[test]

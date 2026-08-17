@@ -22,8 +22,9 @@ as a token transfer between them.
 - The user account is derived from the identity commitment inside the enclave.
   Email, authentication subject, source wallet, route and provider are not
   ledger-account dimensions and are not emitted by the response.
-- The idempotency key is committed before either balance is published. A retry
-  cannot credit either leg twice.
+- The canonical finalized-pool evidence hash is committed into the enclave
+  ledger replay set before either balance is published. Reusing that evidence
+  under a different operator idempotency key cannot credit either leg twice.
 - Direct, routed and late deposits use the same enclave posting once the
   canonical pool receipt is final. Below-minimum and refunded routes never call
   this command and therefore create neither leg.

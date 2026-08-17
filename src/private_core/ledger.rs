@@ -286,10 +286,15 @@ impl Ledger {
                 "confirmed deposit requires an opaque user-available liability".into(),
             ));
         }
-        if self
-            .applied_idempotency_keys
-            .contains(&transaction.idempotency_key)
-        {
+        // The operator command key is useful for transport retries, but it is
+        // not the financial replay boundary: the same finalized pool receipt
+        // could otherwise be submitted under a different command key. Commit
+        // the canonical finality-evidence hash into the ledger replay set.
+        let evidence_replay_key = format!(
+            "confirmed-deposit-evidence:{}",
+            hex::encode(transaction.evidence_hash)
+        );
+        if self.applied_idempotency_keys.contains(&evidence_replay_key) {
             return Err(CoreError::DuplicateCommand);
         }
 
@@ -305,11 +310,11 @@ impl Ledger {
             .checked_add(1)
             .ok_or(CoreError::UnbalancedTransaction)?;
         self.applied_idempotency_keys
-            .insert(transaction.idempotency_key.clone());
+            .insert(evidence_replay_key.clone());
         let state_root = self.state_root();
         Ok(AppliedLedgerTransaction {
             sequence: self.sequence,
-            idempotency_key: transaction.idempotency_key,
+            idempotency_key: evidence_replay_key,
             business_reference: format!(
                 "confirmed-deposit:{}",
                 hex::encode(transaction.evidence_hash)
