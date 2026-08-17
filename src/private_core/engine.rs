@@ -789,6 +789,10 @@ enum JournaledSystemCommand {
         idempotency_key: String,
         flow: ExternalFlowTransaction,
     },
+    ConfirmedDeposit {
+        idempotency_key: String,
+        flow: ExternalFlowTransaction,
+    },
     AccrueReward {
         idempotency_key: String,
         identity_commitment: [u8; 32],
@@ -1521,6 +1525,34 @@ impl PrivateTradingCore {
         evidence_hash: [u8; 32],
         now_millis: i64,
     ) -> CoreResult<SystemResponse> {
+        if matches!(
+            account.bucket,
+            AccountBucket::UserAvailable | AccountBucket::UserWithdrawalHold
+        ) {
+            return Err(CoreError::InvalidOrder(
+                "user custody flows require the dedicated deposit or withdrawal command".into(),
+            ));
+        }
+        self.apply_external_flow_internal(
+            idempotency_key,
+            account,
+            amount,
+            direction,
+            evidence_hash,
+            now_millis,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_external_flow_internal(
+        &mut self,
+        idempotency_key: String,
+        account: AccountKey,
+        amount: u128,
+        direction: ExternalFlowDirection,
+        evidence_hash: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
         self.validate_new_system_key(&idempotency_key)?;
         let prior_root = self.state_root();
         let flow = ExternalFlowTransaction {
@@ -1568,6 +1600,61 @@ impl PrivateTradingCore {
         ))
     }
 
+    fn apply_confirmed_deposit(
+        &mut self,
+        idempotency_key: String,
+        account: AccountKey,
+        amount: u128,
+        evidence_hash: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        let prior_root = self.state_root();
+        let flow = ExternalFlowTransaction {
+            idempotency_key: format!("deposit:{idempotency_key}"),
+            evidence_hash,
+            account,
+            amount,
+            direction: ExternalFlowDirection::Inflow,
+        };
+        let mut ledger = self.ledger.clone();
+        ledger.apply_confirmed_deposit(flow.clone())?;
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::ConfirmedDeposit {
+            idempotency_key: idempotency_key.clone(),
+            flow,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.ledger = ledger;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            "confirmed-deposit",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn apply_user_external_flow(
         &mut self,
@@ -1589,14 +1676,29 @@ impl PrivateTradingCore {
             ));
         }
         let owner = derive_private_user_id(&self.identity_key, &identity_commitment);
-        self.apply_external_flow(
-            idempotency_key,
-            AccountKey::new(owner, bucket, asset),
-            amount,
-            direction,
-            evidence_hash,
-            now_millis,
-        )
+        let account = AccountKey::new(owner, bucket.clone(), asset);
+        match (bucket, direction) {
+            (AccountBucket::UserAvailable, ExternalFlowDirection::Inflow) => self
+                .apply_confirmed_deposit(
+                    idempotency_key,
+                    account,
+                    amount,
+                    evidence_hash,
+                    now_millis,
+                ),
+            (AccountBucket::UserWithdrawalHold, ExternalFlowDirection::Outflow) => self
+                .apply_external_flow_internal(
+                    idempotency_key,
+                    account,
+                    amount,
+                    direction,
+                    evidence_hash,
+                    now_millis,
+                ),
+            _ => Err(CoreError::InvalidOrder(
+                "invalid external user-flow direction".into(),
+            )),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

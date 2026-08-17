@@ -55,9 +55,11 @@ pub use journal::{
     EnclaveReceipt, EncryptedJournal, EncryptedJournalRecord, EncryptedSnapshot, JournalKey,
     ReceiptSigner,
 };
+#[allow(unused_imports)]
 pub use ledger::{
     AccountBucket, AccountKey, ClaimPayout, CompleteSetDirection, CompleteSetTransaction,
-    ExternalFlowDirection, ExternalFlowTransaction, Ledger, LedgerTransaction, Transfer,
+    ExternalFlowDirection, ExternalFlowTransaction, Ledger, LedgerPosting, LedgerTransaction,
+    PostingSide, Transfer,
 };
 #[allow(unused_imports)]
 pub use orderbook::{

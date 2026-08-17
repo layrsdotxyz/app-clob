@@ -82,6 +82,26 @@ pub struct AppliedLedgerTransaction {
     pub prior_state_root: [u8; 32],
     pub state_root: [u8; 32],
     pub transfers: Vec<Transfer>,
+    /// General-ledger legs for custody-boundary events. Internal balance
+    /// reclassifications continue to use `transfers`; external deposits use
+    /// explicit normal-side postings because both the custody asset and the
+    /// corresponding user liability increase together.
+    #[serde(default)]
+    pub postings: Vec<LedgerPosting>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PostingSide {
+    Debit,
+    Credit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerPosting {
+    pub account: AccountKey,
+    pub side: PostingSide,
+    pub amount: u128,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,6 +259,76 @@ impl Ledger {
             prior_state_root,
             state_root,
             transfers: transaction.transfers,
+            postings: Vec::new(),
+        })
+    }
+
+    /// Records one finalized pool deposit as a balanced custody asset and
+    /// user-liability pair. The caller must provide an opaque enclave-local
+    /// user account and independent finality evidence for the canonical pool
+    /// receipt. Provider progress, source-chain detection and quotes are not
+    /// sufficient evidence for this operation.
+    pub fn apply_confirmed_deposit(
+        &mut self,
+        transaction: ExternalFlowTransaction,
+    ) -> CoreResult<AppliedLedgerTransaction> {
+        if transaction.amount == 0 || transaction.evidence_hash == [0u8; 32] {
+            return Err(CoreError::ZeroAmount);
+        }
+        if transaction.direction != ExternalFlowDirection::Inflow
+            || transaction.account.bucket != AccountBucket::UserAvailable
+            || transaction.account.owner.is_empty()
+            || transaction.account.owner == "layrs"
+            || transaction.account.market_id.is_some()
+            || transaction.account.outcome.is_some()
+        {
+            return Err(CoreError::InvalidOrder(
+                "confirmed deposit requires an opaque user-available liability".into(),
+            ));
+        }
+        if self
+            .applied_idempotency_keys
+            .contains(&transaction.idempotency_key)
+        {
+            return Err(CoreError::DuplicateCommand);
+        }
+
+        let pool = AccountKey::new("layrs", AccountBucket::PoolCash, &transaction.account.asset);
+        let prior_state_root = self.state_root();
+        let mut next = self.balances.clone();
+        credit(&mut next, &pool, transaction.amount)?;
+        credit(&mut next, &transaction.account, transaction.amount)?;
+
+        self.balances = next;
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(CoreError::UnbalancedTransaction)?;
+        self.applied_idempotency_keys
+            .insert(transaction.idempotency_key.clone());
+        let state_root = self.state_root();
+        Ok(AppliedLedgerTransaction {
+            sequence: self.sequence,
+            idempotency_key: transaction.idempotency_key,
+            business_reference: format!(
+                "confirmed-deposit:{}",
+                hex::encode(transaction.evidence_hash)
+            ),
+            prior_state_root,
+            state_root,
+            transfers: Vec::new(),
+            postings: vec![
+                LedgerPosting {
+                    account: pool,
+                    side: PostingSide::Debit,
+                    amount: transaction.amount,
+                },
+                LedgerPosting {
+                    account: transaction.account,
+                    side: PostingSide::Credit,
+                    amount: transaction.amount,
+                },
+            ],
         })
     }
 
@@ -290,6 +380,7 @@ impl Ledger {
             prior_state_root,
             state_root,
             transfers: Vec::new(),
+            postings: Vec::new(),
         })
     }
 
@@ -470,6 +561,7 @@ impl Ledger {
             prior_state_root,
             state_root: self.state_root(),
             transfers: Vec::new(),
+            postings: Vec::new(),
         })
     }
 
