@@ -2833,15 +2833,35 @@ impl PrivateTradingCore {
                     .get(&order.market_id)
                     .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
                 validate_order_for_market(&order, market, now_millis)?;
-                enforce_user_position_limit(
-                    &ledger,
-                    &books,
-                    &bootstrap_executions,
-                    market,
-                    &order,
-                )?;
                 match &market.execution {
                     MarketExecution::NativeClob | MarketExecution::NativeExactCondition { .. } => {
+                        // GTD deadlines are consensus inputs, but wall-clock
+                        // passage alone cannot mutate the enclave state. At the
+                        // next valid write for this market, expire all elapsed
+                        // orders and release their grouped holds atomically
+                        // before position-limit validation or matching.
+                        {
+                            let book = books.entry(order.market_id.clone()).or_default();
+                            let expired = book.cancel_expired(&order.market_id, now_millis);
+                            let releases = cancellation_transfers(&ledger, book, market, &expired)?;
+                            if !releases.is_empty() {
+                                ledger.apply(LedgerTransaction {
+                                    idempotency_key: format!(
+                                        "expire-orders:{}",
+                                        command.idempotency_key
+                                    ),
+                                    business_reference: command.command_id.clone(),
+                                    transfers: releases,
+                                })?;
+                            }
+                        }
+                        enforce_user_position_limit(
+                            &ledger,
+                            &books,
+                            &bootstrap_executions,
+                            market,
+                            &order,
+                        )?;
                         let book = books.entry(order.market_id.clone()).or_default();
                         let match_result = book.submit(order.clone(), now_millis)?;
                         if match_result
@@ -2904,6 +2924,13 @@ impl PrivateTradingCore {
                         }
                     }
                     MarketExecution::PolymarketBootstrap { .. } => {
+                        enforce_user_position_limit(
+                            &ledger,
+                            &books,
+                            &bootstrap_executions,
+                            market,
+                            &order,
+                        )?;
                         if !matches!(order.time_in_force, super::TimeInForce::Fok) {
                             return Err(CoreError::InvalidOrder(
                                 "bootstrap execution requires fill-or-kill".into(),

@@ -625,6 +625,32 @@ impl PriceTimeBook {
         cancelled
     }
 
+    /// Deterministically expires every active order whose signed deadline has
+    /// elapsed. Time does not mutate enclave state by itself, so callers run
+    /// this at a journalled market write boundary and release the associated
+    /// grouped holds in the same atomic transition.
+    pub fn cancel_expired(&mut self, market_id: &str, now_millis: i64) -> Vec<BookOrder> {
+        let ids: Vec<Uuid> = self
+            .active
+            .iter()
+            .filter(|id| {
+                let order = &self.orders[*id];
+                order.market_id == market_id && is_expired(order, now_millis)
+            })
+            .copied()
+            .collect();
+        let mut cancelled = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(order) = self.orders.get_mut(&id) {
+                order.status = OrderStatus::Cancelled;
+                order.updated_at_millis = now_millis;
+                cancelled.push(order.clone());
+            }
+            self.active.remove(&id);
+        }
+        cancelled
+    }
+
     fn validate(&self, order: &BookOrder, now_millis: i64) -> CoreResult<()> {
         if order.price_micros == 0 || u128::from(order.price_micros) >= PRICE_SCALE {
             return Err(CoreError::InvalidOrder(
