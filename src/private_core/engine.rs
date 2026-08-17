@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use ethers_core::types::U256;
 use hmac::{Hmac, Mac};
@@ -519,6 +520,60 @@ pub struct PortfolioSnapshot {
     pub positions: Vec<PrivatePosition>,
     pub orders: Vec<BookOrder>,
     pub as_of_millis: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrivateFillView {
+    pub fill_id: String,
+    pub order_id: String,
+    pub market_id: String,
+    pub outcome: String,
+    pub action: String,
+    pub role: String,
+    pub match_type: String,
+    pub price_micros: u64,
+    pub quantity_micros: String,
+    pub fee_atomic: String,
+    pub sequence: String,
+    pub occurred_at_millis: i64,
+    pub receipt_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrivateActivitySnapshot {
+    pub orders: Vec<BookOrder>,
+    pub fills: Vec<PrivateFillView>,
+    pub as_of_millis: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PrivateOrderHistoryState {
+    Active,
+    Historical,
+    All,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrivateActivityPage<T> {
+    pub data: Vec<T>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PrivateActivityCursor {
+    version: u8,
+    kind: String,
+    order_state: Option<PrivateOrderHistoryState>,
+    market_id: Option<String>,
+    order_id: Option<String>,
+    timestamp_millis: i64,
+    sequence: u64,
+    id: String,
+    issued_at_millis: i64,
+    expires_at_millis: i64,
 }
 
 /// Privacy-safe aggregate preflight for a market settlement. It deliberately
@@ -1074,6 +1129,7 @@ impl PrivateTradingCore {
         })
         .map_err(|_| CoreError::JournalCrypto)?;
         remove_json_field(&mut value, "filled_micros");
+        remove_json_field(&mut value, "fill_history");
         self.journal.seal_snapshot(
             legacy_state_root(
                 &self.ledger,
@@ -1121,6 +1177,7 @@ impl PrivateTradingCore {
         })
         .map_err(|_| CoreError::JournalCrypto)?;
         remove_json_field(&mut value, "filled_micros");
+        remove_json_field(&mut value, "fill_history");
         remove_json_field(&mut value, "private_rewards");
         self.journal.seal_snapshot(
             production_legacy_state_root(
@@ -1534,6 +1591,348 @@ impl PrivateTradingCore {
             &private_user_id,
             now_millis,
         )
+    }
+
+    /// Return complete owner activity only when every cumulative order fill is
+    /// backed by an individually committed private fill row. Legacy aggregate-
+    /// only snapshots fail closed and must be rebuilt by deterministic journal
+    /// replay before the history API can be enabled.
+    pub fn private_activity_for_identity(
+        &self,
+        identity_commitment: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<PrivateActivitySnapshot> {
+        if self
+            .books
+            .values()
+            .any(|book| !book.has_complete_fill_history())
+        {
+            return Err(CoreError::SnapshotMigrationRequired);
+        }
+        let private_user_id = derive_private_user_id(&self.identity_key, &identity_commitment);
+        let mut orders: Vec<BookOrder> = self
+            .books
+            .values()
+            .flat_map(|book| book.orders_for_owner(&private_user_id))
+            .collect();
+        for order in &mut orders {
+            order.private_user_id.clear();
+        }
+        orders.sort_by(|left, right| {
+            (right.updated_at_millis, right.sequence, right.order_id).cmp(&(
+                left.updated_at_millis,
+                left.sequence,
+                left.order_id,
+            ))
+        });
+
+        let mut fills = Vec::new();
+        for (market_id, book) in &self.books {
+            let market = self
+                .markets
+                .get(market_id)
+                .ok_or_else(|| CoreError::InvalidOrder("fill market is not registered".into()))?;
+            for fill in book.fills_for_owner(&private_user_id) {
+                if fill.occurred_at_millis <= 0 {
+                    return Err(CoreError::SnapshotMigrationRequired);
+                }
+                let (role, order_id, price_micros) =
+                    if fill.maker_private_user_id == private_user_id {
+                        ("MAKER", fill.maker_order_id, fill.price_micros)
+                    } else {
+                        ("TAKER", fill.taker_order_id, fill.taker_price_micros())
+                    };
+                let order = book
+                    .order(order_id)
+                    .ok_or(CoreError::JournalChainMismatch)?;
+                let fee_atomic = if role == "TAKER" {
+                    taker_fee_atomic(market, fill.quantity_micros, price_micros)?
+                } else {
+                    0
+                };
+                fills.push(PrivateFillView {
+                    fill_id: fill.fill_id.to_string(),
+                    order_id: order_id.to_string(),
+                    market_id: fill.market_id,
+                    outcome: outcome_name(order.outcome).into(),
+                    action: match order.action {
+                        OrderAction::Buy => "BUY",
+                        OrderAction::Sell => "SELL",
+                    }
+                    .into(),
+                    role: role.into(),
+                    match_type: match fill.match_type {
+                        MatchType::Normal => "NORMAL",
+                        MatchType::Mint => "MINT",
+                        MatchType::Merge => "MERGE",
+                    }
+                    .into(),
+                    price_micros,
+                    quantity_micros: fill.quantity_micros.to_string(),
+                    fee_atomic: fee_atomic.to_string(),
+                    sequence: fill.sequence.to_string(),
+                    occurred_at_millis: fill.occurred_at_millis,
+                    // The signed receipt is returned and archived by the
+                    // command path after the state root is committed; storing
+                    // its ID here would create a circular state-root dependency.
+                    receipt_id: None,
+                });
+            }
+        }
+        fills.sort_by(|left, right| {
+            (
+                right.occurred_at_millis,
+                right.sequence.parse::<u64>().unwrap_or_default(),
+                right.fill_id.as_str(),
+            )
+                .cmp(&(
+                    left.occurred_at_millis,
+                    left.sequence.parse::<u64>().unwrap_or_default(),
+                    left.fill_id.as_str(),
+                ))
+        });
+        Ok(PrivateActivitySnapshot {
+            orders,
+            fills,
+            as_of_millis: now_millis,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn private_order_page_for_identity(
+        &self,
+        identity_commitment: [u8; 32],
+        state: PrivateOrderHistoryState,
+        market_id: Option<&str>,
+        order_id: Option<Uuid>,
+        limit: usize,
+        cursor: Option<&str>,
+        now_millis: i64,
+    ) -> CoreResult<PrivateActivityPage<BookOrder>> {
+        validate_private_activity_query(market_id, limit, now_millis)?;
+        let private_user_id = derive_private_user_id(&self.identity_key, &identity_commitment);
+        let after = cursor
+            .map(|value| {
+                self.decode_private_activity_cursor(
+                    value,
+                    &private_user_id,
+                    "ORDERS",
+                    Some(state),
+                    market_id,
+                    order_id,
+                    now_millis,
+                )
+            })
+            .transpose()?;
+        let mut orders = self
+            .private_activity_for_identity(identity_commitment, now_millis)?
+            .orders
+            .into_iter()
+            .filter(|order| market_id.is_none_or(|value| order.market_id == value))
+            .filter(|order| order_id.is_none_or(|value| order.order_id == value))
+            .filter(|order| match state {
+                PrivateOrderHistoryState::Active => matches!(
+                    order.status,
+                    OrderStatus::Open | OrderStatus::PartiallyFilled
+                ),
+                PrivateOrderHistoryState::Historical => !matches!(
+                    order.status,
+                    OrderStatus::Open | OrderStatus::PartiallyFilled
+                ),
+                PrivateOrderHistoryState::All => true,
+            })
+            .filter(|order| {
+                after.as_ref().is_none_or(|position| {
+                    (
+                        order.updated_at_millis,
+                        order.sequence,
+                        order.order_id.to_string(),
+                    ) < (
+                        position.timestamp_millis,
+                        position.sequence,
+                        position.id.clone(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let has_more = orders.len() > limit;
+        orders.truncate(limit);
+        let next_cursor = if has_more {
+            let last = orders.last().ok_or(CoreError::JournalChainMismatch)?;
+            Some(self.encode_private_activity_cursor(
+                &private_user_id,
+                PrivateActivityCursor {
+                    version: 1,
+                    kind: "ORDERS".into(),
+                    order_state: Some(state),
+                    market_id: market_id.map(str::to_owned),
+                    order_id: order_id.map(|value| value.to_string()),
+                    timestamp_millis: last.updated_at_millis,
+                    sequence: last.sequence,
+                    id: last.order_id.to_string(),
+                    issued_at_millis: now_millis,
+                    expires_at_millis: now_millis + 15 * 60_000,
+                },
+            )?)
+        } else {
+            None
+        };
+        Ok(PrivateActivityPage {
+            data: orders,
+            next_cursor,
+        })
+    }
+
+    pub fn private_fill_page_for_identity(
+        &self,
+        identity_commitment: [u8; 32],
+        market_id: Option<&str>,
+        limit: usize,
+        cursor: Option<&str>,
+        now_millis: i64,
+    ) -> CoreResult<PrivateActivityPage<PrivateFillView>> {
+        validate_private_activity_query(market_id, limit, now_millis)?;
+        let private_user_id = derive_private_user_id(&self.identity_key, &identity_commitment);
+        let after = cursor
+            .map(|value| {
+                self.decode_private_activity_cursor(
+                    value,
+                    &private_user_id,
+                    "FILLS",
+                    None,
+                    market_id,
+                    None,
+                    now_millis,
+                )
+            })
+            .transpose()?;
+        let mut fills = self
+            .private_activity_for_identity(identity_commitment, now_millis)?
+            .fills
+            .into_iter()
+            .filter(|fill| market_id.is_none_or(|value| fill.market_id == value))
+            .filter(|fill| {
+                after.as_ref().is_none_or(|position| {
+                    (
+                        fill.occurred_at_millis,
+                        fill.sequence.parse::<u64>().unwrap_or_default(),
+                        fill.fill_id.clone(),
+                    ) < (
+                        position.timestamp_millis,
+                        position.sequence,
+                        position.id.clone(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let has_more = fills.len() > limit;
+        fills.truncate(limit);
+        let next_cursor = if has_more {
+            let last = fills.last().ok_or(CoreError::JournalChainMismatch)?;
+            Some(
+                self.encode_private_activity_cursor(
+                    &private_user_id,
+                    PrivateActivityCursor {
+                        version: 1,
+                        kind: "FILLS".into(),
+                        order_state: None,
+                        market_id: market_id.map(str::to_owned),
+                        order_id: None,
+                        timestamp_millis: last.occurred_at_millis,
+                        sequence: last
+                            .sequence
+                            .parse()
+                            .map_err(|_| CoreError::JournalChainMismatch)?,
+                        id: last.fill_id.clone(),
+                        issued_at_millis: now_millis,
+                        expires_at_millis: now_millis + 15 * 60_000,
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
+        Ok(PrivateActivityPage {
+            data: fills,
+            next_cursor,
+        })
+    }
+
+    fn encode_private_activity_cursor(
+        &self,
+        private_user_id: &str,
+        cursor: PrivateActivityCursor,
+    ) -> CoreResult<String> {
+        let encoded = serde_json::to_vec(&cursor).map_err(|_| CoreError::JournalCrypto)?;
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.identity_key)
+            .map_err(|_| CoreError::JournalCrypto)?;
+        mac.update(b"layrs.private-activity-cursor.v1\0");
+        mac.update(private_user_id.as_bytes());
+        mac.update(&encoded);
+        Ok(format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(encoded),
+            URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_private_activity_cursor(
+        &self,
+        value: &str,
+        private_user_id: &str,
+        expected_kind: &str,
+        expected_state: Option<PrivateOrderHistoryState>,
+        expected_market_id: Option<&str>,
+        expected_order_id: Option<Uuid>,
+        now_millis: i64,
+    ) -> CoreResult<PrivateActivityCursor> {
+        if value.len() > 2_048 {
+            return Err(CoreError::InvalidOrder(
+                "invalid private activity cursor".into(),
+            ));
+        }
+        let (payload, signature) = value
+            .split_once('.')
+            .ok_or_else(|| CoreError::InvalidOrder("invalid private activity cursor".into()))?;
+        let encoded = URL_SAFE_NO_PAD
+            .decode(payload)
+            .map_err(|_| CoreError::InvalidOrder("invalid private activity cursor".into()))?;
+        if URL_SAFE_NO_PAD.encode(&encoded) != payload {
+            return Err(CoreError::InvalidOrder(
+                "invalid private activity cursor".into(),
+            ));
+        }
+        let supplied = URL_SAFE_NO_PAD
+            .decode(signature)
+            .map_err(|_| CoreError::InvalidOrder("invalid private activity cursor".into()))?;
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.identity_key)
+            .map_err(|_| CoreError::JournalCrypto)?;
+        mac.update(b"layrs.private-activity-cursor.v1\0");
+        mac.update(private_user_id.as_bytes());
+        mac.update(&encoded);
+        mac.verify_slice(&supplied)
+            .map_err(|_| CoreError::InvalidOrder("invalid private activity cursor".into()))?;
+        let cursor: PrivateActivityCursor = serde_json::from_slice(&encoded)
+            .map_err(|_| CoreError::InvalidOrder("invalid private activity cursor".into()))?;
+        if cursor.version != 1
+            || cursor.kind != expected_kind
+            || cursor.order_state != expected_state
+            || cursor.market_id.as_deref() != expected_market_id
+            || cursor.order_id.as_deref()
+                != expected_order_id.as_ref().map(Uuid::to_string).as_deref()
+            || cursor.timestamp_millis <= 0
+            || cursor.sequence == 0
+            || Uuid::parse_str(&cursor.id).is_err()
+            || cursor.issued_at_millis > now_millis + 5_000
+            || cursor.expires_at_millis < now_millis
+            || cursor.expires_at_millis - cursor.issued_at_millis != 15 * 60_000
+        {
+            return Err(CoreError::InvalidOrder(
+                "invalid private activity cursor".into(),
+            ));
+        }
+        Ok(cursor)
     }
 
     pub fn apply_external_flow(
@@ -5723,6 +6122,28 @@ fn portfolio_snapshot(
     }
 }
 
+fn validate_private_activity_query(
+    market_id: Option<&str>,
+    limit: usize,
+    now_millis: i64,
+) -> CoreResult<()> {
+    if !(1..=100).contains(&limit)
+        || now_millis <= 0
+        || market_id.is_some_and(|value| {
+            value.is_empty()
+                || value.len() > 160
+                || !value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-' | b'_' | b'.')
+                })
+        })
+    {
+        return Err(CoreError::InvalidOrder(
+            "invalid private activity query".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn processed_hashes(processed: &BTreeMap<String, ProcessedCommand>) -> BTreeMap<String, [u8; 32]> {
     processed
         .iter()
@@ -6177,7 +6598,7 @@ mod snapshot_migration_tests {
     use crate::private_core::TimeInForce;
 
     #[test]
-    fn restores_legacy_book_root_and_reconstructs_deterministic_fill_history() {
+    fn restores_legacy_book_root_but_requires_replay_for_exact_fill_history() {
         let journal_key = JournalKey::from_bytes([201u8; 32]);
         let mut core =
             PrivateTradingCore::new(journal_key.clone(), ReceiptSigner::generate([202u8; 48]));
@@ -6224,13 +6645,23 @@ mod snapshot_migration_tests {
             0,
         )
         .unwrap();
-        assert_eq!(restored.state_root(), current_root);
+        // A pre-history snapshot cannot reproduce the current root because the
+        // individual maker/taker fill rows were never committed. Restoration
+        // remains available for trading continuity, while private activity
+        // reads fail closed until the encrypted journal is replayed.
+        assert_ne!(restored.state_root(), current_root);
         let mut orders = restored.books[market_id].orders_for_owner("maker");
         orders.extend(restored.books[market_id].orders_for_owner("taker"));
         assert_eq!(orders.len(), 2);
         assert!(orders
             .iter()
             .all(|order| order.filled_micros == order.quantity_micros));
+        assert_eq!(
+            restored
+                .private_activity_for_identity([0u8; 32], 2_000)
+                .unwrap_err(),
+            CoreError::SnapshotMigrationRequired
+        );
     }
 
     #[test]
@@ -6281,7 +6712,7 @@ mod snapshot_migration_tests {
             0,
         )
         .unwrap();
-        assert_eq!(restored.state_root(), current_root);
+        assert_ne!(restored.state_root(), current_root);
         let maker = restored.books[market_id]
             .orders_for_owner("maker")
             .pop()
@@ -6292,6 +6723,12 @@ mod snapshot_migration_tests {
             .unwrap();
         assert_eq!(maker.filled_micros, 1_000_000);
         assert_eq!(taker.filled_micros, 1_000_000);
+        assert_eq!(
+            restored
+                .private_activity_for_identity([0u8; 32], 2_000)
+                .unwrap_err(),
+            CoreError::SnapshotMigrationRequired
+        );
     }
 
     #[test]

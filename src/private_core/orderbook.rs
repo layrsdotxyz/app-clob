@@ -160,6 +160,11 @@ pub struct Fill {
     #[serde(with = "super::decimal_u128")]
     pub quantity_micros: u128,
     pub sequence: u64,
+    /// Enclave-authoritative execution time. Older command receipts deserialize
+    /// with zero, but only fills persisted in `fill_history` are eligible for
+    /// the complete private-history projection.
+    #[serde(default)]
+    pub occurred_at_millis: i64,
 }
 
 impl Fill {
@@ -315,6 +320,11 @@ pub struct PriceTimeBook {
     orders: BTreeMap<Uuid, BookOrder>,
     active: BTreeSet<Uuid>,
     sequence: u64,
+    /// Complete private fill history is committed with the book. Empty is
+    /// omitted so pre-history snapshots retain their exact legacy root; reads
+    /// fail closed when cumulative order fills cannot be reconciled to it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fill_history: Vec<Fill>,
 }
 
 #[derive(Serialize)]
@@ -433,7 +443,10 @@ impl PriceTimeBook {
         if incoming.time_in_force == TimeInForce::Fok
             && self.executable_quantity(&incoming, now_millis) < incoming.quantity_micros
         {
+            self.sequence += 1;
+            incoming.sequence = self.sequence;
             incoming.status = OrderStatus::Rejected;
+            self.orders.insert(incoming.order_id, incoming.clone());
             return Ok(MatchResult {
                 accepted_order: Some(incoming),
                 fills: Vec::new(),
@@ -496,6 +509,7 @@ impl PriceTimeBook {
                 price_micros: maker.price_micros,
                 quantity_micros: quantity,
                 sequence: fill_sequence,
+                occurred_at_millis: now_millis,
             });
             if maker.remaining_micros == 0 {
                 self.active.remove(&candidate.order_id);
@@ -526,10 +540,38 @@ impl PriceTimeBook {
         }
 
         self.orders.insert(incoming.order_id, incoming.clone());
+        self.fill_history.extend(fills.iter().cloned());
         Ok(MatchResult {
             accepted_order: Some(incoming),
             fills,
             cancelled_remainder_micros,
+        })
+    }
+
+    pub fn fills_for_owner(&self, private_user_id: &str) -> Vec<Fill> {
+        self.fill_history
+            .iter()
+            .filter(|fill| {
+                fill.maker_private_user_id == private_user_id
+                    || fill.taker_private_user_id == private_user_id
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// A legacy snapshot may contain cumulative order fill counters without
+    /// the individual fill rows needed for an honest history API. Never infer
+    /// maker/taker rows from aggregates: require replay migration instead.
+    pub fn has_complete_fill_history(&self) -> bool {
+        self.orders.values().all(|order| {
+            let recorded = self
+                .fill_history
+                .iter()
+                .filter(|fill| {
+                    fill.maker_order_id == order.order_id || fill.taker_order_id == order.order_id
+                })
+                .try_fold(0u128, |total, fill| total.checked_add(fill.quantity_micros));
+            recorded == Some(order.filled_micros)
         })
     }
 

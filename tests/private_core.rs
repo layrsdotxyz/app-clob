@@ -3,10 +3,10 @@ use clob_service::private_core::{
     signing_payload, AccountBucket, AccountKey, BookOrder, BoundaryEvidence, CommandResult,
     CompleteSetDirection, CoreError, EncryptedJournal, ExternalFlowDirection, FeeProfileId,
     JournalKey, Ledger, LedgerTransaction, MarketConfig, MarketExecution, OrderAction, OrderStatus,
-    Outcome, PolymarketResolutionStatement, PriceTimeBook, PrivateTradingCore, ReceiptSigner,
-    ResolutionOutcome, ResolutionStatement, SessionGuard, SessionRequest,
-    SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence, SignedSessionRequest,
-    TimeInForce, Transfer, UserCommand, UserCommandAction,
+    Outcome, PolymarketResolutionStatement, PriceTimeBook, PrivateOrderHistoryState,
+    PrivateTradingCore, ReceiptSigner, ResolutionOutcome, ResolutionStatement, SessionGuard,
+    SessionRequest, SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence,
+    SignedSessionRequest, TimeInForce, Transfer, UserCommand, UserCommandAction,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
@@ -65,6 +65,229 @@ fn delegated_portfolio_snapshot_is_strictly_identity_scoped() {
     assert_ne!(alice_view.balances, bob_view.balances);
     assert!(alice_view.positions.is_empty() && alice_view.orders.is_empty());
     assert!(bob_view.positions.is_empty() && bob_view.orders.is_empty());
+}
+
+#[test]
+fn private_order_and_fill_history_is_complete_scoped_paginated_and_snapshot_safe() {
+    let journal_key = JournalKey::from_bytes([221u8; 32]);
+    let alice_key = SigningKey::from_bytes(&[222u8; 32]);
+    let bob_key = SigningKey::from_bytes(&[223u8; 32]);
+    let alice_identity = [31u8; 32];
+    let bob_identity = [32u8; 32];
+    let market_id = "layrs:v1:USDC:15m:2800";
+    let mut core =
+        PrivateTradingCore::new(journal_key.clone(), ReceiptSigner::generate([224u8; 48]));
+    core.register_market(
+        "history:market".into(),
+        MarketConfig {
+            market_id: market_id.into(),
+            settlement_asset: "USDC".into(),
+            settlement_decimals: 6,
+            public_settlement_chain: Some("base".into()),
+            opens_at_millis: 900,
+            closes_at_millis: 2_800,
+            minimum_quantity_micros: 1,
+            maximum_quantity_micros: 10_000_000,
+            minimum_order_notional_micros: 1,
+            maximum_order_notional_micros: 10_000_000,
+            maximum_user_position_micros: 10_000_000,
+            maximum_pending_bootstrap_notional_micros: 100_000_000,
+            tick_size_micros: 1_000,
+            oracle_feed_id: 1,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
+            execution: MarketExecution::NativeClob,
+        },
+        800,
+    )
+    .unwrap();
+    for (index, identity, key) in [
+        (1u8, alice_identity, &alice_key),
+        (2u8, bob_identity, &bob_key),
+    ] {
+        core.register_session(
+            format!("history:session:{index}"),
+            format!("history-session:{index}"),
+            identity,
+            key.verifying_key().to_bytes(),
+            3_000,
+            810 + i64::from(index),
+        )
+        .unwrap();
+        core.apply_user_external_flow(
+            format!("history:deposit:{index}"),
+            identity,
+            "USDC".into(),
+            AccountBucket::UserAvailable,
+            10_000_000,
+            ExternalFlowDirection::Inflow,
+            [index; 32],
+            820 + i64::from(index),
+        )
+        .unwrap();
+    }
+
+    execute_signed(
+        &mut core,
+        &bob_key,
+        "history-session:2",
+        1,
+        "history:mint",
+        UserCommandAction::CompleteSet {
+            market_id: market_id.into(),
+            quantity_micros: 2_000_000,
+            direction: CompleteSetDirection::Mint,
+        },
+        1_000,
+    );
+    for (sequence, suffix) in [(2, "one"), (3, "two")] {
+        execute_signed(
+            &mut core,
+            &bob_key,
+            "history-session:2",
+            sequence,
+            &format!("history:sell:{suffix}"),
+            UserCommandAction::SubmitOrder {
+                order: BookOrder::new(
+                    "caller-controlled-owner",
+                    market_id,
+                    Outcome::Up,
+                    OrderAction::Sell,
+                    400_000,
+                    1_000_000,
+                    TimeInForce::Gtc,
+                    None,
+                ),
+            },
+            1_100 + i64::try_from(sequence).unwrap(),
+        );
+    }
+    let buy_action = UserCommandAction::SubmitOrder {
+        order: BookOrder::new(
+            "different-caller-alias",
+            market_id,
+            Outcome::Up,
+            OrderAction::Buy,
+            400_000,
+            2_000_000,
+            TimeInForce::Fak,
+            None,
+        ),
+    };
+    let buy = execute_signed_response(
+        &mut core,
+        &alice_key,
+        "history-session:1",
+        1,
+        "history:buy",
+        buy_action,
+        1_500,
+    );
+    assert_eq!(buy.audit_fills.len(), 2);
+
+    let alice = core
+        .private_activity_for_identity(alice_identity, 2_000)
+        .unwrap();
+    let bob = core
+        .private_activity_for_identity(bob_identity, 2_000)
+        .unwrap();
+    assert_eq!(alice.orders.len(), 1);
+    assert_eq!(alice.fills.len(), 2);
+    assert_eq!(bob.orders.len(), 2);
+    assert_eq!(bob.fills.len(), 2);
+    assert!(alice.fills.iter().all(|fill| {
+        fill.role == "TAKER" && fill.fee_atomic == "800" && fill.receipt_id.is_none()
+    }));
+    assert!(bob
+        .fills
+        .iter()
+        .all(|fill| fill.role == "MAKER" && fill.fee_atomic == "0"));
+    let encoded = serde_json::to_string(&(alice.clone(), bob.clone())).unwrap();
+    for forbidden in [
+        derived_private_user([221u8; 32], alice_identity),
+        derived_private_user([221u8; 32], bob_identity),
+        "caller-controlled-owner".into(),
+        "different-caller-alias".into(),
+    ] {
+        assert!(!encoded.contains(&forbidden));
+    }
+
+    let first = core
+        .private_fill_page_for_identity(alice_identity, Some(market_id), 1, None, 2_000)
+        .unwrap();
+    assert_eq!(first.data.len(), 1);
+    let cursor = first.next_cursor.clone().expect("second fill page");
+    let second = core
+        .private_fill_page_for_identity(alice_identity, Some(market_id), 1, Some(&cursor), 2_001)
+        .unwrap();
+    assert_eq!(second.data.len(), 1);
+    assert_ne!(first.data[0].fill_id, second.data[0].fill_id);
+    assert!(second.next_cursor.is_none());
+    assert!(core
+        .private_fill_page_for_identity(bob_identity, Some(market_id), 1, Some(&cursor), 2_001)
+        .is_err());
+    let mut tampered = cursor.clone().into_bytes();
+    let last = tampered.len() - 1;
+    tampered[last] = if tampered[last] == b'A' { b'B' } else { b'A' };
+    assert!(core
+        .private_fill_page_for_identity(
+            alice_identity,
+            Some(market_id),
+            1,
+            Some(std::str::from_utf8(&tampered).unwrap()),
+            2_001,
+        )
+        .is_err());
+    assert!(core
+        .private_fill_page_for_identity(alice_identity, None, 1, Some(&cursor), 2_001)
+        .is_err());
+    assert!(core
+        .private_fill_page_for_identity(alice_identity, Some(market_id), 1, Some(&cursor), 902_001,)
+        .is_err());
+
+    let historical = core
+        .private_order_page_for_identity(
+            bob_identity,
+            PrivateOrderHistoryState::Historical,
+            Some(market_id),
+            None,
+            1,
+            None,
+            2_000,
+        )
+        .unwrap();
+    assert_eq!(historical.data.len(), 1);
+    assert!(historical.next_cursor.is_some());
+    assert!(historical.data[0].private_user_id.is_empty());
+    assert!(core
+        .private_order_page_for_identity(
+            bob_identity,
+            PrivateOrderHistoryState::Active,
+            Some(market_id),
+            None,
+            25,
+            None,
+            2_000,
+        )
+        .unwrap()
+        .data
+        .is_empty());
+
+    let snapshot = core.export_encrypted_snapshot().unwrap();
+    let restored = PrivateTradingCore::restore_encrypted_snapshot(
+        journal_key,
+        ReceiptSigner::generate([225u8; 48]),
+        &snapshot,
+        0,
+    )
+    .unwrap();
+    assert_eq!(restored.state_root(), core.state_root());
+    assert_eq!(
+        restored
+            .private_activity_for_identity(alice_identity, 2_100)
+            .unwrap()
+            .fills,
+        alice.fills
+    );
 }
 
 #[test]

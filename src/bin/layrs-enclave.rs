@@ -26,14 +26,14 @@ use clob_service::polymarket_enclave::{
 use clob_service::private_core::{
     binance_resolution_signing_payload, exact_condition_resolution_signing_payload,
     polymarket_resolution_signing_payload, resolution_signing_payload, AccountKey,
-    BinanceResolutionStatement, BootstrapExecutionState, CommandResult, CoreResponse,
+    BinanceResolutionStatement, BootstrapExecutionState, CommandResult, CoreError, CoreResponse,
     EnclaveReceipt, EncryptedJournalRecord, EncryptedSnapshot, ExactConditionResolutionStatement,
     ExternalFlowDirection, JournalKey, MarketConfig, MarketExecution, OrderStatus,
-    PolymarketResolutionStatement, PrivateTradingCore, ReceiptSigner, ResolutionStatement,
-    SignedAuditFillArtifact, SignedBinanceResolution, SignedExactConditionResolution,
-    SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence,
-    SignedTaskQualificationArtifact, SystemResponse, UserCommand, UserCommandAction,
-    WithdrawalAuthorization,
+    PolymarketResolutionStatement, PrivateOrderHistoryState, PrivateTradingCore, ReceiptSigner,
+    ResolutionStatement, SignedAuditFillArtifact, SignedBinanceResolution,
+    SignedExactConditionResolution, SignedPolymarketResolution, SignedResolution,
+    SignedResolutionEvidence, SignedTaskQualificationArtifact, SystemResponse, UserCommand,
+    UserCommandAction, WithdrawalAuthorization,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use openssl::{
@@ -259,6 +259,16 @@ enum OperatorCommand {
         identity_commitment: [u8; 32],
         response_public_key: [u8; 32],
         projection: DelegatedReadProjection,
+        #[serde(default)]
+        order_state: Option<PrivateOrderHistoryState>,
+        #[serde(default)]
+        market_id: Option<String>,
+        #[serde(default)]
+        order_id: Option<uuid::Uuid>,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        cursor: Option<String>,
         api_key_id: uuid::Uuid,
         capability_jti: uuid::Uuid,
         capability_token_sha256: [u8; 32],
@@ -365,6 +375,8 @@ enum DelegatedReadProjection {
     Positions,
     Portfolio,
     ActiveOrders,
+    Orders,
+    Fills,
 }
 
 impl DelegatedReadProjection {
@@ -374,6 +386,8 @@ impl DelegatedReadProjection {
             Self::Positions => "positions:read",
             Self::Portfolio => "account:read",
             Self::ActiveOrders => "orders:read",
+            Self::Orders => "orders:read",
+            Self::Fills => "orders:read",
         }
     }
 
@@ -383,6 +397,8 @@ impl DelegatedReadProjection {
             Self::Positions => "POSITIONS",
             Self::Portfolio => "PORTFOLIO",
             Self::ActiveOrders => "ACTIVE_ORDERS",
+            Self::Orders => "ORDERS",
+            Self::Fills => "FILLS",
         }
     }
 }
@@ -1687,6 +1703,11 @@ async fn dispatch_operator(
             identity_commitment,
             response_public_key,
             projection,
+            order_state,
+            market_id,
+            order_id,
+            limit,
+            cursor,
             api_key_id,
             capability_jti,
             capability_token_sha256,
@@ -1712,26 +1733,79 @@ async fn dispatch_operator(
                 .core
                 .as_ref()
                 .ok_or_else(|| "NOT_PROVISIONED".to_string())?;
-            let snapshot = core.portfolio_snapshot_for_identity(identity_commitment, now_millis);
             let items = match projection {
-                DelegatedReadProjection::Balances => serde_json::to_value(snapshot.balances),
-                DelegatedReadProjection::Positions => serde_json::to_value(snapshot.positions),
-                DelegatedReadProjection::Portfolio => serde_json::to_value(serde_json::json!({
-                    "balances": snapshot.balances,
-                    "positions": snapshot.positions,
-                })),
-                DelegatedReadProjection::ActiveOrders => serde_json::to_value(
-                    snapshot
-                        .orders
-                        .into_iter()
-                        .filter(|order| {
-                            matches!(
-                                order.status,
-                                OrderStatus::Open | OrderStatus::PartiallyFilled
-                            )
-                        })
-                        .collect::<Vec<_>>(),
-                ),
+                DelegatedReadProjection::Balances
+                | DelegatedReadProjection::Positions
+                | DelegatedReadProjection::Portfolio
+                | DelegatedReadProjection::ActiveOrders => {
+                    if order_state.is_some()
+                        || market_id.is_some()
+                        || order_id.is_some()
+                        || limit.is_some()
+                        || cursor.is_some()
+                    {
+                        return Err("INVALID_DELEGATED_READ_QUERY".into());
+                    }
+                    let snapshot =
+                        core.portfolio_snapshot_for_identity(identity_commitment, now_millis);
+                    match projection {
+                        DelegatedReadProjection::Balances => {
+                            serde_json::to_value(snapshot.balances)
+                        }
+                        DelegatedReadProjection::Positions => {
+                            serde_json::to_value(snapshot.positions)
+                        }
+                        DelegatedReadProjection::Portfolio => {
+                            serde_json::to_value(serde_json::json!({
+                                "balances": snapshot.balances,
+                                "positions": snapshot.positions,
+                            }))
+                        }
+                        DelegatedReadProjection::ActiveOrders => serde_json::to_value(
+                            snapshot
+                                .orders
+                                .into_iter()
+                                .filter(|order| {
+                                    matches!(
+                                        order.status,
+                                        OrderStatus::Open | OrderStatus::PartiallyFilled
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                        _ => unreachable!(),
+                    }
+                }
+                DelegatedReadProjection::Orders => {
+                    let state = order_state.unwrap_or(PrivateOrderHistoryState::All);
+                    let page = core
+                        .private_order_page_for_identity(
+                            identity_commitment,
+                            state,
+                            market_id.as_deref(),
+                            order_id,
+                            limit.unwrap_or(25),
+                            cursor.as_deref(),
+                            now_millis,
+                        )
+                        .map_err(private_activity_read_error)?;
+                    serde_json::to_value(page)
+                }
+                DelegatedReadProjection::Fills => {
+                    if order_state.is_some() || order_id.is_some() {
+                        return Err("INVALID_DELEGATED_READ_QUERY".into());
+                    }
+                    let page = core
+                        .private_fill_page_for_identity(
+                            identity_commitment,
+                            market_id.as_deref(),
+                            limit.unwrap_or(25),
+                            cursor.as_deref(),
+                            now_millis,
+                        )
+                        .map_err(private_activity_read_error)?;
+                    serde_json::to_value(page)
+                }
             }
             .map_err(|_| "DELEGATED_READ_ENCODING_FAILED".to_string())?;
             let plaintext = DelegatedReadPlaintext {
@@ -1739,7 +1813,7 @@ async fn dispatch_operator(
                 request_id,
                 projection: projection.label(),
                 enclave_sequence: core.sequence().to_string(),
-                as_of_millis: snapshot.as_of_millis,
+                as_of_millis: now_millis,
                 items,
             };
             let envelope = encrypt_delegated_read(
@@ -2495,7 +2569,22 @@ const DELEGATED_READ_MAX_REVOCATION_AGE_MILLIS: i64 = 10_000;
 // Reserve the 16-byte GCM tag so the complete ciphertext remains within the
 // public API and Cloudflare 1 MiB response boundary.
 const DELEGATED_READ_MAX_PLAINTEXT_BYTES: usize = 1_048_576 - 16;
+// Order/fill page cardinality is private metadata. Activity plaintext is
+// padded with valid JSON trailing whitespace before encryption so the
+// coordinator and edge cannot infer the number of rows from ciphertext size.
+const DELEGATED_ACTIVITY_PADDED_PLAINTEXT_BYTES: usize = 512 * 1024;
 
+fn private_activity_read_error(error: CoreError) -> String {
+    match error {
+        CoreError::SnapshotMigrationRequired => {
+            "PRIVATE_ACTIVITY_HISTORY_MIGRATION_REQUIRED".into()
+        }
+        CoreError::InvalidOrder(_) => "INVALID_DELEGATED_READ_QUERY".into(),
+        _ => "PRIVATE_ACTIVITY_HISTORY_UNAVAILABLE".into(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn validate_delegated_read_authorization(
     projection: DelegatedReadProjection,
     environment: &str,
@@ -2578,6 +2667,17 @@ fn encrypt_delegated_read<T: Serialize>(
     );
     let mut encoded =
         serde_json::to_vec(plaintext).map_err(|_| "DELEGATED_READ_ENCODING_FAILED".to_string())?;
+    if matches!(
+        projection,
+        DelegatedReadProjection::Orders | DelegatedReadProjection::Fills
+    ) {
+        if encoded.len() > DELEGATED_ACTIVITY_PADDED_PLAINTEXT_BYTES {
+            encoded.zeroize();
+            key.zeroize();
+            return Err("DELEGATED_READ_RESPONSE_TOO_LARGE".into());
+        }
+        encoded.resize(DELEGATED_ACTIVITY_PADDED_PLAINTEXT_BYTES, b' ');
+    }
     if encoded.len() > DELEGATED_READ_MAX_PLAINTEXT_BYTES {
         encoded.zeroize();
         key.zeroize();
@@ -2611,6 +2711,7 @@ fn encrypt_delegated_read<T: Serialize>(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn delegated_read_aad(
     request_id: uuid::Uuid,
     projection: DelegatedReadProjection,
@@ -2994,6 +3095,46 @@ mod tests {
             ),
             Err(code) if code == "DELEGATED_READ_RESPONSE_TOO_LARGE"
         ));
+    }
+
+    #[test]
+    fn delegated_activity_ciphertext_hides_private_page_cardinality() {
+        let recipient_public = PublicKey::from(&StaticSecret::random()).to_bytes();
+        let encrypt = |items: serde_json::Value, request_id: u128| {
+            encrypt_delegated_read(
+                &DelegatedReadPlaintext {
+                    protocol_version: "layrs.delegated-private-read.v1",
+                    request_id: uuid::Uuid::from_u128(request_id),
+                    projection: "ORDERS",
+                    enclave_sequence: "1".into(),
+                    as_of_millis: 1_700_000_000_000,
+                    items,
+                },
+                recipient_public,
+                DelegatedReadProjection::Orders,
+                uuid::Uuid::from_u128(32),
+                uuid::Uuid::from_u128(33),
+                [34u8; 32],
+                1_700_000_060_000,
+            )
+            .expect("padded activity envelope")
+        };
+        let empty = encrypt(serde_json::json!({"data":[],"nextCursor":null}), 30);
+        let populated = encrypt(
+            serde_json::json!({
+                "data": (0..100).map(|index| serde_json::json!({
+                    "orderId": format!("{index:08x}-0000-4000-8000-000000000000"),
+                    "quantityMicros": "1000000"
+                })).collect::<Vec<_>>(),
+                "nextCursor": "opaque"
+            }),
+            31,
+        );
+        assert_eq!(
+            empty.ciphertext.len(),
+            DELEGATED_ACTIVITY_PADDED_PLAINTEXT_BYTES + 16
+        );
+        assert_eq!(empty.ciphertext.len(), populated.ciphertext.len());
     }
 
     #[test]
