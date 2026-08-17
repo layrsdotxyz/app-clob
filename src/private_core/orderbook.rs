@@ -570,6 +570,10 @@ impl PriceTimeBook {
             let order = &self.orders[order_id];
             if order.market_id != market_id
                 || order.outcome != outcome
+                // The coordinator supplies a quantized publication boundary.
+                // Excluding later orders makes repeated reads for one boundary
+                // deterministic and prevents intra-bucket arrival inference.
+                || order.created_at_millis > now_millis
                 || is_expired(order, now_millis)
             {
                 continue;

@@ -1282,7 +1282,7 @@ fn rolling_zen_markets_handle_many_small_multi_user_trades_cancellation_and_lock
 }
 
 #[test]
-fn public_depth_hides_thin_levels_buckets_size_and_clears_at_market_close() {
+fn public_depth_hides_thin_levels_uses_fixed_marker_and_clears_at_market_close() {
     let journal_key = [211u8; 32];
     let mut core = PrivateTradingCore::new(
         JournalKey::from_bytes(journal_key),
@@ -1317,7 +1317,9 @@ fn public_depth_hides_thin_levels_buckets_size_and_clears_at_market_close() {
         (SigningKey::from_bytes(&[213u8; 32]), [214u8; 32]),
         (SigningKey::from_bytes(&[215u8; 32]), [216u8; 32]),
         (SigningKey::from_bytes(&[217u8; 32]), [218u8; 32]),
+        (SigningKey::from_bytes(&[219u8; 32]), [220u8; 32]),
     ];
+    let mut order_ids = Vec::new();
     for (index, (key, commitment)) in users.iter().enumerate() {
         let session_id = format!("session:privacy-depth:{index}");
         core.register_session(
@@ -1334,13 +1336,14 @@ fn public_depth_hides_thin_levels_buckets_size_and_clears_at_market_close() {
             *commitment,
             "USDC".into(),
             AccountBucket::UserAvailable,
-            10_000_000,
+            50_000_000,
             ExternalFlowDirection::Inflow,
             *commitment,
             950 + index as i64,
         )
         .unwrap();
-        execute_signed(
+        let quantity = if index == 3 { 40_000_000 } else { 10_000_000 };
+        let result = execute_signed(
             &mut core,
             key,
             &session_id,
@@ -1353,21 +1356,131 @@ fn public_depth_hides_thin_levels_buckets_size_and_clears_at_market_close() {
                     Outcome::Up,
                     OrderAction::Buy,
                     150_000,
-                    6_666_667,
+                    quantity,
                     TimeInForce::Gtc,
                     None,
                 ),
             },
-            1_100 + index as i64,
+            1_100 + index as i64 * 100,
         );
+        let order_id = match result {
+            CommandResult::Order { result } => result.accepted_order.unwrap().order_id,
+            _ => panic!("expected resting order"),
+        };
+        order_ids.push(order_id);
 
-        let (bids, _) = core.aggregate_depth(market_id, Outcome::Up, 1_500, 1_000_000);
+        // Multiple orders and sessions for one private owner do not satisfy
+        // the independent-contributor requirement. The identity commitment,
+        // not an order id or session alias, defines a contributor.
+        if index == 1 {
+            core.register_session(
+                "sys:session:privacy-depth:0:alias".into(),
+                "session:privacy-depth:0:alias".into(),
+                users[0].1,
+                users[0].0.verifying_key().to_bytes(),
+                10_000,
+                1_240,
+            )
+            .unwrap();
+            execute_signed(
+                &mut core,
+                &users[0].0,
+                "session:privacy-depth:0:alias",
+                1,
+                "cmd:privacy-depth:same-owner-second-order",
+                UserCommandAction::SubmitOrder {
+                    order: BookOrder::new(
+                        "ignored",
+                        market_id,
+                        Outcome::Up,
+                        OrderAction::Buy,
+                        150_000,
+                        10_000_000,
+                        TimeInForce::Gtc,
+                        None,
+                    ),
+                },
+                1_250,
+            );
+        }
+
+        let as_of = 1_100 + index as i64 * 100;
+        let (bids, _) = core.aggregate_depth(market_id, Outcome::Up, as_of, 1);
         if index < 2 {
             assert!(bids.is_empty(), "one or two owners must remain private");
         } else {
-            assert_eq!(bids, vec![(150_000, 20_000_000)]);
+            assert_eq!(bids, vec![(150_000, 25_000_000)]);
         }
     }
+
+    // A caller cannot lower the enclave's privacy floor or binary-search the
+    // aggregate by changing its request. Nor does a fourth maker change the
+    // public marker from the three-maker projection.
+    let canonical = (vec![(150_000, 25_000_000)], Vec::new());
+    for requested_threshold in [0, 1, 1_000_000, 25_000_000, u128::MAX] {
+        assert_eq!(
+            core.aggregate_depth(market_id, Outcome::Up, 1_500, requested_threshold),
+            canonical,
+        );
+    }
+    let observer_view = serde_json::to_string(&canonical).unwrap();
+    for private_value in ["40000000", "80000000", "usr_", "session:privacy-depth"] {
+        assert!(!observer_view.contains(private_value));
+    }
+
+    // The quantized as-of boundary is authoritative: the fourth order cannot
+    // appear in an earlier bucket, while repeated reads of that bucket are
+    // byte-for-byte stable and read-only.
+    let root_before_reads = core.state_root();
+    assert_eq!(
+        core.aggregate_depth(market_id, Outcome::Up, 1_299, 25_000_000),
+        (Vec::new(), Vec::new()),
+        "the third contributor must not appear before its cadence boundary",
+    );
+    assert_eq!(
+        core.aggregate_depth(market_id, Outcome::Up, 1_399, 25_000_000),
+        canonical,
+    );
+    assert_eq!(
+        core.aggregate_depth(market_id, Outcome::Up, 1_399, 1),
+        canonical,
+    );
+    assert_eq!(core.state_root(), root_before_reads);
+
+    // Cancellation of surplus liquidity above the privacy boundary cannot be
+    // observed as a size delta: the same constant marker remains visible.
+    execute_signed(
+        &mut core,
+        &users[3].0,
+        "session:privacy-depth:3",
+        2,
+        "cmd:privacy-depth:cancel-surplus",
+        UserCommandAction::CancelOrder {
+            market_id: market_id.into(),
+            order_id: order_ids[3],
+        },
+        1_600,
+    );
+    assert_eq!(
+        core.aggregate_depth(market_id, Outcome::Up, 1_600, 1),
+        canonical,
+    );
+
+    // Encrypted recovery preserves the private book and produces exactly the
+    // same privacy-safe public projection without changing the state root.
+    let snapshot = core.export_encrypted_snapshot().unwrap();
+    let restored = PrivateTradingCore::restore_encrypted_snapshot(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([221u8; 48]),
+        &snapshot,
+        snapshot.sequence,
+    )
+    .unwrap();
+    assert_eq!(restored.state_root(), core.state_root());
+    assert_eq!(
+        restored.aggregate_depth(market_id, Outcome::Up, 1_600, u128::MAX),
+        canonical,
+    );
 
     let (closed_bids, closed_asks) = core.aggregate_depth(market_id, Outcome::Up, 3_000, 1_000_000);
     assert!(closed_bids.is_empty());

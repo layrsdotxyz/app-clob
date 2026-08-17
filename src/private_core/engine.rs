@@ -27,6 +27,13 @@ use super::{
 /// from acting as an oracle for one user's exact order size and arrival time.
 const MIN_PUBLIC_DEPTH_DISTINCT_OWNERS: usize = 3;
 
+/// Public depth is a threshold signal, not a quantity feed. Keeping this floor
+/// inside the enclave prevents an operator from lowering the request value and
+/// binary-searching a private aggregate. Every qualifying level emits this
+/// same marker, so additions, partial fills, and cancellations above the floor
+/// do not disclose an individual order-size delta.
+const PUBLIC_DEPTH_QUANTITY_MARKER_MICROS: u128 = 25_000_000;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketConfig {
     pub market_id: String,
@@ -3389,7 +3396,7 @@ impl PrivateTradingCore {
         market_id: &str,
         outcome: Outcome,
         now_millis: i64,
-        minimum_level_quantity_micros: u128,
+        _minimum_level_quantity_micros: u128,
     ) -> (Vec<(u64, u128)>, Vec<(u64, u128)>) {
         let Some(market) = self.markets.get(market_id) else {
             return (Vec::new(), Vec::new());
@@ -3407,17 +3414,10 @@ impl PrivateTradingCore {
                     levels
                         .into_iter()
                         .filter(|(_, quantity, distinct_owners)| {
-                            *quantity >= minimum_level_quantity_micros
+                            *quantity >= PUBLIC_DEPTH_QUANTITY_MARKER_MICROS
                                 && *distinct_owners >= MIN_PUBLIC_DEPTH_DISTINCT_OWNERS
                         })
-                        .filter_map(|(price, quantity, _)| {
-                            // Publish only whole privacy buckets. Observers see
-                            // a bounded range, never the enclave's exact size.
-                            let bucketed = quantity
-                                .checked_div(minimum_level_quantity_micros)?
-                                .checked_mul(minimum_level_quantity_micros)?;
-                            (bucketed > 0).then_some((price, bucketed))
-                        })
+                        .map(|(price, _, _)| (price, PUBLIC_DEPTH_QUANTITY_MARKER_MICROS))
                         .collect()
                 };
                 (filter(bids), filter(asks))
