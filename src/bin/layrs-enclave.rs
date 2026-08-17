@@ -74,13 +74,18 @@ enum WireRequest {
     Attestation {
         nonce: Vec<u8>,
     },
-    Encrypted {
+    EncryptedUser {
         client_public_key: [u8; 32],
         nonce: [u8; 12],
         #[serde(with = "serde_bytes")]
         ciphertext: Vec<u8>,
-        #[serde(default)]
-        request_context: Option<EncryptedRequestContext>,
+        request_context: EncryptedRequestContext,
+    },
+    EncryptedOperator {
+        client_public_key: [u8; 32],
+        nonce: [u8; 12],
+        #[serde(with = "serde_bytes")]
+        ciphertext: Vec<u8>,
     },
 }
 
@@ -96,6 +101,11 @@ struct EncryptedRequestContext {
     expected_position_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_command_commitment: Option<String>,
+}
+
+enum EncryptedOuterContext {
+    User(EncryptedRequestContext),
+    Operator,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -640,7 +650,7 @@ async fn serve_connection(
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let response = match request {
         WireRequest::Attestation { nonce } => create_attestation(&state, nonce).await,
-        WireRequest::Encrypted {
+        WireRequest::EncryptedUser {
             client_public_key,
             nonce,
             ciphertext,
@@ -651,7 +661,21 @@ async fn serve_connection(
                 client_public_key,
                 nonce,
                 ciphertext,
-                request_context,
+                EncryptedOuterContext::User(request_context),
+            )
+            .await
+        }
+        WireRequest::EncryptedOperator {
+            client_public_key,
+            nonce,
+            ciphertext,
+        } => {
+            handle_encrypted(
+                &state,
+                client_public_key,
+                nonce,
+                ciphertext,
+                EncryptedOuterContext::Operator,
             )
             .await
         }
@@ -696,7 +720,7 @@ async fn handle_encrypted(
     client_public_key: [u8; 32],
     nonce: [u8; 12],
     ciphertext: Vec<u8>,
-    request_context: Option<EncryptedRequestContext>,
+    request_context: EncryptedOuterContext,
 ) -> WireResponse {
     let mut state = state.lock().await;
     let mut replay_key = [0u8; 44];
@@ -740,7 +764,7 @@ async fn handle_encrypted(
     // Consume a successfully decrypted transport nonce even when the outer API
     // context is wrong. This prevents the generic mismatch response becoming
     // an oracle that can be probed repeatedly against one private command.
-    if validate_request_context(&request, request_context.as_ref()).is_err() {
+    if validate_request_context(&request, &request_context).is_err() {
         return WireResponse::Error {
             code: "PRIVATE_COMMAND_CONTEXT_MISMATCH",
         };
@@ -898,13 +922,22 @@ fn pad_private_response(mut encoded: Vec<u8>) -> io::Result<Vec<u8>> {
 
 fn validate_request_context(
     request: &PlainRequest,
-    context: Option<&EncryptedRequestContext>,
+    context: &EncryptedOuterContext,
 ) -> Result<(), ()> {
-    let Some(context) = context else {
-        return Ok(());
-    };
-    let PlainRequest::User { command, .. } = request else {
-        return Err(());
+    let (PlainRequest::User { command, .. }, EncryptedOuterContext::User(context)) =
+        (request, context)
+    else {
+        return if matches!(
+            (request, context),
+            (
+                PlainRequest::Operator { .. },
+                EncryptedOuterContext::Operator
+            )
+        ) {
+            Ok(())
+        } else {
+            Err(())
+        };
     };
     let (actual_action, actual_order_id, actual_position_id, actual_session_tag) =
         match &command.action {
@@ -2807,6 +2840,42 @@ mod tests {
     use clob_service::private_core::FeeProfileId;
     use serde_cbor::Value;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn encrypted_wire_request_requires_command_context() {
+        let without_context = serde_json::json!({
+            "type": "ENCRYPTED_USER",
+            "client_public_key": vec![1u8; 32],
+            "nonce": vec![2u8; 12],
+            "ciphertext": vec![3u8; 32],
+        });
+        assert!(serde_json::from_value::<WireRequest>(without_context).is_err());
+    }
+
+    #[test]
+    fn encrypted_outer_context_cannot_cross_user_operator_boundary() {
+        let operator = PlainRequest::Operator {
+            envelope: OperatorEnvelope {
+                nonce: [0x42; 32],
+                command: OperatorCommand::ProvisionStatus,
+                signature: vec![0x24; 64],
+            },
+        };
+        let user_context = EncryptedRequestContext {
+            idempotency_key: "order:submit:context-boundary".into(),
+            expected_action: ExpectedEncryptedAction::Submit,
+            expected_order_id: None,
+            expected_position_id: None,
+            expected_session_tags: vec![],
+            expected_command_commitment: None,
+        };
+
+        assert!(
+            validate_request_context(&operator, &EncryptedOuterContext::User(user_context))
+                .is_err()
+        );
+        assert!(validate_request_context(&operator, &EncryptedOuterContext::Operator).is_ok());
+    }
 
     #[test]
     fn replay_cache_rejects_duplicate_keys() {

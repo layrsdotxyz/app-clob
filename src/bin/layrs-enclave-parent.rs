@@ -60,13 +60,18 @@ enum WireRequest {
     Attestation {
         nonce: Vec<u8>,
     },
-    Encrypted {
+    EncryptedUser {
         client_public_key: [u8; 32],
         nonce: [u8; 12],
         #[serde(with = "serde_bytes")]
         ciphertext: Vec<u8>,
-        #[serde(default)]
-        request_context: Option<EncryptedRequestContext>,
+        request_context: EncryptedRequestContext,
+    },
+    EncryptedOperator {
+        client_public_key: [u8; 32],
+        nonce: [u8; 12],
+        #[serde(with = "serde_bytes")]
+        ciphertext: Vec<u8>,
     },
 }
 
@@ -145,8 +150,16 @@ struct PrivateEnvelope {
     client_public_key: String,
     nonce: String,
     ciphertext: String,
-    #[serde(default)]
-    request_context: Option<EncryptedRequestContext>,
+    request_context: EncryptedRequestContext,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PrivateOperatorEnvelope {
+    protocol_version: String,
+    client_public_key: String,
+    nonce: String,
+    ciphertext: String,
 }
 
 #[derive(Serialize)]
@@ -200,6 +213,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(healthz))
         .route("/v1/attestation", get(attestation))
         .route("/v1/private/relay", post(relay))
+        .route("/v1/private/operator-relay", post(operator_relay))
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         // Snapshot artifacts are ciphertext and are serialized as JSON byte
         // arrays on the parent boundary. Compression prevents a valid private
@@ -329,20 +343,81 @@ async fn relay(State(state): State<AppState>, Json(envelope): Json<PrivateEnvelo
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
-    if envelope
-        .request_context
-        .as_ref()
-        .is_some_and(|context| !valid_request_context(context))
-    {
+    if !valid_request_context(&envelope.request_context) {
         return gateway_error(StatusCode::BAD_REQUEST, "INVALID_COMMAND_CONTEXT").into_response();
     }
     match exchange(
         &state,
-        WireRequest::Encrypted {
+        WireRequest::EncryptedUser {
             client_public_key,
             nonce,
             ciphertext,
             request_context: envelope.request_context,
+        },
+    )
+    .await
+    {
+        Ok(WireResponse::Encrypted {
+            nonce,
+            ciphertext,
+            journal_artifacts,
+            snapshot_artifacts,
+            receipt_artifacts,
+            audit_artifacts,
+            task_artifacts,
+        }) => Json(PrivateResponseEnvelope {
+            protocol_version: "layrs.v1",
+            client_public_key: envelope.client_public_key,
+            nonce: URL_SAFE_NO_PAD.encode(nonce),
+            ciphertext: URL_SAFE_NO_PAD.encode(ciphertext),
+            journal_artifacts,
+            snapshot_artifacts,
+            receipt_artifacts,
+            audit_artifacts,
+            task_artifacts,
+        })
+        .into_response(),
+        Ok(WireResponse::Error { code }) => {
+            gateway_error(StatusCode::UNPROCESSABLE_ENTITY, &code).into_response()
+        }
+        Ok(_) => {
+            gateway_error(StatusCode::BAD_GATEWAY, "UNEXPECTED_ENCLAVE_RESPONSE").into_response()
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn operator_relay(
+    State(state): State<AppState>,
+    Json(envelope): Json<PrivateOperatorEnvelope>,
+) -> Response {
+    if envelope.protocol_version != "layrs.v1" {
+        return gateway_error(StatusCode::BAD_REQUEST, "UNSUPPORTED_PROTOCOL").into_response();
+    }
+    let client_public_key: [u8; 32] =
+        match decode_fixed(&envelope.client_public_key, "INVALID_CLIENT_KEY") {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    let nonce: [u8; 12] = match decode_fixed(&envelope.nonce, "INVALID_ENVELOPE_NONCE") {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    let ciphertext = match decode_bounded(
+        &envelope.ciphertext,
+        17,
+        MAX_FRAME_BYTES - 512,
+        "INVALID_CIPHERTEXT",
+    ) {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    match exchange(
+        &state,
+        WireRequest::EncryptedOperator {
+            client_public_key,
+            nonce,
+            ciphertext,
         },
     )
     .await
@@ -542,25 +617,25 @@ mod tests {
     #[test]
     fn vsock_wire_encoding_does_not_expand_checkpoint_ciphertext() {
         let ciphertext = vec![0xabu8; 20 * 1024 * 1024];
-        let request = WireRequest::Encrypted {
+        let request = WireRequest::EncryptedUser {
             client_public_key: [7; 32],
             nonce: [9; 12],
             ciphertext,
-            request_context: Some(EncryptedRequestContext {
+            request_context: EncryptedRequestContext {
                 idempotency_key: "order:create:1234".into(),
                 expected_action: ExpectedEncryptedAction::Submit,
                 expected_session_tags: vec![URL_SAFE_NO_PAD.encode([8u8; 32])],
                 expected_order_id: None,
                 expected_position_id: None,
                 expected_command_commitment: None,
-            }),
+            },
         };
         let encoded = serde_cbor::to_vec(&request).expect("wire request encodes");
         assert!(encoded.len() < 21 * 1024 * 1024);
         assert!(encoded.len() < MAX_FRAME_BYTES);
         let decoded: WireRequest = serde_cbor::from_slice(&encoded).expect("wire request decodes");
         match decoded {
-            WireRequest::Encrypted { ciphertext, .. } => {
+            WireRequest::EncryptedUser { ciphertext, .. } => {
                 assert_eq!(ciphertext.len(), 20 * 1024 * 1024);
                 assert_eq!(ciphertext[0], 0xab);
             }
@@ -645,6 +720,34 @@ mod tests {
             expected_session_tags: vec!["not-a-tag".into()],
             ..valid
         }));
+    }
+
+    #[test]
+    fn private_relay_envelope_requires_command_context() {
+        let without_context = serde_json::json!({
+            "protocolVersion": "layrs.v1",
+            "clientPublicKey": URL_SAFE_NO_PAD.encode([1u8; 32]),
+            "nonce": URL_SAFE_NO_PAD.encode([2u8; 12]),
+            "ciphertext": URL_SAFE_NO_PAD.encode([3u8; 32]),
+        });
+        assert!(serde_json::from_value::<super::PrivateEnvelope>(without_context).is_err());
+    }
+
+    #[test]
+    fn operator_relay_is_explicit_and_rejects_user_context() {
+        let operator = serde_json::json!({
+            "protocolVersion": "layrs.v1",
+            "clientPublicKey": URL_SAFE_NO_PAD.encode([1u8; 32]),
+            "nonce": URL_SAFE_NO_PAD.encode([2u8; 12]),
+            "ciphertext": URL_SAFE_NO_PAD.encode([3u8; 32]),
+        });
+        assert!(serde_json::from_value::<super::PrivateOperatorEnvelope>(operator.clone()).is_ok());
+        let mut with_context = operator;
+        with_context.as_object_mut().unwrap().insert(
+            "requestContext".into(),
+            serde_json::json!({ "idempotencyKey": "order:create:1234" }),
+        );
+        assert!(serde_json::from_value::<super::PrivateOperatorEnvelope>(with_context).is_err());
     }
 
     #[tokio::test]
