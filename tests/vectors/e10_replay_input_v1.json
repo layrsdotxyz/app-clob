@@ -1,0 +1,80 @@
+{
+  "version": "layrs.deterministic-replay.v1",
+  "journalKeyByte": 31,
+  "receiptSeedByte": 36,
+  "oracleKeyByte": 39,
+  "market": {
+    "marketId": "layrs:v3:ZEN:15m:2000",
+    "feeProfile": "LAYRS_CRYPTO_V2",
+    "settlementAsset": "ZEN",
+    "settlementDecimals": 18,
+    "opensAtMillis": 900,
+    "closesAtMillis": 2000
+  },
+  "users": [
+    {
+      "label": "up",
+      "signingKeyByte": 32,
+      "identityCommitmentByte": 34,
+      "sessionId": "session:up",
+      "depositAtomic": "1000000000000000000"
+    },
+    {
+      "label": "down",
+      "signingKeyByte": 33,
+      "identityCommitmentByte": 35,
+      "sessionId": "session:down",
+      "depositAtomic": "1000000000000000000"
+    }
+  ],
+  "commands": [
+    {
+      "commandId": "cmd:vector:mint-maker",
+      "user": "up",
+      "sequence": 1,
+      "nowMillis": 1000,
+      "orderId": "00000000-0000-0000-0000-000000000384",
+      "outcome": "UP",
+      "action": "BUY",
+      "priceMicros": 400000,
+      "quantityMicros": "1000000",
+      "timeInForce": "GTC"
+    },
+    {
+      "commandId": "cmd:vector:mint-taker",
+      "user": "down",
+      "sequence": 1,
+      "nowMillis": 1050,
+      "orderId": "00000000-0000-0000-0000-000000000385",
+      "outcome": "DOWN",
+      "action": "BUY",
+      "priceMicros": 600000,
+      "quantityMicros": "1000000",
+      "timeInForce": "FOK"
+    },
+    {
+      "commandId": "cmd:vector:merge-maker",
+      "user": "up",
+      "sequence": 2,
+      "nowMillis": 1100,
+      "orderId": "00000000-0000-0000-0000-000000000386",
+      "outcome": "UP",
+      "action": "SELL",
+      "priceMicros": 400000,
+      "quantityMicros": "1000000",
+      "timeInForce": "GTC"
+    },
+    {
+      "commandId": "cmd:vector:merge-taker",
+      "user": "down",
+      "sequence": 2,
+      "nowMillis": 1150,
+      "orderId": "00000000-0000-0000-0000-000000000387",
+      "outcome": "DOWN",
+      "action": "SELL",
+      "priceMicros": 600000,
+      "quantityMicros": "1000000",
+      "timeInForce": "FOK"
+    }
+  ]
+}

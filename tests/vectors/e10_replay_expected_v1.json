@@ -1,0 +1,65 @@
+{
+  "version": "layrs.deterministic-replay.v1",
+  "setupStateRoot": "0ecdee4280b2ff82b02a0ef0594fb7120f3b599eac3fd29afe723467f1b36977",
+  "commands": [
+    {
+      "commandId": "cmd:vector:mint-maker",
+      "stateRoot": "67792c6a4267c6ee66e8f3e1e322a35347d669c9dac6e46ad5b5850dc4f6d3e6",
+      "feeRevenueAtomic": "0",
+      "fills": []
+    },
+    {
+      "commandId": "cmd:vector:mint-taker",
+      "stateRoot": "cb34be5a3a67b8c0269e412114c3ba3aa00f3f63a3e5563fb144f0a685ddc33e",
+      "feeRevenueAtomic": "16800000000000000",
+      "fills": [
+        {
+          "fillId": "ad084248-0572-5570-b625-8d69810317aa",
+          "makerOrderId": "00000000-0000-0000-0000-000000000384",
+          "takerOrderId": "00000000-0000-0000-0000-000000000385",
+          "outcome": "DOWN",
+          "matchType": "MINT",
+          "priceMicros": 400000,
+          "takerPriceMicros": 600000,
+          "quantityMicros": "1000000",
+          "sequence": 3,
+          "feeAtomic": "16800000000000000"
+        }
+      ]
+    },
+    {
+      "commandId": "cmd:vector:merge-maker",
+      "stateRoot": "37620bf14629b0da6dc102d70caf7393c4a77477b90d1c14e5165fccff9985ef",
+      "feeRevenueAtomic": "16800000000000000",
+      "fills": []
+    },
+    {
+      "commandId": "cmd:vector:merge-taker",
+      "stateRoot": "b9966c76d4f8732d883dd0c987d959c453ba6f73c51ae6cf3c736198a14fc759",
+      "feeRevenueAtomic": "33600000000000000",
+      "fills": [
+        {
+          "fillId": "803a0cdf-ea9f-5652-a266-df402440488a",
+          "makerOrderId": "00000000-0000-0000-0000-000000000386",
+          "takerOrderId": "00000000-0000-0000-0000-000000000387",
+          "outcome": "DOWN",
+          "matchType": "MERGE",
+          "priceMicros": 400000,
+          "takerPriceMicros": 600000,
+          "quantityMicros": "1000000",
+          "sequence": 6,
+          "feeAtomic": "16800000000000000"
+        }
+      ]
+    }
+  ],
+  "finalStateRoot": "b9966c76d4f8732d883dd0c987d959c453ba6f73c51ae6cf3c736198a14fc759",
+  "finalBalances": {
+    "upAvailableAtomic": "1000000000000000000",
+    "downAvailableAtomic": "966400000000000000",
+    "feeRevenueAtomic": "33600000000000000",
+    "marketCollateralAtomic": "0",
+    "upClaimMicros": "0",
+    "downClaimMicros": "0"
+  }
+}
