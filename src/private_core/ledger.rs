@@ -193,6 +193,22 @@ pub struct ClaimPayout {
     pub winning_fee_atomic: u128,
 }
 
+/// Financial interpretation of a terminal market result.
+///
+/// `Invalid` is intentionally a ledger-only distinction. Public settlement
+/// contracts encode an exposed invalid market as the governed `PUSH_REFUND`
+/// outcome, while a zero-exposure market may be marked INVALIDATED without a
+/// payout. Keeping the distinction here lets accounting tests prove that both
+/// void paths refund symmetrically and never charge a winning fee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ResolutionPayoutKind {
+    Up,
+    Down,
+    Push,
+    Invalid,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Ledger {
     balances: BTreeMap<AccountKey, u128>,
@@ -827,22 +843,87 @@ impl Ledger {
         &mut self,
         idempotency_key: String,
         business_reference: String,
+        resolution_evidence_hash: [u8; 32],
+        payout_kind: ResolutionPayoutKind,
         collateral: AccountKey,
         fee_revenue: AccountKey,
         payouts: Vec<ClaimPayout>,
     ) -> CoreResult<AppliedLedgerTransaction> {
-        if payouts.is_empty() || self.applied_idempotency_keys.contains(&idempotency_key) {
+        if payouts.is_empty()
+            || resolution_evidence_hash == [0u8; 32]
+            || self.applied_idempotency_keys.contains(&idempotency_key)
+        {
             return Err(if payouts.is_empty() {
                 CoreError::ZeroAmount
+            } else if resolution_evidence_hash == [0u8; 32] {
+                CoreError::InvalidResolution("resolution payout evidence is required".into())
             } else {
                 CoreError::DuplicateCommand
             });
         }
+        let evidence_replay_key = format!(
+            "resolution-payout-evidence:{}",
+            hex::encode(resolution_evidence_hash)
+        );
+        if self.applied_idempotency_keys.contains(&evidence_replay_key) {
+            return Err(CoreError::DuplicateCommand);
+        }
+        let market_id = collateral
+            .market_id
+            .as_deref()
+            .ok_or(CoreError::UnbalancedTransaction)?;
+        if collateral.bucket != AccountBucket::MarketCollateral
+            || collateral.owner != "layrs"
+            || collateral.outcome.is_some()
+            || fee_revenue.bucket != AccountBucket::FeeRevenue
+            || fee_revenue.owner != "layrs"
+            || fee_revenue.asset != collateral.asset
+            || fee_revenue.market_id.is_some()
+            || fee_revenue.outcome.is_some()
+        {
+            return Err(CoreError::UnbalancedTransaction);
+        }
         let prior_state_root = self.state_root();
         let mut next = self.balances.clone();
+        let mut transfers = Vec::with_capacity(payouts.len() * 2);
+        let mut postings = Vec::with_capacity(payouts.len() * 4);
         for payout in &payouts {
             if payout.claim_quantity_micros == 0
                 || payout.winning_fee_atomic > payout.gross_payout_atomic
+            {
+                return Err(CoreError::UnbalancedTransaction);
+            }
+            let claim_outcome = payout
+                .claim_account
+                .outcome
+                .as_deref()
+                .ok_or(CoreError::UnbalancedTransaction)?;
+            let claim_is_winner = matches!(
+                (payout_kind, claim_outcome),
+                (ResolutionPayoutKind::Up, "UP") | (ResolutionPayoutKind::Down, "DOWN")
+            );
+            let valid_payout_shape = match payout_kind {
+                ResolutionPayoutKind::Up | ResolutionPayoutKind::Down => {
+                    (claim_is_winner && payout.gross_payout_atomic > 0)
+                        || (!claim_is_winner && payout.gross_payout_atomic == 0)
+                }
+                ResolutionPayoutKind::Push | ResolutionPayoutKind::Invalid => {
+                    payout.gross_payout_atomic > 0 && payout.winning_fee_atomic == 0
+                }
+            };
+            let expected_claim_asset = format!("CLAIM:{market_id}:{claim_outcome}");
+            if !matches!(claim_outcome, "UP" | "DOWN")
+                || !valid_payout_shape
+                || payout.claim_account.bucket != AccountBucket::UserPosition
+                || payout.claim_account.owner.is_empty()
+                || payout.claim_account.owner == "layrs"
+                || payout.claim_account.asset != expected_claim_asset
+                || payout.claim_account.market_id.as_deref() != Some(market_id)
+                || payout.destination.bucket != AccountBucket::UserAvailable
+                || payout.destination.owner != payout.claim_account.owner
+                || payout.destination.asset != collateral.asset
+                || payout.destination.market_id.is_some()
+                || payout.destination.outcome.is_some()
             {
                 return Err(CoreError::UnbalancedTransaction);
             }
@@ -851,18 +932,60 @@ impl Ledger {
                 &payout.claim_account,
                 payout.claim_quantity_micros,
             )?;
+            postings.push(posting(
+                &payout.claim_account,
+                PostingSide::Debit,
+                payout.claim_quantity_micros,
+            ));
             if payout.gross_payout_atomic > 0 {
                 debit(&mut next, &collateral, payout.gross_payout_atomic)?;
                 let net = payout.gross_payout_atomic - payout.winning_fee_atomic;
+                postings.push(posting(
+                    &collateral,
+                    PostingSide::Debit,
+                    payout.gross_payout_atomic,
+                ));
                 if net > 0 {
                     credit(&mut next, &payout.destination, net)?;
+                    transfers.push(Transfer {
+                        from: collateral.clone(),
+                        to: payout.destination.clone(),
+                        amount: net,
+                    });
+                    postings.push(posting(&payout.destination, PostingSide::Credit, net));
                 }
                 if payout.winning_fee_atomic > 0 {
                     credit(&mut next, &fee_revenue, payout.winning_fee_atomic)?;
+                    transfers.push(Transfer {
+                        from: collateral.clone(),
+                        to: fee_revenue.clone(),
+                        amount: payout.winning_fee_atomic,
+                    });
+                    postings.push(posting(
+                        &fee_revenue,
+                        PostingSide::Credit,
+                        payout.winning_fee_atomic,
+                    ));
                 }
             }
         }
-        self.commit_special(idempotency_key, business_reference, prior_state_root, next)
+        self.balances = next;
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(CoreError::UnbalancedTransaction)?;
+        self.applied_idempotency_keys
+            .insert(idempotency_key.clone());
+        self.applied_idempotency_keys.insert(evidence_replay_key);
+        Ok(AppliedLedgerTransaction {
+            sequence: self.sequence,
+            idempotency_key,
+            business_reference,
+            prior_state_root,
+            state_root: self.state_root(),
+            transfers,
+            postings,
+        })
     }
 
     pub fn positions_for_market(&self, market_id: &str) -> Vec<(AccountKey, u128)> {

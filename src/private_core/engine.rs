@@ -18,7 +18,7 @@ use super::{
     EncryptedJournal, EncryptedJournalRecord, EncryptedSnapshot, ExternalFlowDirection,
     ExternalFlowTransaction, Fill, JournalKey, Ledger, LedgerTransaction, MatchResult, MatchType,
     NormalFillPosting, OrderAction, OrderStatus, Outcome, PriceTimeBook, ReceiptSigner,
-    SessionGuard, SignedSessionRequest, Transfer, PRICE_SCALE,
+    ResolutionPayoutKind, SessionGuard, SignedSessionRequest, Transfer, PRICE_SCALE,
 };
 
 /// Public depth is deliberately less precise than the enclave's private book.
@@ -2087,6 +2087,12 @@ impl PrivateTradingCore {
             ));
         }
         let outcome = resolution.outcome;
+        let payout_evidence_hash = resolution_payout_evidence_hash(&resolution)?;
+        let payout_kind = match outcome {
+            ResolutionOutcome::Up => ResolutionPayoutKind::Up,
+            ResolutionOutcome::Down => ResolutionPayoutKind::Down,
+            ResolutionOutcome::Push => ResolutionPayoutKind::Push,
+        };
 
         let prior_root = self.state_root();
         let mut ledger = self.ledger.clone();
@@ -2175,6 +2181,8 @@ impl PrivateTradingCore {
             ledger.apply_claim_payouts(
                 format!("resolution-payout:{idempotency_key}"),
                 market.market_id.clone(),
+                payout_evidence_hash,
+                payout_kind,
                 collateral.clone(),
                 AccountKey::new("layrs", AccountBucket::FeeRevenue, &market.settlement_asset),
                 payouts,
@@ -3628,6 +3636,20 @@ fn system_command_commitment(command: &JournaledSystemCommand) -> CoreResult<[u8
     let encoded = serde_json::to_vec(command).map_err(|_| CoreError::RequestHashMismatch)?;
     let mut hash = Sha256::new();
     hash.update(b"layrs.system-command.v1\0");
+    hash.update((encoded.len() as u64).to_be_bytes());
+    hash.update(encoded);
+    Ok(hash.finalize().into())
+}
+
+/// Stable replay identity for the financial payout caused by signed resolution evidence.
+/// This is deliberately independent of the operator-supplied command idempotency key: if the
+/// enclave committed the payout but its response was lost, a redispatch with a new key cannot
+/// debit market collateral a second time.
+fn resolution_payout_evidence_hash(resolution: &MarketResolution) -> CoreResult<[u8; 32]> {
+    let encoded = serde_json::to_vec(resolution)
+        .map_err(|_| CoreError::InvalidResolution("cannot encode payout evidence".into()))?;
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.resolution-payout.v1\0");
     hash.update((encoded.len() as u64).to_be_bytes());
     hash.update(encoded);
     Ok(hash.finalize().into())
