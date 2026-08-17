@@ -363,6 +363,7 @@ enum OperatorCommand {
 enum DelegatedReadProjection {
     Balances,
     Positions,
+    Portfolio,
     ActiveOrders,
 }
 
@@ -371,6 +372,7 @@ impl DelegatedReadProjection {
         match self {
             Self::Balances => "balances:read",
             Self::Positions => "positions:read",
+            Self::Portfolio => "account:read",
             Self::ActiveOrders => "orders:read",
         }
     }
@@ -379,6 +381,7 @@ impl DelegatedReadProjection {
         match self {
             Self::Balances => "BALANCES",
             Self::Positions => "POSITIONS",
+            Self::Portfolio => "PORTFOLIO",
             Self::ActiveOrders => "ACTIVE_ORDERS",
         }
     }
@@ -1713,6 +1716,10 @@ async fn dispatch_operator(
             let items = match projection {
                 DelegatedReadProjection::Balances => serde_json::to_value(snapshot.balances),
                 DelegatedReadProjection::Positions => serde_json::to_value(snapshot.positions),
+                DelegatedReadProjection::Portfolio => serde_json::to_value(serde_json::json!({
+                    "balances": snapshot.balances,
+                    "positions": snapshot.positions,
+                })),
                 DelegatedReadProjection::ActiveOrders => serde_json::to_value(
                     snapshot
                         .orders
@@ -2743,6 +2750,17 @@ mod tests {
             now,
         )
         .is_ok());
+        assert!(validate_delegated_read_authorization(
+            DelegatedReadProjection::Portfolio,
+            "production",
+            "https://api.layrs.xyz/mcp",
+            "account:read",
+            now - 1_000,
+            now + 60_000,
+            now,
+            now,
+        )
+        .is_ok());
         assert_eq!(
             validate_delegated_read_authorization(
                 DelegatedReadProjection::Positions,
@@ -2874,6 +2892,83 @@ mod tests {
                 },
             )
             .is_err());
+    }
+
+    #[test]
+    fn delegated_portfolio_envelope_keeps_balances_and_positions_atomic_and_recipient_only() {
+        let recipient_secret = StaticSecret::random();
+        let recipient_public = PublicKey::from(&recipient_secret).to_bytes();
+        let request_id = uuid::Uuid::from_u128(21);
+        let api_key_id = uuid::Uuid::from_u128(22);
+        let capability_jti = uuid::Uuid::from_u128(23);
+        let capability_digest = [24u8; 32];
+        let expires_at_millis = 1_700_000_060_000;
+        let plaintext = DelegatedReadPlaintext {
+            protocol_version: "layrs.delegated-private-read.v1",
+            request_id,
+            projection: "PORTFOLIO",
+            enclave_sequence: "29".into(),
+            as_of_millis: 1_700_000_000_000,
+            items: serde_json::json!({
+                "balances": [{"asset":"USDC","bucket":"USER_AVAILABLE","amount_atomic":"5000000"}],
+                "positions": [{"market_id":"market-1","outcome":"UP","quantity_micros":"2500000","cost_basis_micros":"1000000"}],
+            }),
+        };
+        let envelope = encrypt_delegated_read(
+            &plaintext,
+            recipient_public,
+            DelegatedReadProjection::Portfolio,
+            api_key_id,
+            capability_jti,
+            capability_digest,
+            expires_at_millis,
+        )
+        .expect("portfolio envelope");
+        let shared =
+            recipient_secret.diffie_hellman(&PublicKey::from(envelope.ephemeral_public_key));
+        let key: [u8; 32] = {
+            let mut hash = Sha256::new();
+            hash.update(b"layrs.delegated-private-read.key.v1\0");
+            hash.update(shared.as_bytes());
+            hash.update(request_id.as_bytes());
+            hash.update(api_key_id.as_bytes());
+            hash.update(capability_jti.as_bytes());
+            hash.update(capability_digest);
+            hash.update(recipient_public);
+            hash.update(envelope.ephemeral_public_key);
+            hash.finalize().into()
+        };
+        let aad = delegated_read_aad(
+            request_id,
+            DelegatedReadProjection::Portfolio,
+            api_key_id,
+            capability_jti,
+            capability_digest,
+            recipient_public,
+            envelope.ephemeral_public_key,
+            expires_at_millis,
+        );
+        let decoded = Aes256Gcm::new_from_slice(&key)
+            .unwrap()
+            .decrypt(
+                Nonce::from_slice(&envelope.nonce),
+                aes_gcm::aead::Payload {
+                    msg: &envelope.ciphertext,
+                    aad: &aad,
+                },
+            )
+            .expect("recipient decrypts atomic portfolio");
+        let value: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(value["projection"], "PORTFOLIO");
+        assert_eq!(value["enclaveSequence"], "29");
+        assert_eq!(value["asOfMillis"], 1_700_000_000_000i64);
+        assert_eq!(value["items"]["balances"][0]["amount_atomic"], "5000000");
+        assert_eq!(value["items"]["positions"][0]["quantity_micros"], "2500000");
+
+        let wrong_secret = StaticSecret::random();
+        let wrong_shared =
+            wrong_secret.diffie_hellman(&PublicKey::from(envelope.ephemeral_public_key));
+        assert_ne!(wrong_shared.as_bytes(), shared.as_bytes());
     }
 
     #[test]
