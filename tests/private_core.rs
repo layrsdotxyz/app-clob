@@ -3,8 +3,8 @@ use clob_service::private_core::{
     signing_payload, AccountBucket, AccountKey, BookOrder, BoundaryEvidence, CommandResult,
     CompleteSetDirection, CoreError, EncryptedJournal, ExternalFlowDirection, FeeProfileId,
     JournalKey, Ledger, LedgerTransaction, MarketConfig, MarketExecution, OrderAction, OrderStatus,
-    Outcome, PolymarketResolutionStatement, PriceTimeBook, PrivateTradingCore, ReceiptSigner,
-    ResolutionOutcome, ResolutionStatement, SessionGuard, SessionRequest,
+    Outcome, PolymarketResolutionStatement, PostingSide, PriceTimeBook, PrivateTradingCore,
+    ReceiptSigner, ResolutionOutcome, ResolutionStatement, SessionGuard, SessionRequest,
     SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence, SignedSessionRequest,
     TimeInForce, Transfer, UserCommand, UserCommandAction,
 };
@@ -49,6 +49,13 @@ fn ledger_is_atomic_conservative_and_idempotent() {
     assert_eq!(ledger.balance(&hold), 400);
     assert_eq!(ledger.total_for_asset("ZEN"), total_before);
     assert_ne!(applied.prior_state_root, applied.state_root);
+    assert_eq!(applied.postings.len(), 2);
+    assert_eq!(applied.postings[0].account, user);
+    assert_eq!(applied.postings[0].side, PostingSide::Debit);
+    assert_eq!(applied.postings[0].amount, 400);
+    assert_eq!(applied.postings[1].account, hold);
+    assert_eq!(applied.postings[1].side, PostingSide::Credit);
+    assert_eq!(applied.postings[1].amount, 400);
 
     let duplicate = ledger.apply(LedgerTransaction {
         idempotency_key: "order:reserve:001".into(),
@@ -91,6 +98,206 @@ fn insufficient_transfer_does_not_partially_mutate_ledger() {
     assert_eq!(ledger.balance(&first), 0);
     assert_eq!(ledger.balance(&second), 0);
     assert_eq!(ledger.state_root(), root_before);
+}
+
+#[test]
+fn order_hold_postings_are_atomic_exact_and_race_safe() {
+    let user = AccountKey::new("usr_hold", AccountBucket::UserAvailable, "USDC");
+    let mut hold = AccountKey::new("usr_hold", AccountBucket::UserOrderHold, "USDC");
+    hold.market_id = Some("layrs:v5:BTC:USDC:15m:1".into());
+    hold.outcome = Some("UP".into());
+    let mut collateral = AccountKey::new("layrs", AccountBucket::MarketCollateral, "USDC");
+    collateral.market_id = hold.market_id.clone();
+
+    let mut ledger = Ledger::default();
+    ledger.seed_balance(user.clone(), 1_000).unwrap();
+    let reserve = ledger
+        .apply(LedgerTransaction {
+            idempotency_key: "order-hold:reserve:1".into(),
+            business_reference: "private-order:1".into(),
+            transfers: vec![Transfer {
+                from: user.clone(),
+                to: hold.clone(),
+                amount: 700,
+            }],
+        })
+        .unwrap();
+    assert_eq!(ledger.balance(&user), 300);
+    assert_eq!(ledger.balance(&hold), 700);
+    assert_balanced_postings(&reserve, 700);
+
+    let partial_fill = ledger
+        .apply(LedgerTransaction {
+            idempotency_key: "order-hold:partial-fill:1".into(),
+            business_reference: "private-fill:1".into(),
+            transfers: vec![Transfer {
+                from: hold.clone(),
+                to: collateral.clone(),
+                amount: 250,
+            }],
+        })
+        .unwrap();
+    assert_eq!(ledger.balance(&hold), 450);
+    assert_balanced_postings(&partial_fill, 250);
+
+    let release = ledger
+        .apply(LedgerTransaction {
+            idempotency_key: "order-hold:cancel:1".into(),
+            business_reference: "private-order:1".into(),
+            transfers: vec![Transfer {
+                from: hold.clone(),
+                to: user.clone(),
+                amount: 450,
+            }],
+        })
+        .unwrap();
+    assert_eq!(ledger.balance(&hold), 0);
+    assert_eq!(ledger.balance(&user), 750);
+    assert_eq!(ledger.balance(&collateral), 250);
+    assert_eq!(ledger.total_for_asset("USDC"), 1_000);
+    assert_balanced_postings(&release, 450);
+
+    // The command replay cannot reserve a second time, even after the order's
+    // remaining hold has been released.
+    let root = ledger.state_root();
+    assert_eq!(
+        ledger
+            .apply(LedgerTransaction {
+                idempotency_key: "order-hold:reserve:1".into(),
+                business_reference: "private-order:1".into(),
+                transfers: vec![Transfer {
+                    from: user.clone(),
+                    to: hold.clone(),
+                    amount: 700
+                }],
+            })
+            .unwrap_err(),
+        CoreError::DuplicateCommand
+    );
+    assert_eq!(ledger.state_root(), root);
+
+    // A one-atomic-unit remainder remains representable and releases exactly;
+    // no settlement-precision dust is rounded into or out of the hold bucket.
+    let dust_reserve = ledger
+        .apply(LedgerTransaction {
+            idempotency_key: "order-hold:dust-reserve".into(),
+            business_reference: "private-order:dust".into(),
+            transfers: vec![Transfer {
+                from: user.clone(),
+                to: hold.clone(),
+                amount: 1,
+            }],
+        })
+        .unwrap();
+    assert_balanced_postings(&dust_reserve, 1);
+    ledger
+        .apply(LedgerTransaction {
+            idempotency_key: "order-hold:dust-release".into(),
+            business_reference: "private-order:dust".into(),
+            transfers: vec![Transfer {
+                from: hold.clone(),
+                to: user.clone(),
+                amount: 1,
+            }],
+        })
+        .unwrap();
+    assert_eq!(ledger.balance(&hold), 0);
+
+    // Cancel and full-fill are mutually exclusive consumers of the same hold.
+    // Whichever serializable transition wins leaves the loser unable to debit
+    // the now-zero bucket, with no partial state mutation.
+    let mut race_base = Ledger::default();
+    race_base.seed_balance(user.clone(), 100).unwrap();
+    race_base
+        .apply(LedgerTransaction {
+            idempotency_key: "race:reserve".into(),
+            business_reference: "private-order:race".into(),
+            transfers: vec![Transfer {
+                from: user.clone(),
+                to: hold.clone(),
+                amount: 100,
+            }],
+        })
+        .unwrap();
+
+    let mut cancel_wins = race_base.clone();
+    cancel_wins
+        .apply(LedgerTransaction {
+            idempotency_key: "race:cancel".into(),
+            business_reference: "private-order:race".into(),
+            transfers: vec![Transfer {
+                from: hold.clone(),
+                to: user.clone(),
+                amount: 100,
+            }],
+        })
+        .unwrap();
+    let cancel_root = cancel_wins.state_root();
+    assert_eq!(
+        cancel_wins
+            .apply(LedgerTransaction {
+                idempotency_key: "race:fill".into(),
+                business_reference: "private-fill:race".into(),
+                transfers: vec![Transfer {
+                    from: hold.clone(),
+                    to: collateral.clone(),
+                    amount: 100
+                }],
+            })
+            .unwrap_err(),
+        CoreError::InsufficientBalance
+    );
+    assert_eq!(cancel_wins.state_root(), cancel_root);
+
+    let mut fill_wins = race_base;
+    fill_wins
+        .apply(LedgerTransaction {
+            idempotency_key: "race:fill".into(),
+            business_reference: "private-fill:race".into(),
+            transfers: vec![Transfer {
+                from: hold.clone(),
+                to: collateral,
+                amount: 100,
+            }],
+        })
+        .unwrap();
+    let fill_root = fill_wins.state_root();
+    assert_eq!(
+        fill_wins
+            .apply(LedgerTransaction {
+                idempotency_key: "race:cancel".into(),
+                business_reference: "private-order:race".into(),
+                transfers: vec![Transfer {
+                    from: hold,
+                    to: user,
+                    amount: 100
+                }],
+            })
+            .unwrap_err(),
+        CoreError::InsufficientBalance
+    );
+    assert_eq!(fill_wins.state_root(), fill_root);
+}
+
+fn assert_balanced_postings(
+    applied: &clob_service::private_core::AppliedLedgerTransaction,
+    amount: u128,
+) {
+    let debits: u128 = applied
+        .postings
+        .iter()
+        .filter(|posting| posting.side == PostingSide::Debit)
+        .map(|posting| posting.amount)
+        .sum();
+    let credits: u128 = applied
+        .postings
+        .iter()
+        .filter(|posting| posting.side == PostingSide::Credit)
+        .map(|posting| posting.amount)
+        .sum();
+    assert_eq!(debits, amount);
+    assert_eq!(credits, amount);
+    assert_eq!(applied.postings.len(), applied.transfers.len() * 2);
 }
 
 #[test]

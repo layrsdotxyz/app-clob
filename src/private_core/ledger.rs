@@ -82,10 +82,9 @@ pub struct AppliedLedgerTransaction {
     pub prior_state_root: [u8; 32],
     pub state_root: [u8; 32],
     pub transfers: Vec<Transfer>,
-    /// General-ledger legs for custody-boundary events. Internal balance
-    /// reclassifications continue to use `transfers`; external deposits use
-    /// explicit normal-side postings because both the custody asset and the
-    /// corresponding user liability increase together.
+    /// Explicit general-ledger legs. Internal transfers produce one debit and
+    /// one credit per conserved asset movement; custody-boundary deposits use
+    /// normal-side asset/liability postings because both balances increase.
     #[serde(default)]
     pub postings: Vec<LedgerPosting>,
 }
@@ -252,6 +251,25 @@ impl Ledger {
             .insert(transaction.idempotency_key.clone());
         let state_root = self.state_root();
 
+        let postings = transaction
+            .transfers
+            .iter()
+            .flat_map(|transfer| {
+                [
+                    LedgerPosting {
+                        account: transfer.from.clone(),
+                        side: PostingSide::Debit,
+                        amount: transfer.amount,
+                    },
+                    LedgerPosting {
+                        account: transfer.to.clone(),
+                        side: PostingSide::Credit,
+                        amount: transfer.amount,
+                    },
+                ]
+            })
+            .collect();
+
         Ok(AppliedLedgerTransaction {
             sequence: self.sequence,
             idempotency_key: transaction.idempotency_key,
@@ -259,7 +277,7 @@ impl Ledger {
             prior_state_root,
             state_root,
             transfers: transaction.transfers,
-            postings: Vec::new(),
+            postings,
         })
     }
 
