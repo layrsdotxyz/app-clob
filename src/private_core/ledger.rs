@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize, Serializer};
 use tiny_keccak::{Hasher, Keccak};
 
 use super::{CoreError, CoreResult};
@@ -285,8 +285,22 @@ impl Serialize for Ledger {
 impl<'de> Deserialize<'de> for Ledger {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire = LedgerWire::deserialize(deserializer)?;
+        let mut balances = BTreeMap::new();
+        for (account, amount) in wire.balances {
+            validate_account_key(&account).map_err(D::Error::custom)?;
+            if amount == 0 {
+                return Err(D::Error::custom("ledger snapshot contains a zero balance"));
+            }
+            if balances.insert(account, amount).is_some() {
+                return Err(D::Error::custom(
+                    "ledger snapshot contains a duplicate account",
+                ));
+            }
+        }
+        validate_balance_model(&balances).map_err(D::Error::custom)?;
+        validate_replay_keys(&wire.applied_idempotency_keys).map_err(D::Error::custom)?;
         Ok(Self {
-            balances: wire.balances.into_iter().collect(),
+            balances,
             applied_idempotency_keys: wire.applied_idempotency_keys,
             sequence: wire.sequence,
         })
@@ -309,7 +323,17 @@ impl Ledger {
                 "balances may be seeded only before the first ledger transaction".into(),
             ));
         }
-        self.balances.insert(account, amount);
+        if amount == 0 {
+            return Err(CoreError::ZeroAmount);
+        }
+        validate_account_key(&account)?;
+        if self.balances.contains_key(&account) {
+            return Err(CoreError::DuplicateCommand);
+        }
+        let mut next = self.balances.clone();
+        next.insert(account, amount);
+        validate_balance_model(&next)?;
+        self.balances = next;
         Ok(())
     }
 
@@ -609,6 +633,8 @@ impl Ledger {
             }
         }
 
+        canonicalize_balances(&mut next);
+        validate_balance_model(&next)?;
         self.balances = next;
         self.sequence = self
             .sequence
@@ -633,12 +659,21 @@ impl Ledger {
         transaction: LedgerTransaction,
         additional_replay_keys: BTreeSet<String>,
     ) -> CoreResult<AppliedLedgerTransaction> {
-        if transaction.transfers.is_empty() {
+        if transaction.transfers.is_empty() || transaction.idempotency_key.is_empty() {
             return Err(CoreError::UnbalancedTransaction);
         }
         if self
             .applied_idempotency_keys
             .contains(&transaction.idempotency_key)
+        {
+            return Err(CoreError::DuplicateCommand);
+        }
+        let mut all_new_replay_keys = additional_replay_keys.clone();
+        all_new_replay_keys.insert(transaction.idempotency_key.clone());
+        validate_replay_keys(&all_new_replay_keys)?;
+        if additional_replay_keys
+            .iter()
+            .any(|key| self.applied_idempotency_keys.contains(key))
         {
             return Err(CoreError::DuplicateCommand);
         }
@@ -650,21 +685,20 @@ impl Ledger {
             if transfer.amount == 0 {
                 return Err(CoreError::ZeroAmount);
             }
-            if transfer.from.asset != transfer.to.asset {
+            validate_account_key(&transfer.from)?;
+            validate_account_key(&transfer.to)?;
+            if transfer.from == transfer.to || transfer.from.asset != transfer.to.asset {
                 return Err(CoreError::UnbalancedTransaction);
             }
-            let from_balance = next.get(&transfer.from).copied().unwrap_or_default();
-            let debited = from_balance
-                .checked_sub(transfer.amount)
-                .ok_or(CoreError::InsufficientBalance)?;
-            let to_balance = next.get(&transfer.to).copied().unwrap_or_default();
-            let credited = to_balance
-                .checked_add(transfer.amount)
-                .ok_or(CoreError::UnbalancedTransaction)?;
-            next.insert(transfer.from.clone(), debited);
-            next.insert(transfer.to.clone(), credited);
+            if transfer.to.bucket == AccountBucket::RoundingReserve {
+                validate_rounding_dust_transfer(&transfer.to, transfer.amount)?;
+            }
+            debit(&mut next, &transfer.from, transfer.amount)?;
+            credit(&mut next, &transfer.to, transfer.amount)?;
         }
 
+        canonicalize_balances(&mut next);
+        validate_balance_model(&next)?;
         self.balances = next;
         self.sequence = self
             .sequence
@@ -746,6 +780,8 @@ impl Ledger {
         credit(&mut next, &pool, transaction.amount)?;
         credit(&mut next, &transaction.account, transaction.amount)?;
 
+        canonicalize_balances(&mut next);
+        validate_balance_model(&next)?;
         self.balances = next;
         self.sequence = self
             .sequence
@@ -816,6 +852,8 @@ impl Ledger {
         debit(&mut next, &transaction.account, transaction.amount)?;
         debit(&mut next, &pool, transaction.amount)?;
 
+        canonicalize_balances(&mut next);
+        validate_balance_model(&next)?;
         self.balances = next;
         self.sequence = self
             .sequence
@@ -1212,6 +1250,8 @@ impl Ledger {
                 }
             }
         }
+        canonicalize_balances(&mut next);
+        validate_balance_model(&next)?;
         self.balances = next;
         self.sequence = self
             .sequence
@@ -1295,6 +1335,10 @@ impl Ledger {
         transfers: Vec<Transfer>,
         postings: Vec<LedgerPosting>,
     ) -> CoreResult<AppliedLedgerTransaction> {
+        let mut balances = balances;
+        canonicalize_balances(&mut balances);
+        validate_balance_model(&balances)?;
+        validate_posting_shape(&postings)?;
         self.balances = balances;
         self.sequence = self
             .sequence
@@ -1318,7 +1362,18 @@ impl Ledger {
             .iter()
             .filter(|(key, _)| key.asset == asset)
             .map(|(_, amount)| *amount)
-            .sum()
+            .fold(0u128, u128::saturating_add)
+    }
+
+    pub fn checked_total_for_asset(&self, asset: &str) -> CoreResult<u128> {
+        self.balances
+            .iter()
+            .filter(|(key, _)| key.asset == asset)
+            .try_fold(0u128, |total, (_, amount)| {
+                total
+                    .checked_add(*amount)
+                    .ok_or(CoreError::UnbalancedTransaction)
+            })
     }
 
     pub fn total_for_owner_asset(&self, owner: &str, asset: &str) -> u128 {
@@ -1326,7 +1381,18 @@ impl Ledger {
             .iter()
             .filter(|(key, _)| key.owner == owner && key.asset == asset)
             .map(|(_, amount)| *amount)
-            .sum()
+            .fold(0u128, u128::saturating_add)
+    }
+
+    pub fn checked_total_for_owner_asset(&self, owner: &str, asset: &str) -> CoreResult<u128> {
+        self.balances
+            .iter()
+            .filter(|(key, _)| key.owner == owner && key.asset == asset)
+            .try_fold(0u128, |total, (_, amount)| {
+                total
+                    .checked_add(*amount)
+                    .ok_or(CoreError::UnbalancedTransaction)
+            })
     }
 
     pub fn state_root(&self) -> [u8; 32] {
@@ -1590,12 +1656,18 @@ fn debit(
     amount: u128,
 ) -> CoreResult<()> {
     let current = balances.get(account).copied().unwrap_or_default();
-    balances.insert(
-        account.clone(),
-        current
-            .checked_sub(amount)
-            .ok_or(CoreError::InsufficientBalance)?,
-    );
+    if amount == 0 {
+        return Err(CoreError::ZeroAmount);
+    }
+    validate_account_key(account)?;
+    let next = current
+        .checked_sub(amount)
+        .ok_or(CoreError::InsufficientBalance)?;
+    if next == 0 {
+        balances.remove(account);
+    } else {
+        balances.insert(account.clone(), next);
+    }
     Ok(())
 }
 
@@ -1604,6 +1676,10 @@ fn credit(
     account: &AccountKey,
     amount: u128,
 ) -> CoreResult<()> {
+    if amount == 0 {
+        return Err(CoreError::ZeroAmount);
+    }
+    validate_account_key(account)?;
     let current = balances.get(account).copied().unwrap_or_default();
     balances.insert(
         account.clone(),
@@ -1611,5 +1687,87 @@ fn credit(
             .checked_add(amount)
             .ok_or(CoreError::UnbalancedTransaction)?,
     );
+    Ok(())
+}
+
+const MAX_PRIVATE_KEY_COMPONENT_BYTES: usize = 256;
+const MAX_REPLAY_KEY_BYTES: usize = 512;
+
+fn validate_account_key(account: &AccountKey) -> CoreResult<()> {
+    let valid_component = |value: &str| {
+        !value.is_empty()
+            && value.len() <= MAX_PRIVATE_KEY_COMPONENT_BYTES
+            && !value
+                .bytes()
+                .any(|byte| byte == 0 || byte.is_ascii_control())
+    };
+    if !valid_component(&account.owner)
+        || !valid_component(&account.asset)
+        || account
+            .market_id
+            .as_deref()
+            .is_some_and(|value| !valid_component(value))
+        || account
+            .outcome
+            .as_deref()
+            .is_some_and(|value| !valid_component(value))
+    {
+        return Err(CoreError::UnbalancedTransaction);
+    }
+    Ok(())
+}
+
+fn validate_replay_keys(keys: &BTreeSet<String>) -> CoreResult<()> {
+    if keys.iter().any(|key| {
+        key.is_empty()
+            || key.len() > MAX_REPLAY_KEY_BYTES
+            || key.bytes().any(|byte| byte == 0 || byte.is_ascii_control())
+    }) {
+        return Err(CoreError::UnbalancedTransaction);
+    }
+    Ok(())
+}
+
+fn canonicalize_balances(balances: &mut BTreeMap<AccountKey, u128>) {
+    balances.retain(|_, amount| *amount > 0);
+}
+
+/// Rejects non-canonical snapshots and mutations. Asset and liability accounts
+/// intentionally coexist for the same token, so their diagnostic aggregate
+/// can exceed u128 even though every financial leg remains representable.
+fn validate_balance_model(balances: &BTreeMap<AccountKey, u128>) -> CoreResult<()> {
+    for (account, amount) in balances {
+        validate_account_key(account)?;
+        if *amount == 0 {
+            return Err(CoreError::UnbalancedTransaction);
+        }
+    }
+    Ok(())
+}
+
+fn validate_posting_shape(postings: &[LedgerPosting]) -> CoreResult<()> {
+    for posting in postings {
+        validate_account_key(&posting.account)?;
+        if posting.amount == 0 {
+            return Err(CoreError::ZeroAmount);
+        }
+    }
+    Ok(())
+}
+
+fn validate_rounding_dust_transfer(account: &AccountKey, amount: u128) -> CoreResult<()> {
+    if account.owner != "layrs" || account.market_id.is_some() || account.outcome.is_some() {
+        return Err(CoreError::UnbalancedTransaction);
+    }
+    let limit = match account.asset.as_str() {
+        // 0.001 of the settlement token. Larger residuals signal a broken
+        // payout/precision invariant and must not be silently absorbed.
+        "USDC" => 1_000,
+        "ZEN" => 1_000_000_000_000_000,
+        _ => return Err(CoreError::UnbalancedTransaction),
+    };
+    if amount > limit {
+        return Err(CoreError::UnbalancedTransaction);
+    }
     Ok(())
 }
