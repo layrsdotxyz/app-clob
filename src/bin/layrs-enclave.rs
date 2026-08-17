@@ -27,13 +27,13 @@ use clob_service::private_core::{
     binance_resolution_signing_payload, exact_condition_resolution_signing_payload,
     polymarket_resolution_signing_payload, resolution_signing_payload, AccountKey,
     BinanceResolutionStatement, BootstrapExecutionState, CommandResult, CoreResponse,
-    EnclaveReceipt, EncryptedJournalRecord, EncryptedSnapshot, ExactConditionResolutionStatement,
-    ExternalFlowDirection, JournalKey, MarketConfig, MarketExecution,
-    PolymarketResolutionStatement, PrivateTradingCore, ReceiptSigner, ResolutionStatement,
-    SignedAuditFillArtifact, SignedBinanceResolution, SignedExactConditionResolution,
-    SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence,
-    SignedTaskQualificationArtifact, SystemResponse, UserCommand, UserCommandAction,
-    WithdrawalAuthorization,
+    CustodyReconciliationSnapshot, EnclaveReceipt, EncryptedJournalRecord, EncryptedSnapshot,
+    ExactConditionResolutionStatement, ExternalFlowDirection, JournalKey, MarketConfig,
+    MarketExecution, PolymarketResolutionStatement, PrivateTradingCore, ReceiptSigner,
+    ResolutionStatement, SignedAuditFillArtifact, SignedBinanceResolution,
+    SignedExactConditionResolution, SignedPolymarketResolution, SignedResolution,
+    SignedResolutionEvidence, SignedTaskQualificationArtifact, SystemResponse, UserCommand,
+    UserCommandAction, WithdrawalAuthorization,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use openssl::{
@@ -217,6 +217,10 @@ enum OperatorCommand {
     ResolutionReadiness {
         market_id: String,
         now_millis: i64,
+    },
+    CustodyReconciliationSnapshot {
+        checkpoint_commitment: [u8; 32],
+        chain_finality_commitments: Vec<[u8; 32]>,
     },
     TradingFreezeStatus,
     AggregateDepth {
@@ -475,6 +479,9 @@ enum PlainResponse {
     },
     ResolutionReadiness {
         readiness: clob_service::private_core::MarketSettlementReadiness,
+    },
+    CustodyReconciliationSnapshot {
+        snapshot: CustodyReconciliationSnapshot,
     },
     TradingFreezeStatus {
         frozen: bool,
@@ -1613,6 +1620,16 @@ async fn dispatch_operator(
             .market_settlement_readiness(&market_id, now_millis)
             .map(|readiness| PlainResponse::ResolutionReadiness { readiness })
             .map_err(|error| error.to_string()),
+        OperatorCommand::CustodyReconciliationSnapshot {
+            checkpoint_commitment,
+            chain_finality_commitments,
+        } => state
+            .core
+            .as_ref()
+            .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+            .custody_reconciliation_snapshot(checkpoint_commitment, chain_finality_commitments)
+            .map(|snapshot| PlainResponse::CustodyReconciliationSnapshot { snapshot })
+            .map_err(|error| error.to_string()),
         OperatorCommand::TransferAccountStatus {
             identity_commitment,
         } => {
@@ -1991,6 +2008,7 @@ async fn dispatch_operator(
                 | OperatorCommand::MarketStatus { .. }
                 | OperatorCommand::ResolutionStatus { .. }
                 | OperatorCommand::ResolutionReadiness { .. }
+                | OperatorCommand::CustodyReconciliationSnapshot { .. }
                 | OperatorCommand::TransferAccountStatus { .. }
                 | OperatorCommand::TradingFreezeStatus
                 | OperatorCommand::AggregateDepth { .. }

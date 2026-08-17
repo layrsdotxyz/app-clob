@@ -761,6 +761,25 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
         .unwrap_err(),
         CoreError::TradingFrozen
     );
+    assert_eq!(
+        execute_signed_result(
+            &mut core,
+            &bob,
+            "session:2",
+            1,
+            "cmd:frozen-withdrawal",
+            UserCommandAction::RequestWithdrawal {
+                withdrawal_id: uuid::Uuid::from_u128(9001),
+                chain: "horizen".into(),
+                asset: "ZEN".into(),
+                amount_atomic: 1,
+                destination: "0x1111111111111111111111111111111111111111".into(),
+            },
+            960,
+        )
+        .unwrap_err(),
+        CoreError::TradingFrozen
+    );
     core.set_trading_freeze("sys:unfreeze:1".into(), false, [92u8; 32], 975)
         .unwrap();
     assert!(!core.trading_frozen());
@@ -1131,6 +1150,8 @@ fn native_clob_partial_fill_locks_remainder_and_cancel_releases_once() {
     );
     assert_eq!(overdraw.unwrap_err(), CoreError::InsufficientBalance);
 
+    core.set_trading_freeze("sys:freeze:cancel-only".into(), true, [93u8; 32], 1_175)
+        .unwrap();
     execute_signed(
         &mut core,
         &alice,
@@ -1143,6 +1164,8 @@ fn native_clob_partial_fill_locks_remainder_and_cancel_releases_once() {
         },
         1_200,
     );
+    core.set_trading_freeze("sys:unfreeze:cancel-only".into(), false, [94u8; 32], 1_225)
+        .unwrap();
     assert_eq!(core.balance(&alice_cash_hold), 0);
     assert_eq!(
         core.balance(&AccountKey::new(

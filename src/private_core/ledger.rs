@@ -194,6 +194,19 @@ pub struct LedgerPosting {
     pub amount: u128,
 }
 
+/// Privacy-safe aggregate used only by the attested custody reconciler.
+///
+/// Owners, markets, outcomes, orders and individual balances are deliberately
+/// omitted. The result is still derived from the authoritative enclave ledger
+/// and therefore fails closed if any aggregate cannot be represented exactly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustodyLedgerTotal {
+    pub bucket: AccountBucket,
+    pub asset: String,
+    #[serde(with = "super::decimal_u128")]
+    pub amount: u128,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ExternalFlowDirection {
@@ -1393,6 +1406,41 @@ impl Ledger {
                     .checked_add(*amount)
                     .ok_or(CoreError::UnbalancedTransaction)
             })
+    }
+
+    /// Returns only the custody-side aggregates required to compare the
+    /// enclave ledger with independently observed pool, bridge and strategy
+    /// holdings. No user- or market-scoped key leaves the enclave.
+    pub fn custody_reconciliation_totals(&self) -> CoreResult<Vec<CustodyLedgerTotal>> {
+        let mut totals = BTreeMap::<(String, AccountBucket), u128>::new();
+        for (account, amount) in &self.balances {
+            if !matches!(
+                account.bucket,
+                AccountBucket::PoolCash
+                    | AccountBucket::VaultCash
+                    | AccountBucket::VaultStrategyInTransit
+                    | AccountBucket::VaultStrategyReceivable
+                    | AccountBucket::BridgeInTransit
+            ) {
+                continue;
+            }
+            let key = (account.asset.clone(), account.bucket.clone());
+            let next = totals
+                .get(&key)
+                .copied()
+                .unwrap_or_default()
+                .checked_add(*amount)
+                .ok_or(CoreError::UnbalancedTransaction)?;
+            totals.insert(key, next);
+        }
+        Ok(totals
+            .into_iter()
+            .map(|((asset, bucket), amount)| CustodyLedgerTotal {
+                bucket,
+                asset,
+                amount,
+            })
+            .collect())
     }
 
     pub fn state_root(&self) -> [u8; 32] {

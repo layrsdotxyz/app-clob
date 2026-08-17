@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -14,12 +15,12 @@ use super::rewards::{
 };
 use super::{
     AccountBucket, AccountKey, BookOrder, ClaimPayout, CompleteSetDirection,
-    CompleteSetFillPosting, CompleteSetTransaction, CoreError, CoreResult, EnclaveReceipt,
-    EncryptedJournal, EncryptedJournalRecord, EncryptedSnapshot, ExternalFlowDirection,
-    ExternalFlowTransaction, Fill, JournalKey, Ledger, LedgerTransaction, MatchResult, MatchType,
-    NormalFillPosting, OrderAction, OrderStatus, Outcome, PriceTimeBook, ReceiptSigner,
-    ResolutionPayoutKind, SessionGuard, SignedSessionRequest, Transfer, VaultStrategyTransaction,
-    VaultStrategyTransition, PRICE_SCALE,
+    CompleteSetFillPosting, CompleteSetTransaction, CoreError, CoreResult, CustodyLedgerTotal,
+    EnclaveReceipt, EncryptedJournal, EncryptedJournalRecord, EncryptedSnapshot,
+    ExternalFlowDirection, ExternalFlowTransaction, Fill, JournalKey, Ledger, LedgerTransaction,
+    MatchResult, MatchType, NormalFillPosting, OrderAction, OrderStatus, Outcome, PriceTimeBook,
+    ReceiptSigner, ResolutionPayoutKind, SessionGuard, SignedSessionRequest, Transfer,
+    VaultStrategyTransaction, VaultStrategyTransition, PRICE_SCALE,
 };
 
 /// Public depth is deliberately less precise than the enclave's private book.
@@ -541,6 +542,20 @@ pub struct PortfolioSnapshot {
     pub as_of_millis: i64,
 }
 
+/// Aggregate-only custody view returned over the authenticated enclave
+/// operator channel. It binds every amount to the exact private state root and
+/// sequence without exposing owners, positions, markets or orders.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustodyReconciliationSnapshot {
+    pub checkpoint_commitment: [u8; 32],
+    pub chain_finality_commitments: Vec<[u8; 32]>,
+    pub enclave_sequence: u64,
+    pub state_root: [u8; 32],
+    pub totals: Vec<CustodyLedgerTotal>,
+    pub receipt_public_key: [u8; 32],
+    pub signature: Vec<u8>,
+}
+
 /// Privacy-safe aggregate preflight for a market settlement. It deliberately
 /// excludes owners, orders, balances and position mappings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -910,6 +925,7 @@ pub struct PrivateTradingCore {
     trading_frozen: bool,
     sequence: u64,
     identity_key: [u8; 32],
+    custody_totals_cache: RefCell<Option<(u64, [u8; 32], Vec<CustodyLedgerTotal>)>>,
 }
 
 impl PrivateTradingCore {
@@ -932,6 +948,7 @@ impl PrivateTradingCore {
             trading_frozen: false,
             sequence: 0,
             identity_key,
+            custody_totals_cache: RefCell::new(None),
         }
     }
 
@@ -1279,6 +1296,7 @@ impl PrivateTradingCore {
             trading_frozen: state.trading_frozen,
             sequence: state.sequence,
             identity_key,
+            custody_totals_cache: RefCell::new(None),
         })
     }
 
@@ -1298,6 +1316,47 @@ impl PrivateTradingCore {
             self.trading_frozen,
             self.sequence,
         )
+    }
+
+    pub fn custody_reconciliation_snapshot(
+        &self,
+        checkpoint_commitment: [u8; 32],
+        chain_finality_commitments: Vec<[u8; 32]>,
+    ) -> CoreResult<CustodyReconciliationSnapshot> {
+        if checkpoint_commitment == [0; 32]
+            || chain_finality_commitments.len() != 2
+            || chain_finality_commitments
+                .iter()
+                .any(|value| *value == [0; 32])
+            || chain_finality_commitments[0] == chain_finality_commitments[1]
+        {
+            return Err(CoreError::InvalidOrder(
+                "custody snapshot requires one checkpoint and two distinct finality commitments"
+                    .into(),
+            ));
+        }
+        let state_root = self.state_root();
+        let totals = self
+            .custody_totals_cache
+            .borrow()
+            .as_ref()
+            .filter(|(sequence, root, _)| *sequence == self.sequence && *root == state_root)
+            .map(|(_, _, totals)| totals.clone())
+            .unwrap_or(self.ledger.custody_reconciliation_totals()?);
+        *self.custody_totals_cache.borrow_mut() = Some((self.sequence, state_root, totals.clone()));
+        let mut snapshot = CustodyReconciliationSnapshot {
+            checkpoint_commitment,
+            chain_finality_commitments,
+            enclave_sequence: self.sequence,
+            state_root,
+            totals,
+            receipt_public_key: self.receipt_signer.verifying_key(),
+            signature: Vec::new(),
+        };
+        snapshot.signature = self
+            .receipt_signer
+            .sign_domain_payload(b"layrs.custody-reconciliation-snapshot.v1\0", &snapshot);
+        Ok(snapshot)
     }
 
     pub fn trading_frozen(&self) -> bool {
@@ -3095,7 +3154,9 @@ impl PrivateTradingCore {
         if self.trading_frozen
             && matches!(
                 &command.action,
-                UserCommandAction::SubmitOrder { .. } | UserCommandAction::CompleteSet { .. }
+                UserCommandAction::SubmitOrder { .. }
+                    | UserCommandAction::CompleteSet { .. }
+                    | UserCommandAction::RequestWithdrawal { .. }
             )
         {
             return Err(CoreError::TradingFrozen);
