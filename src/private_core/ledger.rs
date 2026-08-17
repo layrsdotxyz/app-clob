@@ -14,6 +14,16 @@ pub enum AccountBucket {
     UserPosition,
     MarketCollateral,
     PoolCash,
+    /// Idle asset owned by one LP vault. This is deliberately distinct from
+    /// `PoolCash`: strategy principal must never become synthetic trading
+    /// liquidity merely because both are denominated in the same token.
+    VaultCash,
+    /// Principal that has left vault custody but has not yet reached the
+    /// independently-finalized strategy boundary.
+    VaultStrategyInTransit,
+    /// Independently-finalized principal held by an approved external
+    /// strategy on behalf of one vault.
+    VaultStrategyReceivable,
     VenueInventory,
     BridgeInTransit,
     FeeRevenue,
@@ -72,6 +82,40 @@ pub struct LedgerTransaction {
     pub idempotency_key: String,
     pub business_reference: String,
     pub transfers: Vec<Transfer>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum VaultStrategyTransition {
+    /// One-chain deployment whose receipt proves cash left the vault and the
+    /// adapter received the same principal atomically.
+    CashToReceivable,
+    /// Source-chain finality for an asynchronous/cross-chain deployment.
+    CashToTransit,
+    /// Destination and adapter/report finality for deployed principal.
+    TransitToReceivable,
+    /// Finalized strategy recall that has not reached vault custody yet.
+    ReceivableToTransit,
+    /// One-chain recall whose receipt atomically proves the adapter released
+    /// principal and vault custody received it.
+    ReceivableToCash,
+    /// Finalized return into vault custody.
+    TransitToCash,
+}
+
+/// Enclave-private vault principal transition. Commitments are opaque hashes;
+/// raw vault, strategy, adapter, bridge and transaction identifiers never
+/// leave the encrypted journal or appear in the signed public receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultStrategyTransaction {
+    pub idempotency_key: String,
+    pub evidence_hash: [u8; 32],
+    pub vault_commitment: [u8; 32],
+    pub strategy_commitment: [u8; 32],
+    pub operation_commitment: [u8; 32],
+    pub asset: String,
+    pub amount: u128,
+    pub transition: VaultStrategyTransition,
 }
 
 /// Enclave-private economic legs for one NORMAL fill. The cash side and claim
@@ -274,6 +318,74 @@ impl Ledger {
         transaction: LedgerTransaction,
     ) -> CoreResult<AppliedLedgerTransaction> {
         self.apply_with_replay_keys(transaction, BTreeSet::new())
+    }
+
+    /// Reclassifies vault principal between mutually-exclusive cash,
+    /// in-transit and external-receivable accounts. The total recognized
+    /// principal is invariant, and trading pool cash is not reachable by any
+    /// transition. Replay protection is derived from independent finality
+    /// evidence rather than the operator's transport idempotency key.
+    pub fn apply_vault_strategy_transition(
+        &mut self,
+        transaction: VaultStrategyTransaction,
+    ) -> CoreResult<AppliedLedgerTransaction> {
+        validate_vault_strategy_transaction(&transaction)?;
+        let evidence_replay_key = format!(
+            "vault-strategy-evidence:{}",
+            hex::encode(transaction.evidence_hash)
+        );
+        if self.applied_idempotency_keys.contains(&evidence_replay_key) {
+            return Err(CoreError::DuplicateCommand);
+        }
+
+        let vault_owner = format!("vault:{}", hex::encode(transaction.vault_commitment));
+        let strategy_owner = format!(
+            "vault:{}:strategy:{}",
+            hex::encode(transaction.vault_commitment),
+            hex::encode(transaction.strategy_commitment)
+        );
+        let transit_owner = format!(
+            "vault:{}:operation:{}",
+            hex::encode(transaction.vault_commitment),
+            hex::encode(transaction.operation_commitment)
+        );
+        let cash = AccountKey::new(vault_owner, AccountBucket::VaultCash, &transaction.asset);
+        let receivable = AccountKey::new(
+            strategy_owner,
+            AccountBucket::VaultStrategyReceivable,
+            &transaction.asset,
+        );
+        let transit = AccountKey::new(
+            transit_owner,
+            AccountBucket::VaultStrategyInTransit,
+            &transaction.asset,
+        );
+        let (from, to) = match transaction.transition {
+            VaultStrategyTransition::CashToReceivable => (cash, receivable),
+            VaultStrategyTransition::CashToTransit => (cash, transit),
+            VaultStrategyTransition::TransitToReceivable => (transit, receivable),
+            VaultStrategyTransition::ReceivableToTransit => (receivable, transit),
+            VaultStrategyTransition::ReceivableToCash => (receivable, cash),
+            VaultStrategyTransition::TransitToCash => (transit, cash),
+        };
+        let mut replay_keys = BTreeSet::new();
+        replay_keys.insert(evidence_replay_key);
+        self.apply_with_replay_keys(
+            LedgerTransaction {
+                idempotency_key: transaction.idempotency_key,
+                business_reference: format!(
+                    "vault-strategy:{}:{}",
+                    vault_strategy_transition_name(transaction.transition),
+                    hex::encode(transaction.evidence_hash)
+                ),
+                transfers: vec![Transfer {
+                    from,
+                    to,
+                    amount: transaction.amount,
+                }],
+            },
+            replay_keys,
+        )
     }
 
     /// Applies a batch of NORMAL fills plus the incoming order's reserve and
@@ -795,6 +907,16 @@ impl Ledger {
         &mut self,
         transaction: ExternalFlowTransaction,
     ) -> CoreResult<AppliedLedgerTransaction> {
+        if matches!(
+            transaction.account.bucket,
+            AccountBucket::VaultCash
+                | AccountBucket::VaultStrategyInTransit
+                | AccountBucket::VaultStrategyReceivable
+        ) {
+            return Err(CoreError::InvalidOrder(
+                "vault principal requires a balanced strategy transition".into(),
+            ));
+        }
         if transaction.amount == 0 || transaction.evidence_hash == [0u8; 32] {
             return Err(CoreError::ZeroAmount);
         }
@@ -1377,6 +1499,40 @@ fn posting(account: &AccountKey, side: PostingSide, amount: u128) -> LedgerPosti
         account: account.clone(),
         side,
         amount,
+    }
+}
+
+fn validate_vault_strategy_transaction(transaction: &VaultStrategyTransaction) -> CoreResult<()> {
+    if transaction.amount == 0 {
+        return Err(CoreError::ZeroAmount);
+    }
+    if transaction.evidence_hash == [0u8; 32]
+        || transaction.vault_commitment == [0u8; 32]
+        || transaction.strategy_commitment == [0u8; 32]
+        || transaction.operation_commitment == [0u8; 32]
+        || transaction.idempotency_key.is_empty()
+        || transaction.asset.is_empty()
+        || transaction.asset.len() > 32
+        || !transaction
+            .asset
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(CoreError::InvalidOrder(
+            "invalid vault strategy transition".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn vault_strategy_transition_name(transition: VaultStrategyTransition) -> &'static str {
+    match transition {
+        VaultStrategyTransition::CashToReceivable => "cash-to-receivable",
+        VaultStrategyTransition::CashToTransit => "cash-to-transit",
+        VaultStrategyTransition::TransitToReceivable => "transit-to-receivable",
+        VaultStrategyTransition::ReceivableToTransit => "receivable-to-transit",
+        VaultStrategyTransition::ReceivableToCash => "receivable-to-cash",
+        VaultStrategyTransition::TransitToCash => "transit-to-cash",
     }
 }
 

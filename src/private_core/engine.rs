@@ -18,7 +18,8 @@ use super::{
     EncryptedJournal, EncryptedJournalRecord, EncryptedSnapshot, ExternalFlowDirection,
     ExternalFlowTransaction, Fill, JournalKey, Ledger, LedgerTransaction, MatchResult, MatchType,
     NormalFillPosting, OrderAction, OrderStatus, Outcome, PriceTimeBook, ReceiptSigner,
-    ResolutionPayoutKind, SessionGuard, SignedSessionRequest, Transfer, PRICE_SCALE,
+    ResolutionPayoutKind, SessionGuard, SignedSessionRequest, Transfer, VaultStrategyTransaction,
+    VaultStrategyTransition, PRICE_SCALE,
 };
 
 /// Public depth is deliberately less precise than the enclave's private book.
@@ -816,6 +817,10 @@ enum JournaledSystemCommand {
         idempotency_key: String,
         flow: ExternalFlowTransaction,
     },
+    VaultStrategyTransition {
+        idempotency_key: String,
+        transaction: VaultStrategyTransaction,
+    },
     AccrueReward {
         idempotency_key: String,
         identity_commitment: [u8; 32],
@@ -1556,10 +1561,14 @@ impl PrivateTradingCore {
     ) -> CoreResult<SystemResponse> {
         if matches!(
             account.bucket,
-            AccountBucket::UserAvailable | AccountBucket::UserWithdrawalHold
+            AccountBucket::UserAvailable
+                | AccountBucket::UserWithdrawalHold
+                | AccountBucket::VaultCash
+                | AccountBucket::VaultStrategyInTransit
+                | AccountBucket::VaultStrategyReceivable
         ) {
             return Err(CoreError::InvalidOrder(
-                "user custody flows require the dedicated deposit or withdrawal command".into(),
+                "custody flows require their dedicated balanced command".into(),
             ));
         }
         self.apply_external_flow_internal(
@@ -1570,6 +1579,69 @@ impl PrivateTradingCore {
             evidence_hash,
             now_millis,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_vault_strategy_transition(
+        &mut self,
+        idempotency_key: String,
+        evidence_hash: [u8; 32],
+        vault_commitment: [u8; 32],
+        strategy_commitment: [u8; 32],
+        operation_commitment: [u8; 32],
+        asset: String,
+        amount: u128,
+        transition: VaultStrategyTransition,
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        let prior_root = self.state_root();
+        let transaction = VaultStrategyTransaction {
+            idempotency_key: format!("vault-strategy:{idempotency_key}"),
+            evidence_hash,
+            vault_commitment,
+            strategy_commitment,
+            operation_commitment,
+            asset,
+            amount,
+            transition,
+        };
+        let mut ledger = self.ledger.clone();
+        ledger.apply_vault_strategy_transition(transaction.clone())?;
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::VaultStrategyTransition {
+            idempotency_key: idempotency_key.clone(),
+            transaction,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.ledger = ledger;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            "vault-strategy-transition",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
