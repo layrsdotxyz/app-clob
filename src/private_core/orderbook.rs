@@ -445,6 +445,7 @@ impl PriceTimeBook {
         incoming.sequence = self.sequence;
         let candidate_ids = self.matching_candidates(&incoming, now_millis);
         let mut fills = Vec::new();
+        let mut completed_set_fill = false;
 
         for candidate in candidate_ids {
             if incoming.remaining_micros == 0 {
@@ -476,6 +477,18 @@ impl PriceTimeBook {
             } else {
                 OrderStatus::PartiallyFilled
             };
+            if candidate.match_type != MatchType::Normal {
+                completed_set_fill = true;
+                if is_unpayable_complete_set_remainder(maker) {
+                    // Never round a fill above either order's authorized
+                    // quantity. A residual that cannot fund both legs at the
+                    // protocol settlement precision is instead cancelled
+                    // deterministically and released by the ledger settlement
+                    // path in the same command.
+                    maker.status = OrderStatus::Cancelled;
+                    self.active.remove(&candidate.order_id);
+                }
+            }
             self.sequence += 1;
             let fill_sequence = self.sequence;
             let fill_id = deterministic_fill_id(
@@ -504,6 +517,11 @@ impl PriceTimeBook {
 
         let cancelled_remainder_micros = match incoming.time_in_force {
             TimeInForce::Fak | TimeInForce::Fok => incoming.remaining_micros,
+            TimeInForce::Gtc | TimeInForce::Gtd
+                if completed_set_fill && is_unpayable_complete_set_remainder(&incoming) =>
+            {
+                incoming.remaining_micros
+            }
             TimeInForce::Gtc | TimeInForce::Gtd => 0,
         };
 
@@ -764,6 +782,11 @@ fn match_type_priority(match_type: MatchType) -> u8 {
 fn minimum_complete_set_quantity_micros(price_micros: u64) -> u128 {
     let complement = PRICE_SCALE - u128::from(price_micros);
     PRICE_SCALE.div_ceil(complement)
+}
+
+fn is_unpayable_complete_set_remainder(order: &BookOrder) -> bool {
+    order.remaining_micros > 0
+        && order.remaining_micros < minimum_complete_set_quantity_micros(order.price_micros)
 }
 
 fn deterministic_fill_id(

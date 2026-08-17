@@ -39,6 +39,28 @@ rejected before a candidate enters the queue.
 This ordering avoids unnecessary collateral operations when equivalent direct
 liquidity exists and is independent of hash-map iteration order.
 
+## Settlement-precision residuals
+
+The engine never rounds an execution above either order's authorized
+quantity. For a resting price `p`, it computes the smallest quantity for which
+the collateral unit can allocate at least one settlement micro to both the
+maker and complementary taker legs. A MINT or MERGE candidate below that
+quantity is not executable.
+
+If a valid partial complete-set fill leaves a smaller tail, that tail is
+cancelled deterministically in the same command:
+
+- the executed quantity remains exactly `min(maker_remaining, taker_remaining)`;
+- cumulative filled quantity records only the executed shares;
+- the unpayable tail is removed from the active book;
+- its cash or claim hold is released atomically against the authoritative
+  post-match book; and
+- FOK preflight, command execution and journal replay use the same rule.
+
+This policy covers fractional 35/65 and 36/64 sizing without creating a stuck
+one-micro order, without inventing a share, and without changing NORMAL
+matching.
+
 ## Ledger transitions
 
 `Ledger::apply_complete_set` remains the only claim issuance/burn primitive.

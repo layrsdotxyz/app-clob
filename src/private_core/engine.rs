@@ -4000,6 +4000,43 @@ fn apply_complete_set_match_settlement(
         }
     }
 
+    // A complete-set partial fill can leave a sub-settlement-precision tail
+    // (for example one micro-share at 35/65). The book marks that tail
+    // cancelled rather than rounding the fill above an authorized quantity.
+    // Release every affected maker bucket against the authoritative next book
+    // in the same command so no collateral or claim remains stranded.
+    let mut dust_maker_ids = BTreeSet::new();
+    let mut dust_cancelled_makers = Vec::new();
+    for fill in result
+        .fills
+        .iter()
+        .filter(|fill| fill.match_type != MatchType::Normal)
+    {
+        if !dust_maker_ids.insert(fill.maker_order_id) {
+            continue;
+        }
+        let Some(next_maker) = next_book.order(fill.maker_order_id) else {
+            return Err(CoreError::InvalidOrder(
+                "complete-set maker disappeared after matching".into(),
+            ));
+        };
+        if next_maker.status == OrderStatus::Cancelled && next_maker.remaining_micros > 0 {
+            dust_cancelled_makers.push(next_maker.clone());
+        }
+    }
+    if !dust_cancelled_makers.is_empty() {
+        let transfers = cancellation_transfers(ledger, next_book, market, &dust_cancelled_makers)?;
+        if !transfers.is_empty() {
+            ledger.apply(LedgerTransaction {
+                idempotency_key: format!(
+                    "order:{command_idempotency_key}:complete-set-dust-refund"
+                ),
+                business_reference: business_reference.into(),
+                transfers,
+            })?;
+        }
+    }
+
     let accepted = result
         .accepted_order
         .as_ref()

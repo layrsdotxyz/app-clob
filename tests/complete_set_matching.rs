@@ -1,11 +1,11 @@
 use clob_service::private_core::{
     command_request_hash, exact_condition_resolution_signing_payload, resolution_signing_payload,
     signing_payload, AccountBucket, AccountKey, BookOrder, BoundaryEvidence, CommandResult,
-    ExactConditionResolutionStatement, ExternalFlowDirection, FeeProfileId, JournalKey,
-    MarketConfig, MarketExecution, MatchType, OrderAction, OrderStatus, Outcome, PriceTimeBook,
-    PrivateTradingCore, ReceiptSigner, ResolutionOutcome, ResolutionStatement, SessionRequest,
-    SignedExactConditionResolution, SignedResolution, SignedSessionRequest, TimeInForce,
-    UserCommand, UserCommandAction,
+    CompleteSetDirection, ExactConditionResolutionStatement, ExternalFlowDirection, FeeProfileId,
+    JournalKey, MarketConfig, MarketExecution, MatchType, OrderAction, OrderStatus, Outcome,
+    PriceTimeBook, PrivateTradingCore, ReceiptSigner, ResolutionOutcome, ResolutionStatement,
+    SessionRequest, SignedExactConditionResolution, SignedResolution, SignedSessionRequest,
+    TimeInForce, UserCommand, UserCommandAction,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use proptest::prelude::*;
@@ -207,7 +207,14 @@ fn complementary_rounding_dust_does_not_poison_a_price_level() {
         .unwrap();
     assert_eq!(first.fills.len(), 1);
     assert_eq!(first.fills[0].quantity_micros, 2_857_142);
-    assert_eq!(book.order(dust_maker_id).unwrap().remaining_micros, 1);
+    let cancelled_dust = book.order(dust_maker_id).unwrap();
+    assert_eq!(cancelled_dust.filled_micros, 2_857_142);
+    assert_eq!(cancelled_dust.remaining_micros, 1);
+    assert_eq!(cancelled_dust.status, OrderStatus::Cancelled);
+    assert!(book
+        .aggregate_depth(MARKET_ID, Outcome::Up, now + 1)
+        .0
+        .is_empty());
 
     book.submit(
         BookOrder::with_id(
@@ -245,6 +252,141 @@ fn complementary_rounding_dust_does_not_poison_a_price_level() {
 
     let mut replay = before_second;
     assert_eq!(second, replay.submit(second_order, now + 3).unwrap());
+}
+
+#[test]
+fn complementary_dust_policy_cancels_maker_and_taker_tails_without_overfill() {
+    let now = 2_000;
+
+    let mut maker_tail_book = PriceTimeBook::default();
+    let maker_id = Uuid::from_u128(12);
+    maker_tail_book
+        .submit(
+            BookOrder::with_id(
+                maker_id,
+                "up-maker",
+                MARKET_ID,
+                Outcome::Up,
+                OrderAction::Buy,
+                360_000,
+                3_125_001,
+                TimeInForce::Gtc,
+                None,
+            ),
+            now,
+        )
+        .unwrap();
+    let maker_tail = maker_tail_book
+        .submit(
+            BookOrder::with_id(
+                Uuid::from_u128(13),
+                "down-taker",
+                MARKET_ID,
+                Outcome::Down,
+                OrderAction::Buy,
+                640_000,
+                3_125_000,
+                TimeInForce::Fok,
+                None,
+            ),
+            now + 1,
+        )
+        .unwrap();
+    assert_eq!(maker_tail.fills[0].quantity_micros, 3_125_000);
+    let maker = maker_tail_book.order(maker_id).unwrap();
+    assert_eq!(maker.status, OrderStatus::Cancelled);
+    assert_eq!(maker.filled_micros, 3_125_000);
+    assert_eq!(maker.remaining_micros, 1);
+
+    let mut taker_tail_book = PriceTimeBook::default();
+    taker_tail_book
+        .submit(
+            BookOrder::with_id(
+                Uuid::from_u128(14),
+                "up-maker",
+                MARKET_ID,
+                Outcome::Up,
+                OrderAction::Buy,
+                360_000,
+                3_125_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+            now,
+        )
+        .unwrap();
+    let taker_id = Uuid::from_u128(15);
+    let taker_tail = taker_tail_book
+        .submit(
+            BookOrder::with_id(
+                taker_id,
+                "down-taker",
+                MARKET_ID,
+                Outcome::Down,
+                OrderAction::Buy,
+                640_000,
+                3_125_001,
+                TimeInForce::Gtc,
+                None,
+            ),
+            now + 1,
+        )
+        .unwrap();
+    assert_eq!(taker_tail.fills[0].quantity_micros, 3_125_000);
+    assert_eq!(taker_tail.cancelled_remainder_micros, 1);
+    let taker = taker_tail_book.order(taker_id).unwrap();
+    assert_eq!(taker.status, OrderStatus::PartiallyFilled);
+    assert_eq!(taker.filled_micros, 3_125_000);
+    assert_eq!(taker.remaining_micros, 0);
+    assert!(taker_tail_book
+        .aggregate_depth(MARKET_ID, Outcome::Down, now + 1)
+        .0
+        .is_empty());
+}
+
+#[test]
+fn complementary_merge_cancels_one_micro_maker_tail_deterministically() {
+    let now = 3_000;
+    let maker = BookOrder::with_id(
+        Uuid::from_u128(16),
+        "up-seller",
+        MARKET_ID,
+        Outcome::Up,
+        OrderAction::Sell,
+        350_000,
+        2_857_143,
+        TimeInForce::Gtc,
+        None,
+    );
+    let taker = BookOrder::with_id(
+        Uuid::from_u128(17),
+        "down-seller",
+        MARKET_ID,
+        Outcome::Down,
+        OrderAction::Sell,
+        650_000,
+        2_857_142,
+        TimeInForce::Fok,
+        None,
+    );
+    let run = || {
+        let mut book = PriceTimeBook::default();
+        book.submit(maker.clone(), now).unwrap();
+        let result = book.submit(taker.clone(), now + 1).unwrap();
+        (book, result)
+    };
+    let (first_book, first_result) = run();
+    let (second_book, second_result) = run();
+    assert_eq!(first_result, second_result);
+    assert_eq!(
+        serde_json::to_vec(&first_book).unwrap(),
+        serde_json::to_vec(&second_book).unwrap()
+    );
+    assert_eq!(first_result.fills[0].match_type, MatchType::Merge);
+    assert_eq!(first_result.fills[0].quantity_micros, 2_857_142);
+    let cancelled = first_book.order(maker.order_id).unwrap();
+    assert_eq!(cancelled.status, OrderStatus::Cancelled);
+    assert_eq!(cancelled.remaining_micros, 1);
 }
 
 #[test]
@@ -1015,6 +1157,8 @@ proptest! {
         let complementary = 1_000_000u64 - maker_price;
         let taker_limit = complementary.saturating_add(price_improvement).min(999_999);
         prop_assume!(taker_limit >= complementary);
+        let minimum_payable_quantity = 1_000_000u128.div_ceil(1_000_000u128 - u128::from(maker_price));
+        prop_assume!(quantity >= minimum_payable_quantity);
         let maker = BookOrder::with_id(
             Uuid::from_u128(500),
             "maker",
@@ -1053,6 +1197,283 @@ proptest! {
         );
         prop_assert_eq!(first.fills[0].quantity_micros, quantity);
     }
+
+    #[test]
+    fn one_micro_complete_set_tails_are_cancelled_for_all_midrange_prices(
+        maker_price in 100_000u64..900_001,
+        fill_quantity in 10u128..10_000_000,
+    ) {
+        let maker = BookOrder::with_id(
+            Uuid::from_u128(510),
+            "maker",
+            MARKET_ID,
+            Outcome::Up,
+            OrderAction::Buy,
+            maker_price,
+            fill_quantity + 1,
+            TimeInForce::Gtc,
+            None,
+        );
+        let taker = BookOrder::with_id(
+            Uuid::from_u128(511),
+            "taker",
+            MARKET_ID,
+            Outcome::Down,
+            OrderAction::Buy,
+            1_000_000 - maker_price,
+            fill_quantity,
+            TimeInForce::Fok,
+            None,
+        );
+        let run = || {
+            let mut book = PriceTimeBook::default();
+            book.submit(maker.clone(), 1_000).unwrap();
+            let result = book.submit(taker.clone(), 1_001).unwrap();
+            (book, result)
+        };
+        let (first_book, first_result) = run();
+        let (second_book, second_result) = run();
+        prop_assert_eq!(&first_result, &second_result);
+        prop_assert_eq!(serde_json::to_vec(&first_book).unwrap(), serde_json::to_vec(&second_book).unwrap());
+        prop_assert_eq!(first_result.fills.len(), 1);
+        prop_assert_eq!(first_result.fills[0].quantity_micros, fill_quantity);
+        let cancelled = first_book.order(maker.order_id).unwrap();
+        prop_assert_eq!(cancelled.status, OrderStatus::Cancelled);
+        prop_assert_eq!(cancelled.filled_micros, fill_quantity);
+        prop_assert_eq!(cancelled.remaining_micros, 1);
+    }
+}
+
+#[test]
+fn usdc_mint_dust_release_is_atomic_conservative_and_replay_deterministic() {
+    let run = || {
+        let (mut core, up_key, down_key, up_owner, down_owner) =
+            configured_exact_condition_core_with_balance(5_000_000);
+        let maker_id = Uuid::from_u128(520);
+        execute(
+            &mut core,
+            &up_key,
+            "session:up",
+            1,
+            "cmd:dust-maker",
+            UserCommandAction::SubmitOrder {
+                order: BookOrder::with_id(
+                    maker_id,
+                    "ignored",
+                    MARKET_ID,
+                    Outcome::Up,
+                    OrderAction::Buy,
+                    350_000,
+                    2_857_143,
+                    TimeInForce::Gtc,
+                    None,
+                ),
+            },
+            1_000,
+        );
+        let fill = execute(
+            &mut core,
+            &down_key,
+            "session:down",
+            1,
+            "cmd:dust-taker",
+            UserCommandAction::SubmitOrder {
+                order: BookOrder::with_id(
+                    Uuid::from_u128(521),
+                    "ignored",
+                    MARKET_ID,
+                    Outcome::Down,
+                    OrderAction::Buy,
+                    650_000,
+                    2_857_142,
+                    TimeInForce::Fok,
+                    None,
+                ),
+            },
+            1_050,
+        );
+        let portfolio = execute(
+            &mut core,
+            &up_key,
+            "session:up",
+            2,
+            "cmd:dust-maker-portfolio",
+            UserCommandAction::Portfolio,
+            1_100,
+        );
+        let CommandResult::Portfolio { snapshot } = portfolio.result else {
+            panic!("expected portfolio");
+        };
+        let maker_order = snapshot
+            .orders
+            .iter()
+            .find(|order| order.order_id == maker_id)
+            .unwrap();
+        assert_eq!(maker_order.status, OrderStatus::Cancelled);
+        assert_eq!(maker_order.filled_micros, 2_857_142);
+        assert_eq!(maker_order.remaining_micros, 1);
+
+        let up_available = AccountKey::new(&up_owner, AccountBucket::UserAvailable, "USDC");
+        let down_available = AccountKey::new(&down_owner, AccountBucket::UserAvailable, "USDC");
+        let up_hold = order_hold(&up_owner, Outcome::Up, "USDC");
+        let down_hold = order_hold(&down_owner, Outcome::Down, "USDC");
+        let collateral = market_collateral_usdc();
+        let fee = AccountKey::new("layrs", AccountBucket::FeeRevenue, "USDC");
+        let balances = [
+            core.balance(&up_available),
+            core.balance(&down_available),
+            core.balance(&up_hold),
+            core.balance(&down_hold),
+            core.balance(&collateral),
+            core.balance(&fee),
+            core.balance(&claim(&up_owner, Outcome::Up)),
+            core.balance(&claim(&down_owner, Outcome::Down)),
+        ];
+        assert_eq!(balances[2], 0, "maker dust collateral must be released");
+        assert_eq!(balances[3], 0, "taker reserve must be fully reconciled");
+        assert_eq!(balances[4], 2_857_142);
+        assert_eq!(balances[6], 2_857_142);
+        assert_eq!(balances[7], 2_857_142);
+        assert_eq!(balances[..6].iter().sum::<u128>(), 10_000_000);
+        assert_eq!(
+            order_result(&fill.result).fills[0].quantity_micros,
+            2_857_142
+        );
+        (fill.result, portfolio.receipt.state_root, balances)
+    };
+
+    let first = run();
+    let second = run();
+    assert_eq!(first, second);
+}
+
+#[test]
+fn usdc_merge_dust_release_preserves_claims_collateral_and_replay() {
+    let run = || {
+        let (mut core, up_key, down_key, up_owner, down_owner) =
+            configured_exact_condition_core_with_balance(5_000_000);
+        for (key, session, command, now) in [
+            (&up_key, "session:up", "cmd:merge-seed-up", 950),
+            (&down_key, "session:down", "cmd:merge-seed-down", 951),
+        ] {
+            execute(
+                &mut core,
+                key,
+                session,
+                1,
+                command,
+                UserCommandAction::CompleteSet {
+                    market_id: MARKET_ID.into(),
+                    quantity_micros: 2_857_143,
+                    direction: CompleteSetDirection::Mint,
+                },
+                now,
+            );
+        }
+
+        let maker_id = Uuid::from_u128(530);
+        execute(
+            &mut core,
+            &up_key,
+            "session:up",
+            2,
+            "cmd:merge-dust-maker",
+            UserCommandAction::SubmitOrder {
+                order: BookOrder::with_id(
+                    maker_id,
+                    "ignored",
+                    MARKET_ID,
+                    Outcome::Up,
+                    OrderAction::Sell,
+                    350_000,
+                    2_857_143,
+                    TimeInForce::Gtc,
+                    None,
+                ),
+            },
+            1_000,
+        );
+        let fill = execute(
+            &mut core,
+            &down_key,
+            "session:down",
+            2,
+            "cmd:merge-dust-taker",
+            UserCommandAction::SubmitOrder {
+                order: BookOrder::with_id(
+                    Uuid::from_u128(531),
+                    "ignored",
+                    MARKET_ID,
+                    Outcome::Down,
+                    OrderAction::Sell,
+                    650_000,
+                    2_857_142,
+                    TimeInForce::Fok,
+                    None,
+                ),
+            },
+            1_050,
+        );
+        assert_eq!(
+            order_result(&fill.result).fills[0].match_type,
+            MatchType::Merge
+        );
+        assert_eq!(
+            order_result(&fill.result).fills[0].quantity_micros,
+            2_857_142
+        );
+
+        let portfolio = execute(
+            &mut core,
+            &up_key,
+            "session:up",
+            3,
+            "cmd:merge-dust-maker-portfolio",
+            UserCommandAction::Portfolio,
+            1_100,
+        );
+        let CommandResult::Portfolio { snapshot } = portfolio.result else {
+            panic!("expected portfolio");
+        };
+        let maker = snapshot
+            .orders
+            .iter()
+            .find(|order| order.order_id == maker_id)
+            .unwrap();
+        assert_eq!(maker.status, OrderStatus::Cancelled);
+        assert_eq!(maker.filled_micros, 2_857_142);
+        assert_eq!(maker.remaining_micros, 1);
+
+        let up_available = AccountKey::new(&up_owner, AccountBucket::UserAvailable, "USDC");
+        let down_available = AccountKey::new(&down_owner, AccountBucket::UserAvailable, "USDC");
+        let up_hold = order_hold(&up_owner, Outcome::Up, &format!("CLAIM:{MARKET_ID}:UP"));
+        let down_hold = order_hold(
+            &down_owner,
+            Outcome::Down,
+            &format!("CLAIM:{MARKET_ID}:DOWN"),
+        );
+        let collateral = market_collateral_usdc();
+        let fee = AccountKey::new("layrs", AccountBucket::FeeRevenue, "USDC");
+        let balances = [
+            core.balance(&up_available),
+            core.balance(&down_available),
+            core.balance(&up_hold),
+            core.balance(&down_hold),
+            core.balance(&collateral),
+            core.balance(&fee),
+            core.balance(&claim(&up_owner, Outcome::Up)),
+            core.balance(&claim(&down_owner, Outcome::Down)),
+        ];
+        assert_eq!(balances[2], 0, "maker claim dust hold must be released");
+        assert_eq!(balances[3], 0, "taker claim hold must be reconciled");
+        assert_eq!(balances[4], 2_857_144);
+        assert_eq!(balances[6], 1);
+        assert_eq!(balances[7], 1);
+        assert_eq!(balances[..6].iter().sum::<u128>(), 10_000_000);
+        (fill.result, portfolio.receipt.state_root, balances)
+    };
+
+    assert_eq!(run(), run());
 }
 
 #[test]
@@ -1444,6 +1865,17 @@ fn claim(owner: &str, outcome: Outcome) -> AccountKey {
         Outcome::Down => "DOWN",
     };
     AccountKey::position(owner, format!("CLAIM:{MARKET_ID}:{name}"), MARKET_ID, name)
+}
+
+fn order_hold(owner: &str, outcome: Outcome, asset: &str) -> AccountKey {
+    let outcome = match outcome {
+        Outcome::Up => "UP",
+        Outcome::Down => "DOWN",
+    };
+    let mut account = AccountKey::new(owner, AccountBucket::UserOrderHold, asset);
+    account.market_id = Some(MARKET_ID.into());
+    account.outcome = Some(outcome.into());
+    account
 }
 
 fn market_collateral() -> AccountKey {
