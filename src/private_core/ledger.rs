@@ -90,6 +90,37 @@ pub struct NormalFillPosting {
     pub quantity_micros: u128,
 }
 
+/// Enclave-private economic legs for one complementary MINT or MERGE fill.
+///
+/// A complete-set fill has two independently conserved boundaries:
+/// settlement cash is conserved exactly across holds/collateral/fees, while
+/// the UP and DOWN claim quantities must be issued or burned in equal amounts.
+/// The account interpretation depends on `direction`:
+///
+/// * MINT: `maker_hold`/`taker_hold` are cash holds and the destinations are
+///   the two user claim positions.
+/// * BURN: the holds are the two claim holds and the destinations are user
+///   cash-available accounts.
+///
+/// This descriptor and every account owner remain inside the encrypted
+/// journal. Only the existing aggregate fill artifact may leave the enclave.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompleteSetFillPosting {
+    pub fill_id: String,
+    pub direction: CompleteSetDirection,
+    pub maker_hold: AccountKey,
+    pub taker_hold: AccountKey,
+    pub maker_destination: AccountKey,
+    pub taker_destination: AccountKey,
+    pub market_collateral: AccountKey,
+    pub fee_revenue: AccountKey,
+    pub quantity_micros: u128,
+    pub collateral_amount_atomic: u128,
+    pub maker_amount_atomic: u128,
+    pub taker_amount_atomic: u128,
+    pub taker_fee_atomic: u128,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppliedLedgerTransaction {
     pub sequence: u64,
@@ -285,6 +316,188 @@ impl Ledger {
         }
 
         self.apply_with_replay_keys(transaction, replay_keys)
+    }
+
+    /// Atomically applies one complete-set fill. Replay protection is derived
+    /// from the enclave fill ID, independent of the operator request key, so a
+    /// committed MINT/MERGE cannot be financially posted again after a lost
+    /// response or under a different transport idempotency key.
+    pub fn apply_complete_set_fill(
+        &mut self,
+        idempotency_key: String,
+        business_reference: String,
+        fill: CompleteSetFillPosting,
+    ) -> CoreResult<AppliedLedgerTransaction> {
+        validate_complete_set_fill(&fill)?;
+        if self.applied_idempotency_keys.contains(&idempotency_key) {
+            return Err(CoreError::DuplicateCommand);
+        }
+        let evidence_replay_key = format!("complete-set-fill-evidence:{}", fill.fill_id);
+        if self.applied_idempotency_keys.contains(&evidence_replay_key) {
+            return Err(CoreError::DuplicateCommand);
+        }
+
+        let prior_state_root = self.state_root();
+        let mut next = self.balances.clone();
+        let taker_cash_or_proceeds = fill
+            .taker_amount_atomic
+            .checked_sub(fill.taker_fee_atomic)
+            .ok_or(CoreError::UnbalancedTransaction)?;
+        let mut transfers = Vec::with_capacity(3);
+        let mut postings = Vec::with_capacity(6);
+
+        match fill.direction {
+            CompleteSetDirection::Mint => {
+                let taker_debit = fill
+                    .taker_amount_atomic
+                    .checked_add(fill.taker_fee_atomic)
+                    .ok_or(CoreError::UnbalancedTransaction)?;
+                debit(&mut next, &fill.maker_hold, fill.maker_amount_atomic)?;
+                debit(&mut next, &fill.taker_hold, taker_debit)?;
+                credit(
+                    &mut next,
+                    &fill.market_collateral,
+                    fill.collateral_amount_atomic,
+                )?;
+                if fill.taker_fee_atomic > 0 {
+                    credit(&mut next, &fill.fee_revenue, fill.taker_fee_atomic)?;
+                }
+                credit(&mut next, &fill.maker_destination, fill.quantity_micros)?;
+                credit(&mut next, &fill.taker_destination, fill.quantity_micros)?;
+
+                transfers.push(Transfer {
+                    from: fill.maker_hold.clone(),
+                    to: fill.market_collateral.clone(),
+                    amount: fill.maker_amount_atomic,
+                });
+                transfers.push(Transfer {
+                    from: fill.taker_hold.clone(),
+                    to: fill.market_collateral.clone(),
+                    amount: fill.taker_amount_atomic,
+                });
+                if fill.taker_fee_atomic > 0 {
+                    transfers.push(Transfer {
+                        from: fill.taker_hold.clone(),
+                        to: fill.fee_revenue.clone(),
+                        amount: fill.taker_fee_atomic,
+                    });
+                }
+
+                postings.extend([
+                    posting(
+                        &fill.maker_hold,
+                        PostingSide::Debit,
+                        fill.maker_amount_atomic,
+                    ),
+                    posting(&fill.taker_hold, PostingSide::Debit, taker_debit),
+                    posting(
+                        &fill.market_collateral,
+                        PostingSide::Credit,
+                        fill.collateral_amount_atomic,
+                    ),
+                    posting(
+                        &fill.maker_destination,
+                        PostingSide::Credit,
+                        fill.quantity_micros,
+                    ),
+                    posting(
+                        &fill.taker_destination,
+                        PostingSide::Credit,
+                        fill.quantity_micros,
+                    ),
+                ]);
+                if fill.taker_fee_atomic > 0 {
+                    postings.push(posting(
+                        &fill.fee_revenue,
+                        PostingSide::Credit,
+                        fill.taker_fee_atomic,
+                    ));
+                }
+            }
+            CompleteSetDirection::Burn => {
+                debit(&mut next, &fill.maker_hold, fill.quantity_micros)?;
+                debit(&mut next, &fill.taker_hold, fill.quantity_micros)?;
+                debit(
+                    &mut next,
+                    &fill.market_collateral,
+                    fill.collateral_amount_atomic,
+                )?;
+                credit(&mut next, &fill.maker_destination, fill.maker_amount_atomic)?;
+                if taker_cash_or_proceeds > 0 {
+                    credit(&mut next, &fill.taker_destination, taker_cash_or_proceeds)?;
+                }
+                if fill.taker_fee_atomic > 0 {
+                    credit(&mut next, &fill.fee_revenue, fill.taker_fee_atomic)?;
+                }
+
+                transfers.push(Transfer {
+                    from: fill.market_collateral.clone(),
+                    to: fill.maker_destination.clone(),
+                    amount: fill.maker_amount_atomic,
+                });
+                if taker_cash_or_proceeds > 0 {
+                    transfers.push(Transfer {
+                        from: fill.market_collateral.clone(),
+                        to: fill.taker_destination.clone(),
+                        amount: taker_cash_or_proceeds,
+                    });
+                }
+                if fill.taker_fee_atomic > 0 {
+                    transfers.push(Transfer {
+                        from: fill.market_collateral.clone(),
+                        to: fill.fee_revenue.clone(),
+                        amount: fill.taker_fee_atomic,
+                    });
+                }
+
+                postings.extend([
+                    posting(&fill.maker_hold, PostingSide::Debit, fill.quantity_micros),
+                    posting(&fill.taker_hold, PostingSide::Debit, fill.quantity_micros),
+                    posting(
+                        &fill.market_collateral,
+                        PostingSide::Debit,
+                        fill.collateral_amount_atomic,
+                    ),
+                    posting(
+                        &fill.maker_destination,
+                        PostingSide::Credit,
+                        fill.maker_amount_atomic,
+                    ),
+                ]);
+                if taker_cash_or_proceeds > 0 {
+                    postings.push(posting(
+                        &fill.taker_destination,
+                        PostingSide::Credit,
+                        taker_cash_or_proceeds,
+                    ));
+                }
+                if fill.taker_fee_atomic > 0 {
+                    postings.push(posting(
+                        &fill.fee_revenue,
+                        PostingSide::Credit,
+                        fill.taker_fee_atomic,
+                    ));
+                }
+            }
+        }
+
+        self.balances = next;
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(CoreError::UnbalancedTransaction)?;
+        self.applied_idempotency_keys
+            .insert(idempotency_key.clone());
+        self.applied_idempotency_keys.insert(evidence_replay_key);
+        Ok(AppliedLedgerTransaction {
+            sequence: self.sequence,
+            idempotency_key,
+            business_reference,
+            prior_state_root,
+            state_root: self.state_root(),
+            transfers,
+            postings,
+        })
     }
 
     fn apply_with_replay_keys(
@@ -533,22 +746,64 @@ impl Ledger {
             "DOWN",
         );
 
-        match transaction.direction {
+        let (transfers, postings) = match transaction.direction {
             CompleteSetDirection::Mint => {
                 debit(&mut next, &available, transaction.collateral_amount_atomic)?;
                 credit(&mut next, &collateral, transaction.collateral_amount_atomic)?;
                 credit(&mut next, &up, transaction.quantity_micros)?;
                 credit(&mut next, &down, transaction.quantity_micros)?;
+                (
+                    vec![Transfer {
+                        from: available.clone(),
+                        to: collateral.clone(),
+                        amount: transaction.collateral_amount_atomic,
+                    }],
+                    vec![
+                        posting(
+                            &available,
+                            PostingSide::Debit,
+                            transaction.collateral_amount_atomic,
+                        ),
+                        posting(
+                            &collateral,
+                            PostingSide::Credit,
+                            transaction.collateral_amount_atomic,
+                        ),
+                        posting(&up, PostingSide::Credit, transaction.quantity_micros),
+                        posting(&down, PostingSide::Credit, transaction.quantity_micros),
+                    ],
+                )
             }
             CompleteSetDirection::Burn => {
                 debit(&mut next, &up, transaction.quantity_micros)?;
                 debit(&mut next, &down, transaction.quantity_micros)?;
                 debit(&mut next, &collateral, transaction.collateral_amount_atomic)?;
                 credit(&mut next, &available, transaction.collateral_amount_atomic)?;
+                (
+                    vec![Transfer {
+                        from: collateral.clone(),
+                        to: available.clone(),
+                        amount: transaction.collateral_amount_atomic,
+                    }],
+                    vec![
+                        posting(&up, PostingSide::Debit, transaction.quantity_micros),
+                        posting(&down, PostingSide::Debit, transaction.quantity_micros),
+                        posting(
+                            &collateral,
+                            PostingSide::Debit,
+                            transaction.collateral_amount_atomic,
+                        ),
+                        posting(
+                            &available,
+                            PostingSide::Credit,
+                            transaction.collateral_amount_atomic,
+                        ),
+                    ],
+                )
             }
-        }
+        };
 
-        self.commit_special(
+        self.commit_special_with_details(
             transaction.idempotency_key,
             format!(
                 "complete-set:{}:{}",
@@ -560,6 +815,8 @@ impl Ledger {
             ),
             prior_state_root,
             next,
+            transfers,
+            postings,
         )
     }
 
@@ -653,6 +910,25 @@ impl Ledger {
         prior_state_root: [u8; 32],
         balances: BTreeMap<AccountKey, u128>,
     ) -> CoreResult<AppliedLedgerTransaction> {
+        self.commit_special_with_details(
+            idempotency_key,
+            business_reference,
+            prior_state_root,
+            balances,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    fn commit_special_with_details(
+        &mut self,
+        idempotency_key: String,
+        business_reference: String,
+        prior_state_root: [u8; 32],
+        balances: BTreeMap<AccountKey, u128>,
+        transfers: Vec<Transfer>,
+        postings: Vec<LedgerPosting>,
+    ) -> CoreResult<AppliedLedgerTransaction> {
         self.balances = balances;
         self.sequence = self
             .sequence
@@ -666,8 +942,8 @@ impl Ledger {
             business_reference,
             prior_state_root,
             state_root: self.state_root(),
-            transfers: Vec::new(),
-            postings: Vec::new(),
+            transfers,
+            postings,
         })
     }
 
@@ -753,6 +1029,111 @@ fn validate_normal_fill(fill: &NormalFillPosting) -> CoreResult<()> {
         return Err(CoreError::UnbalancedTransaction);
     }
     Ok(())
+}
+
+fn validate_complete_set_fill(fill: &CompleteSetFillPosting) -> CoreResult<()> {
+    if fill.fill_id.is_empty()
+        || fill.quantity_micros == 0
+        || fill.collateral_amount_atomic == 0
+        || fill.maker_amount_atomic == 0
+        || fill.taker_amount_atomic == 0
+    {
+        return Err(CoreError::ZeroAmount);
+    }
+    if fill.taker_fee_atomic > fill.taker_amount_atomic
+        || fill
+            .maker_amount_atomic
+            .checked_add(fill.taker_amount_atomic)
+            != Some(fill.collateral_amount_atomic)
+    {
+        return Err(CoreError::UnbalancedTransaction);
+    }
+
+    let market_id = fill
+        .market_collateral
+        .market_id
+        .as_deref()
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    let maker_outcome = fill
+        .maker_hold
+        .outcome
+        .as_deref()
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    let taker_outcome = fill
+        .taker_hold
+        .outcome
+        .as_deref()
+        .ok_or(CoreError::UnbalancedTransaction)?;
+    if !matches!(maker_outcome, "UP" | "DOWN")
+        || !matches!(taker_outcome, "UP" | "DOWN")
+        || maker_outcome == taker_outcome
+        || fill.maker_hold.owner.is_empty()
+        || fill.taker_hold.owner.is_empty()
+        || fill.maker_hold.owner == "layrs"
+        || fill.taker_hold.owner == "layrs"
+        || fill.maker_hold.owner == fill.taker_hold.owner
+        || fill.maker_hold.owner != fill.maker_destination.owner
+        || fill.taker_hold.owner != fill.taker_destination.owner
+        || fill.maker_hold.market_id.as_deref() != Some(market_id)
+        || fill.taker_hold.market_id.as_deref() != Some(market_id)
+        || fill.market_collateral.bucket != AccountBucket::MarketCollateral
+        || fill.market_collateral.owner != "layrs"
+        || fill.market_collateral.outcome.is_some()
+        || fill.fee_revenue.bucket != AccountBucket::FeeRevenue
+        || fill.fee_revenue.owner != "layrs"
+        || fill.fee_revenue.market_id.is_some()
+        || fill.fee_revenue.outcome.is_some()
+        || fill.market_collateral.asset != fill.fee_revenue.asset
+        || fill.market_collateral.asset.is_empty()
+    {
+        return Err(CoreError::UnbalancedTransaction);
+    }
+
+    let settlement_asset = &fill.market_collateral.asset;
+    let maker_claim = format!("CLAIM:{market_id}:{maker_outcome}");
+    let taker_claim = format!("CLAIM:{market_id}:{taker_outcome}");
+    let valid = match fill.direction {
+        CompleteSetDirection::Mint => {
+            fill.maker_hold.bucket == AccountBucket::UserOrderHold
+                && fill.taker_hold.bucket == AccountBucket::UserOrderHold
+                && fill.maker_hold.asset == *settlement_asset
+                && fill.taker_hold.asset == *settlement_asset
+                && fill.maker_destination.bucket == AccountBucket::UserPosition
+                && fill.taker_destination.bucket == AccountBucket::UserPosition
+                && fill.maker_destination.asset == maker_claim
+                && fill.taker_destination.asset == taker_claim
+                && fill.maker_destination.market_id.as_deref() == Some(market_id)
+                && fill.taker_destination.market_id.as_deref() == Some(market_id)
+                && fill.maker_destination.outcome.as_deref() == Some(maker_outcome)
+                && fill.taker_destination.outcome.as_deref() == Some(taker_outcome)
+        }
+        CompleteSetDirection::Burn => {
+            fill.maker_hold.bucket == AccountBucket::UserOrderHold
+                && fill.taker_hold.bucket == AccountBucket::UserOrderHold
+                && fill.maker_hold.asset == maker_claim
+                && fill.taker_hold.asset == taker_claim
+                && fill.maker_destination.bucket == AccountBucket::UserAvailable
+                && fill.taker_destination.bucket == AccountBucket::UserAvailable
+                && fill.maker_destination.asset == *settlement_asset
+                && fill.taker_destination.asset == *settlement_asset
+                && fill.maker_destination.market_id.is_none()
+                && fill.taker_destination.market_id.is_none()
+                && fill.maker_destination.outcome.is_none()
+                && fill.taker_destination.outcome.is_none()
+        }
+    };
+    if !valid {
+        return Err(CoreError::UnbalancedTransaction);
+    }
+    Ok(())
+}
+
+fn posting(account: &AccountKey, side: PostingSide, amount: u128) -> LedgerPosting {
+    LedgerPosting {
+        account: account.clone(),
+        side,
+        amount,
+    }
 }
 
 fn consume_transfer(

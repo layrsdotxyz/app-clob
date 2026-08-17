@@ -14,11 +14,11 @@ use super::rewards::{
 };
 use super::{
     AccountBucket, AccountKey, BookOrder, ClaimPayout, CompleteSetDirection,
-    CompleteSetTransaction, CoreError, CoreResult, EnclaveReceipt, EncryptedJournal,
-    EncryptedJournalRecord, EncryptedSnapshot, ExternalFlowDirection, ExternalFlowTransaction,
-    Fill, JournalKey, Ledger, LedgerTransaction, MatchResult, MatchType, NormalFillPosting,
-    OrderAction, OrderStatus, Outcome, PriceTimeBook, ReceiptSigner, SessionGuard,
-    SignedSessionRequest, Transfer, PRICE_SCALE,
+    CompleteSetFillPosting, CompleteSetTransaction, CoreError, CoreResult, EnclaveReceipt,
+    EncryptedJournal, EncryptedJournalRecord, EncryptedSnapshot, ExternalFlowDirection,
+    ExternalFlowTransaction, Fill, JournalKey, Ledger, LedgerTransaction, MatchResult, MatchType,
+    NormalFillPosting, OrderAction, OrderStatus, Outcome, PriceTimeBook, ReceiptSigner,
+    SessionGuard, SignedSessionRequest, Transfer, PRICE_SCALE,
 };
 
 /// Public depth is deliberately less precise than the enclave's private book.
@@ -3858,11 +3858,20 @@ fn apply_complete_set_match_settlement(
                 let taker_fee =
                     taker_fee_atomic(market, fill.quantity_micros, fill.taker_price_micros())?;
                 let mut transfers = Vec::with_capacity(3);
+                let normal_posting;
                 match incoming.action {
                     OrderAction::Buy => {
+                        let seller_available =
+                            available(&maker.private_user_id, &market.settlement_asset);
+                        let seller_claim_hold = claim_hold(&maker);
+                        let buyer_position = claim_position_for(
+                            &incoming.private_user_id,
+                            &incoming.market_id,
+                            incoming.outcome,
+                        );
                         transfers.push(Transfer {
                             from: incoming_cash_hold.clone(),
-                            to: available(&maker.private_user_id, &market.settlement_asset),
+                            to: seller_available.clone(),
                             amount: fill_notional,
                         });
                         if taker_fee > 0 {
@@ -3873,14 +3882,21 @@ fn apply_complete_set_match_settlement(
                             });
                         }
                         transfers.push(Transfer {
-                            from: claim_hold(&maker),
-                            to: claim_position_for(
-                                &incoming.private_user_id,
-                                &incoming.market_id,
-                                incoming.outcome,
-                            ),
+                            from: seller_claim_hold.clone(),
+                            to: buyer_position.clone(),
                             amount: fill.quantity_micros,
                         });
+                        normal_posting = NormalFillPosting {
+                            fill_id: fill.fill_id.to_string(),
+                            buyer_cash_hold: incoming_cash_hold.clone(),
+                            seller_available,
+                            seller_claim_hold,
+                            buyer_position,
+                            fee_revenue: fee_revenue(&market.settlement_asset),
+                            seller_proceeds_atomic: fill_notional,
+                            fee_atomic: taker_fee,
+                            quantity_micros: fill.quantity_micros,
+                        };
                         incoming_cash_used = incoming_cash_used
                             .checked_add(fill_notional)
                             .and_then(|value| value.checked_add(taker_fee))
@@ -3890,42 +3906,60 @@ fn apply_complete_set_match_settlement(
                         let seller_proceeds = fill_notional
                             .checked_sub(taker_fee)
                             .ok_or(CoreError::UnbalancedTransaction)?;
+                        let buyer_cash_hold = cash_hold(&maker, &market.settlement_asset);
+                        let seller_available =
+                            available(&incoming.private_user_id, &market.settlement_asset);
+                        let buyer_position = claim_position_for(
+                            &maker.private_user_id,
+                            &incoming.market_id,
+                            incoming.outcome,
+                        );
                         if seller_proceeds > 0 {
                             transfers.push(Transfer {
-                                from: cash_hold(&maker, &market.settlement_asset),
-                                to: available(&incoming.private_user_id, &market.settlement_asset),
+                                from: buyer_cash_hold.clone(),
+                                to: seller_available.clone(),
                                 amount: seller_proceeds,
                             });
                         }
                         if taker_fee > 0 {
                             transfers.push(Transfer {
-                                from: cash_hold(&maker, &market.settlement_asset),
+                                from: buyer_cash_hold.clone(),
                                 to: fee_revenue(&market.settlement_asset),
                                 amount: taker_fee,
                             });
                         }
                         transfers.push(Transfer {
                             from: incoming_claim_hold.clone(),
-                            to: claim_position_for(
-                                &maker.private_user_id,
-                                &incoming.market_id,
-                                incoming.outcome,
-                            ),
+                            to: buyer_position.clone(),
                             amount: fill.quantity_micros,
                         });
+                        normal_posting = NormalFillPosting {
+                            fill_id: fill.fill_id.to_string(),
+                            buyer_cash_hold,
+                            seller_available,
+                            seller_claim_hold: incoming_claim_hold.clone(),
+                            buyer_position,
+                            fee_revenue: fee_revenue(&market.settlement_asset),
+                            seller_proceeds_atomic: seller_proceeds,
+                            fee_atomic: taker_fee,
+                            quantity_micros: fill.quantity_micros,
+                        };
                         incoming_claim_used = incoming_claim_used
                             .checked_add(fill.quantity_micros)
                             .ok_or(CoreError::UnbalancedTransaction)?;
                     }
                 }
-                ledger.apply(LedgerTransaction {
-                    idempotency_key: format!(
-                        "order:{command_idempotency_key}:normal:{}",
-                        fill.sequence
-                    ),
-                    business_reference: business_reference.into(),
-                    transfers,
-                })?;
+                ledger.apply_normal_fill_settlement(
+                    LedgerTransaction {
+                        idempotency_key: format!(
+                            "order:{command_idempotency_key}:normal:{}",
+                            fill.sequence
+                        ),
+                        business_reference: business_reference.into(),
+                        transfers,
+                    },
+                    vec![normal_posting],
+                )?;
             }
             MatchType::Mint => {
                 if incoming.action != OrderAction::Buy
@@ -3937,65 +3971,36 @@ fn apply_complete_set_match_settlement(
                     ));
                 }
                 let amounts = complete_set_fill_amounts(market, fill)?;
-                let mut funding = vec![
-                    Transfer {
-                        from: cash_hold(&maker, &market.settlement_asset),
-                        to: available(&maker.private_user_id, &market.settlement_asset),
-                        amount: amounts.maker_atomic,
-                    },
-                    Transfer {
-                        from: incoming_cash_hold.clone(),
-                        to: available(&maker.private_user_id, &market.settlement_asset),
-                        amount: amounts.taker_atomic,
-                    },
-                ];
-                if amounts.taker_fee_atomic > 0 {
-                    funding.push(Transfer {
-                        from: incoming_cash_hold.clone(),
-                        to: fee_revenue(&market.settlement_asset),
-                        amount: amounts.taker_fee_atomic,
-                    });
-                }
-                ledger.apply(LedgerTransaction {
-                    idempotency_key: format!(
-                        "order:{command_idempotency_key}:mint-fund:{}",
-                        fill.sequence
-                    ),
-                    business_reference: business_reference.into(),
-                    transfers: funding,
-                })?;
-                ledger.apply_complete_set(CompleteSetTransaction {
-                    idempotency_key: format!(
-                        "order:{command_idempotency_key}:mint-set:{}",
-                        fill.sequence
-                    ),
-                    owner: maker.private_user_id.clone(),
-                    market_id: incoming.market_id.clone(),
-                    settlement_asset: market.settlement_asset.clone(),
-                    quantity_micros: fill.quantity_micros,
-                    collateral_amount_atomic: amounts.collateral_atomic,
-                    direction: CompleteSetDirection::Mint,
-                })?;
-                ledger.apply(LedgerTransaction {
-                    idempotency_key: format!(
-                        "order:{command_idempotency_key}:mint-claim:{}",
-                        fill.sequence
-                    ),
-                    business_reference: business_reference.into(),
-                    transfers: vec![Transfer {
-                        from: claim_position_for(
+                ledger.apply_complete_set_fill(
+                    format!("order:{command_idempotency_key}:mint:{}", fill.sequence),
+                    business_reference.into(),
+                    CompleteSetFillPosting {
+                        fill_id: fill.fill_id.to_string(),
+                        direction: CompleteSetDirection::Mint,
+                        maker_hold: cash_hold(&maker, &market.settlement_asset),
+                        taker_hold: incoming_cash_hold.clone(),
+                        maker_destination: claim_position_for(
                             &maker.private_user_id,
                             &incoming.market_id,
-                            incoming.outcome,
+                            maker.outcome,
                         ),
-                        to: claim_position_for(
+                        taker_destination: claim_position_for(
                             &incoming.private_user_id,
                             &incoming.market_id,
                             incoming.outcome,
                         ),
-                        amount: fill.quantity_micros,
-                    }],
-                })?;
+                        market_collateral: market_collateral(
+                            &incoming.market_id,
+                            &market.settlement_asset,
+                        ),
+                        fee_revenue: fee_revenue(&market.settlement_asset),
+                        quantity_micros: fill.quantity_micros,
+                        collateral_amount_atomic: amounts.collateral_atomic,
+                        maker_amount_atomic: amounts.maker_atomic,
+                        taker_amount_atomic: amounts.taker_atomic,
+                        taker_fee_atomic: amounts.taker_fee_atomic,
+                    },
+                )?;
                 add_basis(
                     cost_basis,
                     position_key(&maker.private_user_id, &incoming.market_id, maker.outcome),
@@ -4025,11 +4030,6 @@ fn apply_complete_set_match_settlement(
                     ));
                 }
                 let amounts = complete_set_fill_amounts(market, fill)?;
-                let taker_proceeds = amounts
-                    .taker_atomic
-                    .checked_sub(amounts.taker_fee_atomic)
-                    .ok_or(CoreError::UnbalancedTransaction)?;
-
                 reduce_basis_for_held_quantity(
                     ledger,
                     cost_basis,
@@ -4053,71 +4053,34 @@ fn apply_complete_set_match_settlement(
                     fill.quantity_micros,
                 )?;
 
-                ledger.apply(LedgerTransaction {
-                    idempotency_key: format!(
-                        "order:{command_idempotency_key}:merge-claims:{}",
-                        fill.sequence
-                    ),
-                    business_reference: business_reference.into(),
-                    transfers: vec![
-                        Transfer {
-                            from: claim_hold(&maker),
-                            to: claim_position_for(
-                                &maker.private_user_id,
-                                &incoming.market_id,
-                                maker.outcome,
-                            ),
-                            amount: fill.quantity_micros,
-                        },
-                        Transfer {
-                            from: incoming_claim_hold.clone(),
-                            to: claim_position_for(
-                                &maker.private_user_id,
-                                &incoming.market_id,
-                                incoming.outcome,
-                            ),
-                            amount: fill.quantity_micros,
-                        },
-                    ],
-                })?;
-                ledger.apply_complete_set(CompleteSetTransaction {
-                    idempotency_key: format!(
-                        "order:{command_idempotency_key}:merge-set:{}",
-                        fill.sequence
-                    ),
-                    owner: maker.private_user_id.clone(),
-                    market_id: incoming.market_id.clone(),
-                    settlement_asset: market.settlement_asset.clone(),
-                    quantity_micros: fill.quantity_micros,
-                    collateral_amount_atomic: amounts.collateral_atomic,
-                    direction: CompleteSetDirection::Burn,
-                })?;
-                let mut payout = Vec::with_capacity(2);
-                if taker_proceeds > 0 {
-                    payout.push(Transfer {
-                        from: available(&maker.private_user_id, &market.settlement_asset),
-                        to: available(&incoming.private_user_id, &market.settlement_asset),
-                        amount: taker_proceeds,
-                    });
-                }
-                if amounts.taker_fee_atomic > 0 {
-                    payout.push(Transfer {
-                        from: available(&maker.private_user_id, &market.settlement_asset),
-                        to: fee_revenue(&market.settlement_asset),
-                        amount: amounts.taker_fee_atomic,
-                    });
-                }
-                if payout.is_empty() {
-                    return Err(CoreError::ZeroAmount);
-                }
-                ledger.apply(LedgerTransaction {
-                    idempotency_key: format!(
-                        "order:{command_idempotency_key}:merge-payout:{}",
-                        fill.sequence
-                    ),
-                    business_reference: business_reference.into(),
-                    transfers: payout,
-                })?;
+                ledger.apply_complete_set_fill(
+                    format!("order:{command_idempotency_key}:merge:{}", fill.sequence),
+                    business_reference.into(),
+                    CompleteSetFillPosting {
+                        fill_id: fill.fill_id.to_string(),
+                        direction: CompleteSetDirection::Burn,
+                        maker_hold: claim_hold(&maker),
+                        taker_hold: incoming_claim_hold.clone(),
+                        maker_destination: available(
+                            &maker.private_user_id,
+                            &market.settlement_asset,
+                        ),
+                        taker_destination: available(
+                            &incoming.private_user_id,
+                            &market.settlement_asset,
+                        ),
+                        market_collateral: market_collateral(
+                            &incoming.market_id,
+                            &market.settlement_asset,
+                        ),
+                        fee_revenue: fee_revenue(&market.settlement_asset),
+                        quantity_micros: fill.quantity_micros,
+                        collateral_amount_atomic: amounts.collateral_atomic,
+                        maker_amount_atomic: amounts.maker_atomic,
+                        taker_amount_atomic: amounts.taker_atomic,
+                        taker_fee_atomic: amounts.taker_fee_atomic,
+                    },
+                )?;
                 incoming_claim_used = incoming_claim_used
                     .checked_add(fill.quantity_micros)
                     .ok_or(CoreError::UnbalancedTransaction)?;
