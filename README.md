@@ -53,7 +53,7 @@ to `withdraw(address,uint256)` on its pinned pool after private-core authorizati
 signer can produce only `AdminOracle.resolve(bytes32,uint8,string)` after the core verifies the
 exact signed Pyth/Polymarket evidence and outcome. The Ed25519 key signs that evidence inside the
 enclave; only its public verifier enters ordinary service configuration. Nonces, raw transactions
-and fees are persisted before broadcast so recovery rebroadcasts identical bytes. New V2
+and fees are persisted before broadcast so recovery rebroadcasts identical bytes. New Layrs V2
 markets use the versioned `C * rate * p * (1-p)` taker-fee curve, zero winning fee, and
 private maker-rebate attribution; already-open V1 markets retain their original 20 bps
 taker and winning-fee policy byte-for-byte.

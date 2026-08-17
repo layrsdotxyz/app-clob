@@ -21,6 +21,12 @@ use super::{
     PRICE_SCALE,
 };
 
+/// Public depth is deliberately less precise than the enclave's private book.
+/// A level must contain liquidity from at least this many independent private
+/// owners before it can leave the enclave. This prevents a thin public level
+/// from acting as an oracle for one user's exact order size and arrival time.
+const MIN_PUBLIC_DEPTH_DISTINCT_OWNERS: usize = 3;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketConfig {
     pub market_id: String,
@@ -89,6 +95,20 @@ pub enum FeeProfileId {
     PolymarketBusinessV2,
     PolymarketGeneralV2,
     PolymarketGeopoliticsV2,
+    LayrsCryptoV2,
+    LayrsMacroV2,
+    LayrsFinanceV2,
+    LayrsPoliticsV2,
+    LayrsSportsV2,
+    LayrsEsportsV2,
+    LayrsWeatherV2,
+    LayrsTechnologyV2,
+    LayrsMentionsV2,
+    LayrsScienceV2,
+    LayrsCultureV2,
+    LayrsBusinessV2,
+    LayrsGeneralV2,
+    LayrsGeopoliticsV2,
 }
 
 impl FeeProfileId {
@@ -123,33 +143,60 @@ impl FeeProfileId {
             | Self::PolymarketCultureV2
             | Self::PolymarketBusinessV2
             | Self::PolymarketGeneralV2
-            | Self::PolymarketGeopoliticsV2 => return None,
+            | Self::PolymarketGeopoliticsV2
+            | Self::LayrsCryptoV2
+            | Self::LayrsMacroV2
+            | Self::LayrsFinanceV2
+            | Self::LayrsPoliticsV2
+            | Self::LayrsSportsV2
+            | Self::LayrsEsportsV2
+            | Self::LayrsWeatherV2
+            | Self::LayrsTechnologyV2
+            | Self::LayrsMentionsV2
+            | Self::LayrsScienceV2
+            | Self::LayrsCultureV2
+            | Self::LayrsBusinessV2
+            | Self::LayrsGeneralV2
+            | Self::LayrsGeopoliticsV2 => return None,
         };
         Some(parameters)
     }
 
     fn taker_curve_rate_bps(self) -> Option<u128> {
         match self {
-            Self::PolymarketCryptoV2 => Some(700),
+            Self::PolymarketCryptoV2 | Self::LayrsCryptoV2 => Some(700),
             Self::PolymarketMacroV2
             | Self::PolymarketWeatherV2
             | Self::PolymarketScienceV2
             | Self::PolymarketCultureV2
-            | Self::PolymarketGeneralV2 => Some(500),
-            // Esports inherits Sports economics until Polymarket publishes a
-            // distinct Esports schedule.
-            Self::PolymarketSportsV2 | Self::PolymarketEsportsV2 => Some(500),
+            | Self::PolymarketGeneralV2
+            | Self::LayrsMacroV2
+            | Self::LayrsWeatherV2
+            | Self::LayrsScienceV2
+            | Self::LayrsCultureV2
+            | Self::LayrsGeneralV2 => Some(500),
+            // Esports inherits the Layrs Sports schedule until governance
+            // activates a distinct immutable profile.
+            Self::PolymarketSportsV2
+            | Self::PolymarketEsportsV2
+            | Self::LayrsSportsV2
+            | Self::LayrsEsportsV2 => Some(500),
             Self::PolymarketFinanceV2
             | Self::PolymarketPoliticsV2
             | Self::PolymarketTechnologyV2
             | Self::PolymarketMentionsV2
-            | Self::PolymarketBusinessV2 => Some(400),
-            Self::PolymarketGeopoliticsV2 => Some(0),
+            | Self::PolymarketBusinessV2
+            | Self::LayrsFinanceV2
+            | Self::LayrsPoliticsV2
+            | Self::LayrsTechnologyV2
+            | Self::LayrsMentionsV2
+            | Self::LayrsBusinessV2 => Some(400),
+            Self::PolymarketGeopoliticsV2 | Self::LayrsGeopoliticsV2 => Some(0),
             _ => None,
         }
     }
 
-    fn has_polymarket_taker_fees(self) -> bool {
+    fn has_layrs_curve_fees(self) -> bool {
         self.taker_curve_rate_bps().is_some()
     }
 }
@@ -3344,6 +3391,14 @@ impl PrivateTradingCore {
         now_millis: i64,
         minimum_level_quantity_micros: u128,
     ) -> (Vec<(u64, u128)>, Vec<(u64, u128)>) {
+        let Some(market) = self.markets.get(market_id) else {
+            return (Vec::new(), Vec::new());
+        };
+        // No closed-market liquidity is public, even if GTC orders remain in
+        // the private book awaiting the deterministic lifecycle cancellation.
+        if now_millis < market.opens_at_millis || now_millis >= market.closes_at_millis {
+            return (Vec::new(), Vec::new());
+        }
         self.books.get(market_id).map_or_else(
             || (Vec::new(), Vec::new()),
             |book| {
@@ -3351,8 +3406,18 @@ impl PrivateTradingCore {
                 let filter = |levels: Vec<(u64, u128, usize)>| {
                     levels
                         .into_iter()
-                        .filter(|(_, quantity, _)| *quantity >= minimum_level_quantity_micros)
-                        .map(|(price, quantity, _)| (price, quantity))
+                        .filter(|(_, quantity, distinct_owners)| {
+                            *quantity >= minimum_level_quantity_micros
+                                && *distinct_owners >= MIN_PUBLIC_DEPTH_DISTINCT_OWNERS
+                        })
+                        .filter_map(|(price, quantity, _)| {
+                            // Publish only whole privacy buckets. Observers see
+                            // a bounded range, never the enclave's exact size.
+                            let bucketed = quantity
+                                .checked_div(minimum_level_quantity_micros)?
+                                .checked_mul(minimum_level_quantity_micros)?;
+                            (bucketed > 0).then_some((price, bucketed))
+                        })
                         .collect()
                 };
                 (filter(bids), filter(asks))
@@ -4557,7 +4622,7 @@ fn floor_bps(amount: u128, bps: u128) -> CoreResult<u128> {
 }
 
 /// Returns the taker fee in six-decimal settlement micros. V2 policies use
-/// the Polymarket curve C * rate * p * (1-p); historical policies retain the
+/// the Layrs curve C * rate * p * (1-p); historical policies retain the
 /// deployed 20 bps notional fee so open markets cannot change economics after
 /// an enclave rotation.
 fn taker_fee_micros(
@@ -4587,7 +4652,7 @@ fn taker_fee_micros(
         .and_then(|value| value.checked_mul(U256::from(PRICE_SCALE - price)))
         .and_then(|value| value.checked_mul(U256::from(rate_bps)))
         .ok_or(CoreError::UnbalancedTransaction)?;
-    // Polymarket rounds settlement-asset fees to five decimal places. The
+    // Layrs V2 rounds settlement-asset fees to five decimal places. The
     // private core represents one settlement unit with six decimals before
     // converting into the asset's native precision, so one fee quantum is ten
     // micros. Round half-up to that quantum; amounts below half a quantum
@@ -4632,7 +4697,7 @@ fn maximum_buy_taker_fee_atomic(
     quantity_micros: u128,
     limit_price_micros: u64,
 ) -> CoreResult<u128> {
-    let reserve_price = if market.fee_profile_id.has_polymarket_taker_fees()
+    let reserve_price = if market.fee_profile_id.has_layrs_curve_fees()
         && limit_price_micros >= (PRICE_SCALE / 2) as u64
     {
         (PRICE_SCALE / 2) as u64
@@ -4644,8 +4709,11 @@ fn maximum_buy_taker_fee_atomic(
 
 fn maker_rebate_bps(profile_id: FeeProfileId) -> u128 {
     match profile_id {
-        FeeProfileId::PolymarketCryptoV2 => 2_000,
-        FeeProfileId::PolymarketSportsV2 | FeeProfileId::PolymarketEsportsV2 => 1_500,
+        FeeProfileId::PolymarketCryptoV2 | FeeProfileId::LayrsCryptoV2 => 2_000,
+        FeeProfileId::PolymarketSportsV2
+        | FeeProfileId::PolymarketEsportsV2
+        | FeeProfileId::LayrsSportsV2
+        | FeeProfileId::LayrsEsportsV2 => 1_500,
         FeeProfileId::PolymarketMacroV2
         | FeeProfileId::PolymarketFinanceV2
         | FeeProfileId::PolymarketPoliticsV2
@@ -4655,8 +4723,20 @@ fn maker_rebate_bps(profile_id: FeeProfileId) -> u128 {
         | FeeProfileId::PolymarketScienceV2
         | FeeProfileId::PolymarketCultureV2
         | FeeProfileId::PolymarketBusinessV2
-        | FeeProfileId::PolymarketGeneralV2 => 2_500,
-        FeeProfileId::PolymarketGeopoliticsV2 | FeeProfileId::LegacyProfitV1 => 0,
+        | FeeProfileId::PolymarketGeneralV2
+        | FeeProfileId::LayrsMacroV2
+        | FeeProfileId::LayrsFinanceV2
+        | FeeProfileId::LayrsPoliticsV2
+        | FeeProfileId::LayrsWeatherV2
+        | FeeProfileId::LayrsTechnologyV2
+        | FeeProfileId::LayrsMentionsV2
+        | FeeProfileId::LayrsScienceV2
+        | FeeProfileId::LayrsCultureV2
+        | FeeProfileId::LayrsBusinessV2
+        | FeeProfileId::LayrsGeneralV2 => 2_500,
+        FeeProfileId::PolymarketGeopoliticsV2
+        | FeeProfileId::LayrsGeopoliticsV2
+        | FeeProfileId::LegacyProfitV1 => 0,
         FeeProfileId::CryptoV1
         | FeeProfileId::MacroV1
         | FeeProfileId::FinanceV1
@@ -4713,7 +4793,7 @@ fn settlement_winning_fee(
     gross_payout_atomic: u128,
     is_push: bool,
 ) -> CoreResult<u128> {
-    if profile_id.has_polymarket_taker_fees() {
+    if profile_id.has_layrs_curve_fees() {
         return Ok(0);
     }
     if is_push || gross_payout_atomic <= executed_stake_atomic {
@@ -5962,26 +6042,26 @@ mod category_fee_tests {
     }
 
     #[test]
-    fn polymarket_v2_profiles_cover_every_supported_category() {
+    fn layrs_v2_profiles_cover_every_supported_category() {
         let vectors = [
-            (FeeProfileId::PolymarketCryptoV2, 700),
-            (FeeProfileId::PolymarketMacroV2, 500),
-            (FeeProfileId::PolymarketFinanceV2, 400),
-            (FeeProfileId::PolymarketPoliticsV2, 400),
-            (FeeProfileId::PolymarketSportsV2, 500),
-            (FeeProfileId::PolymarketEsportsV2, 500),
-            (FeeProfileId::PolymarketWeatherV2, 500),
-            (FeeProfileId::PolymarketTechnologyV2, 400),
-            (FeeProfileId::PolymarketMentionsV2, 400),
-            (FeeProfileId::PolymarketScienceV2, 500),
-            (FeeProfileId::PolymarketCultureV2, 500),
-            (FeeProfileId::PolymarketBusinessV2, 400),
-            (FeeProfileId::PolymarketGeneralV2, 500),
-            (FeeProfileId::PolymarketGeopoliticsV2, 0),
+            (FeeProfileId::LayrsCryptoV2, 700),
+            (FeeProfileId::LayrsMacroV2, 500),
+            (FeeProfileId::LayrsFinanceV2, 400),
+            (FeeProfileId::LayrsPoliticsV2, 400),
+            (FeeProfileId::LayrsSportsV2, 500),
+            (FeeProfileId::LayrsEsportsV2, 500),
+            (FeeProfileId::LayrsWeatherV2, 500),
+            (FeeProfileId::LayrsTechnologyV2, 400),
+            (FeeProfileId::LayrsMentionsV2, 400),
+            (FeeProfileId::LayrsScienceV2, 500),
+            (FeeProfileId::LayrsCultureV2, 500),
+            (FeeProfileId::LayrsBusinessV2, 400),
+            (FeeProfileId::LayrsGeneralV2, 500),
+            (FeeProfileId::LayrsGeopoliticsV2, 0),
         ];
 
         for (profile, expected_rate_bps) in vectors {
-            assert!(profile.has_polymarket_taker_fees());
+            assert!(profile.has_layrs_curve_fees());
             assert_eq!(profile.taker_curve_rate_bps(), Some(expected_rate_bps));
             assert_eq!(profile.parameters(), None);
             assert_eq!(settlement_winning_fee(profile, 10, 100, false).unwrap(), 0);
@@ -5989,14 +6069,27 @@ mod category_fee_tests {
     }
 
     #[test]
-    fn polymarket_v2_curve_matches_public_fee_vectors() {
+    fn layrs_v2_names_are_canonical_without_rewriting_legacy_signed_profiles() {
+        let current = serde_json::to_string(&FeeProfileId::LayrsCryptoV2).unwrap();
+        let legacy = serde_json::from_str::<FeeProfileId>("\"POLYMARKET_CRYPTO_V2\"").unwrap();
+        assert_eq!(current, "\"LAYRS_CRYPTO_V2\"");
+        assert_eq!(legacy, FeeProfileId::PolymarketCryptoV2);
+        assert_eq!(legacy.taker_curve_rate_bps(), current_profile_rate());
+
+        fn current_profile_rate() -> Option<u128> {
+            FeeProfileId::LayrsCryptoV2.taker_curve_rate_bps()
+        }
+    }
+
+    #[test]
+    fn layrs_v2_curve_matches_public_fee_vectors() {
         const ONE_HUNDRED_SHARES: u128 = 100_000_000;
         let vectors = [
-            (FeeProfileId::PolymarketCryptoV2, 1_750_000),
-            (FeeProfileId::PolymarketSportsV2, 1_250_000),
-            (FeeProfileId::PolymarketFinanceV2, 1_000_000),
-            (FeeProfileId::PolymarketMacroV2, 1_250_000),
-            (FeeProfileId::PolymarketGeopoliticsV2, 0),
+            (FeeProfileId::LayrsCryptoV2, 1_750_000),
+            (FeeProfileId::LayrsSportsV2, 1_250_000),
+            (FeeProfileId::LayrsFinanceV2, 1_000_000),
+            (FeeProfileId::LayrsMacroV2, 1_250_000),
+            (FeeProfileId::LayrsGeopoliticsV2, 0),
         ];
 
         for (profile, expected_at_fifty_cents) in vectors {
@@ -6009,13 +6102,13 @@ mod category_fee_tests {
     }
 
     #[test]
-    fn polymarket_v2_curve_is_symmetric_and_peaks_at_fifty_cents() {
+    fn layrs_v2_curve_is_symmetric_and_peaks_at_fifty_cents() {
         const SHARES: u128 = 123_456_789;
         for profile in [
-            FeeProfileId::PolymarketCryptoV2,
-            FeeProfileId::PolymarketMacroV2,
-            FeeProfileId::PolymarketSportsV2,
-            FeeProfileId::PolymarketTechnologyV2,
+            FeeProfileId::LayrsCryptoV2,
+            FeeProfileId::LayrsMacroV2,
+            FeeProfileId::LayrsSportsV2,
+            FeeProfileId::LayrsTechnologyV2,
         ] {
             let low = taker_fee_micros(profile, SHARES, 10_000).unwrap();
             let high = taker_fee_micros(profile, SHARES, 990_000).unwrap();
@@ -6026,21 +6119,21 @@ mod category_fee_tests {
     }
 
     #[test]
-    fn polymarket_v2_fee_rounds_to_five_decimal_places() {
+    fn layrs_v2_fee_rounds_to_five_decimal_places() {
         assert_eq!(
-            taker_fee_micros(FeeProfileId::PolymarketCryptoV2, 100_000_000, 10_000).unwrap(),
+            taker_fee_micros(FeeProfileId::LayrsCryptoV2, 100_000_000, 10_000).unwrap(),
             69_300
         );
         assert_eq!(
-            taker_fee_micros(FeeProfileId::PolymarketCryptoV2, 1, 10_000).unwrap(),
+            taker_fee_micros(FeeProfileId::LayrsCryptoV2, 1, 10_000).unwrap(),
             0
         );
         assert_eq!(
-            taker_fee_micros(FeeProfileId::PolymarketCryptoV2, 100, 500_000).unwrap(),
+            taker_fee_micros(FeeProfileId::LayrsCryptoV2, 100, 500_000).unwrap(),
             0
         );
         assert_eq!(
-            taker_fee_micros(FeeProfileId::PolymarketCryptoV2, 1_000, 500_000).unwrap(),
+            taker_fee_micros(FeeProfileId::LayrsCryptoV2, 1_000, 500_000).unwrap(),
             20
         );
     }
