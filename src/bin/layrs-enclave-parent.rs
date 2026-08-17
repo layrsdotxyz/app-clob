@@ -29,6 +29,7 @@ use tower_http::{
     compression::CompressionLayer, request_id::MakeRequestUuid,
     request_id::PropagateRequestIdLayer, request_id::SetRequestIdLayer, timeout::TimeoutLayer,
 };
+use uuid::Uuid;
 
 // Provisioning restores the latest encrypted private-core snapshot through the same
 // ciphertext-only relay used by ordinary private commands. Keep the decoded frame
@@ -75,12 +76,15 @@ struct EncryptedRequestContext {
     idempotency_key: String,
     expected_action: ExpectedEncryptedAction,
     expected_session_tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_order_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum ExpectedEncryptedAction {
     SubmitOrder,
+    ReplaceOrder,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -361,6 +365,10 @@ async fn relay(State(state): State<AppState>, Json(envelope): Json<PrivateEnvelo
 
 fn valid_request_context(context: &EncryptedRequestContext) -> bool {
     valid_idempotency_key(&context.idempotency_key)
+        && match context.expected_action {
+            ExpectedEncryptedAction::SubmitOrder => context.expected_order_id.is_none(),
+            ExpectedEncryptedAction::ReplaceOrder => context.expected_order_id.is_some(),
+        }
         && (1..=8).contains(&context.expected_session_tags.len())
         && context.expected_session_tags.iter().all(|tag| {
             URL_SAFE_NO_PAD
@@ -500,6 +508,7 @@ mod tests {
                 idempotency_key: "order:create:1234".into(),
                 expected_action: ExpectedEncryptedAction::SubmitOrder,
                 expected_session_tags: vec![URL_SAFE_NO_PAD.encode([8u8; 32])],
+                expected_order_id: None,
             }),
         };
         let encoded = serde_cbor::to_vec(&request).expect("wire request encodes");
@@ -526,6 +535,7 @@ mod tests {
             idempotency_key: "order:create:1234".into(),
             expected_action: ExpectedEncryptedAction::SubmitOrder,
             expected_session_tags: vec![URL_SAFE_NO_PAD.encode([9u8; 32])],
+            expected_order_id: None,
         };
         assert!(valid_request_context(&valid));
         assert!(!valid_request_context(&EncryptedRequestContext {

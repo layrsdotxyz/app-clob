@@ -456,6 +456,11 @@ pub enum UserCommandAction {
     SubmitOrder {
         order: BookOrder,
     },
+    ReplaceOrder {
+        market_id: String,
+        order_id: Uuid,
+        replacement: BookOrder,
+    },
     CancelOrder {
         market_id: String,
         order_id: Uuid,
@@ -612,6 +617,10 @@ pub enum CommandResult {
     },
     Cancelled {
         order: BookOrder,
+    },
+    Replaced {
+        cancelled: BookOrder,
+        result: MatchResult,
     },
     CompleteSet {
         market_id: String,
@@ -2904,7 +2913,9 @@ impl PrivateTradingCore {
         if self.trading_frozen
             && matches!(
                 &command.action,
-                UserCommandAction::SubmitOrder { .. } | UserCommandAction::CompleteSet { .. }
+                UserCommandAction::SubmitOrder { .. }
+                    | UserCommandAction::ReplaceOrder { .. }
+                    | UserCommandAction::CompleteSet { .. }
             )
         {
             return Err(CoreError::TradingFrozen);
@@ -2923,6 +2934,9 @@ impl PrivateTradingCore {
         let task_order_commitment = match &command.action {
             UserCommandAction::SubmitOrder { order } => {
                 Some(private_order_commitment(order, &private_user_id))
+            }
+            UserCommandAction::ReplaceOrder { replacement, .. } => {
+                Some(private_order_commitment(replacement, &private_user_id))
             }
             _ => None,
         };
@@ -3090,6 +3104,155 @@ impl PrivateTradingCore {
                 public_order.private_user_id.clear();
                 CommandResult::Cancelled {
                     order: public_order,
+                }
+            }
+            UserCommandAction::ReplaceOrder {
+                market_id,
+                order_id,
+                replacement,
+            } => {
+                let market = self
+                    .markets
+                    .get(market_id)
+                    .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
+                if !matches!(
+                    market.execution,
+                    MarketExecution::NativeClob | MarketExecution::NativeExactCondition { .. }
+                ) {
+                    return Err(CoreError::InvalidOrder(
+                        "order replacement is unavailable for bootstrap execution".into(),
+                    ));
+                }
+
+                let book = books
+                    .get_mut(market_id)
+                    .ok_or_else(|| CoreError::InvalidOrder("order book does not exist".into()))?;
+                let original = book
+                    .order(*order_id)
+                    .cloned()
+                    .ok_or_else(|| CoreError::InvalidOrder("order does not exist".into()))?;
+                if original.private_user_id != private_user_id {
+                    return Err(CoreError::InvalidOrder("order owner mismatch".into()));
+                }
+                if replacement.order_id == *order_id {
+                    return Err(CoreError::InvalidOrder(
+                        "replacement requires a new order id".into(),
+                    ));
+                }
+                if replacement.market_id != *market_id
+                    || replacement.outcome != original.outcome
+                    || replacement.action != original.action
+                {
+                    return Err(CoreError::InvalidOrder(
+                        "replacement cannot change market, outcome, or action".into(),
+                    ));
+                }
+
+                let cancelled = book.cancel(*order_id, &private_user_id, now_millis)?;
+                let release = cancellation_transfers(
+                    &ledger,
+                    book,
+                    market,
+                    std::slice::from_ref(&cancelled),
+                )?;
+                ledger.apply(LedgerTransaction {
+                    idempotency_key: format!("replace-cancel:{}", command.idempotency_key),
+                    business_reference: command.command_id.clone(),
+                    transfers: release,
+                })?;
+
+                // The replacement is always a new order and therefore receives fresh
+                // sequence priority. Client-supplied timestamps, fill counters and owner
+                // fields are discarded at this trust boundary.
+                let mut incoming = replacement.clone();
+                incoming.private_user_id = private_user_id.clone();
+                incoming.created_at_millis = 0;
+                incoming.updated_at_millis = 0;
+                incoming.sequence = 0;
+                incoming.filled_micros = 0;
+                incoming.remaining_micros = incoming.quantity_micros;
+                incoming.status = OrderStatus::Open;
+                validate_order_for_market(&incoming, market, now_millis)?;
+                enforce_user_position_limit(
+                    &ledger,
+                    &books,
+                    &bootstrap_executions,
+                    market,
+                    &incoming,
+                )?;
+
+                let replacement_prior_books = books.clone();
+                let match_result = books
+                    .get_mut(market_id)
+                    .expect("replacement book remains present")
+                    .submit(incoming.clone(), now_millis)?;
+                if match_result
+                    .accepted_order
+                    .as_ref()
+                    .is_some_and(|accepted| accepted.status == OrderStatus::Rejected)
+                {
+                    return Err(CoreError::InvalidOrder(
+                        "replacement order was rejected".into(),
+                    ));
+                }
+                if match_result.accepted_order.as_ref().is_some() {
+                    if match_result
+                        .fills
+                        .iter()
+                        .all(|fill| fill.match_type == MatchType::Normal)
+                    {
+                        let (transfers, fill_postings) = settlement_transfers(
+                            &replacement_prior_books,
+                            &books,
+                            market,
+                            &incoming,
+                            &match_result,
+                        )?;
+                        apply_fill_cost_basis(
+                            &ledger,
+                            &replacement_prior_books,
+                            &books,
+                            market,
+                            &incoming,
+                            &match_result,
+                            &mut position_cost_basis,
+                        )?;
+                        let transaction = LedgerTransaction {
+                            idempotency_key: format!("replace-order:{}", command.idempotency_key),
+                            business_reference: command.command_id.clone(),
+                            transfers,
+                        };
+                        if fill_postings.is_empty() {
+                            ledger.apply(transaction)?;
+                        } else {
+                            ledger.apply_normal_fill_settlement(transaction, fill_postings)?;
+                        }
+                    } else {
+                        apply_complete_set_match_settlement(
+                            &mut ledger,
+                            &replacement_prior_books,
+                            &books,
+                            market,
+                            &incoming,
+                            &match_result,
+                            &mut position_cost_basis,
+                            &format!("replace:{}", command.idempotency_key),
+                            &command.command_id,
+                        )?;
+                    }
+                    record_native_fill_economics(
+                        &mut private_rewards,
+                        market,
+                        &match_result,
+                        now_millis,
+                    )?;
+                }
+                audit_drafts = native_audit_drafts(&incoming, &match_result, market)?;
+                let mut public_cancelled = cancelled;
+                public_cancelled.private_user_id.clear();
+                CommandResult::Replaced {
+                    cancelled: public_cancelled,
+                    result: redact_match_result(match_result),
                 }
             }
             UserCommandAction::CompleteSet {
@@ -3346,6 +3509,7 @@ impl PrivateTradingCore {
             Some(matches!(
                 command.action,
                 UserCommandAction::SubmitOrder { .. }
+                    | UserCommandAction::ReplaceOrder { .. }
                     | UserCommandAction::CancelOrder { .. }
                     | UserCommandAction::CompleteSet { .. }
                     | UserCommandAction::RequestRewardClaim { .. }

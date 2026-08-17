@@ -435,6 +435,72 @@ fn duplicate_order_id_is_rejected_before_it_can_replace_resting_liquidity() {
 }
 
 #[test]
+fn cancelled_then_replaced_order_receives_fresh_deterministic_priority() {
+    let mut book = PriceTimeBook::default();
+    let market_id = "layrs:v5:BTC:USDC:15m:replace-priority";
+    let old_id = uuid::Uuid::from_u128(1);
+    let peer_id = uuid::Uuid::from_u128(2);
+    let replacement_id = uuid::Uuid::from_u128(3);
+    for (order_id, owner, now) in [(old_id, "usr_a", 1_000), (peer_id, "usr_b", 1_100)] {
+        book.submit(
+            BookOrder::with_id(
+                order_id,
+                owner,
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                400_000,
+                1_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+            now,
+        )
+        .unwrap();
+    }
+    book.cancel(old_id, "usr_a", 1_200).unwrap();
+    book.submit(
+        BookOrder::with_id(
+            replacement_id,
+            "usr_a",
+            market_id,
+            Outcome::Up,
+            OrderAction::Buy,
+            400_000,
+            1_000_000,
+            TimeInForce::Gtc,
+            None,
+        ),
+        1_200,
+    )
+    .unwrap();
+
+    let fill = book
+        .submit(
+            BookOrder::with_id(
+                uuid::Uuid::from_u128(4),
+                "usr_c",
+                market_id,
+                Outcome::Up,
+                OrderAction::Sell,
+                400_000,
+                1_000_000,
+                TimeInForce::Fak,
+                None,
+            ),
+            1_300,
+        )
+        .unwrap();
+    assert_eq!(fill.fills.len(), 1);
+    assert_eq!(fill.fills[0].maker_order_id, peer_id);
+    assert_eq!(book.order(old_id).unwrap().status, OrderStatus::Cancelled);
+    assert_eq!(
+        book.order(replacement_id).unwrap().status,
+        OrderStatus::Open
+    );
+}
+
+#[test]
 fn encrypted_journal_detects_ciphertext_and_chain_tampering() {
     let mut journal = EncryptedJournal::new(JournalKey::from_bytes([7u8; 32]));
     let record = journal
@@ -3430,6 +3496,203 @@ fn api_order_creation_enforces_funded_hold_limits_tif_and_replay() {
     );
     assert!(matches!(invalid, Err(CoreError::InvalidOrder(_))));
     assert_eq!(core.state_root(), invalid_root);
+}
+
+#[test]
+fn api_order_replacement_is_atomic_replay_safe_and_releases_exact_collateral() {
+    let user_key = SigningKey::from_bytes(&[111u8; 32]);
+    let journal_key = [112u8; 32];
+    let commitment = [113u8; 32];
+    let owner = derived_private_user(journal_key, commitment);
+    let market_id = "layrs:v5:BTC:USDC:15m:3000";
+    let mut core = PrivateTradingCore::new(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([114u8; 48]),
+    );
+    core.register_market(
+        "sys:market:replace-atomic".into(),
+        MarketConfig {
+            market_id: market_id.into(),
+            settlement_asset: "USDC".into(),
+            settlement_decimals: 6,
+            public_settlement_chain: Some("horizen".into()),
+            opens_at_millis: 900,
+            closes_at_millis: 3_000,
+            minimum_quantity_micros: 250_000,
+            maximum_quantity_micros: 10_000_000,
+            minimum_order_notional_micros: 250_000,
+            maximum_order_notional_micros: 5_000_000,
+            maximum_user_position_micros: 10_000_000,
+            maximum_pending_bootstrap_notional_micros: 10_000_000,
+            tick_size_micros: 10_000,
+            oracle_feed_id: 9002,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
+            execution: MarketExecution::NativeClob,
+        },
+        800,
+    )
+    .unwrap();
+    core.register_session(
+        "sys:session:replace-atomic".into(),
+        "session:replace-atomic".into(),
+        commitment,
+        user_key.verifying_key().to_bytes(),
+        4_000,
+        850,
+    )
+    .unwrap();
+    core.apply_user_external_flow(
+        "sys:deposit:replace-atomic".into(),
+        commitment,
+        "USDC".into(),
+        AccountBucket::UserAvailable,
+        5_000_000,
+        ExternalFlowDirection::Inflow,
+        [115u8; 32],
+        875,
+    )
+    .unwrap();
+
+    let original_response = execute_signed_response(
+        &mut core,
+        &user_key,
+        "session:replace-atomic",
+        1,
+        "cmd:replace-original",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                400_000,
+                2_500_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_000,
+    );
+    let original = match original_response.result {
+        CommandResult::Order { result } => result.accepted_order.unwrap(),
+        _ => panic!("expected original order"),
+    };
+    let available = AccountKey::new(&owner, AccountBucket::UserAvailable, "USDC");
+    let mut hold = AccountKey::new(&owner, AccountBucket::UserOrderHold, "USDC");
+    hold.market_id = Some(market_id.into());
+    hold.outcome = Some("UP".into());
+    let root_before_failure = core.state_root();
+    let available_before_failure = core.balance(&available);
+    let hold_before_failure = core.balance(&hold);
+
+    let invalid = execute_signed_result(
+        &mut core,
+        &user_key,
+        "session:replace-atomic",
+        2,
+        "cmd:replace-invalid",
+        UserCommandAction::ReplaceOrder {
+            market_id: market_id.into(),
+            order_id: original.order_id,
+            replacement: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                400_000,
+                20_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_100,
+    );
+    assert!(matches!(invalid, Err(CoreError::InvalidOrder(_))));
+    assert_eq!(core.state_root(), root_before_failure);
+    assert_eq!(core.balance(&available), available_before_failure);
+    assert_eq!(core.balance(&hold), hold_before_failure);
+
+    let rejected_fok = execute_signed_result(
+        &mut core,
+        &user_key,
+        "session:replace-atomic",
+        2,
+        "cmd:replace-rejected-fok",
+        UserCommandAction::ReplaceOrder {
+            market_id: market_id.into(),
+            order_id: original.order_id,
+            replacement: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                500_000,
+                1_000_000,
+                TimeInForce::Fok,
+                None,
+            ),
+        },
+        1_150,
+    );
+    assert!(matches!(rejected_fok, Err(CoreError::InvalidOrder(_))));
+    assert_eq!(core.state_root(), root_before_failure);
+    assert_eq!(core.balance(&available), available_before_failure);
+    assert_eq!(core.balance(&hold), hold_before_failure);
+
+    let replacement = BookOrder::new(
+        "ignored",
+        market_id,
+        Outcome::Up,
+        OrderAction::Buy,
+        500_000,
+        1_000_000,
+        TimeInForce::Gtc,
+        None,
+    );
+    let action = UserCommandAction::ReplaceOrder {
+        market_id: market_id.into(),
+        order_id: original.order_id,
+        replacement: replacement.clone(),
+    };
+    let replaced = execute_signed_response(
+        &mut core,
+        &user_key,
+        "session:replace-atomic",
+        2,
+        "cmd:replace-success",
+        action.clone(),
+        1_200,
+    );
+    let (cancelled, accepted) = match &replaced.result {
+        CommandResult::Replaced { cancelled, result } => {
+            (cancelled, result.accepted_order.as_ref().unwrap())
+        }
+        _ => panic!("expected replacement result"),
+    };
+    assert_eq!(cancelled.order_id, original.order_id);
+    assert_eq!(cancelled.status, OrderStatus::Cancelled);
+    assert_eq!(accepted.order_id, replacement.order_id);
+    assert_eq!(accepted.status, OrderStatus::Open);
+    assert!(accepted.sequence > original.sequence);
+    assert_eq!(core.balance(&available) + core.balance(&hold), 5_000_000);
+    assert!(core.balance(&hold) < hold_before_failure);
+
+    let committed_root = core.state_root();
+    let available_after = core.balance(&available);
+    let hold_after = core.balance(&hold);
+    let replay = execute_signed_response(
+        &mut core,
+        &user_key,
+        "session:replace-atomic",
+        2,
+        "cmd:replace-success",
+        action,
+        1_200,
+    );
+    assert_eq!(replay.receipt.state_root, replaced.receipt.state_root);
+    assert_eq!(core.state_root(), committed_root);
+    assert_eq!(core.balance(&available), available_after);
+    assert_eq!(core.balance(&hold), hold_after);
 }
 
 fn execute_signed(

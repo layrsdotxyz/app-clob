@@ -53,6 +53,7 @@ use tokio::{
     sync::Mutex,
 };
 use tokio_vsock::{VsockAddr, VsockListener, VsockStream, VMADDR_CID_ANY};
+use uuid::Uuid;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
@@ -87,12 +88,15 @@ struct EncryptedRequestContext {
     idempotency_key: String,
     expected_action: ExpectedEncryptedAction,
     expected_session_tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_order_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum ExpectedEncryptedAction {
     SubmitOrder,
+    ReplaceOrder,
 }
 
 #[derive(Debug, Serialize)]
@@ -819,10 +823,18 @@ fn validate_request_context(
     let PlainRequest::User { command, .. } = request else {
         return Err(());
     };
+    let (actual_action, actual_order_id) = match &command.action {
+        UserCommandAction::SubmitOrder { .. } => (ExpectedEncryptedAction::SubmitOrder, None),
+        UserCommandAction::ReplaceOrder { order_id, .. } => {
+            (ExpectedEncryptedAction::ReplaceOrder, Some(*order_id))
+        }
+        _ => return Err(()),
+    };
     validate_user_command_context(
         &command.idempotency_key,
         &command.session.request.session_id,
-        matches!(command.action, UserCommandAction::SubmitOrder { .. }),
+        actual_action,
+        actual_order_id,
         context,
     )
 }
@@ -830,7 +842,8 @@ fn validate_request_context(
 fn validate_user_command_context(
     idempotency_key: &str,
     session_id: &str,
-    is_submit_order: bool,
+    actual_action: ExpectedEncryptedAction,
+    actual_order_id: Option<Uuid>,
     context: &EncryptedRequestContext,
 ) -> Result<(), ()> {
     if idempotency_key != context.idempotency_key
@@ -841,8 +854,16 @@ fn validate_user_command_context(
     {
         return Err(());
     }
-    match context.expected_action {
-        ExpectedEncryptedAction::SubmitOrder if is_submit_order => Ok(()),
+    if context.expected_action != actual_action {
+        return Err(());
+    }
+    match actual_action {
+        ExpectedEncryptedAction::SubmitOrder if context.expected_order_id.is_none() => Ok(()),
+        ExpectedEncryptedAction::ReplaceOrder
+            if context.expected_order_id == actual_order_id && actual_order_id.is_some() =>
+        {
+            Ok(())
+        }
         _ => Err(()),
     }
 }
@@ -2529,33 +2550,65 @@ mod tests {
             idempotency_key: "order:create:1234".into(),
             expected_action: ExpectedEncryptedAction::SubmitOrder,
             expected_session_tags: vec![expected_tag],
+            expected_order_id: None,
         };
         assert!(validate_user_command_context(
             "order:create:1234",
             "session:user-a",
-            true,
+            ExpectedEncryptedAction::SubmitOrder,
+            None,
             &context
         )
         .is_ok());
         assert!(validate_user_command_context(
             "order:create:5678",
             "session:user-a",
-            true,
+            ExpectedEncryptedAction::SubmitOrder,
+            None,
             &context
         )
         .is_err());
         assert!(validate_user_command_context(
             "order:create:1234",
             "session:user-b",
-            true,
+            ExpectedEncryptedAction::SubmitOrder,
+            None,
             &context
         )
         .is_err());
         assert!(validate_user_command_context(
             "order:create:1234",
             "session:user-a",
-            false,
+            ExpectedEncryptedAction::ReplaceOrder,
+            Some(Uuid::nil()),
             &context
+        )
+        .is_err());
+
+        let order_id = Uuid::new_v4();
+        let replace = EncryptedRequestContext {
+            idempotency_key: "order:replace:1234".into(),
+            expected_action: ExpectedEncryptedAction::ReplaceOrder,
+            expected_session_tags: vec![api_session_request_tag(
+                "order:replace:1234",
+                "session:user-a",
+            )],
+            expected_order_id: Some(order_id),
+        };
+        assert!(validate_user_command_context(
+            "order:replace:1234",
+            "session:user-a",
+            ExpectedEncryptedAction::ReplaceOrder,
+            Some(order_id),
+            &replace,
+        )
+        .is_ok());
+        assert!(validate_user_command_context(
+            "order:replace:1234",
+            "session:user-a",
+            ExpectedEncryptedAction::ReplaceOrder,
+            Some(Uuid::new_v4()),
+            &replace,
         )
         .is_err());
     }
