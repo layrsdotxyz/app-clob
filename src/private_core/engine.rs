@@ -13,12 +13,12 @@ use super::rewards::{
     PrivateRewardBook, PrivateRewardEntitlement, RewardClaimAuthorization, RewardClaimIntent,
 };
 use super::{
-    AccountBucket, AccountKey, BookOrder, ClaimPayout, CompleteSetDirection,
-    CompleteSetTransaction, CoreError, CoreResult, EnclaveReceipt, EncryptedJournal,
-    EncryptedJournalRecord, EncryptedSnapshot, ExternalFlowDirection, ExternalFlowTransaction,
-    Fill, JournalKey, Ledger, LedgerTransaction, MatchResult, MatchType, NormalFillPosting,
-    OrderAction, OrderStatus, Outcome, PriceTimeBook, ReceiptSigner, SessionGuard,
-    SignedSessionRequest, TimeInForce, Transfer, PRICE_SCALE,
+    command_result_commitment, AccountBucket, AccountKey, BookOrder, ClaimPayout,
+    CommandReceiptState, CompleteSetDirection, CompleteSetTransaction, CoreError, CoreResult,
+    EnclaveReceipt, EncryptedJournal, EncryptedJournalRecord, EncryptedSnapshot,
+    ExternalFlowDirection, ExternalFlowTransaction, Fill, JournalKey, Ledger, LedgerTransaction,
+    MatchResult, MatchType, NormalFillPosting, OrderAction, OrderStatus, Outcome, PriceTimeBook,
+    ReceiptSigner, SessionGuard, SignedSessionRequest, TimeInForce, Transfer, PRICE_SCALE,
 };
 
 /// Public depth is deliberately less precise than the enclave's private book.
@@ -692,12 +692,26 @@ pub enum CommandResult {
         order: BookOrder,
     },
     OrdersCancelled {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<CancelAllOrdersFilter>,
         outcomes: Vec<CancelledOrderOutcome>,
     },
     PositionClosePreview {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        market_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<Outcome>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_tag: Option<String>,
         preview: PositionClosePreview,
     },
     PositionClosed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        market_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<Outcome>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_tag: Option<String>,
         preview: PositionClosePreview,
         order_id: Uuid,
     },
@@ -750,6 +764,8 @@ pub enum CommandResult {
 pub struct CoreResponse {
     pub result: CommandResult,
     pub receipt: EnclaveReceipt,
+    pub receipt_state: CommandReceiptState,
+    pub receipt_disclosure_nonce: [u8; 32],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_record: Option<EncryptedJournalRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -887,6 +903,10 @@ struct RecoveryCapsule {
     result_digest: [u8; 32],
     result: CommandResult,
     receipt: EnclaveReceipt,
+    #[serde(default)]
+    receipt_state: CommandReceiptState,
+    #[serde(default)]
+    receipt_disclosure_nonce: [u8; 32],
     audit_fills: Vec<SignedAuditFillArtifact>,
     task_qualifications: Vec<SignedTaskQualificationArtifact>,
 }
@@ -896,6 +916,8 @@ impl RecoveryCapsule {
         CoreResponse {
             result: self.result.clone(),
             receipt: self.receipt.clone(),
+            receipt_state: self.receipt_state,
+            receipt_disclosure_nonce: self.receipt_disclosure_nonce,
             encrypted_record: None,
             withdrawal_authorization: None,
             reward_claim_authorization: None,
@@ -1937,6 +1959,8 @@ impl PrivateTradingCore {
             idempotency_key,
             Some(command_commitment),
             Some(true),
+            None,
+            None,
             next_sequence,
             prior_root,
             next_root,
@@ -3871,13 +3895,16 @@ impl PrivateTradingCore {
                         transfers,
                     })?;
                 }
-                CommandResult::OrdersCancelled { outcomes }
+                CommandResult::OrdersCancelled {
+                    filter: Some(filter.clone()),
+                    outcomes,
+                }
             }
             UserCommandAction::PreviewPositionClose {
                 position_id,
                 market_id,
                 outcome,
-                session_tag: _,
+                session_tag,
                 quantity_micros,
                 minimum_price_micros,
             } => {
@@ -3915,6 +3942,9 @@ impl PrivateTradingCore {
                 let mut book = prior_book.clone();
                 let match_result = book.submit(order.clone(), now_millis)?;
                 CommandResult::PositionClosePreview {
+                    market_id: Some(market_id.clone()),
+                    outcome: Some(*outcome),
+                    session_tag: Some(session_tag.clone()),
                     preview: position_close_preview(
                         &self.identity_key,
                         &private_user_id,
@@ -3932,7 +3962,7 @@ impl PrivateTradingCore {
                 position_id,
                 market_id,
                 outcome,
-                session_tag: _,
+                session_tag,
                 quantity_micros,
                 minimum_price_micros,
                 quote,
@@ -4035,7 +4065,13 @@ impl PrivateTradingCore {
                     now_millis,
                 )?;
                 audit_drafts = native_audit_drafts(&order, &match_result, market)?;
-                CommandResult::PositionClosed { preview, order_id }
+                CommandResult::PositionClosed {
+                    market_id: Some(market_id.clone()),
+                    outcome: Some(*outcome),
+                    session_tag: Some(session_tag.clone()),
+                    preview,
+                    order_id,
+                }
             }
             UserCommandAction::ReplaceOrder {
                 market_id,
@@ -4460,22 +4496,37 @@ impl PrivateTradingCore {
         // journal/time fence without its financial state.
         let mut journal = self.journal.clone();
         let record = journal.append(next_root, &journal_value)?;
+        let command_state = command_receipt_state(&command.action, &result)?;
+        let disclosure_nonce =
+            self.receipt_signer
+                .result_disclosure_nonce(expected_hash, next_sequence, next_root);
+        let semantic_receipt = is_s08_semantic_result(&command.action, &result);
+        let result_commitment = semantic_receipt
+            .then(|| command_result_commitment(command_state, disclosure_nonce, &result))
+            .transpose()?;
+        // The leaf exposes only opaque commitments. A journal-committed FOK
+        // rejection therefore remains safe to batch and can still be verified
+        // after a governed receipt-key rotation.
+        let publication_eligible = matches!(
+            command.action,
+            UserCommandAction::SubmitOrder { .. }
+                | UserCommandAction::ReplaceOrder { .. }
+                | UserCommandAction::CancelOrder { .. }
+                | UserCommandAction::CancelAllOrders { .. }
+                | UserCommandAction::ClosePosition { .. }
+                | UserCommandAction::CompleteSet { .. }
+                | UserCommandAction::RequestRewardClaim { .. }
+                | UserCommandAction::CancelBootstrap { .. }
+                | UserCommandAction::RequestWithdrawal { .. }
+                | UserCommandAction::TransferFunds { .. }
+        );
         let receipt = self.receipt_signer.sign(
             command.command_id,
             command.idempotency_key.clone(),
             Some(expected_hash),
-            Some(matches!(
-                command.action,
-                UserCommandAction::SubmitOrder { .. }
-                    | UserCommandAction::ReplaceOrder { .. }
-                    | UserCommandAction::CancelOrder { .. }
-                    | UserCommandAction::ClosePosition { .. }
-                    | UserCommandAction::CompleteSet { .. }
-                    | UserCommandAction::RequestRewardClaim { .. }
-                    | UserCommandAction::CancelBootstrap { .. }
-                    | UserCommandAction::RequestWithdrawal { .. }
-                    | UserCommandAction::TransferFunds { .. }
-            )),
+            Some(publication_eligible),
+            result_commitment,
+            semantic_receipt.then_some(true),
             next_sequence,
             prior_root,
             next_root,
@@ -4530,6 +4581,8 @@ impl PrivateTradingCore {
         let response = CoreResponse {
             result,
             receipt,
+            receipt_state: command_state,
+            receipt_disclosure_nonce: disclosure_nonce,
             encrypted_record: Some(record),
             withdrawal_authorization,
             reward_claim_authorization: None,
@@ -4548,6 +4601,8 @@ impl PrivateTradingCore {
                         .expect("SubmitOrder recovery digest was derived before commit"),
                     result: response.result.clone(),
                     receipt: response.receipt.clone(),
+                    receipt_state: response.receipt_state,
+                    receipt_disclosure_nonce: response.receipt_disclosure_nonce,
                     audit_fills: response.audit_fills.clone(),
                     task_qualifications: response.task_qualifications.clone(),
                 },
@@ -4585,6 +4640,7 @@ impl PrivateTradingCore {
         let private_user_id = self
             .sessions
             .verify_signed_readonly(&command.session, now_millis)?;
+        let root = self.state_root();
         let result = match &command.action {
             UserCommandAction::Portfolio => CommandResult::Portfolio {
                 snapshot: portfolio_snapshot(
@@ -4611,13 +4667,17 @@ impl PrivateTradingCore {
             }
             _ => return Err(CoreError::InvalidOrder("command is not read-only".into())),
         };
-        let root = self.state_root();
         let journal_hash = read_only_response_hash(&command, &result, root)?;
+        let disclosure_nonce =
+            self.receipt_signer
+                .result_disclosure_nonce(expected_hash, self.sequence, root);
         let receipt = self.receipt_signer.sign(
             command.command_id,
             command.idempotency_key,
             Some(expected_hash),
             Some(false),
+            None,
+            None,
             self.sequence,
             root,
             root,
@@ -4627,6 +4687,8 @@ impl PrivateTradingCore {
         Ok(CoreResponse {
             result,
             receipt,
+            receipt_state: CommandReceiptState::Accepted,
+            receipt_disclosure_nonce: disclosure_nonce,
             encrypted_record: None,
             withdrawal_authorization: None,
             reward_claim_authorization: None,
@@ -4695,6 +4757,8 @@ impl PrivateTradingCore {
         let receipt = self.receipt_signer.sign(
             command_id.into(),
             idempotency_key,
+            None,
+            None,
             None,
             None,
             self.sequence,
@@ -6189,6 +6253,295 @@ fn redact_match_result(mut result: MatchResult) -> MatchResult {
         fill.taker_private_user_id.clear();
     }
     result
+}
+
+fn command_receipt_state(
+    action: &UserCommandAction,
+    result: &CommandResult,
+) -> CoreResult<CommandReceiptState> {
+    validate_trading_receipt_binding(action, result)?;
+    let state = match result {
+        CommandResult::Order { result } => match_receipt_state(result)?,
+        CommandResult::Cancelled { .. } => CommandReceiptState::Cancelled,
+        CommandResult::OrdersCancelled { outcomes, .. } => {
+            if outcomes.is_empty() {
+                CommandReceiptState::Accepted
+            } else {
+                CommandReceiptState::Cancelled
+            }
+        }
+        CommandResult::Replaced { result, .. } => match_receipt_state(result)?,
+        CommandResult::PositionClosed { .. } => CommandReceiptState::Filled,
+        _ => CommandReceiptState::Accepted,
+    };
+    // A result must remain paired with the action which produced it. This
+    // prevents a future refactor from signing a plausible state for the wrong
+    // command variant while the result commitment still hashes correctly.
+    let compatible = matches!(
+        (action, result),
+        (
+            UserCommandAction::SubmitOrder { .. },
+            CommandResult::Order { .. }
+        ) | (
+            UserCommandAction::CancelOrder { .. },
+            CommandResult::Cancelled { .. }
+        ) | (
+            UserCommandAction::CancelAllOrders { .. },
+            CommandResult::OrdersCancelled { .. }
+        ) | (
+            UserCommandAction::ReplaceOrder { .. },
+            CommandResult::Replaced { .. }
+        ) | (
+            UserCommandAction::PreviewPositionClose { .. },
+            CommandResult::PositionClosePreview { .. }
+        ) | (
+            UserCommandAction::ClosePosition { .. },
+            CommandResult::PositionClosed { .. }
+        ) | (
+            UserCommandAction::CompleteSet { .. },
+            CommandResult::CompleteSet { .. }
+        ) | (
+            UserCommandAction::Portfolio,
+            CommandResult::Portfolio { .. }
+        ) | (UserCommandAction::Rewards, CommandResult::Rewards { .. })
+            | (
+                UserCommandAction::RequestRewardClaim { .. },
+                CommandResult::RewardClaimAuthorized { .. }
+            )
+            | (
+                UserCommandAction::BootstrapStatus { .. },
+                CommandResult::BootstrapStatus { .. }
+            )
+            | (
+                UserCommandAction::CancelBootstrap { .. },
+                CommandResult::BootstrapCancelled { .. }
+            )
+            | (
+                UserCommandAction::RequestWithdrawal { .. },
+                CommandResult::WithdrawalReserved { .. }
+            )
+            | (
+                UserCommandAction::TransferFunds { .. },
+                CommandResult::FundsTransferred { .. }
+            )
+            | (
+                UserCommandAction::SubmitOrder { .. },
+                CommandResult::BootstrapPending { .. }
+            )
+    );
+    if !compatible {
+        return Err(CoreError::InvalidOrder(
+            "command result does not match the requested action".into(),
+        ));
+    }
+    Ok(state)
+}
+
+fn is_s08_semantic_result(action: &UserCommandAction, result: &CommandResult) -> bool {
+    matches!(
+        (action, result),
+        (
+            UserCommandAction::SubmitOrder { .. },
+            CommandResult::Order { .. }
+        ) | (
+            UserCommandAction::ReplaceOrder { .. },
+            CommandResult::Replaced { .. }
+        ) | (
+            UserCommandAction::CancelOrder { .. },
+            CommandResult::Cancelled { .. }
+        ) | (
+            UserCommandAction::CancelAllOrders { .. },
+            CommandResult::OrdersCancelled { .. }
+        ) | (
+            UserCommandAction::ClosePosition { .. },
+            CommandResult::PositionClosed { .. }
+        )
+    )
+}
+
+fn validate_trading_receipt_binding(
+    action: &UserCommandAction,
+    result: &CommandResult,
+) -> CoreResult<()> {
+    let valid = match (action, result) {
+        (UserCommandAction::SubmitOrder { order }, CommandResult::Order { result }) => result
+            .accepted_order
+            .as_ref()
+            .is_some_and(|accepted| order_intent_matches(order, accepted)),
+        (
+            UserCommandAction::ReplaceOrder {
+                market_id,
+                order_id,
+                replacement,
+            },
+            CommandResult::Replaced { cancelled, result },
+        ) => {
+            cancelled.order_id == *order_id
+                && cancelled.market_id == *market_id
+                && cancelled.status == OrderStatus::Cancelled
+                && result
+                    .accepted_order
+                    .as_ref()
+                    .is_some_and(|accepted| order_intent_matches(replacement, accepted))
+        }
+        (
+            UserCommandAction::CancelOrder {
+                market_id,
+                order_id,
+            },
+            CommandResult::Cancelled { order },
+        ) => {
+            order.order_id == *order_id
+                && order.market_id == *market_id
+                && order.status == OrderStatus::Cancelled
+        }
+        (
+            UserCommandAction::CancelAllOrders { filter },
+            CommandResult::OrdersCancelled {
+                filter: echoed,
+                outcomes,
+            },
+        ) => {
+            Some(filter) == echoed.as_ref()
+                && outcomes
+                    .iter()
+                    .all(|outcome| outcome.status == OrderStatus::Cancelled)
+                && match filter {
+                    CancelAllOrdersFilter::Market { market_id } => outcomes
+                        .iter()
+                        .all(|outcome| outcome.market_id == *market_id),
+                    CancelAllOrdersFilter::All | CancelAllOrdersFilter::Asset { .. } => true,
+                }
+        }
+        (
+            UserCommandAction::PreviewPositionClose {
+                position_id,
+                market_id,
+                outcome,
+                session_tag,
+                quantity_micros,
+                minimum_price_micros,
+            },
+            CommandResult::PositionClosePreview {
+                market_id: echoed_market,
+                outcome: echoed_outcome,
+                session_tag: echoed_session,
+                preview,
+            },
+        ) => {
+            preview.position_id == *position_id
+                && preview.quantity_micros == *quantity_micros
+                && preview.minimum_price_micros == *minimum_price_micros
+                && echoed_market.as_ref() == Some(market_id)
+                && echoed_outcome.as_ref() == Some(outcome)
+                && echoed_session.as_ref() == Some(session_tag)
+        }
+        (
+            UserCommandAction::ClosePosition {
+                position_id,
+                market_id,
+                outcome,
+                session_tag,
+                quantity_micros,
+                minimum_price_micros,
+                quote,
+            },
+            CommandResult::PositionClosed {
+                market_id: echoed_market,
+                outcome: echoed_outcome,
+                session_tag: echoed_session,
+                preview,
+                ..
+            },
+        ) => {
+            preview == quote
+                && preview.position_id == *position_id
+                && preview.quantity_micros == *quantity_micros
+                && preview.minimum_price_micros == *minimum_price_micros
+                && echoed_market.as_ref() == Some(market_id)
+                && echoed_outcome.as_ref() == Some(outcome)
+                && echoed_session.as_ref() == Some(session_tag)
+        }
+        // Non-trading command/result compatibility is still enforced below,
+        // but S08 does not advertise a semantic outcome proof for it.
+        _ => true,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(CoreError::InvalidOrder(
+            "command receipt action/result binding failed".into(),
+        ))
+    }
+}
+
+fn order_intent_matches(expected: &BookOrder, actual: &BookOrder) -> bool {
+    expected.order_id == actual.order_id
+        && expected.market_id == actual.market_id
+        && expected.outcome == actual.outcome
+        && expected.action == actual.action
+        && expected.price_micros == actual.price_micros
+        && expected.quantity_micros == actual.quantity_micros
+        && expected.time_in_force == actual.time_in_force
+        && expected.expires_at_millis == actual.expires_at_millis
+}
+
+fn match_receipt_state(result: &MatchResult) -> CoreResult<CommandReceiptState> {
+    let order = result.accepted_order.as_ref().ok_or_else(|| {
+        CoreError::InvalidOrder("order result must contain accepted_order".into())
+    })?;
+    let fill_quantity = result.fills.iter().try_fold(0u128, |total, fill| {
+        total
+            .checked_add(fill.quantity_micros)
+            .ok_or_else(|| CoreError::InvalidOrder("order result fill quantity overflow".into()))
+    })?;
+    let accounted = order
+        .filled_micros
+        .checked_add(order.remaining_micros)
+        .and_then(|value| value.checked_add(result.cancelled_remainder_micros))
+        .ok_or_else(|| CoreError::InvalidOrder("order result quantity overflow".into()))?;
+    let fills_match = fill_quantity == order.filled_micros;
+    let quantity_matches = accounted == order.quantity_micros;
+
+    let valid = match order.status {
+        OrderStatus::Rejected | OrderStatus::Open => {
+            result.fills.is_empty()
+                && order.filled_micros == 0
+                && order.remaining_micros == order.quantity_micros
+                && result.cancelled_remainder_micros == 0
+        }
+        OrderStatus::Cancelled | OrderStatus::Expired => {
+            result.fills.is_empty()
+                && order.filled_micros == 0
+                && order.remaining_micros == 0
+                && result.cancelled_remainder_micros == order.quantity_micros
+        }
+        OrderStatus::PartiallyFilled => {
+            !result.fills.is_empty()
+                && order.filled_micros > 0
+                && order.filled_micros < order.quantity_micros
+                && fills_match
+                && quantity_matches
+        }
+        OrderStatus::Filled => {
+            !result.fills.is_empty()
+                && order.filled_micros == order.quantity_micros
+                && order.remaining_micros == 0
+                && result.cancelled_remainder_micros == 0
+                && fills_match
+        }
+    };
+    if !valid {
+        return Err(CoreError::InvalidOrder(
+            "order result status/fill/remaining invariant failed".into(),
+        ));
+    }
+    Ok(match order.status {
+        OrderStatus::Rejected => CommandReceiptState::Rejected,
+        OrderStatus::Cancelled | OrderStatus::Expired => CommandReceiptState::Cancelled,
+        OrderStatus::Filled | OrderStatus::PartiallyFilled => CommandReceiptState::Filled,
+        OrderStatus::Open => CommandReceiptState::Accepted,
+    })
 }
 
 fn signed_audit_fills(

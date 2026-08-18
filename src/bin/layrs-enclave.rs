@@ -26,13 +26,14 @@ use clob_service::polymarket_enclave::{
     VenueRedemptionTransactionIntent, VenueSide,
 };
 use clob_service::private_core::{
-    binance_resolution_signing_payload, exact_condition_resolution_signing_payload,
-    polymarket_resolution_signing_payload, resolution_signing_payload, AccountKey,
-    BinanceResolutionStatement, BootstrapExecutionState, BootstrapPreparedVenueOrder,
-    CommandResult, CoreResponse, EnclaveReceipt, EncryptedJournalRecord, EncryptedSnapshot,
-    ExactConditionResolutionStatement, ExternalFlowDirection, JournalKey, MarketConfig,
-    MarketExecution, PolymarketResolutionStatement, PrivateTradingCore, ReceiptSigner,
-    RecoveryBridgeArtifact, ResolutionStatement, SignedAuditFillArtifact, SignedBinanceResolution,
+    binance_resolution_signing_payload, command_result_commitment,
+    exact_condition_resolution_signing_payload, polymarket_resolution_signing_payload,
+    resolution_signing_payload, AccountKey, BinanceResolutionStatement, BootstrapExecutionState,
+    BootstrapPreparedVenueOrder, CommandReceiptState, CommandResult, CoreResponse, EnclaveReceipt,
+    EncryptedJournalRecord, EncryptedSnapshot, ExactConditionResolutionStatement,
+    ExternalFlowDirection, JournalKey, MarketConfig, MarketExecution,
+    PolymarketResolutionStatement, PrivateTradingCore, ReceiptSigner, RecoveryBridgeArtifact,
+    ResolutionStatement, SignedAuditFillArtifact, SignedBinanceResolution,
     SignedExactConditionResolution, SignedPolymarketResolution, SignedResolution,
     SignedResolutionEvidence, SignedTaskQualificationArtifact, SystemResponse, UserCommand,
     UserCommandAction, WithdrawalAuthorization,
@@ -179,6 +180,17 @@ enum ExpectedEncryptedAction {
     RequestWithdrawal,
     #[serde(rename = "TRANSFER_FUNDS")]
     TransferFunds,
+}
+
+fn is_s08_semantic_action(action: ExpectedEncryptedAction) -> bool {
+    matches!(
+        action,
+        ExpectedEncryptedAction::Submit
+            | ExpectedEncryptedAction::Replace
+            | ExpectedEncryptedAction::Cancel
+            | ExpectedEncryptedAction::CancelAll
+            | ExpectedEncryptedAction::ClosePosition
+    )
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -578,6 +590,8 @@ struct DurableCommandRejection {
     response_envelope_sha256: [u8; 32],
     response_envelope_bytes: u64,
     error_digest_sha256: [u8; 32],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command_receipt: Option<EnclaveReceipt>,
     occurred_at_millis: i64,
     signature: Vec<u8>,
 }
@@ -678,6 +692,12 @@ enum PlainResponse {
     },
     Error {
         code: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        receipt: Option<EnclaveReceipt>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        receipt_state: Option<CommandReceiptState>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        receipt_disclosure_nonce: Option<[u8; 32]>,
     },
 }
 
@@ -1053,6 +1073,14 @@ async fn handle_encrypted(
     };
     let request_envelope_sha256 = request_envelope_hash(client_public_key, nonce, &ciphertext);
     let (actor_domain, command_idempotency_key) = command_durable_binding(&request);
+    let user_rejection_command = match (&request, &request_context) {
+        (PlainRequest::User { command, .. }, EncryptedOuterContext::User(context)) => Some((
+            command.command_id.clone(),
+            command.idempotency_key.clone(),
+            is_s08_semantic_action(context.expected_action),
+        )),
+        _ => None,
+    };
     let durable_command_commitment = match &request_context {
         EncryptedOuterContext::User(context) => context
             .expected_command_commitment
@@ -1190,7 +1218,7 @@ async fn handle_encrypted(
             .transpose(),
         _ => Ok(None),
     };
-    let response = match recovered {
+    let mut response = match recovered {
         Ok(Some(Some(mut response))) => {
             // The original encrypted journal record was already committed. Do
             // not emit it as a new persistence sidecar on a response recovery.
@@ -1244,6 +1272,9 @@ async fn handle_encrypted(
         }
         Err(error) => PlainResponse::Error {
             code: error.to_string(),
+            receipt: None,
+            receipt_state: None,
+            receipt_disclosure_nonce: None,
         },
     };
     // A user dispatch may fail after the core tentatively committed (for
@@ -1256,6 +1287,68 @@ async fn handle_encrypted(
             if let Some(nonce) = rollback_operator_nonce.take() {
                 state.operator_nonces.forget(&nonce);
             }
+        }
+    }
+    // A verified user command which fails before a journal transition still
+    // receives a signed, result-bound v3 receipt. The unchanged root and
+    // `journal_committed=false` make the terminal rejection distinguishable
+    // from a journaled FOK/validation outcome while preserving privacy.
+    if let (
+        Some((command_id, idempotency_key, semantic_receipt)),
+        PlainResponse::Error {
+            code,
+            receipt,
+            receipt_state,
+            receipt_disclosure_nonce,
+        },
+    ) = (&user_rejection_command, &mut response)
+    {
+        if let (Some(core), Some(signer), Some(now_millis)) = (
+            state.core.as_ref(),
+            state.receipt_signer.as_ref(),
+            writer_trusted_now_millis,
+        ) {
+            let root = core.state_root();
+            let error_digest: [u8; 32] = Sha256::digest(code.as_bytes()).into();
+            let disclosure_nonce =
+                signer.result_disclosure_nonce(durable_command_commitment, core.sequence(), root);
+            let semantic = serde_json::json!({ "code": code, "type": "ERROR" });
+            let result_commitment = if *semantic_receipt {
+                let Ok(commitment) = command_result_commitment(
+                    CommandReceiptState::Rejected,
+                    disclosure_nonce,
+                    &semantic,
+                ) else {
+                    return WireResponse::Error {
+                        code: "RECEIPT_RESULT_COMMITMENT_FAILED",
+                    };
+                };
+                Some(commitment)
+            } else {
+                None
+            };
+            let mut evidence = Sha256::new();
+            evidence.update(b"layrs.rejected-command-evidence.v1\0");
+            evidence.update(command_binding_sha256);
+            evidence.update(durable_command_commitment);
+            evidence.update(error_digest);
+            evidence.update(root);
+            *receipt = Some(signer.sign(
+                command_id.clone(),
+                idempotency_key.clone(),
+                Some(durable_command_commitment),
+                Some(false),
+                result_commitment,
+                semantic_receipt.then_some(false),
+                core.sequence(),
+                root,
+                root,
+                evidence.finalize().into(),
+                now_millis,
+            ));
+            // The disclosure fields never leave the encrypted response.
+            *receipt_state = semantic_receipt.then_some(CommandReceiptState::Rejected);
+            *receipt_disclosure_nonce = semantic_receipt.then_some(disclosure_nonce);
         }
     }
     // These sidecars contain only AEAD ciphertext and its integrity/chain metadata. They let the
@@ -1504,7 +1597,7 @@ async fn handle_encrypted(
                 });
             }
             if journal_artifacts.is_empty() {
-                if let PlainResponse::Error { code } = &response {
+                if let PlainResponse::Error { code, receipt, .. } = &response {
                     if actor_domain == "USER" || actor_domain == "OPERATOR" {
                         let Some(signer) = state.receipt_signer.as_ref() else {
                             return rollback_wire_error(
@@ -1539,6 +1632,7 @@ async fn handle_encrypted(
                             response_envelope_sha256,
                             response_envelope_bytes: ciphertext.len() as u64,
                             error_digest_sha256: Sha256::digest(code.as_bytes()).into(),
+                            command_receipt: receipt.clone(),
                             occurred_at_millis,
                             signature: Vec::new(),
                         };
@@ -2484,7 +2578,12 @@ async fn dispatch(
                 }
             }),
     };
-    result.unwrap_or_else(|code| PlainResponse::Error { code })
+    result.unwrap_or_else(|code| PlainResponse::Error {
+        code,
+        receipt: None,
+        receipt_state: None,
+        receipt_disclosure_nonce: None,
+    })
 }
 
 fn is_polymarket_execution(execution: &MarketExecution) -> bool {
@@ -4290,6 +4389,16 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn position_close_preview_is_transition_only_for_success_and_rejection() {
+        assert!(!is_s08_semantic_action(
+            ExpectedEncryptedAction::PreviewPositionClose
+        ));
+        assert!(is_s08_semantic_action(
+            ExpectedEncryptedAction::ClosePosition
+        ));
+    }
+
+    #[test]
     fn encrypted_wire_request_requires_command_context() {
         let without_context = serde_json::json!({
             "type": "ENCRYPTED_USER",
@@ -4388,6 +4497,8 @@ mod tests {
             idempotency_key: "private:durable:preparation-8".into(),
             command_commitment_sha256: Some([10; 32]),
             publication_eligible: Some(true),
+            result_commitment_sha256: None,
+            journal_committed: None,
             enclave_sequence: 8,
             prior_state_root: [11; 32],
             state_root: [3; 32],
@@ -4814,7 +4925,13 @@ mod tests {
         ];
         let encoded = codes.map(|code| {
             pad_private_response(
-                serde_json::to_vec(&PlainResponse::Error { code: code.into() }).unwrap(),
+                serde_json::to_vec(&PlainResponse::Error {
+                    code: code.into(),
+                    receipt: None,
+                    receipt_state: None,
+                    receipt_disclosure_nonce: None,
+                })
+                .unwrap(),
             )
             .unwrap()
         });

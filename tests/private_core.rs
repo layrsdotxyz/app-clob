@@ -1,11 +1,11 @@
 use clob_service::private_core::{
     command_request_hash, polymarket_resolution_signing_payload, resolution_signing_payload,
     signing_payload, AccountBucket, AccountKey, BookOrder, BootstrapPreparedVenueOrder,
-    BoundaryEvidence, CancelAllOrdersFilter, CommandResult, CompleteSetDirection, CoreError,
-    EncryptedJournal, ExternalFlowDirection, FeeProfileId, JournalKey, Ledger, LedgerTransaction,
-    MarketConfig, MarketExecution, OrderAction, OrderStatus, Outcome,
-    PolymarketResolutionStatement, PostingSide, PriceTimeBook, PrivateTradingCore, ReceiptSigner,
-    ResolutionOutcome, ResolutionStatement, SessionGuard, SessionRequest,
+    BoundaryEvidence, CancelAllOrdersFilter, CommandReceiptState, CommandResult,
+    CompleteSetDirection, CoreError, EncryptedJournal, ExternalFlowDirection, FeeProfileId,
+    JournalKey, Ledger, LedgerTransaction, MarketConfig, MarketExecution, OrderAction, OrderStatus,
+    Outcome, PolymarketResolutionStatement, PostingSide, PriceTimeBook, PrivateTradingCore,
+    ReceiptSigner, ResolutionOutcome, ResolutionStatement, SessionGuard, SessionRequest,
     SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence, SignedSessionRequest,
     TimeInForce, Transfer, UserCommand, UserCommandAction,
 };
@@ -886,7 +886,10 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
         buy_action.clone(),
         1_200,
     );
-    assert_eq!(fill_response.receipt.protocol_version, "layrs.v2");
+    assert_eq!(fill_response.receipt.protocol_version, "layrs.v3");
+    assert!(fill_response.receipt.result_commitment_sha256.is_some());
+    assert_eq!(fill_response.receipt.journal_committed, Some(true));
+    assert_eq!(fill_response.receipt_state, CommandReceiptState::Filled);
     assert_eq!(fill_response.receipt.publication_eligible, Some(true));
     assert_eq!(
         fill_response.receipt.command_commitment_sha256,
@@ -4103,8 +4106,17 @@ fn api_cancel_all_filters_owner_orders_releases_holds_and_replays_once() {
         },
         1_150,
     );
+    assert_eq!(by_market.receipt.protocol_version, "layrs.v3");
+    assert_eq!(by_market.receipt_state, CommandReceiptState::Cancelled);
+    assert_eq!(by_market.receipt.publication_eligible, Some(true));
     match by_market.result {
-        CommandResult::OrdersCancelled { outcomes } => {
+        CommandResult::OrdersCancelled { filter, outcomes } => {
+            assert_eq!(
+                filter,
+                Some(CancelAllOrdersFilter::Market {
+                    market_id: btc.into()
+                })
+            );
             assert_eq!(outcomes.len(), 2);
             assert_eq!(outcomes[0].order_id, alice_btc.order_id);
             assert_eq!(outcomes[0].status, OrderStatus::Cancelled);
@@ -4131,7 +4143,7 @@ fn api_cancel_all_filters_owner_orders_releases_holds_and_replays_once() {
         1_200,
     );
     match &by_asset.result {
-        CommandResult::OrdersCancelled { outcomes } => {
+        CommandResult::OrdersCancelled { outcomes, .. } => {
             assert_eq!(outcomes.len(), 1);
             assert_eq!(outcomes[0].order_id, alice_eth.order_id);
         }
@@ -4165,7 +4177,7 @@ fn api_cancel_all_filters_owner_orders_releases_holds_and_replays_once() {
         1_250,
     );
     match all.result {
-        CommandResult::OrdersCancelled { outcomes } => {
+        CommandResult::OrdersCancelled { outcomes, .. } => {
             assert_eq!(outcomes.len(), 1);
             assert_eq!(outcomes[0].order_id, alice_zen.order_id);
         }
@@ -4217,6 +4229,48 @@ fn api_cancel_all_filters_owner_orders_releases_holds_and_replays_once() {
         }
         _ => panic!("expected Bob portfolio"),
     }
+}
+
+#[test]
+fn legacy_command_results_restore_without_s08_private_binding_echoes() {
+    let cancel_all: CommandResult = serde_json::from_value(serde_json::json!({
+        "type": "ORDERS_CANCELLED",
+        "outcomes": [{
+            "order_id": "00000000-0000-4000-8000-000000000001",
+            "market_id": "market-1",
+            "status": "CANCELLED"
+        }]
+    }))
+    .unwrap();
+    let CommandResult::OrdersCancelled { filter, .. } = &cancel_all else {
+        panic!("expected legacy cancel-all result");
+    };
+    assert_eq!(filter, &None);
+    assert!(serde_json::to_value(cancel_all)
+        .unwrap()
+        .get("filter")
+        .is_none());
+
+    let preview: CommandResult = serde_json::from_value(serde_json::json!({
+        "type": "POSITION_CLOSE_PREVIEW",
+        "preview": {
+            "position_id": "pos_legacy", "quantity_micros": "1", "minimum_price_micros": 1,
+            "average_price_micros": 1, "gross_payout_atomic": "1", "fee_atomic": "0",
+            "net_payout_atomic": "1", "book_commitment_sha256": vec![0; 32], "book_sequence": 0,
+            "expires_at_millis": 1, "quote_commitment_sha256": vec![0; 32]
+        }
+    }))
+    .unwrap();
+    let CommandResult::PositionClosePreview {
+        market_id,
+        outcome,
+        session_tag,
+        ..
+    } = preview
+    else {
+        panic!("expected legacy close preview");
+    };
+    assert_eq!((market_id, outcome, session_tag), (None, None, None));
 }
 
 #[test]
@@ -4362,7 +4416,10 @@ fn api_position_close_previews_and_executes_exact_protected_payout_atomically() 
     assert_ne!(preview.receipt.prior_state_root, preview.receipt.state_root);
     assert!(preview.encrypted_record.is_some());
     assert_eq!(preview.receipt.publication_eligible, Some(false));
-    let CommandResult::PositionClosePreview { preview: quote } = preview.result else {
+    assert_eq!(preview.receipt.protocol_version, "layrs.v2");
+    assert_eq!(preview.receipt.result_commitment_sha256, None);
+    assert_eq!(preview.receipt_state, CommandReceiptState::Accepted);
+    let CommandResult::PositionClosePreview { preview: quote, .. } = preview.result else {
         panic!("expected close preview");
     };
     assert_eq!(quote.position_id, position_id);
@@ -4476,6 +4533,7 @@ fn api_position_close_previews_and_executes_exact_protected_payout_atomically() 
     );
     let CommandResult::PositionClosePreview {
         preview: refreshed_quote,
+        ..
     } = refreshed.result
     else {
         panic!("expected refreshed preview");
@@ -4589,7 +4647,7 @@ fn api_position_close_previews_and_executes_exact_protected_payout_atomically() 
         },
         1_400,
     );
-    let CommandResult::PositionClosePreview { preview: quote } = final_preview.result else {
+    let CommandResult::PositionClosePreview { preview: quote, .. } = final_preview.result else {
         panic!("expected final close preview");
     };
 
@@ -4720,6 +4778,7 @@ fn api_position_close_previews_and_executes_exact_protected_payout_atomically() 
     let CommandResult::PositionClosed {
         preview: actual,
         order_id,
+        ..
     } = &closed.result
     else {
         panic!("expected closed position");
@@ -5093,7 +5152,7 @@ fn api_position_close_mixes_normal_and_merge_zen_liquidity_with_exact_conservati
         },
         1_300,
     );
-    let CommandResult::PositionClosePreview { preview: quote } = preview.result else {
+    let CommandResult::PositionClosePreview { preview: quote, .. } = preview.result else {
         panic!("expected mixed close preview");
     };
     assert_eq!(quote.average_price_micros, 405_000);

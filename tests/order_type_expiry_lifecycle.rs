@@ -1,9 +1,9 @@
 use clob_service::private_core::{
-    command_request_hash, exact_condition_resolution_signing_payload, signing_payload,
-    AccountBucket, AccountKey, BookOrder, CommandResult, CompleteSetDirection, CoreError,
-    ExactConditionResolutionStatement, ExternalFlowDirection, FeeProfileId, JournalKey,
-    MarketConfig, MarketExecution, OrderAction, OrderStatus, Outcome, PriceTimeBook,
-    PrivateTradingCore, ReceiptSigner, ResolutionOutcome, SessionRequest,
+    command_request_hash, command_result_commitment, exact_condition_resolution_signing_payload,
+    signing_payload, AccountBucket, AccountKey, BookOrder, CommandReceiptState, CommandResult,
+    CompleteSetDirection, CoreError, ExactConditionResolutionStatement, ExternalFlowDirection,
+    FeeProfileId, JournalKey, MarketConfig, MarketExecution, OrderAction, OrderStatus, Outcome,
+    PriceTimeBook, PrivateTradingCore, ReceiptSigner, ResolutionOutcome, SessionRequest,
     SignedExactConditionResolution, SignedSessionRequest, TimeInForce, UserCommand,
     UserCommandAction,
 };
@@ -430,6 +430,7 @@ fn api_tif_commands_preserve_fees_conservation_privacy_and_snapshot_replay() {
         1_100,
     );
     let fak = core.execute(fak_command.clone(), 1_100).unwrap();
+    assert_semantic_receipt(&fak, CommandReceiptState::Filled, true);
     let CommandResult::Order { result } = &fak.result else {
         panic!("expected FAK result");
     };
@@ -503,6 +504,8 @@ fn api_tif_commands_preserve_fees_conservation_privacy_and_snapshot_replay() {
     let before_fok_balances = financial_balances(&core, &taker_owner, &maker_owner);
     let fok_command = signed_command(&taker_key, 2, "cmd:tif:fok-no-fill", fok_action, 1_200);
     let rejected = core.execute(fok_command.clone(), 1_200).unwrap();
+    assert_semantic_receipt(&rejected, CommandReceiptState::Rejected, true);
+    assert_eq!(rejected.receipt.publication_eligible, Some(true));
     let CommandResult::Order { result } = &rejected.result else {
         panic!("expected FOK result");
     };
@@ -584,7 +587,7 @@ fn api_tif_commands_preserve_fees_conservation_privacy_and_snapshot_replay() {
     );
     assert!(restored.balance(&AccountKey::new("layrs", AccountBucket::FeeRevenue, "USDC")) > 0);
 
-    execute(
+    let cancelled = execute(
         &mut restored,
         &taker_key,
         4,
@@ -596,6 +599,7 @@ fn api_tif_commands_preserve_fees_conservation_privacy_and_snapshot_replay() {
         1_350,
     )
     .unwrap();
+    assert_semantic_receipt(&cancelled, CommandReceiptState::Cancelled, true);
     assert_eq!(
         restored.balance(&cash_hold(&taker_owner, OLD_MARKET, Outcome::Up)),
         0
@@ -612,6 +616,9 @@ fn api_tif_commands_preserve_fees_conservation_privacy_and_snapshot_replay() {
     let CommandResult::Portfolio { snapshot } = portfolio.result else {
         panic!("expected portfolio");
     };
+    assert_eq!(portfolio.receipt.protocol_version, "layrs.v2");
+    assert_eq!(portfolio.receipt.result_commitment_sha256, None);
+    assert_eq!(portfolio.receipt_state, CommandReceiptState::Accepted);
     assert!(snapshot
         .orders
         .iter()
@@ -620,6 +627,38 @@ fn api_tif_commands_preserve_fees_conservation_privacy_and_snapshot_replay() {
         .orders
         .iter()
         .all(|order| order.order_id != remaining_ask_id));
+
+    let fak_no_liquidity = execute(
+        &mut restored,
+        &taker_key,
+        6,
+        "cmd:tif:fak-no-liquidity",
+        UserCommandAction::SubmitOrder {
+            order: order(
+                405,
+                "ignored",
+                OLD_MARKET,
+                Outcome::Up,
+                OrderAction::Buy,
+                300_000,
+                1_000_000,
+                TimeInForce::Fak,
+                None,
+            ),
+        },
+        1_450,
+    )
+    .unwrap();
+    assert_semantic_receipt(&fak_no_liquidity, CommandReceiptState::Cancelled, true);
+    let CommandResult::Order { result } = &fak_no_liquidity.result else {
+        panic!("expected no-liquidity FAK result");
+    };
+    let accepted = result.accepted_order.as_ref().expect("accepted FAK");
+    assert_eq!(accepted.status, OrderStatus::Cancelled);
+    assert_eq!(accepted.filled_micros, 0);
+    assert_eq!(accepted.remaining_micros, 0);
+    assert_eq!(result.cancelled_remainder_micros, 1_000_000);
+    assert!(result.fills.is_empty());
 
     let fee = restored.balance(&AccountKey::new("layrs", AccountBucket::FeeRevenue, "USDC"));
     let mut collateral = AccountKey::new("layrs", AccountBucket::MarketCollateral, "USDC");
@@ -630,6 +669,27 @@ fn api_tif_commands_preserve_fees_conservation_privacy_and_snapshot_replay() {
             + restored.balance(&collateral)
             + fee,
         TOTAL_INFLOW
+    );
+}
+
+fn assert_semantic_receipt(
+    response: &clob_service::private_core::CoreResponse,
+    expected_state: CommandReceiptState,
+    journal_committed: bool,
+) {
+    assert_eq!(response.receipt.protocol_version, "layrs.v3");
+    assert_eq!(response.receipt_state, expected_state);
+    assert_eq!(response.receipt.journal_committed, Some(journal_committed));
+    assert_eq!(
+        response.receipt.result_commitment_sha256,
+        Some(
+            command_result_commitment(
+                expected_state,
+                response.receipt_disclosure_nonce,
+                &response.result,
+            )
+            .unwrap(),
+        )
     );
 }
 

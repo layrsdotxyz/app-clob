@@ -53,8 +53,8 @@ pub use engine::{
     UserCommandAction, WithdrawalAuthorization, WithdrawalIntent,
 };
 pub use journal::{
-    EnclaveReceipt, EncryptedJournal, EncryptedJournalRecord, EncryptedSnapshot, JournalKey,
-    ReceiptSigner,
+    command_result_commitment, CommandReceiptState, EnclaveReceipt, EncryptedJournal,
+    EncryptedJournalRecord, EncryptedSnapshot, JournalKey, ReceiptSigner,
 };
 #[allow(unused_imports)]
 pub use ledger::{

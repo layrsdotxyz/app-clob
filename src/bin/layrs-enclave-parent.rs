@@ -272,6 +272,8 @@ struct DurableCommandRejection {
     response_envelope_sha256: [u8; 32],
     response_envelope_bytes: u64,
     error_digest_sha256: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    command_receipt: Option<EnclaveReceipt>,
     occurred_at_millis: i64,
     signature: Vec<u8>,
 }
