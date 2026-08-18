@@ -262,6 +262,8 @@ pub struct PolymarketRedemptionIntent {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum BootstrapExecutionState {
     FundsReserved,
+    VenueIntentDurable,
+    VenueSubmissionAttempted,
     VenueSubmitted,
     VenueConfirmed,
     Failed,
@@ -284,12 +286,22 @@ pub struct BootstrapExecutionView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapPreparedVenueOrder {
+    pub deterministic_order_id: String,
+    pub exact_request_body: String,
+    pub request_body_sha256: [u8; 32],
+    pub credential_generation_sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct BootstrapExecution {
     view: BootstrapExecutionView,
     private_user_id: String,
     reserved_atomic: u128,
     venue_order_id: Option<String>,
     venue_evidence_hash: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepared_venue_order: Option<BootstrapPreparedVenueOrder>,
     created_at_millis: i64,
 }
 
@@ -952,6 +964,17 @@ enum JournaledSystemCommand {
         idempotency_key: String,
         resolution: MarketResolution,
     },
+    MarkBootstrapVenueIntentDurable {
+        idempotency_key: String,
+        execution_id: Uuid,
+        deterministic_order_id: String,
+        request_body_sha256: [u8; 32],
+        credential_generation_sha256: [u8; 32],
+    },
+    AuthorizeBootstrapSubmissionAttempt {
+        idempotency_key: String,
+        execution_id: Uuid,
+    },
     MarkBootstrapSubmitted {
         idempotency_key: String,
         execution_id: Uuid,
@@ -1409,6 +1432,90 @@ impl PrivateTradingCore {
         })
     }
 
+    /// Restores an authenticated direct successor of the current committed
+    /// state. This is used only by the durable-command finalizer after the
+    /// encrypted successor snapshot and journal record have been made durable
+    /// outside the enclave. It deliberately refuses gaps, forks and rollback.
+    pub fn restore_successor_snapshot(&self, snapshot: &EncryptedSnapshot) -> CoreResult<Self> {
+        if snapshot.sequence
+            != self
+                .sequence
+                .checked_add(1)
+                .ok_or(CoreError::JournalChainMismatch)?
+        {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        let mut journal = self.journal.clone();
+        let state: CoreStateSnapshot = journal.open_snapshot(snapshot)?;
+        if state.sequence != snapshot.sequence {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        let position_cost_basis: BTreeMap<PositionKey, u128> =
+            state.position_cost_basis.into_iter().collect();
+        validate_recovery_capsules(
+            &state.recovery_capsules,
+            &state.processed_hashes,
+            &state.system_keys,
+            &self.identity_key,
+            state.sequence,
+        )?;
+        let processed: BTreeMap<String, ProcessedCommand> = state
+            .processed_hashes
+            .into_iter()
+            .map(|(key, request_hash)| {
+                let response = state
+                    .recovery_capsules
+                    .get(&key)
+                    .map(RecoveryCapsule::response);
+                (
+                    key,
+                    ProcessedCommand {
+                        request_hash,
+                        response,
+                    },
+                )
+            })
+            .collect();
+        let computed_root = state_root(
+            &state.ledger,
+            &state.books,
+            &state.markets,
+            &state.sessions,
+            &processed_hashes(&processed),
+            &state.system_keys,
+            &position_cost_basis,
+            &state.resolutions,
+            &state.oracle_public_key,
+            &state.bootstrap_executions,
+            &state.private_rewards,
+            state.trading_frozen,
+            state.sequence,
+        );
+        if computed_root != snapshot.state_root {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        journal.restore_chain_head(snapshot.sequence, snapshot.journal_head)?;
+        Ok(Self {
+            ledger: state.ledger,
+            books: state.books,
+            markets: state.markets,
+            sessions: state.sessions,
+            processed,
+            recovery_capsules: state.recovery_capsules,
+            system_keys: state.system_keys,
+            journal,
+            receipt_signer: self.receipt_signer.clone(),
+            position_cost_basis,
+            resolutions: state.resolutions,
+            oracle_public_key: state.oracle_public_key,
+            bootstrap_executions: state.bootstrap_executions,
+            private_rewards: state.private_rewards,
+            trading_frozen: state.trading_frozen,
+            sequence: state.sequence,
+            identity_key: self.identity_key,
+        })
+    }
+
     pub fn state_root(&self) -> [u8; 32] {
         state_root(
             &self.ledger,
@@ -1425,6 +1532,10 @@ impl PrivateTradingCore {
             self.trading_frozen,
             self.sequence,
         )
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.sequence
     }
 
     pub fn trading_frozen(&self) -> bool {
@@ -2620,6 +2731,154 @@ impl PrivateTradingCore {
         })
     }
 
+    /// Commits the deterministic external-venue intent before any network I/O.
+    /// The coordinator must finalize this transition before asking the enclave
+    /// to submit the venue order.
+    pub fn mark_bootstrap_venue_intent_durable(
+        &mut self,
+        idempotency_key: String,
+        execution_id: Uuid,
+        prepared_order: BootstrapPreparedVenueOrder,
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        let prior_root = self.state_root();
+        let mut executions = self.bootstrap_executions.clone();
+        let execution = executions
+            .get_mut(&execution_id)
+            .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
+        if execution.view.state != BootstrapExecutionState::FundsReserved {
+            return Err(CoreError::InvalidOrder(
+                "bootstrap execution is not awaiting a durable venue intent".into(),
+            ));
+        }
+        if !prepared_order.deterministic_order_id.starts_with("0x")
+            || prepared_order.deterministic_order_id.len() != 66
+            || prepared_order.exact_request_body.len() < 64
+            || prepared_order.exact_request_body.len() > 65_536
+            || Sha256::digest(prepared_order.exact_request_body.as_bytes()).as_slice()
+                != prepared_order.request_body_sha256
+        {
+            return Err(CoreError::InvalidOrder(
+                "invalid prepared venue order".into(),
+            ));
+        }
+        execution.view.state = BootstrapExecutionState::VenueIntentDurable;
+        execution.prepared_venue_order = Some(prepared_order.clone());
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &self.ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::MarkBootstrapVenueIntentDurable {
+            idempotency_key: idempotency_key.clone(),
+            execution_id,
+            deterministic_order_id: prepared_order.deterministic_order_id,
+            request_body_sha256: prepared_order.request_body_sha256,
+            credential_generation_sha256: prepared_order.credential_generation_sha256,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.bootstrap_executions = executions;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            "bootstrap-venue-intent-durable",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
+    }
+
+    pub fn bootstrap_prepared_venue_order(
+        &self,
+        execution_id: Uuid,
+    ) -> CoreResult<BootstrapPreparedVenueOrder> {
+        let execution = self
+            .bootstrap_executions
+            .get(&execution_id)
+            .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
+        if execution.view.state != BootstrapExecutionState::VenueSubmissionAttempted {
+            return Err(CoreError::InvalidOrder(
+                "venue submission is not authorized".into(),
+            ));
+        }
+        execution
+            .prepared_venue_order
+            .clone()
+            .ok_or_else(|| CoreError::InvalidOrder("prepared venue order is unavailable".into()))
+    }
+
+    pub fn authorize_bootstrap_submission_attempt(
+        &mut self,
+        idempotency_key: String,
+        execution_id: Uuid,
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        let prior_root = self.state_root();
+        let mut executions = self.bootstrap_executions.clone();
+        let execution = executions
+            .get_mut(&execution_id)
+            .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
+        if execution.view.state != BootstrapExecutionState::VenueIntentDurable
+            || execution.prepared_venue_order.is_none()
+        {
+            return Err(CoreError::InvalidOrder(
+                "durable venue intent is required".into(),
+            ));
+        }
+        execution.view.state = BootstrapExecutionState::VenueSubmissionAttempted;
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &self.ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::AuthorizeBootstrapSubmissionAttempt {
+            idempotency_key: idempotency_key.clone(),
+            execution_id,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.bootstrap_executions = executions;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            "bootstrap-submission-attempt-authorized",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
+    }
+
     /// Produces the exact public venue-redemption intent that backs the outstanding private
     /// claims. Signing and broadcasting are separate so the prepared raw transaction can be
     /// durably recorded before it is sent to Polygon.
@@ -2789,15 +3048,17 @@ impl PrivateTradingCore {
             .bootstrap_executions
             .get(&execution_id)
             .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
-        if execution.view.state != BootstrapExecutionState::VenueSubmitted {
-            return Err(CoreError::InvalidOrder(
-                "bootstrap execution is not awaiting venue confirmation".into(),
-            ));
+        match execution.view.state {
+            BootstrapExecutionState::VenueSubmitted => execution.venue_order_id.clone(),
+            BootstrapExecutionState::VenueSubmissionAttempted => execution
+                .prepared_venue_order
+                .as_ref()
+                .map(|prepared| prepared.deterministic_order_id.clone()),
+            _ => None,
         }
-        execution
-            .venue_order_id
-            .clone()
-            .ok_or_else(|| CoreError::InvalidOrder("venue order id is unavailable".into()))
+        .ok_or_else(|| {
+            CoreError::InvalidOrder("bootstrap execution is not awaiting venue confirmation".into())
+        })
     }
 
     pub fn bootstrap_execution_view(
@@ -2849,7 +3110,7 @@ impl PrivateTradingCore {
         let execution = executions
             .get_mut(&execution_id)
             .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
-        if execution.view.state != BootstrapExecutionState::FundsReserved {
+        if execution.view.state != BootstrapExecutionState::VenueSubmissionAttempted {
             return Err(CoreError::InvalidOrder(
                 "bootstrap execution is not awaiting venue submission".into(),
             ));
@@ -3207,7 +3468,10 @@ impl PrivateTradingCore {
             .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
         if !matches!(
             execution.view.state,
-            BootstrapExecutionState::FundsReserved | BootstrapExecutionState::VenueSubmitted
+            BootstrapExecutionState::FundsReserved
+                | BootstrapExecutionState::VenueIntentDurable
+                | BootstrapExecutionState::VenueSubmissionAttempted
+                | BootstrapExecutionState::VenueSubmitted
         ) {
             return Err(CoreError::InvalidOrder(
                 "bootstrap execution is already terminal".into(),
@@ -3495,6 +3759,7 @@ impl PrivateTradingCore {
                                 reserved_atomic,
                                 venue_order_id: None,
                                 venue_evidence_hash: None,
+                                prepared_venue_order: None,
                                 created_at_millis: now_millis,
                             },
                         );
@@ -5454,6 +5719,8 @@ fn enforce_user_position_limit(
                 && matches!(
                     execution.view.state,
                     BootstrapExecutionState::FundsReserved
+                        | BootstrapExecutionState::VenueIntentDurable
+                        | BootstrapExecutionState::VenueSubmissionAttempted
                         | BootstrapExecutionState::VenueSubmitted
                 )
         })
@@ -5487,6 +5754,8 @@ fn enforce_pending_bootstrap_limit(
                 && matches!(
                     execution.view.state,
                     BootstrapExecutionState::FundsReserved
+                        | BootstrapExecutionState::VenueIntentDurable
+                        | BootstrapExecutionState::VenueSubmissionAttempted
                         | BootstrapExecutionState::VenueSubmitted
                 )
         })

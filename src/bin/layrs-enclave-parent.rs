@@ -67,12 +67,14 @@ enum WireRequest {
         #[serde(with = "serde_bytes")]
         ciphertext: Vec<u8>,
         request_context: EncryptedRequestContext,
+        writer_authorization: DurableWriterAuthorization,
     },
     EncryptedOperator {
         client_public_key: [u8; 32],
         nonce: [u8; 12],
         #[serde(with = "serde_bytes")]
         ciphertext: Vec<u8>,
+        writer_authorization: Option<DurableWriterAuthorization>,
     },
 }
 
@@ -94,6 +96,23 @@ struct EncryptedRequestContext {
     expected_transfer_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_command_commitment: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DurableWriterAuthorization {
+    protocol_version: String,
+    environment: String,
+    epoch: u64,
+    lease_id: Uuid,
+    not_before_millis: i64,
+    expires_at_millis: i64,
+    actor_domain: String,
+    command_idempotency_key: String,
+    command_commitment_sha256: [u8; 32],
+    request_context_sha256: [u8; 32],
+    request_envelope_sha256: [u8; 32],
+    signature: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,6 +166,8 @@ enum WireResponse {
         audit_artifacts: Vec<SignedAuditFillArtifact>,
         task_artifacts: Vec<SignedTaskQualificationArtifact>,
         recovery_artifacts: Vec<RecoveryBridgeArtifact>,
+        preparation_artifacts: Vec<DurableCommandPreparation>,
+        rejection_artifacts: Vec<DurableCommandRejection>,
     },
     Error {
         code: String,
@@ -175,6 +196,7 @@ struct PrivateEnvelope {
     nonce: String,
     ciphertext: String,
     request_context: EncryptedRequestContext,
+    writer_authorization: DurableWriterAuthorization,
 }
 
 #[derive(Deserialize)]
@@ -184,6 +206,8 @@ struct PrivateOperatorEnvelope {
     client_public_key: String,
     nonce: String,
     ciphertext: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    writer_authorization: Option<DurableWriterAuthorization>,
 }
 
 #[derive(Serialize)]
@@ -199,6 +223,57 @@ struct PrivateResponseEnvelope {
     audit_artifacts: Vec<SignedAuditFillArtifact>,
     task_artifacts: Vec<SignedTaskQualificationArtifact>,
     recovery_artifacts: Vec<RecoveryBridgeArtifact>,
+    preparation_artifacts: Vec<DurableCommandPreparation>,
+    rejection_artifacts: Vec<DurableCommandRejection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableCommandPreparation {
+    protocol_version: String,
+    environment: String,
+    enclave_measurement_sha384: Vec<u8>,
+    preparation_id: [u8; 32],
+    actor_domain: String,
+    command_binding_sha256: [u8; 32],
+    command_commitment_sha256: [u8; 32],
+    request_context_sha256: [u8; 32],
+    request_envelope_sha256: [u8; 32],
+    command_idempotency_key: String,
+    writer_epoch: u64,
+    writer_lease_id: Uuid,
+    prior_enclave_sequence: u64,
+    enclave_sequence: u64,
+    prior_state_root: [u8; 32],
+    prior_journal_head: [u8; 32],
+    state_root: [u8; 32],
+    journal_record_hash: [u8; 32],
+    snapshot_ciphertext_hash: [u8; 32],
+    response_envelope_sha256: [u8; 32],
+    response_envelope_bytes: u64,
+    response_status: u16,
+    response_content_type: String,
+    receipt_id: String,
+    prepared_at_millis: i64,
+    expires_at_millis: i64,
+    signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableCommandRejection {
+    protocol_version: String,
+    environment: String,
+    enclave_measurement_sha384: Vec<u8>,
+    actor_domain: String,
+    command_binding_sha256: [u8; 32],
+    command_commitment_sha256: [u8; 32],
+    request_context_sha256: [u8; 32],
+    request_envelope_sha256: [u8; 32],
+    command_idempotency_key: String,
+    response_envelope_sha256: [u8; 32],
+    response_envelope_bytes: u64,
+    error_digest_sha256: [u8; 32],
+    occurred_at_millis: i64,
+    signature: Vec<u8>,
 }
 
 #[tokio::main]
@@ -378,6 +453,7 @@ async fn relay(State(state): State<AppState>, Json(envelope): Json<PrivateEnvelo
             nonce,
             ciphertext,
             request_context: envelope.request_context,
+            writer_authorization: envelope.writer_authorization,
         },
     )
     .await
@@ -391,6 +467,8 @@ async fn relay(State(state): State<AppState>, Json(envelope): Json<PrivateEnvelo
             audit_artifacts,
             task_artifacts,
             recovery_artifacts,
+            preparation_artifacts,
+            rejection_artifacts,
         }) => Json(PrivateResponseEnvelope {
             protocol_version: "layrs.v1",
             client_public_key: envelope.client_public_key,
@@ -402,6 +480,8 @@ async fn relay(State(state): State<AppState>, Json(envelope): Json<PrivateEnvelo
             audit_artifacts,
             task_artifacts,
             recovery_artifacts,
+            preparation_artifacts,
+            rejection_artifacts,
         })
         .into_response(),
         Ok(WireResponse::Error { code }) => {
@@ -445,6 +525,7 @@ async fn operator_relay(
             client_public_key,
             nonce,
             ciphertext,
+            writer_authorization: envelope.writer_authorization,
         },
     )
     .await
@@ -458,6 +539,8 @@ async fn operator_relay(
             audit_artifacts,
             task_artifacts,
             recovery_artifacts,
+            preparation_artifacts,
+            rejection_artifacts,
         }) => Json(PrivateResponseEnvelope {
             protocol_version: "layrs.v1",
             client_public_key: envelope.client_public_key,
@@ -469,6 +552,8 @@ async fn operator_relay(
             audit_artifacts,
             task_artifacts,
             recovery_artifacts,
+            preparation_artifacts,
+            rejection_artifacts,
         })
         .into_response(),
         Ok(WireResponse::Error { code }) => {
@@ -660,8 +745,8 @@ mod tests {
 
     use super::{
         acquire_exchange_permit, valid_idempotency_key, valid_request_context, AppState,
-        EncryptedRequestContext, ExpectedEncryptedAction, WireRequest, ENCLAVE_EXCHANGE_TIMEOUT,
-        MAX_FRAME_BYTES, MAX_HTTP_BODY_BYTES, URL_SAFE_NO_PAD,
+        DurableWriterAuthorization, EncryptedRequestContext, ExpectedEncryptedAction, WireRequest,
+        ENCLAVE_EXCHANGE_TIMEOUT, MAX_FRAME_BYTES, MAX_HTTP_BODY_BYTES, URL_SAFE_NO_PAD,
     };
 
     #[test]
@@ -699,6 +784,20 @@ mod tests {
                 expected_withdrawal_id: None,
                 expected_transfer_id: None,
                 expected_command_commitment: Some(format!("0x{}", "77".repeat(32))),
+            },
+            writer_authorization: DurableWriterAuthorization {
+                protocol_version: "layrs.durable-writer-authorization.v1".into(),
+                environment: "test".into(),
+                epoch: 1,
+                lease_id: Uuid::from_u128(1),
+                not_before_millis: 1,
+                expires_at_millis: 2,
+                actor_domain: "USER".into(),
+                command_idempotency_key: "order:create:1234".into(),
+                command_commitment_sha256: [7; 32],
+                request_context_sha256: [8; 32],
+                request_envelope_sha256: [9; 32],
+                signature: vec![10; 64],
             },
         };
         let encoded = serde_cbor::to_vec(&request).expect("wire request encodes");

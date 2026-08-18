@@ -16,6 +16,12 @@ case "${LAYRS_RECOVERY_ENVIRONMENT:-}" in
   *) echo "LAYRS_RECOVERY_ENVIRONMENT must be development, staging, or production" >&2; exit 1 ;;
 esac
 
+if [[ -n ${LAYRS_ENCLAVE_TRANSITION_POLICY_SHA256:-}
+      && ! ${LAYRS_ENCLAVE_TRANSITION_POLICY_SHA256} =~ ^[0-9a-f]{64}$ ]]; then
+  echo "LAYRS_ENCLAVE_TRANSITION_POLICY_SHA256 must be empty or a 32-byte lowercase hex policy" >&2
+  exit 1
+fi
+
 image_tag=${LAYRS_ENCLAVE_IMAGE_TAG:-layrsv2-clob-enclave:local}
 output_eif=${LAYRS_EIF_OUTPUT:-build/layrsv2-clob.eif}
 measurement_file=${LAYRS_MEASUREMENT_OUTPUT:-build/layrsv2-clob-measurements.json}
@@ -33,6 +39,7 @@ docker build \
   --file enclave/Dockerfile \
   --build-arg "LAYRS_OPERATOR_PUBLIC_KEY_HEX=${LAYRS_OPERATOR_PUBLIC_KEY_HEX}" \
   --build-arg "LAYRS_RECOVERY_ENVIRONMENT=${LAYRS_RECOVERY_ENVIRONMENT}" \
+  --build-arg "LAYRS_ENCLAVE_TRANSITION_POLICY_SHA256=${LAYRS_ENCLAVE_TRANSITION_POLICY_SHA256:-}" \
   --tag "${image_tag}" \
   .
 

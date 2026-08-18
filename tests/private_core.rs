@@ -1,12 +1,13 @@
 use clob_service::private_core::{
     command_request_hash, polymarket_resolution_signing_payload, resolution_signing_payload,
-    signing_payload, AccountBucket, AccountKey, BookOrder, BoundaryEvidence, CancelAllOrdersFilter,
-    CommandResult, CompleteSetDirection, CoreError, EncryptedJournal, ExternalFlowDirection,
-    FeeProfileId, JournalKey, Ledger, LedgerTransaction, MarketConfig, MarketExecution,
-    OrderAction, OrderStatus, Outcome, PolymarketResolutionStatement, PostingSide, PriceTimeBook,
-    PrivateTradingCore, ReceiptSigner, ResolutionOutcome, ResolutionStatement, SessionGuard,
-    SessionRequest, SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence,
-    SignedSessionRequest, TimeInForce, Transfer, UserCommand, UserCommandAction,
+    signing_payload, AccountBucket, AccountKey, BookOrder, BootstrapPreparedVenueOrder,
+    BoundaryEvidence, CancelAllOrdersFilter, CommandResult, CompleteSetDirection, CoreError,
+    EncryptedJournal, ExternalFlowDirection, FeeProfileId, JournalKey, Ledger, LedgerTransaction,
+    MarketConfig, MarketExecution, OrderAction, OrderStatus, Outcome,
+    PolymarketResolutionStatement, PostingSide, PriceTimeBook, PrivateTradingCore, ReceiptSigner,
+    ResolutionOutcome, ResolutionStatement, SessionGuard, SessionRequest,
+    SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence, SignedSessionRequest,
+    TimeInForce, Transfer, UserCommand, UserCommandAction,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
@@ -2300,10 +2301,39 @@ fn polymarket_bootstrap_never_credits_an_unconfirmed_fill() {
         0
     );
 
+    assert!(core.bootstrap_prepared_venue_order(execution_id).is_err());
+    let exact_body = "{".to_string() + &"x".repeat(80) + "}";
+    core.mark_bootstrap_venue_intent_durable(
+        "sys:venue-intent:47".into(),
+        execution_id,
+        BootstrapPreparedVenueOrder {
+            deterministic_order_id: format!("0x{}", "ab".repeat(32)),
+            request_body_sha256: Sha256::digest(exact_body.as_bytes()).into(),
+            exact_request_body: exact_body.clone(),
+            credential_generation_sha256: [50u8; 32],
+        },
+        1_140,
+    )
+    .unwrap();
+    let root_before_unauthorized_submit = core.state_root();
+    assert!(core
+        .mark_bootstrap_submitted(
+            "sys:venue-submitted-before-attempt:47".into(),
+            execution_id,
+            format!("0x{}", "ab".repeat(32)),
+            1_142,
+        )
+        .is_err());
+    assert_eq!(core.state_root(), root_before_unauthorized_submit);
+    core.authorize_bootstrap_submission_attempt("sys:venue-attempt:47".into(), execution_id, 1_145)
+        .unwrap();
+    let prepared = core.bootstrap_prepared_venue_order(execution_id).unwrap();
+    assert_eq!(prepared.exact_request_body, exact_body);
+    assert_eq!(prepared.credential_generation_sha256, [50u8; 32]);
     core.mark_bootstrap_submitted(
         "sys:venue-submitted:47".into(),
         execution_id,
-        "pm-order-47".into(),
+        format!("0x{}", "ab".repeat(32)),
         1_150,
     )
     .unwrap();

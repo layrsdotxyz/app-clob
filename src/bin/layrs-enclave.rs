@@ -21,17 +21,18 @@ use clob_service::chain_signer::{
     MarketResolutionTransaction, PoolWithdrawalTransaction,
 };
 use clob_service::polymarket_enclave::{
-    EnclavePolymarketClient, PolymarketSecretBundle, SignedVenueRedemptionTransaction,
-    VenueConfirmation, VenueOrderIntent, VenueRedemptionTransactionIntent, VenueSide,
+    EnclavePolymarketClient, PolymarketSecretBundle, PreparedPolymarketOrder,
+    SignedVenueRedemptionTransaction, VenueConfirmation, VenueOrderIntent, VenueOrderObservation,
+    VenueRedemptionTransactionIntent, VenueSide,
 };
 use clob_service::private_core::{
     binance_resolution_signing_payload, exact_condition_resolution_signing_payload,
     polymarket_resolution_signing_payload, resolution_signing_payload, AccountKey,
-    BinanceResolutionStatement, BootstrapExecutionState, CommandResult, CoreResponse,
-    EnclaveReceipt, EncryptedJournalRecord, EncryptedSnapshot, ExactConditionResolutionStatement,
-    ExternalFlowDirection, JournalKey, MarketConfig, MarketExecution,
-    PolymarketResolutionStatement, PrivateTradingCore, ReceiptSigner, RecoveryBridgeArtifact,
-    ResolutionStatement, SignedAuditFillArtifact, SignedBinanceResolution,
+    BinanceResolutionStatement, BootstrapExecutionState, BootstrapPreparedVenueOrder,
+    CommandResult, CoreResponse, EnclaveReceipt, EncryptedJournalRecord, EncryptedSnapshot,
+    ExactConditionResolutionStatement, ExternalFlowDirection, JournalKey, MarketConfig,
+    MarketExecution, PolymarketResolutionStatement, PrivateTradingCore, ReceiptSigner,
+    RecoveryBridgeArtifact, ResolutionStatement, SignedAuditFillArtifact, SignedBinanceResolution,
     SignedExactConditionResolution, SignedPolymarketResolution, SignedResolution,
     SignedResolutionEvidence, SignedTaskQualificationArtifact, SystemResponse, UserCommand,
     UserCommandAction, WithdrawalAuthorization,
@@ -67,6 +68,7 @@ const MAX_TRANSPORT_REPLAY_ENTRIES: usize = 262_144;
 const MAX_OPERATOR_REPLAY_ENTRIES: usize = 100_000;
 const TRUSTED_TIME_ATTESTATION_DOMAIN: &[u8] = b"layrs.nsm-trusted-time.v1\0";
 const MIN_PRIVATE_RESPONSE_BYTES: usize = 4 * 1024;
+const MAX_PRIVATE_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 #[cfg(not(test))]
 const RECOVERY_ENVIRONMENT: &str = env!(
@@ -92,12 +94,14 @@ enum WireRequest {
         #[serde(with = "serde_bytes")]
         ciphertext: Vec<u8>,
         request_context: EncryptedRequestContext,
+        writer_authorization: DurableWriterAuthorization,
     },
     EncryptedOperator {
         client_public_key: [u8; 32],
         nonce: [u8; 12],
         #[serde(with = "serde_bytes")]
         ciphertext: Vec<u8>,
+        writer_authorization: Option<DurableWriterAuthorization>,
     },
 }
 
@@ -121,6 +125,24 @@ struct EncryptedRequestContext {
     expected_command_commitment: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DurableWriterAuthorization {
+    protocol_version: String,
+    environment: String,
+    epoch: u64,
+    lease_id: Uuid,
+    not_before_millis: i64,
+    expires_at_millis: i64,
+    actor_domain: String,
+    command_idempotency_key: String,
+    command_commitment_sha256: [u8; 32],
+    request_context_sha256: [u8; 32],
+    request_envelope_sha256: [u8; 32],
+    signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 enum EncryptedOuterContext {
     User(EncryptedRequestContext),
     Operator,
@@ -159,7 +181,7 @@ enum ExpectedEncryptedAction {
     TransferFunds,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 enum WireResponse {
     Attestation {
@@ -177,6 +199,8 @@ enum WireResponse {
         audit_artifacts: Vec<SignedAuditFillArtifact>,
         task_artifacts: Vec<SignedTaskQualificationArtifact>,
         recovery_artifacts: Vec<RecoveryBridgeArtifact>,
+        preparation_artifacts: Vec<DurableCommandPreparation>,
+        rejection_artifacts: Vec<DurableCommandRejection>,
     },
     Error {
         code: &'static str,
@@ -193,6 +217,23 @@ struct OperatorEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 enum OperatorCommand {
+    PreparedCommandStatus {
+        preparation_id: [u8; 32],
+        enclave_sequence: u64,
+        state_root: [u8; 32],
+    },
+    FinalizePreparedCommand {
+        preparation: DurableCommandPreparation,
+        snapshot: EncryptedSnapshot,
+        /// Governed roll-forward authorization for an irrevocable manifest
+        /// prepared by the immediately prior EIF generation. This field is
+        /// inside the signed operator command and must equal the immutable
+        /// preparation measurement byte-for-byte.
+        authorized_preparation_measurement_sha384: Vec<u8>,
+        target_enclave_measurement_sha384: Vec<u8>,
+        snapshot_schema: String,
+        transition_policy_sha256: [u8; 32],
+    },
     ProvisionStatus,
     BeginProvision {
         kms_key_id: String,
@@ -267,6 +308,23 @@ enum OperatorCommand {
         now_millis: i64,
     },
     ExecuteBootstrap {
+        idempotency_key: String,
+        execution_id: uuid::Uuid,
+        timestamp_seconds: u64,
+        now_millis: i64,
+    },
+    SubmitPreparedBootstrap {
+        idempotency_key: String,
+        execution_id: uuid::Uuid,
+        timestamp_seconds: u64,
+        now_millis: i64,
+    },
+    AuthorizeBootstrapSubmission {
+        idempotency_key: String,
+        execution_id: uuid::Uuid,
+        now_millis: i64,
+    },
+    ObserveBootstrapSubmission {
         idempotency_key: String,
         execution_id: uuid::Uuid,
         timestamp_seconds: u64,
@@ -452,7 +510,7 @@ enum UnsignedResolutionEvidence {
     Polymarket(PolymarketResolutionStatement),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 // Keep the authenticated wire schema byte-for-byte stable. Boxing the operator
 // envelope would change the request representation for no runtime benefit in
@@ -475,9 +533,66 @@ enum PlainRequest {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct DurableCommandPreparation {
+    protocol_version: String,
+    environment: String,
+    enclave_measurement_sha384: Vec<u8>,
+    preparation_id: [u8; 32],
+    actor_domain: String,
+    command_binding_sha256: [u8; 32],
+    command_commitment_sha256: [u8; 32],
+    request_context_sha256: [u8; 32],
+    request_envelope_sha256: [u8; 32],
+    command_idempotency_key: String,
+    writer_epoch: u64,
+    writer_lease_id: Uuid,
+    prior_enclave_sequence: u64,
+    enclave_sequence: u64,
+    prior_state_root: [u8; 32],
+    prior_journal_head: [u8; 32],
+    state_root: [u8; 32],
+    journal_record_hash: [u8; 32],
+    snapshot_ciphertext_hash: [u8; 32],
+    response_envelope_sha256: [u8; 32],
+    response_envelope_bytes: u64,
+    response_status: u16,
+    response_content_type: String,
+    receipt_id: String,
+    prepared_at_millis: i64,
+    expires_at_millis: i64,
+    signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct DurableCommandRejection {
+    protocol_version: String,
+    environment: String,
+    enclave_measurement_sha384: Vec<u8>,
+    actor_domain: String,
+    command_binding_sha256: [u8; 32],
+    command_commitment_sha256: [u8; 32],
+    request_context_sha256: [u8; 32],
+    request_envelope_sha256: [u8; 32],
+    command_idempotency_key: String,
+    response_envelope_sha256: [u8; 32],
+    response_envelope_bytes: u64,
+    error_digest_sha256: [u8; 32],
+    occurred_at_millis: i64,
+    signature: Vec<u8>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 enum PlainResponse {
+    PreparedCommandStatus {
+        state: &'static str,
+    },
+    PreparedCommandFinalized {
+        preparation_id: [u8; 32],
+        enclave_sequence: u64,
+        state_root: [u8; 32],
+    },
     Provisioned,
     ProvisionStatus {
         state: &'static str,
@@ -577,6 +692,9 @@ struct EnclaveState {
     operator_nonces: ReplayCache<32>,
     transport_nonces: TransportReplayCache,
     core: Option<PrivateTradingCore>,
+    pending_preparation: Option<PendingPreparedTransition>,
+    minimum_writer_epoch: u64,
+    writer_lease_id: Option<Uuid>,
     pending_provision: Option<PendingProvision>,
     pending_polymarket_provision: Option<PendingPolymarketProvision>,
     polymarket: Option<EnclavePolymarketClient>,
@@ -584,6 +702,46 @@ struct EnclaveState {
     chain_signer: Option<EnclaveChainSigner>,
     pending_audit_signer_provision: Option<PendingAuditSignerProvision>,
     audit_signer: Option<EnclaveAuditSigner>,
+}
+
+struct PendingPreparedTransition {
+    core: PrivateTradingCore,
+    preparation: DurableCommandPreparation,
+    replay_key: [u8; 44],
+    response: PreparedResponseBundle,
+    writer_epoch: u64,
+    writer_lease_id: Uuid,
+}
+
+#[derive(Clone)]
+struct PreparedResponseBundle {
+    nonce: [u8; 12],
+    ciphertext: Vec<u8>,
+    journal_artifacts: Vec<EncryptedJournalRecord>,
+    snapshot_artifacts: Vec<EncryptedSnapshot>,
+    receipt_artifacts: Vec<EnclaveReceipt>,
+    audit_artifacts: Vec<SignedAuditFillArtifact>,
+    task_artifacts: Vec<SignedTaskQualificationArtifact>,
+    recovery_artifacts: Vec<RecoveryBridgeArtifact>,
+    preparation_artifacts: Vec<DurableCommandPreparation>,
+    rejection_artifacts: Vec<DurableCommandRejection>,
+}
+
+impl PreparedResponseBundle {
+    fn wire_response(&self) -> WireResponse {
+        WireResponse::Encrypted {
+            nonce: self.nonce,
+            ciphertext: self.ciphertext.clone(),
+            journal_artifacts: self.journal_artifacts.clone(),
+            snapshot_artifacts: self.snapshot_artifacts.clone(),
+            receipt_artifacts: self.receipt_artifacts.clone(),
+            audit_artifacts: self.audit_artifacts.clone(),
+            task_artifacts: self.task_artifacts.clone(),
+            recovery_artifacts: self.recovery_artifacts.clone(),
+            preparation_artifacts: self.preparation_artifacts.clone(),
+            rejection_artifacts: self.rejection_artifacts.clone(),
+        }
+    }
 }
 
 struct ReplayCache<const N: usize> {
@@ -730,6 +888,9 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         operator_nonces: ReplayCache::new(MAX_OPERATOR_REPLAY_ENTRIES),
         transport_nonces: TransportReplayCache::new(MAX_TRANSPORT_REPLAY_ENTRIES),
         core: None,
+        pending_preparation: None,
+        minimum_writer_epoch: 0,
+        writer_lease_id: None,
         pending_provision: None,
         pending_polymarket_provision: None,
         polymarket: None,
@@ -763,6 +924,7 @@ async fn serve_connection(
             nonce,
             ciphertext,
             request_context,
+            writer_authorization,
         } => {
             handle_encrypted(
                 &state,
@@ -770,6 +932,7 @@ async fn serve_connection(
                 nonce,
                 ciphertext,
                 EncryptedOuterContext::User(request_context),
+                Some(writer_authorization),
             )
             .await
         }
@@ -777,6 +940,7 @@ async fn serve_connection(
             client_public_key,
             nonce,
             ciphertext,
+            writer_authorization,
         } => {
             handle_encrypted(
                 &state,
@@ -784,6 +948,7 @@ async fn serve_connection(
                 nonce,
                 ciphertext,
                 EncryptedOuterContext::Operator,
+                writer_authorization,
             )
             .await
         }
@@ -829,6 +994,7 @@ async fn handle_encrypted(
     nonce: [u8; 12],
     ciphertext: Vec<u8>,
     request_context: EncryptedOuterContext,
+    writer_authorization: Option<DurableWriterAuthorization>,
 ) -> WireResponse {
     let mut state = state.lock().await;
     let mut rollback_core: Option<PrivateTradingCore> = None;
@@ -869,6 +1035,37 @@ async fn handle_encrypted(
             }
         }
     };
+    let command_binding_sha256: [u8; 32] = match serde_json::to_vec(&request) {
+        Ok(value) => Sha256::digest(value).into(),
+        Err(_) => {
+            return WireResponse::Error {
+                code: "INVALID_REQUEST",
+            }
+        }
+    };
+    let request_context_sha256 = match request_context_hash(&request_context) {
+        Ok(value) => value,
+        Err(()) => {
+            return WireResponse::Error {
+                code: "INVALID_REQUEST",
+            }
+        }
+    };
+    let request_envelope_sha256 = request_envelope_hash(client_public_key, nonce, &ciphertext);
+    let (actor_domain, command_idempotency_key) = command_durable_binding(&request);
+    let durable_command_commitment = match &request_context {
+        EncryptedOuterContext::User(context) => context
+            .expected_command_commitment
+            .as_deref()
+            .and_then(|value| value.strip_prefix("0x"))
+            .and_then(|value| hex::decode(value).ok())
+            .and_then(|value| value.try_into().ok())
+            .unwrap_or(command_binding_sha256),
+        EncryptedOuterContext::Operator => match &request {
+            PlainRequest::Operator { envelope } => operator_command_hash(&envelope.command),
+            _ => command_binding_sha256,
+        },
+    };
     let requires_recovery_artifact = matches!(
         &request,
         PlainRequest::User { command, .. }
@@ -882,6 +1079,105 @@ async fn handle_encrypted(
         return WireResponse::Error {
             code: "PRIVATE_COMMAND_CONTEXT_MISMATCH",
         };
+    }
+    let writer_trusted_now_millis = if request_requires_writer_authorization(&request) {
+        let Some(authorization) = writer_authorization.as_ref() else {
+            return WireResponse::Error {
+                code: "DURABLE_WRITER_AUTHORIZATION_REQUIRED",
+            };
+        };
+        let now = match trusted_nsm_now_millis(state.nsm_fd, &state.enclave_measurement_sha384) {
+            Ok(value) => value,
+            Err(()) => {
+                return WireResponse::Error {
+                    code: "TRUSTED_TIME_UNAVAILABLE",
+                }
+            }
+        };
+        if let Err(code) = verify_writer_authorization(
+            &mut state,
+            authorization,
+            &actor_domain,
+            &command_idempotency_key,
+            durable_command_commitment,
+            request_context_sha256,
+            request_envelope_sha256,
+            now,
+        ) {
+            return WireResponse::Error { code };
+        }
+        Some(now)
+    } else {
+        None
+    };
+    if transport_replay == TransportReplayDecision::ExactRetry
+        && state
+            .pending_preparation
+            .as_ref()
+            .is_some_and(|pending| pending.replay_key == replay_key)
+    {
+        if let Some(authorization) = writer_authorization.as_ref() {
+            let needs_rebind = state.pending_preparation.as_ref().is_some_and(|pending| {
+                authorization.epoch > pending.writer_epoch
+                    || authorization.epoch == pending.writer_epoch
+                        && authorization.lease_id != pending.writer_lease_id
+            });
+            if needs_rebind {
+                let Some(rebound_at_millis) = writer_trusted_now_millis else {
+                    return WireResponse::Error {
+                        code: "TRUSTED_TIME_UNAVAILABLE",
+                    };
+                };
+                let rebound_expires_at_millis = rebound_at_millis
+                    .saturating_add(30_000)
+                    .min(authorization.expires_at_millis);
+                if rebound_expires_at_millis <= rebound_at_millis {
+                    return WireResponse::Error {
+                        code: "DURABLE_WRITER_AUTHORIZATION_INVALID",
+                    };
+                }
+                let Some(signer) = state.receipt_signer.clone() else {
+                    return WireResponse::Error {
+                        code: "RECEIPT_SIGNER_UNAVAILABLE",
+                    };
+                };
+                let pending = state
+                    .pending_preparation
+                    .as_mut()
+                    .expect("pending preparation was checked");
+                rebind_durable_preparation(
+                    &mut pending.preparation,
+                    authorization,
+                    rebound_at_millis,
+                    rebound_expires_at_millis,
+                    &signer,
+                );
+                pending.response.preparation_artifacts = vec![pending.preparation.clone()];
+                pending.writer_epoch = authorization.epoch;
+                pending.writer_lease_id = authorization.lease_id;
+            }
+            if authorization.epoch >= state.minimum_writer_epoch {
+                state.minimum_writer_epoch = authorization.epoch;
+                state.writer_lease_id = Some(authorization.lease_id);
+            }
+        }
+        return state
+            .pending_preparation
+            .as_ref()
+            .expect("pending preparation was checked")
+            .response
+            .wire_response();
+    }
+    if state.pending_preparation.is_some() && !durable_control_request(&request) {
+        return WireResponse::Error {
+            code: "DURABLE_PREPARATION_IN_PROGRESS",
+        };
+    }
+    if let Some(authorization) = writer_authorization.as_ref() {
+        if authorization.epoch > state.minimum_writer_epoch {
+            state.minimum_writer_epoch = authorization.epoch;
+            state.writer_lease_id = Some(authorization.lease_id);
+        }
     }
     // Exact committed position-close retries are recovered before consulting the
     // clock. This preserves idempotent lost-response recovery during a temporary
@@ -914,10 +1210,15 @@ async fn handle_encrypted(
             // timestamp is obtained directly from the Nitro Secure Module for
             // every new encrypted user command. The parent cannot delay, rewrite,
             // replay, or forge this in-enclave NSM exchange.
-            let verified_now_millis = if matches!(request, PlainRequest::User { .. }) {
-                match trusted_nsm_now_millis(state.nsm_fd, &state.enclave_measurement_sha384) {
-                    Ok(value) => Some(value),
-                    Err(()) => {
+            let verified_now_millis = if matches!(
+                request,
+                PlainRequest::User { .. } | PlainRequest::Operator { .. }
+            ) {
+                match writer_trusted_now_millis.or_else(|| {
+                    trusted_nsm_now_millis(state.nsm_fd, &state.enclave_measurement_sha384).ok()
+                }) {
+                    Some(value) => Some(value),
+                    None => {
                         return WireResponse::Error {
                             code: "TRUSTED_TIME_UNAVAILABLE",
                         }
@@ -930,16 +1231,14 @@ async fn handle_encrypted(
             // Until the padded response, recovery proof, and encrypted
             // snapshot are all constructible, the live core remains
             // rollbackable to this exact pre-command clone.
-            if matches!(request, PlainRequest::User { .. }) {
+            if matches!(
+                request,
+                PlainRequest::User { .. } | PlainRequest::Operator { .. }
+            ) {
                 rollback_core = state.core.clone();
-            } else if let PlainRequest::Operator { envelope } = &request {
-                if matches!(
-                    envelope.command,
-                    OperatorCommand::AcknowledgeRecoveryArchive { .. }
-                ) {
-                    rollback_core = state.core.clone();
-                    rollback_operator_nonce = Some(envelope.nonce);
-                }
+            }
+            if let PlainRequest::Operator { envelope } = &request {
+                rollback_operator_nonce = Some(envelope.nonce);
             }
             dispatch(&mut state, request, verified_now_millis).await
         }
@@ -1081,6 +1380,176 @@ async fn handle_encrypted(
                     code: "RECOVERY_ARTIFACT_FAILED",
                 };
             }
+            let mut preparation_artifacts = Vec::new();
+            let mut rejection_artifacts = Vec::new();
+            if !journal_artifacts.is_empty() {
+                let Some(snapshot) = snapshot_artifacts.first() else {
+                    return rollback_wire_error(
+                        &mut state,
+                        &mut rollback_core,
+                        &mut rollback_operator_nonce,
+                        &replay_key,
+                        "SNAPSHOT_EXPORT_FAILED",
+                    );
+                };
+                let Some(record) = journal_artifacts.first() else {
+                    return rollback_wire_error(
+                        &mut state,
+                        &mut rollback_core,
+                        &mut rollback_operator_nonce,
+                        &replay_key,
+                        "JOURNAL_ARTIFACT_REQUIRED",
+                    );
+                };
+                let Some(receipt) = receipt_artifacts.first() else {
+                    return rollback_wire_error(
+                        &mut state,
+                        &mut rollback_core,
+                        &mut rollback_operator_nonce,
+                        &replay_key,
+                        "RECEIPT_ARTIFACT_REQUIRED",
+                    );
+                };
+                let Ok(prepared_at_millis) =
+                    trusted_nsm_now_millis(state.nsm_fd, &state.enclave_measurement_sha384)
+                else {
+                    return rollback_wire_error(
+                        &mut state,
+                        &mut rollback_core,
+                        &mut rollback_operator_nonce,
+                        &replay_key,
+                        "TRUSTED_TIME_UNAVAILABLE",
+                    );
+                };
+                let Some(signer) = state.receipt_signer.as_ref() else {
+                    return rollback_wire_error(
+                        &mut state,
+                        &mut rollback_core,
+                        &mut rollback_operator_nonce,
+                        &replay_key,
+                        "RECEIPT_SIGNER_UNAVAILABLE",
+                    );
+                };
+                let Some(writer) = writer_authorization.as_ref() else {
+                    return rollback_wire_error(
+                        &mut state,
+                        &mut rollback_core,
+                        &mut rollback_operator_nonce,
+                        &replay_key,
+                        "DURABLE_WRITER_AUTHORIZATION_REQUIRED",
+                    );
+                };
+                if prepared_at_millis >= writer.expires_at_millis {
+                    return rollback_wire_error(
+                        &mut state,
+                        &mut rollback_core,
+                        &mut rollback_operator_nonce,
+                        &replay_key,
+                        "DURABLE_WRITER_AUTHORIZATION_EXPIRED",
+                    );
+                }
+                let preparation = build_durable_preparation(
+                    signer,
+                    state.enclave_measurement_sha384,
+                    &actor_domain,
+                    command_binding_sha256,
+                    durable_command_commitment,
+                    request_context_sha256,
+                    request_envelope_sha256,
+                    &command_idempotency_key,
+                    writer,
+                    record,
+                    snapshot,
+                    receipt,
+                    response_envelope_sha256,
+                    ciphertext.len() as u64,
+                    prepared_at_millis,
+                );
+                let Some(candidate) = state.core.take() else {
+                    return rollback_wire_error(
+                        &mut state,
+                        &mut rollback_core,
+                        &mut rollback_operator_nonce,
+                        &replay_key,
+                        "NOT_PROVISIONED",
+                    );
+                };
+                let Some(prior) = rollback_core.take() else {
+                    state.core = Some(candidate);
+                    return WireResponse::Error {
+                        code: "DURABLE_PREPARATION_FAILED",
+                    };
+                };
+                state.core = Some(prior);
+                preparation_artifacts.push(preparation.clone());
+                let bundle = PreparedResponseBundle {
+                    nonce: response_nonce,
+                    ciphertext: ciphertext.clone(),
+                    journal_artifacts: journal_artifacts.clone(),
+                    snapshot_artifacts: snapshot_artifacts.clone(),
+                    receipt_artifacts: receipt_artifacts.clone(),
+                    audit_artifacts: audit_artifacts.clone(),
+                    task_artifacts: task_artifacts.clone(),
+                    recovery_artifacts: recovery_artifacts.clone(),
+                    preparation_artifacts: preparation_artifacts.clone(),
+                    rejection_artifacts: Vec::new(),
+                };
+                state.pending_preparation = Some(PendingPreparedTransition {
+                    core: candidate,
+                    preparation,
+                    replay_key,
+                    response: bundle,
+                    writer_epoch: writer.epoch,
+                    writer_lease_id: writer.lease_id,
+                });
+            }
+            if journal_artifacts.is_empty() {
+                if let PlainResponse::Error { code } = &response {
+                    if actor_domain == "USER" || actor_domain == "OPERATOR" {
+                        let Some(signer) = state.receipt_signer.as_ref() else {
+                            return rollback_wire_error(
+                                &mut state,
+                                &mut rollback_core,
+                                &mut rollback_operator_nonce,
+                                &replay_key,
+                                "RECEIPT_SIGNER_UNAVAILABLE",
+                            );
+                        };
+                        let Ok(occurred_at_millis) =
+                            trusted_nsm_now_millis(state.nsm_fd, &state.enclave_measurement_sha384)
+                        else {
+                            return rollback_wire_error(
+                                &mut state,
+                                &mut rollback_core,
+                                &mut rollback_operator_nonce,
+                                &replay_key,
+                                "TRUSTED_TIME_UNAVAILABLE",
+                            );
+                        };
+                        let mut rejection = DurableCommandRejection {
+                            protocol_version: "layrs.durable-command-rejection.v1".into(),
+                            environment: recovery_environment().into(),
+                            enclave_measurement_sha384: state.enclave_measurement_sha384.to_vec(),
+                            actor_domain: actor_domain.clone(),
+                            command_binding_sha256,
+                            command_commitment_sha256: durable_command_commitment,
+                            request_context_sha256,
+                            request_envelope_sha256,
+                            command_idempotency_key: command_idempotency_key.clone(),
+                            response_envelope_sha256,
+                            response_envelope_bytes: ciphertext.len() as u64,
+                            error_digest_sha256: Sha256::digest(code.as_bytes()).into(),
+                            occurred_at_millis,
+                            signature: Vec::new(),
+                        };
+                        rejection.signature = signer.sign_domain_payload(
+                            b"layrs.durable-command-rejection.v1\0",
+                            &rejection,
+                        );
+                        rejection_artifacts.push(rejection);
+                    }
+                }
+            }
             WireResponse::Encrypted {
                 nonce: response_nonce,
                 ciphertext,
@@ -1090,6 +1559,8 @@ async fn handle_encrypted(
                 audit_artifacts,
                 task_artifacts,
                 recovery_artifacts,
+                preparation_artifacts,
+                rejection_artifacts,
             }
         }
         Err(_) => {
@@ -1128,6 +1599,397 @@ fn pad_private_response(mut encoded: Vec<u8>) -> io::Result<Vec<u8>> {
     }
     encoded.resize(padded_len, b' ');
     Ok(encoded)
+}
+
+fn rollback_wire_error(
+    state: &mut EnclaveState,
+    rollback_core: &mut Option<PrivateTradingCore>,
+    rollback_operator_nonce: &mut Option<[u8; 32]>,
+    replay_key: &[u8; 44],
+    code: &'static str,
+) -> WireResponse {
+    if let Some(core) = rollback_core.take() {
+        state.core = Some(core);
+    }
+    state.transport_nonces.forget(replay_key);
+    if let Some(nonce) = rollback_operator_nonce.take() {
+        state.operator_nonces.forget(&nonce);
+    }
+    WireResponse::Error { code }
+}
+
+fn request_envelope_hash(
+    client_public_key: [u8; 32],
+    nonce: [u8; 12],
+    ciphertext: &[u8],
+) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.private-command-envelope.v1\0");
+    hash.update(("layrs.v1".len() as u32).to_be_bytes());
+    hash.update(b"layrs.v1");
+    hash.update(client_public_key);
+    hash.update(nonce);
+    hash.update((ciphertext.len() as u64).to_be_bytes());
+    hash.update(ciphertext);
+    hash.finalize().into()
+}
+
+fn request_context_hash(context: &EncryptedOuterContext) -> Result<[u8; 32], ()> {
+    let value = match context {
+        EncryptedOuterContext::User(context) => serde_json::to_value(context).map_err(|_| ())?,
+        EncryptedOuterContext::Operator => serde_json::Value::String("OPERATOR".into()),
+    };
+    let encoded = canonical_json(&value)?.into_bytes();
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.private-command-context.v1\0");
+    hash.update((encoded.len() as u32).to_be_bytes());
+    hash.update(encoded);
+    Ok(hash.finalize().into())
+}
+
+fn operator_command_hash(command: &OperatorCommand) -> [u8; 32] {
+    let value =
+        serde_json::to_value(command).expect("operator command serialization is infallible");
+    let encoded = canonical_json(&value).expect("operator command canonicalization is infallible");
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.operator-command.v1\0");
+    hash.update((encoded.len() as u32).to_be_bytes());
+    hash.update(encoded.as_bytes());
+    hash.finalize().into()
+}
+
+fn canonical_json(value: &serde_json::Value) -> Result<String, ()> {
+    match value {
+        serde_json::Value::Object(fields) => {
+            let mut keys: Vec<_> = fields.keys().collect();
+            keys.sort_unstable();
+            let mut output = String::from("{");
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                output.push_str(&serde_json::to_string(key).map_err(|_| ())?);
+                output.push(':');
+                output.push_str(&canonical_json(fields.get(key).ok_or(())?)?);
+            }
+            output.push('}');
+            Ok(output)
+        }
+        serde_json::Value::Array(values) => {
+            let mut output = String::from("[");
+            for (index, item) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                output.push_str(&canonical_json(item)?);
+            }
+            output.push(']');
+            Ok(output)
+        }
+        _ => serde_json::to_string(value).map_err(|_| ()),
+    }
+}
+
+fn command_durable_binding(request: &PlainRequest) -> (String, String) {
+    match request {
+        PlainRequest::User { command, .. } => ("USER".into(), command.idempotency_key.clone()),
+        PlainRequest::Operator { envelope } => {
+            let encoded = serde_json::to_value(&envelope.command)
+                .expect("operator command serialization is infallible");
+            let supplied = encoded
+                .get("idempotency_key")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| {
+                    (8..=128).contains(&value.len())
+                        && value.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-')
+                        })
+                });
+            let key = supplied.map(str::to_owned).unwrap_or_else(|| {
+                let command_type = encoded
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("COMMAND")
+                    .to_ascii_lowercase();
+                format!(
+                    "operator:{command_type}:{}",
+                    hex::encode(operator_command_hash(&envelope.command))
+                )
+            });
+            ("OPERATOR".into(), key)
+        }
+        PlainRequest::AggregateDepth { .. } => ("READ_ONLY".into(), "read-only".into()),
+    }
+}
+
+fn durable_control_request(request: &PlainRequest) -> bool {
+    matches!(
+        request,
+        PlainRequest::Operator { envelope }
+            if matches!(
+                envelope.command,
+                OperatorCommand::PreparedCommandStatus { .. }
+                    | OperatorCommand::FinalizePreparedCommand { .. }
+            )
+    )
+}
+
+fn request_requires_writer_authorization(request: &PlainRequest) -> bool {
+    match request {
+        PlainRequest::User { .. } => true,
+        PlainRequest::Operator { envelope } => matches!(
+            &envelope.command,
+            OperatorCommand::SetTradingFreeze { .. }
+                | OperatorCommand::AcknowledgeRecoveryArchive { .. }
+                | OperatorCommand::RegisterMarket { .. }
+                | OperatorCommand::RegisterSession { .. }
+                | OperatorCommand::RegisterTransferAccount { .. }
+                | OperatorCommand::ExternalFlow { .. }
+                | OperatorCommand::CreditDeposit { .. }
+                | OperatorCommand::AccrueReward { .. }
+                | OperatorCommand::FinalizeWithdrawal { .. }
+                | OperatorCommand::ReleaseWithdrawal { .. }
+                | OperatorCommand::ResolveMarket { .. }
+                | OperatorCommand::ResolveBinanceMarket { .. }
+                | OperatorCommand::ResolveExactConditionMarket { .. }
+                | OperatorCommand::ResolvePolymarketMarket { .. }
+                | OperatorCommand::ExecuteBootstrap { .. }
+                | OperatorCommand::AuthorizeBootstrapSubmission { .. }
+                | OperatorCommand::SubmitPreparedBootstrap { .. }
+                | OperatorCommand::ObserveBootstrapSubmission { .. }
+                | OperatorCommand::ReconcileBootstrap { .. }
+                | OperatorCommand::SignPoolWithdrawal { .. }
+                | OperatorCommand::FinalizePreparedCommand { .. }
+        ),
+        PlainRequest::AggregateDepth { .. } => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_writer_authorization(
+    state: &mut EnclaveState,
+    authorization: &DurableWriterAuthorization,
+    actor_domain: &str,
+    command_idempotency_key: &str,
+    command_commitment_sha256: [u8; 32],
+    request_context_sha256: [u8; 32],
+    request_envelope_sha256: [u8; 32],
+    trusted_now_millis: i64,
+) -> Result<(), &'static str> {
+    if authorization.protocol_version != "layrs.durable-writer-authorization.v1"
+        || authorization.environment != recovery_environment()
+        || authorization.epoch == 0
+        || authorization.actor_domain != actor_domain
+        || authorization.command_idempotency_key != command_idempotency_key
+        || authorization.command_commitment_sha256 != command_commitment_sha256
+        || authorization.request_context_sha256 != request_context_sha256
+        || authorization.request_envelope_sha256 != request_envelope_sha256
+        || authorization.not_before_millis > trusted_now_millis.saturating_add(2_000)
+        || trusted_now_millis >= authorization.expires_at_millis
+        || authorization.expires_at_millis <= authorization.not_before_millis
+        || authorization.expires_at_millis - authorization.not_before_millis > 180_000
+    {
+        return Err("DURABLE_WRITER_AUTHORIZATION_INVALID");
+    }
+    let signature: [u8; 64] = authorization
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| "DURABLE_WRITER_AUTHORIZATION_INVALID")?;
+    let mut unsigned = authorization.clone();
+    unsigned.signature.clear();
+    let encoded =
+        serde_json::to_vec(&unsigned).map_err(|_| "DURABLE_WRITER_AUTHORIZATION_INVALID")?;
+    let mut payload = Vec::with_capacity(encoded.len() + 64);
+    payload.extend_from_slice(b"layrs.durable-writer-authorization.v1\0");
+    payload.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+    payload.extend_from_slice(&encoded);
+    state
+        .operator_public_key
+        .verify(&payload, &Signature::from_bytes(&signature))
+        .map_err(|_| "DURABLE_WRITER_AUTHORIZATION_INVALID")?;
+    if authorization.epoch < state.minimum_writer_epoch
+        || authorization.epoch == state.minimum_writer_epoch
+            && state
+                .writer_lease_id
+                .is_some_and(|lease| lease != authorization.lease_id)
+    {
+        return Err("DURABLE_WRITER_FENCE_STALE");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_durable_preparation(
+    signer: &ReceiptSigner,
+    enclave_measurement_sha384: [u8; 48],
+    actor_domain: &str,
+    command_binding_sha256: [u8; 32],
+    command_commitment_sha256: [u8; 32],
+    request_context_sha256: [u8; 32],
+    request_envelope_sha256: [u8; 32],
+    command_idempotency_key: &str,
+    writer_authorization: &DurableWriterAuthorization,
+    record: &EncryptedJournalRecord,
+    snapshot: &EncryptedSnapshot,
+    receipt: &EnclaveReceipt,
+    response_envelope_sha256: [u8; 32],
+    response_envelope_bytes: u64,
+    prepared_at_millis: i64,
+) -> DurableCommandPreparation {
+    let mut preparation = DurableCommandPreparation {
+        protocol_version: "layrs.durable-command-preparation.v1".into(),
+        environment: recovery_environment().into(),
+        enclave_measurement_sha384: enclave_measurement_sha384.to_vec(),
+        preparation_id: [0; 32],
+        actor_domain: actor_domain.into(),
+        command_binding_sha256,
+        command_commitment_sha256,
+        request_context_sha256,
+        request_envelope_sha256,
+        command_idempotency_key: command_idempotency_key.into(),
+        writer_epoch: writer_authorization.epoch,
+        writer_lease_id: writer_authorization.lease_id,
+        prior_enclave_sequence: record.sequence.saturating_sub(1),
+        enclave_sequence: record.sequence,
+        prior_state_root: receipt.prior_state_root,
+        prior_journal_head: record.prior_record_hash,
+        state_root: record.state_root,
+        journal_record_hash: record.record_hash,
+        snapshot_ciphertext_hash: snapshot.ciphertext_hash,
+        response_envelope_sha256,
+        response_envelope_bytes,
+        response_status: 200,
+        response_content_type: "application/json".into(),
+        receipt_id: receipt.receipt_id.clone(),
+        prepared_at_millis,
+        expires_at_millis: prepared_at_millis.saturating_add(30_000),
+        signature: Vec::new(),
+    };
+    preparation.preparation_id = durable_preparation_id(&preparation);
+    preparation.signature =
+        signer.sign_domain_payload(b"layrs.durable-command-preparation.v1\0", &preparation);
+    preparation
+}
+
+fn durable_preparation_id(preparation: &DurableCommandPreparation) -> [u8; 32] {
+    let mut unsigned = preparation.clone();
+    unsigned.preparation_id = [0; 32];
+    unsigned.signature.clear();
+    let encoded = serde_json::to_vec(&unsigned).expect("preparation serialization is infallible");
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.durable-command-preparation-id.v1\0");
+    hash.update((encoded.len() as u32).to_be_bytes());
+    hash.update(encoded);
+    hash.finalize().into()
+}
+
+fn rebind_durable_preparation(
+    preparation: &mut DurableCommandPreparation,
+    authorization: &DurableWriterAuthorization,
+    prepared_at_millis: i64,
+    expires_at_millis: i64,
+    signer: &ReceiptSigner,
+) {
+    preparation.writer_epoch = authorization.epoch;
+    preparation.writer_lease_id = authorization.lease_id;
+    // This is still the exact uncommitted candidate: only its governed writer
+    // fence and bounded persistence window are renewed. Financial execution
+    // and the successor snapshot are never repeated.
+    preparation.prepared_at_millis = prepared_at_millis;
+    preparation.expires_at_millis = expires_at_millis;
+    preparation.preparation_id = durable_preparation_id(preparation);
+    preparation.signature.clear();
+    preparation.signature =
+        signer.sign_domain_payload(b"layrs.durable-command-preparation.v1\0", preparation);
+}
+
+fn verify_durable_preparation(
+    receipt_public_key: &[u8; 32],
+    authorized_preparation_measurement_sha384: &[u8],
+    preparation: &DurableCommandPreparation,
+    snapshot: &EncryptedSnapshot,
+) -> Result<(), String> {
+    if preparation.protocol_version != "layrs.durable-command-preparation.v1"
+        || preparation.environment != recovery_environment()
+        || preparation.enclave_measurement_sha384.as_slice()
+            != authorized_preparation_measurement_sha384
+        || preparation.writer_epoch == 0
+        || preparation.preparation_id != durable_preparation_id(preparation)
+        || preparation.enclave_sequence != preparation.prior_enclave_sequence.saturating_add(1)
+        || preparation.response_status != 200
+        || preparation.response_content_type != "application/json"
+        || preparation.response_envelope_bytes < MIN_PRIVATE_RESPONSE_BYTES as u64
+        || preparation.response_envelope_bytes > MAX_PRIVATE_RESPONSE_BYTES as u64
+        || preparation.prepared_at_millis >= preparation.expires_at_millis
+        || snapshot.sequence != preparation.enclave_sequence
+        || snapshot.state_root != preparation.state_root
+        || snapshot.journal_head != preparation.journal_record_hash
+        || snapshot.ciphertext_hash != preparation.snapshot_ciphertext_hash
+    {
+        return Err("DURABLE_PREPARATION_INVALID".into());
+    }
+    let signature: [u8; 64] = preparation
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| "DURABLE_PREPARATION_INVALID".to_string())?;
+    let mut unsigned = preparation.clone();
+    unsigned.signature.clear();
+    let encoded =
+        serde_json::to_vec(&unsigned).map_err(|_| "DURABLE_PREPARATION_INVALID".to_string())?;
+    let mut payload = Vec::with_capacity(encoded.len() + 64);
+    payload.extend_from_slice(b"layrs.durable-command-preparation.v1\0");
+    payload.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+    payload.extend_from_slice(&encoded);
+    VerifyingKey::from_bytes(receipt_public_key)
+        .map_err(|_| "DURABLE_PREPARATION_INVALID".to_string())?
+        .verify(&payload, &Signature::from_bytes(&signature))
+        .map_err(|_| "DURABLE_PREPARATION_INVALID".to_string())
+}
+
+fn enclave_transition_policy_hash(source: &[u8], target: &[u8], schema: &str) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.enclave-generation-transition.v1\0");
+    hash.update((source.len() as u32).to_be_bytes());
+    hash.update(source);
+    hash.update((target.len() as u32).to_be_bytes());
+    hash.update(target);
+    hash.update((schema.len() as u32).to_be_bytes());
+    hash.update(schema.as_bytes());
+    hash.finalize().into()
+}
+
+fn configured_transition_policy_hash() -> Option<[u8; 32]> {
+    option_env!("LAYRS_ENCLAVE_TRANSITION_POLICY_SHA256")
+        .and_then(|value| hex::decode(value).ok())
+        .and_then(|value| value.try_into().ok())
+}
+
+fn verify_enclave_generation_transition(
+    source: &[u8],
+    target: &[u8],
+    current: &[u8; 48],
+    schema: &str,
+    supplied_policy: [u8; 32],
+) -> Result<(), String> {
+    if source.len() != 48
+        || target != current.as_slice()
+        || schema != "layrs.private-core-snapshot.s07.v1"
+    {
+        return Err("DURABLE_ENCLAVE_TRANSITION_INVALID".into());
+    }
+    let expected = enclave_transition_policy_hash(source, target, schema);
+    if supplied_policy != expected {
+        return Err("DURABLE_ENCLAVE_TRANSITION_INVALID".into());
+    }
+    if source != target && configured_transition_policy_hash() != Some(expected) {
+        // Cross-PCR roll-forward is disabled unless the target EIF embeds the
+        // exact reviewed source/target/schema policy commitment. Same-PCR
+        // recovery remains available without a transition policy.
+        return Err("DURABLE_ENCLAVE_TRANSITION_NOT_AUTHORIZED".into());
+    }
+    Ok(())
 }
 
 fn validate_request_context(
@@ -1673,8 +2535,104 @@ async fn dispatch_operator(
     if !state.operator_nonces.remember(envelope.nonce) {
         return Err("OPERATOR_REPLAY_REJECTED".into());
     }
+    if direct_bootstrap_outcome_command(&envelope.command) {
+        return Err("DIRECT_BOOTSTRAP_OUTCOME_MUTATION_FORBIDDEN".into());
+    }
 
     match envelope.command {
+        OperatorCommand::PreparedCommandStatus {
+            preparation_id,
+            enclave_sequence,
+            state_root,
+        } => {
+            let status = if state.core.as_ref().is_some_and(|core| {
+                core.sequence() == enclave_sequence && core.state_root() == state_root
+            }) {
+                "FINALIZED"
+            } else if state.pending_preparation.as_ref().is_some_and(|pending| {
+                pending.preparation.preparation_id == preparation_id
+                    && pending.preparation.enclave_sequence == enclave_sequence
+                    && pending.preparation.state_root == state_root
+            }) {
+                "PREPARED"
+            } else {
+                "UNKNOWN"
+            };
+            Ok(PlainResponse::PreparedCommandStatus { state: status })
+        }
+        OperatorCommand::FinalizePreparedCommand {
+            preparation,
+            snapshot,
+            authorized_preparation_measurement_sha384,
+            target_enclave_measurement_sha384,
+            snapshot_schema,
+            transition_policy_sha256,
+        } => {
+            verify_enclave_generation_transition(
+                &authorized_preparation_measurement_sha384,
+                &target_enclave_measurement_sha384,
+                &state.enclave_measurement_sha384,
+                &snapshot_schema,
+                transition_policy_sha256,
+            )?;
+            verify_durable_preparation(
+                &state.receipt_public_key,
+                &authorized_preparation_measurement_sha384,
+                &preparation,
+                &snapshot,
+            )?;
+            let core = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?;
+            if core.sequence() == preparation.enclave_sequence
+                && core.state_root() == preparation.state_root
+            {
+                if let Some(pending) = state.pending_preparation.take() {
+                    if pending.preparation != preparation {
+                        state.pending_preparation = Some(pending);
+                        return Err("DURABLE_FINALIZE_PREPARATION_MISMATCH".into());
+                    }
+                }
+                return Ok(PlainResponse::PreparedCommandFinalized {
+                    preparation_id: preparation.preparation_id,
+                    enclave_sequence: preparation.enclave_sequence,
+                    state_root: preparation.state_root,
+                });
+            }
+            if core.sequence() != preparation.prior_enclave_sequence
+                || core.state_root() != preparation.prior_state_root
+            {
+                return Err("DURABLE_FINALIZE_HEAD_MISMATCH".into());
+            }
+            let candidate = match state.pending_preparation.take() {
+                Some(pending)
+                    if pending.preparation == preparation
+                        && pending.writer_epoch == preparation.writer_epoch
+                        && pending.writer_lease_id == preparation.writer_lease_id =>
+                {
+                    pending.core
+                }
+                Some(pending) => {
+                    state.pending_preparation = Some(pending);
+                    return Err("DURABLE_FINALIZE_PREPARATION_MISMATCH".into());
+                }
+                None => core
+                    .restore_successor_snapshot(&snapshot)
+                    .map_err(|_| "DURABLE_FINALIZE_SNAPSHOT_INVALID".to_string())?,
+            };
+            if candidate.sequence() != preparation.enclave_sequence
+                || candidate.state_root() != preparation.state_root
+            {
+                return Err("DURABLE_FINALIZE_CANDIDATE_MISMATCH".into());
+            }
+            state.core = Some(candidate);
+            Ok(PlainResponse::PreparedCommandFinalized {
+                preparation_id: preparation.preparation_id,
+                enclave_sequence: preparation.enclave_sequence,
+                state_root: preparation.state_root,
+            })
+        }
         OperatorCommand::ProvisionStatus => Ok(PlainResponse::ProvisionStatus {
             state: if state.core.is_some() {
                 "READY"
@@ -1772,7 +2730,10 @@ async fn dispatch_operator(
             let signer = ReceiptSigner::from_seed(receipt_seed, state.enclave_measurement_sha384);
             receipt_seed.zeroize();
             state.receipt_public_key = signer.verifying_key();
-            state.receipt_signer = None;
+            // Durable preparation signatures must survive an EIF restart. The
+            // signer is deterministically derived from the KMS-unsealed journal
+            // key, and this wrapper clone never leaves enclave memory.
+            state.receipt_signer = Some(signer.clone());
             state.core = Some(match pending.snapshot {
                 Some(snapshot) => PrivateTradingCore::restore_encrypted_snapshot(
                     key,
@@ -2308,13 +3269,9 @@ async fn dispatch_operator(
         OperatorCommand::ExecuteBootstrap {
             idempotency_key,
             execution_id,
-            timestamp_seconds,
             now_millis,
+            ..
         } => {
-            let client = state
-                .polymarket
-                .as_ref()
-                .ok_or_else(|| "POLYMARKET_NOT_PROVISIONED".to_string())?;
             let intent = state
                 .core
                 .as_ref()
@@ -2333,7 +3290,70 @@ async fn dispatch_operator(
                 negative_risk: intent.negative_risk,
                 order_salt: intent.order_salt,
             };
-            let (submitted, _) = client.submit_fok(&venue, timestamp_seconds).await?;
+            let prepared = state
+                .polymarket
+                .as_ref()
+                .ok_or_else(|| "POLYMARKET_NOT_PROVISIONED".to_string())?
+                .prepare_fok(&venue)
+                .await?;
+            let response = state
+                .core
+                .as_mut()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .mark_bootstrap_venue_intent_durable(
+                    idempotency_key,
+                    execution_id,
+                    BootstrapPreparedVenueOrder {
+                        deterministic_order_id: prepared.deterministic_order_id,
+                        exact_request_body: prepared.exact_request_body,
+                        request_body_sha256: prepared.request_body_sha256,
+                        credential_generation_sha256: prepared.credential_generation_sha256,
+                    },
+                    now_millis,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(PlainResponse::System { response })
+        }
+        OperatorCommand::AuthorizeBootstrapSubmission {
+            idempotency_key,
+            execution_id,
+            now_millis,
+        } => {
+            let response = state
+                .core
+                .as_mut()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .authorize_bootstrap_submission_attempt(idempotency_key, execution_id, now_millis)
+                .map_err(|error| error.to_string())?;
+            Ok(PlainResponse::System { response })
+        }
+        OperatorCommand::SubmitPreparedBootstrap {
+            idempotency_key,
+            execution_id,
+            timestamp_seconds,
+            now_millis,
+        } => {
+            let client = state
+                .polymarket
+                .as_ref()
+                .ok_or_else(|| "POLYMARKET_NOT_PROVISIONED".to_string())?;
+            let prepared = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .bootstrap_prepared_venue_order(execution_id)
+                .map_err(|error| error.to_string())?;
+            let (submitted, _) = client
+                .submit_prepared_fok(
+                    &PreparedPolymarketOrder {
+                        deterministic_order_id: prepared.deterministic_order_id,
+                        exact_request_body: prepared.exact_request_body,
+                        request_body_sha256: prepared.request_body_sha256,
+                        credential_generation_sha256: prepared.credential_generation_sha256,
+                    },
+                    timestamp_seconds,
+                )
+                .await?;
             let response = state
                 .core
                 .as_mut()
@@ -2346,6 +3366,44 @@ async fn dispatch_operator(
                 )
                 .map_err(|error| error.to_string())?;
             Ok(PlainResponse::System { response })
+        }
+        OperatorCommand::ObserveBootstrapSubmission {
+            idempotency_key,
+            execution_id,
+            timestamp_seconds,
+            now_millis,
+        } => {
+            let order_id = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .bootstrap_venue_order_id(execution_id)
+                .map_err(|error| error.to_string())?;
+            match state
+                .polymarket
+                .as_ref()
+                .ok_or_else(|| "POLYMARKET_NOT_PROVISIONED".to_string())?
+                .observe_order(&order_id, timestamp_seconds)
+                .await?
+            {
+                VenueOrderObservation::Found => {
+                    let response = state
+                        .core
+                        .as_mut()
+                        .expect("core checked")
+                        .mark_bootstrap_submitted(
+                            idempotency_key,
+                            execution_id,
+                            order_id,
+                            now_millis,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    Ok(PlainResponse::System { response })
+                }
+                VenueOrderObservation::AuthoritativelyAbsent => {
+                    Ok(PlainResponse::BootstrapPending { execution_id })
+                }
+            }
         }
         OperatorCommand::BootstrapExecutionStatus {
             execution_id,
@@ -2715,43 +3773,11 @@ async fn dispatch_operator(
                     signed,
                     now_millis,
                 } => core.resolve_polymarket_market(idempotency_key, signed, now_millis),
-                OperatorCommand::MarkBootstrapSubmitted {
-                    idempotency_key,
-                    execution_id,
-                    venue_order_id,
-                    now_millis,
-                } => core.mark_bootstrap_submitted(
-                    idempotency_key,
-                    execution_id,
-                    venue_order_id,
-                    now_millis,
-                ),
-                OperatorCommand::ConfirmBootstrapFill {
-                    idempotency_key,
-                    execution_id,
-                    fill_price_micros,
-                    evidence_hash,
-                    now_millis,
-                } => core.confirm_bootstrap_fill(
-                    idempotency_key,
-                    execution_id,
-                    fill_price_micros,
-                    evidence_hash,
-                    now_millis,
-                ),
-                OperatorCommand::FailBootstrapExecution {
-                    idempotency_key,
-                    execution_id,
-                    failure_code,
-                    evidence_hash,
-                    now_millis,
-                } => core.fail_bootstrap_execution(
-                    idempotency_key,
-                    execution_id,
-                    failure_code,
-                    evidence_hash,
-                    now_millis,
-                ),
+                OperatorCommand::MarkBootstrapSubmitted { .. }
+                | OperatorCommand::ConfirmBootstrapFill { .. }
+                | OperatorCommand::FailBootstrapExecution { .. } => {
+                    return Err("DIRECT_BOOTSTRAP_OUTCOME_MUTATION_FORBIDDEN".into());
+                }
                 OperatorCommand::ExportSnapshot => {
                     return core
                         .export_encrypted_snapshot()
@@ -2759,6 +3785,8 @@ async fn dispatch_operator(
                         .map_err(|error| error.to_string());
                 }
                 OperatorCommand::BeginProvision { .. }
+                | OperatorCommand::PreparedCommandStatus { .. }
+                | OperatorCommand::FinalizePreparedCommand { .. }
                 | OperatorCommand::CompleteProvision { .. }
                 | OperatorCommand::ProvisionStatus
                 | OperatorCommand::PolymarketStatus
@@ -2777,6 +3805,9 @@ async fn dispatch_operator(
                 | OperatorCommand::CompleteAuditSignerProvision { .. }
                 | OperatorCommand::SignAuditBatch { .. }
                 | OperatorCommand::ExecuteBootstrap { .. }
+                | OperatorCommand::AuthorizeBootstrapSubmission { .. }
+                | OperatorCommand::SubmitPreparedBootstrap { .. }
+                | OperatorCommand::ObserveBootstrapSubmission { .. }
                 | OperatorCommand::BootstrapExecutionStatus { .. }
                 | OperatorCommand::MarketStatus { .. }
                 | OperatorCommand::ResolutionStatus { .. }
@@ -2791,6 +3822,15 @@ async fn dispatch_operator(
             Ok(PlainResponse::System { response })
         }
     }
+}
+
+fn direct_bootstrap_outcome_command(command: &OperatorCommand) -> bool {
+    matches!(
+        command,
+        OperatorCommand::MarkBootstrapSubmitted { .. }
+            | OperatorCommand::ConfirmBootstrapFill { .. }
+            | OperatorCommand::FailBootstrapExecution { .. }
+    )
 }
 
 fn operator_payload(nonce: [u8; 32], command: &OperatorCommand) -> Result<Vec<u8>, String> {
@@ -3286,6 +4326,236 @@ mod tests {
                 .is_err()
         );
         assert!(validate_request_context(&operator, &EncryptedOuterContext::Operator).is_ok());
+    }
+
+    #[test]
+    fn durable_request_hashes_match_browser_and_backend_vectors() {
+        let mut public_key = [0u8; 32];
+        for (index, byte) in public_key.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        let mut nonce = [0u8; 12];
+        for (index, byte) in nonce.iter_mut().enumerate() {
+            *byte = 0x20 + index as u8;
+        }
+        let ciphertext: Vec<u8> = (0x2c..0x4c).collect();
+        assert_eq!(
+            hex::encode(request_envelope_hash(public_key, nonce, &ciphertext)),
+            "31f3da8fd6f8ba84ed6232257c240157bc473aadaa4be9f5a4959e6ac3f5264f",
+        );
+
+        let context = EncryptedOuterContext::User(EncryptedRequestContext {
+            idempotency_key: "private:durable:01234567".into(),
+            expected_action: ExpectedEncryptedAction::Submit,
+            expected_session_tags: vec!["tag-b".into(), "tag-a".into()],
+            expected_order_id: None,
+            expected_position_id: None,
+            expected_execution_id: None,
+            expected_withdrawal_id: None,
+            expected_transfer_id: None,
+            expected_command_commitment: Some(format!("0x{}", "ab".repeat(32))),
+        });
+        assert_eq!(
+            hex::encode(request_context_hash(&context).unwrap()),
+            "dbe0409fbd2913f38e8566fb4c21f8239e08c7992f28332b8be00687e422a5ec",
+        );
+    }
+
+    #[test]
+    fn durable_preparation_signature_binds_every_successor_artifact() {
+        let measurement = [0x31; 48];
+        let signer = ReceiptSigner::generate(measurement);
+        let record = EncryptedJournalRecord {
+            sequence: 8,
+            nonce: [1; 12],
+            prior_record_hash: [2; 32],
+            state_root: [3; 32],
+            ciphertext: vec![4; 32],
+            record_hash: [5; 32],
+        };
+        let snapshot = EncryptedSnapshot {
+            sequence: 8,
+            journal_head: [5; 32],
+            state_root: [3; 32],
+            nonce: [6; 12],
+            ciphertext: vec![7; 48],
+            ciphertext_hash: [8; 32],
+        };
+        let receipt = EnclaveReceipt {
+            protocol_version: "layrs.v2".into(),
+            receipt_id: format!("receipt_{}", "09".repeat(32)),
+            command_id: "command-8".into(),
+            idempotency_key: "private:durable:preparation-8".into(),
+            command_commitment_sha256: Some([10; 32]),
+            publication_eligible: Some(true),
+            enclave_sequence: 8,
+            prior_state_root: [11; 32],
+            state_root: [3; 32],
+            journal_hash: [5; 32],
+            enclave_measurement_sha384: measurement.to_vec(),
+            occurred_at_millis: 1_787_000_000_000,
+            signature: vec![12; 64],
+        };
+        let writer = DurableWriterAuthorization {
+            protocol_version: "layrs.durable-writer-authorization.v1".into(),
+            environment: "test".into(),
+            epoch: 7,
+            lease_id: Uuid::from_u128(7),
+            not_before_millis: 1_787_000_000_000,
+            expires_at_millis: 1_787_000_180_000,
+            actor_domain: "USER".into(),
+            command_idempotency_key: receipt.idempotency_key.clone(),
+            command_commitment_sha256: [10; 32],
+            request_context_sha256: [14; 32],
+            request_envelope_sha256: [15; 32],
+            signature: vec![0; 64],
+        };
+        let preparation = build_durable_preparation(
+            &signer,
+            measurement,
+            "USER",
+            [13; 32],
+            [10; 32],
+            [14; 32],
+            [15; 32],
+            &receipt.idempotency_key,
+            &writer,
+            &record,
+            &snapshot,
+            &receipt,
+            [16; 32],
+            MIN_PRIVATE_RESPONSE_BYTES as u64,
+            1_787_000_000_000,
+        );
+        assert!(verify_durable_preparation(
+            &signer.verifying_key(),
+            &measurement,
+            &preparation,
+            &snapshot,
+        )
+        .is_ok());
+
+        let mut rebound = preparation.clone();
+        let mut successor_writer = writer.clone();
+        successor_writer.epoch += 1;
+        successor_writer.lease_id = Uuid::from_u128(8);
+        successor_writer.expires_at_millis = preparation.expires_at_millis + 210_000;
+        let financial_successor = (
+            rebound.state_root,
+            rebound.journal_record_hash,
+            rebound.snapshot_ciphertext_hash,
+            rebound.response_envelope_sha256,
+        );
+        rebind_durable_preparation(
+            &mut rebound,
+            &successor_writer,
+            preparation.expires_at_millis + 60_000,
+            preparation.expires_at_millis + 90_000,
+            &signer,
+        );
+        assert_eq!(rebound.writer_epoch, 8);
+        assert_eq!(rebound.writer_lease_id, Uuid::from_u128(8));
+        assert!(rebound.prepared_at_millis > preparation.expires_at_millis);
+        assert_ne!(rebound.preparation_id, preparation.preparation_id);
+        assert_eq!(
+            financial_successor,
+            (
+                rebound.state_root,
+                rebound.journal_record_hash,
+                rebound.snapshot_ciphertext_hash,
+                rebound.response_envelope_sha256
+            )
+        );
+        assert!(verify_durable_preparation(
+            &signer.verifying_key(),
+            &measurement,
+            &rebound,
+            &snapshot,
+        )
+        .is_ok());
+
+        let mut forged = preparation.clone();
+        forged.command_commitment_sha256[0] ^= 1;
+        assert!(verify_durable_preparation(
+            &signer.verifying_key(),
+            &measurement,
+            &forged,
+            &snapshot,
+        )
+        .is_err());
+
+        let mut forked_snapshot = snapshot.clone();
+        forked_snapshot.state_root[0] ^= 1;
+        assert!(verify_durable_preparation(
+            &signer.verifying_key(),
+            &measurement,
+            &preparation,
+            &forked_snapshot,
+        )
+        .is_err());
+        assert!(verify_durable_preparation(
+            &signer.verifying_key(),
+            &[0x32; 48],
+            &preparation,
+            &snapshot,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn enclave_generation_transition_is_manifest_bound_and_fail_closed() {
+        let source = [0x31; 48];
+        let target = [0x32; 48];
+        let schema = "layrs.private-core-snapshot.s07.v1";
+        let same = enclave_transition_policy_hash(&target, &target, schema);
+        assert!(
+            verify_enclave_generation_transition(&target, &target, &target, schema, same).is_ok()
+        );
+
+        let cross = enclave_transition_policy_hash(&source, &target, schema);
+        assert_eq!(
+            verify_enclave_generation_transition(&source, &target, &target, schema, cross)
+                .unwrap_err(),
+            "DURABLE_ENCLAVE_TRANSITION_NOT_AUTHORIZED"
+        );
+        let mut forged = cross;
+        forged[0] ^= 1;
+        assert_eq!(
+            verify_enclave_generation_transition(&source, &target, &target, schema, forged)
+                .unwrap_err(),
+            "DURABLE_ENCLAVE_TRANSITION_INVALID"
+        );
+    }
+
+    #[test]
+    fn direct_bootstrap_outcome_mutations_are_tombstoned() {
+        let execution_id = uuid::Uuid::from_u128(7);
+        assert!(direct_bootstrap_outcome_command(
+            &OperatorCommand::MarkBootstrapSubmitted {
+                idempotency_key: "bootstrap:forged:submitted".into(),
+                execution_id,
+                venue_order_id: "forged".into(),
+                now_millis: 1,
+            }
+        ));
+        assert!(direct_bootstrap_outcome_command(
+            &OperatorCommand::ConfirmBootstrapFill {
+                idempotency_key: "bootstrap:forged:fill".into(),
+                execution_id,
+                fill_price_micros: 500_000,
+                evidence_hash: [1u8; 32],
+                now_millis: 1,
+            }
+        ));
+        assert!(direct_bootstrap_outcome_command(
+            &OperatorCommand::FailBootstrapExecution {
+                idempotency_key: "bootstrap:forged:failure".into(),
+                execution_id,
+                failure_code: "FORGED".into(),
+                evidence_hash: [2u8; 32],
+                now_millis: 1,
+            }
+        ));
     }
 
     #[test]
