@@ -30,11 +30,11 @@ use clob_service::private_core::{
     BinanceResolutionStatement, BootstrapExecutionState, CommandResult, CoreResponse,
     EnclaveReceipt, EncryptedJournalRecord, EncryptedSnapshot, ExactConditionResolutionStatement,
     ExternalFlowDirection, JournalKey, MarketConfig, MarketExecution,
-    PolymarketResolutionStatement, PrivateTradingCore, ReceiptSigner, ResolutionStatement,
-    SignedAuditFillArtifact, SignedBinanceResolution, SignedExactConditionResolution,
-    SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence,
-    SignedTaskQualificationArtifact, SystemResponse, UserCommand, UserCommandAction,
-    WithdrawalAuthorization,
+    PolymarketResolutionStatement, PrivateTradingCore, ReceiptSigner, RecoveryBridgeArtifact,
+    ResolutionStatement, SignedAuditFillArtifact, SignedBinanceResolution,
+    SignedExactConditionResolution, SignedPolymarketResolution, SignedResolution,
+    SignedResolutionEvidence, SignedTaskQualificationArtifact, SystemResponse, UserCommand,
+    UserCommandAction, WithdrawalAuthorization,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use openssl::{
@@ -67,6 +67,18 @@ const MAX_TRANSPORT_REPLAY_ENTRIES: usize = 262_144;
 const MAX_OPERATOR_REPLAY_ENTRIES: usize = 100_000;
 const TRUSTED_TIME_ATTESTATION_DOMAIN: &[u8] = b"layrs.nsm-trusted-time.v1\0";
 const MIN_PRIVATE_RESPONSE_BYTES: usize = 4 * 1024;
+
+#[cfg(not(test))]
+const RECOVERY_ENVIRONMENT: &str = env!(
+    "LAYRS_RECOVERY_ENVIRONMENT",
+    "LAYRS_RECOVERY_ENVIRONMENT must be embedded in every non-test enclave build"
+);
+#[cfg(test)]
+const RECOVERY_ENVIRONMENT: &str = "test";
+
+fn recovery_environment() -> &'static str {
+    RECOVERY_ENVIRONMENT
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
@@ -164,6 +176,7 @@ enum WireResponse {
         receipt_artifacts: Vec<EnclaveReceipt>,
         audit_artifacts: Vec<SignedAuditFillArtifact>,
         task_artifacts: Vec<SignedTaskQualificationArtifact>,
+        recovery_artifacts: Vec<RecoveryBridgeArtifact>,
     },
     Error {
         code: &'static str,
@@ -300,6 +313,21 @@ enum OperatorCommand {
         frozen: bool,
         reason_commitment: [u8; 32],
         now_millis: i64,
+    },
+    AcknowledgeRecoveryArchive {
+        idempotency_key: String,
+        command_idempotency_key: String,
+        result_digest: [u8; 32],
+        archive_row_commitment: [u8; 32],
+        environment: String,
+        recovery_artifact: RecoveryBridgeArtifact,
+        now_millis: i64,
+    },
+    RecoveryArchiveAckStatus {
+        command_idempotency_key: String,
+        result_digest: [u8; 32],
+        archive_row_commitment: [u8; 32],
+        environment: String,
     },
     ExportSnapshot,
     RegisterMarket {
@@ -530,6 +558,9 @@ enum PlainResponse {
     TradingFreezeStatus {
         frozen: bool,
     },
+    RecoveryArchiveAckStatus {
+        acknowledged: bool,
+    },
     Error {
         code: String,
     },
@@ -544,7 +575,7 @@ struct EnclaveState {
     receipt_public_key: [u8; 32],
     operator_public_key: VerifyingKey,
     operator_nonces: ReplayCache<32>,
-    transport_nonces: ReplayCache<44>,
+    transport_nonces: TransportReplayCache,
     core: Option<PrivateTradingCore>,
     pending_provision: Option<PendingProvision>,
     pending_polymarket_provision: Option<PendingPolymarketProvision>,
@@ -587,6 +618,61 @@ impl<const N: usize> ReplayCache<N> {
         }
         self.order.push_back(key);
         self.seen.insert(key)
+    }
+
+    fn forget(&mut self, key: &[u8; N]) {
+        self.seen.remove(key);
+        self.order.retain(|candidate| candidate != key);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportReplayDecision {
+    New,
+    ExactRetry,
+    Conflict,
+}
+
+struct TransportReplayCache {
+    seen: std::collections::HashMap<[u8; 44], [u8; 32]>,
+    order: VecDeque<[u8; 44]>,
+    capacity: usize,
+}
+
+impl TransportReplayCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            seen: std::collections::HashMap::new(),
+            order: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn check_or_remember(&mut self, key: [u8; 44], ciphertext: &[u8]) -> TransportReplayDecision {
+        let digest: [u8; 32] = Sha256::digest(ciphertext).into();
+        if let Some(prior) = self.seen.get(&key) {
+            return if prior == &digest {
+                TransportReplayDecision::ExactRetry
+            } else {
+                TransportReplayDecision::Conflict
+            };
+        }
+        if self.capacity == 0 {
+            return TransportReplayDecision::Conflict;
+        }
+        while self.order.len() >= self.capacity {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+        self.order.push_back(key);
+        self.seen.insert(key, digest);
+        TransportReplayDecision::New
+    }
+
+    fn forget(&mut self, key: &[u8; 44]) {
+        self.seen.remove(key);
+        self.order.retain(|candidate| candidate != key);
     }
 }
 
@@ -642,7 +728,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         receipt_public_key,
         operator_public_key,
         operator_nonces: ReplayCache::new(MAX_OPERATOR_REPLAY_ENTRIES),
-        transport_nonces: ReplayCache::new(MAX_TRANSPORT_REPLAY_ENTRIES),
+        transport_nonces: TransportReplayCache::new(MAX_TRANSPORT_REPLAY_ENTRIES),
         core: None,
         pending_provision: None,
         pending_polymarket_provision: None,
@@ -745,10 +831,16 @@ async fn handle_encrypted(
     request_context: EncryptedOuterContext,
 ) -> WireResponse {
     let mut state = state.lock().await;
+    let mut rollback_core: Option<PrivateTradingCore> = None;
+    let mut rollback_operator_nonce: Option<[u8; 32]> = None;
+    let mut exact_recovery = false;
     let mut replay_key = [0u8; 44];
     replay_key[..32].copy_from_slice(&client_public_key);
     replay_key[32..].copy_from_slice(&nonce);
-    if state.transport_nonces.contains(&replay_key) {
+    let transport_replay = state
+        .transport_nonces
+        .check_or_remember(replay_key, &ciphertext);
+    if transport_replay == TransportReplayDecision::Conflict {
         return WireResponse::Error {
             code: "REPLAY_REJECTED",
         };
@@ -777,12 +869,12 @@ async fn handle_encrypted(
             }
         }
     };
+    let requires_recovery_artifact = matches!(
+        &request,
+        PlainRequest::User { command, .. }
+            if matches!(command.action, UserCommandAction::SubmitOrder { .. })
+    );
     plaintext.zeroize();
-    if !state.transport_nonces.remember(replay_key) {
-        return WireResponse::Error {
-            code: "REPLAY_REJECTED",
-        };
-    }
     // Consume a successfully decrypted transport nonce even when the outer API
     // context is wrong. This prevents the generic mismatch response becoming
     // an oracle that can be probed repeatedly against one private command.
@@ -798,7 +890,7 @@ async fn handle_encrypted(
         PlainRequest::User { command, .. } => state
             .core
             .as_ref()
-            .map(|core| core.recover_exact_position_close(command))
+            .map(|core| core.recover_exact_user_command(command))
             .transpose(),
         _ => Ok(None),
     };
@@ -807,9 +899,15 @@ async fn handle_encrypted(
             // The original encrypted journal record was already committed. Do
             // not emit it as a new persistence sidecar on a response recovery.
             response.encrypted_record = None;
+            exact_recovery = true;
             PlainResponse::User {
                 response: Box::new(response),
             }
+        }
+        Ok(_) if transport_replay == TransportReplayDecision::ExactRetry => {
+            return WireResponse::Error {
+                code: "REPLAY_REJECTED",
+            };
         }
         Ok(_) => {
             // User-provided wall time is never an authorization input. A fresh
@@ -828,12 +926,39 @@ async fn handle_encrypted(
             } else {
                 None
             };
+            // Execute a new private command against an isolated candidate.
+            // Until the padded response, recovery proof, and encrypted
+            // snapshot are all constructible, the live core remains
+            // rollbackable to this exact pre-command clone.
+            if matches!(request, PlainRequest::User { .. }) {
+                rollback_core = state.core.clone();
+            } else if let PlainRequest::Operator { envelope } = &request {
+                if matches!(
+                    envelope.command,
+                    OperatorCommand::AcknowledgeRecoveryArchive { .. }
+                ) {
+                    rollback_core = state.core.clone();
+                    rollback_operator_nonce = Some(envelope.nonce);
+                }
+            }
             dispatch(&mut state, request, verified_now_millis).await
         }
         Err(error) => PlainResponse::Error {
             code: error.to_string(),
         },
     };
+    // A user dispatch may fail after the core tentatively committed (for
+    // example, reward-claim signing after execute). No error response may leave
+    // that mutation live without its encrypted journal/snapshot sidecars.
+    if matches!(response, PlainResponse::Error { .. }) {
+        if let Some(core) = rollback_core.take() {
+            state.core = Some(core);
+            state.transport_nonces.forget(&replay_key);
+            if let Some(nonce) = rollback_operator_nonce.take() {
+                state.operator_nonces.forget(&nonce);
+            }
+        }
+    }
     // These sidecars contain only AEAD ciphertext and its integrity/chain metadata. They let the
     // untrusted parent persist state transitions without learning the encrypted response body.
     let journal_artifacts = match &response {
@@ -847,16 +972,23 @@ async fn handle_encrypted(
     };
     let snapshot_artifacts = match &response {
         PlainResponse::Snapshot { snapshot } => vec![snapshot.clone()],
-        _ if !journal_artifacts.is_empty() => match state
+        _ if !journal_artifacts.is_empty() || exact_recovery => match state
             .core
             .as_ref()
             .and_then(|core| core.export_encrypted_snapshot().ok())
         {
             Some(snapshot) => vec![snapshot],
             None => {
+                if let Some(core) = rollback_core.take() {
+                    state.core = Some(core);
+                    state.transport_nonces.forget(&replay_key);
+                    if let Some(nonce) = rollback_operator_nonce.take() {
+                        state.operator_nonces.forget(&nonce);
+                    }
+                }
                 return WireResponse::Error {
                     code: "SNAPSHOT_EXPORT_FAILED",
-                }
+                };
             }
         },
         _ => Vec::new(),
@@ -890,9 +1022,16 @@ async fn handle_encrypted(
     {
         Ok(value) => value,
         Err(_) => {
+            if let Some(core) = rollback_core.take() {
+                state.core = Some(core);
+                state.transport_nonces.forget(&replay_key);
+                if let Some(nonce) = rollback_operator_nonce.take() {
+                    state.operator_nonces.forget(&nonce);
+                }
+            }
             return WireResponse::Error {
                 code: "ENCODING_FAILED",
-            }
+            };
         }
     };
     let mut response_nonce = [0u8; 12];
@@ -904,18 +1043,67 @@ async fn handle_encrypted(
             aad: response_aad(&client_public_key, &state.transport_public_key).as_slice(),
         },
     ) {
-        Ok(ciphertext) => WireResponse::Encrypted {
-            nonce: response_nonce,
-            ciphertext,
-            journal_artifacts,
-            snapshot_artifacts,
-            receipt_artifacts,
-            audit_artifacts,
-            task_artifacts,
-        },
-        Err(_) => WireResponse::Error {
-            code: "ENCRYPTION_FAILED",
-        },
+        Ok(ciphertext) => {
+            let mut envelope_hash = Sha256::new();
+            envelope_hash.update(b"layrs.private-response-envelope.v1\0");
+            envelope_hash.update(("layrs.v1".len() as u32).to_be_bytes());
+            envelope_hash.update(b"layrs.v1");
+            envelope_hash.update(client_public_key);
+            envelope_hash.update(response_nonce);
+            envelope_hash.update((ciphertext.len() as u64).to_be_bytes());
+            envelope_hash.update(&ciphertext);
+            let response_envelope_sha256: [u8; 32] = envelope_hash.finalize().into();
+            let recovery_artifacts: Vec<_> = match &response {
+                PlainResponse::User { response } => state
+                    .core
+                    .as_ref()
+                    .and_then(|core| {
+                        core.signed_recovery_bridge_artifact(
+                            &response.receipt.idempotency_key,
+                            recovery_environment(),
+                            response_envelope_sha256,
+                            ciphertext.len() as u64,
+                        )
+                    })
+                    .into_iter()
+                    .collect(),
+                _ => Vec::new(),
+            };
+            if requires_recovery_artifact && recovery_artifacts.is_empty() {
+                if let Some(core) = rollback_core.take() {
+                    state.core = Some(core);
+                    state.transport_nonces.forget(&replay_key);
+                    if let Some(nonce) = rollback_operator_nonce.take() {
+                        state.operator_nonces.forget(&nonce);
+                    }
+                }
+                return WireResponse::Error {
+                    code: "RECOVERY_ARTIFACT_FAILED",
+                };
+            }
+            WireResponse::Encrypted {
+                nonce: response_nonce,
+                ciphertext,
+                journal_artifacts,
+                snapshot_artifacts,
+                receipt_artifacts,
+                audit_artifacts,
+                task_artifacts,
+                recovery_artifacts,
+            }
+        }
+        Err(_) => {
+            if let Some(core) = rollback_core.take() {
+                state.core = Some(core);
+                state.transport_nonces.forget(&replay_key);
+                if let Some(nonce) = rollback_operator_nonce.take() {
+                    state.operator_nonces.forget(&nonce);
+                }
+            }
+            WireResponse::Error {
+                code: "ENCRYPTION_FAILED",
+            }
+        }
     }
 }
 
@@ -1385,6 +1573,7 @@ async fn dispatch(
                 .as_ref()
                 .ok_or_else(|| "NOT_PROVISIONED".to_string())?;
             ensure_market_execution_available(core, &command.action, state.polymarket.is_some())?;
+            let recovery_command = command.clone();
             let mut response = state
                 .core
                 .as_mut()
@@ -1398,7 +1587,14 @@ async fn dispatch(
                     .chain_signer
                     .as_ref()
                     .ok_or_else(|| "CHAIN_SIGNER_NOT_PROVISIONED".to_string())?;
-                response.reward_claim_authorization = Some(signer.sign_reward_claim(intent)?);
+                let authorization = signer.sign_reward_claim(intent)?;
+                state
+                    .core
+                    .as_mut()
+                    .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                    .attach_reward_claim_authorization(&recovery_command, authorization.clone())
+                    .map_err(|error| error.to_string())?;
+                response.reward_claim_authorization = Some(authorization);
             }
             Ok(PlainResponse::User {
                 response: Box::new(response),
@@ -2208,6 +2404,27 @@ async fn dispatch_operator(
                 .ok_or_else(|| "NOT_PROVISIONED".to_string())?
                 .trading_frozen(),
         }),
+        OperatorCommand::RecoveryArchiveAckStatus {
+            command_idempotency_key,
+            result_digest,
+            archive_row_commitment,
+            environment,
+        } => {
+            if environment != recovery_environment() {
+                return Err("RECOVERY_ARCHIVE_ENVIRONMENT_MISMATCH".into());
+            }
+            Ok(PlainResponse::RecoveryArchiveAckStatus {
+                acknowledged: state
+                    .core
+                    .as_ref()
+                    .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                    .recovery_archive_acknowledged(
+                        &command_idempotency_key,
+                        result_digest,
+                        archive_row_commitment,
+                    ),
+            })
+        }
         OperatorCommand::AggregateDepth {
             market_id,
             outcome,
@@ -2338,6 +2555,37 @@ async fn dispatch_operator(
                     now_millis,
                 } => {
                     core.set_trading_freeze(idempotency_key, frozen, reason_commitment, now_millis)
+                }
+                OperatorCommand::AcknowledgeRecoveryArchive {
+                    idempotency_key,
+                    command_idempotency_key,
+                    result_digest,
+                    archive_row_commitment,
+                    environment,
+                    recovery_artifact,
+                    now_millis,
+                } => {
+                    if environment != recovery_environment() {
+                        return Err("RECOVERY_ARCHIVE_ENVIRONMENT_MISMATCH".into());
+                    }
+                    let expected_artifact = core.signed_recovery_bridge_artifact(
+                        &command_idempotency_key,
+                        &environment,
+                        recovery_artifact.response_envelope_sha256,
+                        recovery_artifact.response_envelope_bytes,
+                    );
+                    if expected_artifact.as_ref() != Some(&recovery_artifact)
+                        || recovery_artifact.result_digest != result_digest
+                    {
+                        return Err("RECOVERY_ARCHIVE_PROOF_INVALID".into());
+                    }
+                    core.acknowledge_recovery_archive(
+                        idempotency_key,
+                        command_idempotency_key,
+                        result_digest,
+                        archive_row_commitment,
+                        now_millis,
+                    )
                 }
                 OperatorCommand::RegisterMarket {
                     idempotency_key,
@@ -2535,6 +2783,7 @@ async fn dispatch_operator(
                 | OperatorCommand::ResolutionReadiness { .. }
                 | OperatorCommand::TransferAccountStatus { .. }
                 | OperatorCommand::TradingFreezeStatus
+                | OperatorCommand::RecoveryArchiveAckStatus { .. }
                 | OperatorCommand::AggregateDepth { .. }
                 | OperatorCommand::ReconcileBootstrap { .. } => unreachable!(),
             }
@@ -3071,6 +3320,29 @@ mod tests {
     fn replay_cache_zero_capacity_fails_closed() {
         let mut cache = ReplayCache::<2>::new(0);
         assert!(!cache.remember([1u8, 1]));
+    }
+
+    #[test]
+    fn transport_replay_accepts_only_byte_identical_retry_and_rejects_conflict() {
+        let mut cache = TransportReplayCache::new(2);
+        let key = [0x41; 44];
+        assert_eq!(
+            cache.check_or_remember(key, b"ciphertext-one"),
+            TransportReplayDecision::New,
+        );
+        assert_eq!(
+            cache.check_or_remember(key, b"ciphertext-one"),
+            TransportReplayDecision::ExactRetry,
+        );
+        assert_eq!(
+            cache.check_or_remember(key, b"ciphertext-two"),
+            TransportReplayDecision::Conflict,
+        );
+        cache.forget(&key);
+        assert_eq!(
+            cache.check_or_remember(key, b"ciphertext-two"),
+            TransportReplayDecision::New,
+        );
     }
 
     fn synthetic_nsm_document(

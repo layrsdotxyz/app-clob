@@ -1438,10 +1438,10 @@ fn native_clob_partial_fill_locks_remainder_and_cancel_releases_once() {
     );
     assert_eq!(core.balance(&collateral), 1_000_000_000_000_000_000);
 
-    // A committed response may be lost between the enclave and API. Snapshot
-    // recovery keeps only the processed request hash, so the same signed
-    // command must be reported as previously processed without applying the
-    // fill, fee or position transfer a second time.
+    // A committed SubmitOrder response may be lost between the enclave and
+    // API. Its bounded recovery capsule preserves the exact private semantic
+    // result and receipt across restore without applying the fill, fee or
+    // position transfer a second time.
     let snapshot = core.export_encrypted_snapshot().unwrap();
     let snapshot_sequence = snapshot.sequence;
     let mut restored = PrivateTradingCore::restore_encrypted_snapshot(
@@ -1461,10 +1461,15 @@ fn native_clob_partial_fill_locks_remainder_and_cancel_releases_once() {
         sell_taker_action,
         1_450,
     );
+    let recovered = lost_response_retry.expect("recover committed submit result");
+    assert_eq!(recovered.result, sell_taker_fill.result);
+    assert_eq!(recovered.receipt, sell_taker_fill.receipt);
+    assert_eq!(recovered.audit_fills, sell_taker_fill.audit_fills);
     assert_eq!(
-        lost_response_retry.unwrap_err(),
-        CoreError::PreviouslyProcessed
+        recovered.task_qualifications,
+        sell_taker_fill.task_qualifications
     );
+    assert!(recovered.encrypted_record.is_none());
     assert_eq!(restored.state_root(), restored_root);
     assert_eq!(restored.balance(&collateral), 1_000_000_000_000_000_000);
     assert_eq!(
@@ -3064,8 +3069,7 @@ fn private_rewards_accrue_cumulatively_and_authorize_only_the_bound_account() {
 
     let account = "0x0000000000000000000000000000000000000022";
     let recipient = "0x0000000000000000000000000000000000000033";
-    let authorized = execute_signed_response(
-        &mut core,
+    let reward_claim_command = signed_user_command(
         &user,
         "session:rewards",
         2,
@@ -3079,16 +3083,45 @@ fn private_rewards_accrue_cumulatively_and_authorize_only_the_bound_account() {
         },
         1_400,
     );
-    match authorized.result {
+    let authorized = core.execute(reward_claim_command.clone(), 1_400).unwrap();
+    let claim_intent = match &authorized.result {
         CommandResult::RewardClaimAuthorized { intent } => {
             assert_eq!(intent.account, account);
             assert_eq!(intent.recipient, recipient);
             assert_eq!(intent.cumulative_amount_atomic, "125");
             assert_ne!(intent.context_hash, [0u8; 32]);
+            intent.clone()
         }
         _ => panic!("expected reward claim authorization"),
-    }
+    };
     assert!(authorized.reward_claim_authorization.is_none());
+
+    // The wrapper signs only after the financial core commits. The exact
+    // signed response must be cached without another sequence/root mutation so
+    // a dropped first response can be returned byte-for-byte on retry.
+    let signed_authorization = clob_service::private_core::RewardClaimAuthorization {
+        intent: claim_intent,
+        chain_id: 8_453,
+        distributor: "0x0000000000000000000000000000000000000055".into(),
+        signer: "0x0000000000000000000000000000000000000066".into(),
+        signature: vec![0x77; 65],
+    };
+    let root_before_authorization = core.state_root();
+    core.attach_reward_claim_authorization(&reward_claim_command, signed_authorization.clone())
+        .unwrap();
+    assert_eq!(core.state_root(), root_before_authorization);
+    let recovered = core
+        .recover_exact_user_command(&reward_claim_command)
+        .unwrap()
+        .expect("exact reward claim retry");
+    assert_eq!(
+        recovered.reward_claim_authorization,
+        Some(signed_authorization)
+    );
+    assert_eq!(
+        recovered.receipt.enclave_sequence,
+        authorized.receipt.enclave_sequence
+    );
 
     let changed_account = execute_signed_result(
         &mut core,
@@ -4650,7 +4683,7 @@ fn api_position_close_previews_and_executes_exact_protected_payout_atomically() 
     );
     let closed = core.execute(close_command.clone(), 1_410).unwrap();
     assert!(core
-        .recover_exact_position_close(&close_command)
+        .recover_exact_user_command(&close_command)
         .unwrap()
         .is_some());
     assert_eq!(closed.receipt.publication_eligible, Some(true));
@@ -4730,7 +4763,7 @@ fn api_position_close_previews_and_executes_exact_protected_payout_atomically() 
         .to_bytes()
         .to_vec();
     assert_eq!(
-        core.recover_exact_position_close(&mismatched_retry)
+        core.recover_exact_user_command(&mismatched_retry)
             .unwrap_err(),
         CoreError::DuplicateCommand
     );

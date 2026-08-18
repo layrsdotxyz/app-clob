@@ -751,6 +751,25 @@ pub struct CoreResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryBridgeArtifact {
+    pub protocol_version: String,
+    pub environment: String,
+    pub command_idempotency_key: String,
+    pub result_digest: [u8; 32],
+    pub enclave_sequence: u64,
+    pub command_commitment_sha256: [u8; 32],
+    pub state_root: [u8; 32],
+    pub receipt_id: String,
+    pub response_envelope_sha256: [u8; 32],
+    pub response_envelope_bytes: u64,
+    pub response_status: u16,
+    pub content_type: String,
+    pub observed_at_millis: i64,
+    pub expires_at_millis: i64,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemResponse {
     pub receipt: EnclaveReceipt,
     pub encrypted_record: EncryptedJournalRecord,
@@ -841,6 +860,39 @@ struct ProcessedCommand {
     response: Option<CoreResponse>,
 }
 
+const MAX_RECOVERY_CAPSULES: usize = 256;
+const MAX_RECOVERY_CAPSULE_BYTES: usize = 64 * 1024;
+const MAX_RECOVERY_WINDOW_BYTES: usize = 16 * 1024 * 1024;
+const MAX_RECOVERY_FILLS: usize = 64;
+
+/// A bounded, encrypted-snapshot recovery record for a committed private
+/// command. The exact command/context binding remains in the rooted
+/// `processed-command` marker; the result hash has its own rooted marker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RecoveryCapsule {
+    sequence: u64,
+    request_hash: [u8; 32],
+    result_digest: [u8; 32],
+    result: CommandResult,
+    receipt: EnclaveReceipt,
+    audit_fills: Vec<SignedAuditFillArtifact>,
+    task_qualifications: Vec<SignedTaskQualificationArtifact>,
+}
+
+impl RecoveryCapsule {
+    fn response(&self) -> CoreResponse {
+        CoreResponse {
+            result: self.result.clone(),
+            receipt: self.receipt.clone(),
+            encrypted_record: None,
+            withdrawal_authorization: None,
+            reward_claim_authorization: None,
+            audit_fills: self.audit_fills.clone(),
+            task_qualifications: self.task_qualifications.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 enum JournaledSystemCommand {
@@ -917,6 +969,12 @@ enum JournaledSystemCommand {
         failure_code: String,
         evidence_hash: [u8; 32],
     },
+    AcknowledgeRecoveryArchive {
+        idempotency_key: String,
+        command_idempotency_key: String,
+        result_digest: [u8; 32],
+        archive_row_commitment: [u8; 32],
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -926,6 +984,11 @@ struct CoreStateSnapshot {
     markets: BTreeMap<String, MarketConfig>,
     sessions: SessionGuard,
     processed_hashes: BTreeMap<String, [u8; 32]>,
+    /// Recent exact private results only. This window is deterministically
+    /// bounded before a snapshot is sealed; older commands remain committed
+    /// and return `PreviouslyProcessed` rather than being executed twice.
+    #[serde(default)]
+    recovery_capsules: BTreeMap<String, RecoveryCapsule>,
     system_keys: BTreeSet<String>,
     position_cost_basis: Vec<(PositionKey, u128)>,
     resolutions: BTreeMap<String, MarketResolution>,
@@ -939,12 +1002,14 @@ struct CoreStateSnapshot {
     sequence: u64,
 }
 
+#[derive(Clone)]
 pub struct PrivateTradingCore {
     ledger: Ledger,
     books: BTreeMap<String, PriceTimeBook>,
     markets: BTreeMap<String, MarketConfig>,
     sessions: SessionGuard,
     processed: BTreeMap<String, ProcessedCommand>,
+    recovery_capsules: BTreeMap<String, RecoveryCapsule>,
     system_keys: BTreeSet<String>,
     journal: EncryptedJournal,
     receipt_signer: ReceiptSigner,
@@ -967,6 +1032,7 @@ impl PrivateTradingCore {
             markets: BTreeMap::new(),
             sessions: SessionGuard::default(),
             processed: BTreeMap::new(),
+            recovery_capsules: BTreeMap::new(),
             system_keys: BTreeSet::new(),
             journal: EncryptedJournal::new(journal_key),
             receipt_signer,
@@ -1115,6 +1181,7 @@ impl PrivateTradingCore {
                 markets: self.markets.clone(),
                 sessions: self.sessions.clone(),
                 processed_hashes: processed_hashes(&self.processed),
+                recovery_capsules: self.recovery_capsules.clone(),
                 system_keys: self.system_keys.clone(),
                 position_cost_basis: self
                     .position_cost_basis
@@ -1143,6 +1210,7 @@ impl PrivateTradingCore {
             markets: self.markets.clone(),
             sessions: self.sessions.clone(),
             processed_hashes: processed_hashes(&self.processed),
+            recovery_capsules: self.recovery_capsules.clone(),
             system_keys: self.system_keys.clone(),
             position_cost_basis: self
                 .position_cost_basis
@@ -1190,6 +1258,7 @@ impl PrivateTradingCore {
             markets: self.markets.clone(),
             sessions: self.sessions.clone(),
             processed_hashes: processed_hashes(&self.processed),
+            recovery_capsules: self.recovery_capsules.clone(),
             system_keys: self.system_keys.clone(),
             position_cost_basis: self
                 .position_cost_basis
@@ -1242,15 +1311,26 @@ impl PrivateTradingCore {
         }
         let position_cost_basis: BTreeMap<PositionKey, u128> =
             state.position_cost_basis.into_iter().collect();
+        validate_recovery_capsules(
+            &state.recovery_capsules,
+            &state.processed_hashes,
+            &state.system_keys,
+            &identity_key,
+            state.sequence,
+        )?;
         let processed: BTreeMap<String, ProcessedCommand> = state
             .processed_hashes
             .into_iter()
             .map(|(key, request_hash)| {
+                let response = state
+                    .recovery_capsules
+                    .get(&key)
+                    .map(RecoveryCapsule::response);
                 (
                     key,
                     ProcessedCommand {
                         request_hash,
-                        response: None,
+                        response,
                     },
                 )
             })
@@ -1314,6 +1394,7 @@ impl PrivateTradingCore {
             markets: state.markets,
             sessions: state.sessions,
             processed,
+            recovery_capsules: state.recovery_capsules,
             system_keys: state.system_keys,
             journal,
             receipt_signer,
@@ -1350,23 +1431,16 @@ impl PrivateTradingCore {
         self.trading_frozen
     }
 
-    /// Recovers only a byte-for-byte identical committed position-close command.
+    /// Recovers only a byte-for-byte identical committed user command.
     ///
     /// This check is intentionally available before a fresh NSM clock read so a
     /// lost HTTP response can be recovered even during a temporary NSM failure.
     /// Legacy processed entries without the rooted full-command marker remain
     /// non-recoverable and return `PreviouslyProcessed`.
-    pub fn recover_exact_position_close(
+    pub fn recover_exact_user_command(
         &self,
         command: &UserCommand,
     ) -> CoreResult<Option<CoreResponse>> {
-        if !matches!(
-            command.action,
-            UserCommandAction::PreviewPositionClose { .. }
-                | UserCommandAction::ClosePosition { .. }
-        ) {
-            return Ok(None);
-        }
         let expected_hash = command_request_hash(
             &command.command_id,
             &command.idempotency_key,
@@ -1392,6 +1466,116 @@ impl PrivateTradingCore {
             .clone()
             .map(Some)
             .ok_or(CoreError::PreviouslyProcessed)
+    }
+
+    /// Attaches the chain signer output to the exact cached reward-claim
+    /// response after signing succeeds outside the financial core.
+    ///
+    /// The financial mutation and its rooted request marker are already
+    /// committed by `execute`. This method may only enrich that exact cached
+    /// response with an authorization whose intent is byte-for-byte identical
+    /// to the rooted command result. It does not alter financial state, journal
+    /// sequence, or the state root. This makes a byte-identical transport retry
+    /// return the original signed authorization instead of authorizing twice.
+    pub fn attach_reward_claim_authorization(
+        &mut self,
+        command: &UserCommand,
+        authorization: RewardClaimAuthorization,
+    ) -> CoreResult<()> {
+        let expected_hash = command_request_hash(
+            &command.command_id,
+            &command.idempotency_key,
+            &command.action,
+        )?;
+        if command.session.request.request_hash != expected_hash {
+            return Err(CoreError::RequestHashMismatch);
+        }
+        let processed = self
+            .processed
+            .get_mut(&command.idempotency_key)
+            .ok_or(CoreError::PreviouslyProcessed)?;
+        if processed.request_hash != expected_hash {
+            return Err(CoreError::DuplicateCommand);
+        }
+        let response = processed
+            .response
+            .as_mut()
+            .ok_or(CoreError::PreviouslyProcessed)?;
+        let CommandResult::RewardClaimAuthorized { intent } = &response.result else {
+            return Err(CoreError::InvalidOrder(
+                "reward authorization does not match command result".into(),
+            ));
+        };
+        if authorization.intent != *intent {
+            return Err(CoreError::InvalidOrder(
+                "reward authorization intent mismatch".into(),
+            ));
+        }
+        match &response.reward_claim_authorization {
+            Some(existing) if existing != &authorization => {
+                return Err(CoreError::InvalidOrder(
+                    "reward authorization already differs".into(),
+                ));
+            }
+            Some(_) => return Ok(()),
+            None => {}
+        }
+        response.reward_claim_authorization = Some(authorization);
+        Ok(())
+    }
+
+    pub fn signed_recovery_bridge_artifact(
+        &self,
+        command_idempotency_key: &str,
+        environment: &str,
+        response_envelope_sha256: [u8; 32],
+        response_envelope_bytes: u64,
+    ) -> Option<RecoveryBridgeArtifact> {
+        self.recovery_capsules
+            .get(command_idempotency_key)
+            .and_then(|capsule| {
+                let mut artifact = RecoveryBridgeArtifact {
+                    protocol_version: "layrs.private-response-recovery.v1".into(),
+                    environment: environment.to_owned(),
+                    command_idempotency_key: command_idempotency_key.to_owned(),
+                    result_digest: capsule.result_digest,
+                    enclave_sequence: capsule.sequence,
+                    command_commitment_sha256: capsule.request_hash,
+                    state_root: capsule.receipt.state_root,
+                    receipt_id: capsule.receipt.receipt_id.clone(),
+                    response_envelope_sha256,
+                    response_envelope_bytes,
+                    response_status: 200,
+                    content_type: "application/json".into(),
+                    observed_at_millis: capsule.receipt.occurred_at_millis,
+                    expires_at_millis: capsule
+                        .receipt
+                        .occurred_at_millis
+                        .checked_add(24 * 60 * 60 * 1_000)?,
+                    signature: Vec::new(),
+                };
+                artifact.signature = self.receipt_signer.sign_domain_payload(
+                    b"layrs.private-response-recovery-artifact.v1\0",
+                    &artifact,
+                );
+                Some(artifact)
+            })
+    }
+
+    /// Read-only reconciliation proof for an archive ACK whose response may
+    /// have been lost after the enclave committed it. The exact marker is
+    /// rooted by `acknowledge_recovery_archive`; absence never implies success.
+    pub fn recovery_archive_acknowledged(
+        &self,
+        command_idempotency_key: &str,
+        result_digest: [u8; 32],
+        archive_row_commitment: [u8; 32],
+    ) -> bool {
+        self.system_keys.contains(&recovery_archive_ack_marker(
+            command_idempotency_key,
+            result_digest,
+            archive_row_commitment,
+        ))
     }
 
     pub fn set_trading_freeze(
@@ -1441,6 +1625,90 @@ impl PrivateTradingCore {
             } else {
                 "trading-unfreeze"
             },
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
+    }
+
+    /// Removes one exact SubmitOrder recovery bridge only after the governed
+    /// operator attests that the padded opaque response is durably archived.
+    /// The archive commitment and result digest are rooted and journaled; an
+    /// ACK for another command/result can never free capacity.
+    pub fn acknowledge_recovery_archive(
+        &mut self,
+        idempotency_key: String,
+        command_idempotency_key: String,
+        result_digest: [u8; 32],
+        archive_row_commitment: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        if archive_row_commitment == [0u8; 32] {
+            return Err(CoreError::InvalidRecoveryCapsule);
+        }
+        let capsule = self
+            .recovery_capsules
+            .get(&command_idempotency_key)
+            .ok_or(CoreError::InvalidRecoveryCapsule)?;
+        if capsule.result_digest != result_digest {
+            return Err(CoreError::InvalidRecoveryCapsule);
+        }
+        let capsule_request_hash = capsule.request_hash;
+
+        let prior_root = self.state_root();
+        let mut capsules = self.recovery_capsules.clone();
+        capsules.remove(&command_idempotency_key);
+        let mut processed = self.processed.clone();
+        let processed_command = processed
+            .get_mut(&command_idempotency_key)
+            .ok_or(CoreError::InvalidRecoveryCapsule)?;
+        if processed_command.request_hash != capsule_request_hash {
+            return Err(CoreError::InvalidRecoveryCapsule);
+        }
+        processed_command.response = None;
+        let mut keys = self.system_keys.clone();
+        keys.remove(&recovery_result_marker(
+            &command_idempotency_key,
+            result_digest,
+        ));
+        keys.insert(idempotency_key.clone());
+        keys.insert(recovery_archive_ack_marker(
+            &command_idempotency_key,
+            result_digest,
+            archive_row_commitment,
+        ));
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &self.ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::AcknowledgeRecoveryArchive {
+            idempotency_key: idempotency_key.clone(),
+            command_idempotency_key,
+            result_digest,
+            archive_row_commitment,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.recovery_capsules = capsules;
+        self.processed = processed;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            "acknowledge-recovery-archive",
             idempotency_key,
             prior_root,
             next_root,
@@ -3042,6 +3310,9 @@ impl PrivateTradingCore {
         {
             return Err(CoreError::TradingFrozen);
         }
+        if matches!(command.action, UserCommandAction::SubmitOrder { .. }) {
+            reserve_recovery_capacity(&self.recovery_capsules)?;
+        }
 
         let prior_root = self.state_root();
         let mut sessions = self.sessions.clone();
@@ -3072,15 +3343,35 @@ impl PrivateTradingCore {
                     .get(&order.market_id)
                     .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
                 validate_order_for_market(&order, market, now_millis)?;
-                enforce_user_position_limit(
-                    &ledger,
-                    &books,
-                    &bootstrap_executions,
-                    market,
-                    &order,
-                )?;
                 match &market.execution {
                     MarketExecution::NativeClob | MarketExecution::NativeExactCondition { .. } => {
+                        // GTD deadlines are consensus inputs, but wall-clock
+                        // passage alone cannot mutate the enclave state. At the
+                        // next valid write for this market, expire all elapsed
+                        // orders and release their grouped holds atomically
+                        // before position-limit validation or matching.
+                        {
+                            let book = books.entry(order.market_id.clone()).or_default();
+                            let expired = book.cancel_expired(&order.market_id, now_millis);
+                            let releases = cancellation_transfers(&ledger, book, market, &expired)?;
+                            if !releases.is_empty() {
+                                ledger.apply(LedgerTransaction {
+                                    idempotency_key: format!(
+                                        "expire-orders:{}",
+                                        command.idempotency_key
+                                    ),
+                                    business_reference: command.command_id.clone(),
+                                    transfers: releases,
+                                })?;
+                            }
+                        }
+                        enforce_user_position_limit(
+                            &ledger,
+                            &books,
+                            &bootstrap_executions,
+                            market,
+                            &order,
+                        )?;
                         let book = books.entry(order.market_id.clone()).or_default();
                         let match_result = book.submit(order.clone(), now_millis)?;
                         if match_result
@@ -3149,6 +3440,13 @@ impl PrivateTradingCore {
                         }
                     }
                     MarketExecution::PolymarketBootstrap { .. } => {
+                        enforce_user_position_limit(
+                            &ledger,
+                            &books,
+                            &bootstrap_executions,
+                            market,
+                            &order,
+                        )?;
                         if !matches!(order.time_in_force, super::TimeInForce::Fok) {
                             return Err(CoreError::InvalidOrder(
                                 "bootstrap execution requires fill-or-kill".into(),
@@ -3848,10 +4146,26 @@ impl PrivateTradingCore {
             }
         };
 
+        if let CommandResult::Order { result } = &result {
+            if result.fills.len() > MAX_RECOVERY_FILLS {
+                return Err(CoreError::RecoveryCapsuleTooLarge);
+            }
+        }
+
         system_keys.insert(processed_command_marker(
             &command.idempotency_key,
             full_user_command_commitment(&command)?,
         ));
+        let recovery_result_digest =
+            matches!(command.action, UserCommandAction::SubmitOrder { .. })
+                .then(|| private_recovery_result_digest(&self.identity_key, &result))
+                .transpose()?;
+        if let Some(result_digest) = recovery_result_digest {
+            system_keys.insert(recovery_result_marker(
+                &command.idempotency_key,
+                result_digest,
+            ));
+        }
 
         let mut processed_hash_map = processed_hashes(&self.processed);
         processed_hash_map.insert(command.idempotency_key.clone(), expected_hash);
@@ -3957,6 +4271,23 @@ impl PrivateTradingCore {
             audit_fills,
             task_qualifications,
         };
+        let mut recovery_capsules = self.recovery_capsules.clone();
+        if matches!(command.action, UserCommandAction::SubmitOrder { .. }) {
+            insert_recovery_capsule(
+                &mut recovery_capsules,
+                command.idempotency_key.clone(),
+                RecoveryCapsule {
+                    sequence: next_sequence,
+                    request_hash: expected_hash,
+                    result_digest: recovery_result_digest
+                        .expect("SubmitOrder recovery digest was derived before commit"),
+                    result: response.result.clone(),
+                    receipt: response.receipt.clone(),
+                    audit_fills: response.audit_fills.clone(),
+                    task_qualifications: response.task_qualifications.clone(),
+                },
+            )?;
+        }
         self.ledger = ledger;
         self.books = books;
         self.sessions = sessions;
@@ -3973,6 +4304,7 @@ impl PrivateTradingCore {
                 response: Some(response.clone()),
             },
         );
+        self.recovery_capsules = recovery_capsules;
         Ok(response)
     }
 
@@ -6674,6 +7006,111 @@ fn processed_hashes(processed: &BTreeMap<String, ProcessedCommand>) -> BTreeMap<
         .iter()
         .map(|(key, value)| (key.clone(), value.request_hash))
         .collect()
+}
+
+fn recovery_result_marker(idempotency_key: &str, digest: [u8; 32]) -> String {
+    format!("recovery-result:{idempotency_key}:{}", hex::encode(digest))
+}
+
+fn private_recovery_result_digest(
+    identity_key: &[u8; 32],
+    result: &CommandResult,
+) -> CoreResult<[u8; 32]> {
+    let encoded = serde_json::to_vec(result).map_err(|_| CoreError::InvalidRecoveryCapsule)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(identity_key)
+        .map_err(|_| CoreError::InvalidRecoveryCapsule)?;
+    mac.update(b"layrs.private-recovery-result.v1\0");
+    mac.update(&(encoded.len() as u64).to_be_bytes());
+    mac.update(&encoded);
+    Ok(mac.finalize().into_bytes().into())
+}
+
+fn recovery_archive_ack_marker(
+    idempotency_key: &str,
+    result_digest: [u8; 32],
+    archive_row_commitment: [u8; 32],
+) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.private-recovery-archive-ack.v1\0");
+    hash.update((idempotency_key.len() as u64).to_be_bytes());
+    hash.update(idempotency_key.as_bytes());
+    hash.update(result_digest);
+    hash.update(archive_row_commitment);
+    format!("recovery-archive-ack:{}", hex::encode(hash.finalize()))
+}
+
+fn recovery_capsule_size(capsule: &RecoveryCapsule) -> CoreResult<usize> {
+    serde_json::to_vec(capsule)
+        .map(|encoded| encoded.len())
+        .map_err(|_| CoreError::InvalidRecoveryCapsule)
+}
+
+fn recovery_window_size(capsules: &BTreeMap<String, RecoveryCapsule>) -> CoreResult<usize> {
+    serde_json::to_vec(capsules)
+        .map(|encoded| encoded.len())
+        .map_err(|_| CoreError::InvalidRecoveryCapsule)
+}
+
+fn insert_recovery_capsule(
+    capsules: &mut BTreeMap<String, RecoveryCapsule>,
+    idempotency_key: String,
+    capsule: RecoveryCapsule,
+) -> CoreResult<()> {
+    if recovery_capsule_size(&capsule)? > MAX_RECOVERY_CAPSULE_BYTES {
+        return Err(CoreError::RecoveryCapsuleTooLarge);
+    }
+    capsules.insert(idempotency_key.clone(), capsule);
+    if capsules.len() > MAX_RECOVERY_CAPSULES
+        || recovery_window_size(capsules)? > MAX_RECOVERY_WINDOW_BYTES
+    {
+        capsules.remove(&idempotency_key);
+        return Err(CoreError::RecoveryWindowFull);
+    }
+    Ok(())
+}
+
+fn reserve_recovery_capacity(capsules: &BTreeMap<String, RecoveryCapsule>) -> CoreResult<()> {
+    if capsules.len() >= MAX_RECOVERY_CAPSULES
+        || recovery_window_size(capsules)?
+            .checked_add(MAX_RECOVERY_CAPSULE_BYTES + 128 + 8)
+            .ok_or(CoreError::RecoveryWindowFull)?
+            > MAX_RECOVERY_WINDOW_BYTES
+    {
+        return Err(CoreError::RecoveryWindowFull);
+    }
+    Ok(())
+}
+
+fn validate_recovery_capsules(
+    capsules: &BTreeMap<String, RecoveryCapsule>,
+    processed: &BTreeMap<String, [u8; 32]>,
+    system_keys: &BTreeSet<String>,
+    identity_key: &[u8; 32],
+    snapshot_sequence: u64,
+) -> CoreResult<()> {
+    if capsules.len() > MAX_RECOVERY_CAPSULES
+        || recovery_window_size(capsules)? > MAX_RECOVERY_WINDOW_BYTES
+    {
+        return Err(CoreError::InvalidRecoveryCapsule);
+    }
+    for (idempotency_key, capsule) in capsules {
+        if recovery_capsule_size(capsule)? > MAX_RECOVERY_CAPSULE_BYTES
+            || capsule.sequence > snapshot_sequence
+            || capsule.receipt.idempotency_key != *idempotency_key
+            || capsule.receipt.enclave_sequence != capsule.sequence
+            || capsule.receipt.command_commitment_sha256 != Some(capsule.request_hash)
+            || processed.get(idempotency_key).copied() != Some(capsule.request_hash)
+            || private_recovery_result_digest(identity_key, &capsule.result)?
+                != capsule.result_digest
+            || !system_keys.contains(&recovery_result_marker(
+                idempotency_key,
+                capsule.result_digest,
+            ))
+        {
+            return Err(CoreError::InvalidRecoveryCapsule);
+        }
+    }
+    Ok(())
 }
 
 fn read_only_response_hash(

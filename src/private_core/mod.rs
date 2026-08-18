@@ -45,8 +45,8 @@ pub use engine::{
     CommandResult, CoreResponse, ExactConditionResolutionStatement, FeeProfileId, MarketConfig,
     MarketExecution, MarketResolution, MarketSettlementReadiness, PolymarketRedemptionIntent,
     PolymarketResolutionStatement, PortfolioSnapshot, PositionClosePreview, PrivateBalance,
-    PrivatePosition, PrivateTradingCore, ResolutionEvidence, ResolutionOutcome,
-    ResolutionStatement, SignedAuditFillArtifact, SignedBinanceResolution,
+    PrivatePosition, PrivateTradingCore, RecoveryBridgeArtifact, ResolutionEvidence,
+    ResolutionOutcome, ResolutionStatement, SignedAuditFillArtifact, SignedBinanceResolution,
     SignedExactConditionResolution, SignedPolymarketResolution, SignedResolution,
     SignedResolutionEvidence, SignedTaskQualificationArtifact, SystemResponse,
     TaskQualificationStatement, UserCommand, UserCommandAction, WithdrawalAuthorization,
@@ -114,6 +114,12 @@ pub enum CoreError {
     RollbackDetected,
     #[error("command was processed before the restored checkpoint; query its receipt archive")]
     PreviouslyProcessed,
+    #[error("private command recovery record exceeds the certified bound")]
+    RecoveryCapsuleTooLarge,
+    #[error("private command recovery window is full pending durable archive acknowledgement")]
+    RecoveryWindowFull,
+    #[error("private command recovery window is inconsistent")]
+    InvalidRecoveryCapsule,
 }
 
 pub type CoreResult<T> = Result<T, CoreError>;

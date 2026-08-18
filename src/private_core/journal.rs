@@ -390,6 +390,7 @@ pub struct EnclaveReceipt {
     pub signature: Vec<u8>,
 }
 
+#[derive(Clone)]
 pub struct ReceiptSigner {
     signing_key: SigningKey,
     enclave_measurement_sha384: [u8; 48],

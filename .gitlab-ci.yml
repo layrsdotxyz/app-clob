@@ -19,6 +19,10 @@ default:
   cache:
     key: { files: [Cargo.lock] }
     paths: [.cargo-cache/registry/, .cargo-cache/git/]
+  variables:
+    # CI artifacts are never production EIFs. Production release builds must
+    # explicitly embed `production`, which changes PCR0 and is manifest-bound.
+    LAYRS_RECOVERY_ENVIRONMENT: development
 
 clob-fast:
   stage: fast
