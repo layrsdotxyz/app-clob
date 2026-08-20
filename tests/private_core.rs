@@ -571,7 +571,7 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
         },
         1_000,
     );
-    execute_signed(
+    let resting_order = execute_signed_response(
         &mut core,
         &bob,
         "session:2",
@@ -590,6 +590,15 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
             ),
         },
         1_100,
+    );
+    assert!(resting_order.audit_fills.is_empty());
+    assert_eq!(resting_order.task_qualifications.len(), 1);
+    assert_eq!(
+        resting_order.task_qualifications[0]
+            .statement
+            .market_id
+            .as_deref(),
+        Some(market_id)
     );
     let buy_action = UserCommandAction::SubmitOrder {
         order: BookOrder::new(
@@ -645,12 +654,13 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
     assert_eq!(fill_response.task_qualifications.len(), 1);
     let task = &fill_response.task_qualifications[0];
     assert_eq!(task.statement.event_type, "ORDER_ACCEPTED");
+    assert_eq!(task.statement.market_id.as_deref(), Some(market_id));
     assert_eq!(task.statement.settlement_asset, "ZEN");
     assert_eq!(task.statement.asset_notional_micros, 400_000);
     assert_eq!(task.statement.filled_quantity_micros, 1_000_000);
     assert_eq!(task.receipt_id, fill_response.receipt.receipt_id);
     let serialized_task = serde_json::to_string(task).unwrap();
-    for private_value in ["usr_", market_id, "BUY", "UP"] {
+    for private_value in ["usr_", "BUY", "UP"] {
         assert!(
             !serialized_task.contains(private_value),
             "task qualification leaked private order field: {private_value}"
