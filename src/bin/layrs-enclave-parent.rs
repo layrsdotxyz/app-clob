@@ -426,8 +426,8 @@ mod tests {
     use tokio::sync::Semaphore;
 
     use super::{
-        acquire_exchange_permit, AppState, WireRequest, ENCLAVE_EXCHANGE_TIMEOUT, MAX_FRAME_BYTES,
-        MAX_HTTP_BODY_BYTES,
+        acquire_exchange_permit, AccessCapability, AppState, WireRequest, ENCLAVE_EXCHANGE_TIMEOUT,
+        MAX_FRAME_BYTES, MAX_HTTP_BODY_BYTES,
     };
 
     #[test]
