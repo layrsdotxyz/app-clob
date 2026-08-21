@@ -13,6 +13,7 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+#[cfg(not(feature = "standalone-enclave-runtime"))]
 use clob_service::access_capability::AccessCapability;
 use clob_service::private_core::{
     EnclaveReceipt, EncryptedJournalRecord, EncryptedSnapshot, SignedAuditFillArtifact,
@@ -30,6 +31,12 @@ use tower_http::{
     compression::CompressionLayer, request_id::MakeRequestUuid,
     request_id::PropagateRequestIdLayer, request_id::SetRequestIdLayer, timeout::TimeoutLayer,
 };
+
+#[cfg(feature = "standalone-enclave-runtime")]
+#[path = "../access_capability.rs"]
+mod standalone_access_capability;
+#[cfg(feature = "standalone-enclave-runtime")]
+use standalone_access_capability::AccessCapability;
 
 // Provisioning restores the latest encrypted private-core snapshot through the same
 // ciphertext-only relay used by ordinary private commands. Keep the decoded frame

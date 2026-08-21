@@ -3,8 +3,6 @@
 //! The retained migration server has broader dependencies. The EIF is built from this package so
 //! those dependencies cannot enter the enclave image or its release audit closure.
 
-#[path = "../../../src/access_capability.rs"]
-pub mod access_capability;
 #[path = "../../../src/audit_signer.rs"]
 pub mod audit_signer;
 #[path = "../../../src/chain_signer.rs"]

@@ -12,6 +12,7 @@ use aws_nitro_enclaves_nsm_api::{
     api::{Request as NsmRequest, Response as NsmResponse},
     driver::{nsm_exit, nsm_init, nsm_process_request},
 };
+#[cfg(not(feature = "standalone-enclave-runtime"))]
 use clob_service::access_capability::AccessCapability;
 use clob_service::audit_signer::{
     AuditBatchRequest, AuditSignerBundle, EnclaveAuditSigner, SignedAuditSettlementTransaction,
@@ -55,6 +56,12 @@ use tokio::{
 use tokio_vsock::{VsockAddr, VsockListener, VsockStream, VMADDR_CID_ANY};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
+
+#[cfg(feature = "standalone-enclave-runtime")]
+#[path = "../access_capability.rs"]
+mod standalone_access_capability;
+#[cfg(feature = "standalone-enclave-runtime")]
+use standalone_access_capability::AccessCapability;
 
 const PORT: u32 = 5_003;
 // Must match or exceed the parent relay cap. Provisioning restores encrypted
