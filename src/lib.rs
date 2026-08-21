@@ -8,6 +8,7 @@
     clippy::wrong_self_convention
 )]
 
+pub mod access_capability;
 pub mod audit_signer;
 /// clob-service library crate.
 ///
