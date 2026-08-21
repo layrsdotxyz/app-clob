@@ -12,6 +12,7 @@ use aws_nitro_enclaves_nsm_api::{
     api::{Request as NsmRequest, Response as NsmResponse},
     driver::{nsm_exit, nsm_init, nsm_process_request},
 };
+use clob_service::access_capability::AccessCapability;
 use clob_service::audit_signer::{
     AuditBatchRequest, AuditSignerBundle, EnclaveAuditSigner, SignedAuditSettlementTransaction,
 };
@@ -71,6 +72,7 @@ enum WireRequest {
         nonce: Vec<u8>,
     },
     Encrypted {
+        access_capability: Option<AccessCapability>,
         client_public_key: [u8; 32],
         nonce: [u8; 12],
         #[serde(with = "serde_bytes")]
@@ -604,10 +606,20 @@ async fn serve_connection(
     let response = match request {
         WireRequest::Attestation { nonce } => create_attestation(&state, nonce).await,
         WireRequest::Encrypted {
+            access_capability,
             client_public_key,
             nonce,
             ciphertext,
-        } => handle_encrypted(&state, client_public_key, nonce, ciphertext).await,
+        } => {
+            handle_encrypted(
+                &state,
+                access_capability,
+                client_public_key,
+                nonce,
+                ciphertext,
+            )
+            .await
+        }
     };
     let encoded = serde_cbor::to_vec(&response)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -646,6 +658,7 @@ async fn create_attestation(state: &Arc<Mutex<EnclaveState>>, nonce: Vec<u8>) ->
 
 async fn handle_encrypted(
     state: &Arc<Mutex<EnclaveState>>,
+    access_capability: Option<AccessCapability>,
     client_public_key: [u8; 32],
     nonce: [u8; 12],
     ciphertext: Vec<u8>,
@@ -665,7 +678,12 @@ async fn handle_encrypted(
         Nonce::from_slice(&nonce),
         aes_gcm::aead::Payload {
             msg: &ciphertext,
-            aad: request_aad(&client_public_key, &state.transport_public_key).as_slice(),
+            aad: request_aad(
+                &client_public_key,
+                &state.transport_public_key,
+                access_capability,
+            )
+            .as_slice(),
         },
     ) {
         Ok(value) => value,
@@ -684,6 +702,11 @@ async fn handle_encrypted(
         }
     };
     plaintext.zeroize();
+    if access_capability.is_some_and(|claimed| expected_access_capability(&request) != claimed) {
+        return WireResponse::Error {
+            code: "ACCESS_CAPABILITY_MISMATCH",
+        };
+    }
     if !state.transport_nonces.remember(replay_key) {
         return WireResponse::Error {
             code: "REPLAY_REJECTED",
@@ -2342,11 +2365,48 @@ fn transport_key(secret: &StaticSecret, client_public_key: [u8; 32]) -> [u8; 32]
     hash.finalize().into()
 }
 
-fn request_aad(client: &[u8; 32], enclave: &[u8; 32]) -> Vec<u8> {
+fn request_aad(
+    client: &[u8; 32],
+    enclave: &[u8; 32],
+    access_capability: Option<AccessCapability>,
+) -> Vec<u8> {
     let mut aad = b"layrs.enclave-request.v1\0".to_vec();
     aad.extend_from_slice(client);
     aad.extend_from_slice(enclave);
+    if let Some(capability) = access_capability {
+        aad.extend_from_slice(b"\0layrs.access-capability.v1\0");
+        aad.extend_from_slice(capability.aad_label());
+    }
     aad
+}
+
+fn expected_access_capability(request: &PlainRequest) -> AccessCapability {
+    match request {
+        PlainRequest::User { command, .. } => expected_user_access_capability(&command.action),
+        PlainRequest::AggregateDepth { .. } => AccessCapability::PublicData,
+        PlainRequest::Operator { .. } => AccessCapability::PrivateApiMutations,
+    }
+}
+
+fn expected_user_access_capability(action: &UserCommandAction) -> AccessCapability {
+    match action {
+        UserCommandAction::SubmitOrder { .. } => AccessCapability::NewOrders,
+        UserCommandAction::CancelOrder { .. } | UserCommandAction::CancelBootstrap { .. } => {
+            AccessCapability::OrderCancellation
+        }
+        UserCommandAction::CompleteSet { direction, .. } => match direction {
+            clob_service::private_core::CompleteSetDirection::Mint => AccessCapability::NewOrders,
+            clob_service::private_core::CompleteSetDirection::Burn => {
+                AccessCapability::PositionReduction
+            }
+        },
+        UserCommandAction::Portfolio
+        | UserCommandAction::Rewards
+        | UserCommandAction::BootstrapStatus { .. } => AccessCapability::AccountRead,
+        UserCommandAction::RequestRewardClaim { .. } => AccessCapability::Redemptions,
+        UserCommandAction::RequestWithdrawal { .. } => AccessCapability::Withdrawals,
+        UserCommandAction::TransferFunds { .. } => AccessCapability::PrivateApiMutations,
+    }
 }
 
 fn response_aad(client: &[u8; 32], enclave: &[u8; 32]) -> Vec<u8> {
@@ -2404,6 +2464,47 @@ async fn write_frame(stream: &mut VsockStream, value: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use clob_service::private_core::FeeProfileId;
+
+    #[test]
+    fn capability_is_bound_into_request_aad() {
+        let legacy = request_aad(&[1; 32], &[2; 32], None);
+        let read = request_aad(&[1; 32], &[2; 32], Some(AccessCapability::AccountRead));
+        let order = request_aad(&[1; 32], &[2; 32], Some(AccessCapability::NewOrders));
+        assert_ne!(legacy, read);
+        assert_ne!(read, order);
+        assert!(read.ends_with(b"accountRead"));
+    }
+
+    #[test]
+    fn enclave_derives_capability_from_decrypted_action() {
+        assert_eq!(
+            expected_user_access_capability(&UserCommandAction::Portfolio),
+            AccessCapability::AccountRead
+        );
+        assert_eq!(
+            expected_user_access_capability(&UserCommandAction::CancelOrder {
+                market_id: "layrs:v5:TEST:capability:abababababababab".into(),
+                order_id: uuid::Uuid::nil(),
+            }),
+            AccessCapability::OrderCancellation
+        );
+        assert_eq!(
+            expected_user_access_capability(&UserCommandAction::CompleteSet {
+                market_id: "layrs:v5:TEST:capability:abababababababab".into(),
+                quantity_micros: 1,
+                direction: clob_service::private_core::CompleteSetDirection::Burn,
+            }),
+            AccessCapability::PositionReduction
+        );
+        assert_eq!(
+            expected_user_access_capability(&UserCommandAction::CompleteSet {
+                market_id: "layrs:v5:TEST:capability:abababababababab".into(),
+                quantity_micros: 1,
+                direction: clob_service::private_core::CompleteSetDirection::Mint,
+            }),
+            AccessCapability::NewOrders
+        );
+    }
 
     #[test]
     fn replay_cache_rejects_duplicate_keys() {
