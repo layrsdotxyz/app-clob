@@ -20,6 +20,7 @@ fi
 selected_doc=""
 declared_base=""
 selected_distance=""
+selected_cumulative="false"
 for candidate_doc in "${migration_docs[@]}"; do
   candidate_base="$(
     sed -n 's/^BASE_RELEASE_COMMIT:[[:space:]]*//p' "$candidate_doc" \
@@ -38,10 +39,17 @@ for candidate_doc in "${migration_docs[@]}"; do
   else
     candidate_distance="$(git rev-list --count "${candidate_base}...HEAD")"
   fi
-  if [[ -z "$selected_distance" || "$candidate_distance" -lt "$selected_distance" ]]; then
+  candidate_cumulative="false"
+  if grep -q 'CUMULATIVE_STATE_MIGRATION:[[:space:]]*true' "$candidate_doc"; then
+    candidate_cumulative="true"
+  fi
+  if [[ -z "$selected_distance" \
+    || "$candidate_cumulative" == "true" && "$selected_cumulative" != "true" \
+    || "$candidate_cumulative" == "$selected_cumulative" && "$candidate_distance" -lt "$selected_distance" ]]; then
     selected_doc="$candidate_doc"
     declared_base="$candidate_base"
     selected_distance="$candidate_distance"
+    selected_cumulative="$candidate_cumulative"
   fi
 done
 
