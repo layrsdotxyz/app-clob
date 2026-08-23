@@ -1208,6 +1208,17 @@ fn layrs_curve_fee_and_maker_rebate_are_private_and_conserved_on_mint() {
         taker_fill.audit_fills[0].statement.fee_atomic,
         "16800000000000000"
     );
+    // S05 posts the full governed LAYRS_FEE_V2 taker fee to private fee
+    // revenue. The maker rebate remains a separately accrued entitlement and
+    // is neither netted from collateral nor paid during the fill.
+    assert_eq!(
+        core.balance(&AccountKey::new("layrs", AccountBucket::FeeRevenue, "ZEN")),
+        16_800_000_000_000_000
+    );
+    assert_eq!(
+        core.balance(&market_collateral()),
+        1_000_000_000_000_000_000
+    );
 
     let maker_rewards = execute(
         &mut core,

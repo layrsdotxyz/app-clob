@@ -29,13 +29,13 @@ use clob_service::private_core::{
     binance_resolution_signing_payload, exact_condition_resolution_signing_payload,
     polymarket_resolution_signing_payload, resolution_signing_payload, AccountKey,
     BinanceResolutionStatement, BootstrapExecutionState, CommandResult, CoreResponse,
-    EnclaveReceipt, EncryptedJournalRecord, EncryptedSnapshot, ExactConditionResolutionStatement,
-    ExternalFlowDirection, JournalKey, MarketConfig, MarketExecution,
-    PolymarketResolutionStatement, PrivateTradingCore, ReceiptSigner, ResolutionStatement,
-    SignedAuditFillArtifact, SignedBinanceResolution, SignedExactConditionResolution,
-    SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence,
-    SignedTaskQualificationArtifact, SystemResponse, UserCommand, UserCommandAction,
-    WithdrawalAuthorization,
+    CustodyReconciliationSnapshot, EnclaveReceipt, EncryptedJournalRecord, EncryptedSnapshot,
+    ExactConditionResolutionStatement, ExternalFlowDirection, JournalKey, MarketConfig,
+    MarketExecution, PolymarketResolutionStatement, PrivateTradingCore, ReceiptSigner,
+    ResolutionStatement, SignedAuditFillArtifact, SignedBinanceResolution,
+    SignedExactConditionResolution, SignedPolymarketResolution, SignedResolution,
+    SignedResolutionEvidence, SignedTaskQualificationArtifact, SystemResponse, UserCommand,
+    UserCommandAction, WithdrawalAuthorization,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use openssl::{
@@ -227,6 +227,10 @@ enum OperatorCommand {
         market_id: String,
         now_millis: i64,
     },
+    CustodyReconciliationSnapshot {
+        checkpoint_commitment: [u8; 32],
+        chain_finality_commitments: Vec<[u8; 32]>,
+    },
     TradingFreezeStatus,
     AggregateDepth {
         market_id: String,
@@ -272,6 +276,18 @@ enum OperatorCommand {
         evidence_hash: [u8; 32],
         now_millis: i64,
     },
+    VaultStrategyTransition {
+        idempotency_key: String,
+        evidence_hash: [u8; 32],
+        vault_commitment: [u8; 32],
+        strategy_commitment: [u8; 32],
+        operation_commitment: [u8; 32],
+        asset: String,
+        #[serde(with = "clob_service::private_core::decimal_u128")]
+        amount_atomic: u128,
+        transition: clob_service::private_core::VaultStrategyTransition,
+        now_millis: i64,
+    },
     CreditDeposit {
         idempotency_key: String,
         identity_commitment: [u8; 32],
@@ -289,6 +305,12 @@ enum OperatorCommand {
         #[serde(with = "clob_service::private_core::decimal_u128")]
         amount_atomic: u128,
         evidence_hash: [u8; 32],
+        source_id_hash: [u8; 32],
+        program_id: String,
+        program_type: String,
+        policy_id: String,
+        policy_version: u32,
+        fee_policy_version: String,
         now_millis: i64,
     },
     FinalizeWithdrawal {
@@ -466,6 +488,9 @@ enum PlainResponse {
     },
     ResolutionReadiness {
         readiness: clob_service::private_core::MarketSettlementReadiness,
+    },
+    CustodyReconciliationSnapshot {
+        snapshot: CustodyReconciliationSnapshot,
     },
     TradingFreezeStatus {
         frozen: bool,
@@ -1625,6 +1650,16 @@ async fn dispatch_operator(
             .market_settlement_readiness(&market_id, now_millis)
             .map(|readiness| PlainResponse::ResolutionReadiness { readiness })
             .map_err(|error| error.to_string()),
+        OperatorCommand::CustodyReconciliationSnapshot {
+            checkpoint_commitment,
+            chain_finality_commitments,
+        } => state
+            .core
+            .as_ref()
+            .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+            .custody_reconciliation_snapshot(checkpoint_commitment, chain_finality_commitments)
+            .map(|snapshot| PlainResponse::CustodyReconciliationSnapshot { snapshot })
+            .map_err(|error| error.to_string()),
         OperatorCommand::TransferAccountStatus {
             identity_commitment,
         } => {
@@ -1818,6 +1853,27 @@ async fn dispatch_operator(
                     evidence_hash,
                     now_millis,
                 ),
+                OperatorCommand::VaultStrategyTransition {
+                    idempotency_key,
+                    evidence_hash,
+                    vault_commitment,
+                    strategy_commitment,
+                    operation_commitment,
+                    asset,
+                    amount_atomic,
+                    transition,
+                    now_millis,
+                } => core.apply_vault_strategy_transition(
+                    idempotency_key,
+                    evidence_hash,
+                    vault_commitment,
+                    strategy_commitment,
+                    operation_commitment,
+                    asset,
+                    amount_atomic,
+                    transition,
+                    now_millis,
+                ),
                 OperatorCommand::CreditDeposit {
                     idempotency_key,
                     identity_commitment,
@@ -1842,6 +1898,12 @@ async fn dispatch_operator(
                     reward_token,
                     amount_atomic,
                     evidence_hash,
+                    source_id_hash,
+                    program_id,
+                    program_type,
+                    policy_id,
+                    policy_version,
+                    fee_policy_version,
                     now_millis,
                 } => core.accrue_private_reward(
                     idempotency_key,
@@ -1850,6 +1912,12 @@ async fn dispatch_operator(
                     reward_token,
                     amount_atomic,
                     evidence_hash,
+                    source_id_hash,
+                    program_id,
+                    program_type,
+                    policy_id,
+                    policy_version,
+                    fee_policy_version,
                     now_millis,
                 ),
                 OperatorCommand::FinalizeWithdrawal {
@@ -1970,6 +2038,7 @@ async fn dispatch_operator(
                 | OperatorCommand::MarketStatus { .. }
                 | OperatorCommand::ResolutionStatus { .. }
                 | OperatorCommand::ResolutionReadiness { .. }
+                | OperatorCommand::CustodyReconciliationSnapshot { .. }
                 | OperatorCommand::TransferAccountStatus { .. }
                 | OperatorCommand::TradingFreezeStatus
                 | OperatorCommand::AggregateDepth { .. }

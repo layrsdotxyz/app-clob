@@ -3,8 +3,8 @@ use clob_service::private_core::{
     signing_payload, AccountBucket, AccountKey, BookOrder, BoundaryEvidence, CommandResult,
     CompleteSetDirection, CoreError, EncryptedJournal, ExternalFlowDirection, FeeProfileId,
     JournalKey, Ledger, LedgerTransaction, MarketConfig, MarketExecution, OrderAction, OrderStatus,
-    Outcome, PolymarketResolutionStatement, PriceTimeBook, PrivateTradingCore, ReceiptSigner,
-    ResolutionOutcome, ResolutionStatement, SessionGuard, SessionRequest,
+    Outcome, PolymarketResolutionStatement, PostingSide, PriceTimeBook, PrivateTradingCore,
+    ReceiptSigner, ResolutionOutcome, ResolutionStatement, SessionGuard, SessionRequest,
     SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence, SignedSessionRequest,
     TimeInForce, Transfer, UserCommand, UserCommandAction,
 };
@@ -49,6 +49,13 @@ fn ledger_is_atomic_conservative_and_idempotent() {
     assert_eq!(ledger.balance(&hold), 400);
     assert_eq!(ledger.total_for_asset("ZEN"), total_before);
     assert_ne!(applied.prior_state_root, applied.state_root);
+    assert_eq!(applied.postings.len(), 2);
+    assert_eq!(applied.postings[0].account, user);
+    assert_eq!(applied.postings[0].side, PostingSide::Debit);
+    assert_eq!(applied.postings[0].amount, 400);
+    assert_eq!(applied.postings[1].account, hold);
+    assert_eq!(applied.postings[1].side, PostingSide::Credit);
+    assert_eq!(applied.postings[1].amount, 400);
 
     let duplicate = ledger.apply(LedgerTransaction {
         idempotency_key: "order:reserve:001".into(),
@@ -91,6 +98,206 @@ fn insufficient_transfer_does_not_partially_mutate_ledger() {
     assert_eq!(ledger.balance(&first), 0);
     assert_eq!(ledger.balance(&second), 0);
     assert_eq!(ledger.state_root(), root_before);
+}
+
+#[test]
+fn order_hold_postings_are_atomic_exact_and_race_safe() {
+    let user = AccountKey::new("usr_hold", AccountBucket::UserAvailable, "USDC");
+    let mut hold = AccountKey::new("usr_hold", AccountBucket::UserOrderHold, "USDC");
+    hold.market_id = Some("layrs:v5:BTC:USDC:15m:1".into());
+    hold.outcome = Some("UP".into());
+    let mut collateral = AccountKey::new("layrs", AccountBucket::MarketCollateral, "USDC");
+    collateral.market_id = hold.market_id.clone();
+
+    let mut ledger = Ledger::default();
+    ledger.seed_balance(user.clone(), 1_000).unwrap();
+    let reserve = ledger
+        .apply(LedgerTransaction {
+            idempotency_key: "order-hold:reserve:1".into(),
+            business_reference: "private-order:1".into(),
+            transfers: vec![Transfer {
+                from: user.clone(),
+                to: hold.clone(),
+                amount: 700,
+            }],
+        })
+        .unwrap();
+    assert_eq!(ledger.balance(&user), 300);
+    assert_eq!(ledger.balance(&hold), 700);
+    assert_balanced_postings(&reserve, 700);
+
+    let partial_fill = ledger
+        .apply(LedgerTransaction {
+            idempotency_key: "order-hold:partial-fill:1".into(),
+            business_reference: "private-fill:1".into(),
+            transfers: vec![Transfer {
+                from: hold.clone(),
+                to: collateral.clone(),
+                amount: 250,
+            }],
+        })
+        .unwrap();
+    assert_eq!(ledger.balance(&hold), 450);
+    assert_balanced_postings(&partial_fill, 250);
+
+    let release = ledger
+        .apply(LedgerTransaction {
+            idempotency_key: "order-hold:cancel:1".into(),
+            business_reference: "private-order:1".into(),
+            transfers: vec![Transfer {
+                from: hold.clone(),
+                to: user.clone(),
+                amount: 450,
+            }],
+        })
+        .unwrap();
+    assert_eq!(ledger.balance(&hold), 0);
+    assert_eq!(ledger.balance(&user), 750);
+    assert_eq!(ledger.balance(&collateral), 250);
+    assert_eq!(ledger.total_for_asset("USDC"), 1_000);
+    assert_balanced_postings(&release, 450);
+
+    // The command replay cannot reserve a second time, even after the order's
+    // remaining hold has been released.
+    let root = ledger.state_root();
+    assert_eq!(
+        ledger
+            .apply(LedgerTransaction {
+                idempotency_key: "order-hold:reserve:1".into(),
+                business_reference: "private-order:1".into(),
+                transfers: vec![Transfer {
+                    from: user.clone(),
+                    to: hold.clone(),
+                    amount: 700
+                }],
+            })
+            .unwrap_err(),
+        CoreError::DuplicateCommand
+    );
+    assert_eq!(ledger.state_root(), root);
+
+    // A one-atomic-unit remainder remains representable and releases exactly;
+    // no settlement-precision dust is rounded into or out of the hold bucket.
+    let dust_reserve = ledger
+        .apply(LedgerTransaction {
+            idempotency_key: "order-hold:dust-reserve".into(),
+            business_reference: "private-order:dust".into(),
+            transfers: vec![Transfer {
+                from: user.clone(),
+                to: hold.clone(),
+                amount: 1,
+            }],
+        })
+        .unwrap();
+    assert_balanced_postings(&dust_reserve, 1);
+    ledger
+        .apply(LedgerTransaction {
+            idempotency_key: "order-hold:dust-release".into(),
+            business_reference: "private-order:dust".into(),
+            transfers: vec![Transfer {
+                from: hold.clone(),
+                to: user.clone(),
+                amount: 1,
+            }],
+        })
+        .unwrap();
+    assert_eq!(ledger.balance(&hold), 0);
+
+    // Cancel and full-fill are mutually exclusive consumers of the same hold.
+    // Whichever serializable transition wins leaves the loser unable to debit
+    // the now-zero bucket, with no partial state mutation.
+    let mut race_base = Ledger::default();
+    race_base.seed_balance(user.clone(), 100).unwrap();
+    race_base
+        .apply(LedgerTransaction {
+            idempotency_key: "race:reserve".into(),
+            business_reference: "private-order:race".into(),
+            transfers: vec![Transfer {
+                from: user.clone(),
+                to: hold.clone(),
+                amount: 100,
+            }],
+        })
+        .unwrap();
+
+    let mut cancel_wins = race_base.clone();
+    cancel_wins
+        .apply(LedgerTransaction {
+            idempotency_key: "race:cancel".into(),
+            business_reference: "private-order:race".into(),
+            transfers: vec![Transfer {
+                from: hold.clone(),
+                to: user.clone(),
+                amount: 100,
+            }],
+        })
+        .unwrap();
+    let cancel_root = cancel_wins.state_root();
+    assert_eq!(
+        cancel_wins
+            .apply(LedgerTransaction {
+                idempotency_key: "race:fill".into(),
+                business_reference: "private-fill:race".into(),
+                transfers: vec![Transfer {
+                    from: hold.clone(),
+                    to: collateral.clone(),
+                    amount: 100
+                }],
+            })
+            .unwrap_err(),
+        CoreError::InsufficientBalance
+    );
+    assert_eq!(cancel_wins.state_root(), cancel_root);
+
+    let mut fill_wins = race_base;
+    fill_wins
+        .apply(LedgerTransaction {
+            idempotency_key: "race:fill".into(),
+            business_reference: "private-fill:race".into(),
+            transfers: vec![Transfer {
+                from: hold.clone(),
+                to: collateral,
+                amount: 100,
+            }],
+        })
+        .unwrap();
+    let fill_root = fill_wins.state_root();
+    assert_eq!(
+        fill_wins
+            .apply(LedgerTransaction {
+                idempotency_key: "race:cancel".into(),
+                business_reference: "private-order:race".into(),
+                transfers: vec![Transfer {
+                    from: hold,
+                    to: user,
+                    amount: 100
+                }],
+            })
+            .unwrap_err(),
+        CoreError::InsufficientBalance
+    );
+    assert_eq!(fill_wins.state_root(), fill_root);
+}
+
+fn assert_balanced_postings(
+    applied: &clob_service::private_core::AppliedLedgerTransaction,
+    amount: u128,
+) {
+    let debits: u128 = applied
+        .postings
+        .iter()
+        .filter(|posting| posting.side == PostingSide::Debit)
+        .map(|posting| posting.amount)
+        .sum();
+    let credits: u128 = applied
+        .postings
+        .iter()
+        .filter(|posting| posting.side == PostingSide::Credit)
+        .map(|posting| posting.amount)
+        .sum();
+    assert_eq!(debits, amount);
+    assert_eq!(credits, amount);
+    assert_eq!(applied.postings.len(), applied.transfers.len() * 2);
 }
 
 #[test]
@@ -554,6 +761,25 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
         .unwrap_err(),
         CoreError::TradingFrozen
     );
+    assert_eq!(
+        execute_signed_result(
+            &mut core,
+            &bob,
+            "session:2",
+            1,
+            "cmd:frozen-withdrawal",
+            UserCommandAction::RequestWithdrawal {
+                withdrawal_id: uuid::Uuid::from_u128(9001),
+                chain: "horizen".into(),
+                asset: "ZEN".into(),
+                amount_atomic: 1,
+                destination: "0x1111111111111111111111111111111111111111".into(),
+            },
+            960,
+        )
+        .unwrap_err(),
+        CoreError::TradingFrozen
+    );
     core.set_trading_freeze("sys:unfreeze:1".into(), false, [92u8; 32], 975)
         .unwrap();
     assert!(!core.trading_frozen());
@@ -924,6 +1150,8 @@ fn native_clob_partial_fill_locks_remainder_and_cancel_releases_once() {
     );
     assert_eq!(overdraw.unwrap_err(), CoreError::InsufficientBalance);
 
+    core.set_trading_freeze("sys:freeze:cancel-only".into(), true, [93u8; 32], 1_175)
+        .unwrap();
     execute_signed(
         &mut core,
         &alice,
@@ -936,6 +1164,8 @@ fn native_clob_partial_fill_locks_remainder_and_cancel_releases_once() {
         },
         1_200,
     );
+    core.set_trading_freeze("sys:unfreeze:cancel-only".into(), false, [94u8; 32], 1_225)
+        .unwrap();
     assert_eq!(core.balance(&alice_cash_hold), 0);
     assert_eq!(
         core.balance(&AccountKey::new(
@@ -970,6 +1200,231 @@ fn native_clob_partial_fill_locks_remainder_and_cancel_releases_once() {
             "ZEN"
         )),
         799_600_000_000_000_000
+    );
+
+    // Fill the seller's remaining UP claim completely. The second order
+    // proves that a prior partial fill plus a later full fill preserve the
+    // collateral account and book the exact buyer position, seller proceeds
+    // and taker fees.
+    execute_signed(
+        &mut core,
+        &bob,
+        "session:bob",
+        3,
+        "cmd:bob-final-ask",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Sell,
+                500_000,
+                600_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_300,
+    );
+    let full_buy_action = UserCommandAction::SubmitOrder {
+        order: BookOrder::new(
+            "ignored",
+            market_id,
+            Outcome::Up,
+            OrderAction::Buy,
+            500_000,
+            600_000,
+            TimeInForce::Gtc,
+            None,
+        ),
+    };
+    let full_fill = execute_signed_response(
+        &mut core,
+        &alice,
+        "session:alice",
+        5,
+        "cmd:alice-full-buy",
+        full_buy_action.clone(),
+        1_350,
+    );
+    assert!(matches!(
+        full_fill.result,
+        CommandResult::Order { ref result }
+            if result.fills.len() == 1
+                && result.accepted_order.as_ref().is_some_and(|order|
+                    order.status == OrderStatus::Filled
+                        && order.remaining_micros == 0
+                        && order.filled_micros == 600_000)
+    ));
+
+    let mut collateral = AccountKey::new("layrs", AccountBucket::MarketCollateral, "ZEN");
+    collateral.market_id = Some(market_id.into());
+    assert_eq!(core.balance(&collateral), 1_000_000_000_000_000_000);
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &alice_owner,
+            AccountBucket::UserAvailable,
+            "ZEN"
+        )),
+        499_000_000_000_000_000
+    );
+    assert_eq!(core.balance(&alice_cash_hold), 0);
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &bob_owner,
+            AccountBucket::UserAvailable,
+            "ZEN"
+        )),
+        500_000_000_000_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new("layrs", AccountBucket::FeeRevenue, "ZEN")),
+        1_000_000_000_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::position(
+            &alice_owner,
+            format!("CLAIM:{market_id}:UP"),
+            market_id,
+            "UP"
+        )),
+        1_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::position(
+            &bob_owner,
+            format!("CLAIM:{market_id}:UP"),
+            market_id,
+            "UP"
+        )),
+        0
+    );
+
+    // Exercise the opposite fee direction: the resting BUY maker funds the
+    // gross notional from its hold, while the incoming SELL taker receives
+    // net proceeds and the fee is split to protocol revenue atomically.
+    execute_signed(
+        &mut core,
+        &bob,
+        "session:bob",
+        4,
+        "cmd:bob-resting-bid",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                500_000,
+                200_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_400,
+    );
+    let sell_taker_action = UserCommandAction::SubmitOrder {
+        order: BookOrder::new(
+            "ignored",
+            market_id,
+            Outcome::Up,
+            OrderAction::Sell,
+            500_000,
+            200_000,
+            TimeInForce::Gtc,
+            None,
+        ),
+    };
+    let sell_taker_fill = execute_signed_response(
+        &mut core,
+        &alice,
+        "session:alice",
+        6,
+        "cmd:alice-sell-taker",
+        sell_taker_action.clone(),
+        1_450,
+    );
+    assert!(matches!(
+        sell_taker_fill.result,
+        CommandResult::Order { ref result }
+            if result.fills.len() == 1
+                && result.accepted_order.as_ref().is_some_and(|order|
+                    order.status == OrderStatus::Filled
+                        && order.remaining_micros == 0
+                        && order.filled_micros == 200_000)
+    ));
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &alice_owner,
+            AccountBucket::UserAvailable,
+            "ZEN"
+        )),
+        598_800_000_000_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &bob_owner,
+            AccountBucket::UserAvailable,
+            "ZEN"
+        )),
+        400_000_000_000_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new("layrs", AccountBucket::FeeRevenue, "ZEN")),
+        1_200_000_000_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::position(
+            &alice_owner,
+            format!("CLAIM:{market_id}:UP"),
+            market_id,
+            "UP"
+        )),
+        800_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::position(
+            &bob_owner,
+            format!("CLAIM:{market_id}:UP"),
+            market_id,
+            "UP"
+        )),
+        200_000
+    );
+    assert_eq!(core.balance(&collateral), 1_000_000_000_000_000_000);
+
+    // A committed response may be lost between the enclave and API. Snapshot
+    // recovery keeps only the processed request hash, so the same signed
+    // command must be reported as previously processed without applying the
+    // fill, fee or position transfer a second time.
+    let snapshot = core.export_encrypted_snapshot().unwrap();
+    let snapshot_sequence = snapshot.sequence;
+    let mut restored = PrivateTradingCore::restore_encrypted_snapshot(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([67u8; 48]),
+        &snapshot,
+        snapshot_sequence,
+    )
+    .unwrap();
+    let restored_root = restored.state_root();
+    let lost_response_retry = execute_signed_result(
+        &mut restored,
+        &alice,
+        "session:alice",
+        6,
+        "cmd:alice-sell-taker",
+        sell_taker_action,
+        1_450,
+    );
+    assert_eq!(
+        lost_response_retry.unwrap_err(),
+        CoreError::PreviouslyProcessed
+    );
+    assert_eq!(restored.state_root(), restored_root);
+    assert_eq!(restored.balance(&collateral), 1_000_000_000_000_000_000);
+    assert_eq!(
+        restored.balance(&AccountKey::new("layrs", AccountBucket::FeeRevenue, "ZEN")),
+        1_200_000_000_000_000
     );
 }
 
@@ -2021,6 +2476,9 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
     assert_eq!(response.receipt.protocol_version, "layrs.v2");
     assert_eq!(response.receipt.publication_eligible, Some(true));
     assert!(response.encrypted_record.is_some());
+    let public_receipt = serde_json::to_string(&response.receipt).unwrap();
+    assert!(!public_receipt.contains("0x1111111111111111111111111111111111111111"));
+    assert!(!public_receipt.contains(&hex::encode(identity_commitment)));
     let authorization = response.withdrawal_authorization.unwrap();
     assert_eq!(authorization.intent.receipt_id, response.receipt.receipt_id);
     assert_eq!(
@@ -2107,6 +2565,90 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
             "USDC"
         )),
         0
+    );
+
+    let release_snapshot = core.export_encrypted_snapshot().unwrap();
+    let mut release_restored = PrivateTradingCore::restore_encrypted_snapshot(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([32u8; 48]),
+        &release_snapshot,
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        release_restored
+            .release_user_withdrawal(
+                "sys:withdrawal-release:35:retry".into(),
+                identity_commitment,
+                "USDC".into(),
+                10_000_000,
+                [36u8; 32],
+                1_410,
+            )
+            .unwrap_err(),
+        clob_service::private_core::CoreError::DuplicateCommand
+    );
+
+    execute_signed_response(
+        &mut core,
+        &user,
+        "session:withdrawal",
+        3,
+        "cmd:withdrawal-confirmed",
+        UserCommandAction::RequestWithdrawal {
+            withdrawal_id: uuid::Uuid::from_u128(36),
+            chain: "base".into(),
+            asset: "USDC".into(),
+            amount_atomic: 10_000_000,
+            destination: "0x2222222222222222222222222222222222222222".into(),
+        },
+        1_500,
+    );
+    core.apply_user_external_flow(
+        "withdrawal-final:36".into(),
+        identity_commitment,
+        "USDC".into(),
+        AccountBucket::UserWithdrawalHold,
+        10_000_000,
+        ExternalFlowDirection::Outflow,
+        [38u8; 32],
+        1_600,
+    )
+    .unwrap();
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &private_user,
+            AccountBucket::UserWithdrawalHold,
+            "USDC"
+        )),
+        0
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new("layrs", AccountBucket::PoolCash, "USDC")),
+        40_000_000
+    );
+    let confirmed_snapshot = core.export_encrypted_snapshot().unwrap();
+    let mut confirmed_restored = PrivateTradingCore::restore_encrypted_snapshot(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([32u8; 48]),
+        &confirmed_snapshot,
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        confirmed_restored
+            .apply_user_external_flow(
+                "withdrawal-final:36:retry".into(),
+                identity_commitment,
+                "USDC".into(),
+                AccountBucket::UserWithdrawalHold,
+                10_000_000,
+                ExternalFlowDirection::Outflow,
+                [38u8; 32],
+                1_610,
+            )
+            .unwrap_err(),
+        clob_service::private_core::CoreError::DuplicateCommand
     );
 }
 
@@ -2531,6 +3073,12 @@ fn private_rewards_accrue_cumulatively_and_authorize_only_the_bound_account() {
         reward_token.into(),
         100,
         [45u8; 32],
+        [55u8; 32],
+        "trader-reward-v1".into(),
+        "TRADER_REWARD".into(),
+        "layrs-fee-v2".into(),
+        1,
+        "LAYRS_FEE_V2".into(),
         1_100,
     )
     .unwrap();
@@ -2541,6 +3089,12 @@ fn private_rewards_accrue_cumulatively_and_authorize_only_the_bound_account() {
         reward_token.into(),
         25,
         [46u8; 32],
+        [56u8; 32],
+        "trader-reward-v1".into(),
+        "TRADER_REWARD".into(),
+        "layrs-fee-v2".into(),
+        1,
+        "LAYRS_FEE_V2".into(),
         1_200,
     )
     .unwrap();
@@ -2615,6 +3169,44 @@ fn private_rewards_accrue_cumulatively_and_authorize_only_the_bound_account() {
         snapshot.sequence,
     )
     .unwrap();
+    // A scheduler may lose the first response after the enclave committed it.
+    // Retrying under a new transport idempotency key must not double-accrue,
+    // and an altered payload under the same evidence must fail closed.
+    restored
+        .accrue_private_reward(
+            "sys:reward:lost-response-retry".into(),
+            identity_commitment,
+            "base".into(),
+            reward_token.into(),
+            100,
+            [45u8; 32],
+            [55u8; 32],
+            "trader-reward-v1".into(),
+            "TRADER_REWARD".into(),
+            "layrs-fee-v2".into(),
+            1,
+            "LAYRS_FEE_V2".into(),
+            1_550,
+        )
+        .unwrap();
+    assert!(matches!(
+        restored.accrue_private_reward(
+            "sys:reward:conflicting-retry".into(),
+            identity_commitment,
+            "base".into(),
+            reward_token.into(),
+            101,
+            [45u8; 32],
+            [55u8; 32],
+            "trader-reward-v1".into(),
+            "TRADER_REWARD".into(),
+            "layrs-fee-v2".into(),
+            1,
+            "LAYRS_FEE_V2".into(),
+            1_560,
+        ),
+        Err(CoreError::InvalidOrder(message)) if message.contains("immutable accrual")
+    ));
     match execute_signed(
         &mut restored,
         &user,

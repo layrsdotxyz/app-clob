@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -14,11 +15,12 @@ use super::rewards::{
 };
 use super::{
     AccountBucket, AccountKey, BookOrder, ClaimPayout, CompleteSetDirection,
-    CompleteSetTransaction, CoreError, CoreResult, EnclaveReceipt, EncryptedJournal,
-    EncryptedJournalRecord, EncryptedSnapshot, ExternalFlowDirection, ExternalFlowTransaction,
-    Fill, JournalKey, Ledger, LedgerTransaction, MatchResult, MatchType, OrderAction, OrderStatus,
-    Outcome, PriceTimeBook, ReceiptSigner, SessionGuard, SignedSessionRequest, Transfer,
-    PRICE_SCALE,
+    CompleteSetFillPosting, CompleteSetTransaction, CoreError, CoreResult, CustodyLedgerTotal,
+    EnclaveReceipt, EncryptedJournal, EncryptedJournalRecord, EncryptedSnapshot,
+    ExternalFlowDirection, ExternalFlowTransaction, Fill, JournalKey, Ledger, LedgerTransaction,
+    MatchResult, MatchType, NormalFillPosting, OrderAction, OrderStatus, Outcome, PriceTimeBook,
+    ReceiptSigner, ResolutionPayoutKind, SessionGuard, SignedSessionRequest, Transfer,
+    VaultStrategyTransaction, VaultStrategyTransition, PRICE_SCALE,
 };
 
 /// Public depth is deliberately less precise than the enclave's private book.
@@ -114,6 +116,25 @@ pub enum FeeProfileId {
 impl FeeProfileId {
     fn is_legacy(&self) -> bool {
         matches!(self, Self::LegacyProfitV1)
+    }
+
+    /// Canonical immutable policy family persisted with each private fill.
+    /// The legacy `POLYMARKET_*` enum aliases execute the same governed Layrs
+    /// curve and are deliberately normalized so new evidence never revives the
+    /// obsolete provider-facing policy name.
+    fn fee_policy_version(self) -> &'static str {
+        if self.has_layrs_curve_fees() {
+            "LAYRS_FEE_V2"
+        } else {
+            "LAYRS_FEE_V1"
+        }
+    }
+
+    fn immutable_profile_id(self) -> String {
+        serde_json::to_string(&self)
+            .expect("fee profile enum serialization cannot fail")
+            .trim_matches('"')
+            .replace("POLYMARKET_", "LAYRS_")
     }
 
     fn parameters(self) -> Option<FeeProfileParameters> {
@@ -521,6 +542,20 @@ pub struct PortfolioSnapshot {
     pub as_of_millis: i64,
 }
 
+/// Aggregate-only custody view returned over the authenticated enclave
+/// operator channel. It binds every amount to the exact private state root and
+/// sequence without exposing owners, positions, markets or orders.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustodyReconciliationSnapshot {
+    pub checkpoint_commitment: [u8; 32],
+    pub chain_finality_commitments: Vec<[u8; 32]>,
+    pub enclave_sequence: u64,
+    pub state_root: [u8; 32],
+    pub totals: Vec<CustodyLedgerTotal>,
+    pub receipt_public_key: [u8; 32],
+    pub signature: Vec<u8>,
+}
+
 /// Privacy-safe aggregate preflight for a market settlement. It deliberately
 /// excludes owners, orders, balances and position mappings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -789,6 +824,18 @@ enum JournaledSystemCommand {
         idempotency_key: String,
         flow: ExternalFlowTransaction,
     },
+    ConfirmedDeposit {
+        idempotency_key: String,
+        flow: ExternalFlowTransaction,
+    },
+    ConfirmedWithdrawal {
+        idempotency_key: String,
+        flow: ExternalFlowTransaction,
+    },
+    VaultStrategyTransition {
+        idempotency_key: String,
+        transaction: VaultStrategyTransaction,
+    },
     AccrueReward {
         idempotency_key: String,
         identity_commitment: [u8; 32],
@@ -797,6 +844,12 @@ enum JournaledSystemCommand {
         #[serde(with = "super::decimal_u128")]
         amount_atomic: u128,
         evidence_hash: [u8; 32],
+        source_id_hash: [u8; 32],
+        program_id: String,
+        program_type: String,
+        policy_id: String,
+        policy_version: u32,
+        fee_policy_version: String,
     },
     ReleaseWithdrawal {
         idempotency_key: String,
@@ -872,6 +925,7 @@ pub struct PrivateTradingCore {
     trading_frozen: bool,
     sequence: u64,
     identity_key: [u8; 32],
+    custody_totals_cache: RefCell<Option<(u64, [u8; 32], Vec<CustodyLedgerTotal>)>>,
 }
 
 impl PrivateTradingCore {
@@ -894,6 +948,7 @@ impl PrivateTradingCore {
             trading_frozen: false,
             sequence: 0,
             identity_key,
+            custody_totals_cache: RefCell::new(None),
         }
     }
 
@@ -1241,6 +1296,7 @@ impl PrivateTradingCore {
             trading_frozen: state.trading_frozen,
             sequence: state.sequence,
             identity_key,
+            custody_totals_cache: RefCell::new(None),
         })
     }
 
@@ -1260,6 +1316,45 @@ impl PrivateTradingCore {
             self.trading_frozen,
             self.sequence,
         )
+    }
+
+    pub fn custody_reconciliation_snapshot(
+        &self,
+        checkpoint_commitment: [u8; 32],
+        chain_finality_commitments: Vec<[u8; 32]>,
+    ) -> CoreResult<CustodyReconciliationSnapshot> {
+        if checkpoint_commitment == [0; 32]
+            || chain_finality_commitments.len() != 2
+            || chain_finality_commitments.contains(&[0; 32])
+            || chain_finality_commitments[0] == chain_finality_commitments[1]
+        {
+            return Err(CoreError::InvalidOrder(
+                "custody snapshot requires one checkpoint and two distinct finality commitments"
+                    .into(),
+            ));
+        }
+        let state_root = self.state_root();
+        let totals = self
+            .custody_totals_cache
+            .borrow()
+            .as_ref()
+            .filter(|(sequence, root, _)| *sequence == self.sequence && *root == state_root)
+            .map(|(_, _, totals)| totals.clone())
+            .unwrap_or(self.ledger.custody_reconciliation_totals()?);
+        *self.custody_totals_cache.borrow_mut() = Some((self.sequence, state_root, totals.clone()));
+        let mut snapshot = CustodyReconciliationSnapshot {
+            checkpoint_commitment,
+            chain_finality_commitments,
+            enclave_sequence: self.sequence,
+            state_root,
+            totals,
+            receipt_public_key: self.receipt_signer.verifying_key(),
+            signature: Vec::new(),
+        };
+        snapshot.signature = self
+            .receipt_signer
+            .sign_domain_payload(b"layrs.custody-reconciliation-snapshot.v1\0", &snapshot);
+        Ok(snapshot)
     }
 
     pub fn trading_frozen(&self) -> bool {
@@ -1521,6 +1616,101 @@ impl PrivateTradingCore {
         evidence_hash: [u8; 32],
         now_millis: i64,
     ) -> CoreResult<SystemResponse> {
+        if matches!(
+            account.bucket,
+            AccountBucket::UserAvailable
+                | AccountBucket::UserWithdrawalHold
+                | AccountBucket::VaultCash
+                | AccountBucket::VaultStrategyInTransit
+                | AccountBucket::VaultStrategyReceivable
+        ) {
+            return Err(CoreError::InvalidOrder(
+                "custody flows require their dedicated balanced command".into(),
+            ));
+        }
+        self.apply_external_flow_internal(
+            idempotency_key,
+            account,
+            amount,
+            direction,
+            evidence_hash,
+            now_millis,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_vault_strategy_transition(
+        &mut self,
+        idempotency_key: String,
+        evidence_hash: [u8; 32],
+        vault_commitment: [u8; 32],
+        strategy_commitment: [u8; 32],
+        operation_commitment: [u8; 32],
+        asset: String,
+        amount: u128,
+        transition: VaultStrategyTransition,
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        let prior_root = self.state_root();
+        let transaction = VaultStrategyTransaction {
+            idempotency_key: format!("vault-strategy:{idempotency_key}"),
+            evidence_hash,
+            vault_commitment,
+            strategy_commitment,
+            operation_commitment,
+            asset,
+            amount,
+            transition,
+        };
+        let mut ledger = self.ledger.clone();
+        ledger.apply_vault_strategy_transition(transaction.clone())?;
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::VaultStrategyTransition {
+            idempotency_key: idempotency_key.clone(),
+            transaction,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.ledger = ledger;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            "vault-strategy-transition",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_external_flow_internal(
+        &mut self,
+        idempotency_key: String,
+        account: AccountKey,
+        amount: u128,
+        direction: ExternalFlowDirection,
+        evidence_hash: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
         self.validate_new_system_key(&idempotency_key)?;
         let prior_root = self.state_root();
         let flow = ExternalFlowTransaction {
@@ -1568,6 +1758,118 @@ impl PrivateTradingCore {
         ))
     }
 
+    fn apply_confirmed_deposit(
+        &mut self,
+        idempotency_key: String,
+        account: AccountKey,
+        amount: u128,
+        evidence_hash: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        let prior_root = self.state_root();
+        let flow = ExternalFlowTransaction {
+            idempotency_key: format!("deposit:{idempotency_key}"),
+            evidence_hash,
+            account,
+            amount,
+            direction: ExternalFlowDirection::Inflow,
+        };
+        let mut ledger = self.ledger.clone();
+        ledger.apply_confirmed_deposit(flow.clone())?;
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::ConfirmedDeposit {
+            idempotency_key: idempotency_key.clone(),
+            flow,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.ledger = ledger;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            "confirmed-deposit",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
+    }
+
+    fn apply_confirmed_withdrawal(
+        &mut self,
+        idempotency_key: String,
+        account: AccountKey,
+        amount: u128,
+        evidence_hash: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        let prior_root = self.state_root();
+        let flow = ExternalFlowTransaction {
+            idempotency_key: format!("withdrawal:{idempotency_key}"),
+            evidence_hash,
+            account,
+            amount,
+            direction: ExternalFlowDirection::Outflow,
+        };
+        let mut ledger = self.ledger.clone();
+        ledger.apply_confirmed_withdrawal(flow.clone())?;
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::ConfirmedWithdrawal {
+            idempotency_key: idempotency_key.clone(),
+            flow,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.ledger = ledger;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        // Keep the existing receipt command ID stable because the backend's
+        // deterministic archive lookup uses this public protocol identifier.
+        Ok(self.system_response(
+            "external-flow",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn apply_user_external_flow(
         &mut self,
@@ -1589,14 +1891,28 @@ impl PrivateTradingCore {
             ));
         }
         let owner = derive_private_user_id(&self.identity_key, &identity_commitment);
-        self.apply_external_flow(
-            idempotency_key,
-            AccountKey::new(owner, bucket, asset),
-            amount,
-            direction,
-            evidence_hash,
-            now_millis,
-        )
+        let account = AccountKey::new(owner, bucket.clone(), asset);
+        match (bucket, direction) {
+            (AccountBucket::UserAvailable, ExternalFlowDirection::Inflow) => self
+                .apply_confirmed_deposit(
+                    idempotency_key,
+                    account,
+                    amount,
+                    evidence_hash,
+                    now_millis,
+                ),
+            (AccountBucket::UserWithdrawalHold, ExternalFlowDirection::Outflow) => self
+                .apply_confirmed_withdrawal(
+                    idempotency_key,
+                    account,
+                    amount,
+                    evidence_hash,
+                    now_millis,
+                ),
+            _ => Err(CoreError::InvalidOrder(
+                "invalid external user-flow direction".into(),
+            )),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1608,6 +1924,12 @@ impl PrivateTradingCore {
         reward_token: String,
         amount_atomic: u128,
         evidence_hash: [u8; 32],
+        source_id_hash: [u8; 32],
+        program_id: String,
+        program_type: String,
+        policy_id: String,
+        policy_version: u32,
+        fee_policy_version: String,
         now_millis: i64,
     ) -> CoreResult<SystemResponse> {
         self.validate_new_system_key(&idempotency_key)?;
@@ -1619,7 +1941,19 @@ impl PrivateTradingCore {
         let owner = derive_private_user_id(&self.identity_key, &identity_commitment);
         let prior_root = self.state_root();
         let mut private_rewards = self.private_rewards.clone();
-        private_rewards.accrue(&owner, &chain, &reward_token, amount_atomic)?;
+        private_rewards.accrue(
+            &owner,
+            &chain,
+            &reward_token,
+            amount_atomic,
+            evidence_hash,
+            source_id_hash,
+            &program_id,
+            &program_type,
+            &policy_id,
+            policy_version,
+            &fee_policy_version,
+        )?;
         let mut keys = self.system_keys.clone();
         keys.insert(idempotency_key.clone());
         let next_sequence = checked_sequence(self.sequence)?;
@@ -1645,6 +1979,12 @@ impl PrivateTradingCore {
             reward_token,
             amount_atomic,
             evidence_hash,
+            source_id_hash,
+            program_id,
+            program_type,
+            policy_id,
+            policy_version,
+            fee_policy_version,
         };
         let record = self.journal.append(next_root, &entry)?;
         self.private_rewards = private_rewards;
@@ -1678,15 +2018,13 @@ impl PrivateTradingCore {
         let owner = derive_private_user_id(&self.identity_key, &identity_commitment);
         let prior_root = self.state_root();
         let mut ledger = self.ledger.clone();
-        ledger.apply(LedgerTransaction {
-            idempotency_key: format!("withdrawal-release:{idempotency_key}"),
-            business_reference: hex::encode(evidence_hash),
-            transfers: vec![Transfer {
-                from: AccountKey::new(&owner, AccountBucket::UserWithdrawalHold, &asset),
-                to: AccountKey::new(owner, AccountBucket::UserAvailable, &asset),
-                amount: amount_atomic,
-            }],
-        })?;
+        ledger.release_withdrawal(
+            format!("withdrawal-release:{idempotency_key}"),
+            evidence_hash,
+            AccountKey::new(&owner, AccountBucket::UserWithdrawalHold, &asset),
+            AccountKey::new(owner, AccountBucket::UserAvailable, &asset),
+            amount_atomic,
+        )?;
         let mut keys = self.system_keys.clone();
         keys.insert(idempotency_key.clone());
         let next_sequence = checked_sequence(self.sequence)?;
@@ -1936,6 +2274,12 @@ impl PrivateTradingCore {
             ));
         }
         let outcome = resolution.outcome;
+        let payout_evidence_hash = resolution_payout_evidence_hash(&resolution)?;
+        let payout_kind = match outcome {
+            ResolutionOutcome::Up => ResolutionPayoutKind::Up,
+            ResolutionOutcome::Down => ResolutionPayoutKind::Down,
+            ResolutionOutcome::Push => ResolutionPayoutKind::Push,
+        };
 
         let prior_root = self.state_root();
         let mut ledger = self.ledger.clone();
@@ -2024,6 +2368,8 @@ impl PrivateTradingCore {
             ledger.apply_claim_payouts(
                 format!("resolution-payout:{idempotency_key}"),
                 market.market_id.clone(),
+                payout_evidence_hash,
+                payout_kind,
                 collateral.clone(),
                 AccountKey::new("layrs", AccountBucket::FeeRevenue, &market.settlement_asset),
                 payouts,
@@ -2625,10 +2971,14 @@ impl PrivateTradingCore {
         };
         let (reward_chain, reward_token) = reward_rail(market)?;
         private_rewards.record_fill(
+            &execution_id.to_string(),
             &execution.private_user_id,
             None,
             reward_chain,
             reward_token,
+            market.fee_profile_id.fee_policy_version(),
+            &market.fee_profile_id.immutable_profile_id(),
+            "NORMAL",
             quantity,
             taker_fee,
             0,
@@ -2802,7 +3152,9 @@ impl PrivateTradingCore {
         if self.trading_frozen
             && matches!(
                 &command.action,
-                UserCommandAction::SubmitOrder { .. } | UserCommandAction::CompleteSet { .. }
+                UserCommandAction::SubmitOrder { .. }
+                    | UserCommandAction::CompleteSet { .. }
+                    | UserCommandAction::RequestWithdrawal { .. }
             )
         {
             return Err(CoreError::TradingFrozen);
@@ -2857,7 +3209,7 @@ impl PrivateTradingCore {
                                 // Preserve the exact legacy transition (including one ledger
                                 // sequence increment) so old NORMAL-only journal replay remains
                                 // byte-for-byte stable after the complete-set feature ships.
-                                let transfers = settlement_transfers(
+                                let (transfers, fill_postings) = settlement_transfers(
                                     &self.books,
                                     &books,
                                     market,
@@ -2873,11 +3225,17 @@ impl PrivateTradingCore {
                                     &match_result,
                                     &mut position_cost_basis,
                                 )?;
-                                ledger.apply(LedgerTransaction {
+                                let transaction = LedgerTransaction {
                                     idempotency_key: format!("order:{}", command.idempotency_key),
                                     business_reference: command.command_id.clone(),
                                     transfers,
-                                })?;
+                                };
+                                if fill_postings.is_empty() {
+                                    ledger.apply(transaction)?;
+                                } else {
+                                    ledger
+                                        .apply_normal_fill_settlement(transaction, fill_postings)?;
+                                }
                             } else {
                                 apply_complete_set_match_settlement(
                                     &mut ledger,
@@ -3472,6 +3830,20 @@ fn system_command_commitment(command: &JournaledSystemCommand) -> CoreResult<[u8
     Ok(hash.finalize().into())
 }
 
+/// Stable replay identity for the financial payout caused by signed resolution evidence.
+/// This is deliberately independent of the operator-supplied command idempotency key: if the
+/// enclave committed the payout but its response was lost, a redispatch with a new key cannot
+/// debit market collateral a second time.
+fn resolution_payout_evidence_hash(resolution: &MarketResolution) -> CoreResult<[u8; 32]> {
+    let encoded = serde_json::to_vec(resolution)
+        .map_err(|_| CoreError::InvalidResolution("cannot encode payout evidence".into()))?;
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.resolution-payout.v1\0");
+    hash.update((encoded.len() as u64).to_be_bytes());
+    hash.update(encoded);
+    Ok(hash.finalize().into())
+}
+
 fn registration_evidence(
     identity_commitment: [u8; 32],
     public_key: [u8; 32],
@@ -3513,8 +3885,9 @@ fn settlement_transfers(
     market: &MarketConfig,
     incoming: &BookOrder,
     result: &MatchResult,
-) -> CoreResult<Vec<Transfer>> {
+) -> CoreResult<(Vec<Transfer>, Vec<NormalFillPosting>)> {
     let mut transfers = Vec::new();
+    let mut fill_postings = Vec::new();
     let incoming_cash_hold = cash_hold(incoming, &market.settlement_asset);
     let incoming_claim_hold = claim_hold(incoming);
     let initial_notional_micros = notional(incoming.price_micros, incoming.quantity_micros)?;
@@ -3573,26 +3946,42 @@ fn settlement_transfers(
         } else {
             fill_notional
         };
-        transfers.push(Transfer {
-            from: buyer_hold.clone(),
-            to: available(&seller.private_user_id, &market.settlement_asset),
-            amount: seller_proceeds,
-        });
+        let seller_available = available(&seller.private_user_id, &market.settlement_asset);
+        let buyer_position = claim_position_for(
+            &buyer.private_user_id,
+            &incoming.market_id,
+            incoming.outcome,
+        );
+        let fee_account = fee_revenue(&market.settlement_asset);
+        if seller_proceeds > 0 {
+            transfers.push(Transfer {
+                from: buyer_hold.clone(),
+                to: seller_available.clone(),
+                amount: seller_proceeds,
+            });
+        }
         if taker_fee > 0 {
             transfers.push(Transfer {
-                from: buyer_hold,
-                to: AccountKey::new("layrs", AccountBucket::FeeRevenue, &market.settlement_asset),
+                from: buyer_hold.clone(),
+                to: fee_account.clone(),
                 amount: taker_fee,
             });
         }
         transfers.push(Transfer {
-            from: seller_hold,
-            to: claim_position_for(
-                &buyer.private_user_id,
-                &incoming.market_id,
-                incoming.outcome,
-            ),
+            from: seller_hold.clone(),
+            to: buyer_position.clone(),
             amount: fill.quantity_micros,
+        });
+        fill_postings.push(NormalFillPosting {
+            fill_id: fill.fill_id.to_string(),
+            buyer_cash_hold: buyer_hold,
+            seller_available,
+            seller_claim_hold: seller_hold,
+            buyer_position,
+            fee_revenue: fee_account,
+            seller_proceeds_atomic: seller_proceeds,
+            fee_atomic: taker_fee,
+            quantity_micros: fill.quantity_micros,
         });
         if incoming.action == OrderAction::Buy {
             incoming_cash_used = incoming_cash_used
@@ -3651,7 +4040,7 @@ fn settlement_transfers(
             }
         }
     }
-    Ok(transfers)
+    Ok((transfers, fill_postings))
 }
 
 /// Settles a match result containing at least one complete-set fill. The engine
@@ -3733,11 +4122,20 @@ fn apply_complete_set_match_settlement(
                 let taker_fee =
                     taker_fee_atomic(market, fill.quantity_micros, fill.taker_price_micros())?;
                 let mut transfers = Vec::with_capacity(3);
+                let normal_posting;
                 match incoming.action {
                     OrderAction::Buy => {
+                        let seller_available =
+                            available(&maker.private_user_id, &market.settlement_asset);
+                        let seller_claim_hold = claim_hold(&maker);
+                        let buyer_position = claim_position_for(
+                            &incoming.private_user_id,
+                            &incoming.market_id,
+                            incoming.outcome,
+                        );
                         transfers.push(Transfer {
                             from: incoming_cash_hold.clone(),
-                            to: available(&maker.private_user_id, &market.settlement_asset),
+                            to: seller_available.clone(),
                             amount: fill_notional,
                         });
                         if taker_fee > 0 {
@@ -3748,14 +4146,21 @@ fn apply_complete_set_match_settlement(
                             });
                         }
                         transfers.push(Transfer {
-                            from: claim_hold(&maker),
-                            to: claim_position_for(
-                                &incoming.private_user_id,
-                                &incoming.market_id,
-                                incoming.outcome,
-                            ),
+                            from: seller_claim_hold.clone(),
+                            to: buyer_position.clone(),
                             amount: fill.quantity_micros,
                         });
+                        normal_posting = NormalFillPosting {
+                            fill_id: fill.fill_id.to_string(),
+                            buyer_cash_hold: incoming_cash_hold.clone(),
+                            seller_available,
+                            seller_claim_hold,
+                            buyer_position,
+                            fee_revenue: fee_revenue(&market.settlement_asset),
+                            seller_proceeds_atomic: fill_notional,
+                            fee_atomic: taker_fee,
+                            quantity_micros: fill.quantity_micros,
+                        };
                         incoming_cash_used = incoming_cash_used
                             .checked_add(fill_notional)
                             .and_then(|value| value.checked_add(taker_fee))
@@ -3765,42 +4170,60 @@ fn apply_complete_set_match_settlement(
                         let seller_proceeds = fill_notional
                             .checked_sub(taker_fee)
                             .ok_or(CoreError::UnbalancedTransaction)?;
+                        let buyer_cash_hold = cash_hold(&maker, &market.settlement_asset);
+                        let seller_available =
+                            available(&incoming.private_user_id, &market.settlement_asset);
+                        let buyer_position = claim_position_for(
+                            &maker.private_user_id,
+                            &incoming.market_id,
+                            incoming.outcome,
+                        );
                         if seller_proceeds > 0 {
                             transfers.push(Transfer {
-                                from: cash_hold(&maker, &market.settlement_asset),
-                                to: available(&incoming.private_user_id, &market.settlement_asset),
+                                from: buyer_cash_hold.clone(),
+                                to: seller_available.clone(),
                                 amount: seller_proceeds,
                             });
                         }
                         if taker_fee > 0 {
                             transfers.push(Transfer {
-                                from: cash_hold(&maker, &market.settlement_asset),
+                                from: buyer_cash_hold.clone(),
                                 to: fee_revenue(&market.settlement_asset),
                                 amount: taker_fee,
                             });
                         }
                         transfers.push(Transfer {
                             from: incoming_claim_hold.clone(),
-                            to: claim_position_for(
-                                &maker.private_user_id,
-                                &incoming.market_id,
-                                incoming.outcome,
-                            ),
+                            to: buyer_position.clone(),
                             amount: fill.quantity_micros,
                         });
+                        normal_posting = NormalFillPosting {
+                            fill_id: fill.fill_id.to_string(),
+                            buyer_cash_hold,
+                            seller_available,
+                            seller_claim_hold: incoming_claim_hold.clone(),
+                            buyer_position,
+                            fee_revenue: fee_revenue(&market.settlement_asset),
+                            seller_proceeds_atomic: seller_proceeds,
+                            fee_atomic: taker_fee,
+                            quantity_micros: fill.quantity_micros,
+                        };
                         incoming_claim_used = incoming_claim_used
                             .checked_add(fill.quantity_micros)
                             .ok_or(CoreError::UnbalancedTransaction)?;
                     }
                 }
-                ledger.apply(LedgerTransaction {
-                    idempotency_key: format!(
-                        "order:{command_idempotency_key}:normal:{}",
-                        fill.sequence
-                    ),
-                    business_reference: business_reference.into(),
-                    transfers,
-                })?;
+                ledger.apply_normal_fill_settlement(
+                    LedgerTransaction {
+                        idempotency_key: format!(
+                            "order:{command_idempotency_key}:normal:{}",
+                            fill.sequence
+                        ),
+                        business_reference: business_reference.into(),
+                        transfers,
+                    },
+                    vec![normal_posting],
+                )?;
             }
             MatchType::Mint => {
                 if incoming.action != OrderAction::Buy
@@ -3812,65 +4235,36 @@ fn apply_complete_set_match_settlement(
                     ));
                 }
                 let amounts = complete_set_fill_amounts(market, fill)?;
-                let mut funding = vec![
-                    Transfer {
-                        from: cash_hold(&maker, &market.settlement_asset),
-                        to: available(&maker.private_user_id, &market.settlement_asset),
-                        amount: amounts.maker_atomic,
-                    },
-                    Transfer {
-                        from: incoming_cash_hold.clone(),
-                        to: available(&maker.private_user_id, &market.settlement_asset),
-                        amount: amounts.taker_atomic,
-                    },
-                ];
-                if amounts.taker_fee_atomic > 0 {
-                    funding.push(Transfer {
-                        from: incoming_cash_hold.clone(),
-                        to: fee_revenue(&market.settlement_asset),
-                        amount: amounts.taker_fee_atomic,
-                    });
-                }
-                ledger.apply(LedgerTransaction {
-                    idempotency_key: format!(
-                        "order:{command_idempotency_key}:mint-fund:{}",
-                        fill.sequence
-                    ),
-                    business_reference: business_reference.into(),
-                    transfers: funding,
-                })?;
-                ledger.apply_complete_set(CompleteSetTransaction {
-                    idempotency_key: format!(
-                        "order:{command_idempotency_key}:mint-set:{}",
-                        fill.sequence
-                    ),
-                    owner: maker.private_user_id.clone(),
-                    market_id: incoming.market_id.clone(),
-                    settlement_asset: market.settlement_asset.clone(),
-                    quantity_micros: fill.quantity_micros,
-                    collateral_amount_atomic: amounts.collateral_atomic,
-                    direction: CompleteSetDirection::Mint,
-                })?;
-                ledger.apply(LedgerTransaction {
-                    idempotency_key: format!(
-                        "order:{command_idempotency_key}:mint-claim:{}",
-                        fill.sequence
-                    ),
-                    business_reference: business_reference.into(),
-                    transfers: vec![Transfer {
-                        from: claim_position_for(
+                ledger.apply_complete_set_fill(
+                    format!("order:{command_idempotency_key}:mint:{}", fill.sequence),
+                    business_reference.into(),
+                    CompleteSetFillPosting {
+                        fill_id: fill.fill_id.to_string(),
+                        direction: CompleteSetDirection::Mint,
+                        maker_hold: cash_hold(&maker, &market.settlement_asset),
+                        taker_hold: incoming_cash_hold.clone(),
+                        maker_destination: claim_position_for(
                             &maker.private_user_id,
                             &incoming.market_id,
-                            incoming.outcome,
+                            maker.outcome,
                         ),
-                        to: claim_position_for(
+                        taker_destination: claim_position_for(
                             &incoming.private_user_id,
                             &incoming.market_id,
                             incoming.outcome,
                         ),
-                        amount: fill.quantity_micros,
-                    }],
-                })?;
+                        market_collateral: market_collateral(
+                            &incoming.market_id,
+                            &market.settlement_asset,
+                        ),
+                        fee_revenue: fee_revenue(&market.settlement_asset),
+                        quantity_micros: fill.quantity_micros,
+                        collateral_amount_atomic: amounts.collateral_atomic,
+                        maker_amount_atomic: amounts.maker_atomic,
+                        taker_amount_atomic: amounts.taker_atomic,
+                        taker_fee_atomic: amounts.taker_fee_atomic,
+                    },
+                )?;
                 add_basis(
                     cost_basis,
                     position_key(&maker.private_user_id, &incoming.market_id, maker.outcome),
@@ -3900,11 +4294,6 @@ fn apply_complete_set_match_settlement(
                     ));
                 }
                 let amounts = complete_set_fill_amounts(market, fill)?;
-                let taker_proceeds = amounts
-                    .taker_atomic
-                    .checked_sub(amounts.taker_fee_atomic)
-                    .ok_or(CoreError::UnbalancedTransaction)?;
-
                 reduce_basis_for_held_quantity(
                     ledger,
                     cost_basis,
@@ -3928,71 +4317,34 @@ fn apply_complete_set_match_settlement(
                     fill.quantity_micros,
                 )?;
 
-                ledger.apply(LedgerTransaction {
-                    idempotency_key: format!(
-                        "order:{command_idempotency_key}:merge-claims:{}",
-                        fill.sequence
-                    ),
-                    business_reference: business_reference.into(),
-                    transfers: vec![
-                        Transfer {
-                            from: claim_hold(&maker),
-                            to: claim_position_for(
-                                &maker.private_user_id,
-                                &incoming.market_id,
-                                maker.outcome,
-                            ),
-                            amount: fill.quantity_micros,
-                        },
-                        Transfer {
-                            from: incoming_claim_hold.clone(),
-                            to: claim_position_for(
-                                &maker.private_user_id,
-                                &incoming.market_id,
-                                incoming.outcome,
-                            ),
-                            amount: fill.quantity_micros,
-                        },
-                    ],
-                })?;
-                ledger.apply_complete_set(CompleteSetTransaction {
-                    idempotency_key: format!(
-                        "order:{command_idempotency_key}:merge-set:{}",
-                        fill.sequence
-                    ),
-                    owner: maker.private_user_id.clone(),
-                    market_id: incoming.market_id.clone(),
-                    settlement_asset: market.settlement_asset.clone(),
-                    quantity_micros: fill.quantity_micros,
-                    collateral_amount_atomic: amounts.collateral_atomic,
-                    direction: CompleteSetDirection::Burn,
-                })?;
-                let mut payout = Vec::with_capacity(2);
-                if taker_proceeds > 0 {
-                    payout.push(Transfer {
-                        from: available(&maker.private_user_id, &market.settlement_asset),
-                        to: available(&incoming.private_user_id, &market.settlement_asset),
-                        amount: taker_proceeds,
-                    });
-                }
-                if amounts.taker_fee_atomic > 0 {
-                    payout.push(Transfer {
-                        from: available(&maker.private_user_id, &market.settlement_asset),
-                        to: fee_revenue(&market.settlement_asset),
-                        amount: amounts.taker_fee_atomic,
-                    });
-                }
-                if payout.is_empty() {
-                    return Err(CoreError::ZeroAmount);
-                }
-                ledger.apply(LedgerTransaction {
-                    idempotency_key: format!(
-                        "order:{command_idempotency_key}:merge-payout:{}",
-                        fill.sequence
-                    ),
-                    business_reference: business_reference.into(),
-                    transfers: payout,
-                })?;
+                ledger.apply_complete_set_fill(
+                    format!("order:{command_idempotency_key}:merge:{}", fill.sequence),
+                    business_reference.into(),
+                    CompleteSetFillPosting {
+                        fill_id: fill.fill_id.to_string(),
+                        direction: CompleteSetDirection::Burn,
+                        maker_hold: claim_hold(&maker),
+                        taker_hold: incoming_claim_hold.clone(),
+                        maker_destination: available(
+                            &maker.private_user_id,
+                            &market.settlement_asset,
+                        ),
+                        taker_destination: available(
+                            &incoming.private_user_id,
+                            &market.settlement_asset,
+                        ),
+                        market_collateral: market_collateral(
+                            &incoming.market_id,
+                            &market.settlement_asset,
+                        ),
+                        fee_revenue: fee_revenue(&market.settlement_asset),
+                        quantity_micros: fill.quantity_micros,
+                        collateral_amount_atomic: amounts.collateral_atomic,
+                        maker_amount_atomic: amounts.maker_atomic,
+                        taker_amount_atomic: amounts.taker_atomic,
+                        taker_fee_atomic: amounts.taker_fee_atomic,
+                    },
+                )?;
                 incoming_claim_used = incoming_claim_used
                     .checked_add(fill.quantity_micros)
                     .ok_or(CoreError::UnbalancedTransaction)?;
@@ -4770,14 +5122,23 @@ fn record_native_fill_economics(
     occurred_at_millis: i64,
 ) -> CoreResult<()> {
     let (chain, reward_token) = reward_rail(market)?;
+    let fee_profile_id = market.fee_profile_id.immutable_profile_id();
     for fill in &result.fills {
         let taker_fee = taker_fee_atomic(market, fill.quantity_micros, fill.taker_price_micros())?;
         let maker_rebate = floor_bps(taker_fee, maker_rebate_bps(market.fee_profile_id))?;
         rewards.record_fill(
+            &fill.fill_id.to_string(),
             &fill.taker_private_user_id,
             Some(&fill.maker_private_user_id),
             chain,
             reward_token,
+            market.fee_profile_id.fee_policy_version(),
+            &fee_profile_id,
+            match fill.match_type {
+                MatchType::Normal => "NORMAL",
+                MatchType::Mint => "MINT",
+                MatchType::Merge => "MERGE",
+            },
             fill.quantity_micros,
             taker_fee,
             maker_rebate,

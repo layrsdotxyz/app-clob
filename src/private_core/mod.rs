@@ -42,8 +42,8 @@ pub use engine::{
     resolution_signing_payload, AuditFillStatement, BinanceBoundaryEvidence,
     BinanceResolutionStatement, BootstrapExecutionState, BootstrapExecutionView,
     BootstrapVenueIntent, BoundaryEvidence, CommandResult, CoreResponse,
-    ExactConditionResolutionStatement, FeeProfileId, MarketConfig, MarketExecution,
-    MarketResolution, MarketSettlementReadiness, PolymarketRedemptionIntent,
+    CustodyReconciliationSnapshot, ExactConditionResolutionStatement, FeeProfileId, MarketConfig,
+    MarketExecution, MarketResolution, MarketSettlementReadiness, PolymarketRedemptionIntent,
     PolymarketResolutionStatement, PortfolioSnapshot, PrivateBalance, PrivatePosition,
     PrivateTradingCore, ResolutionEvidence, ResolutionOutcome, ResolutionStatement,
     SignedAuditFillArtifact, SignedBinanceResolution, SignedExactConditionResolution,
@@ -55,9 +55,12 @@ pub use journal::{
     EnclaveReceipt, EncryptedJournal, EncryptedJournalRecord, EncryptedSnapshot, JournalKey,
     ReceiptSigner,
 };
+#[allow(unused_imports)]
 pub use ledger::{
-    AccountBucket, AccountKey, ClaimPayout, CompleteSetDirection, CompleteSetTransaction,
-    ExternalFlowDirection, ExternalFlowTransaction, Ledger, LedgerTransaction, Transfer,
+    AccountBucket, AccountKey, AppliedLedgerTransaction, ClaimPayout, CompleteSetDirection,
+    CompleteSetFillPosting, CompleteSetTransaction, CustodyLedgerTotal, ExternalFlowDirection,
+    ExternalFlowTransaction, Ledger, LedgerPosting, LedgerTransaction, NormalFillPosting,
+    PostingSide, ResolutionPayoutKind, Transfer, VaultStrategyTransaction, VaultStrategyTransition,
 };
 #[allow(unused_imports)]
 pub use orderbook::{
