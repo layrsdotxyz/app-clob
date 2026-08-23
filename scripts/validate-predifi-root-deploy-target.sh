@@ -18,7 +18,10 @@ done
 for required in \
   arn:aws:iam::082223548516:role/layrs-production-deployer \
   082223548516.dkr.ecr.us-east-1.amazonaws.com/layrs-production-zk-proof-worker \
-  arn:aws:sts::082223548516:assumed-role/layrs-production-deployer/
+  arn:aws:sts::082223548516:assumed-role/layrs-production-deployer/ \
+  layrs-production-zk-image-builder \
+  layrs-production-082223548516-us-east-1-build-source \
+  'aws codebuild start-build'
 do
   grep -Fq "$required" "$ci_file" "$deploy_file" || {
     echo "PREDIFI_ROOT_DEPLOY_TARGET_MISSING:$required" >&2

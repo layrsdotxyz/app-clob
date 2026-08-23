@@ -79,6 +79,8 @@ deploy-zk-proof-worker:
   variables:
     LAYRSV2_AWS_ROLE_ARN: arn:aws:iam::082223548516:role/layrs-production-deployer
     LAYRSV2_ZK_PROOF_ECR_REPOSITORY_URI: 082223548516.dkr.ecr.us-east-1.amazonaws.com/layrs-production-zk-proof-worker
+    LAYRSV2_ZK_BUILD_PROJECT: layrs-production-zk-image-builder
+    LAYRSV2_BUILD_SOURCE_BUCKET: layrs-production-082223548516-us-east-1-build-source
     LAYRSV2_PRIMARY_REGION: us-east-1
     LAYRSV2_ENVIRONMENT: production
   script:
