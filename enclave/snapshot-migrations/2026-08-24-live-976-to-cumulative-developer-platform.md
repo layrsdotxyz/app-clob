@@ -65,6 +65,10 @@ Perform the following offline against the candidate:
 7. save only hashes, qualified totals and signed equality evidence outside the
    enclave. Never export private account-level plaintext.
 
+The attested runner report must bind `sourceReleaseCommit` to exact 976 and
+`checkpointSha256` to the checkpoint file supplied to the wrapper; otherwise
+the wrapper rejects the report even if every equality boolean is true.
+
 Any failed restore or equality check is a hard stop. Do not canonicalize,
 rewrite or manually edit the production snapshot to make the candidate load.
 The privacy-safe wrapper for the attested runner is

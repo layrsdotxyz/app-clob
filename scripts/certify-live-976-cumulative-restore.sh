@@ -62,6 +62,7 @@ jq -e --arg release "$expected_release" '
 
 snapshot_sha="$(sha256sum "$snapshot" | awk '{print $1}')"
 journal_sha="$(sha256sum "$journal" | awk '{print $1}')"
+checkpoint_sha="$(sha256sum "$checkpoint" | awk '{print $1}')"
 [[ "$snapshot_sha" == "$(jq -r .snapshotSha256 "$checkpoint")" ]] || {
   echo "Encrypted snapshot checksum mismatch." >&2
   exit 1
@@ -79,7 +80,9 @@ trap 'rm -f "$report"' EXIT
   --checkpoint "$checkpoint" \
   --report "$report"
 
-jq -e '
+jq -e --arg release "$expected_release" --arg checkpoint "$checkpoint_sha" '
+  .sourceReleaseCommit == $release and
+  .checkpointSha256 == $checkpoint and
   .sourceCheckpointEqual == true and
   .sequenceEqual == true and
   .journalHeadEqual == true and
