@@ -5,8 +5,9 @@ export AWS_CLI_AUTO_PROMPT=off
 
 aws_region=${LAYRSV2_PRIMARY_REGION:-us-east-1}
 environment=${LAYRSV2_ENVIRONMENT:-production}
-repository_uri=${LAYRSV2_ZK_PROOF_ECR_REPOSITORY_URI:-255638996474.dkr.ecr.us-east-1.amazonaws.com/layrsv2-production-zk-proof-worker}
+repository_uri=${LAYRSV2_ZK_PROOF_ECR_REPOSITORY_URI:-082223548516.dkr.ecr.us-east-1.amazonaws.com/layrs-production-zk-proof-worker}
 release_sha=${CI_COMMIT_SHA:-$(git rev-parse HEAD)}
+expected_role_arn=arn:aws:iam::082223548516:role/layrs-production-deployer
 
 [[ "$environment" == production ]] || { echo 'only production is wired' >&2; exit 65; }
 [[ "$release_sha" =~ ^[0-9a-f]{40}$ ]] || { echo 'release SHA must be a git commit' >&2; exit 65; }
@@ -14,6 +15,10 @@ command -v aws >/dev/null || { echo 'aws CLI is required' >&2; exit 69; }
 command -v docker >/dev/null || { echo 'docker CLI is required' >&2; exit 69; }
 
 if [[ -n "${LAYRSV2_AWS_ROLE_ARN:-}" ]]; then
+  [[ "$LAYRSV2_AWS_ROLE_ARN" == "$expected_role_arn" ]] || {
+    echo "predifi-root Layrs deploy role required; got $LAYRSV2_AWS_ROLE_ARN" >&2
+    exit 77
+  }
   credentials=$(aws sts assume-role \
     --region "$aws_region" \
     --role-arn "$LAYRSV2_AWS_ROLE_ARN" \
@@ -27,8 +32,8 @@ fi
 
 caller_arn=$(aws sts get-caller-identity --query Arn --output text)
 echo "CALLER $caller_arn"
-[[ "$caller_arn" != *':root' && "$caller_arn" == *':assumed-role/layrsv2-'* ]] || {
-  echo "least-privilege layrsv2 assumed role required; got $caller_arn" >&2
+[[ "$caller_arn" == arn:aws:sts::082223548516:assumed-role/layrs-production-deployer/* ]] || {
+  echo "exact predifi-root Layrs deploy role required; got $caller_arn" >&2
   exit 77
 }
 

@@ -29,6 +29,7 @@ clob-fast:
   stage: fast
   timeout: 90m
   script:
+    - scripts/validate-predifi-root-deploy-target.sh
     - scripts/run-enclave-snapshot-ci-guard.sh
     - cargo fmt --check
     - cargo check --all-targets --locked
@@ -76,7 +77,8 @@ deploy-zk-proof-worker:
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
   variables:
-    LAYRSV2_AWS_ROLE_ARN: arn:aws:iam::255638996474:role/layrsv2-production-deployer
+    LAYRSV2_AWS_ROLE_ARN: arn:aws:iam::082223548516:role/layrs-production-deployer
+    LAYRSV2_ZK_PROOF_ECR_REPOSITORY_URI: 082223548516.dkr.ecr.us-east-1.amazonaws.com/layrs-production-zk-proof-worker
     LAYRSV2_PRIMARY_REGION: us-east-1
     LAYRSV2_ENVIRONMENT: production
   script:
