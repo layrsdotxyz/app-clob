@@ -190,6 +190,47 @@ impl EncryptedJournal {
         serde_json::from_slice(&plaintext).map_err(|_| CoreError::JournalCrypto)
     }
 
+    /// Decrypts only the record already committed as this journal's current
+    /// chain head. This supports recovery from a sealed snapshot, where older
+    /// in-memory records are intentionally absent, without accepting an
+    /// unanchored record or extending the chain.
+    pub fn decrypt_current_head<T: for<'de> Deserialize<'de>>(
+        &self,
+        record: &EncryptedJournalRecord,
+        expected_state_root: [u8; 32],
+    ) -> CoreResult<T> {
+        if record.sequence != self.sequence
+            || record.record_hash != self.head
+            || record.state_root != expected_state_root
+            || record.record_hash
+                != hash_record(
+                    record.sequence,
+                    &record.nonce,
+                    &record.prior_record_hash,
+                    &record.state_root,
+                    &record.ciphertext,
+                )
+        {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        let aad = associated_data(
+            record.sequence,
+            &record.prior_record_hash,
+            &record.state_root,
+        );
+        let plaintext = self
+            .cipher
+            .decrypt(
+                Nonce::from_slice(&record.nonce),
+                Payload {
+                    msg: &record.ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| CoreError::JournalCrypto)?;
+        serde_json::from_slice(&plaintext).map_err(|_| CoreError::JournalCrypto)
+    }
+
     pub fn records(&self) -> &[EncryptedJournalRecord] {
         &self.records
     }

@@ -2811,6 +2811,141 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
 }
 
 #[test]
+fn committed_withdrawal_authorization_recovers_exactly_after_restart_and_expiry() {
+    let user = SigningKey::from_bytes(&[121u8; 32]);
+    let receipt_signer = ReceiptSigner::generate([122u8; 48]);
+    let journal_key = [123u8; 32];
+    let identity_commitment = [124u8; 32];
+    let private_user = derived_private_user(journal_key, identity_commitment);
+    let session_id = "session:withdrawal-restart";
+    let withdrawal_id = uuid::Uuid::from_u128(125);
+    let mut core =
+        PrivateTradingCore::new(JournalKey::from_bytes(journal_key), receipt_signer.clone());
+    core.register_session(
+        "sys:session:withdrawal-restart".into(),
+        session_id.into(),
+        identity_commitment,
+        user.verifying_key().to_bytes(),
+        4_000,
+        1_000,
+    )
+    .unwrap();
+    core.apply_user_external_flow(
+        "sys:deposit:withdrawal-restart".into(),
+        identity_commitment,
+        "USDC".into(),
+        AccountBucket::UserAvailable,
+        25_000_000,
+        ExternalFlowDirection::Inflow,
+        [126u8; 32],
+        1_100,
+    )
+    .unwrap();
+
+    let mut committed = execute_signed_response(
+        &mut core,
+        &user,
+        session_id,
+        1,
+        "cmd:withdrawal-restart",
+        UserCommandAction::RequestWithdrawal {
+            withdrawal_id,
+            chain: "base".into(),
+            asset: "USDC".into(),
+            amount_atomic: 13_799_435,
+            destination: "0x1111111111111111111111111111111111111111".into(),
+        },
+        1_200,
+    );
+    let sequence = core.sequence();
+    let state_root = core.state_root();
+    let terminal_record = committed.encrypted_record.clone().unwrap();
+    let snapshot = core.export_encrypted_snapshot().unwrap();
+
+    let restored = PrivateTradingCore::restore_encrypted_snapshot(
+        JournalKey::from_bytes(journal_key),
+        receipt_signer,
+        &snapshot,
+        sequence,
+    )
+    .unwrap();
+    // Recovery is deliberately independent of the current clock/session and
+    // authorization expiry because it returns only the already-signed result.
+    let recovered = restored
+        .recover_withdrawal_authorization(withdrawal_id, session_id)
+        .unwrap()
+        .unwrap();
+    // Journal ciphertext is already durably archived outside the enclave and
+    // is intentionally not duplicated in the bounded snapshot capsule.
+    committed.encrypted_record = None;
+    assert_eq!(recovered, committed);
+    assert_eq!(restored.sequence(), sequence);
+    assert_eq!(restored.state_root(), state_root);
+    assert_eq!(
+        restored.balance(&AccountKey::new(
+            &private_user,
+            AccountBucket::UserAvailable,
+            "USDC"
+        )),
+        11_200_565
+    );
+    assert_eq!(
+        restored.balance(&AccountKey::new(
+            &private_user,
+            AccountBucket::UserWithdrawalHold,
+            "USDC"
+        )),
+        13_799_435
+    );
+    assert!(restored
+        .recover_withdrawal_authorization(withdrawal_id, "session:wrong-owner")
+        .unwrap()
+        .is_none());
+    assert!(restored
+        .recover_withdrawal_authorization(uuid::Uuid::from_u128(999), session_id)
+        .unwrap()
+        .is_none());
+
+    let journal_recovery = restored
+        .recover_terminal_withdrawal_authorization(
+            &terminal_record,
+            withdrawal_id,
+            session_id,
+            1_000_000,
+        )
+        .unwrap();
+    let journal_authorization = journal_recovery.withdrawal_authorization.unwrap();
+    assert_eq!(
+        journal_authorization.intent.protocol_version,
+        "layrs.withdrawal-recovery.v1"
+    );
+    let proof = journal_authorization.intent.recovery_proof.unwrap();
+    assert_eq!(
+        proof.original_idempotency_key,
+        "idem:cmd:withdrawal-restart"
+    );
+    assert_eq!(proof.terminal_enclave_sequence, sequence);
+    assert_eq!(proof.terminal_state_root, state_root);
+    assert_eq!(proof.terminal_journal_head, terminal_record.record_hash);
+    assert_eq!(restored.sequence(), sequence);
+    assert_eq!(restored.state_root(), state_root);
+
+    let mut tampered_record = terminal_record.clone();
+    tampered_record.ciphertext[0] ^= 1;
+    assert_eq!(
+        restored
+            .recover_terminal_withdrawal_authorization(
+                &tampered_record,
+                withdrawal_id,
+                session_id,
+                1_000_000,
+            )
+            .unwrap_err(),
+        CoreError::JournalChainMismatch
+    );
+}
+
+#[test]
 fn registration_receipt_is_publication_eligible_private_and_identity_unique() {
     let receipt_signer = ReceiptSigner::generate([71u8; 48]);
     let receipt_public_key = receipt_signer.verifying_key();

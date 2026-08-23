@@ -673,6 +673,19 @@ pub struct WithdrawalIntent {
     pub enclave_sequence: u64,
     pub state_root: [u8; 32],
     pub expires_at_millis: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_proof: Option<WithdrawalRecoveryProof>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WithdrawalRecoveryProof {
+    pub protocol_version: String,
+    pub original_idempotency_key: String,
+    pub terminal_enclave_sequence: u64,
+    pub terminal_state_root: [u8; 32],
+    pub terminal_journal_head: [u8; 32],
+    pub terminal_record_hash: [u8; 32],
+    pub recovered_at_millis: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -946,6 +959,11 @@ struct RecoveryCapsule {
     receipt_state: CommandReceiptState,
     #[serde(default)]
     receipt_disclosure_nonce: [u8; 32],
+    /// The exact signed withdrawal authorization returned by the committed
+    /// command. Keeping it inside the encrypted snapshot lets an exact replay
+    /// survive an enclave restart without minting a replacement withdrawal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    withdrawal_authorization: Option<WithdrawalAuthorization>,
     audit_fills: Vec<SignedAuditFillArtifact>,
     task_qualifications: Vec<SignedTaskQualificationArtifact>,
 }
@@ -958,7 +976,7 @@ impl RecoveryCapsule {
             receipt_state: self.receipt_state,
             receipt_disclosure_nonce: self.receipt_disclosure_nonce,
             encrypted_record: None,
-            withdrawal_authorization: None,
+            withdrawal_authorization: self.withdrawal_authorization.clone(),
             reward_claim_authorization: None,
             audit_fills: self.audit_fills.clone(),
             task_qualifications: self.task_qualifications.clone(),
@@ -1695,6 +1713,200 @@ impl PrivateTradingCore {
             .clone()
             .map(Some)
             .ok_or(CoreError::PreviouslyProcessed)
+    }
+
+    /// Returns the exact cached response for a committed withdrawal, bound to
+    /// both its public identifier and originating private session. This is a
+    /// read-only operator recovery primitive: it never releases a hold, creates
+    /// a replacement command, or advances the enclave sequence/state root.
+    pub fn recover_withdrawal_authorization(
+        &self,
+        withdrawal_id: Uuid,
+        session_id: &str,
+    ) -> CoreResult<Option<CoreResponse>> {
+        if session_id.is_empty() {
+            return Err(CoreError::InvalidOrder(
+                "withdrawal recovery requires a session".into(),
+            ));
+        }
+        let mut match_found = None;
+        for processed in self.processed.values() {
+            let Some(response) = &processed.response else {
+                continue;
+            };
+            let CommandResult::WithdrawalReserved {
+                withdrawal_id: candidate_id,
+                chain,
+                asset,
+                amount_atomic,
+                destination,
+            } = &response.result
+            else {
+                continue;
+            };
+            if *candidate_id != withdrawal_id {
+                continue;
+            }
+            let authorization = response
+                .withdrawal_authorization
+                .as_ref()
+                .ok_or(CoreError::InvalidRecoveryCapsule)?;
+            if authorization.intent.session_id != session_id {
+                continue;
+            }
+            if authorization.intent.withdrawal_id != withdrawal_id
+                || authorization.intent.chain != *chain
+                || authorization.intent.asset != *asset
+                || authorization.intent.amount_atomic != amount_atomic.to_string()
+                || authorization.intent.destination != *destination
+                || authorization.intent.receipt_id != response.receipt.receipt_id
+                || authorization.intent.enclave_sequence != response.receipt.enclave_sequence
+                || authorization.intent.state_root != response.receipt.state_root
+            {
+                return Err(CoreError::InvalidRecoveryCapsule);
+            }
+            if match_found.replace(response.clone()).is_some() {
+                return Err(CoreError::InvalidRecoveryCapsule);
+            }
+        }
+        Ok(match_found)
+    }
+
+    /// Reissues a short-lived authorization for the exact withdrawal already
+    /// committed by the terminal encrypted journal record. This is a read-only
+    /// recovery: every command/result/marker/hold binding is verified and no
+    /// ledger, sequence, root, journal, or processed-command state is changed.
+    pub fn recover_terminal_withdrawal_authorization(
+        &self,
+        terminal_record: &EncryptedJournalRecord,
+        withdrawal_id: Uuid,
+        session_id: &str,
+        now_millis: i64,
+    ) -> CoreResult<CoreResponse> {
+        let entry: JournaledUserCommand = self
+            .journal
+            .decrypt_current_head(terminal_record, self.state_root())?;
+        let UserCommandAction::RequestWithdrawal {
+            withdrawal_id: command_withdrawal_id,
+            chain,
+            asset,
+            amount_atomic,
+            destination,
+        } = &entry.command.action
+        else {
+            return Err(CoreError::InvalidRecoveryCapsule);
+        };
+        let CommandResult::WithdrawalReserved {
+            withdrawal_id: result_withdrawal_id,
+            chain: result_chain,
+            asset: result_asset,
+            amount_atomic: result_amount,
+            destination: result_destination,
+        } = &entry.result
+        else {
+            return Err(CoreError::InvalidRecoveryCapsule);
+        };
+        if *command_withdrawal_id != withdrawal_id
+            || *result_withdrawal_id != withdrawal_id
+            || entry.command.session.request.session_id != session_id
+            || chain != result_chain
+            || asset != result_asset
+            || amount_atomic != result_amount
+            || destination != result_destination
+        {
+            return Err(CoreError::InvalidRecoveryCapsule);
+        }
+        let expected_hash = command_request_hash(
+            &entry.command.command_id,
+            &entry.command.idempotency_key,
+            &entry.command.action,
+        )?;
+        if entry.command.session.request.request_hash != expected_hash
+            || self
+                .processed
+                .get(&entry.command.idempotency_key)
+                .map(|processed| processed.request_hash)
+                != Some(expected_hash)
+            || !self.system_keys.contains(&processed_command_marker(
+                &entry.command.idempotency_key,
+                full_user_command_commitment(&entry.command)?,
+            ))
+            || !self.system_keys.contains(&withdrawal_reservation_marker(
+                session_id,
+                withdrawal_id,
+                chain,
+                asset,
+                &amount_atomic.to_string(),
+                destination,
+            )?)
+        {
+            return Err(CoreError::InvalidRecoveryCapsule);
+        }
+        let owner = self
+            .sessions
+            .registered_owner(session_id)
+            .ok_or(CoreError::UnknownSession)?;
+        if self.ledger.balance(&AccountKey::new(
+            owner,
+            AccountBucket::UserWithdrawalHold,
+            asset,
+        )) < *amount_atomic
+        {
+            return Err(CoreError::InvalidRecoveryCapsule);
+        }
+        let root = self.state_root();
+        let recovery_receipt = self.receipt_signer.sign(
+            format!("recover-withdrawal:{withdrawal_id}"),
+            format!("recovery:{}", entry.command.idempotency_key),
+            Some(expected_hash),
+            Some(false),
+            None,
+            None,
+            self.sequence,
+            root,
+            root,
+            terminal_record.record_hash,
+            now_millis,
+        );
+        let intent = WithdrawalIntent {
+            protocol_version: "layrs.withdrawal-recovery.v1".into(),
+            withdrawal_id,
+            session_id: session_id.to_owned(),
+            chain: chain.clone(),
+            asset: asset.clone(),
+            amount_atomic: amount_atomic.to_string(),
+            destination: destination.clone(),
+            receipt_id: recovery_receipt.receipt_id.clone(),
+            enclave_sequence: self.sequence,
+            state_root: root,
+            expires_at_millis: now_millis.saturating_add(15 * 60_000),
+            recovery_proof: Some(WithdrawalRecoveryProof {
+                protocol_version: "layrs.withdrawal-terminal-journal-proof.v1".into(),
+                original_idempotency_key: entry.command.idempotency_key,
+                terminal_enclave_sequence: terminal_record.sequence,
+                terminal_state_root: terminal_record.state_root,
+                terminal_journal_head: terminal_record.record_hash,
+                terminal_record_hash: terminal_record.record_hash,
+                recovered_at_millis: now_millis,
+            }),
+        };
+        let authorization = WithdrawalAuthorization {
+            signature: self
+                .receipt_signer
+                .sign_domain_payload(b"layrs.withdrawal-recovery-authorization.v1\0", &intent),
+            intent,
+        };
+        Ok(CoreResponse {
+            result: entry.result,
+            receipt: recovery_receipt,
+            receipt_state: CommandReceiptState::Accepted,
+            receipt_disclosure_nonce: [0; 32],
+            encrypted_record: None,
+            withdrawal_authorization: Some(authorization),
+            reward_claim_authorization: None,
+            audit_fills: Vec::new(),
+            task_qualifications: Vec::new(),
+        })
     }
 
     /// Attaches the chain signer output to the exact cached reward-claim
@@ -3873,7 +4085,10 @@ impl PrivateTradingCore {
         {
             return Err(CoreError::TradingFrozen);
         }
-        if matches!(command.action, UserCommandAction::SubmitOrder { .. }) {
+        if matches!(
+            command.action,
+            UserCommandAction::SubmitOrder { .. } | UserCommandAction::RequestWithdrawal { .. }
+        ) {
             reserve_recovery_capacity(&self.recovery_capsules)?;
         }
 
@@ -4732,10 +4947,12 @@ impl PrivateTradingCore {
             &command.idempotency_key,
             full_user_command_commitment(&command)?,
         ));
-        let recovery_result_digest =
-            matches!(command.action, UserCommandAction::SubmitOrder { .. })
-                .then(|| private_recovery_result_digest(&self.identity_key, &result))
-                .transpose()?;
+        let recovery_result_digest = matches!(
+            command.action,
+            UserCommandAction::SubmitOrder { .. } | UserCommandAction::RequestWithdrawal { .. }
+        )
+        .then(|| private_recovery_result_digest(&self.identity_key, &result))
+        .transpose()?;
         if let Some(result_digest) = recovery_result_digest {
             system_keys.insert(recovery_result_marker(
                 &command.idempotency_key,
@@ -4828,6 +5045,7 @@ impl PrivateTradingCore {
                     enclave_sequence: next_sequence,
                     state_root: next_root,
                     expires_at_millis: now_millis.saturating_add(15 * 60_000),
+                    recovery_proof: None,
                 };
                 Some(WithdrawalAuthorization {
                     signature: self
@@ -4865,7 +5083,10 @@ impl PrivateTradingCore {
             task_qualifications,
         };
         let mut recovery_capsules = self.recovery_capsules.clone();
-        if matches!(command.action, UserCommandAction::SubmitOrder { .. }) {
+        if matches!(
+            command.action,
+            UserCommandAction::SubmitOrder { .. } | UserCommandAction::RequestWithdrawal { .. }
+        ) {
             insert_recovery_capsule(
                 &mut recovery_capsules,
                 command.idempotency_key.clone(),
@@ -4878,6 +5099,7 @@ impl PrivateTradingCore {
                     receipt: response.receipt.clone(),
                     receipt_state: response.receipt_state,
                     receipt_disclosure_nonce: response.receipt_disclosure_nonce,
+                    withdrawal_authorization: response.withdrawal_authorization.clone(),
                     audit_fills: response.audit_fills.clone(),
                     task_qualifications: response.task_qualifications.clone(),
                 },

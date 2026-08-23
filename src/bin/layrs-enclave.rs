@@ -242,6 +242,13 @@ struct OperatorEnvelope {
 // acknowledge the decode-only enum size here.
 #[allow(clippy::large_enum_variant)]
 enum OperatorCommand {
+    RecoverWithdrawalAuthorization {
+        withdrawal_id: uuid::Uuid,
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_record: Option<EncryptedJournalRecord>,
+        now_millis: i64,
+    },
     PreparedCommandStatus {
         preparation_id: [u8; 32],
         enclave_sequence: u64,
@@ -2780,6 +2787,33 @@ async fn dispatch_operator(
     }
 
     match envelope.command {
+        OperatorCommand::RecoverWithdrawalAuthorization {
+            withdrawal_id,
+            session_id,
+            terminal_record,
+            now_millis,
+        } => {
+            let core = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?;
+            let response = if let Some(record) = terminal_record {
+                core.recover_terminal_withdrawal_authorization(
+                    &record,
+                    withdrawal_id,
+                    &session_id,
+                    now_millis,
+                )
+                .map_err(|error| error.to_string())?
+            } else {
+                core.recover_withdrawal_authorization(withdrawal_id, &session_id)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "WITHDRAWAL_RECOVERY_NOT_FOUND".to_string())?
+            };
+            Ok(PlainResponse::User {
+                response: Box::new(response),
+            })
+        }
         OperatorCommand::PreparedCommandStatus {
             preparation_id,
             enclave_sequence,
@@ -4135,6 +4169,7 @@ async fn dispatch_operator(
                         .map_err(|error| error.to_string());
                 }
                 OperatorCommand::BeginProvision { .. }
+                | OperatorCommand::RecoverWithdrawalAuthorization { .. }
                 | OperatorCommand::PreparedCommandStatus { .. }
                 | OperatorCommand::FinalizePreparedCommand { .. }
                 | OperatorCommand::CompleteProvision { .. }
