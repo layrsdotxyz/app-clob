@@ -22,6 +22,7 @@ path = "src/bin/layrs-enclave-parent.rs"
 
 [features]
 test-helpers = []
+standalone-enclave-runtime = []
 
 [dependencies]
 # Async runtime

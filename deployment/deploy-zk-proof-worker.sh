@@ -52,7 +52,10 @@ if [[ "$image_digest" == sha256:* ]]; then
   echo "DOCKER_IMAGE_REUSE $tagged_image $image_digest"
 else
   echo "DOCKER_BUILD $tagged_image"
-  docker build --pull --file Dockerfile.zk-proof-worker --tag "$tagged_image" .
+  # ECR basic scanning cannot scan an OCI image index. Build a single-platform
+  # image manifest by disabling BuildKit's default provenance attachment; the
+  # immutable digest can then pass the mandatory CRITICAL/HIGH scan gate.
+  docker build --pull --provenance=false --file Dockerfile.zk-proof-worker --tag "$tagged_image" .
   echo "DOCKER_PUSH $tagged_image"
   timeout 1800 docker push "$tagged_image" >/dev/null
 fi
