@@ -62,7 +62,8 @@ pub use ledger::{
     AccountBucket, AccountKey, AppliedLedgerTransaction, ClaimPayout, CompleteSetDirection,
     CompleteSetFillPosting, CompleteSetTransaction, CustodyLedgerTotal, ExternalFlowDirection,
     ExternalFlowTransaction, Ledger, LedgerPosting, LedgerTransaction, NormalFillPosting,
-    PostingSide, ResolutionPayoutKind, Transfer, VaultStrategyTransaction, VaultStrategyTransition,
+    PoolCashOpening, PostingSide, ResolutionPayoutKind, Transfer, VaultStrategyTransaction,
+    VaultStrategyTransition,
 };
 #[allow(unused_imports)]
 pub use orderbook::{

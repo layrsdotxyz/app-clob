@@ -19,9 +19,9 @@ use super::{
     CoreError, CoreResult, CustodyLedgerTotal, EnclaveReceipt, EncryptedJournal,
     EncryptedJournalRecord, EncryptedSnapshot, ExternalFlowDirection, ExternalFlowTransaction,
     Fill, JournalKey, Ledger, LedgerTransaction, MatchResult, MatchType, NormalFillPosting,
-    OrderAction, OrderStatus, Outcome, PriceTimeBook, ReceiptSigner, ResolutionPayoutKind,
-    SessionGuard, SignedSessionRequest, TimeInForce, Transfer, VaultStrategyTransaction,
-    VaultStrategyTransition, PRICE_SCALE,
+    OrderAction, OrderStatus, Outcome, PoolCashOpening, PriceTimeBook, ReceiptSigner,
+    ResolutionPayoutKind, SessionGuard, SignedSessionRequest, TimeInForce, Transfer,
+    VaultStrategyTransaction, VaultStrategyTransition, PRICE_SCALE,
 };
 
 /// Public depth is deliberately less precise than the enclave's private book.
@@ -1024,6 +1024,14 @@ enum JournaledSystemCommand {
         idempotency_key: String,
         transaction: VaultStrategyTransaction,
     },
+    HistoricalPoolCashOpening {
+        idempotency_key: String,
+        evidence_hash: [u8; 32],
+        openings: Vec<PoolCashOpening>,
+        source_sequence: u64,
+        source_state_root: [u8; 32],
+        source_journal_head: [u8; 32],
+    },
     AccrueReward {
         idempotency_key: String,
         identity_commitment: [u8; 32],
@@ -1095,6 +1103,7 @@ enum JournaledSystemCommand {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CoreStateSnapshot {
+    #[serde(deserialize_with = "Ledger::deserialize_snapshot_compatible")]
     ledger: Ledger,
     books: BTreeMap<String, PriceTimeBook>,
     markets: BTreeMap<String, MarketConfig>,
@@ -1410,6 +1419,45 @@ impl PrivateTradingCore {
             ),
             &value,
         )
+    }
+
+    /// Emits the persisted JSON shape used by the exact production source
+    /// release 97614f37. This synthetic fixture proves the additive
+    /// `recovery_capsules` default and root continuity; release operations must
+    /// still replay the real frozen production snapshot because the candidate
+    /// ledger decoder intentionally enforces stricter legacy-data invariants.
+    #[cfg(test)]
+    pub fn export_live_976_snapshot_for_test(&self) -> CoreResult<EncryptedSnapshot> {
+        let (journal_sequence, _) = self.journal.chain_head();
+        if journal_sequence != self.sequence {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        let mut value = serde_json::to_value(CoreStateSnapshot {
+            ledger: self.ledger.clone(),
+            books: self.books.clone(),
+            markets: self.markets.clone(),
+            sessions: self.sessions.clone(),
+            processed_hashes: processed_hashes(&self.processed),
+            recovery_capsules: self.recovery_capsules.clone(),
+            system_keys: self.system_keys.clone(),
+            position_cost_basis: self
+                .position_cost_basis
+                .iter()
+                .map(|(key, value)| (key.clone(), *value))
+                .collect(),
+            resolutions: self.resolutions.clone(),
+            oracle_public_key: self.oracle_public_key,
+            bootstrap_executions: self.bootstrap_executions.clone(),
+            private_rewards: self.private_rewards.clone(),
+            trading_frozen: self.trading_frozen,
+            sequence: self.sequence,
+        })
+        .map_err(|_| CoreError::JournalCrypto)?;
+        value
+            .as_object_mut()
+            .ok_or(CoreError::JournalCrypto)?
+            .remove("recovery_capsules");
+        self.journal.seal_snapshot(self.state_root(), &value)
     }
 
     pub fn restore_encrypted_snapshot(
@@ -2370,6 +2418,77 @@ impl PrivateTradingCore {
             &private_user_id,
             now_millis,
         )
+    }
+
+    /// Performs the one-time, freeze-only historical custody opening after an
+    /// exact 976 checkpoint has been restored and independently reconciled.
+    /// The expected checkpoint tuple prevents applying an opening to a drifted
+    /// or substituted snapshot. No public operator command exposes this method;
+    /// release tooling must add a separately reviewed, attested invocation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn migrate_historical_pool_cash_opening(
+        &mut self,
+        idempotency_key: String,
+        evidence_hash: [u8; 32],
+        openings: Vec<PoolCashOpening>,
+        expected_sequence: u64,
+        expected_state_root: [u8; 32],
+        expected_journal_head: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        if !self.trading_frozen
+            || self.sequence != expected_sequence
+            || self.state_root() != expected_state_root
+            || self.journal.chain_head() != (expected_sequence, expected_journal_head)
+        {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        self.validate_new_system_key(&idempotency_key)?;
+        let prior_root = self.state_root();
+        let mut ledger = self.ledger.clone();
+        ledger.apply_historical_pool_cash_opening(
+            format!("historical-opening:{idempotency_key}"),
+            evidence_hash,
+            openings.clone(),
+        )?;
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::HistoricalPoolCashOpening {
+            idempotency_key: idempotency_key.clone(),
+            evidence_hash,
+            openings,
+            source_sequence: expected_sequence,
+            source_state_root: expected_state_root,
+            source_journal_head: expected_journal_head,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.ledger = ledger;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            "historical-pool-cash-opening",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
     }
 
     pub fn apply_external_flow(
@@ -8684,6 +8803,115 @@ mod category_fee_tests {
 mod snapshot_migration_tests {
     use super::*;
     use crate::private_core::TimeInForce;
+
+    #[test]
+    fn restores_exact_live_976_snapshot_shape_without_changing_checkpoint() {
+        let journal_key = JournalKey::from_bytes([210u8; 32]);
+        let mut core =
+            PrivateTradingCore::new(journal_key.clone(), ReceiptSigner::generate([211u8; 48]));
+        core.ledger
+            .seed_balance(
+                AccountKey::new("private-user", AccountBucket::UserAvailable, "USDC"),
+                5_000_000,
+            )
+            .unwrap();
+
+        let expected_sequence = core.sequence();
+        let expected_root = core.state_root();
+        let snapshot = core.export_live_976_snapshot_for_test().unwrap();
+        let expected_head = snapshot.journal_head;
+
+        let restored = PrivateTradingCore::restore_encrypted_snapshot(
+            journal_key,
+            ReceiptSigner::generate([212u8; 48]),
+            &snapshot,
+            expected_sequence,
+        )
+        .unwrap();
+
+        assert_eq!(restored.sequence(), expected_sequence);
+        assert_eq!(restored.state_root(), expected_root);
+        assert_eq!(
+            restored.journal.chain_head(),
+            (expected_sequence, expected_head)
+        );
+        assert!(restored.recovery_capsules.is_empty());
+    }
+
+    #[test]
+    fn restores_976_zero_balance_and_journals_pool_cash_opening_without_user_drift() {
+        let journal_key = JournalKey::from_bytes([213u8; 32]);
+        let mut core =
+            PrivateTradingCore::new(journal_key.clone(), ReceiptSigner::generate([214u8; 48]));
+        let user = AccountKey::new("private-user", AccountBucket::UserAvailable, "USDC");
+        let depleted = AccountKey::new("depleted-user", AccountBucket::UserAvailable, "USDC");
+        core.ledger.seed_balance(user.clone(), 5_000_000).unwrap();
+        core.ledger
+            .insert_legacy_zero_balance_for_test(depleted.clone());
+        core.set_trading_freeze("freeze-for-opening".into(), true, [9u8; 32], 1_000)
+            .unwrap();
+        let snapshot = core.export_live_976_snapshot_for_test().unwrap();
+
+        let mut restored = PrivateTradingCore::restore_encrypted_snapshot(
+            journal_key,
+            ReceiptSigner::generate([215u8; 48]),
+            &snapshot,
+            snapshot.sequence,
+        )
+        .unwrap();
+        assert_eq!(restored.ledger.legacy_zero_balance_count(), 1);
+        assert_eq!(restored.balance(&user), 5_000_000);
+        assert_eq!(restored.balance(&depleted), 0);
+
+        let source_sequence = restored.sequence();
+        let source_root = restored.state_root();
+        let source_head = restored.journal.chain_head().1;
+        let response = restored
+            .migrate_historical_pool_cash_opening(
+                "opening-usdc".into(),
+                [10u8; 32],
+                vec![PoolCashOpening {
+                    asset: "USDC".into(),
+                    amount: 25_000_000,
+                }],
+                source_sequence,
+                source_root,
+                source_head,
+                2_000,
+            )
+            .unwrap();
+
+        assert_eq!(restored.balance(&user), 5_000_000);
+        assert_eq!(restored.balance(&depleted), 0);
+        assert_eq!(restored.ledger.legacy_zero_balance_count(), 0);
+        assert_eq!(
+            restored.balance(&AccountKey::new("layrs", AccountBucket::PoolCash, "USDC")),
+            25_000_000
+        );
+        assert_eq!(restored.sequence(), source_sequence + 1);
+        assert_eq!(response.receipt.prior_state_root, source_root);
+        assert_eq!(response.receipt.state_root, restored.state_root());
+        assert_eq!(
+            restored.journal.chain_head(),
+            (restored.sequence(), response.encrypted_record.record_hash)
+        );
+
+        assert!(matches!(
+            restored.migrate_historical_pool_cash_opening(
+                "opening-usdc-replay".into(),
+                [10u8; 32],
+                vec![PoolCashOpening {
+                    asset: "USDC".into(),
+                    amount: 25_000_000,
+                }],
+                source_sequence,
+                source_root,
+                source_head,
+                3_000,
+            ),
+            Err(CoreError::JournalChainMismatch)
+        ));
+    }
 
     #[test]
     fn restores_legacy_book_root_and_reconstructs_deterministic_fill_history() {

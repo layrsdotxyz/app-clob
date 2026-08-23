@@ -157,11 +157,21 @@ if [[ "${#migration_docs[@]}" -eq 0 ]]; then
 fi
 
 approved_doc=""
+high_risk_state_change="false"
+for file in "${snapshot_sensitive_files[@]}"; do
+  case "$file" in
+    src/private_core/engine.rs|src/private_core/journal.rs|src/private_core/ledger.rs|enclave/snapshot-schema/*)
+      high_risk_state_change="true"
+      ;;
+  esac
+done
 for doc in "${migration_docs[@]}"; do
   if git grep -q 'SNAPSHOT_SCHEMA_CHANGE_APPROVED:[[:space:]]*true' "${head_sha}" -- "$doc" \
     && git grep -q "BASE_RELEASE_COMMIT:[[:space:]]*${base_sha}" "${head_sha}" -- "$doc" \
     && git grep -q 'PRODUCTION_REPLAY_PLAN:[[:space:]]*true' "${head_sha}" -- "$doc" \
-    && git grep -q 'ROLLBACK_PLAN:[[:space:]]*true' "${head_sha}" -- "$doc"; then
+    && git grep -q 'ROLLBACK_PLAN:[[:space:]]*true' "${head_sha}" -- "$doc" \
+    && { [[ "$high_risk_state_change" != "true" ]] \
+      || git grep -q 'CUMULATIVE_STATE_MIGRATION:[[:space:]]*true' "${head_sha}" -- "$doc"; }; then
     approved_doc="$doc"
     break
   fi
@@ -171,6 +181,9 @@ if [[ -z "$approved_doc" ]]; then
   cat >&2 <<EOF
 No changed migration document contains the required approval markers for base:
   $base_sha
+
+High-risk engine, journal, ledger, or snapshot-schema changes additionally require:
+  CUMULATIVE_STATE_MIGRATION: true
 
 Changed migration docs checked:
 $(printf '  - %s\n' "${migration_docs[@]}")

@@ -207,6 +207,15 @@ pub struct CustodyLedgerTotal {
     pub amount: u128,
 }
 
+/// One independently reconciled custody balance used to establish the
+/// historical `PoolCash` opening without changing any user liability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolCashOpening {
+    pub asset: String,
+    #[serde(with = "super::decimal_u128")]
+    pub amount: u128,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ExternalFlowDirection {
@@ -321,12 +330,50 @@ impl<'de> Deserialize<'de> for Ledger {
 }
 
 impl Ledger {
+    /// Snapshot-only decoder for the exact 976 lineage. Generic `Ledger`
+    /// deserialization remains strict; only an authenticated private-core
+    /// snapshot may preserve historical zero accounts for root continuity.
+    pub(crate) fn deserialize_snapshot_compatible<'de, D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = LedgerWire::deserialize(deserializer)?;
+        let mut balances = BTreeMap::new();
+        for (account, amount) in wire.balances {
+            validate_account_key(&account).map_err(D::Error::custom)?;
+            if balances.insert(account, amount).is_some() {
+                return Err(D::Error::custom(
+                    "ledger snapshot contains a duplicate account",
+                ));
+            }
+        }
+        validate_legacy_balance_model(&balances).map_err(D::Error::custom)?;
+        validate_replay_keys(&wire.applied_idempotency_keys).map_err(D::Error::custom)?;
+        Ok(Self {
+            balances,
+            applied_idempotency_keys: wire.applied_idempotency_keys,
+            sequence: wire.sequence,
+        })
+    }
+
     pub fn balance(&self, account: &AccountKey) -> u128 {
         self.balances.get(account).copied().unwrap_or_default()
     }
 
     pub fn sequence(&self) -> u64 {
         self.sequence
+    }
+
+    pub fn legacy_zero_balance_count(&self) -> usize {
+        self.balances
+            .values()
+            .filter(|amount| **amount == 0)
+            .count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_legacy_zero_balance_for_test(&mut self, account: AccountKey) {
+        self.balances.insert(account, 0);
     }
 
     /// Genesis/import operation. Runtime business code must use balanced transactions.
@@ -987,7 +1034,13 @@ impl Ledger {
                 .checked_sub(transaction.amount)
                 .ok_or(CoreError::InsufficientBalance)?,
         };
-        self.balances.insert(transaction.account.clone(), next);
+        if next == 0 {
+            self.balances.remove(&transaction.account);
+        } else {
+            self.balances.insert(transaction.account.clone(), next);
+        }
+        canonicalize_balances(&mut self.balances);
+        validate_balance_model(&self.balances)?;
         self.sequence = self
             .sequence
             .checked_add(1)
@@ -1010,6 +1063,89 @@ impl Ledger {
             state_root,
             transfers: Vec::new(),
             postings: Vec::new(),
+        })
+    }
+
+    /// Establishes the custody-side opening for balances that predate balanced
+    /// deposit postings. This is a one-time, evidence-bound migration. It does
+    /// not touch any user, order, position, collateral, fee or reward account.
+    pub fn apply_historical_pool_cash_opening(
+        &mut self,
+        idempotency_key: String,
+        evidence_hash: [u8; 32],
+        openings: Vec<PoolCashOpening>,
+    ) -> CoreResult<AppliedLedgerTransaction> {
+        if idempotency_key.is_empty() || evidence_hash == [0u8; 32] || openings.is_empty() {
+            return Err(CoreError::InvalidOrder(
+                "historical pool-cash opening requires idempotency, evidence and assets".into(),
+            ));
+        }
+        let evidence_replay_key = format!(
+            "historical-pool-cash-opening-evidence:{}",
+            hex::encode(evidence_hash)
+        );
+        if self.applied_idempotency_keys.contains(&idempotency_key)
+            || self.applied_idempotency_keys.contains(&evidence_replay_key)
+        {
+            return Err(CoreError::DuplicateCommand);
+        }
+
+        let prior_state_root = self.state_root();
+        let user_balances_before: BTreeMap<_, _> = self
+            .balances
+            .iter()
+            .filter(|(account, amount)| account.owner != "layrs" && **amount > 0)
+            .map(|(account, amount)| (account.clone(), *amount))
+            .collect();
+        let mut next = self.balances.clone();
+        canonicalize_balances(&mut next);
+        let mut seen_assets = BTreeSet::new();
+        let mut postings = Vec::with_capacity(openings.len());
+        for opening in openings {
+            if opening.amount == 0 || !seen_assets.insert(opening.asset.clone()) {
+                return Err(CoreError::UnbalancedTransaction);
+            }
+            let account = AccountKey::new("layrs", AccountBucket::PoolCash, &opening.asset);
+            validate_account_key(&account)?;
+            if next.contains_key(&account) {
+                return Err(CoreError::DuplicateCommand);
+            }
+            next.insert(account.clone(), opening.amount);
+            postings.push(LedgerPosting {
+                account,
+                side: PostingSide::Debit,
+                amount: opening.amount,
+            });
+        }
+        validate_balance_model(&next)?;
+        let user_balances_after: BTreeMap<_, _> = next
+            .iter()
+            .filter(|(account, amount)| account.owner != "layrs" && **amount > 0)
+            .map(|(account, amount)| (account.clone(), *amount))
+            .collect();
+        if user_balances_before != user_balances_after {
+            return Err(CoreError::UnbalancedTransaction);
+        }
+
+        self.balances = next;
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(CoreError::UnbalancedTransaction)?;
+        self.applied_idempotency_keys
+            .insert(idempotency_key.clone());
+        self.applied_idempotency_keys.insert(evidence_replay_key);
+        Ok(AppliedLedgerTransaction {
+            sequence: self.sequence,
+            idempotency_key,
+            business_reference: format!(
+                "historical-pool-cash-opening:{}",
+                hex::encode(evidence_hash)
+            ),
+            prior_state_root,
+            state_root: self.state_root(),
+            transfers: Vec::new(),
+            postings,
         })
     }
 
@@ -1789,6 +1925,13 @@ fn validate_balance_model(balances: &BTreeMap<AccountKey, u128>) -> CoreResult<(
         if *amount == 0 {
             return Err(CoreError::UnbalancedTransaction);
         }
+    }
+    Ok(())
+}
+
+fn validate_legacy_balance_model(balances: &BTreeMap<AccountKey, u128>) -> CoreResult<()> {
+    for account in balances.keys() {
+        validate_account_key(account)?;
     }
     Ok(())
 }
