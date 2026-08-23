@@ -28,3 +28,19 @@ The document should also describe:
 
 Do not add a permanent bypass file. The guard only accepts a migration document
 that changes in the candidate release diff.
+
+An incident-only, read-only terminal recovery may use
+`--allow-stateless-terminal-recovery` only when its changed document contains:
+
+```text
+STATE_SCHEMA_UNCHANGED: true
+STATE_ROOT_MATERIAL_UNCHANGED: true
+TERMINAL_RECOVERY_ONLY: true
+BASE_RELEASE_COMMIT: <exact deployed app-clob commit sha>
+EXACT_SNAPSHOT_TEST: exact_terminal_snapshot_reissues_withdrawal_proof_without_state_change
+```
+
+That mode permits changes only in `engine.rs`, `journal.rs`, `mod.rs` and
+`session.rs`; it still requires a branch from the exact deployed release and a
+test proving recovery leaves the restored sequence, root and journal head
+unchanged. It is not permission to deploy a state migration.

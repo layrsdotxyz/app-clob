@@ -559,6 +559,19 @@ pub struct WithdrawalIntent {
     pub enclave_sequence: u64,
     pub state_root: [u8; 32],
     pub expires_at_millis: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_proof: Option<WithdrawalRecoveryProof>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WithdrawalRecoveryProof {
+    pub protocol_version: String,
+    pub original_idempotency_key: String,
+    pub terminal_enclave_sequence: u64,
+    pub terminal_state_root: [u8; 32],
+    pub terminal_journal_head: [u8; 32],
+    pub terminal_record_hash: [u8; 32],
+    pub recovered_at_millis: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1724,6 +1737,138 @@ impl PrivateTradingCore {
             record,
             now_millis,
         ))
+    }
+
+    /// Reissue a short-lived authorization for the exact withdrawal already
+    /// committed by this checkpoint's terminal encrypted journal record. This
+    /// is strictly read-only: it cannot alter balances, holds, sequence, root,
+    /// journal head, sessions, or processed-command state.
+    pub fn recover_terminal_withdrawal_authorization(
+        &self,
+        terminal_record: &EncryptedJournalRecord,
+        withdrawal_id: Uuid,
+        session_id: &str,
+        now_millis: i64,
+    ) -> CoreResult<CoreResponse> {
+        let entry: JournaledUserCommand = self
+            .journal
+            .decrypt_current_head(terminal_record, self.state_root())?;
+        let UserCommandAction::RequestWithdrawal {
+            withdrawal_id: command_withdrawal_id,
+            chain,
+            asset,
+            amount_atomic,
+            destination,
+        } = &entry.command.action
+        else {
+            return Err(CoreError::InvalidWithdrawalRecoveryProof);
+        };
+        let CommandResult::WithdrawalReserved {
+            withdrawal_id: result_withdrawal_id,
+            chain: result_chain,
+            asset: result_asset,
+            amount_atomic: result_amount,
+            destination: result_destination,
+        } = &entry.result
+        else {
+            return Err(CoreError::InvalidWithdrawalRecoveryProof);
+        };
+        if *command_withdrawal_id != withdrawal_id
+            || *result_withdrawal_id != withdrawal_id
+            || entry.command.session.request.session_id != session_id
+            || chain != result_chain
+            || asset != result_asset
+            || amount_atomic != result_amount
+            || destination != result_destination
+        {
+            return Err(CoreError::InvalidWithdrawalRecoveryProof);
+        }
+        let expected_hash = command_request_hash(
+            &entry.command.command_id,
+            &entry.command.idempotency_key,
+            &entry.command.action,
+        )?;
+        let reservation_marker = withdrawal_reservation_marker(
+            session_id,
+            withdrawal_id,
+            chain,
+            asset,
+            &amount_atomic.to_string(),
+            destination,
+        )?;
+        if entry.command.session.request.request_hash != expected_hash
+            || self
+                .processed
+                .get(&entry.command.idempotency_key)
+                .map(|processed| processed.request_hash)
+                != Some(expected_hash)
+            || !self.system_keys.contains(&reservation_marker)
+        {
+            return Err(CoreError::InvalidWithdrawalRecoveryProof);
+        }
+        let owner = self
+            .sessions
+            .registered_owner(session_id)
+            .ok_or(CoreError::InvalidWithdrawalRecoveryProof)?;
+        if self.ledger.balance(&AccountKey::new(
+            owner,
+            AccountBucket::UserWithdrawalHold,
+            asset,
+        )) < *amount_atomic
+        {
+            return Err(CoreError::InvalidWithdrawalRecoveryProof);
+        }
+        let root = self.state_root();
+        let recovery_receipt = self.receipt_signer.sign_terminal_withdrawal_recovery(
+            format!("recover-withdrawal:{withdrawal_id}"),
+            // Bind retry identity to the original command commitment without
+            // copying an arbitrary-length user idempotency key into a durable
+            // recovery artifact.
+            format!("recovery:{}", hex::encode(expected_hash)),
+            expected_hash,
+            &entry.result,
+            self.sequence,
+            root,
+            terminal_record.record_hash,
+            now_millis,
+        );
+        let intent = WithdrawalIntent {
+            protocol_version: "layrs.withdrawal-recovery.v1".into(),
+            withdrawal_id,
+            session_id: session_id.to_owned(),
+            chain: chain.clone(),
+            asset: asset.clone(),
+            amount_atomic: amount_atomic.to_string(),
+            destination: destination.clone(),
+            receipt_id: recovery_receipt.receipt_id.clone(),
+            enclave_sequence: self.sequence,
+            state_root: root,
+            expires_at_millis: now_millis.saturating_add(15 * 60_000),
+            recovery_proof: Some(WithdrawalRecoveryProof {
+                protocol_version: "layrs.withdrawal-terminal-journal-proof.v1".into(),
+                original_idempotency_key: entry.command.idempotency_key,
+                terminal_enclave_sequence: terminal_record.sequence,
+                terminal_state_root: terminal_record.state_root,
+                terminal_journal_head: terminal_record.record_hash,
+                terminal_record_hash: terminal_record.record_hash,
+                recovered_at_millis: now_millis,
+            }),
+        };
+        let authorization = WithdrawalAuthorization {
+            signature: self
+                .receipt_signer
+                .sign_domain_payload(b"layrs.withdrawal-recovery-authorization.v1\0", &intent),
+            intent,
+        };
+        Ok(CoreResponse {
+            result: entry.result,
+            receipt: recovery_receipt,
+            encrypted_record: None,
+            withdrawal_authorization: Some(authorization),
+            reward_claim_authorization: None,
+            audit_fills: Vec::new(),
+            task_qualifications: Vec::new(),
+        })
     }
 
     pub fn validate_withdrawal_intent(&self, intent: &WithdrawalIntent) -> CoreResult<()> {
@@ -3271,6 +3416,7 @@ impl PrivateTradingCore {
                     enclave_sequence: next_sequence,
                     state_root: next_root,
                     expires_at_millis: now_millis.saturating_add(15 * 60_000),
+                    recovery_proof: None,
                 };
                 Some(WithdrawalAuthorization {
                     signature: self

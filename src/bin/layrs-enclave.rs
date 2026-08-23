@@ -111,6 +111,12 @@ struct OperatorEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 enum OperatorCommand {
+    RecoverWithdrawalAuthorization {
+        withdrawal_id: uuid::Uuid,
+        session_id: String,
+        terminal_record: EncryptedJournalRecord,
+        now_millis: i64,
+    },
     ProvisionStatus,
     BeginProvision {
         kms_key_id: String,
@@ -886,6 +892,28 @@ async fn dispatch_operator(
     }
 
     match envelope.command {
+        OperatorCommand::RecoverWithdrawalAuthorization {
+            withdrawal_id,
+            session_id,
+            terminal_record,
+            now_millis,
+        } => {
+            let core = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?;
+            let response = core
+                .recover_terminal_withdrawal_authorization(
+                    &terminal_record,
+                    withdrawal_id,
+                    &session_id,
+                    now_millis,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(PlainResponse::User {
+                response: Box::new(response),
+            })
+        }
         OperatorCommand::ProvisionStatus => Ok(PlainResponse::ProvisionStatus {
             state: if state.core.is_some() {
                 "READY"
@@ -1918,6 +1946,7 @@ async fn dispatch_operator(
                         .map_err(|error| error.to_string());
                 }
                 OperatorCommand::BeginProvision { .. }
+                | OperatorCommand::RecoverWithdrawalAuthorization { .. }
                 | OperatorCommand::CompleteProvision { .. }
                 | OperatorCommand::ProvisionStatus
                 | OperatorCommand::PolymarketStatus

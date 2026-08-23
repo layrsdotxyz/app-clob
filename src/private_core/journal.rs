@@ -189,6 +189,46 @@ impl EncryptedJournal {
         serde_json::from_slice(&plaintext).map_err(|_| CoreError::JournalCrypto)
     }
 
+    /// Decrypt only the record already committed as this journal's current
+    /// head. A restored checkpoint intentionally has no in-memory history, so
+    /// the normal historical decrypt path cannot prove the terminal record.
+    /// This method never appends or changes the chain.
+    pub fn decrypt_current_head<T: for<'de> Deserialize<'de>>(
+        &self,
+        record: &EncryptedJournalRecord,
+        expected_state_root: [u8; 32],
+    ) -> CoreResult<T> {
+        if record.sequence != self.sequence
+            || record.record_hash != self.head
+            || record.state_root != expected_state_root
+            || record.record_hash
+                != hash_record(
+                    record.sequence,
+                    &record.nonce,
+                    &record.prior_record_hash,
+                    &record.state_root,
+                    &record.ciphertext,
+                )
+        {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        let plaintext = self
+            .cipher
+            .decrypt(
+                Nonce::from_slice(&record.nonce),
+                Payload {
+                    msg: &record.ciphertext,
+                    aad: &associated_data(
+                        record.sequence,
+                        &record.prior_record_hash,
+                        &record.state_root,
+                    ),
+                },
+            )
+            .map_err(|_| CoreError::JournalCrypto)?;
+        serde_json::from_slice(&plaintext).map_err(|_| CoreError::JournalCrypto)
+    }
+
     pub fn records(&self) -> &[EncryptedJournalRecord] {
         &self.records
     }
@@ -380,6 +420,10 @@ pub struct EnclaveReceipt {
     /// portfolio/status receipts remain user-verifiable but are never anchored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publication_eligible: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_commitment_sha256: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_committed: Option<bool>,
     pub enclave_sequence: u64,
     pub prior_state_root: [u8; 32],
     pub state_root: [u8; 32],
@@ -447,8 +491,61 @@ impl ReceiptSigner {
             idempotency_key,
             command_commitment_sha256,
             publication_eligible,
+            result_commitment_sha256: None,
+            journal_committed: None,
             enclave_sequence,
             prior_state_root,
+            state_root,
+            journal_hash,
+            enclave_measurement_sha384: self.enclave_measurement_sha384.to_vec(),
+            occurred_at_millis,
+            signature: Vec::new(),
+        };
+        let payload = serde_json::to_vec(&receipt).expect("receipt serialization cannot fail");
+        receipt.signature = self.signing_key.sign(&payload).to_bytes().to_vec();
+        receipt
+    }
+
+    /// Produce a fresh, non-journal receipt for a terminal withdrawal proof.
+    /// It is bound to the existing command/root/head and cannot authorize a
+    /// different command or represent a new state transition.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_terminal_withdrawal_recovery<T: Serialize>(
+        &self,
+        command_id: String,
+        idempotency_key: String,
+        command_commitment_sha256: [u8; 32],
+        result: &T,
+        enclave_sequence: u64,
+        state_root: [u8; 32],
+        journal_hash: [u8; 32],
+        occurred_at_millis: i64,
+    ) -> EnclaveReceipt {
+        let result_bytes =
+            serde_json::to_vec(result).expect("recovery result serialization cannot fail");
+        let result_commitment_sha256 = Sha256::new()
+            .chain_update(b"layrs.withdrawal-recovery-result.v1\0")
+            .chain_update(command_commitment_sha256)
+            .chain_update((result_bytes.len() as u64).to_be_bytes())
+            .chain_update(result_bytes)
+            .finalize()
+            .into();
+        let mut receipt = EnclaveReceipt {
+            protocol_version: "layrs.v3".into(),
+            receipt_id: deterministic_receipt_id(
+                &command_id,
+                &idempotency_key,
+                enclave_sequence,
+                &state_root,
+            ),
+            command_id,
+            idempotency_key,
+            command_commitment_sha256: Some(command_commitment_sha256),
+            publication_eligible: Some(false),
+            result_commitment_sha256: Some(result_commitment_sha256),
+            journal_committed: Some(false),
+            enclave_sequence,
+            prior_state_root: state_root,
             state_root,
             journal_hash,
             enclave_measurement_sha384: self.enclave_measurement_sha384.to_vec(),
