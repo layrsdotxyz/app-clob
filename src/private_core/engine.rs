@@ -876,13 +876,16 @@ struct AuditFillDraft {
 
 /// Privacy-minimized evidence that an encrypted order was accepted by the attested core.
 ///
-/// The statement deliberately omits the user, market, side, outcome and limit price. The
-/// commitment binds those private fields inside the enclave, while the public notional is the
-/// minimum disclosure required for an external quest verifier.
+/// The statement deliberately omits the user, side, outcome and limit price. A market identifier
+/// is disclosed only for newly accepted orders so the backend can publish that exact active
+/// market rather than spending registry gas on speculative inventory. Historical artifacts omit
+/// it and remain byte-compatible.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskQualificationStatement {
     pub protocol_version: String,
     pub event_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_id: Option<String>,
     pub order_commitment: [u8; 32],
     pub settlement_asset: String,
     #[serde(with = "super::decimal_u128")]
@@ -6895,6 +6898,7 @@ fn signed_task_qualifications(
     let statement = TaskQualificationStatement {
         protocol_version: "layrs.task-qualification.v1".into(),
         event_type: "ORDER_ACCEPTED".into(),
+        market_id: Some(order.market_id.clone()),
         order_commitment: order_commitment
             .ok_or_else(|| CoreError::InvalidOrder("missing private order commitment".into()))?,
         settlement_asset: market.settlement_asset.clone(),
