@@ -787,6 +787,17 @@ fn serialize_depth(levels: Vec<(u64, u128)>) -> Vec<(u64, String)> {
 }
 
 async fn dispatch(state: &mut EnclaveState, request: PlainRequest) -> PlainResponse {
+    // This exact-live descendant is a one-purpose recovery EIF. Do not leave
+    // the ordinary encrypted user-command surface reachable merely because the
+    // recovery parent is network-isolated: a holder of a historical session
+    // key must not be able to turn the recovery checkpoint into a second
+    // writer. Provisioning and recovery are carried only by signed operator
+    // envelopes and are further allowlisted in dispatch_operator.
+    if !recovery_only_plain_request(&request) {
+        return PlainResponse::Error {
+            code: "RECOVERY_ONLY_COMMAND_REJECTED".into(),
+        };
+    }
     let result: Result<PlainResponse, String> = match request {
         PlainRequest::Operator { envelope } => dispatch_operator(state, envelope).await,
         PlainRequest::User {
@@ -887,6 +898,12 @@ async fn dispatch_operator(
             &Signature::from_bytes(&signature_bytes),
         )
         .map_err(|_| "INVALID_OPERATOR_SIGNATURE".to_string())?;
+    // Check the command after authentication but before recording its nonce.
+    // A prohibited command therefore cannot mutate even the operator replay
+    // cache, let alone the restored private core.
+    if !recovery_only_operator_command(&envelope.command) {
+        return Err("RECOVERY_ONLY_COMMAND_REJECTED".into());
+    }
     if !state.operator_nonces.remember(envelope.nonce) {
         return Err("OPERATOR_REPLAY_REJECTED".into());
     }
@@ -1980,6 +1997,21 @@ async fn dispatch_operator(
     }
 }
 
+fn recovery_only_plain_request(request: &PlainRequest) -> bool {
+    matches!(request, PlainRequest::Operator { .. })
+}
+
+fn recovery_only_operator_command(command: &OperatorCommand) -> bool {
+    matches!(
+        command,
+        OperatorCommand::ProvisionStatus
+            | OperatorCommand::BeginProvision { .. }
+            | OperatorCommand::CompleteProvision { .. }
+            | OperatorCommand::RecoverWithdrawalAuthorization { .. }
+            | OperatorCommand::ExportSnapshot
+    )
+}
+
 fn operator_payload(nonce: [u8; 32], command: &OperatorCommand) -> Result<Vec<u8>, String> {
     let encoded =
         serde_json::to_vec(command).map_err(|_| "INVALID_OPERATOR_COMMAND".to_string())?;
@@ -2433,6 +2465,46 @@ async fn write_frame(stream: &mut VsockStream, value: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use clob_service::private_core::FeeProfileId;
+
+    #[test]
+    fn recovery_eif_rejects_the_ordinary_private_request_surface() {
+        assert!(recovery_only_plain_request(&PlainRequest::Operator {
+            envelope: OperatorEnvelope {
+                nonce: [0; 32],
+                command: OperatorCommand::ProvisionStatus,
+                signature: Vec::new(),
+            },
+        }));
+        assert!(!recovery_only_plain_request(
+            &PlainRequest::AggregateDepth {
+                market_id: "must-not-be-readable".into(),
+                outcome: clob_service::private_core::Outcome::Up,
+                now_millis: 0,
+                minimum_level_quantity_micros: 1,
+            }
+        ));
+    }
+
+    #[test]
+    fn recovery_eif_allows_only_restore_proof_and_equality_commands() {
+        assert!(recovery_only_operator_command(
+            &OperatorCommand::ProvisionStatus
+        ));
+        assert!(recovery_only_operator_command(
+            &OperatorCommand::ExportSnapshot
+        ));
+        assert!(!recovery_only_operator_command(
+            &OperatorCommand::SetTradingFreeze {
+                idempotency_key: "prohibited:mutation".into(),
+                frozen: true,
+                reason_commitment: [0; 32],
+                now_millis: 0,
+            }
+        ));
+        assert!(!recovery_only_operator_command(
+            &OperatorCommand::TradingFreezeStatus
+        ));
+    }
 
     #[test]
     fn replay_cache_rejects_duplicate_keys() {
