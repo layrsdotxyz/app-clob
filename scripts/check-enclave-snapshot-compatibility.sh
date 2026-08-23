@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/check-enclave-snapshot-compatibility.sh --base <commit-ish> [--head <commit-ish>] [--mode ci|release] [--allow-state-schema-change]
+  scripts/check-enclave-snapshot-compatibility.sh --base <commit-ish> [--head <commit-ish>] [--mode ci|release] [--allow-state-schema-change|--allow-stateless-terminal-recovery]
 
 Purpose:
   Prevent an enclave transport/provisioning hotfix from accidentally carrying
@@ -21,6 +21,7 @@ base_ref=""
 head_ref="HEAD"
 mode="ci"
 allow_state_schema_change="false"
+allow_stateless_terminal_recovery="false"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -38,6 +39,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --allow-state-schema-change)
       allow_state_schema_change="true"
+      shift
+      ;;
+    --allow-stateless-terminal-recovery)
+      allow_stateless_terminal_recovery="true"
       shift
       ;;
     -h|--help)
@@ -60,6 +65,10 @@ fi
 
 if [[ "$mode" != "ci" && "$mode" != "release" ]]; then
   echo "--mode must be ci or release; got: $mode" >&2
+  exit 2
+fi
+if [[ "$allow_state_schema_change" == "true" && "$allow_stateless_terminal_recovery" == "true" ]]; then
+  echo "Choose only one snapshot compatibility exception mode." >&2
   exit 2
 fi
 
@@ -129,6 +138,38 @@ fi
 
 echo "enclave snapshot compatibility: BLOCKED — snapshot-sensitive files changed in $diff_range:"
 printf '  - %s\n' "${snapshot_sensitive_files[@]}"
+
+if [[ "$allow_stateless_terminal_recovery" == "true" ]]; then
+  allowed_recovery_files_regex='^src/private_core/(engine|journal|mod|session)\.rs$'
+  unexpected_recovery_files=()
+  for file in "${snapshot_sensitive_files[@]}"; do
+    if [[ ! "$file" =~ $allowed_recovery_files_regex ]]; then
+      unexpected_recovery_files+=("$file")
+    fi
+  done
+  if [[ "${#unexpected_recovery_files[@]}" -gt 0 ]]; then
+    echo "Stateless terminal recovery touched an unapproved state-surface file:" >&2
+    printf '  - %s\n' "${unexpected_recovery_files[@]}" >&2
+    exit 1
+  fi
+  approved_doc=""
+  for doc in "${migration_docs[@]}"; do
+    if git grep -q 'STATE_SCHEMA_UNCHANGED:[[:space:]]*true' "${head_sha}" -- "$doc" \
+      && git grep -q 'STATE_ROOT_MATERIAL_UNCHANGED:[[:space:]]*true' "${head_sha}" -- "$doc" \
+      && git grep -q 'TERMINAL_RECOVERY_ONLY:[[:space:]]*true' "${head_sha}" -- "$doc" \
+      && git grep -q "BASE_RELEASE_COMMIT:[[:space:]]*${base_sha}" "${head_sha}" -- "$doc" \
+      && git grep -q 'EXACT_SNAPSHOT_TEST:[[:space:]]*exact_terminal_snapshot_reissues_withdrawal_proof_without_state_change' "${head_sha}" -- "$doc"; then
+      approved_doc="$doc"
+      break
+    fi
+  done
+  if [[ -z "$approved_doc" ]]; then
+    echo "No changed recovery document contains the required stateless terminal-recovery markers." >&2
+    exit 1
+  fi
+  echo "enclave snapshot compatibility: APPROVED stateless terminal recovery via $approved_doc."
+  exit 0
+fi
 
 if [[ "$allow_state_schema_change" != "true" ]]; then
   cat >&2 <<'EOF'

@@ -93,6 +93,8 @@ pub enum CoreError {
     JournalCrypto,
     #[error("journal chain mismatch")]
     JournalChainMismatch,
+    #[error("terminal withdrawal recovery proof is invalid")]
+    InvalidWithdrawalRecoveryProof,
     #[error("snapshot requires an explicit historical fill migration")]
     SnapshotMigrationRequired,
     #[error("unknown or revoked private session")]

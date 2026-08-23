@@ -2111,6 +2111,168 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
 }
 
 #[test]
+fn exact_terminal_snapshot_reissues_withdrawal_proof_without_state_change() {
+    let user = SigningKey::from_bytes(&[81u8; 32]);
+    let journal_key = [82u8; 32];
+    let receipt_seed = [83u8; 32];
+    let measurement = [84u8; 48];
+    let receipt_signer = ReceiptSigner::from_seed(receipt_seed, measurement);
+    let receipt_public_key = receipt_signer.verifying_key();
+    let identity_commitment = [85u8; 32];
+    let private_user = derived_private_user(journal_key, identity_commitment);
+    let session_id = "session_recovery0123456789012345";
+    let withdrawal_id = uuid::Uuid::from_u128(159_300);
+    let mut core = PrivateTradingCore::new(JournalKey::from_bytes(journal_key), receipt_signer);
+    core.register_session(
+        "sys:session:terminal-recovery".into(),
+        session_id.into(),
+        identity_commitment,
+        user.verifying_key().to_bytes(),
+        10_000,
+        1_000,
+    )
+    .unwrap();
+    core.apply_user_external_flow(
+        "sys:deposit:terminal-recovery".into(),
+        identity_commitment,
+        "USDC".into(),
+        AccountBucket::UserAvailable,
+        25_000_000,
+        ExternalFlowDirection::Inflow,
+        [86u8; 32],
+        1_100,
+    )
+    .unwrap();
+    let committed = execute_signed_response(
+        &mut core,
+        &user,
+        session_id,
+        1,
+        "cmd:terminal-recovery",
+        UserCommandAction::RequestWithdrawal {
+            withdrawal_id,
+            chain: "base".into(),
+            asset: "USDC".into(),
+            amount_atomic: 12_345_678,
+            destination: "0x1111111111111111111111111111111111111111".into(),
+        },
+        1_200,
+    );
+    let terminal_record = committed.encrypted_record.unwrap();
+    let snapshot = core.export_encrypted_snapshot().unwrap();
+    assert_eq!(snapshot.sequence, terminal_record.sequence);
+    assert_eq!(snapshot.journal_head, terminal_record.record_hash);
+    assert_eq!(snapshot.state_root, terminal_record.state_root);
+
+    let restored = PrivateTradingCore::restore_encrypted_snapshot(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::from_seed(receipt_seed, measurement),
+        &snapshot,
+        snapshot.sequence,
+    )
+    .unwrap();
+    let root_before = restored.state_root();
+    let checkpoint_before = restored.export_encrypted_snapshot().unwrap();
+    let recovered = restored
+        .recover_terminal_withdrawal_authorization(
+            &terminal_record,
+            withdrawal_id,
+            session_id,
+            2_000,
+        )
+        .unwrap();
+    let authorization = recovered.withdrawal_authorization.clone().unwrap();
+    assert_eq!(
+        authorization.intent.protocol_version,
+        "layrs.withdrawal-recovery.v1"
+    );
+    assert_eq!(authorization.intent.withdrawal_id, withdrawal_id);
+    assert_eq!(authorization.intent.session_id, session_id);
+    assert_eq!(authorization.intent.amount_atomic, "12345678");
+    let proof = authorization.intent.recovery_proof.unwrap();
+    assert_eq!(
+        proof.protocol_version,
+        "layrs.withdrawal-terminal-journal-proof.v1"
+    );
+    assert_eq!(proof.original_idempotency_key, "idem:cmd:terminal-recovery");
+    assert_eq!(proof.terminal_enclave_sequence, snapshot.sequence);
+    assert_eq!(proof.terminal_state_root, snapshot.state_root);
+    assert_eq!(proof.terminal_journal_head, snapshot.journal_head);
+    assert_eq!(proof.terminal_record_hash, terminal_record.record_hash);
+    assert_eq!(recovered.receipt.protocol_version, "layrs.v3");
+    assert_eq!(
+        recovered.receipt.idempotency_key,
+        format!(
+            "recovery:{}",
+            hex::encode(recovered.receipt.command_commitment_sha256.unwrap())
+        )
+    );
+    assert_eq!(recovered.receipt.publication_eligible, Some(false));
+    assert_eq!(recovered.receipt.journal_committed, Some(false));
+    assert_eq!(
+        recovered.receipt.prior_state_root,
+        recovered.receipt.state_root
+    );
+    assert_eq!(recovered.receipt.journal_hash, terminal_record.record_hash);
+    let mut unsigned_receipt = recovered.receipt.clone();
+    let receipt_signature = std::mem::take(&mut unsigned_receipt.signature);
+    VerifyingKey::from_bytes(&receipt_public_key)
+        .unwrap()
+        .verify(
+            &serde_json::to_vec(&unsigned_receipt).unwrap(),
+            &Signature::from_slice(&receipt_signature).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(restored.state_root(), root_before);
+    let checkpoint_after = restored.export_encrypted_snapshot().unwrap();
+    assert_eq!(checkpoint_after.sequence, checkpoint_before.sequence);
+    assert_eq!(
+        checkpoint_after.journal_head,
+        checkpoint_before.journal_head
+    );
+    assert_eq!(checkpoint_after.state_root, checkpoint_before.state_root);
+    assert_eq!(
+        restored.balance(&AccountKey::new(
+            &private_user,
+            AccountBucket::UserWithdrawalHold,
+            "USDC",
+        )),
+        12_345_678
+    );
+
+    let mut tampered = terminal_record.clone();
+    tampered.ciphertext[0] ^= 1;
+    assert_eq!(
+        restored
+            .recover_terminal_withdrawal_authorization(&tampered, withdrawal_id, session_id, 2_000,)
+            .unwrap_err(),
+        CoreError::JournalChainMismatch,
+    );
+    assert_eq!(
+        restored
+            .recover_terminal_withdrawal_authorization(
+                &terminal_record,
+                uuid::Uuid::from_u128(1),
+                session_id,
+                2_000,
+            )
+            .unwrap_err(),
+        CoreError::InvalidWithdrawalRecoveryProof,
+    );
+    assert_eq!(
+        restored
+            .recover_terminal_withdrawal_authorization(
+                &terminal_record,
+                withdrawal_id,
+                "session_wrong01234567890123456",
+                2_000,
+            )
+            .unwrap_err(),
+        CoreError::InvalidWithdrawalRecoveryProof,
+    );
+}
+
+#[test]
 fn registration_receipt_is_publication_eligible_private_and_identity_unique() {
     let receipt_signer = ReceiptSigner::generate([71u8; 48]);
     let receipt_public_key = receipt_signer.verifying_key();

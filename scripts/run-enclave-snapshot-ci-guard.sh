@@ -50,7 +50,12 @@ if [[ -z "$selected_doc" ]]; then
   exit 1
 fi
 
+exception_flag="--allow-state-schema-change"
+if grep -Eq '^TERMINAL_RECOVERY_ONLY:[[:space:]]*true[[:space:]]*$' "$selected_doc"; then
+  exception_flag="--allow-stateless-terminal-recovery"
+fi
+
 exec scripts/check-enclave-snapshot-compatibility.sh \
   --base "$declared_base" \
   --mode ci \
-  --allow-state-schema-change
+  "$exception_flag"
