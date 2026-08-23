@@ -237,6 +237,10 @@ struct OperatorEnvelope {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+// The authenticated operator wire schema is release-bound. Boxing the durable
+// successor fields would change that schema, so retain the representation and
+// acknowledge the decode-only enum size here.
+#[allow(clippy::large_enum_variant)]
 enum OperatorCommand {
     PreparedCommandStatus {
         preparation_id: [u8; 32],
@@ -2464,6 +2468,7 @@ fn parse_nsm_attestation_timestamp(
     i64::try_from(attestation.timestamp).map_err(|_| ())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_bound_user_command_context(
     idempotency_key: &str,
     session_id: &str,
@@ -4562,6 +4567,7 @@ const DELEGATED_READ_MAX_REVOCATION_AGE_MILLIS: i64 = 10_000;
 // public API and Cloudflare 1 MiB response boundary.
 const DELEGATED_READ_MAX_PLAINTEXT_BYTES: usize = 1_048_576 - 16;
 
+#[allow(clippy::too_many_arguments)]
 fn validate_delegated_read_authorization(
     projection: DelegatedReadProjection,
     environment: &str,
@@ -4677,6 +4683,7 @@ fn encrypt_delegated_read<T: Serialize>(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn delegated_read_aad(
     request_id: uuid::Uuid,
     projection: DelegatedReadProjection,
