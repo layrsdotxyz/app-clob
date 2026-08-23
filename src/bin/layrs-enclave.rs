@@ -1940,20 +1940,28 @@ fn command_durable_binding(request: &PlainRequest) -> (String, String) {
 }
 
 fn durable_control_request(request: &PlainRequest) -> bool {
-    matches!(
-        request,
-        PlainRequest::Operator { envelope }
-            if matches!(
-                envelope.command,
-                OperatorCommand::PreparedCommandStatus { .. }
-                    | OperatorCommand::FinalizePreparedCommand { .. }
-            )
-    )
+    match request {
+        // A read-only user command observes state.core, which remains the last
+        // committed core while a candidate is pending. It emits no journal or
+        // snapshot and therefore cannot interfere with prepare/finalize.
+        PlainRequest::User { command, .. } => readonly_user_action(&command.action),
+        PlainRequest::Operator { envelope } => matches!(
+            envelope.command,
+            OperatorCommand::PreparedCommandStatus { .. }
+                | OperatorCommand::FinalizePreparedCommand { .. }
+                | OperatorCommand::DelegatedPortfolioRead { .. }
+        ),
+        PlainRequest::AggregateDepth { .. } => false,
+    }
 }
 
 fn request_requires_writer_authorization(request: &PlainRequest) -> bool {
     match request {
-        PlainRequest::User { .. } => true,
+        // These actions are implemented by PrivateCore::execute_readonly: they
+        // do not advance the sequence, consume a session nonce, modify the
+        // ledger/book, or emit a journal. Requiring the global writer fence
+        // made a portfolio read wait behind unrelated durable mutations.
+        PlainRequest::User { command, .. } => !readonly_user_action(&command.action),
         PlainRequest::Operator { envelope } => matches!(
             &envelope.command,
             OperatorCommand::SetTradingFreeze { .. }
@@ -1980,6 +1988,15 @@ fn request_requires_writer_authorization(request: &PlainRequest) -> bool {
         ),
         PlainRequest::AggregateDepth { .. } => false,
     }
+}
+
+fn readonly_user_action(action: &UserCommandAction) -> bool {
+    matches!(
+        action,
+        UserCommandAction::Portfolio
+            | UserCommandAction::Rewards
+            | UserCommandAction::BootstrapStatus { .. }
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6062,6 +6079,64 @@ mod tests {
         );
         assert_eq!(core.state_root(), root_before);
         assert!(ensure_market_execution_available(&core, &action, true).is_ok());
+    }
+
+    #[test]
+    fn classifies_only_non_journaled_user_actions_as_read_only() {
+        for action in [
+            UserCommandAction::Portfolio,
+            UserCommandAction::Rewards,
+            UserCommandAction::BootstrapStatus {
+                execution_id: Uuid::nil(),
+            },
+        ] {
+            assert!(readonly_user_action(&action));
+        }
+        for action in [
+            UserCommandAction::CancelBootstrap {
+                execution_id: Uuid::nil(),
+            },
+            UserCommandAction::CancelOrder {
+                market_id: "layrs:v4:test".into(),
+                order_id: Uuid::nil(),
+            },
+        ] {
+            assert!(!readonly_user_action(&action));
+        }
+    }
+
+    #[test]
+    fn read_only_user_requests_bypass_writer_and_can_observe_committed_pending_state() {
+        use clob_service::private_core::{SessionRequest, SignedSessionRequest};
+
+        let request = |action| PlainRequest::User {
+            command: UserCommand {
+                command_id: "cmd:read-fairness".into(),
+                idempotency_key: "idem:read-fairness".into(),
+                session: SignedSessionRequest {
+                    request: SessionRequest {
+                        session_id: "session:read-fairness".into(),
+                        sequence: 1,
+                        issued_at_millis: 1,
+                        expires_at_millis: 10,
+                        request_hash: [0u8; 32],
+                    },
+                    signature: vec![0u8; 64],
+                },
+                action,
+            },
+            now_millis: 1,
+        };
+        let portfolio = request(UserCommandAction::Portfolio);
+        assert!(durable_control_request(&portfolio));
+        assert!(!request_requires_writer_authorization(&portfolio));
+
+        let cancellation = request(UserCommandAction::CancelOrder {
+            market_id: "layrs:v4:test".into(),
+            order_id: Uuid::nil(),
+        });
+        assert!(!durable_control_request(&cancellation));
+        assert!(request_requires_writer_authorization(&cancellation));
     }
 
     #[test]
