@@ -1357,6 +1357,10 @@ impl PrivateTradingCore {
         Ok(snapshot)
     }
 
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
     pub fn trading_frozen(&self) -> bool {
         self.trading_frozen
     }
@@ -1605,6 +1609,26 @@ impl PrivateTradingCore {
             )),
             transfer_account,
         }
+    }
+
+    /// Produce the owner-scoped portfolio projection used by an enclave-only
+    /// delegated read. Authorization and response encryption are enforced by
+    /// the enclave command boundary; this method only derives the private
+    /// owner from the immutable identity commitment and never persists a
+    /// plaintext identity-to-financial projection.
+    pub fn portfolio_snapshot_for_identity(
+        &self,
+        identity_commitment: [u8; 32],
+        now_millis: i64,
+    ) -> PortfolioSnapshot {
+        let private_user_id = derive_private_user_id(&self.identity_key, &identity_commitment);
+        portfolio_snapshot(
+            &self.ledger,
+            &self.books,
+            &self.position_cost_basis,
+            &private_user_id,
+            now_millis,
+        )
     }
 
     pub fn apply_external_flow(

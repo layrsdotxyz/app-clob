@@ -26,6 +26,48 @@ fn derived_private_user(journal_key: [u8; 32], commitment: [u8; 32]) -> String {
 }
 
 #[test]
+fn delegated_portfolio_snapshot_is_strictly_identity_scoped() {
+    let mut core = PrivateTradingCore::new(
+        JournalKey::from_bytes([211u8; 32]),
+        ReceiptSigner::generate([212u8; 48]),
+    );
+    let alice = [1u8; 32];
+    let bob = [2u8; 32];
+    core.apply_user_external_flow(
+        "delegated-read:alice".into(),
+        alice,
+        "USDC".into(),
+        AccountBucket::UserAvailable,
+        5_000_000,
+        ExternalFlowDirection::Inflow,
+        [3u8; 32],
+        1_000,
+    )
+    .unwrap();
+    core.apply_user_external_flow(
+        "delegated-read:bob".into(),
+        bob,
+        "USDC".into(),
+        AccountBucket::UserAvailable,
+        9_000_000,
+        ExternalFlowDirection::Inflow,
+        [4u8; 32],
+        1_001,
+    )
+    .unwrap();
+
+    let alice_view = core.portfolio_snapshot_for_identity(alice, 2_000);
+    let bob_view = core.portfolio_snapshot_for_identity(bob, 2_000);
+    assert_eq!(alice_view.balances.len(), 1);
+    assert_eq!(alice_view.balances[0].amount_atomic, "5000000");
+    assert_eq!(bob_view.balances.len(), 1);
+    assert_eq!(bob_view.balances[0].amount_atomic, "9000000");
+    assert_ne!(alice_view.balances, bob_view.balances);
+    assert!(alice_view.positions.is_empty() && alice_view.orders.is_empty());
+    assert!(bob_view.positions.is_empty() && bob_view.orders.is_empty());
+}
+
+#[test]
 fn ledger_is_atomic_conservative_and_idempotent() {
     let mut ledger = Ledger::default();
     let user = AccountKey::new("usr_A", AccountBucket::UserAvailable, "ZEN");
