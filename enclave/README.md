@@ -45,7 +45,12 @@ enclave never accepts a wallet address as a private ledger owner.
   replacement must restore and reconcile immutable ciphertext before traffic is moved. Two
   independently writable enclaves must never share a load balancer.
 - Rotate the EIF by overlapping old and new PCR allowlists, draining orders, reconciling state,
-  then removing the old PCR.
+  then removing the old PCR. If a deployment must roll an already-DURABLE command across PCRs,
+  the target EIF must be built with the exact governed
+  `LAYRS_ENCLAVE_TRANSITION_POLICY_SHA256` for source PCR, target PCR and snapshot schema. The
+  policy changes PCR0 and belongs in the signed release manifest. An empty policy requires a
+  complete DURABLE drain and retention of the old EIF; arbitrary operator authorization cannot
+  relax this gate.
 - Import exactly one Base/USDC and one Horizen/ZEN domain. Each has distinct ledger and
   `AdminOracle` resolver keys; their addresses must equal the corresponding audited-contract role
   holders. The bundle also carries a distinct Ed25519 resolution key whose public half is bound

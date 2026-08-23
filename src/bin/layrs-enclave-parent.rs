@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     io,
     net::{Shutdown, SocketAddr},
     sync::Arc,
@@ -16,8 +17,8 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 #[cfg(not(feature = "standalone-enclave-runtime"))]
 use clob_service::access_capability::AccessCapability;
 use clob_service::private_core::{
-    EnclaveReceipt, EncryptedJournalRecord, EncryptedSnapshot, SignedAuditFillArtifact,
-    SignedTaskQualificationArtifact,
+    EnclaveReceipt, EncryptedJournalRecord, EncryptedSnapshot, RecoveryBridgeArtifact,
+    SignedAuditFillArtifact, SignedTaskQualificationArtifact,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -31,6 +32,7 @@ use tower_http::{
     compression::CompressionLayer, request_id::MakeRequestUuid,
     request_id::PropagateRequestIdLayer, request_id::SetRequestIdLayer, timeout::TimeoutLayer,
 };
+use uuid::Uuid;
 
 #[cfg(feature = "standalone-enclave-runtime")]
 #[path = "../access_capability.rs"]
@@ -67,13 +69,92 @@ enum WireRequest {
     Attestation {
         nonce: Vec<u8>,
     },
-    Encrypted {
+    EncryptedUser {
         access_capability: Option<AccessCapability>,
         client_public_key: [u8; 32],
         nonce: [u8; 12],
         #[serde(with = "serde_bytes")]
         ciphertext: Vec<u8>,
+        request_context: EncryptedRequestContext,
+        writer_authorization: DurableWriterAuthorization,
     },
+    EncryptedOperator {
+        client_public_key: [u8; 32],
+        nonce: [u8; 12],
+        #[serde(with = "serde_bytes")]
+        ciphertext: Vec<u8>,
+        writer_authorization: Option<DurableWriterAuthorization>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EncryptedRequestContext {
+    idempotency_key: String,
+    expected_action: ExpectedEncryptedAction,
+    expected_session_tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_order_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_position_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_execution_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_withdrawal_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_transfer_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_command_commitment: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DurableWriterAuthorization {
+    protocol_version: String,
+    environment: String,
+    epoch: u64,
+    lease_id: Uuid,
+    not_before_millis: i64,
+    expires_at_millis: i64,
+    actor_domain: String,
+    command_idempotency_key: String,
+    command_commitment_sha256: [u8; 32],
+    request_context_sha256: [u8; 32],
+    request_envelope_sha256: [u8; 32],
+    signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ExpectedEncryptedAction {
+    #[serde(rename = "SUBMIT_ORDER")]
+    Submit,
+    #[serde(rename = "REPLACE_ORDER")]
+    Replace,
+    #[serde(rename = "CANCEL_ORDER")]
+    Cancel,
+    #[serde(rename = "CANCEL_ALL_ORDERS")]
+    CancelAll,
+    #[serde(rename = "PREVIEW_POSITION_CLOSE")]
+    PreviewPositionClose,
+    #[serde(rename = "CLOSE_POSITION")]
+    ClosePosition,
+    #[serde(rename = "COMPLETE_SET")]
+    CompleteSet,
+    #[serde(rename = "PORTFOLIO")]
+    Portfolio,
+    #[serde(rename = "REWARDS")]
+    Rewards,
+    #[serde(rename = "REQUEST_REWARD_CLAIM")]
+    RequestRewardClaim,
+    #[serde(rename = "BOOTSTRAP_STATUS")]
+    BootstrapStatus,
+    #[serde(rename = "CANCEL_BOOTSTRAP")]
+    CancelBootstrap,
+    #[serde(rename = "REQUEST_WITHDRAWAL")]
+    RequestWithdrawal,
+    #[serde(rename = "TRANSFER_FUNDS")]
+    TransferFunds,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -93,6 +174,9 @@ enum WireResponse {
         receipt_artifacts: Vec<EnclaveReceipt>,
         audit_artifacts: Vec<SignedAuditFillArtifact>,
         task_artifacts: Vec<SignedTaskQualificationArtifact>,
+        recovery_artifacts: Vec<RecoveryBridgeArtifact>,
+        preparation_artifacts: Vec<DurableCommandPreparation>,
+        rejection_artifacts: Vec<DurableCommandRejection>,
     },
     Error {
         code: String,
@@ -121,6 +205,19 @@ struct PrivateEnvelope {
     client_public_key: String,
     nonce: String,
     ciphertext: String,
+    request_context: EncryptedRequestContext,
+    writer_authorization: DurableWriterAuthorization,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PrivateOperatorEnvelope {
+    protocol_version: String,
+    client_public_key: String,
+    nonce: String,
+    ciphertext: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    writer_authorization: Option<DurableWriterAuthorization>,
 }
 
 #[derive(Serialize)]
@@ -135,6 +232,60 @@ struct PrivateResponseEnvelope {
     receipt_artifacts: Vec<EnclaveReceipt>,
     audit_artifacts: Vec<SignedAuditFillArtifact>,
     task_artifacts: Vec<SignedTaskQualificationArtifact>,
+    recovery_artifacts: Vec<RecoveryBridgeArtifact>,
+    preparation_artifacts: Vec<DurableCommandPreparation>,
+    rejection_artifacts: Vec<DurableCommandRejection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableCommandPreparation {
+    protocol_version: String,
+    environment: String,
+    enclave_measurement_sha384: Vec<u8>,
+    preparation_id: [u8; 32],
+    actor_domain: String,
+    command_binding_sha256: [u8; 32],
+    command_commitment_sha256: [u8; 32],
+    request_context_sha256: [u8; 32],
+    request_envelope_sha256: [u8; 32],
+    command_idempotency_key: String,
+    writer_epoch: u64,
+    writer_lease_id: Uuid,
+    prior_enclave_sequence: u64,
+    enclave_sequence: u64,
+    prior_state_root: [u8; 32],
+    prior_journal_head: [u8; 32],
+    state_root: [u8; 32],
+    journal_record_hash: [u8; 32],
+    snapshot_ciphertext_hash: [u8; 32],
+    response_envelope_sha256: [u8; 32],
+    response_envelope_bytes: u64,
+    response_status: u16,
+    response_content_type: String,
+    receipt_id: String,
+    prepared_at_millis: i64,
+    expires_at_millis: i64,
+    signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableCommandRejection {
+    protocol_version: String,
+    environment: String,
+    enclave_measurement_sha384: Vec<u8>,
+    actor_domain: String,
+    command_binding_sha256: [u8; 32],
+    command_commitment_sha256: [u8; 32],
+    request_context_sha256: [u8; 32],
+    request_envelope_sha256: [u8; 32],
+    command_idempotency_key: String,
+    response_envelope_sha256: [u8; 32],
+    response_envelope_bytes: u64,
+    error_digest_sha256: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    command_receipt: Option<EnclaveReceipt>,
+    occurred_at_millis: i64,
+    signature: Vec<u8>,
 }
 
 #[tokio::main]
@@ -174,6 +325,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(healthz))
         .route("/v1/attestation", get(attestation))
         .route("/v1/private/relay", post(relay))
+        .route("/v1/private/operator-relay", post(operator_relay))
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         // Snapshot artifacts are ciphertext and are serialized as JSON byte
         // arrays on the parent boundary. Compression prevents a valid private
@@ -303,13 +455,18 @@ async fn relay(State(state): State<AppState>, Json(envelope): Json<PrivateEnvelo
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
+    if !valid_request_context(&envelope.request_context) {
+        return gateway_error(StatusCode::BAD_REQUEST, "INVALID_COMMAND_CONTEXT").into_response();
+    }
     match exchange(
         &state,
-        WireRequest::Encrypted {
+        WireRequest::EncryptedUser {
             access_capability: envelope.access_capability,
             client_public_key,
             nonce,
             ciphertext,
+            request_context: envelope.request_context,
+            writer_authorization: envelope.writer_authorization,
         },
     )
     .await
@@ -322,6 +479,9 @@ async fn relay(State(state): State<AppState>, Json(envelope): Json<PrivateEnvelo
             receipt_artifacts,
             audit_artifacts,
             task_artifacts,
+            recovery_artifacts,
+            preparation_artifacts,
+            rejection_artifacts,
         }) => Json(PrivateResponseEnvelope {
             protocol_version: "layrs.v1",
             client_public_key: envelope.client_public_key,
@@ -332,6 +492,9 @@ async fn relay(State(state): State<AppState>, Json(envelope): Json<PrivateEnvelo
             receipt_artifacts,
             audit_artifacts,
             task_artifacts,
+            recovery_artifacts,
+            preparation_artifacts,
+            rejection_artifacts,
         })
         .into_response(),
         Ok(WireResponse::Error { code }) => {
@@ -342,6 +505,158 @@ async fn relay(State(state): State<AppState>, Json(envelope): Json<PrivateEnvelo
         }
         Err(error) => error.into_response(),
     }
+}
+
+async fn operator_relay(
+    State(state): State<AppState>,
+    Json(envelope): Json<PrivateOperatorEnvelope>,
+) -> Response {
+    if envelope.protocol_version != "layrs.v1" {
+        return gateway_error(StatusCode::BAD_REQUEST, "UNSUPPORTED_PROTOCOL").into_response();
+    }
+    let client_public_key: [u8; 32] =
+        match decode_fixed(&envelope.client_public_key, "INVALID_CLIENT_KEY") {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    let nonce: [u8; 12] = match decode_fixed(&envelope.nonce, "INVALID_ENVELOPE_NONCE") {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    let ciphertext = match decode_bounded(
+        &envelope.ciphertext,
+        17,
+        MAX_FRAME_BYTES - 512,
+        "INVALID_CIPHERTEXT",
+    ) {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    match exchange(
+        &state,
+        WireRequest::EncryptedOperator {
+            client_public_key,
+            nonce,
+            ciphertext,
+            writer_authorization: envelope.writer_authorization,
+        },
+    )
+    .await
+    {
+        Ok(WireResponse::Encrypted {
+            nonce,
+            ciphertext,
+            journal_artifacts,
+            snapshot_artifacts,
+            receipt_artifacts,
+            audit_artifacts,
+            task_artifacts,
+            recovery_artifacts,
+            preparation_artifacts,
+            rejection_artifacts,
+        }) => Json(PrivateResponseEnvelope {
+            protocol_version: "layrs.v1",
+            client_public_key: envelope.client_public_key,
+            nonce: URL_SAFE_NO_PAD.encode(nonce),
+            ciphertext: URL_SAFE_NO_PAD.encode(ciphertext),
+            journal_artifacts,
+            snapshot_artifacts,
+            receipt_artifacts,
+            audit_artifacts,
+            task_artifacts,
+            recovery_artifacts,
+            preparation_artifacts,
+            rejection_artifacts,
+        })
+        .into_response(),
+        Ok(WireResponse::Error { code }) => {
+            gateway_error(StatusCode::UNPROCESSABLE_ENTITY, &code).into_response()
+        }
+        Ok(_) => {
+            gateway_error(StatusCode::BAD_GATEWAY, "UNEXPECTED_ENCLAVE_RESPONSE").into_response()
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+fn valid_request_context(context: &EncryptedRequestContext) -> bool {
+    let no_order_or_position =
+        context.expected_order_id.is_none() && context.expected_position_id.is_none();
+    let no_execution_or_funding = context.expected_execution_id.is_none()
+        && context.expected_withdrawal_id.is_none()
+        && context.expected_transfer_id.is_none();
+    let valid_commitment = context
+        .expected_command_commitment
+        .as_ref()
+        .is_some_and(|value| {
+            value.len() == 66
+                && value.starts_with("0x")
+                && value[2..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+    valid_idempotency_key(&context.idempotency_key)
+        && match context.expected_action {
+            ExpectedEncryptedAction::Submit | ExpectedEncryptedAction::CancelAll => {
+                no_order_or_position && no_execution_or_funding && valid_commitment
+            }
+            ExpectedEncryptedAction::Replace | ExpectedEncryptedAction::Cancel => {
+                context.expected_order_id.is_some()
+                    && context.expected_position_id.is_none()
+                    && no_execution_or_funding
+                    && valid_commitment
+            }
+            ExpectedEncryptedAction::PreviewPositionClose
+            | ExpectedEncryptedAction::ClosePosition => {
+                context.expected_order_id.is_none()
+                    && no_execution_or_funding
+                    && context.expected_position_id.as_ref().is_some_and(|value| {
+                        value.len() == 68
+                            && value.starts_with("pos_")
+                            && value[4..].bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                    && valid_commitment
+            }
+            ExpectedEncryptedAction::CompleteSet
+            | ExpectedEncryptedAction::Portfolio
+            | ExpectedEncryptedAction::Rewards
+            | ExpectedEncryptedAction::RequestRewardClaim => {
+                no_order_or_position && no_execution_or_funding && valid_commitment
+            }
+            ExpectedEncryptedAction::BootstrapStatus | ExpectedEncryptedAction::CancelBootstrap => {
+                no_order_or_position
+                    && context.expected_execution_id.is_some()
+                    && context.expected_withdrawal_id.is_none()
+                    && context.expected_transfer_id.is_none()
+                    && valid_commitment
+            }
+            ExpectedEncryptedAction::RequestWithdrawal => {
+                no_order_or_position
+                    && context.expected_execution_id.is_none()
+                    && context.expected_withdrawal_id.is_some()
+                    && context.expected_transfer_id.is_none()
+                    && valid_commitment
+            }
+            ExpectedEncryptedAction::TransferFunds => {
+                no_order_or_position
+                    && context.expected_execution_id.is_none()
+                    && context.expected_withdrawal_id.is_none()
+                    && context.expected_transfer_id.is_some()
+                    && valid_commitment
+            }
+        }
+        && (1..=8).contains(&context.expected_session_tags.len())
+        && context
+            .expected_session_tags
+            .iter()
+            .collect::<HashSet<_>>()
+            .len()
+            == context.expected_session_tags.len()
+        && context.expected_session_tags.iter().all(|tag| {
+            URL_SAFE_NO_PAD
+                .decode(tag)
+                .is_ok_and(|decoded| decoded.len() == 32)
+        })
 }
 
 async fn exchange(state: &AppState, request: WireRequest) -> Result<WireResponse, ApiError> {
@@ -426,15 +741,26 @@ fn decode_fixed<const N: usize>(value: &str, code: &'static str) -> Result<[u8; 
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, code))
 }
 
+fn valid_idempotency_key(value: &str) -> bool {
+    (8..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-'))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{sync::Arc, time::Duration};
 
+    use base64::Engine;
     use tokio::sync::Semaphore;
+    use uuid::Uuid;
 
     use super::{
-        acquire_exchange_permit, AccessCapability, AppState, WireRequest, ENCLAVE_EXCHANGE_TIMEOUT,
-        MAX_FRAME_BYTES, MAX_HTTP_BODY_BYTES,
+        acquire_exchange_permit, valid_idempotency_key, valid_request_context, AccessCapability,
+        AppState, DurableWriterAuthorization, EncryptedRequestContext, ExpectedEncryptedAction,
+        WireRequest, ENCLAVE_EXCHANGE_TIMEOUT, MAX_FRAME_BYTES, MAX_HTTP_BODY_BYTES,
+        URL_SAFE_NO_PAD,
     };
 
     #[test]
@@ -458,23 +784,255 @@ mod tests {
     #[test]
     fn vsock_wire_encoding_does_not_expand_checkpoint_ciphertext() {
         let ciphertext = vec![0xabu8; 20 * 1024 * 1024];
-        let request = WireRequest::Encrypted {
+        let request = WireRequest::EncryptedUser {
             access_capability: Some(AccessCapability::AccountRead),
             client_public_key: [7; 32],
             nonce: [9; 12],
             ciphertext,
+            request_context: EncryptedRequestContext {
+                idempotency_key: "order:create:1234".into(),
+                expected_action: ExpectedEncryptedAction::Submit,
+                expected_session_tags: vec![URL_SAFE_NO_PAD.encode([8u8; 32])],
+                expected_order_id: None,
+                expected_position_id: None,
+                expected_execution_id: None,
+                expected_withdrawal_id: None,
+                expected_transfer_id: None,
+                expected_command_commitment: Some(format!("0x{}", "77".repeat(32))),
+            },
+            writer_authorization: DurableWriterAuthorization {
+                protocol_version: "layrs.durable-writer-authorization.v1".into(),
+                environment: "test".into(),
+                epoch: 1,
+                lease_id: Uuid::from_u128(1),
+                not_before_millis: 1,
+                expires_at_millis: 2,
+                actor_domain: "USER".into(),
+                command_idempotency_key: "order:create:1234".into(),
+                command_commitment_sha256: [7; 32],
+                request_context_sha256: [8; 32],
+                request_envelope_sha256: [9; 32],
+                signature: vec![10; 64],
+            },
         };
         let encoded = serde_cbor::to_vec(&request).expect("wire request encodes");
         assert!(encoded.len() < 21 * 1024 * 1024);
         assert!(encoded.len() < MAX_FRAME_BYTES);
         let decoded: WireRequest = serde_cbor::from_slice(&encoded).expect("wire request decodes");
         match decoded {
-            WireRequest::Encrypted { ciphertext, .. } => {
+            WireRequest::EncryptedUser { ciphertext, .. } => {
                 assert_eq!(ciphertext.len(), 20 * 1024 * 1024);
                 assert_eq!(ciphertext[0], 0xab);
             }
             _ => panic!("unexpected wire request variant"),
         }
+    }
+
+    #[test]
+    fn command_context_idempotency_is_strictly_bounded_and_opaque() {
+        assert!(valid_idempotency_key("order:create:1234"));
+        assert!(!valid_idempotency_key("short"));
+        assert!(!valid_idempotency_key("order.create.1234"));
+        assert!(!valid_idempotency_key("order create 1234"));
+        assert!(!valid_idempotency_key(&"x".repeat(129)));
+        let valid = EncryptedRequestContext {
+            idempotency_key: "order:create:1234".into(),
+            expected_action: ExpectedEncryptedAction::Submit,
+            expected_session_tags: vec![URL_SAFE_NO_PAD.encode([9u8; 32])],
+            expected_order_id: None,
+            expected_position_id: None,
+            expected_execution_id: None,
+            expected_withdrawal_id: None,
+            expected_transfer_id: None,
+            expected_command_commitment: Some(format!("0x{}", "99".repeat(32))),
+        };
+        assert!(valid_request_context(&valid));
+        assert!(!valid_request_context(&EncryptedRequestContext {
+            expected_command_commitment: None,
+            ..valid.clone()
+        }));
+        assert!(!valid_request_context(&EncryptedRequestContext {
+            expected_command_commitment: Some("not-a-commitment".into()),
+            ..valid.clone()
+        }));
+        let cancel = EncryptedRequestContext {
+            idempotency_key: "order:cancel:1234".into(),
+            expected_action: ExpectedEncryptedAction::Cancel,
+            expected_session_tags: vec![URL_SAFE_NO_PAD.encode([8u8; 32])],
+            expected_order_id: Some(Uuid::new_v4()),
+            expected_position_id: None,
+            expected_execution_id: None,
+            expected_withdrawal_id: None,
+            expected_transfer_id: None,
+            expected_command_commitment: Some(format!("0x{}", "88".repeat(32))),
+        };
+        assert!(valid_request_context(&cancel));
+        assert!(!valid_request_context(&EncryptedRequestContext {
+            expected_command_commitment: None,
+            ..cancel.clone()
+        }));
+        assert_eq!(
+            serde_json::to_value(&cancel).unwrap()["expectedAction"],
+            "CANCEL_ORDER"
+        );
+        let replace = EncryptedRequestContext {
+            idempotency_key: "order:replace:1234".into(),
+            expected_action: ExpectedEncryptedAction::Replace,
+            ..cancel.clone()
+        };
+        assert!(valid_request_context(&replace));
+        assert!(!valid_request_context(&EncryptedRequestContext {
+            expected_command_commitment: None,
+            ..replace
+        }));
+        let cancel_all = EncryptedRequestContext {
+            idempotency_key: "orders:cancel-all:1234".into(),
+            expected_action: ExpectedEncryptedAction::CancelAll,
+            expected_session_tags: vec![URL_SAFE_NO_PAD.encode([7u8; 32])],
+            expected_order_id: None,
+            expected_position_id: None,
+            expected_execution_id: None,
+            expected_withdrawal_id: None,
+            expected_transfer_id: None,
+            expected_command_commitment: Some(format!("0x{}", "77".repeat(32))),
+        };
+        assert!(valid_request_context(&cancel_all));
+        assert!(!valid_request_context(&EncryptedRequestContext {
+            expected_command_commitment: None,
+            ..cancel_all.clone()
+        }));
+        assert_eq!(
+            serde_json::to_value(&cancel_all).unwrap()["expectedAction"],
+            "CANCEL_ALL_ORDERS"
+        );
+        let position_id = format!("pos_{}", "ab".repeat(32));
+        for expected_action in [
+            ExpectedEncryptedAction::PreviewPositionClose,
+            ExpectedEncryptedAction::ClosePosition,
+        ] {
+            let position = EncryptedRequestContext {
+                idempotency_key: "position:close:1234".into(),
+                expected_action,
+                expected_session_tags: vec![URL_SAFE_NO_PAD.encode([6u8; 32])],
+                expected_order_id: None,
+                expected_position_id: Some(position_id.clone()),
+                expected_execution_id: None,
+                expected_withdrawal_id: None,
+                expected_transfer_id: None,
+                expected_command_commitment: Some(format!("0x{}", "11".repeat(32))),
+            };
+            assert!(valid_request_context(&position));
+        }
+        for expected_action in [
+            ExpectedEncryptedAction::CompleteSet,
+            ExpectedEncryptedAction::Portfolio,
+            ExpectedEncryptedAction::Rewards,
+            ExpectedEncryptedAction::RequestRewardClaim,
+        ] {
+            assert!(valid_request_context(&EncryptedRequestContext {
+                idempotency_key: "private:read:1234".into(),
+                expected_action,
+                expected_session_tags: vec![URL_SAFE_NO_PAD.encode([5u8; 32])],
+                expected_order_id: None,
+                expected_position_id: None,
+                expected_execution_id: None,
+                expected_withdrawal_id: None,
+                expected_transfer_id: None,
+                expected_command_commitment: Some(format!("0x{}", "22".repeat(32))),
+            }));
+        }
+        let execution_id = Uuid::new_v4();
+        for expected_action in [
+            ExpectedEncryptedAction::BootstrapStatus,
+            ExpectedEncryptedAction::CancelBootstrap,
+        ] {
+            assert!(valid_request_context(&EncryptedRequestContext {
+                idempotency_key: "private:bootstrap:1234".into(),
+                expected_action,
+                expected_session_tags: vec![URL_SAFE_NO_PAD.encode([4u8; 32])],
+                expected_order_id: None,
+                expected_position_id: None,
+                expected_execution_id: Some(execution_id),
+                expected_withdrawal_id: None,
+                expected_transfer_id: None,
+                expected_command_commitment: Some(format!("0x{}", "33".repeat(32))),
+            }));
+        }
+        for (expected_action, expected_withdrawal_id, expected_transfer_id) in [
+            (
+                ExpectedEncryptedAction::RequestWithdrawal,
+                Some(Uuid::new_v4()),
+                None,
+            ),
+            (
+                ExpectedEncryptedAction::TransferFunds,
+                None,
+                Some(Uuid::new_v4()),
+            ),
+        ] {
+            assert!(valid_request_context(&EncryptedRequestContext {
+                idempotency_key: "private:funding:1234".into(),
+                expected_action,
+                expected_session_tags: vec![URL_SAFE_NO_PAD.encode([3u8; 32])],
+                expected_order_id: None,
+                expected_position_id: None,
+                expected_execution_id: None,
+                expected_withdrawal_id,
+                expected_transfer_id,
+                expected_command_commitment: Some(format!("0x{}", "44".repeat(32))),
+            }));
+        }
+        assert!(!valid_request_context(&EncryptedRequestContext {
+            expected_order_id: Some(Uuid::new_v4()),
+            ..cancel_all
+        }));
+        assert!(!valid_request_context(&EncryptedRequestContext {
+            idempotency_key: "order:cancel:1234".into(),
+            expected_action: ExpectedEncryptedAction::Cancel,
+            expected_session_tags: vec![URL_SAFE_NO_PAD.encode([8u8; 32])],
+            expected_order_id: None,
+            expected_position_id: None,
+            expected_execution_id: None,
+            expected_withdrawal_id: None,
+            expected_transfer_id: None,
+            expected_command_commitment: Some(format!("0x{}", "88".repeat(32))),
+        }));
+        assert!(!valid_request_context(&EncryptedRequestContext {
+            expected_session_tags: Vec::new(),
+            ..valid.clone()
+        }));
+        assert!(!valid_request_context(&EncryptedRequestContext {
+            expected_session_tags: vec!["not-a-tag".into()],
+            ..valid
+        }));
+    }
+
+    #[test]
+    fn private_relay_envelope_requires_command_context() {
+        let without_context = serde_json::json!({
+            "protocolVersion": "layrs.v1",
+            "clientPublicKey": URL_SAFE_NO_PAD.encode([1u8; 32]),
+            "nonce": URL_SAFE_NO_PAD.encode([2u8; 12]),
+            "ciphertext": URL_SAFE_NO_PAD.encode([3u8; 32]),
+        });
+        assert!(serde_json::from_value::<super::PrivateEnvelope>(without_context).is_err());
+    }
+
+    #[test]
+    fn operator_relay_is_explicit_and_rejects_user_context() {
+        let operator = serde_json::json!({
+            "protocolVersion": "layrs.v1",
+            "clientPublicKey": URL_SAFE_NO_PAD.encode([1u8; 32]),
+            "nonce": URL_SAFE_NO_PAD.encode([2u8; 12]),
+            "ciphertext": URL_SAFE_NO_PAD.encode([3u8; 32]),
+        });
+        assert!(serde_json::from_value::<super::PrivateOperatorEnvelope>(operator.clone()).is_ok());
+        let mut with_context = operator;
+        with_context.as_object_mut().unwrap().insert(
+            "requestContext".into(),
+            serde_json::json!({ "idempotencyKey": "order:create:1234" }),
+        );
+        assert!(serde_json::from_value::<super::PrivateOperatorEnvelope>(with_context).is_err());
     }
 
     #[tokio::test]

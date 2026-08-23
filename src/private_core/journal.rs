@@ -84,6 +84,7 @@ mod wire_tests {
     }
 }
 
+#[derive(Clone)]
 pub struct EncryptedJournal {
     cipher: Aes256Gcm,
     records: Vec<EncryptedJournalRecord>,
@@ -380,6 +381,16 @@ pub struct EnclaveReceipt {
     /// portfolio/status receipts remain user-verifiable but are never anchored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publication_eligible: Option<bool>,
+    /// Commitment to a nonce-salted, canonical result disclosure carried only
+    /// inside the owner-encrypted response. It proves ACCEPTED/REJECTED/
+    /// CANCELLED/FILLED without revealing that state to the parent, archive or
+    /// public receipt batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_commitment_sha256: Option<[u8; 32]>,
+    /// True when the receipt is bound to an appended encrypted journal record.
+    /// A signed terminal rejection is false and must preserve the prior root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_committed: Option<bool>,
     pub enclave_sequence: u64,
     pub prior_state_root: [u8; 32],
     pub state_root: [u8; 32],
@@ -389,6 +400,71 @@ pub struct EnclaveReceipt {
     pub signature: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CommandReceiptState {
+    #[default]
+    Accepted,
+    Rejected,
+    Cancelled,
+    Filled,
+}
+
+/// Cross-language commitment to the exact private command result. Object keys
+/// are sorted recursively so Rust, TypeScript and offline receipt verifiers
+/// hash identical bytes independent of serializer insertion order.
+pub fn command_result_commitment<T: Serialize>(
+    state: CommandReceiptState,
+    disclosure_nonce: [u8; 32],
+    result: &T,
+) -> CoreResult<[u8; 32]> {
+    let value = serde_json::json!({
+        "disclosure_nonce": disclosure_nonce,
+        "protocol_version": "layrs.command-result.v1",
+        "result": result,
+        "state": state,
+    });
+    let canonical = canonical_json(&value)?;
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.command-receipt-result.v1\0");
+    hash.update((canonical.len() as u64).to_be_bytes());
+    hash.update(canonical.as_bytes());
+    Ok(hash.finalize().into())
+}
+
+fn canonical_json(value: &serde_json::Value) -> CoreResult<String> {
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::String(_) => {
+            serde_json::to_string(value).map_err(|_| CoreError::RequestHashMismatch)
+        }
+        serde_json::Value::Number(number) => {
+            if !number.is_i64() && !number.is_u64() {
+                return Err(CoreError::RequestHashMismatch);
+            }
+            Ok(number.to_string())
+        }
+        serde_json::Value::Array(items) => {
+            let encoded = items
+                .iter()
+                .map(canonical_json)
+                .collect::<CoreResult<Vec<_>>>()?;
+            Ok(format!("[{}]", encoded.join(",")))
+        }
+        serde_json::Value::Object(fields) => {
+            let mut keys: Vec<_> = fields.keys().collect();
+            keys.sort_unstable();
+            let mut encoded = Vec::with_capacity(keys.len());
+            for key in keys {
+                let name =
+                    serde_json::to_string(key).map_err(|_| CoreError::RequestHashMismatch)?;
+                encoded.push(format!("{name}:{}", canonical_json(&fields[key])?));
+            }
+            Ok(format!("{{{}}}", encoded.join(",")))
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct ReceiptSigner {
     signing_key: SigningKey,
     enclave_measurement_sha384: [u8; 48],
@@ -420,6 +496,8 @@ impl ReceiptSigner {
         idempotency_key: String,
         command_commitment_sha256: Option<[u8; 32]>,
         publication_eligible: Option<bool>,
+        result_commitment_sha256: Option<[u8; 32]>,
+        journal_committed: Option<bool>,
         enclave_sequence: u64,
         prior_state_root: [u8; 32],
         state_root: [u8; 32],
@@ -431,8 +509,22 @@ impl ReceiptSigner {
             publication_eligible.is_some(),
             "receipt command commitment and publication policy must be versioned together"
         );
+        assert_eq!(
+            result_commitment_sha256.is_some(),
+            journal_committed.is_some()
+        );
+        assert!(
+            result_commitment_sha256.is_none() || command_commitment_sha256.is_some(),
+            "semantic command receipts require an exact command commitment"
+        );
+        if journal_committed == Some(false) {
+            assert_eq!(prior_state_root, state_root);
+            assert_eq!(publication_eligible, Some(false));
+        }
         let mut receipt = EnclaveReceipt {
-            protocol_version: if command_commitment_sha256.is_some() {
+            protocol_version: if result_commitment_sha256.is_some() {
+                "layrs.v3".into()
+            } else if command_commitment_sha256.is_some() {
                 "layrs.v2".into()
             } else {
                 "layrs.v1".into()
@@ -447,6 +539,8 @@ impl ReceiptSigner {
             idempotency_key,
             command_commitment_sha256,
             publication_eligible,
+            result_commitment_sha256,
+            journal_committed,
             enclave_sequence,
             prior_state_root,
             state_root,
@@ -462,6 +556,21 @@ impl ReceiptSigner {
 
     pub fn verifying_key(&self) -> [u8; 32] {
         self.signing_key.verifying_key().to_bytes()
+    }
+
+    pub fn result_disclosure_nonce(
+        &self,
+        command_commitment_sha256: [u8; 32],
+        enclave_sequence: u64,
+        state_root: [u8; 32],
+    ) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(b"layrs.command-receipt-disclosure.v1\0");
+        hash.update(self.signing_key.to_bytes());
+        hash.update(command_commitment_sha256);
+        hash.update(enclave_sequence.to_be_bytes());
+        hash.update(state_root);
+        hash.finalize().into()
     }
 
     pub fn sign_domain_payload<T: Serialize>(&self, domain: &[u8], value: &T) -> Vec<u8> {
@@ -488,6 +597,85 @@ fn deterministic_receipt_id(
     hash.update(sequence.to_be_bytes());
     hash.update(state_root);
     format!("receipt_{}", hex::encode(hash.finalize()))
+}
+
+#[cfg(test)]
+mod semantic_receipt_tests {
+    use super::*;
+    use ed25519_dalek::{Signature, Verifier};
+
+    #[test]
+    fn result_commitment_matches_the_browser_golden_vector() {
+        let result = serde_json::json!({
+            "type": "ORDER",
+            "result": {
+                "accepted_order": {
+                    "order_id": "order-open", "market_id": "market-1", "outcome": "UP",
+                    "action": "BUY", "price_micros": 400000,
+                    "quantity_micros": "1000000", "filled_micros": "0",
+                    "remaining_micros": "1000000", "time_in_force": "GTC",
+                    "expires_at_millis": null, "status": "OPEN"
+                },
+                "fills": [],
+                "cancelled_remainder_micros": "0",
+            },
+        });
+        assert_eq!(
+            hex::encode(
+                command_result_commitment(CommandReceiptState::Accepted, [9u8; 32], &result)
+                    .unwrap()
+            ),
+            "2817d0b7a7d0ae84a0ff05c652c42acf8aff7552dadd4a979f91508a8e49761a"
+        );
+    }
+
+    #[test]
+    fn disclosure_nonce_and_semantic_state_are_binding() {
+        let result = serde_json::json!({"type":"CANCELLED","order":{"order_id":"order-1"}});
+        let accepted =
+            command_result_commitment(CommandReceiptState::Accepted, [1u8; 32], &result).unwrap();
+        let cancelled =
+            command_result_commitment(CommandReceiptState::Cancelled, [1u8; 32], &result).unwrap();
+        let changed_nonce =
+            command_result_commitment(CommandReceiptState::Cancelled, [2u8; 32], &result).unwrap();
+        assert_ne!(accepted, cancelled);
+        assert_ne!(cancelled, changed_nonce);
+    }
+
+    #[test]
+    fn v3_signature_binds_result_commitment_and_journal_policy() {
+        let signer = ReceiptSigner::from_seed([3u8; 32], [4u8; 48]);
+        let receipt = signer.sign(
+            "018f1d5e-7b6d-4c31-8b0f-111111111111".into(),
+            "private:receipt:01234567".into(),
+            Some([5u8; 32]),
+            Some(true),
+            Some([6u8; 32]),
+            Some(true),
+            7,
+            [8u8; 32],
+            [9u8; 32],
+            [10u8; 32],
+            1_786_000_000_000,
+        );
+        assert_eq!(receipt.protocol_version, "layrs.v3");
+        let signature = Signature::from_slice(&receipt.signature).unwrap();
+        let mut unsigned = receipt.clone();
+        unsigned.signature.clear();
+        let payload = serde_json::to_vec(&unsigned).unwrap();
+        signer
+            .signing_key
+            .verifying_key()
+            .verify(&payload, &signature)
+            .unwrap();
+
+        unsigned.result_commitment_sha256 = Some([7u8; 32]);
+        assert!(signer
+            .signing_key
+            .verifying_key()
+            .verify(&serde_json::to_vec(&unsigned).unwrap(), &signature)
+            .is_err());
+    }
 }
 
 fn associated_data(sequence: u64, prior: &[u8; 32], root: &[u8; 32]) -> Vec<u8> {

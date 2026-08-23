@@ -41,19 +41,21 @@ pub use engine::{
     exact_condition_resolution_signing_payload, polymarket_resolution_signing_payload,
     resolution_signing_payload, AuditFillStatement, BinanceBoundaryEvidence,
     BinanceResolutionStatement, BootstrapExecutionState, BootstrapExecutionView,
-    BootstrapVenueIntent, BoundaryEvidence, CommandResult, CoreResponse,
-    CustodyReconciliationSnapshot, ExactConditionResolutionStatement, FeeProfileId, MarketConfig,
-    MarketExecution, MarketResolution, MarketSettlementReadiness, PolymarketRedemptionIntent,
-    PolymarketResolutionStatement, PortfolioSnapshot, PrivateBalance, PrivatePosition,
-    PrivateTradingCore, ResolutionEvidence, ResolutionOutcome, ResolutionStatement,
-    SignedAuditFillArtifact, SignedBinanceResolution, SignedExactConditionResolution,
-    SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence,
-    SignedTaskQualificationArtifact, SystemResponse, TaskQualificationStatement, UserCommand,
-    UserCommandAction, WithdrawalAuthorization, WithdrawalIntent,
+    BootstrapPreparedVenueOrder, BootstrapVenueIntent, BoundaryEvidence, CancelAllOrdersFilter,
+    CancelledOrderOutcome, CommandResult, CoreResponse, CustodyReconciliationSnapshot,
+    ExactConditionResolutionStatement, FeeProfileId, MarketConfig, MarketExecution,
+    MarketResolution, MarketSettlementReadiness, PolymarketRedemptionIntent,
+    PolymarketResolutionStatement, PortfolioSnapshot, PositionClosePreview, PrivateBalance,
+    PrivatePosition, PrivateTradingCore, RecoveryBridgeArtifact, ResolutionEvidence,
+    ResolutionOutcome, ResolutionStatement, SignedAuditFillArtifact, SignedBinanceResolution,
+    SignedExactConditionResolution, SignedPolymarketResolution, SignedResolution,
+    SignedResolutionEvidence, SignedTaskQualificationArtifact, SystemResponse,
+    TaskQualificationStatement, UserCommand, UserCommandAction, WithdrawalAuthorization,
+    WithdrawalIntent,
 };
 pub use journal::{
-    EnclaveReceipt, EncryptedJournal, EncryptedJournalRecord, EncryptedSnapshot, JournalKey,
-    ReceiptSigner,
+    command_result_commitment, CommandReceiptState, EnclaveReceipt, EncryptedJournal,
+    EncryptedJournalRecord, EncryptedSnapshot, JournalKey, ReceiptSigner,
 };
 #[allow(unused_imports)]
 pub use ledger::{
@@ -114,6 +116,12 @@ pub enum CoreError {
     RollbackDetected,
     #[error("command was processed before the restored checkpoint; query its receipt archive")]
     PreviouslyProcessed,
+    #[error("private command recovery record exceeds the certified bound")]
+    RecoveryCapsuleTooLarge,
+    #[error("private command recovery window is full pending durable archive acknowledgement")]
+    RecoveryWindowFull,
+    #[error("private command recovery window is inconsistent")]
+    InvalidRecoveryCapsule,
 }
 
 pub type CoreResult<T> = Result<T, CoreError>;

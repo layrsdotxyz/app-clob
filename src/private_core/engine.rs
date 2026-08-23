@@ -14,13 +14,14 @@ use super::rewards::{
     PrivateRewardBook, PrivateRewardEntitlement, RewardClaimAuthorization, RewardClaimIntent,
 };
 use super::{
-    AccountBucket, AccountKey, BookOrder, ClaimPayout, CompleteSetDirection,
-    CompleteSetFillPosting, CompleteSetTransaction, CoreError, CoreResult, CustodyLedgerTotal,
-    EnclaveReceipt, EncryptedJournal, EncryptedJournalRecord, EncryptedSnapshot,
-    ExternalFlowDirection, ExternalFlowTransaction, Fill, JournalKey, Ledger, LedgerTransaction,
-    MatchResult, MatchType, NormalFillPosting, OrderAction, OrderStatus, Outcome, PriceTimeBook,
-    ReceiptSigner, ResolutionPayoutKind, SessionGuard, SignedSessionRequest, Transfer,
-    VaultStrategyTransaction, VaultStrategyTransition, PRICE_SCALE,
+    command_result_commitment, AccountBucket, AccountKey, BookOrder, ClaimPayout,
+    CommandReceiptState, CompleteSetDirection, CompleteSetFillPosting, CompleteSetTransaction,
+    CoreError, CoreResult, CustodyLedgerTotal, EnclaveReceipt, EncryptedJournal,
+    EncryptedJournalRecord, EncryptedSnapshot, ExternalFlowDirection, ExternalFlowTransaction,
+    Fill, JournalKey, Ledger, LedgerTransaction, MatchResult, MatchType, NormalFillPosting,
+    OrderAction, OrderStatus, Outcome, PriceTimeBook, ReceiptSigner, ResolutionPayoutKind,
+    SessionGuard, SignedSessionRequest, TimeInForce, Transfer, VaultStrategyTransaction,
+    VaultStrategyTransition, PRICE_SCALE,
 };
 
 /// Public depth is deliberately less precise than the enclave's private book.
@@ -28,6 +29,10 @@ use super::{
 /// owners before it can leave the enclave. This prevents a thin public level
 /// from acting as an oracle for one user's exact order size and arrival time.
 const MIN_PUBLIC_DEPTH_DISTINCT_OWNERS: usize = 3;
+/// Position-close quotes are deliberately short lived. They commit to the
+/// exact private book state and economics seen by the enclave, so a quote can
+/// neither be replayed after the book moves nor extended by an API client.
+const POSITION_CLOSE_QUOTE_TTL_MILLIS: i64 = 30_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketConfig {
@@ -279,6 +284,8 @@ pub struct PolymarketRedemptionIntent {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum BootstrapExecutionState {
     FundsReserved,
+    VenueIntentDurable,
+    VenueSubmissionAttempted,
     VenueSubmitted,
     VenueConfirmed,
     Failed,
@@ -301,12 +308,22 @@ pub struct BootstrapExecutionView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapPreparedVenueOrder {
+    pub deterministic_order_id: String,
+    pub exact_request_body: String,
+    pub request_body_sha256: [u8; 32],
+    pub credential_generation_sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct BootstrapExecution {
     view: BootstrapExecutionView,
     private_user_id: String,
     reserved_atomic: u128,
     venue_order_id: Option<String>,
     venue_evidence_hash: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepared_venue_order: Option<BootstrapPreparedVenueOrder>,
     created_at_millis: i64,
 }
 
@@ -477,9 +494,36 @@ pub enum UserCommandAction {
     SubmitOrder {
         order: BookOrder,
     },
+    ReplaceOrder {
+        market_id: String,
+        order_id: Uuid,
+        replacement: BookOrder,
+    },
     CancelOrder {
         market_id: String,
         order_id: Uuid,
+    },
+    CancelAllOrders {
+        filter: CancelAllOrdersFilter,
+    },
+    PreviewPositionClose {
+        position_id: String,
+        market_id: String,
+        outcome: Outcome,
+        session_tag: String,
+        #[serde(with = "super::decimal_u128")]
+        quantity_micros: u128,
+        minimum_price_micros: u64,
+    },
+    ClosePosition {
+        position_id: String,
+        market_id: String,
+        outcome: Outcome,
+        session_tag: String,
+        #[serde(with = "super::decimal_u128")]
+        quantity_micros: u128,
+        minimum_price_micros: u64,
+        quote: PositionClosePreview,
     },
     CompleteSet {
         market_id: String,
@@ -520,6 +564,21 @@ pub enum UserCommandAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CancelAllOrdersFilter {
+    All,
+    Market { market_id: String },
+    Asset { asset: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelledOrderOutcome {
+    pub order_id: Uuid,
+    pub market_id: String,
+    pub status: OrderStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrivateBalance {
     pub asset: String,
     pub bucket: AccountBucket,
@@ -528,10 +587,30 @@ pub struct PrivateBalance {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrivatePosition {
+    pub position_id: String,
     pub market_id: String,
     pub outcome: String,
     pub quantity_micros: String,
     pub cost_basis_micros: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PositionClosePreview {
+    pub position_id: String,
+    #[serde(with = "super::decimal_u128")]
+    pub quantity_micros: u128,
+    pub minimum_price_micros: u64,
+    pub average_price_micros: u64,
+    #[serde(with = "super::decimal_u128")]
+    pub gross_payout_atomic: u128,
+    #[serde(with = "super::decimal_u128")]
+    pub fee_atomic: u128,
+    #[serde(with = "super::decimal_u128")]
+    pub net_payout_atomic: u128,
+    pub book_commitment_sha256: [u8; 32],
+    pub book_sequence: u64,
+    pub expires_at_millis: i64,
+    pub quote_commitment_sha256: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -648,6 +727,34 @@ pub enum CommandResult {
     Cancelled {
         order: BookOrder,
     },
+    OrdersCancelled {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<CancelAllOrdersFilter>,
+        outcomes: Vec<CancelledOrderOutcome>,
+    },
+    PositionClosePreview {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        market_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<Outcome>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_tag: Option<String>,
+        preview: PositionClosePreview,
+    },
+    PositionClosed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        market_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<Outcome>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_tag: Option<String>,
+        preview: PositionClosePreview,
+        order_id: Uuid,
+    },
+    Replaced {
+        cancelled: BookOrder,
+        result: MatchResult,
+    },
     CompleteSet {
         market_id: String,
         #[serde(with = "super::decimal_u128")]
@@ -693,6 +800,8 @@ pub enum CommandResult {
 pub struct CoreResponse {
     pub result: CommandResult,
     pub receipt: EnclaveReceipt,
+    pub receipt_state: CommandReceiptState,
+    pub receipt_disclosure_nonce: [u8; 32],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_record: Option<EncryptedJournalRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -703,6 +812,25 @@ pub struct CoreResponse {
     pub audit_fills: Vec<SignedAuditFillArtifact>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub task_qualifications: Vec<SignedTaskQualificationArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryBridgeArtifact {
+    pub protocol_version: String,
+    pub environment: String,
+    pub command_idempotency_key: String,
+    pub result_digest: [u8; 32],
+    pub enclave_sequence: u64,
+    pub command_commitment_sha256: [u8; 32],
+    pub state_root: [u8; 32],
+    pub receipt_id: String,
+    pub response_envelope_sha256: [u8; 32],
+    pub response_envelope_bytes: u64,
+    pub response_status: u16,
+    pub content_type: String,
+    pub observed_at_millis: i64,
+    pub expires_at_millis: i64,
+    pub signature: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -796,6 +924,45 @@ struct ProcessedCommand {
     response: Option<CoreResponse>,
 }
 
+const MAX_RECOVERY_CAPSULES: usize = 256;
+const MAX_RECOVERY_CAPSULE_BYTES: usize = 64 * 1024;
+const MAX_RECOVERY_WINDOW_BYTES: usize = 16 * 1024 * 1024;
+const MAX_RECOVERY_FILLS: usize = 64;
+
+/// A bounded, encrypted-snapshot recovery record for a committed private
+/// command. The exact command/context binding remains in the rooted
+/// `processed-command` marker; the result hash has its own rooted marker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RecoveryCapsule {
+    sequence: u64,
+    request_hash: [u8; 32],
+    result_digest: [u8; 32],
+    result: CommandResult,
+    receipt: EnclaveReceipt,
+    #[serde(default)]
+    receipt_state: CommandReceiptState,
+    #[serde(default)]
+    receipt_disclosure_nonce: [u8; 32],
+    audit_fills: Vec<SignedAuditFillArtifact>,
+    task_qualifications: Vec<SignedTaskQualificationArtifact>,
+}
+
+impl RecoveryCapsule {
+    fn response(&self) -> CoreResponse {
+        CoreResponse {
+            result: self.result.clone(),
+            receipt: self.receipt.clone(),
+            receipt_state: self.receipt_state,
+            receipt_disclosure_nonce: self.receipt_disclosure_nonce,
+            encrypted_record: None,
+            withdrawal_authorization: None,
+            reward_claim_authorization: None,
+            audit_fills: self.audit_fills.clone(),
+            task_qualifications: self.task_qualifications.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 enum JournaledSystemCommand {
@@ -869,6 +1036,17 @@ enum JournaledSystemCommand {
         idempotency_key: String,
         resolution: MarketResolution,
     },
+    MarkBootstrapVenueIntentDurable {
+        idempotency_key: String,
+        execution_id: Uuid,
+        deterministic_order_id: String,
+        request_body_sha256: [u8; 32],
+        credential_generation_sha256: [u8; 32],
+    },
+    AuthorizeBootstrapSubmissionAttempt {
+        idempotency_key: String,
+        execution_id: Uuid,
+    },
     MarkBootstrapSubmitted {
         idempotency_key: String,
         execution_id: Uuid,
@@ -886,6 +1064,12 @@ enum JournaledSystemCommand {
         failure_code: String,
         evidence_hash: [u8; 32],
     },
+    AcknowledgeRecoveryArchive {
+        idempotency_key: String,
+        command_idempotency_key: String,
+        result_digest: [u8; 32],
+        archive_row_commitment: [u8; 32],
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -895,6 +1079,11 @@ struct CoreStateSnapshot {
     markets: BTreeMap<String, MarketConfig>,
     sessions: SessionGuard,
     processed_hashes: BTreeMap<String, [u8; 32]>,
+    /// Recent exact private results only. This window is deterministically
+    /// bounded before a snapshot is sealed; older commands remain committed
+    /// and return `PreviouslyProcessed` rather than being executed twice.
+    #[serde(default)]
+    recovery_capsules: BTreeMap<String, RecoveryCapsule>,
     system_keys: BTreeSet<String>,
     position_cost_basis: Vec<(PositionKey, u128)>,
     resolutions: BTreeMap<String, MarketResolution>,
@@ -908,12 +1097,14 @@ struct CoreStateSnapshot {
     sequence: u64,
 }
 
+#[derive(Clone)]
 pub struct PrivateTradingCore {
     ledger: Ledger,
     books: BTreeMap<String, PriceTimeBook>,
     markets: BTreeMap<String, MarketConfig>,
     sessions: SessionGuard,
     processed: BTreeMap<String, ProcessedCommand>,
+    recovery_capsules: BTreeMap<String, RecoveryCapsule>,
     system_keys: BTreeSet<String>,
     journal: EncryptedJournal,
     receipt_signer: ReceiptSigner,
@@ -937,6 +1128,7 @@ impl PrivateTradingCore {
             markets: BTreeMap::new(),
             sessions: SessionGuard::default(),
             processed: BTreeMap::new(),
+            recovery_capsules: BTreeMap::new(),
             system_keys: BTreeSet::new(),
             journal: EncryptedJournal::new(journal_key),
             receipt_signer,
@@ -1086,6 +1278,7 @@ impl PrivateTradingCore {
                 markets: self.markets.clone(),
                 sessions: self.sessions.clone(),
                 processed_hashes: processed_hashes(&self.processed),
+                recovery_capsules: self.recovery_capsules.clone(),
                 system_keys: self.system_keys.clone(),
                 position_cost_basis: self
                     .position_cost_basis
@@ -1114,6 +1307,7 @@ impl PrivateTradingCore {
             markets: self.markets.clone(),
             sessions: self.sessions.clone(),
             processed_hashes: processed_hashes(&self.processed),
+            recovery_capsules: self.recovery_capsules.clone(),
             system_keys: self.system_keys.clone(),
             position_cost_basis: self
                 .position_cost_basis
@@ -1161,6 +1355,7 @@ impl PrivateTradingCore {
             markets: self.markets.clone(),
             sessions: self.sessions.clone(),
             processed_hashes: processed_hashes(&self.processed),
+            recovery_capsules: self.recovery_capsules.clone(),
             system_keys: self.system_keys.clone(),
             position_cost_basis: self
                 .position_cost_basis
@@ -1213,15 +1408,26 @@ impl PrivateTradingCore {
         }
         let position_cost_basis: BTreeMap<PositionKey, u128> =
             state.position_cost_basis.into_iter().collect();
+        validate_recovery_capsules(
+            &state.recovery_capsules,
+            &state.processed_hashes,
+            &state.system_keys,
+            &identity_key,
+            state.sequence,
+        )?;
         let processed: BTreeMap<String, ProcessedCommand> = state
             .processed_hashes
             .into_iter()
             .map(|(key, request_hash)| {
+                let response = state
+                    .recovery_capsules
+                    .get(&key)
+                    .map(RecoveryCapsule::response);
                 (
                     key,
                     ProcessedCommand {
                         request_hash,
-                        response: None,
+                        response,
                     },
                 )
             })
@@ -1285,6 +1491,7 @@ impl PrivateTradingCore {
             markets: state.markets,
             sessions: state.sessions,
             processed,
+            recovery_capsules: state.recovery_capsules,
             system_keys: state.system_keys,
             journal,
             receipt_signer,
@@ -1296,6 +1503,91 @@ impl PrivateTradingCore {
             trading_frozen: state.trading_frozen,
             sequence: state.sequence,
             identity_key,
+            custody_totals_cache: RefCell::new(None),
+        })
+    }
+
+    /// Restores an authenticated direct successor of the current committed
+    /// state. This is used only by the durable-command finalizer after the
+    /// encrypted successor snapshot and journal record have been made durable
+    /// outside the enclave. It deliberately refuses gaps, forks and rollback.
+    pub fn restore_successor_snapshot(&self, snapshot: &EncryptedSnapshot) -> CoreResult<Self> {
+        if snapshot.sequence
+            != self
+                .sequence
+                .checked_add(1)
+                .ok_or(CoreError::JournalChainMismatch)?
+        {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        let mut journal = self.journal.clone();
+        let state: CoreStateSnapshot = journal.open_snapshot(snapshot)?;
+        if state.sequence != snapshot.sequence {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        let position_cost_basis: BTreeMap<PositionKey, u128> =
+            state.position_cost_basis.into_iter().collect();
+        validate_recovery_capsules(
+            &state.recovery_capsules,
+            &state.processed_hashes,
+            &state.system_keys,
+            &self.identity_key,
+            state.sequence,
+        )?;
+        let processed: BTreeMap<String, ProcessedCommand> = state
+            .processed_hashes
+            .into_iter()
+            .map(|(key, request_hash)| {
+                let response = state
+                    .recovery_capsules
+                    .get(&key)
+                    .map(RecoveryCapsule::response);
+                (
+                    key,
+                    ProcessedCommand {
+                        request_hash,
+                        response,
+                    },
+                )
+            })
+            .collect();
+        let computed_root = state_root(
+            &state.ledger,
+            &state.books,
+            &state.markets,
+            &state.sessions,
+            &processed_hashes(&processed),
+            &state.system_keys,
+            &position_cost_basis,
+            &state.resolutions,
+            &state.oracle_public_key,
+            &state.bootstrap_executions,
+            &state.private_rewards,
+            state.trading_frozen,
+            state.sequence,
+        );
+        if computed_root != snapshot.state_root {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        journal.restore_chain_head(snapshot.sequence, snapshot.journal_head)?;
+        Ok(Self {
+            ledger: state.ledger,
+            books: state.books,
+            markets: state.markets,
+            sessions: state.sessions,
+            processed,
+            recovery_capsules: state.recovery_capsules,
+            system_keys: state.system_keys,
+            journal,
+            receipt_signer: self.receipt_signer.clone(),
+            position_cost_basis,
+            resolutions: state.resolutions,
+            oracle_public_key: state.oracle_public_key,
+            bootstrap_executions: state.bootstrap_executions,
+            private_rewards: state.private_rewards,
+            trading_frozen: state.trading_frozen,
+            sequence: state.sequence,
+            identity_key: self.identity_key,
             custody_totals_cache: RefCell::new(None),
         })
     }
@@ -1365,6 +1657,153 @@ impl PrivateTradingCore {
         self.trading_frozen
     }
 
+    /// Recovers only a byte-for-byte identical committed user command.
+    ///
+    /// This check is intentionally available before a fresh NSM clock read so a
+    /// lost HTTP response can be recovered even during a temporary NSM failure.
+    /// Legacy processed entries without the rooted full-command marker remain
+    /// non-recoverable and return `PreviouslyProcessed`.
+    pub fn recover_exact_user_command(
+        &self,
+        command: &UserCommand,
+    ) -> CoreResult<Option<CoreResponse>> {
+        let expected_hash = command_request_hash(
+            &command.command_id,
+            &command.idempotency_key,
+            &command.action,
+        )?;
+        if command.session.request.request_hash != expected_hash {
+            return Err(CoreError::RequestHashMismatch);
+        }
+        let Some(processed) = self.processed.get(&command.idempotency_key) else {
+            return Ok(None);
+        };
+        if processed.request_hash != expected_hash {
+            return Err(CoreError::DuplicateCommand);
+        }
+        if !self.system_keys.contains(&processed_command_marker(
+            &command.idempotency_key,
+            full_user_command_commitment(command)?,
+        )) {
+            return Err(CoreError::PreviouslyProcessed);
+        }
+        processed
+            .response
+            .clone()
+            .map(Some)
+            .ok_or(CoreError::PreviouslyProcessed)
+    }
+
+    /// Attaches the chain signer output to the exact cached reward-claim
+    /// response after signing succeeds outside the financial core.
+    ///
+    /// The financial mutation and its rooted request marker are already
+    /// committed by `execute`. This method may only enrich that exact cached
+    /// response with an authorization whose intent is byte-for-byte identical
+    /// to the rooted command result. It does not alter financial state, journal
+    /// sequence, or the state root. This makes a byte-identical transport retry
+    /// return the original signed authorization instead of authorizing twice.
+    pub fn attach_reward_claim_authorization(
+        &mut self,
+        command: &UserCommand,
+        authorization: RewardClaimAuthorization,
+    ) -> CoreResult<()> {
+        let expected_hash = command_request_hash(
+            &command.command_id,
+            &command.idempotency_key,
+            &command.action,
+        )?;
+        if command.session.request.request_hash != expected_hash {
+            return Err(CoreError::RequestHashMismatch);
+        }
+        let processed = self
+            .processed
+            .get_mut(&command.idempotency_key)
+            .ok_or(CoreError::PreviouslyProcessed)?;
+        if processed.request_hash != expected_hash {
+            return Err(CoreError::DuplicateCommand);
+        }
+        let response = processed
+            .response
+            .as_mut()
+            .ok_or(CoreError::PreviouslyProcessed)?;
+        let CommandResult::RewardClaimAuthorized { intent } = &response.result else {
+            return Err(CoreError::InvalidOrder(
+                "reward authorization does not match command result".into(),
+            ));
+        };
+        if authorization.intent != *intent {
+            return Err(CoreError::InvalidOrder(
+                "reward authorization intent mismatch".into(),
+            ));
+        }
+        match &response.reward_claim_authorization {
+            Some(existing) if existing != &authorization => {
+                return Err(CoreError::InvalidOrder(
+                    "reward authorization already differs".into(),
+                ));
+            }
+            Some(_) => return Ok(()),
+            None => {}
+        }
+        response.reward_claim_authorization = Some(authorization);
+        Ok(())
+    }
+
+    pub fn signed_recovery_bridge_artifact(
+        &self,
+        command_idempotency_key: &str,
+        environment: &str,
+        response_envelope_sha256: [u8; 32],
+        response_envelope_bytes: u64,
+    ) -> Option<RecoveryBridgeArtifact> {
+        self.recovery_capsules
+            .get(command_idempotency_key)
+            .and_then(|capsule| {
+                let mut artifact = RecoveryBridgeArtifact {
+                    protocol_version: "layrs.private-response-recovery.v1".into(),
+                    environment: environment.to_owned(),
+                    command_idempotency_key: command_idempotency_key.to_owned(),
+                    result_digest: capsule.result_digest,
+                    enclave_sequence: capsule.sequence,
+                    command_commitment_sha256: capsule.request_hash,
+                    state_root: capsule.receipt.state_root,
+                    receipt_id: capsule.receipt.receipt_id.clone(),
+                    response_envelope_sha256,
+                    response_envelope_bytes,
+                    response_status: 200,
+                    content_type: "application/json".into(),
+                    observed_at_millis: capsule.receipt.occurred_at_millis,
+                    expires_at_millis: capsule
+                        .receipt
+                        .occurred_at_millis
+                        .checked_add(24 * 60 * 60 * 1_000)?,
+                    signature: Vec::new(),
+                };
+                artifact.signature = self.receipt_signer.sign_domain_payload(
+                    b"layrs.private-response-recovery-artifact.v1\0",
+                    &artifact,
+                );
+                Some(artifact)
+            })
+    }
+
+    /// Read-only reconciliation proof for an archive ACK whose response may
+    /// have been lost after the enclave committed it. The exact marker is
+    /// rooted by `acknowledge_recovery_archive`; absence never implies success.
+    pub fn recovery_archive_acknowledged(
+        &self,
+        command_idempotency_key: &str,
+        result_digest: [u8; 32],
+        archive_row_commitment: [u8; 32],
+    ) -> bool {
+        self.system_keys.contains(&recovery_archive_ack_marker(
+            command_idempotency_key,
+            result_digest,
+            archive_row_commitment,
+        ))
+    }
+
     pub fn set_trading_freeze(
         &mut self,
         idempotency_key: String,
@@ -1412,6 +1851,90 @@ impl PrivateTradingCore {
             } else {
                 "trading-unfreeze"
             },
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
+    }
+
+    /// Removes one exact SubmitOrder recovery bridge only after the governed
+    /// operator attests that the padded opaque response is durably archived.
+    /// The archive commitment and result digest are rooted and journaled; an
+    /// ACK for another command/result can never free capacity.
+    pub fn acknowledge_recovery_archive(
+        &mut self,
+        idempotency_key: String,
+        command_idempotency_key: String,
+        result_digest: [u8; 32],
+        archive_row_commitment: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        if archive_row_commitment == [0u8; 32] {
+            return Err(CoreError::InvalidRecoveryCapsule);
+        }
+        let capsule = self
+            .recovery_capsules
+            .get(&command_idempotency_key)
+            .ok_or(CoreError::InvalidRecoveryCapsule)?;
+        if capsule.result_digest != result_digest {
+            return Err(CoreError::InvalidRecoveryCapsule);
+        }
+        let capsule_request_hash = capsule.request_hash;
+
+        let prior_root = self.state_root();
+        let mut capsules = self.recovery_capsules.clone();
+        capsules.remove(&command_idempotency_key);
+        let mut processed = self.processed.clone();
+        let processed_command = processed
+            .get_mut(&command_idempotency_key)
+            .ok_or(CoreError::InvalidRecoveryCapsule)?;
+        if processed_command.request_hash != capsule_request_hash {
+            return Err(CoreError::InvalidRecoveryCapsule);
+        }
+        processed_command.response = None;
+        let mut keys = self.system_keys.clone();
+        keys.remove(&recovery_result_marker(
+            &command_idempotency_key,
+            result_digest,
+        ));
+        keys.insert(idempotency_key.clone());
+        keys.insert(recovery_archive_ack_marker(
+            &command_idempotency_key,
+            result_digest,
+            archive_row_commitment,
+        ));
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &self.ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::AcknowledgeRecoveryArchive {
+            idempotency_key: idempotency_key.clone(),
+            command_idempotency_key,
+            result_digest,
+            archive_row_commitment,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.recovery_capsules = capsules;
+        self.processed = processed;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            "acknowledge-recovery-archive",
             idempotency_key,
             prior_root,
             next_root,
@@ -1529,6 +2052,8 @@ impl PrivateTradingCore {
             idempotency_key,
             Some(command_commitment),
             Some(true),
+            None,
+            None,
             next_sequence,
             prior_root,
             next_root,
@@ -1626,6 +2151,7 @@ impl PrivateTradingCore {
             &self.ledger,
             &self.books,
             &self.position_cost_basis,
+            &self.identity_key,
             &private_user_id,
             now_millis,
         )
@@ -2496,6 +3022,154 @@ impl PrivateTradingCore {
         })
     }
 
+    /// Commits the deterministic external-venue intent before any network I/O.
+    /// The coordinator must finalize this transition before asking the enclave
+    /// to submit the venue order.
+    pub fn mark_bootstrap_venue_intent_durable(
+        &mut self,
+        idempotency_key: String,
+        execution_id: Uuid,
+        prepared_order: BootstrapPreparedVenueOrder,
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        let prior_root = self.state_root();
+        let mut executions = self.bootstrap_executions.clone();
+        let execution = executions
+            .get_mut(&execution_id)
+            .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
+        if execution.view.state != BootstrapExecutionState::FundsReserved {
+            return Err(CoreError::InvalidOrder(
+                "bootstrap execution is not awaiting a durable venue intent".into(),
+            ));
+        }
+        if !prepared_order.deterministic_order_id.starts_with("0x")
+            || prepared_order.deterministic_order_id.len() != 66
+            || prepared_order.exact_request_body.len() < 64
+            || prepared_order.exact_request_body.len() > 65_536
+            || Sha256::digest(prepared_order.exact_request_body.as_bytes()).as_slice()
+                != prepared_order.request_body_sha256
+        {
+            return Err(CoreError::InvalidOrder(
+                "invalid prepared venue order".into(),
+            ));
+        }
+        execution.view.state = BootstrapExecutionState::VenueIntentDurable;
+        execution.prepared_venue_order = Some(prepared_order.clone());
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &self.ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::MarkBootstrapVenueIntentDurable {
+            idempotency_key: idempotency_key.clone(),
+            execution_id,
+            deterministic_order_id: prepared_order.deterministic_order_id,
+            request_body_sha256: prepared_order.request_body_sha256,
+            credential_generation_sha256: prepared_order.credential_generation_sha256,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.bootstrap_executions = executions;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            "bootstrap-venue-intent-durable",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
+    }
+
+    pub fn bootstrap_prepared_venue_order(
+        &self,
+        execution_id: Uuid,
+    ) -> CoreResult<BootstrapPreparedVenueOrder> {
+        let execution = self
+            .bootstrap_executions
+            .get(&execution_id)
+            .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
+        if execution.view.state != BootstrapExecutionState::VenueSubmissionAttempted {
+            return Err(CoreError::InvalidOrder(
+                "venue submission is not authorized".into(),
+            ));
+        }
+        execution
+            .prepared_venue_order
+            .clone()
+            .ok_or_else(|| CoreError::InvalidOrder("prepared venue order is unavailable".into()))
+    }
+
+    pub fn authorize_bootstrap_submission_attempt(
+        &mut self,
+        idempotency_key: String,
+        execution_id: Uuid,
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        let prior_root = self.state_root();
+        let mut executions = self.bootstrap_executions.clone();
+        let execution = executions
+            .get_mut(&execution_id)
+            .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
+        if execution.view.state != BootstrapExecutionState::VenueIntentDurable
+            || execution.prepared_venue_order.is_none()
+        {
+            return Err(CoreError::InvalidOrder(
+                "durable venue intent is required".into(),
+            ));
+        }
+        execution.view.state = BootstrapExecutionState::VenueSubmissionAttempted;
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &self.ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::AuthorizeBootstrapSubmissionAttempt {
+            idempotency_key: idempotency_key.clone(),
+            execution_id,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.bootstrap_executions = executions;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            "bootstrap-submission-attempt-authorized",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
+    }
+
     /// Produces the exact public venue-redemption intent that backs the outstanding private
     /// claims. Signing and broadcasting are separate so the prepared raw transaction can be
     /// durably recorded before it is sent to Polygon.
@@ -2665,15 +3339,17 @@ impl PrivateTradingCore {
             .bootstrap_executions
             .get(&execution_id)
             .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
-        if execution.view.state != BootstrapExecutionState::VenueSubmitted {
-            return Err(CoreError::InvalidOrder(
-                "bootstrap execution is not awaiting venue confirmation".into(),
-            ));
+        match execution.view.state {
+            BootstrapExecutionState::VenueSubmitted => execution.venue_order_id.clone(),
+            BootstrapExecutionState::VenueSubmissionAttempted => execution
+                .prepared_venue_order
+                .as_ref()
+                .map(|prepared| prepared.deterministic_order_id.clone()),
+            _ => None,
         }
-        execution
-            .venue_order_id
-            .clone()
-            .ok_or_else(|| CoreError::InvalidOrder("venue order id is unavailable".into()))
+        .ok_or_else(|| {
+            CoreError::InvalidOrder("bootstrap execution is not awaiting venue confirmation".into())
+        })
     }
 
     pub fn bootstrap_execution_view(
@@ -2725,7 +3401,7 @@ impl PrivateTradingCore {
         let execution = executions
             .get_mut(&execution_id)
             .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
-        if execution.view.state != BootstrapExecutionState::FundsReserved {
+        if execution.view.state != BootstrapExecutionState::VenueSubmissionAttempted {
             return Err(CoreError::InvalidOrder(
                 "bootstrap execution is not awaiting venue submission".into(),
             ));
@@ -3087,7 +3763,10 @@ impl PrivateTradingCore {
             .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
         if !matches!(
             execution.view.state,
-            BootstrapExecutionState::FundsReserved | BootstrapExecutionState::VenueSubmitted
+            BootstrapExecutionState::FundsReserved
+                | BootstrapExecutionState::VenueIntentDurable
+                | BootstrapExecutionState::VenueSubmissionAttempted
+                | BootstrapExecutionState::VenueSubmitted
         ) {
             return Err(CoreError::InvalidOrder(
                 "bootstrap execution is already terminal".into(),
@@ -3168,6 +3847,12 @@ impl PrivateTradingCore {
             if processed.request_hash != expected_hash {
                 return Err(CoreError::DuplicateCommand);
             }
+            if !self.system_keys.contains(&processed_command_marker(
+                &command.idempotency_key,
+                full_user_command_commitment(&command)?,
+            )) {
+                return Err(CoreError::PreviouslyProcessed);
+            }
             return processed
                 .response
                 .clone()
@@ -3177,11 +3862,16 @@ impl PrivateTradingCore {
             && matches!(
                 &command.action,
                 UserCommandAction::SubmitOrder { .. }
+                    | UserCommandAction::ReplaceOrder { .. }
+                    | UserCommandAction::ClosePosition { .. }
                     | UserCommandAction::CompleteSet { .. }
                     | UserCommandAction::RequestWithdrawal { .. }
             )
         {
             return Err(CoreError::TradingFrozen);
+        }
+        if matches!(command.action, UserCommandAction::SubmitOrder { .. }) {
+            reserve_recovery_capacity(&self.recovery_capsules)?;
         }
 
         let prior_root = self.state_root();
@@ -3193,10 +3883,14 @@ impl PrivateTradingCore {
         let mut bootstrap_executions = self.bootstrap_executions.clone();
         let mut private_rewards = self.private_rewards.clone();
         let mut system_keys = self.system_keys.clone();
+        advance_trusted_time_high_water(&mut system_keys, now_millis)?;
         let mut audit_drafts = Vec::new();
         let task_order_commitment = match &command.action {
             UserCommandAction::SubmitOrder { order } => {
                 Some(private_order_commitment(order, &private_user_id))
+            }
+            UserCommandAction::ReplaceOrder { replacement, .. } => {
+                Some(private_order_commitment(replacement, &private_user_id))
             }
             _ => None,
         };
@@ -3209,15 +3903,35 @@ impl PrivateTradingCore {
                     .get(&order.market_id)
                     .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
                 validate_order_for_market(&order, market, now_millis)?;
-                enforce_user_position_limit(
-                    &ledger,
-                    &books,
-                    &bootstrap_executions,
-                    market,
-                    &order,
-                )?;
                 match &market.execution {
                     MarketExecution::NativeClob | MarketExecution::NativeExactCondition { .. } => {
+                        // GTD deadlines are consensus inputs, but wall-clock
+                        // passage alone cannot mutate the enclave state. At the
+                        // next valid write for this market, expire all elapsed
+                        // orders and release their grouped holds atomically
+                        // before position-limit validation or matching.
+                        {
+                            let book = books.entry(order.market_id.clone()).or_default();
+                            let expired = book.cancel_expired(&order.market_id, now_millis);
+                            let releases = cancellation_transfers(&ledger, book, market, &expired)?;
+                            if !releases.is_empty() {
+                                ledger.apply(LedgerTransaction {
+                                    idempotency_key: format!(
+                                        "expire-orders:{}",
+                                        command.idempotency_key
+                                    ),
+                                    business_reference: command.command_id.clone(),
+                                    transfers: releases,
+                                })?;
+                            }
+                        }
+                        enforce_user_position_limit(
+                            &ledger,
+                            &books,
+                            &bootstrap_executions,
+                            market,
+                            &order,
+                        )?;
                         let book = books.entry(order.market_id.clone()).or_default();
                         let match_result = book.submit(order.clone(), now_millis)?;
                         if match_result
@@ -3286,6 +4000,13 @@ impl PrivateTradingCore {
                         }
                     }
                     MarketExecution::PolymarketBootstrap { .. } => {
+                        enforce_user_position_limit(
+                            &ledger,
+                            &books,
+                            &bootstrap_executions,
+                            market,
+                            &order,
+                        )?;
                         if !matches!(order.time_in_force, super::TimeInForce::Fok) {
                             return Err(CoreError::InvalidOrder(
                                 "bootstrap execution requires fill-or-kill".into(),
@@ -3334,6 +4055,7 @@ impl PrivateTradingCore {
                                 reserved_atomic,
                                 venue_order_id: None,
                                 venue_evidence_hash: None,
+                                prepared_venue_order: None,
                                 created_at_millis: now_millis,
                             },
                         );
@@ -3364,6 +4086,412 @@ impl PrivateTradingCore {
                 public_order.private_user_id.clear();
                 CommandResult::Cancelled {
                     order: public_order,
+                }
+            }
+            UserCommandAction::CancelAllOrders { filter } => {
+                let market_ids: Vec<String> = match filter {
+                    CancelAllOrdersFilter::All => self.markets.keys().cloned().collect(),
+                    CancelAllOrdersFilter::Market { market_id } => {
+                        if !self.markets.contains_key(market_id) {
+                            return Err(CoreError::InvalidOrder("unknown market".into()));
+                        }
+                        vec![market_id.clone()]
+                    }
+                    CancelAllOrdersFilter::Asset { asset } => {
+                        if asset.is_empty() || asset.len() > 64 || !asset.is_ascii() {
+                            return Err(CoreError::InvalidOrder("invalid asset filter".into()));
+                        }
+                        let matching: Vec<String> = self
+                            .markets
+                            .iter()
+                            .filter(|(_, market)| market.settlement_asset == *asset)
+                            .map(|(market_id, _)| market_id.clone())
+                            .collect();
+                        if matching.is_empty() {
+                            return Err(CoreError::InvalidOrder("unknown asset".into()));
+                        }
+                        matching
+                    }
+                };
+
+                let mut cancelled_by_market = BTreeMap::<String, Vec<BookOrder>>::new();
+                for market_id in market_ids {
+                    let Some(book) = books.get_mut(&market_id) else {
+                        continue;
+                    };
+                    let mut owned: Vec<BookOrder> = book
+                        .orders_for_owner(&private_user_id)
+                        .into_iter()
+                        .filter(|order| {
+                            matches!(
+                                order.status,
+                                OrderStatus::Open | OrderStatus::PartiallyFilled
+                            )
+                        })
+                        .collect();
+                    owned.sort_by_key(|order| (order.sequence, order.order_id));
+                    for order in owned {
+                        let cancelled =
+                            book.cancel(order.order_id, &private_user_id, now_millis)?;
+                        cancelled_by_market
+                            .entry(market_id.clone())
+                            .or_default()
+                            .push(cancelled);
+                    }
+                }
+
+                let mut transfers = Vec::new();
+                let mut outcomes = Vec::new();
+                for (market_id, cancelled) in &cancelled_by_market {
+                    let market = self
+                        .markets
+                        .get(market_id)
+                        .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
+                    let book = books.get(market_id).ok_or_else(|| {
+                        CoreError::InvalidOrder("order book does not exist".into())
+                    })?;
+                    transfers.extend(cancellation_transfers(&ledger, book, market, cancelled)?);
+                    outcomes.extend(cancelled.iter().map(|order| CancelledOrderOutcome {
+                        order_id: order.order_id,
+                        market_id: order.market_id.clone(),
+                        status: order.status,
+                    }));
+                }
+                if !outcomes.is_empty() && transfers.is_empty() {
+                    return Err(CoreError::UnbalancedTransaction);
+                }
+                if !transfers.is_empty() {
+                    ledger.apply(LedgerTransaction {
+                        idempotency_key: format!("cancel-all:{}", command.idempotency_key),
+                        business_reference: command.command_id.clone(),
+                        transfers,
+                    })?;
+                }
+                CommandResult::OrdersCancelled {
+                    filter: Some(filter.clone()),
+                    outcomes,
+                }
+            }
+            UserCommandAction::PreviewPositionClose {
+                position_id,
+                market_id,
+                outcome,
+                session_tag,
+                quantity_micros,
+                minimum_price_micros,
+            } => {
+                let order = position_close_order(
+                    &self.identity_key,
+                    &ledger,
+                    &self.markets,
+                    &self.resolutions,
+                    &private_user_id,
+                    position_id,
+                    market_id,
+                    *outcome,
+                    *quantity_micros,
+                    *minimum_price_micros,
+                    position_close_order_id(
+                        &command.command_id,
+                        &command.idempotency_key,
+                        position_id,
+                    ),
+                    now_millis,
+                )?;
+                let market = self
+                    .markets
+                    .get(market_id)
+                    .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
+                if !matches!(
+                    market.execution,
+                    MarketExecution::NativeClob | MarketExecution::NativeExactCondition { .. }
+                ) {
+                    return Err(CoreError::InvalidOrder(
+                        "position close is unavailable for bootstrap execution".into(),
+                    ));
+                }
+                let prior_book = books.get(market_id).cloned().unwrap_or_default();
+                let mut book = prior_book.clone();
+                let match_result = book.submit(order.clone(), now_millis)?;
+                CommandResult::PositionClosePreview {
+                    market_id: Some(market_id.clone()),
+                    outcome: Some(*outcome),
+                    session_tag: Some(session_tag.clone()),
+                    preview: position_close_preview(
+                        &self.identity_key,
+                        &private_user_id,
+                        *outcome,
+                        position_id,
+                        market,
+                        &prior_book,
+                        &order,
+                        &match_result,
+                        now_millis.saturating_add(POSITION_CLOSE_QUOTE_TTL_MILLIS),
+                    )?,
+                }
+            }
+            UserCommandAction::ClosePosition {
+                position_id,
+                market_id,
+                outcome,
+                session_tag,
+                quantity_micros,
+                minimum_price_micros,
+                quote,
+            } => {
+                let order_id = position_close_order_id(
+                    &command.command_id,
+                    &command.idempotency_key,
+                    position_id,
+                );
+                let order = position_close_order(
+                    &self.identity_key,
+                    &ledger,
+                    &self.markets,
+                    &self.resolutions,
+                    &private_user_id,
+                    position_id,
+                    market_id,
+                    *outcome,
+                    *quantity_micros,
+                    *minimum_price_micros,
+                    order_id,
+                    now_millis,
+                )?;
+                let market = self
+                    .markets
+                    .get(market_id)
+                    .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
+                if !matches!(
+                    market.execution,
+                    MarketExecution::NativeClob | MarketExecution::NativeExactCondition { .. }
+                ) {
+                    return Err(CoreError::InvalidOrder(
+                        "position close is unavailable for bootstrap execution".into(),
+                    ));
+                }
+                let prior_book = books.get(market_id).cloned().unwrap_or_default();
+                let book = books.entry(market_id.clone()).or_default();
+                let match_result = book.submit(order.clone(), now_millis)?;
+                let preview = position_close_preview(
+                    &self.identity_key,
+                    &private_user_id,
+                    *outcome,
+                    position_id,
+                    market,
+                    &prior_book,
+                    &order,
+                    &match_result,
+                    quote.expires_at_millis,
+                )?;
+                // Quote validity is half-open: it is valid strictly before the
+                // enclave-trusted expiry instant and stale at equality.
+                if quote.expires_at_millis <= now_millis || preview != *quote {
+                    return Err(CoreError::InvalidOrder(
+                        "position close quote is stale".into(),
+                    ));
+                }
+                if match_result
+                    .fills
+                    .iter()
+                    .all(|fill| fill.match_type == MatchType::Normal)
+                {
+                    let (transfers, fill_postings) =
+                        settlement_transfers(&self.books, &books, market, &order, &match_result)?;
+                    apply_fill_cost_basis(
+                        &self.ledger,
+                        &self.books,
+                        &books,
+                        market,
+                        &order,
+                        &match_result,
+                        &mut position_cost_basis,
+                    )?;
+                    let transaction = LedgerTransaction {
+                        idempotency_key: format!("position-close:{}", command.idempotency_key),
+                        business_reference: command.command_id.clone(),
+                        transfers,
+                    };
+                    if fill_postings.is_empty() {
+                        ledger.apply(transaction)?;
+                    } else {
+                        ledger.apply_normal_fill_settlement(transaction, fill_postings)?;
+                    }
+                } else {
+                    apply_complete_set_match_settlement(
+                        &mut ledger,
+                        &self.books,
+                        &books,
+                        market,
+                        &order,
+                        &match_result,
+                        &mut position_cost_basis,
+                        &command.idempotency_key,
+                        &command.command_id,
+                    )?;
+                }
+                record_native_fill_economics(
+                    &mut private_rewards,
+                    market,
+                    &match_result,
+                    now_millis,
+                )?;
+                audit_drafts = native_audit_drafts(&order, &match_result, market)?;
+                CommandResult::PositionClosed {
+                    market_id: Some(market_id.clone()),
+                    outcome: Some(*outcome),
+                    session_tag: Some(session_tag.clone()),
+                    preview,
+                    order_id,
+                }
+            }
+            UserCommandAction::ReplaceOrder {
+                market_id,
+                order_id,
+                replacement,
+            } => {
+                let market = self
+                    .markets
+                    .get(market_id)
+                    .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
+                if !matches!(
+                    market.execution,
+                    MarketExecution::NativeClob | MarketExecution::NativeExactCondition { .. }
+                ) {
+                    return Err(CoreError::InvalidOrder(
+                        "order replacement is unavailable for bootstrap execution".into(),
+                    ));
+                }
+
+                let book = books
+                    .get_mut(market_id)
+                    .ok_or_else(|| CoreError::InvalidOrder("order book does not exist".into()))?;
+                let original = book
+                    .order(*order_id)
+                    .cloned()
+                    .ok_or_else(|| CoreError::InvalidOrder("order does not exist".into()))?;
+                if original.private_user_id != private_user_id {
+                    return Err(CoreError::InvalidOrder("order owner mismatch".into()));
+                }
+                if replacement.order_id == *order_id {
+                    return Err(CoreError::InvalidOrder(
+                        "replacement requires a new order id".into(),
+                    ));
+                }
+                if replacement.market_id != *market_id
+                    || replacement.outcome != original.outcome
+                    || replacement.action != original.action
+                {
+                    return Err(CoreError::InvalidOrder(
+                        "replacement cannot change market, outcome, or action".into(),
+                    ));
+                }
+
+                let cancelled = book.cancel(*order_id, &private_user_id, now_millis)?;
+                let release = cancellation_transfers(
+                    &ledger,
+                    book,
+                    market,
+                    std::slice::from_ref(&cancelled),
+                )?;
+                ledger.apply(LedgerTransaction {
+                    idempotency_key: format!("replace-cancel:{}", command.idempotency_key),
+                    business_reference: command.command_id.clone(),
+                    transfers: release,
+                })?;
+
+                // The replacement is always a new order and therefore receives fresh
+                // sequence priority. Client-supplied timestamps, fill counters and owner
+                // fields are discarded at this trust boundary.
+                let mut incoming = replacement.clone();
+                incoming.private_user_id = private_user_id.clone();
+                incoming.created_at_millis = 0;
+                incoming.updated_at_millis = 0;
+                incoming.sequence = 0;
+                incoming.filled_micros = 0;
+                incoming.remaining_micros = incoming.quantity_micros;
+                incoming.status = OrderStatus::Open;
+                validate_order_for_market(&incoming, market, now_millis)?;
+                enforce_user_position_limit(
+                    &ledger,
+                    &books,
+                    &bootstrap_executions,
+                    market,
+                    &incoming,
+                )?;
+
+                let replacement_prior_books = books.clone();
+                let match_result = books
+                    .get_mut(market_id)
+                    .expect("replacement book remains present")
+                    .submit(incoming.clone(), now_millis)?;
+                if match_result
+                    .accepted_order
+                    .as_ref()
+                    .is_some_and(|accepted| accepted.status == OrderStatus::Rejected)
+                {
+                    return Err(CoreError::InvalidOrder(
+                        "replacement order was rejected".into(),
+                    ));
+                }
+                if match_result.accepted_order.as_ref().is_some() {
+                    if match_result
+                        .fills
+                        .iter()
+                        .all(|fill| fill.match_type == MatchType::Normal)
+                    {
+                        let (transfers, fill_postings) = settlement_transfers(
+                            &replacement_prior_books,
+                            &books,
+                            market,
+                            &incoming,
+                            &match_result,
+                        )?;
+                        apply_fill_cost_basis(
+                            &ledger,
+                            &replacement_prior_books,
+                            &books,
+                            market,
+                            &incoming,
+                            &match_result,
+                            &mut position_cost_basis,
+                        )?;
+                        let transaction = LedgerTransaction {
+                            idempotency_key: format!("replace-order:{}", command.idempotency_key),
+                            business_reference: command.command_id.clone(),
+                            transfers,
+                        };
+                        if fill_postings.is_empty() {
+                            ledger.apply(transaction)?;
+                        } else {
+                            ledger.apply_normal_fill_settlement(transaction, fill_postings)?;
+                        }
+                    } else {
+                        apply_complete_set_match_settlement(
+                            &mut ledger,
+                            &replacement_prior_books,
+                            &books,
+                            market,
+                            &incoming,
+                            &match_result,
+                            &mut position_cost_basis,
+                            &format!("replace:{}", command.idempotency_key),
+                            &command.command_id,
+                        )?;
+                    }
+                    record_native_fill_economics(
+                        &mut private_rewards,
+                        market,
+                        &match_result,
+                        now_millis,
+                    )?;
+                }
+                audit_drafts = native_audit_drafts(&incoming, &match_result, market)?;
+                let mut public_cancelled = cancelled;
+                public_cancelled.private_user_id.clear();
+                CommandResult::Replaced {
+                    cancelled: public_cancelled,
+                    result: redact_match_result(match_result),
                 }
             }
             UserCommandAction::CompleteSet {
@@ -3430,6 +4558,7 @@ impl PrivateTradingCore {
                     &ledger,
                     &books,
                     &position_cost_basis,
+                    &self.identity_key,
                     &private_user_id,
                     now_millis,
                 ),
@@ -3590,6 +4719,27 @@ impl PrivateTradingCore {
             }
         };
 
+        if let CommandResult::Order { result } = &result {
+            if result.fills.len() > MAX_RECOVERY_FILLS {
+                return Err(CoreError::RecoveryCapsuleTooLarge);
+            }
+        }
+
+        system_keys.insert(processed_command_marker(
+            &command.idempotency_key,
+            full_user_command_commitment(&command)?,
+        ));
+        let recovery_result_digest =
+            matches!(command.action, UserCommandAction::SubmitOrder { .. })
+                .then(|| private_recovery_result_digest(&self.identity_key, &result))
+                .transpose()?;
+        if let Some(result_digest) = recovery_result_digest {
+            system_keys.insert(recovery_result_marker(
+                &command.idempotency_key,
+                result_digest,
+            ));
+        }
+
         let mut processed_hash_map = processed_hashes(&self.processed);
         processed_hash_map.insert(command.idempotency_key.clone(), expected_hash);
         let next_sequence = checked_sequence(self.sequence)?;
@@ -3612,21 +4762,43 @@ impl PrivateTradingCore {
             command: command.clone(),
             result: result.clone(),
         };
-        let record = self.journal.append(next_root, &journal_value)?;
+        // Append against a command-local journal clone. Later audit/task
+        // artifact construction remains fallible; assigning this clone only at
+        // the final commit point prevents a failed command from advancing the
+        // journal/time fence without its financial state.
+        let mut journal = self.journal.clone();
+        let record = journal.append(next_root, &journal_value)?;
+        let command_state = command_receipt_state(&command.action, &result)?;
+        let disclosure_nonce =
+            self.receipt_signer
+                .result_disclosure_nonce(expected_hash, next_sequence, next_root);
+        let semantic_receipt = is_s08_semantic_result(&command.action, &result);
+        let result_commitment = semantic_receipt
+            .then(|| command_result_commitment(command_state, disclosure_nonce, &result))
+            .transpose()?;
+        // The leaf exposes only opaque commitments. A journal-committed FOK
+        // rejection therefore remains safe to batch and can still be verified
+        // after a governed receipt-key rotation.
+        let publication_eligible = matches!(
+            command.action,
+            UserCommandAction::SubmitOrder { .. }
+                | UserCommandAction::ReplaceOrder { .. }
+                | UserCommandAction::CancelOrder { .. }
+                | UserCommandAction::CancelAllOrders { .. }
+                | UserCommandAction::ClosePosition { .. }
+                | UserCommandAction::CompleteSet { .. }
+                | UserCommandAction::RequestRewardClaim { .. }
+                | UserCommandAction::CancelBootstrap { .. }
+                | UserCommandAction::RequestWithdrawal { .. }
+                | UserCommandAction::TransferFunds { .. }
+        );
         let receipt = self.receipt_signer.sign(
             command.command_id,
             command.idempotency_key.clone(),
             Some(expected_hash),
-            Some(matches!(
-                command.action,
-                UserCommandAction::SubmitOrder { .. }
-                    | UserCommandAction::CancelOrder { .. }
-                    | UserCommandAction::CompleteSet { .. }
-                    | UserCommandAction::RequestRewardClaim { .. }
-                    | UserCommandAction::CancelBootstrap { .. }
-                    | UserCommandAction::RequestWithdrawal { .. }
-                    | UserCommandAction::TransferFunds { .. }
-            )),
+            Some(publication_eligible),
+            result_commitment,
+            semantic_receipt.then_some(true),
             next_sequence,
             prior_root,
             next_root,
@@ -3681,12 +4853,33 @@ impl PrivateTradingCore {
         let response = CoreResponse {
             result,
             receipt,
+            receipt_state: command_state,
+            receipt_disclosure_nonce: disclosure_nonce,
             encrypted_record: Some(record),
             withdrawal_authorization,
             reward_claim_authorization: None,
             audit_fills,
             task_qualifications,
         };
+        let mut recovery_capsules = self.recovery_capsules.clone();
+        if matches!(command.action, UserCommandAction::SubmitOrder { .. }) {
+            insert_recovery_capsule(
+                &mut recovery_capsules,
+                command.idempotency_key.clone(),
+                RecoveryCapsule {
+                    sequence: next_sequence,
+                    request_hash: expected_hash,
+                    result_digest: recovery_result_digest
+                        .expect("SubmitOrder recovery digest was derived before commit"),
+                    result: response.result.clone(),
+                    receipt: response.receipt.clone(),
+                    receipt_state: response.receipt_state,
+                    receipt_disclosure_nonce: response.receipt_disclosure_nonce,
+                    audit_fills: response.audit_fills.clone(),
+                    task_qualifications: response.task_qualifications.clone(),
+                },
+            )?;
+        }
         self.ledger = ledger;
         self.books = books;
         self.sessions = sessions;
@@ -3694,6 +4887,7 @@ impl PrivateTradingCore {
         self.bootstrap_executions = bootstrap_executions;
         self.private_rewards = private_rewards;
         self.system_keys = system_keys;
+        self.journal = journal;
         self.sequence = next_sequence;
         self.processed.insert(
             command.idempotency_key,
@@ -3702,6 +4896,7 @@ impl PrivateTradingCore {
                 response: Some(response.clone()),
             },
         );
+        self.recovery_capsules = recovery_capsules;
         Ok(response)
     }
 
@@ -3717,12 +4912,14 @@ impl PrivateTradingCore {
         let private_user_id = self
             .sessions
             .verify_signed_readonly(&command.session, now_millis)?;
+        let root = self.state_root();
         let result = match &command.action {
             UserCommandAction::Portfolio => CommandResult::Portfolio {
                 snapshot: portfolio_snapshot(
                     &self.ledger,
                     &self.books,
                     &self.position_cost_basis,
+                    &self.identity_key,
                     &private_user_id,
                     now_millis,
                 ),
@@ -3742,13 +4939,17 @@ impl PrivateTradingCore {
             }
             _ => return Err(CoreError::InvalidOrder("command is not read-only".into())),
         };
-        let root = self.state_root();
         let journal_hash = read_only_response_hash(&command, &result, root)?;
+        let disclosure_nonce =
+            self.receipt_signer
+                .result_disclosure_nonce(expected_hash, self.sequence, root);
         let receipt = self.receipt_signer.sign(
             command.command_id,
             command.idempotency_key,
             Some(expected_hash),
             Some(false),
+            None,
+            None,
             self.sequence,
             root,
             root,
@@ -3758,6 +4959,8 @@ impl PrivateTradingCore {
         Ok(CoreResponse {
             result,
             receipt,
+            receipt_state: CommandReceiptState::Accepted,
+            receipt_disclosure_nonce: disclosure_nonce,
             encrypted_record: None,
             withdrawal_authorization: None,
             reward_claim_authorization: None,
@@ -3826,6 +5029,8 @@ impl PrivateTradingCore {
         let receipt = self.receipt_signer.sign(
             command_id.into(),
             idempotency_key,
+            None,
+            None,
             None,
             None,
             self.sequence,
@@ -4827,6 +6032,8 @@ fn enforce_user_position_limit(
                 && matches!(
                     execution.view.state,
                     BootstrapExecutionState::FundsReserved
+                        | BootstrapExecutionState::VenueIntentDurable
+                        | BootstrapExecutionState::VenueSubmissionAttempted
                         | BootstrapExecutionState::VenueSubmitted
                 )
         })
@@ -4860,6 +6067,8 @@ fn enforce_pending_bootstrap_limit(
                 && matches!(
                     execution.view.state,
                     BootstrapExecutionState::FundsReserved
+                        | BootstrapExecutionState::VenueIntentDurable
+                        | BootstrapExecutionState::VenueSubmissionAttempted
                         | BootstrapExecutionState::VenueSubmitted
                 )
         })
@@ -5302,6 +6511,295 @@ fn redact_match_result(mut result: MatchResult) -> MatchResult {
         fill.taker_private_user_id.clear();
     }
     result
+}
+
+fn command_receipt_state(
+    action: &UserCommandAction,
+    result: &CommandResult,
+) -> CoreResult<CommandReceiptState> {
+    validate_trading_receipt_binding(action, result)?;
+    let state = match result {
+        CommandResult::Order { result } => match_receipt_state(result)?,
+        CommandResult::Cancelled { .. } => CommandReceiptState::Cancelled,
+        CommandResult::OrdersCancelled { outcomes, .. } => {
+            if outcomes.is_empty() {
+                CommandReceiptState::Accepted
+            } else {
+                CommandReceiptState::Cancelled
+            }
+        }
+        CommandResult::Replaced { result, .. } => match_receipt_state(result)?,
+        CommandResult::PositionClosed { .. } => CommandReceiptState::Filled,
+        _ => CommandReceiptState::Accepted,
+    };
+    // A result must remain paired with the action which produced it. This
+    // prevents a future refactor from signing a plausible state for the wrong
+    // command variant while the result commitment still hashes correctly.
+    let compatible = matches!(
+        (action, result),
+        (
+            UserCommandAction::SubmitOrder { .. },
+            CommandResult::Order { .. }
+        ) | (
+            UserCommandAction::CancelOrder { .. },
+            CommandResult::Cancelled { .. }
+        ) | (
+            UserCommandAction::CancelAllOrders { .. },
+            CommandResult::OrdersCancelled { .. }
+        ) | (
+            UserCommandAction::ReplaceOrder { .. },
+            CommandResult::Replaced { .. }
+        ) | (
+            UserCommandAction::PreviewPositionClose { .. },
+            CommandResult::PositionClosePreview { .. }
+        ) | (
+            UserCommandAction::ClosePosition { .. },
+            CommandResult::PositionClosed { .. }
+        ) | (
+            UserCommandAction::CompleteSet { .. },
+            CommandResult::CompleteSet { .. }
+        ) | (
+            UserCommandAction::Portfolio,
+            CommandResult::Portfolio { .. }
+        ) | (UserCommandAction::Rewards, CommandResult::Rewards { .. })
+            | (
+                UserCommandAction::RequestRewardClaim { .. },
+                CommandResult::RewardClaimAuthorized { .. }
+            )
+            | (
+                UserCommandAction::BootstrapStatus { .. },
+                CommandResult::BootstrapStatus { .. }
+            )
+            | (
+                UserCommandAction::CancelBootstrap { .. },
+                CommandResult::BootstrapCancelled { .. }
+            )
+            | (
+                UserCommandAction::RequestWithdrawal { .. },
+                CommandResult::WithdrawalReserved { .. }
+            )
+            | (
+                UserCommandAction::TransferFunds { .. },
+                CommandResult::FundsTransferred { .. }
+            )
+            | (
+                UserCommandAction::SubmitOrder { .. },
+                CommandResult::BootstrapPending { .. }
+            )
+    );
+    if !compatible {
+        return Err(CoreError::InvalidOrder(
+            "command result does not match the requested action".into(),
+        ));
+    }
+    Ok(state)
+}
+
+fn is_s08_semantic_result(action: &UserCommandAction, result: &CommandResult) -> bool {
+    matches!(
+        (action, result),
+        (
+            UserCommandAction::SubmitOrder { .. },
+            CommandResult::Order { .. }
+        ) | (
+            UserCommandAction::ReplaceOrder { .. },
+            CommandResult::Replaced { .. }
+        ) | (
+            UserCommandAction::CancelOrder { .. },
+            CommandResult::Cancelled { .. }
+        ) | (
+            UserCommandAction::CancelAllOrders { .. },
+            CommandResult::OrdersCancelled { .. }
+        ) | (
+            UserCommandAction::ClosePosition { .. },
+            CommandResult::PositionClosed { .. }
+        )
+    )
+}
+
+fn validate_trading_receipt_binding(
+    action: &UserCommandAction,
+    result: &CommandResult,
+) -> CoreResult<()> {
+    let valid = match (action, result) {
+        (UserCommandAction::SubmitOrder { order }, CommandResult::Order { result }) => result
+            .accepted_order
+            .as_ref()
+            .is_some_and(|accepted| order_intent_matches(order, accepted)),
+        (
+            UserCommandAction::ReplaceOrder {
+                market_id,
+                order_id,
+                replacement,
+            },
+            CommandResult::Replaced { cancelled, result },
+        ) => {
+            cancelled.order_id == *order_id
+                && cancelled.market_id == *market_id
+                && cancelled.status == OrderStatus::Cancelled
+                && result
+                    .accepted_order
+                    .as_ref()
+                    .is_some_and(|accepted| order_intent_matches(replacement, accepted))
+        }
+        (
+            UserCommandAction::CancelOrder {
+                market_id,
+                order_id,
+            },
+            CommandResult::Cancelled { order },
+        ) => {
+            order.order_id == *order_id
+                && order.market_id == *market_id
+                && order.status == OrderStatus::Cancelled
+        }
+        (
+            UserCommandAction::CancelAllOrders { filter },
+            CommandResult::OrdersCancelled {
+                filter: echoed,
+                outcomes,
+            },
+        ) => {
+            Some(filter) == echoed.as_ref()
+                && outcomes
+                    .iter()
+                    .all(|outcome| outcome.status == OrderStatus::Cancelled)
+                && match filter {
+                    CancelAllOrdersFilter::Market { market_id } => outcomes
+                        .iter()
+                        .all(|outcome| outcome.market_id == *market_id),
+                    CancelAllOrdersFilter::All | CancelAllOrdersFilter::Asset { .. } => true,
+                }
+        }
+        (
+            UserCommandAction::PreviewPositionClose {
+                position_id,
+                market_id,
+                outcome,
+                session_tag,
+                quantity_micros,
+                minimum_price_micros,
+            },
+            CommandResult::PositionClosePreview {
+                market_id: echoed_market,
+                outcome: echoed_outcome,
+                session_tag: echoed_session,
+                preview,
+            },
+        ) => {
+            preview.position_id == *position_id
+                && preview.quantity_micros == *quantity_micros
+                && preview.minimum_price_micros == *minimum_price_micros
+                && echoed_market.as_ref() == Some(market_id)
+                && echoed_outcome.as_ref() == Some(outcome)
+                && echoed_session.as_ref() == Some(session_tag)
+        }
+        (
+            UserCommandAction::ClosePosition {
+                position_id,
+                market_id,
+                outcome,
+                session_tag,
+                quantity_micros,
+                minimum_price_micros,
+                quote,
+            },
+            CommandResult::PositionClosed {
+                market_id: echoed_market,
+                outcome: echoed_outcome,
+                session_tag: echoed_session,
+                preview,
+                ..
+            },
+        ) => {
+            preview == quote
+                && preview.position_id == *position_id
+                && preview.quantity_micros == *quantity_micros
+                && preview.minimum_price_micros == *minimum_price_micros
+                && echoed_market.as_ref() == Some(market_id)
+                && echoed_outcome.as_ref() == Some(outcome)
+                && echoed_session.as_ref() == Some(session_tag)
+        }
+        // Non-trading command/result compatibility is still enforced below,
+        // but S08 does not advertise a semantic outcome proof for it.
+        _ => true,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(CoreError::InvalidOrder(
+            "command receipt action/result binding failed".into(),
+        ))
+    }
+}
+
+fn order_intent_matches(expected: &BookOrder, actual: &BookOrder) -> bool {
+    expected.order_id == actual.order_id
+        && expected.market_id == actual.market_id
+        && expected.outcome == actual.outcome
+        && expected.action == actual.action
+        && expected.price_micros == actual.price_micros
+        && expected.quantity_micros == actual.quantity_micros
+        && expected.time_in_force == actual.time_in_force
+        && expected.expires_at_millis == actual.expires_at_millis
+}
+
+fn match_receipt_state(result: &MatchResult) -> CoreResult<CommandReceiptState> {
+    let order = result.accepted_order.as_ref().ok_or_else(|| {
+        CoreError::InvalidOrder("order result must contain accepted_order".into())
+    })?;
+    let fill_quantity = result.fills.iter().try_fold(0u128, |total, fill| {
+        total
+            .checked_add(fill.quantity_micros)
+            .ok_or_else(|| CoreError::InvalidOrder("order result fill quantity overflow".into()))
+    })?;
+    let accounted = order
+        .filled_micros
+        .checked_add(order.remaining_micros)
+        .and_then(|value| value.checked_add(result.cancelled_remainder_micros))
+        .ok_or_else(|| CoreError::InvalidOrder("order result quantity overflow".into()))?;
+    let fills_match = fill_quantity == order.filled_micros;
+    let quantity_matches = accounted == order.quantity_micros;
+
+    let valid = match order.status {
+        OrderStatus::Rejected | OrderStatus::Open => {
+            result.fills.is_empty()
+                && order.filled_micros == 0
+                && order.remaining_micros == order.quantity_micros
+                && result.cancelled_remainder_micros == 0
+        }
+        OrderStatus::Cancelled | OrderStatus::Expired => {
+            result.fills.is_empty()
+                && order.filled_micros == 0
+                && order.remaining_micros == 0
+                && result.cancelled_remainder_micros == order.quantity_micros
+        }
+        OrderStatus::PartiallyFilled => {
+            !result.fills.is_empty()
+                && order.filled_micros > 0
+                && order.filled_micros < order.quantity_micros
+                && fills_match
+                && quantity_matches
+        }
+        OrderStatus::Filled => {
+            !result.fills.is_empty()
+                && order.filled_micros == order.quantity_micros
+                && order.remaining_micros == 0
+                && result.cancelled_remainder_micros == 0
+                && fills_match
+        }
+    };
+    if !valid {
+        return Err(CoreError::InvalidOrder(
+            "order result status/fill/remaining invariant failed".into(),
+        ));
+    }
+    Ok(match order.status {
+        OrderStatus::Rejected => CommandReceiptState::Rejected,
+        OrderStatus::Cancelled | OrderStatus::Expired => CommandReceiptState::Cancelled,
+        OrderStatus::Filled | OrderStatus::PartiallyFilled => CommandReceiptState::Filled,
+        OrderStatus::Open => CommandReceiptState::Accepted,
+    })
 }
 
 fn signed_audit_fills(
@@ -6024,6 +7522,67 @@ fn validate_private_transfer(
     Ok(())
 }
 
+const TRUSTED_TIME_HIGH_WATER_PREFIX: &str = "trusted-time-high-water:";
+
+/// Advances the enclave-trusted clock fence in command-local state.
+///
+/// `system_keys` is already encrypted in snapshots, committed by the state root,
+/// and assigned to the live core only after the complete user command succeeds.
+/// Keeping the single high-water marker here therefore makes a failed command
+/// non-consuming while detecting rollback/regression after a restored snapshot.
+fn advance_trusted_time_high_water(
+    system_keys: &mut BTreeSet<String>,
+    now_millis: i64,
+) -> CoreResult<()> {
+    if now_millis < 0 {
+        return Err(CoreError::InvalidOrder(
+            "trusted time is unavailable".into(),
+        ));
+    }
+    let mut matching = system_keys
+        .range(TRUSTED_TIME_HIGH_WATER_PREFIX.to_owned()..)
+        .take_while(|key| key.starts_with(TRUSTED_TIME_HIGH_WATER_PREFIX));
+    let existing = matching.next().cloned();
+    if matching.next().is_some() {
+        return Err(CoreError::RollbackDetected);
+    }
+    if let Some(marker) = existing.as_ref() {
+        let encoded = marker
+            .strip_prefix(TRUSTED_TIME_HIGH_WATER_PREFIX)
+            .ok_or(CoreError::RollbackDetected)?;
+        let high_water = encoded
+            .parse::<i64>()
+            .map_err(|_| CoreError::RollbackDetected)?;
+        if now_millis < high_water {
+            return Err(CoreError::RollbackDetected);
+        }
+        system_keys.remove(marker);
+    }
+    system_keys.insert(format!("{TRUSTED_TIME_HIGH_WATER_PREFIX}{now_millis:020}"));
+    Ok(())
+}
+
+fn full_user_command_commitment(command: &UserCommand) -> CoreResult<[u8; 32]> {
+    let encoded = serde_json::to_vec(command).map_err(|_| CoreError::RequestHashMismatch)?;
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.full-user-command.v1\0");
+    hash.update((encoded.len() as u64).to_be_bytes());
+    hash.update(encoded);
+    Ok(hash.finalize().into())
+}
+
+fn processed_command_marker(idempotency_key: &str, commitment: [u8; 32]) -> String {
+    let mut key_hash = Sha256::new();
+    key_hash.update(b"layrs.processed-command-key.v1\0");
+    key_hash.update((idempotency_key.len() as u32).to_be_bytes());
+    key_hash.update(idempotency_key.as_bytes());
+    format!(
+        "processed-command-commitment:{}:{}",
+        hex::encode(key_hash.finalize()),
+        hex::encode(commitment),
+    )
+}
+
 fn derive_private_user_id(identity_key: &[u8; 32], commitment: &[u8; 32]) -> String {
     let mut hash = Sha256::new();
     hash.update(b"layrs.private-user-id.v1\0");
@@ -6032,10 +7591,242 @@ fn derive_private_user_id(identity_key: &[u8; 32], commitment: &[u8; 32]) -> Str
     format!("usr_{}", hex::encode(hash.finalize()))
 }
 
+fn derive_private_position_id(
+    identity_key: &[u8; 32],
+    owner: &str,
+    market_id: &str,
+    outcome: Outcome,
+) -> String {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(identity_key)
+        .expect("identity key has fixed HMAC length");
+    mac.update(b"layrs.private-position-id.v1\0");
+    mac.update(&(owner.len() as u32).to_be_bytes());
+    mac.update(owner.as_bytes());
+    mac.update(&(market_id.len() as u32).to_be_bytes());
+    mac.update(market_id.as_bytes());
+    mac.update(match outcome {
+        Outcome::Up => b"UP",
+        Outcome::Down => b"DOWN",
+    });
+    format!("pos_{}", hex::encode(mac.finalize().into_bytes()))
+}
+
+fn position_close_order_id(command_id: &str, idempotency_key: &str, position_id: &str) -> Uuid {
+    let mut name =
+        Vec::with_capacity(command_id.len() + idempotency_key.len() + position_id.len() + 32);
+    name.extend_from_slice(b"layrs.position-close-order.v1\0");
+    name.extend_from_slice(command_id.as_bytes());
+    name.push(0);
+    name.extend_from_slice(idempotency_key.as_bytes());
+    name.push(0);
+    name.extend_from_slice(position_id.as_bytes());
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, &name)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn position_close_order(
+    identity_key: &[u8; 32],
+    ledger: &Ledger,
+    markets: &BTreeMap<String, MarketConfig>,
+    resolutions: &BTreeMap<String, MarketResolution>,
+    owner: &str,
+    position_id: &str,
+    market_id: &str,
+    outcome: Outcome,
+    quantity_micros: u128,
+    minimum_price_micros: u64,
+    order_id: Uuid,
+    now_millis: i64,
+) -> CoreResult<BookOrder> {
+    let market = markets
+        .get(market_id)
+        .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
+    if resolutions.contains_key(market_id) {
+        return Err(CoreError::InvalidOrder(
+            "market is resolving or resolved".into(),
+        ));
+    }
+    if now_millis >= market.closes_at_millis {
+        return Err(CoreError::InvalidOrder("market is closed".into()));
+    }
+    if now_millis < market.opens_at_millis {
+        return Err(CoreError::InvalidOrder("market is not open".into()));
+    }
+    let expected_position_id = derive_private_position_id(identity_key, owner, market_id, outcome);
+    if position_id != expected_position_id {
+        return Err(CoreError::InvalidOrder("position owner mismatch".into()));
+    }
+    if quantity_micros == 0
+        || ledger.balance(&claim_position_for(owner, market_id, outcome)) < quantity_micros
+    {
+        return Err(CoreError::InsufficientBalance);
+    }
+    let order = BookOrder::with_id(
+        order_id,
+        owner,
+        market_id,
+        outcome,
+        OrderAction::Sell,
+        minimum_price_micros,
+        quantity_micros,
+        TimeInForce::Fok,
+        None,
+    );
+    validate_order_for_market(&order, market, now_millis)?;
+    Ok(order)
+}
+
+fn position_close_preview(
+    identity_key: &[u8; 32],
+    owner: &str,
+    outcome: Outcome,
+    position_id: &str,
+    market: &MarketConfig,
+    prior_book: &PriceTimeBook,
+    order: &BookOrder,
+    result: &MatchResult,
+    expires_at_millis: i64,
+) -> CoreResult<PositionClosePreview> {
+    let accepted = result
+        .accepted_order
+        .as_ref()
+        .ok_or_else(|| CoreError::InvalidOrder("position close result is missing".into()))?;
+    let executed_quantity = result.fills.iter().try_fold(0u128, |total, fill| {
+        total
+            .checked_add(fill.quantity_micros)
+            .ok_or(CoreError::UnbalancedTransaction)
+    })?;
+    if accepted.status != OrderStatus::Filled || executed_quantity != order.quantity_micros {
+        return Err(CoreError::InvalidOrder(
+            "insufficient protected liquidity for position close".into(),
+        ));
+    }
+    let mut weighted_price = 0u128;
+    let mut gross_payout_atomic = 0u128;
+    let mut fee_atomic = 0u128;
+    for fill in &result.fills {
+        let taker_price = fill.taker_price_micros();
+        weighted_price = weighted_price
+            .checked_add(
+                u128::from(taker_price)
+                    .checked_mul(fill.quantity_micros)
+                    .ok_or(CoreError::UnbalancedTransaction)?,
+            )
+            .ok_or(CoreError::UnbalancedTransaction)?;
+        gross_payout_atomic = gross_payout_atomic
+            .checked_add(settlement_atomic(
+                market,
+                notional(taker_price, fill.quantity_micros)?,
+            )?)
+            .ok_or(CoreError::UnbalancedTransaction)?;
+        fee_atomic = fee_atomic
+            .checked_add(taker_fee_atomic(market, fill.quantity_micros, taker_price)?)
+            .ok_or(CoreError::UnbalancedTransaction)?;
+    }
+    let average_price_micros = u64::try_from(weighted_price / executed_quantity)
+        .map_err(|_| CoreError::UnbalancedTransaction)?;
+    if average_price_micros < order.price_micros {
+        return Err(CoreError::InvalidOrder(
+            "position close violated price protection".into(),
+        ));
+    }
+    // Commit only to the exact protected liquidity slice consumed by this FOK
+    // close. Hashing the entire private book lets an unrelated dust order or
+    // cancellation invalidate every outstanding quote, creating a cheap DoS.
+    // Each contributing maker's immutable priority plus current executable
+    // state is included, so altering/cancelling any consumed liquidity, or
+    // introducing a better executable level, still changes the commitment.
+    let mut book_hash = Sha256::new();
+    book_hash.update(b"layrs.position-close-executable-slice.v2\0");
+    book_hash.update((market.market_id.len() as u32).to_be_bytes());
+    book_hash.update(market.market_id.as_bytes());
+    book_hash.update((result.fills.len() as u32).to_be_bytes());
+    let mut protected_sequence = 0u64;
+    for fill in &result.fills {
+        let maker = prior_book
+            .order(fill.maker_order_id)
+            .ok_or_else(|| CoreError::InvalidOrder("position close quote is unavailable".into()))?;
+        protected_sequence = protected_sequence.max(maker.sequence);
+        book_hash.update(fill.maker_order_id.as_bytes());
+        book_hash.update([match fill.match_type {
+            MatchType::Normal => 0,
+            MatchType::Mint => 1,
+            MatchType::Merge => 2,
+        }]);
+        book_hash.update([match maker.outcome {
+            Outcome::Up => 0,
+            Outcome::Down => 1,
+        }]);
+        book_hash.update([match maker.action {
+            OrderAction::Buy => 0,
+            OrderAction::Sell => 1,
+        }]);
+        book_hash.update(maker.price_micros.to_be_bytes());
+        book_hash.update(maker.remaining_micros.to_be_bytes());
+        book_hash.update(maker.sequence.to_be_bytes());
+        book_hash.update(maker.expires_at_millis.unwrap_or(i64::MAX).to_be_bytes());
+        book_hash.update(fill.quantity_micros.to_be_bytes());
+    }
+    let book_commitment_sha256: [u8; 32] = book_hash.finalize().into();
+    let mut preview = PositionClosePreview {
+        position_id: position_id.to_owned(),
+        quantity_micros: executed_quantity,
+        minimum_price_micros: order.price_micros,
+        average_price_micros,
+        gross_payout_atomic,
+        fee_atomic,
+        net_payout_atomic: gross_payout_atomic
+            .checked_sub(fee_atomic)
+            .ok_or(CoreError::UnbalancedTransaction)?,
+        book_commitment_sha256,
+        // This is the highest maker-priority sequence in the protected slice,
+        // not the mutable whole-book sequence.
+        book_sequence: protected_sequence,
+        expires_at_millis,
+        quote_commitment_sha256: [0u8; 32],
+    };
+    preview.quote_commitment_sha256 =
+        position_close_quote_commitment(identity_key, owner, &market.market_id, outcome, &preview);
+    Ok(preview)
+}
+
+fn position_close_quote_commitment(
+    identity_key: &[u8; 32],
+    owner: &str,
+    market_id: &str,
+    outcome: Outcome,
+    preview: &PositionClosePreview,
+) -> [u8; 32] {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(identity_key)
+        .expect("identity key has fixed HMAC length");
+    mac.update(b"layrs.position-close-quote.v1\0");
+    mac.update(&(owner.len() as u32).to_be_bytes());
+    mac.update(owner.as_bytes());
+    mac.update(&(market_id.len() as u32).to_be_bytes());
+    mac.update(market_id.as_bytes());
+    mac.update(match outcome {
+        Outcome::Up => b"UP",
+        Outcome::Down => b"DOWN",
+    });
+    mac.update(&(preview.position_id.len() as u32).to_be_bytes());
+    mac.update(preview.position_id.as_bytes());
+    mac.update(&preview.quantity_micros.to_be_bytes());
+    mac.update(&preview.minimum_price_micros.to_be_bytes());
+    mac.update(&preview.average_price_micros.to_be_bytes());
+    mac.update(&preview.gross_payout_atomic.to_be_bytes());
+    mac.update(&preview.fee_atomic.to_be_bytes());
+    mac.update(&preview.net_payout_atomic.to_be_bytes());
+    mac.update(&preview.book_commitment_sha256);
+    mac.update(&preview.book_sequence.to_be_bytes());
+    mac.update(&preview.expires_at_millis.to_be_bytes());
+    mac.finalize().into_bytes().into()
+}
+
 fn portfolio_snapshot(
     ledger: &Ledger,
     books: &BTreeMap<String, PriceTimeBook>,
     cost_basis: &BTreeMap<PositionKey, u128>,
+    identity_key: &[u8; 32],
     owner: &str,
     now_millis: i64,
 ) -> PortfolioSnapshot {
@@ -6050,6 +7841,12 @@ fn portfolio_snapshot(
                     Outcome::Down
                 };
                 positions.push(PrivatePosition {
+                    position_id: derive_private_position_id(
+                        identity_key,
+                        owner,
+                        &market_id,
+                        parsed,
+                    ),
                     cost_basis_micros: cost_basis
                         .get(&position_key(owner, &market_id, parsed))
                         .copied()
@@ -6089,6 +7886,111 @@ fn processed_hashes(processed: &BTreeMap<String, ProcessedCommand>) -> BTreeMap<
         .iter()
         .map(|(key, value)| (key.clone(), value.request_hash))
         .collect()
+}
+
+fn recovery_result_marker(idempotency_key: &str, digest: [u8; 32]) -> String {
+    format!("recovery-result:{idempotency_key}:{}", hex::encode(digest))
+}
+
+fn private_recovery_result_digest(
+    identity_key: &[u8; 32],
+    result: &CommandResult,
+) -> CoreResult<[u8; 32]> {
+    let encoded = serde_json::to_vec(result).map_err(|_| CoreError::InvalidRecoveryCapsule)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(identity_key)
+        .map_err(|_| CoreError::InvalidRecoveryCapsule)?;
+    mac.update(b"layrs.private-recovery-result.v1\0");
+    mac.update(&(encoded.len() as u64).to_be_bytes());
+    mac.update(&encoded);
+    Ok(mac.finalize().into_bytes().into())
+}
+
+fn recovery_archive_ack_marker(
+    idempotency_key: &str,
+    result_digest: [u8; 32],
+    archive_row_commitment: [u8; 32],
+) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.private-recovery-archive-ack.v1\0");
+    hash.update((idempotency_key.len() as u64).to_be_bytes());
+    hash.update(idempotency_key.as_bytes());
+    hash.update(result_digest);
+    hash.update(archive_row_commitment);
+    format!("recovery-archive-ack:{}", hex::encode(hash.finalize()))
+}
+
+fn recovery_capsule_size(capsule: &RecoveryCapsule) -> CoreResult<usize> {
+    serde_json::to_vec(capsule)
+        .map(|encoded| encoded.len())
+        .map_err(|_| CoreError::InvalidRecoveryCapsule)
+}
+
+fn recovery_window_size(capsules: &BTreeMap<String, RecoveryCapsule>) -> CoreResult<usize> {
+    serde_json::to_vec(capsules)
+        .map(|encoded| encoded.len())
+        .map_err(|_| CoreError::InvalidRecoveryCapsule)
+}
+
+fn insert_recovery_capsule(
+    capsules: &mut BTreeMap<String, RecoveryCapsule>,
+    idempotency_key: String,
+    capsule: RecoveryCapsule,
+) -> CoreResult<()> {
+    if recovery_capsule_size(&capsule)? > MAX_RECOVERY_CAPSULE_BYTES {
+        return Err(CoreError::RecoveryCapsuleTooLarge);
+    }
+    capsules.insert(idempotency_key.clone(), capsule);
+    if capsules.len() > MAX_RECOVERY_CAPSULES
+        || recovery_window_size(capsules)? > MAX_RECOVERY_WINDOW_BYTES
+    {
+        capsules.remove(&idempotency_key);
+        return Err(CoreError::RecoveryWindowFull);
+    }
+    Ok(())
+}
+
+fn reserve_recovery_capacity(capsules: &BTreeMap<String, RecoveryCapsule>) -> CoreResult<()> {
+    if capsules.len() >= MAX_RECOVERY_CAPSULES
+        || recovery_window_size(capsules)?
+            .checked_add(MAX_RECOVERY_CAPSULE_BYTES + 128 + 8)
+            .ok_or(CoreError::RecoveryWindowFull)?
+            > MAX_RECOVERY_WINDOW_BYTES
+    {
+        return Err(CoreError::RecoveryWindowFull);
+    }
+    Ok(())
+}
+
+fn validate_recovery_capsules(
+    capsules: &BTreeMap<String, RecoveryCapsule>,
+    processed: &BTreeMap<String, [u8; 32]>,
+    system_keys: &BTreeSet<String>,
+    identity_key: &[u8; 32],
+    snapshot_sequence: u64,
+) -> CoreResult<()> {
+    if capsules.len() > MAX_RECOVERY_CAPSULES
+        || recovery_window_size(capsules)? > MAX_RECOVERY_WINDOW_BYTES
+    {
+        return Err(CoreError::InvalidRecoveryCapsule);
+    }
+    for (idempotency_key, capsule) in capsules {
+        if recovery_capsule_size(capsule)? > MAX_RECOVERY_CAPSULE_BYTES
+            || capsule.sequence > snapshot_sequence
+            || capsule.receipt.idempotency_key != *idempotency_key
+            || capsule.receipt.enclave_sequence != capsule.sequence
+            || capsule.receipt.command_commitment_sha256 != Some(capsule.request_hash)
+            || processed.get(idempotency_key).copied() != Some(capsule.request_hash)
+            || private_recovery_result_digest(identity_key, &capsule.result)?
+                != capsule.result_digest
+            || !system_keys.contains(&recovery_result_marker(
+                idempotency_key,
+                capsule.result_digest,
+            ))
+        {
+            return Err(CoreError::InvalidRecoveryCapsule);
+        }
+    }
+    Ok(())
 }
 
 fn read_only_response_hash(
@@ -6252,9 +8154,29 @@ fn state_root_with_serialized_books(
         hash.update(&(encoded.len() as u64).to_be_bytes());
         hash.update(&encoded);
     }
+    // Preserve byte-for-byte legacy roots until the first enclave-trusted user
+    // command installs the clock fence. Thereafter this explicit versioned
+    // domain makes the accepted high-water part of every state root while the
+    // encrypted snapshot continues to persist the marker in `system_keys`.
+    if let Some(high_water) = trusted_time_high_water(system_keys) {
+        hash.update(b"layrs.trusted-time-state.v1\0");
+        hash.update(&high_water.to_be_bytes());
+    }
     let mut output = [0u8; 32];
     hash.finalize(&mut output);
     output
+}
+
+fn trusted_time_high_water(system_keys: &BTreeSet<String>) -> Option<i64> {
+    let mut matching = system_keys
+        .range(TRUSTED_TIME_HIGH_WATER_PREFIX.to_owned()..)
+        .take_while(|key| key.starts_with(TRUSTED_TIME_HIGH_WATER_PREFIX));
+    let value = matching
+        .next()?
+        .strip_prefix(TRUSTED_TIME_HIGH_WATER_PREFIX)?
+        .parse::<i64>()
+        .ok()?;
+    matching.next().is_none().then_some(value)
 }
 
 fn withdrawal_reservation_marker(

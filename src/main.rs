@@ -488,15 +488,26 @@ async fn async_main() -> Result<()> {
                     get(routes::pm::get_private_index),
                 )
                 .route("/v1/pm/deposit-note", post(routes::pm::deposit_note))
-                // Order endpoints
-                .route("/v1/orders", post(routes::orders::create_order))
-                .route("/v1/orders/commit", post(routes::orders::commit_order))
-                .route("/v1/orders/reveal", post(routes::orders::reveal_order))
-                .route("/v1/orders/:order_id", delete(routes::orders::cancel_order))
-                .route("/v1/orders/:order_id", get(routes::orders::get_order))
+                // Every legacy plaintext order route is a generic, state-free
+                // tombstone. Live order traffic uses the encrypted enclave
+                // relay exclusively; no exact order or identity is reflected.
+                .route("/v1/orders", post(routes::orders::legacy_order_api_retired))
+                .route(
+                    "/v1/orders/commit",
+                    post(routes::orders::legacy_order_api_retired),
+                )
+                .route(
+                    "/v1/orders/reveal",
+                    post(routes::orders::legacy_order_api_retired),
+                )
+                .route(
+                    "/v1/orders/:order_id",
+                    get(routes::orders::legacy_order_api_retired)
+                        .delete(routes::orders::legacy_order_api_retired),
+                )
                 .route(
                     "/v1/orders/user/:user_id",
-                    get(routes::orders::get_user_orders),
+                    get(routes::orders::legacy_order_api_retired),
                 )
                 // Trades endpoints (user-scoped only — aggregate market trades are intentionally hidden)
                 .route(
