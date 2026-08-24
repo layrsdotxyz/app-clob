@@ -4,6 +4,26 @@ import { pathToFileURL } from 'node:url';
 
 const ACCOUNT_ID = '082223548516';
 const REGION = 'us-east-1';
+const SOURCE_AMI = Object.freeze({
+  architecture: 'x86_64',
+  bootMode: 'uefi-preferred',
+  creationDate: '2026-08-12T23:50:59.000Z',
+  imageId: 'ami-0332d564d76dbd8d6',
+  imageLocation: 'amazon/al2023-ami-2023.12.20260817.0-kernel-6.18-x86_64',
+  imdsSupport: 'v2.0',
+  name: 'al2023-ami-2023.12.20260817.0-kernel-6.18-x86_64',
+  ownerId: '137112412989',
+  platformDetails: 'Linux/UNIX',
+  rootDeviceName: '/dev/xvda',
+  rootSnapshotId: 'snap-0bc9cf3f9e4893b60',
+  usageOperation: 'RunInstances',
+  virtualizationType: 'hvm',
+});
+const REQUIRED_SSM_SERVICES = Object.freeze([
+  `com.amazonaws.${REGION}.ec2messages`,
+  `com.amazonaws.${REGION}.ssm`,
+  `com.amazonaws.${REGION}.ssmmessages`,
+]);
 const FORBIDDEN_ACTIONS = [
   /^\*$/iu,
   /^kms:/iu,
@@ -23,8 +43,8 @@ const FORBIDDEN_ACTIONS = [
 const ALLOWED_BUILD_ROLE_ACTIONS = new Set([
   'ec2messages:acknowledgemessage', 'ec2messages:deletemessage',
   'ec2messages:failmessage', 'ec2messages:getendpoint', 'ec2messages:getmessages',
-  'ec2messages:sendreply', 'logs:createlogstream', 'logs:describelogstreams',
-  'logs:putlogevents', 'ssm:updateinstanceinformation',
+  'ec2messages:sendreply', 'ssm:describeassociation', 'ssm:listinstanceassociations',
+  'ssm:updateinstanceassociationstatus', 'ssm:updateinstanceinformation',
   'ssmmessages:createcontrolchannel', 'ssmmessages:createdatachannel',
   'ssmmessages:opencontrolchannel', 'ssmmessages:opendatachannel',
 ]);
@@ -84,16 +104,35 @@ function normalizedPermission(permission) {
 }
 
 function validateSourceAmi(input) {
-  requireExactFields(input, ['expectedImageId', 'expectedOwnerId', 'response'], 'source AMI preflight');
+  requireExactFields(input, ['expectedImageId', 'expectedOwnerId', 'response', 'snapshotResponse'], 'source AMI preflight');
   const image = one(requireObject(input.response, 'source AMI response').Images, 'source AMI response.Images');
-  if (input.expectedOwnerId !== '137112412989'
-      || image.ImageId !== input.expectedImageId || image.OwnerId !== input.expectedOwnerId
+  const snapshot = one(requireObject(input.snapshotResponse, 'source snapshot response').Snapshots,
+    'source snapshot response.Snapshots');
+  if (input.expectedImageId !== SOURCE_AMI.imageId || input.expectedOwnerId !== SOURCE_AMI.ownerId
+      || image.ImageId !== SOURCE_AMI.imageId || image.OwnerId !== SOURCE_AMI.ownerId
       || image.State !== 'available' || image.Architecture !== 'x86_64'
       || image.RootDeviceType !== 'ebs' || image.VirtualizationType !== 'hvm'
-      || image.EnaSupport !== true || typeof image.RootDeviceName !== 'string'
-      || !image.RootDeviceName || !Array.isArray(image.BlockDeviceMappings)
-      || !image.BlockDeviceMappings.some(mapping => mapping.DeviceName === image.RootDeviceName && mapping.Ebs)) {
-    throw new Error('source AMI is not the exact usable AL2023 x86_64 EBS input');
+      || image.EnaSupport !== true || image.Name !== SOURCE_AMI.name
+      || image.ImageLocation !== SOURCE_AMI.imageLocation
+      || image.CreationDate !== SOURCE_AMI.creationDate
+      || image.PlatformDetails !== SOURCE_AMI.platformDetails
+      || image.UsageOperation !== SOURCE_AMI.usageOperation
+      || image.ImdsSupport !== SOURCE_AMI.imdsSupport
+      || image.BootMode !== SOURCE_AMI.bootMode
+      || image.RootDeviceName !== SOURCE_AMI.rootDeviceName
+      || image.Public !== true || !Array.isArray(image.BlockDeviceMappings)
+      || image.BlockDeviceMappings.length !== 1
+      || image.BlockDeviceMappings[0]?.DeviceName !== SOURCE_AMI.rootDeviceName
+      || image.BlockDeviceMappings[0]?.Ebs?.SnapshotId !== SOURCE_AMI.rootSnapshotId
+      || image.BlockDeviceMappings[0]?.Ebs?.DeleteOnTermination !== true
+      || image.BlockDeviceMappings[0]?.Ebs?.Encrypted !== false
+      || image.BlockDeviceMappings[0]?.Ebs?.VolumeSize !== 8
+      || image.BlockDeviceMappings[0]?.Ebs?.VolumeType !== 'gp3'
+      || snapshot.SnapshotId !== SOURCE_AMI.rootSnapshotId
+      || snapshot.OwnerId !== SOURCE_AMI.ownerId || snapshot.State !== 'completed'
+      || snapshot.Encrypted !== false || snapshot.VolumeSize !== 8
+      || snapshot.StorageTier !== 'standard') {
+    throw new Error('source AMI does not match the mechanically pinned AL2023 provenance');
   }
   return {
     architecture: image.Architecture,
@@ -110,11 +149,25 @@ function validateSourceAmi(input) {
     bootMode: String(image.BootMode ?? ''),
     enaSupport: image.EnaSupport,
     imageId: image.ImageId,
+    imageLocation: image.ImageLocation,
+    creationDate: image.CreationDate,
+    imdsSupport: image.ImdsSupport,
+    name: image.Name,
     ownerId: image.OwnerId,
+    platformDetails: image.PlatformDetails,
     public: Boolean(image.Public),
     rootDeviceName: image.RootDeviceName,
     rootDeviceType: image.RootDeviceType,
     state: image.State,
+    rootSnapshot: {
+      encrypted: snapshot.Encrypted,
+      ownerId: snapshot.OwnerId,
+      snapshotId: snapshot.SnapshotId,
+      state: snapshot.State,
+      storageTier: snapshot.StorageTier,
+      volumeSize: snapshot.VolumeSize,
+    },
+    usageOperation: image.UsageOperation,
     virtualizationType: image.VirtualizationType,
   };
 }
@@ -128,8 +181,7 @@ function routeTarget(route) {
   if (targets.length !== 1) throw new Error('each build route must have one exact target');
   const field = targets[0];
   const value = String(route[field]);
-  if (!((field === 'GatewayId' && (value === 'local' || /^vpce-[0-9a-f]{8,17}$/u.test(value)))
-      || (field === 'VpcEndpointId' && /^vpce-[0-9a-f]{8,17}$/u.test(value)))) {
+  if (!(field === 'GatewayId' && value === 'local')) {
     throw new Error(`build route has forbidden target ${field}`);
   }
   return { field, value };
@@ -179,13 +231,23 @@ function validateBuildNetwork(input) {
   if (!Array.isArray(securityGroups)) throw new Error('security groups response is malformed');
   const buildGroup = securityGroups.find(group => group.GroupId === input.expectedSecurityGroupId);
   if (!buildGroup || buildGroup.VpcId !== subnet.VpcId
-      || !String(buildGroup.GroupName ?? '').startsWith('layrs-seq159300-recovery-')
+      || !String(buildGroup.GroupName ?? '').startsWith('layrs-production-recovery-seq159300-')
       || (buildGroup.IpPermissions ?? []).length !== 0
       || !Array.isArray(buildGroup.IpPermissionsEgress) || buildGroup.IpPermissionsEgress.length < 1) {
     throw new Error('build security group is not the exact ingress-free recovery group');
   }
   const referencedIds = new Set();
+  let sentinelCount = 0;
   for (const permission of buildGroup.IpPermissionsEgress) {
+    const sentinel = String(permission.IpProtocol) === '-1'
+      && (permission.IpRanges ?? []).length === 1
+      && permission.IpRanges[0]?.CidrIp === '127.0.0.1/32'
+      && !(permission.Ipv6Ranges ?? []).length && !(permission.PrefixListIds ?? []).length
+      && !(permission.UserIdGroupPairs ?? []).length;
+    if (sentinel) {
+      sentinelCount += 1;
+      continue;
+    }
     if (!['tcp', '6'].includes(String(permission.IpProtocol))
         || permission.FromPort !== 443 || permission.ToPort !== 443
         || (permission.IpRanges ?? []).length || (permission.Ipv6Ranges ?? []).length
@@ -193,6 +255,9 @@ function validateBuildNetwork(input) {
       throw new Error('build security-group egress is not endpoint-SG-only TCP/443');
     }
     for (const pair of permission.UserIdGroupPairs) referencedIds.add(String(pair.GroupId ?? ''));
+  }
+  if (sentinelCount !== 1 || referencedIds.size < 1) {
+    throw new Error('build security group requires one loopback sentinel and exact endpoint egress');
   }
   for (const referencedId of referencedIds) {
     const group = securityGroups.find(candidate => candidate.GroupId === referencedId);
@@ -218,29 +283,34 @@ function validateBuildNetwork(input) {
     }
   }
 
-  const allowedServices = new Set([
-    `com.amazonaws.${REGION}.ec2messages`, `com.amazonaws.${REGION}.logs`,
-    `com.amazonaws.${REGION}.ssm`, `com.amazonaws.${REGION}.ssmmessages`,
-  ]);
+  const allowedServices = new Set(REQUIRED_SSM_SERVICES);
   const endpoints = requireObject(input.vpcEndpointsResponse, 'VPC endpoints response').VpcEndpoints;
   const interfaces = requireObject(input.networkInterfacesResponse, 'network interfaces response').NetworkInterfaces;
   if (!Array.isArray(endpoints) || !Array.isArray(interfaces)) throw new Error('endpoint inventory is malformed');
   const endpointInterfaceIds = new Set();
+  const observedServices = new Set();
   for (const referencedId of referencedIds) {
     const matches = endpoints.filter(endpoint => (endpoint.Groups ?? []).some(group => group.GroupId === referencedId));
     if (matches.length < 1) throw new Error('recovery endpoint security group must bind private VPC endpoints');
     for (const endpoint of matches) {
       if (endpoint.VpcId !== subnet.VpcId || endpoint.VpcEndpointType !== 'Interface'
           || endpoint.State !== 'available' || endpoint.PrivateDnsEnabled !== true
-          || !allowedServices.has(endpoint.ServiceName)) {
+          || !allowedServices.has(endpoint.ServiceName)
+          || !Array.isArray(endpoint.SubnetIds) || endpoint.SubnetIds.length !== 1
+          || endpoint.SubnetIds[0] !== subnet.SubnetId
+          || !Array.isArray(endpoint.NetworkInterfaceIds)
+          || endpoint.NetworkInterfaceIds.length !== 1) {
         throw new Error('build security-group destination is not an allowed private control-plane endpoint');
       }
+      observedServices.add(endpoint.ServiceName);
       for (const interfaceId of endpoint.NetworkInterfaceIds ?? []) endpointInterfaceIds.add(interfaceId);
     }
   }
   for (const networkInterface of interfaces) {
     if (networkInterface.VpcId !== subnet.VpcId || networkInterface.InterfaceType !== 'vpc_endpoint'
         || networkInterface.RequesterManaged !== true
+        || networkInterface.SubnetId !== subnet.SubnetId
+        || networkInterface.AvailabilityZone !== subnet.AvailabilityZone
         || !endpointInterfaceIds.has(networkInterface.NetworkInterfaceId)) {
       throw new Error('recovery endpoint security group is attached outside reviewed VPC endpoints');
     }
@@ -250,6 +320,12 @@ function validateBuildNetwork(input) {
         .some(group => referencedIds.has(group.GroupId)))) {
     throw new Error('VPC endpoint network-interface inventory is incomplete');
   }
+  if (observedServices.size !== REQUIRED_SSM_SERVICES.length
+      || REQUIRED_SSM_SERVICES.some(service => !observedServices.has(service))
+      || endpoints.filter(endpoint => (endpoint.Groups ?? [])
+        .some(group => referencedIds.has(group.GroupId))).length !== REQUIRED_SSM_SERVICES.length) {
+    throw new Error('all three exact SSM interface endpoints are required in the build subnet and AZ');
+  }
   return {
     endpoints: endpoints.filter(endpoint => (endpoint.Groups ?? [])
       .some(group => referencedIds.has(group.GroupId))).map(endpoint => ({
@@ -257,6 +333,7 @@ function validateBuildNetwork(input) {
       privateDnsEnabled: endpoint.PrivateDnsEnabled,
       serviceName: endpoint.ServiceName,
       state: endpoint.State,
+      subnetIds: [...endpoint.SubnetIds].sort(),
       vpcEndpointId: endpoint.VpcEndpointId,
       vpcEndpointType: endpoint.VpcEndpointType,
       vpcId: endpoint.VpcId,
@@ -282,6 +359,61 @@ function validateBuildNetwork(input) {
   };
 }
 
+function validatePackageSet(input) {
+  requireExactFields(input, ['manifest'], 'Nitro package-set preflight');
+  const manifest = requireObject(input.manifest, 'Nitro package-set manifest');
+  requireExactFields(manifest, [
+    'accountId', 'environment', 'packages', 'protocol', 'region',
+  ], 'Nitro package-set manifest');
+  if (manifest.protocol !== 'layrs.seq159300.nitro-offline-package-set.v1'
+      || manifest.accountId !== ACCOUNT_ID || manifest.region !== REGION
+      || manifest.environment !== 'production'
+      || !Array.isArray(manifest.packages) || manifest.packages.length < 2) {
+    throw new Error('Nitro package-set manifest binding is invalid');
+  }
+  const seenFiles = new Set();
+  const seenNevras = new Set();
+  let hasCli = false;
+  const packages = manifest.packages.map((entry, index) => {
+    requireExactFields(entry, [
+      'filename', 'nevra', 'objectKey', 'objectVersionId', 'sha384', 'signatureKeyId',
+    ], `Nitro package-set packages[${index}]`);
+    if (!/^[A-Za-z0-9][A-Za-z0-9._+-]{0,180}\.rpm$/u.test(entry.filename)
+        || !/^[A-Za-z0-9][A-Za-z0-9+_.:-]{0,220}\.(?:x86_64|noarch)$/u.test(entry.nevra)
+        || !immutableKey(entry.objectKey) || !immutableVersion(entry.objectVersionId)
+        || !entry.objectKey.startsWith('evidence/seq159300/recovery-only/phase2/')
+        || !sha384(entry.sha384) || !/^[0-9A-F]{8,16}$/u.test(entry.signatureKeyId)
+        || seenFiles.has(entry.filename) || seenNevras.has(entry.nevra)) {
+      throw new Error('Nitro package-set package entry is invalid or duplicated');
+    }
+    seenFiles.add(entry.filename);
+    seenNevras.add(entry.nevra);
+    if (entry.nevra.startsWith('aws-nitro-enclaves-cli-')) hasCli = true;
+    if (entry.nevra.startsWith('aws-nitro-enclaves-cli-devel-')) {
+      throw new Error('Nitro development package is forbidden');
+    }
+    return { ...entry };
+  }).sort((left, right) => left.nevra.localeCompare(right.nevra));
+  if (!hasCli) throw new Error('Nitro package set must contain the exact CLI package');
+  if (canonicalJson(packages) !== canonicalJson(manifest.packages)) {
+    throw new Error('Nitro package-set packages must be canonical NEVRA order');
+  }
+  return { ...manifest, packages };
+}
+
+function immutableKey(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._/-]{0,1023}$/u.test(value)
+    && !value.includes('..');
+}
+
+function immutableVersion(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9._-]{8,256}$/u.test(value);
+}
+
+function sha384(value) {
+  return typeof value === 'string' && /^[0-9a-f]{96}$/u.test(value);
+}
+
 function actions(statement) {
   if (Object.hasOwn(statement, 'NotAction')) throw new Error('build role Allow/NotAction is forbidden');
   const value = statement.Action;
@@ -294,6 +426,7 @@ function validateInstanceProfile(input) {
   requireExactFields(input, ['expectedInstanceProfileName', 'policies', 'response'], 'instance-profile preflight');
   const profile = requireObject(requireObject(input.response, 'instance-profile response').InstanceProfile, 'instance profile');
   if (profile.InstanceProfileName !== input.expectedInstanceProfileName
+      || !profile.InstanceProfileName.startsWith('layrs-production-recovery-seq159300-')
       || !String(profile.Arn ?? '').startsWith(`arn:aws:iam::${ACCOUNT_ID}:instance-profile/`)
       || !Array.isArray(profile.Roles) || profile.Roles.length !== 1) {
     throw new Error('build instance profile is not exact or does not contain one role');
@@ -313,6 +446,7 @@ function validateInstanceProfile(input) {
     throw new Error('build role trust is not EC2-only');
   }
   if (!Array.isArray(input.policies)) throw new Error('build role policies must be an array');
+  const observedAllowedActions = new Set();
   for (const policy of input.policies) {
     requireExactFields(policy, ['document', 'name', 'source'], 'build role policy');
     const statements = requireObject(policy.document, `policy ${policy.name}`).Statement;
@@ -326,8 +460,13 @@ function validateInstanceProfile(input) {
         if (!ALLOWED_BUILD_ROLE_ACTIONS.has(action.toLowerCase())) {
           throw new Error(`build role action is outside the minimal recovery allowlist: ${action}`);
         }
+        observedAllowedActions.add(action.toLowerCase());
       }
     }
+  }
+  if (observedAllowedActions.size !== ALLOWED_BUILD_ROLE_ACTIONS.size
+      || [...ALLOWED_BUILD_ROLE_ACTIONS].some(action => !observedAllowedActions.has(action))) {
+    throw new Error('build role does not contain the exact complete SSM agent action set');
   }
   return {
     instanceProfileArn: profile.Arn,
@@ -365,6 +504,7 @@ function validateOutputAmi(input) {
     SourceAmiProvenanceSha384: expected.sourceAmiProvenanceSha384,
     NitroCliRpmSha384: expected.nitroCliRpmSha384,
     NitroPackageInventorySha384: expected.nitroPackageInventorySha384,
+    NitroPackageSetSha384: expected.nitroPackageSetSha384,
     Visibility: 'private',
   };
   if (image.ImageId !== expected.imageId || image.OwnerId !== ACCOUNT_ID || image.Public !== false
@@ -404,6 +544,7 @@ export function validatePreflight(input) {
     case 'build-network': return validateBuildNetwork(input.payload);
     case 'instance-profile': return validateInstanceProfile(input.payload);
     case 'output-ami': return validateOutputAmi(input.payload);
+    case 'nitro-package-set': return validatePackageSet(input.payload);
     default: throw new Error('unsupported recovery-parent preflight kind');
   }
 }

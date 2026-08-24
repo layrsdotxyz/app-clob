@@ -16,11 +16,14 @@ const FIELDS = Object.freeze([
   'buildInstanceProfileInventorySha384', 'buildSecurityGroupInventorySha384',
   'buildSubnetInventorySha384', 'eifSha384', 'environment', 'implementationCommit',
   'implementationEvidenceObjectKey', 'implementationEvidenceObjectVersionId',
-  'implementationEvidenceSha384', 'nitroCliNevra', 'nitroCliRpmObjectKey',
+  'implementationEvidenceObjectSha384', 'nitroCliNevra', 'nitroCliRpmObjectKey',
   'nitroCliRpmObjectVersionId', 'nitroCliRpmSha384', 'nitroPackageInventorySha384',
+  'nitroPackageSetEvidenceObjectKey', 'nitroPackageSetEvidenceSha384',
+  'nitroPackageSetEvidenceObjectVersionId', 'nitroPackageSetObjectKey',
+  'nitroPackageSetSha384', 'nitroPackageSetObjectVersionId',
   'outputAmiInventorySha384', 'packerManifestSha384', 'packerTemplateSha384',
   'parentBinarySha384', 'pcr0Sha384', 'phase2EvidenceObjectKey',
-  'phase2EvidenceObjectVersionId', 'phase2EvidenceSha384', 'phase2TemplateCommit',
+  'phase2EvidenceObjectVersionId', 'phase2EvidenceObjectSha384', 'phase2TemplateCommit',
   'phase2TemplateSha384', 'protocol', 'region',
   'remediationEvidenceCommit', 'remediationIndexObjectVersionId', 'sourceCommit',
   'sourceAmiId', 'sourceAmiOwner', 'sourceAmiProvenanceSha384',
@@ -32,7 +35,7 @@ function immutableObjectKey(value) {
 }
 
 function immutableVersionId(value) {
-  return typeof value === 'string' && /^[A-Za-z0-9._-]{1,1024}$/u.test(value);
+  return typeof value === 'string' && /^[A-Za-z0-9._-]{8,256}$/u.test(value);
 }
 
 export function canonicalJson(value) {
@@ -60,24 +63,35 @@ export function renderRecoveryParentBuildEvidence(input) {
       || input.builderSourceCommit === SOURCE_COMMIT
       || !/^[0-9a-f]{40}$/u.test(input.implementationCommit)
       || !/^[0-9a-f]{40}$/u.test(input.phase2TemplateCommit)
+      || input.phase2TemplateCommit === input.implementationCommit
       || input.remediationEvidenceCommit !== REMEDIATION_COMMIT
       || input.remediationIndexObjectVersionId !== REMEDIATION_INDEX_VERSION
       || input.parentBinarySha384 !== PARENT_SHA384 || input.eifSha384 !== EIF_SHA384
       || input.pcr0Sha384 !== PCR0_SHA384 || !/^ami-[0-9a-f]{8,17}$/u.test(input.amiId)
-      || !/^ami-[0-9a-f]{8,17}$/u.test(input.sourceAmiId)
+      || input.sourceAmiId !== 'ami-0332d564d76dbd8d6'
       || input.sourceAmiOwner !== '137112412989'
       || !/^aws-nitro-enclaves-cli-[0-9]+:?[A-Za-z0-9._+~]+-[A-Za-z0-9._+~]+\.x86_64$/u.test(input.nitroCliNevra)
       || !immutableObjectKey(input.phase2EvidenceObjectKey)
       || !immutableObjectKey(input.implementationEvidenceObjectKey)
       || !immutableObjectKey(input.nitroCliRpmObjectKey)
+      || !immutableObjectKey(input.nitroPackageSetObjectKey)
+      || !immutableObjectKey(input.nitroPackageSetEvidenceObjectKey)
+      || !input.nitroCliRpmObjectKey.startsWith('evidence/seq159300/recovery-only/phase2/')
+      || !input.nitroPackageSetObjectKey.startsWith('evidence/seq159300/recovery-only/phase2/')
+      || !input.nitroPackageSetEvidenceObjectKey.startsWith('evidence/seq159300/recovery-only/phase2/')
+      || !input.phase2EvidenceObjectKey.startsWith('evidence/seq159300/recovery-only/phase2/')
+      || !input.implementationEvidenceObjectKey.startsWith('evidence/seq159300/recovery-only/implementation/')
       || !immutableVersionId(input.phase2EvidenceObjectVersionId)
       || !immutableVersionId(input.implementationEvidenceObjectVersionId)
       || !immutableVersionId(input.nitroCliRpmObjectVersionId)
+      || !immutableVersionId(input.nitroPackageSetObjectVersionId)
+      || !immutableVersionId(input.nitroPackageSetEvidenceObjectVersionId)
       || [
         input.buildInstanceProfileInventorySha384, input.buildSecurityGroupInventorySha384,
-        input.buildSubnetInventorySha384, input.implementationEvidenceSha384,
+        input.buildSubnetInventorySha384, input.implementationEvidenceObjectSha384,
         input.nitroCliRpmSha384, input.nitroPackageInventorySha384, input.outputAmiInventorySha384,
-        input.packerManifestSha384, input.packerTemplateSha384, input.phase2EvidenceSha384,
+        input.nitroPackageSetSha384, input.nitroPackageSetEvidenceSha384,
+        input.packerManifestSha384, input.packerTemplateSha384, input.phase2EvidenceObjectSha384,
         input.phase2TemplateSha384, input.sourceAmiProvenanceSha384,
       ].some(value => !/^[0-9a-f]{96}$/u.test(value))
       || !Number.isFinite(completedAt.getTime())

@@ -17,8 +17,8 @@ variable "aws_region" {
 variable "source_ami_id" {
   type = string
   validation {
-    condition     = can(regex("^ami-[0-9a-f]{8,17}$", var.source_ami_id))
-    error_message = "An exact pinned source AMI ID is required."
+    condition     = var.source_ami_id == "ami-0332d564d76dbd8d6"
+    error_message = "The exact reviewed AL2023 source AMI ID is required."
   }
 }
 variable "source_ami_owner" {
@@ -52,7 +52,7 @@ variable "build_security_group_id" {
 variable "build_instance_profile" {
   type = string
   validation {
-    condition     = can(regex("^layrs-seq159300-recovery-[A-Za-z0-9+=,.@_-]+$", var.build_instance_profile))
+    condition     = can(regex("^layrs-production-recovery-seq159300-[A-Za-z0-9+=,.@_-]+$", var.build_instance_profile))
     error_message = "The build instance profile must be recovery-specific."
   }
 }
@@ -140,6 +140,20 @@ variable "nitro_package_inventory_sha384" {
     error_message = "The expected installed-package inventory SHA384 is required."
   }
 }
+variable "nitro_package_set_sha384" {
+  type = string
+  validation {
+    condition     = can(regex("^[0-9a-f]{96}$", var.nitro_package_set_sha384))
+    error_message = "The exact immutable Nitro dependency-closure manifest SHA384 is required."
+  }
+}
+variable "package_install_plan" {
+  type = string
+  validation {
+    condition     = length(trimspace(var.package_install_plan)) > 0
+    error_message = "A locally verified package-install plan is required."
+  }
+}
 variable "package_inventory_output" {
   type = string
   validation {
@@ -220,6 +234,7 @@ source "amazon-ebs" "seq159300_recovery_parent" {
     NitroCliNevra               = var.nitro_cli_nevra
     NitroCliRpmSha384           = var.nitro_cli_rpm_sha384
     NitroPackageInventorySha384 = var.nitro_package_inventory_sha384
+    NitroPackageSetSha384       = var.nitro_package_set_sha384
     ProductionRouteAttached     = "false"
     Visibility                  = "private"
   }
@@ -277,18 +292,23 @@ build {
     destination = "/tmp/allocator.yaml"
   }
   provisioner "file" {
-    source      = "build/aws-nitro-enclaves-cli.rpm"
-    destination = "/tmp/aws-nitro-enclaves-cli.rpm"
+    source      = "build/seq159300-nitro-packages"
+    destination = "/tmp/seq159300-nitro-packages"
+  }
+  provisioner "file" {
+    source      = var.package_install_plan
+    destination = "/tmp/seq159300-package-install-plan.tsv"
   }
 
   provisioner "shell" {
     inline = [
       "printf '%s  %s\\n' 'd9506bf11627b04bd5d220e18e78584cd5e649952fe380309346d9c6bbecd511eb318cdcdee6a1d0db989d581a742db1' '/tmp/layrs-enclave-parent' | sha384sum -c -",
       "printf '%s  %s\\n' '958e084e0a66d0aca6773193a74d40659cd258fcffa116b0117fed1fab8361046ffea6411379b72fc72c97b86f611290' '/tmp/layrsv2-clob.eif' | sha384sum -c -",
-      "printf '%s  %s\\n' '${var.nitro_cli_rpm_sha384}' '/tmp/aws-nitro-enclaves-cli.rpm' | sha384sum -c -",
-      "sudo dnf install -y --disablerepo='*' /tmp/aws-nitro-enclaves-cli.rpm",
+      "test \"$(find /tmp/seq159300-nitro-packages -mindepth 1 -maxdepth 1 -type f -name '*.rpm' | wc -l)\" = \"$(wc -l < /tmp/seq159300-package-install-plan.tsv)\"",
+      "while IFS='\t' read -r file sha nevra key; do test -f \"/tmp/seq159300-nitro-packages/$file\"; printf '%s  %s\\n' \"$sha\" \"/tmp/seq159300-nitro-packages/$file\" | sha384sum -c -; rpmkeys --checksig --verbose \"/tmp/seq159300-nitro-packages/$file\" | grep -iF \"key ID $key\" | grep -F ': OK'; test \"$(rpm -qp --qf '%%{NAME}-%%{EPOCHNUM}:%%{VERSION}-%%{RELEASE}.%%{ARCH}' \"/tmp/seq159300-nitro-packages/$file\")\" = \"$nevra\"; done < /tmp/seq159300-package-install-plan.tsv",
+      "sudo dnf install -y --disablerepo='*' $(awk -F '\t' '{printf \"/tmp/seq159300-nitro-packages/%%s \", $1}' /tmp/seq159300-package-install-plan.tsv)",
+      "while IFS='\t' read -r file sha nevra key; do name=$(rpm -qp --qf '%%{NAME}' \"/tmp/seq159300-nitro-packages/$file\"); test \"$(rpm -q --qf '%%{NAME}-%%{EPOCHNUM}:%%{VERSION}-%%{RELEASE}.%%{ARCH}' \"$name\")\" = \"$nevra\"; printf '%s\t%s\\n' \"$nevra\" \"$sha\"; done < /tmp/seq159300-package-install-plan.tsv > /tmp/layrs-seq159300-installed-package-inventory.txt",
       "test \"$(rpm -q --qf '%%{NAME}-%%{EPOCHNUM}:%%{VERSION}-%%{RELEASE}.%%{ARCH}' aws-nitro-enclaves-cli)\" = '${var.nitro_cli_nevra}'",
-      "printf '%s\\n' '${var.nitro_cli_nevra}' > /tmp/layrs-seq159300-installed-package-inventory.txt",
       "printf '%s  %s\\n' '${var.nitro_package_inventory_sha384}' '/tmp/layrs-seq159300-installed-package-inventory.txt' | sha384sum -c -",
       "sudo useradd --system --home-dir /nonexistent --shell /sbin/nologin layrsv2 || true",
       "sudo usermod -aG ne ec2-user",
@@ -335,6 +355,7 @@ build {
       nitroCliNevra                       = var.nitro_cli_nevra
       nitroCliRpmSha384                   = var.nitro_cli_rpm_sha384
       nitroPackageInventorySha384         = var.nitro_package_inventory_sha384
+      nitroPackageSetSha384               = var.nitro_package_set_sha384
       productionRouteAttached             = "false"
       recoveryServicesUnchanged           = "true"
     }

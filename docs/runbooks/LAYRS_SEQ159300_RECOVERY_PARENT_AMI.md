@@ -19,16 +19,25 @@ The wrapper fails closed unless all of these inputs are exact:
   `958e084e0a66d0aca6773193a74d40659cd258fcffa116b0117fed1fab8361046ffea6411379b72fc72c97b86f611290`;
 - PCR0
   `57fc48ad4d755edda38665bc8f0a16e7fd9dc485e3b57a2bce9070f60bd3b9724711ff973175340d5ebbfed4d63b7fac`;
-- a pinned AL2023 AMI ID owned by AWS account `137112412989`; and
-- the commit and SHA384 of the separately reviewed Phase2 isolation template,
+- exact AL2023 AMI `ami-0332d564d76dbd8d6`, name and image location
+  `al2023-ami-2023.12.20260817.0-kernel-6.18-x86_64` (the image location is
+  `amazon/` plus that name), owner `137112412989`, creation time
+  `2026-08-12T23:50:59.000Z`, Linux/UNIX platform, `RunInstances` operation,
+  IMDS `v2.0`, `uefi-preferred` boot, `/dev/xvda` EBS root, and exact unencrypted
+  8-GiB gp3 source snapshot `snap-0bc9cf3f9e4893b60`; and
+- the app-backend/IaC commit and SHA384 of the separately reviewed Phase2 isolation template,
   plus the immutable object key, VersionId and SHA384 of its evidence;
 - the SHA384 calculated directly from this Packer template; and
-- one exact reviewed `aws-nitro-enclaves-cli` x86_64 NEVRA and a regular local
-  `build/aws-nitro-enclaves-cli.rpm` whose SHA384, immutable object key and
-  VersionId are supplied by the reviewed evidence. Packer rehashes the RPM,
-  installs it with all repositories disabled, validates the installed NEVRA and
-  exports its canonical package inventory. It does not install the development
-  package or fetch runtime packages from a network repository.
+- one canonical immutable Nitro package-set manifest at
+  `build/seq159300-nitro-package-set.json` and its complete regular-file RPM
+  closure at `build/seq159300-nitro-packages/`. Every entry binds filename,
+  NEVRA, immutable object key, VersionId, SHA384 and signing-key ID. The build
+  caller retrieves every exact remote object version and the package-set
+  evidence object, rehashes and byte-compares them locally, and verifies the
+  RPM signature and header. Packer repeats signature/header/hash checks,
+  installs the entire closure with `dnf --disablerepo='*'`, validates each
+  installed NEVRA, and exports a canonical NEVRA-plus-package-file-hash
+  inventory. Development packages and live repositories are forbidden.
 
 The known build-a EIF SHA384
 `110c31235f36fa85e4a50d61fb89ab3a08e5b18587a35dfe4818c3615eed5a79513082df101e5c655fce8c7640d66ad8`
@@ -52,17 +61,26 @@ no public address or user data, produces a private AMI and adds no credentials,
 services, DNS or target-group registrations.
 
 `--build` first performs read-only AWS preflight in account `082223548516` and
-region `us-east-1`. Packer independently uses `allowed_account_ids` for the same
-account. The preflight fails closed unless:
+region `us-east-1`. It additionally requires the current STS session to resolve
+to the exact separately reviewed
+`layrs-production-recovery-seq159300-packer-*` control-plane role; arbitrary
+account credentials and root are rejected. Packer independently uses
+`allowed_account_ids` for the same account. The preflight fails closed unless:
 
 - the source AMI has the exact ID and AWS AL2023 owner, is available, x86_64,
   HVM/EBS and has a valid root mapping;
 - the build subnet disables automatic public IPs and every active route is
-  either VPC-local or an exact VPC endpoint route. Internet gateways, NAT,
-  transit gateways, peering, network-interface routes and public defaults fail;
+  VPC-local. Endpoint, internet-gateway, NAT, transit, peering,
+  network-interface and public-default routes fail; interface endpoints do not
+  require route entries, so any purported endpoint route is rejected rather
+  than accepted without correlation;
 - the build security group has no ingress and its only egress is TCP/443 to
   recovery-labelled endpoint security groups in the same VPC; and
-- the build instance profile belongs to the recovery account, has one
+- all three SSM interface endpoints (`ssm`, `ssmmessages`, `ec2messages`) are
+  available, private-DNS enabled and attached to that exact subnet and AZ, and
+  all endpoint ENIs are completely inventoried there; and
+- the build instance profile belongs to the recovery account, uses the exact
+  `layrs-production-recovery-seq159300-*` naming contract, has one
   EC2-only role and contains only the minimal SSM message-channel and recovery
   log actions. Secret, KMS, S3, parameter read, database/data, route mutation,
   target registration, PassRole and AssumeRole authority fail closed.
@@ -93,11 +111,14 @@ these two exact paths and start the two exact units. There is no
 `--validate-only` performs local source, hash, PCR0 and Phase2-template checks.
 `--build` is a separately authorized operation and emits canonical Phase2 AMI
 build evidence. The evidence includes the exact builder/source commits,
-Phase2 commit/hash and immutable reference, final implementation commit and
+Phase2 IaC commit/hash and immutable reference, final integrated backend
+implementation commit and its independent immutable reference,
 immutable reference, source AMI provenance, network/profile inventory hashes,
 Packer template and manifest hashes, installed Nitro CLI NEVRA/package hash,
-and post-build private/encrypted AMI readback hash. The implementation commit is
-only recorded here; a later signed gate must independently require equality.
+and post-build private/encrypted AMI readback hash. The two cross-repository
+commit fields are intentionally independent and must never be forced equal.
+Both are only recorded here; a later signed gate must independently require
+equality to their respective reviewed immutable evidence.
 
 No self-hash is used: the clean builder HEAD and Packer template are hashed
 before the build, while the completed Packer manifest is hashed only after it
