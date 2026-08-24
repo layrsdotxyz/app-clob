@@ -38,14 +38,16 @@ const runbook = readFileSync(
 const SOURCE_COMMIT = 'f282583cae7a5c873a26aa8d0c1bec10c490eb8e';
 const IMPLEMENTATION_COMMIT = '9e21c925d121822019524ec3d9b4973b1a32f38a';
 const PARENT_PACKAGE_COMMIT = '24405e0da728e237dc851915bcdb60c6ee1db5bb';
-const PHASE2_TEMPLATE_COMMIT = '23f92bc64171862abc410af953321a991e5e1515';
+const PHASE2_TEMPLATE_COMMIT = '37f9ce648efcf4f3e048cab7edf2748cda4ce2c3';
+const PHASE2_TEMPLATE_SHA384 = '74a007bfaae07601afb056d9d0e4c2b198a4b508951bfacaf8552cd2573736fbd4a86232e55f4a1a1e5146fb866efcae';
+const CLEANUP_IMPLEMENTATION_COMMIT = '23f92bc64171862abc410af953321a991e5e1515';
 const BUILDER_TEMPLATE_SHA384 = '75e536d6d138b88aaf7ef29fece2f67f3e6ffbda02841092de73726795b4d55a6fe01af492d8d8d1f0d3dc7f8db105d7';
 const INVOKER_TEMPLATE_SHA384 = 'd67e4f78be6bd679b4ab61e316215fce24035e89508baaefcf3b2df6209682fd94dc0fcd84bac1530664f02aaf7723e1';
 const TEMPLATE_PUBLISHER_SHA384 = '6eefb0154b78e08949ffb677a5179782cd17ab3f9a2f3d68ddf65789ce085b73aa9f76ad13821aff06fe9d853153d529';
 const CLEANUP_TEMPLATE_SHA384 = '72c5872db412726d8e56c0c078067bae19c8cf316bba204f0849a6ae34bc504792b12601f023f76efdf81b750a6aa77c';
 const POSTBUILD_PUBLISHER_SHA384 = '329c3ad67e05dec6efff89d7ede7553e652b18d7a6727c95fc88e7766584037f6d1345210120448cccba7f56397e9361';
 const FINALIZER_TEMPLATE_SHA384 = '2eeca9da6a30bc6aef84126d8e53b70723b8b00554aa65c9da982e3fd47f82eb694c00b05a26c598eed3d5b8d110b2c9';
-const BOOTSTRAP_TEMPLATE_SHA384 = 'caae4fa5902593a3648f6755669f87e4b6b59cb3bbb027ed82991b51ff8727f02cbcfe6883e8ea7644bd57477c9a8620';
+const BOOTSTRAP_TEMPLATE_SHA384 = 'a1842b42708550d46233b7abbd7296b70a413ad02cd4e907debe36944a8e9a036fcd6a56bb8cf6cf2c6d74530b9691f2';
 const SHA384 = '3'.repeat(96);
 const PARENT_SHA384 = 'd9506bf11627b04bd5d220e18e78584cd5e649952fe380309346d9c6bbecd511eb318cdcdee6a1d0db989d581a742db1';
 const EIF_SHA384 = '958e084e0a66d0aca6773193a74d40659cd258fcffa116b0117fed1fab8361046ffea6411379b72fc72c97b86f611290';
@@ -152,7 +154,7 @@ function validEvidence(overrides = {}) {
     phase2EvidenceObjectVersionId: 'phase2.version.1',
     phase2EvidenceObjectSha384: SHA384,
     phase2TemplateCommit: PHASE2_TEMPLATE_COMMIT,
-    phase2TemplateSha384: SHA384,
+    phase2TemplateSha384: PHASE2_TEMPLATE_SHA384,
     remediationEvidenceCommit: '540fc566c83dee2c3226862cc71a95541bc69af7',
     remediationIndexObjectVersionId: 'oBGf0odkWa6tzYpml_UtGemDwXI6GdXy',
     sourceCommit: SOURCE_COMMIT,
@@ -226,23 +228,24 @@ function validPostBuildCleanupEvidence(overrides = {}) {
   const evidenceRefs = [
     ['evidence/seq159300/recovery-only/phase2/parent-build/build.json', 'parent.build.version.1', '1'.repeat(96)],
     [`evidence/seq159300/recovery-only/phase2/builder/cleanup/templates/layrs-seq159300-recovery-builder-cleanup-${CLEANUP_TEMPLATE_SHA384}.yml`, 'cleanup.template.version.1', CLEANUP_TEMPLATE_SHA384],
-    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/receipts/${PHASE2_TEMPLATE_COMMIT}-${'5'.repeat(96)}.json`, 'cleanup.receipt.version.1', '3'.repeat(96)],
+    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/receipts/${CLEANUP_IMPLEMENTATION_COMMIT}-${'5'.repeat(96)}.json`, 'cleanup.receipt.version.1', '3'.repeat(96)],
     ['evidence/seq159300/recovery-only/phase2/builder/cleanup/inventory/pre-delete.json', 'predelete.inventory.version.1', '4'.repeat(96)],
     ['evidence/seq159300/recovery-only/phase2/builder/cleanup/intents/cleanup.json', 'cleanup.intent.version.1', '5'.repeat(96)],
     [`evidence/seq159300/recovery-only/phase2/builder/cleanup/publisher/templates/layrs-seq159300-recovery-post-build-evidence-publisher-${POSTBUILD_PUBLISHER_SHA384}.yml`, 'postbuild.publisher.template.version.1', POSTBUILD_PUBLISHER_SHA384],
     [`evidence/seq159300/recovery-only/phase2/builder/cleanup/finalizer/templates/layrs-seq159300-recovery-finalizer-${FINALIZER_TEMPLATE_SHA384}.yml`, 'finalizer.template.version.1', FINALIZER_TEMPLATE_SHA384],
-    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/finalizer/inventory/${PHASE2_TEMPLATE_COMMIT}-${'5'.repeat(96)}.json`, 'finalizer.role.inventory.version.1', '9'.repeat(96)],
+    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/finalizer/inventory/${CLEANUP_IMPLEMENTATION_COMMIT}-${'5'.repeat(96)}.json`, 'finalizer.role.inventory.version.1', '9'.repeat(96)],
     [`evidence/seq159300/recovery-only/phase2/builder/cleanup/finalizer/deployer/templates/layrs-predifi-root-bootstrap-${BOOTSTRAP_TEMPLATE_SHA384}.yml`, 'production.deployer.template.version.1', BOOTSTRAP_TEMPLATE_SHA384],
-    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/finalizer/deployer/inventory/${PHASE2_TEMPLATE_COMMIT}-${'5'.repeat(96)}.json`, 'production.deployer.inventory.version.1', 'f'.repeat(96)],
-    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/finalizer/stack-inventory/${PHASE2_TEMPLATE_COMMIT}-${'5'.repeat(96)}.json`, 'finalizer.stack.inventory.version.1', 'c'.repeat(96)],
-    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/roles/cleanup-execution/inventory/${PHASE2_TEMPLATE_COMMIT}-${'5'.repeat(96)}.json`, 'cleanup.execution.inventory.version.1', 'd'.repeat(96)],
-    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/roles/cleanup-submitter/inventory/${PHASE2_TEMPLATE_COMMIT}-${'5'.repeat(96)}.json`, 'cleanup.submitter.inventory.version.1', 'e'.repeat(96)],
-    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/roles/post-build-evidence-publisher/inventory/${PHASE2_TEMPLATE_COMMIT}-${'5'.repeat(96)}.json`, 'postbuild.publisher.inventory.version.1', '0'.repeat(96)],
+    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/finalizer/deployer/inventory/${CLEANUP_IMPLEMENTATION_COMMIT}-${'5'.repeat(96)}.json`, 'production.deployer.inventory.version.1', 'f'.repeat(96)],
+    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/finalizer/stack-inventory/${CLEANUP_IMPLEMENTATION_COMMIT}-${'5'.repeat(96)}.json`, 'finalizer.stack.inventory.version.1', 'c'.repeat(96)],
+    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/roles/cleanup-execution/inventory/${CLEANUP_IMPLEMENTATION_COMMIT}-${'5'.repeat(96)}.json`, 'cleanup.execution.inventory.version.1', 'd'.repeat(96)],
+    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/roles/cleanup-submitter/inventory/${CLEANUP_IMPLEMENTATION_COMMIT}-${'5'.repeat(96)}.json`, 'cleanup.submitter.inventory.version.1', 'e'.repeat(96)],
+    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/roles/post-build-evidence-publisher/inventory/${CLEANUP_IMPLEMENTATION_COMMIT}-${'5'.repeat(96)}.json`, 'postbuild.publisher.inventory.version.1', '0'.repeat(96)],
   ];
   return {
     protocol: 'layrs.seq159300.recovery-parent-post-build-cleanup-evidence.v1',
     accountId: '082223548516', region: 'us-east-1', environment: 'production',
-    cleanupImplementationCommit: PHASE2_TEMPLATE_COMMIT, verifiedAt: '2026-08-24T08:00:00Z',
+    cleanupImplementationCommit: CLEANUP_IMPLEMENTATION_COMMIT,
+    verifiedAt: '2026-08-24T08:00:00Z',
     finalizerApprovedAt: '2026-08-24T07:59:00Z',
     finalizerExpiresAt: '2026-08-24T08:59:00Z',
     cleanupApprovedAt: '2026-08-24T07:56:00Z',
@@ -563,6 +566,7 @@ test('renderer rejects swapped artifacts and recovery bindings', () => {
     { packerTemplateSha384: '0'.repeat(95) },
     { implementationCommit: 'not-a-commit' },
     { phase2TemplateCommit: '0'.repeat(40) },
+    { phase2TemplateSha384: '0'.repeat(96) },
     { nitroCliRpmSha384: '0'.repeat(95) },
     { phase2EvidenceObjectKey: '../mutable.json' },
     { remediationIndexObjectVersionId: 'different' },
@@ -1385,7 +1389,8 @@ test('output AMI readback rejects public, unencrypted or provenance-swapped imag
     nitroPackageSetSha384: SHA384, nitroPackageClosureSha384: SHA384,
     packerInvokerRoleInventorySha384: SHA384,
     packerTemplateSha384: SHA384,
-    phase2TemplateCommit: PHASE2_TEMPLATE_COMMIT, phase2TemplateSha384: SHA384,
+    phase2TemplateCommit: PHASE2_TEMPLATE_COMMIT,
+    phase2TemplateSha384: PHASE2_TEMPLATE_SHA384,
     recoveryEvidenceIndexSha384: SHA384,
     sourceAmiId: 'ami-0332d564d76dbd8d6', sourceAmiProvenanceSha384: SHA384,
     sourceCommit: SOURCE_COMMIT,
@@ -1396,7 +1401,7 @@ test('output AMI readback rejects public, unencrypted or provenance-swapped imag
     ['BuildSubnetInventorySha384', SHA384],
     ['GateImplementationCommit', IMPLEMENTATION_COMMIT],
     ['Phase2TemplateCommit', PHASE2_TEMPLATE_COMMIT],
-    ['Phase2TemplateSha384', SHA384],
+    ['Phase2TemplateSha384', PHASE2_TEMPLATE_SHA384],
     ['PackerTemplateSha384', SHA384],
     ['RecoveryParentPackageCommit', PARENT_PACKAGE_COMMIT],
     ['RecoveryEifSha384', EIF_SHA384], ['RecoveryParentSha384', PARENT_SHA384],

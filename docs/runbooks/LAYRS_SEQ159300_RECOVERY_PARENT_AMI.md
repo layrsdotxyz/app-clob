@@ -31,8 +31,11 @@ The wrapper fails closed unless all of these inputs are exact:
   8-GiB gp3 source snapshot `snap-0bc9cf3f9e4893b60`; and
 - the app-backend/IaC commit and SHA384 of the separately reviewed Phase2 isolation template,
   plus the immutable object key, VersionId and SHA384 of its evidence;
-- accepted app-backend recovery implementation/Phase2 commit
-  `23f92bc64171862abc410af953321a991e5e1515`, with these exact independently
+- accepted app-backend cleanup implementation commit
+  `23f92bc64171862abc410af953321a991e5e1515`; accepted isolated Phase-2 template
+  commit `37f9ce648efcf4f3e048cab7edf2748cda4ce2c3` and SHA384
+  `74a007bfaae07601afb056d9d0e4c2b198a4b508951bfacaf8552cd2573736fbd4a86232e55f4a1a1e5146fb866efcae`,
+  with these exact independently
   reviewed CloudFormation template SHA384 identities:
   - recovery builder `75e536d6d138b88aaf7ef29fece2f67f3e6ffbda02841092de73726795b4d55a6fe01af492d8d8d1f0d3dc7f8db105d7`;
   - Packer invoker `d67e4f78be6bd679b4ab61e316215fce24035e89508baaefcf3b2df6209682fd94dc0fcd84bac1530664f02aaf7723e1`;
@@ -40,7 +43,7 @@ The wrapper fails closed unless all of these inputs are exact:
   - builder cleanup `72c5872db412726d8e56c0c078067bae19c8cf316bba204f0849a6ae34bc504792b12601f023f76efdf81b750a6aa77c`;
   - post-build evidence publisher `329c3ad67e05dec6efff89d7ede7553e652b18d7a6727c95fc88e7766584037f6d1345210120448cccba7f56397e9361`;
   - retained finalizer `2eeca9da6a30bc6aef84126d8e53b70723b8b00554aa65c9da982e3fd47f82eb694c00b05a26c598eed3d5b8d110b2c9`;
-  - production deployer bootstrap `caae4fa5902593a3648f6755669f87e4b6b59cb3bbb027ed82991b51ff8727f02cbcfe6883e8ea7644bd57477c9a8620`.
+  - production deployer bootstrap `a1842b42708550d46233b7abbd7296b70a413ad02cd4e907debe36944a8e9a036fcd6a56bb8cf6cf2c6d74530b9691f2`.
   These source identities are necessary but not authorization: the later gate
   must still exact-read immutable VersionIds, validate signed evidence and keep
   Phase4 closed;

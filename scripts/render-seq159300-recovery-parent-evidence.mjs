@@ -10,7 +10,9 @@ const REMEDIATION_INDEX_VERSION = 'oBGf0odkWa6tzYpml_UtGemDwXI6GdXy';
 const PARENT_SHA384 = 'd9506bf11627b04bd5d220e18e78584cd5e649952fe380309346d9c6bbecd511eb318cdcdee6a1d0db989d581a742db1';
 const EIF_SHA384 = '958e084e0a66d0aca6773193a74d40659cd258fcffa116b0117fed1fab8361046ffea6411379b72fc72c97b86f611290';
 const PCR0_SHA384 = '57fc48ad4d755edda38665bc8f0a16e7fd9dc485e3b57a2bce9070f60bd3b9724711ff973175340d5ebbfed4d63b7fac';
-const ACCEPTED_PHASE2_TEMPLATE_COMMIT = '23f92bc64171862abc410af953321a991e5e1515';
+const ACCEPTED_PHASE2_TEMPLATE_COMMIT = '37f9ce648efcf4f3e048cab7edf2748cda4ce2c3';
+const ACCEPTED_PHASE2_TEMPLATE_SHA384 =
+  '74a007bfaae07601afb056d9d0e4c2b198a4b508951bfacaf8552cd2573736fbd4a86232e55f4a1a1e5146fb866efcae';
 const ACCEPTED_BUILDER_TEMPLATE_SHA384 = '75e536d6d138b88aaf7ef29fece2f67f3e6ffbda02841092de73726795b4d55a6fe01af492d8d8d1f0d3dc7f8db105d7';
 const ACCEPTED_INVOKER_TEMPLATE_SHA384 = 'd67e4f78be6bd679b4ab61e316215fce24035e89508baaefcf3b2df6209682fd94dc0fcd84bac1530664f02aaf7723e1';
 const ACCEPTED_TEMPLATE_PUBLISHER_SHA384 = '6eefb0154b78e08949ffb677a5179782cd17ab3f9a2f3d68ddf65789ce085b73aa9f76ad13821aff06fe9d853153d529';
@@ -113,6 +115,7 @@ export function renderRecoveryParentBuildEvidence(input) {
       || input.parentPackageCommit === SOURCE_COMMIT
       || !/^[0-9a-f]{40}$/u.test(input.implementationCommit)
       || input.phase2TemplateCommit !== ACCEPTED_PHASE2_TEMPLATE_COMMIT
+      || input.phase2TemplateSha384 !== ACCEPTED_PHASE2_TEMPLATE_SHA384
       || input.remediationEvidenceCommit !== REMEDIATION_COMMIT
       || input.remediationIndexObjectVersionId !== REMEDIATION_INDEX_VERSION
       || input.parentBinarySha384 !== PARENT_SHA384 || input.eifSha384 !== EIF_SHA384
