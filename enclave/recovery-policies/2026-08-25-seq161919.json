@@ -1,0 +1,28 @@
+{
+  "schemaVersion": "layrs.incident-terminal-recovery-policy.v1",
+  "incidentId": "layrs-seq161891-recovery-20260825",
+  "sourceReleaseCommit": "97614f37c05089708f93bf50ac8831adde98ab2f",
+  "restoreSequence": 161919,
+  "rollbackFloor": 161919,
+  "stateRoot": "647bc1b6a8f48caf6460b8cafc20baedbb208815dc52c88e9bdde70191c67f6a",
+  "journalHead": "02c52dce702bd2e7e83b96bbe82f0169fc2fa961eef1c50ed5dc455cdd43c881",
+  "snapshot": {
+    "bucket": "layrs-production-082223548516-us-east-1-immutable",
+    "key": "enclave/snapshot/00000000000000161919-cb284d9b13bc8b17d20c75d44e4e3b68a1d29dec3a7a5b9fd80871f340ea8da9.json",
+    "versionId": "nHXxPKfOHWlyZ1UzcYeBjFpXLzq2c1Bu",
+    "sizeBytes": 39930295,
+    "bodySha256": "9283a32007d96c2ba670bf093191d8e619af22da888bea4ece559c659e68d290",
+    "ciphertextSha256": "cb284d9b13bc8b17d20c75d44e4e3b68a1d29dec3a7a5b9fd80871f340ea8da9"
+  },
+  "sourceProvenance": {
+    "eifSha384": "4c23589c8f0a09e509584e5263fedd1368827c4b48388b2519b7a4b217c82991ddf06c6380f3086db4e28c75223a8a9f",
+    "pcr0": "d144679b70ac6ea9d84130e6d27112b1cd6fc0870d93dd5d595644283df2c20cc2cd6d8cb7cf49e1b643d6245336e2ad",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "f36c630bc592645bf86bb5ef4252c51e0dcb7d0e24af2f842dfff49fc22b0e3fd56bbb0f2d0eeff367587d0aa6605fb8",
+    "sourceAmiId": "ami-069ef36debc518fc9",
+    "copiedParentAmiId": "ami-03241294e5c3b3990",
+    "parentBinarySha384": "2fc8185a132856d8bb71d955c4cdfba2dcea78144ff82fa1f9052749a2c3947e75bdbb3e6672ca2f72b1bf4a58e67283"
+  },
+  "historicalJournalReplayRequired": false,
+  "historicalFillCompletenessCertified": false
+}

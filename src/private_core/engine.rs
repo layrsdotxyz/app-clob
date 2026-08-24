@@ -19,9 +19,9 @@ use super::{
     CoreError, CoreResult, CustodyLedgerTotal, EnclaveReceipt, EncryptedJournal,
     EncryptedJournalRecord, EncryptedSnapshot, ExternalFlowDirection, ExternalFlowTransaction,
     Fill, JournalKey, Ledger, LedgerTransaction, MatchResult, MatchType, NormalFillPosting,
-    OrderAction, OrderStatus, Outcome, PoolCashOpening, PriceTimeBook, ReceiptSigner,
-    ResolutionPayoutKind, SessionGuard, SignedSessionRequest, TimeInForce, Transfer,
-    VaultStrategyTransaction, VaultStrategyTransition, PRICE_SCALE,
+    OrderAction, OrderStatus, Outcome, PoolCashOpening, PriceTimeBook, PublicAssetTotal,
+    PublicBucketTotal, ReceiptSigner, ResolutionPayoutKind, SessionGuard, SignedSessionRequest,
+    TimeInForce, Transfer, VaultStrategyTransaction, VaultStrategyTransition, PRICE_SCALE,
 };
 
 /// Public depth is deliberately less precise than the enclave's private book.
@@ -1128,6 +1128,13 @@ struct CoreStateSnapshot {
 }
 
 pub const EXACT_LIVE_976_RELEASE_COMMIT: &str = "97614f37c05089708f93bf50ac8831adde98ab2f";
+pub const INCIDENT_TERMINAL_SEQUENCE: u64 = 161_919;
+pub const INCIDENT_TERMINAL_STATE_ROOT_HEX: &str =
+    "647bc1b6a8f48caf6460b8cafc20baedbb208815dc52c88e9bdde70191c67f6a";
+pub const INCIDENT_TERMINAL_JOURNAL_HEAD_HEX: &str =
+    "02c52dce702bd2e7e83b96bbe82f0169fc2fa961eef1c50ed5dc455cdd43c881";
+pub const INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX: &str =
+    "cb284d9b13bc8b17d20c75d44e4e3b68a1d29dec3a7a5b9fd80871f340ea8da9";
 
 /// Non-secret checkpoint fields supplied by the outer certification wrapper.
 /// Artifact checksums are revalidated by the runner before this reaches the
@@ -1170,6 +1177,105 @@ pub struct ExactLive976RestoreReport {
     pub qualified_totals_digest: String,
     pub user_state_digest: String,
     pub pool_cash_opening_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExactTerminalCategoryDigests {
+    pub users_and_sessions_sha256: String,
+    pub available_balances_sha256: String,
+    pub order_holds_sha256: String,
+    pub withdrawal_holds_sha256: String,
+    pub positions_and_cost_basis_sha256: String,
+    pub order_books_sha256: String,
+    pub snapshot_fill_state_sha256: String,
+    pub resolutions_sha256: String,
+    pub rewards_sha256: String,
+    pub fees_sha256: String,
+    pub markets_sha256: String,
+    pub replay_state_sha256: String,
+    pub custody_qualified_totals_sha256: String,
+    pub composite_user_state_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExactTerminalCategoryEquality {
+    pub users_and_sessions_equal: bool,
+    pub available_balances_equal: bool,
+    pub order_holds_equal: bool,
+    pub withdrawal_holds_equal: bool,
+    pub positions_and_cost_basis_equal: bool,
+    pub order_books_equal: bool,
+    pub snapshot_fill_state_equal: bool,
+    pub resolutions_equal: bool,
+    pub rewards_equal: bool,
+    pub fees_equal: bool,
+    pub markets_equal: bool,
+    pub replay_state_equal: bool,
+    pub custody_qualified_totals_equal: bool,
+    pub composite_user_state_equal: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExactTerminalCategoryCounts {
+    pub user_count: usize,
+    pub registered_session_count: usize,
+    pub sequenced_session_count: usize,
+    pub ledger_record_count: usize,
+    pub position_cost_basis_count: usize,
+    pub order_count: usize,
+    pub market_count: usize,
+    pub resolution_count: usize,
+    pub processed_command_count: usize,
+    pub system_key_count: usize,
+    pub aggregate_bucket_total_count: usize,
+    pub aggregate_asset_total_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExactTerminalSnapshotRestoreReport {
+    pub source_release_commit: String,
+    pub restored_sequence: u64,
+    pub restored_state_root: String,
+    pub restored_journal_head: String,
+    pub snapshot_ciphertext_sha256: String,
+    pub aggregate_bucket_totals: Vec<PublicBucketTotal>,
+    pub aggregate_asset_totals: Vec<PublicAssetTotal>,
+    pub category_counts: ExactTerminalCategoryCounts,
+    pub category_digests: ExactTerminalCategoryDigests,
+    pub category_equality: ExactTerminalCategoryEquality,
+    pub sequence_equal: bool,
+    pub state_root_equal: bool,
+    pub journal_head_equal: bool,
+    pub aggregate_totals_equal: bool,
+    pub aggregate_totals_zero_delta: bool,
+    pub restore_floor_persisted: bool,
+    pub no_external_state_mutation_performed: bool,
+    pub pool_cash_opening_required: bool,
+    pub historical_journal_replay_performed: bool,
+    pub historical_fill_completeness_certified: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalSnapshotDigests {
+    users_and_sessions: [u8; 32],
+    available_balances: [u8; 32],
+    order_holds: [u8; 32],
+    withdrawal_holds: [u8; 32],
+    positions_and_cost_basis: [u8; 32],
+    order_books: [u8; 32],
+    snapshot_fill_state: [u8; 32],
+    resolutions: [u8; 32],
+    rewards: [u8; 32],
+    fees: [u8; 32],
+    markets: [u8; 32],
+    replay_state: [u8; 32],
+    custody_qualified_totals: [u8; 32],
+    composite_user_state: [u8; 32],
+    pool_cash_opening_required: bool,
 }
 
 #[derive(Debug)]
@@ -1749,6 +1855,158 @@ impl PrivateTradingCore {
             identity_key,
             custody_totals_cache: RefCell::new(None),
         })
+    }
+
+    /// Restores only the immutable terminal snapshot approved for the
+    /// 2026-08-25 incident. Every public checkpoint field is rejected before
+    /// decryption unless it is the exact sequence-161919 tuple.
+    pub fn restore_exact_incident_terminal_snapshot(
+        journal_key: JournalKey,
+        receipt_signer: ReceiptSigner,
+        snapshot: &EncryptedSnapshot,
+    ) -> CoreResult<(Self, ExactTerminalSnapshotRestoreReport)> {
+        validate_exact_incident_terminal_snapshot(snapshot)?;
+
+        let source_journal = EncryptedJournal::new(journal_key.clone());
+        let source: CoreStateSnapshot = source_journal.open_snapshot(snapshot)?;
+        if source.sequence != INCIDENT_TERMINAL_SEQUENCE
+            || source_state_root(&source) != incident_terminal_state_root()
+        {
+            return Err(CoreError::IncidentRecoveryPolicyMismatch);
+        }
+        let source_positions: Vec<(PositionKey, u128)> = source.position_cost_basis.to_vec();
+        let source_digests = terminal_snapshot_digests(
+            &source.ledger,
+            &source.books,
+            &source.markets,
+            &source.sessions,
+            &source.processed_hashes,
+            &source.system_keys,
+            &source_positions,
+            &source.resolutions,
+            &source.private_rewards,
+        )?;
+        let source_counts = terminal_category_counts(
+            &source.ledger,
+            &source.books,
+            &source.markets,
+            &source.sessions,
+            &source.processed_hashes,
+            &source.system_keys,
+            &source_positions,
+            &source.resolutions,
+        )?;
+        let aggregate_bucket_totals = source.ledger.terminal_public_bucket_totals()?;
+        let aggregate_asset_totals = source.ledger.terminal_public_asset_totals()?;
+
+        let restored = Self::restore_encrypted_snapshot(
+            journal_key,
+            receipt_signer,
+            snapshot,
+            INCIDENT_TERMINAL_SEQUENCE,
+        )?;
+        if restored.sequence != INCIDENT_TERMINAL_SEQUENCE
+            || restored.state_root() != incident_terminal_state_root()
+            || restored.journal.chain_head()
+                != (INCIDENT_TERMINAL_SEQUENCE, incident_terminal_journal_head())
+        {
+            return Err(CoreError::IncidentRecoveryPolicyMismatch);
+        }
+        let restored_positions: Vec<(PositionKey, u128)> = restored
+            .position_cost_basis
+            .iter()
+            .map(|(key, amount)| (key.clone(), *amount))
+            .collect();
+        let restored_processed = processed_hashes(&restored.processed);
+        let restored_digests = terminal_snapshot_digests(
+            &restored.ledger,
+            &restored.books,
+            &restored.markets,
+            &restored.sessions,
+            &restored_processed,
+            &restored.system_keys,
+            &restored_positions,
+            &restored.resolutions,
+            &restored.private_rewards,
+        )?;
+        let restored_counts = terminal_category_counts(
+            &restored.ledger,
+            &restored.books,
+            &restored.markets,
+            &restored.sessions,
+            &restored_processed,
+            &restored.system_keys,
+            &restored_positions,
+            &restored.resolutions,
+        )?;
+        let restored_bucket_totals = restored.ledger.terminal_public_bucket_totals()?;
+        let restored_asset_totals = restored.ledger.terminal_public_asset_totals()?;
+        if source_digests != restored_digests
+            || source_counts != restored_counts
+            || aggregate_bucket_totals != restored_bucket_totals
+            || aggregate_asset_totals != restored_asset_totals
+        {
+            return Err(CoreError::IncidentRecoveryPolicyMismatch);
+        }
+
+        let category_equality = ExactTerminalCategoryEquality {
+            users_and_sessions_equal: true,
+            available_balances_equal: true,
+            order_holds_equal: true,
+            withdrawal_holds_equal: true,
+            positions_and_cost_basis_equal: true,
+            order_books_equal: true,
+            snapshot_fill_state_equal: true,
+            resolutions_equal: true,
+            rewards_equal: true,
+            fees_equal: true,
+            markets_equal: true,
+            replay_state_equal: true,
+            custody_qualified_totals_equal: true,
+            composite_user_state_equal: true,
+        };
+        let category_digests = ExactTerminalCategoryDigests {
+            users_and_sessions_sha256: hex::encode(source_digests.users_and_sessions),
+            available_balances_sha256: hex::encode(source_digests.available_balances),
+            order_holds_sha256: hex::encode(source_digests.order_holds),
+            withdrawal_holds_sha256: hex::encode(source_digests.withdrawal_holds),
+            positions_and_cost_basis_sha256: hex::encode(source_digests.positions_and_cost_basis),
+            order_books_sha256: hex::encode(source_digests.order_books),
+            snapshot_fill_state_sha256: hex::encode(source_digests.snapshot_fill_state),
+            resolutions_sha256: hex::encode(source_digests.resolutions),
+            rewards_sha256: hex::encode(source_digests.rewards),
+            fees_sha256: hex::encode(source_digests.fees),
+            markets_sha256: hex::encode(source_digests.markets),
+            replay_state_sha256: hex::encode(source_digests.replay_state),
+            custody_qualified_totals_sha256: hex::encode(source_digests.custody_qualified_totals),
+            composite_user_state_sha256: hex::encode(source_digests.composite_user_state),
+        };
+
+        Ok((
+            restored,
+            ExactTerminalSnapshotRestoreReport {
+                source_release_commit: EXACT_LIVE_976_RELEASE_COMMIT.into(),
+                restored_sequence: INCIDENT_TERMINAL_SEQUENCE,
+                restored_state_root: INCIDENT_TERMINAL_STATE_ROOT_HEX.into(),
+                restored_journal_head: INCIDENT_TERMINAL_JOURNAL_HEAD_HEX.into(),
+                snapshot_ciphertext_sha256: INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX.into(),
+                aggregate_bucket_totals,
+                aggregate_asset_totals,
+                category_counts: source_counts,
+                category_digests,
+                category_equality,
+                sequence_equal: true,
+                state_root_equal: true,
+                journal_head_equal: true,
+                aggregate_totals_equal: true,
+                aggregate_totals_zero_delta: true,
+                restore_floor_persisted: true,
+                no_external_state_mutation_performed: true,
+                pool_cash_opening_required: source_digests.pool_cash_opening_required,
+                historical_journal_replay_performed: false,
+                historical_fill_completeness_certified: false,
+            },
+        ))
     }
 
     /// Restores an authenticated direct successor of the current committed
@@ -8513,6 +8771,219 @@ fn validate_recovery_capsules(
     Ok(())
 }
 
+fn incident_terminal_state_root() -> [u8; 32] {
+    hex::decode(INCIDENT_TERMINAL_STATE_ROOT_HEX)
+        .expect("incident state root is compile-time checked hex")
+        .try_into()
+        .expect("incident state root is 32 bytes")
+}
+
+fn incident_terminal_journal_head() -> [u8; 32] {
+    hex::decode(INCIDENT_TERMINAL_JOURNAL_HEAD_HEX)
+        .expect("incident journal head is compile-time checked hex")
+        .try_into()
+        .expect("incident journal head is 32 bytes")
+}
+
+fn incident_terminal_ciphertext_sha256() -> [u8; 32] {
+    hex::decode(INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX)
+        .expect("incident ciphertext hash is compile-time checked hex")
+        .try_into()
+        .expect("incident ciphertext hash is 32 bytes")
+}
+
+fn validate_exact_incident_terminal_snapshot(snapshot: &EncryptedSnapshot) -> CoreResult<()> {
+    if snapshot.sequence != INCIDENT_TERMINAL_SEQUENCE
+        || snapshot.state_root != incident_terminal_state_root()
+        || snapshot.journal_head != incident_terminal_journal_head()
+        || snapshot.ciphertext_hash != incident_terminal_ciphertext_sha256()
+        || Sha256::digest(&snapshot.ciphertext).as_slice() != snapshot.ciphertext_hash
+    {
+        return Err(CoreError::IncidentRecoveryPolicyMismatch);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn terminal_category_counts(
+    ledger: &Ledger,
+    books: &BTreeMap<String, PriceTimeBook>,
+    markets: &BTreeMap<String, MarketConfig>,
+    sessions: &SessionGuard,
+    processed_hashes: &BTreeMap<String, [u8; 32]>,
+    system_keys: &BTreeSet<String>,
+    position_cost_basis: &[(PositionKey, u128)],
+    resolutions: &BTreeMap<String, MarketResolution>,
+) -> CoreResult<ExactTerminalCategoryCounts> {
+    let mut users = ledger.offline_user_owners();
+    let mut order_count = 0usize;
+    for book in books.values() {
+        order_count = order_count
+            .checked_add(book.offline_orders().len())
+            .ok_or(CoreError::UnbalancedTransaction)?;
+        for order in book.offline_orders().values() {
+            users.insert(order.private_user_id.clone());
+        }
+    }
+    let (registered_session_count, sequenced_session_count) = sessions.offline_counts();
+    Ok(ExactTerminalCategoryCounts {
+        user_count: users.len(),
+        registered_session_count,
+        sequenced_session_count,
+        ledger_record_count: ledger.offline_record_count(),
+        position_cost_basis_count: position_cost_basis.len(),
+        order_count,
+        market_count: markets.len(),
+        resolution_count: resolutions.len(),
+        processed_command_count: processed_hashes.len(),
+        system_key_count: system_keys.len(),
+        aggregate_bucket_total_count: ledger.terminal_public_bucket_totals()?.len(),
+        aggregate_asset_total_count: ledger.terminal_public_asset_totals()?.len(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn terminal_snapshot_digests(
+    ledger: &Ledger,
+    books: &BTreeMap<String, PriceTimeBook>,
+    markets: &BTreeMap<String, MarketConfig>,
+    sessions: &SessionGuard,
+    processed_hashes: &BTreeMap<String, [u8; 32]>,
+    system_keys: &BTreeSet<String>,
+    position_cost_basis: &[(PositionKey, u128)],
+    resolutions: &BTreeMap<String, MarketResolution>,
+    private_rewards: &PrivateRewardBook,
+) -> CoreResult<TerminalSnapshotDigests> {
+    let available = ledger.offline_balances_for_buckets(&[AccountBucket::UserAvailable]);
+    let order_holds = ledger.offline_balances_for_buckets(&[AccountBucket::UserOrderHold]);
+    let withdrawal_holds =
+        ledger.offline_balances_for_buckets(&[AccountBucket::UserWithdrawalHold]);
+    let position_balances = ledger.offline_balances_for_buckets(&[AccountBucket::UserPosition]);
+    let fee_balances = ledger.offline_balances_for_buckets(&[AccountBucket::FeeRevenue]);
+    let pool_cash = ledger.offline_balances_for_buckets(&[AccountBucket::PoolCash]);
+
+    let mut users = ledger.offline_user_owners();
+    let mut snapshot_fill_state = BTreeMap::<(String, Uuid), u128>::new();
+    for (market_id, book) in books {
+        for order in book.offline_orders().values() {
+            users.insert(order.private_user_id.clone());
+            snapshot_fill_state.insert((market_id.clone(), order.order_id), order.filled_micros);
+        }
+    }
+
+    let users_and_sessions = terminal_digest(
+        b"layrs.terminal-snapshot.users-and-sessions.v1\0",
+        &(users, sessions),
+    )?;
+    let available_balances = terminal_digest(
+        b"layrs.terminal-snapshot.available-balances.v1\0",
+        &available,
+    )?;
+    let order_holds = terminal_digest(b"layrs.terminal-snapshot.order-holds.v1\0", &order_holds)?;
+    let withdrawal_holds = terminal_digest(
+        b"layrs.terminal-snapshot.withdrawal-holds.v1\0",
+        &withdrawal_holds,
+    )?;
+    let positions_and_cost_basis = terminal_digest(
+        b"layrs.terminal-snapshot.positions-and-cost-basis.v1\0",
+        &(position_balances, position_cost_basis),
+    )?;
+    let order_books = terminal_digest(b"layrs.terminal-snapshot.order-books.v1\0", books)?;
+    let snapshot_fill_state = terminal_digest(
+        b"layrs.terminal-snapshot.fill-state.v1\0",
+        &snapshot_fill_state,
+    )?;
+    let resolutions = terminal_digest(b"layrs.terminal-snapshot.resolutions.v1\0", resolutions)?;
+    let rewards = terminal_digest(b"layrs.terminal-snapshot.rewards.v1\0", private_rewards)?;
+    let fees = terminal_digest(
+        b"layrs.terminal-snapshot.fees.v1\0",
+        &(fee_balances, private_rewards),
+    )?;
+    let markets = terminal_digest(b"layrs.terminal-snapshot.markets.v1\0", markets)?;
+    let replay_state = terminal_digest(
+        b"layrs.terminal-snapshot.replay-state.v1\0",
+        &(ledger.offline_replay_keys(), processed_hashes, system_keys),
+    )?;
+    let custody_qualified_totals = terminal_digest(
+        b"layrs.terminal-snapshot.custody-qualified-totals.v1\0",
+        &ledger.custody_reconciliation_totals()?,
+    )?;
+    let composite_user_state = terminal_digest(
+        b"layrs.terminal-snapshot.composite-user-state.v1\0",
+        &[
+            users_and_sessions,
+            available_balances,
+            order_holds,
+            withdrawal_holds,
+            positions_and_cost_basis,
+            order_books,
+            snapshot_fill_state,
+            resolutions,
+            rewards,
+            fees,
+            markets,
+            replay_state,
+            custody_qualified_totals,
+        ],
+    )?;
+    let has_user_liability = available.iter().any(|(_, amount)| *amount > 0)
+        || position_cost_basis.iter().any(|(_, amount)| *amount > 0)
+        || ledger
+            .offline_balances_for_buckets(&[
+                AccountBucket::UserOrderHold,
+                AccountBucket::UserWithdrawalHold,
+                AccountBucket::UserPosition,
+            ])
+            .iter()
+            .any(|(_, amount)| *amount > 0);
+    let has_pool_cash = pool_cash.iter().any(|(_, amount)| *amount > 0);
+
+    Ok(TerminalSnapshotDigests {
+        users_and_sessions,
+        available_balances,
+        order_holds,
+        withdrawal_holds,
+        positions_and_cost_basis,
+        order_books,
+        snapshot_fill_state,
+        resolutions,
+        rewards,
+        fees,
+        markets,
+        replay_state,
+        custody_qualified_totals,
+        composite_user_state,
+        pool_cash_opening_required: has_user_liability && !has_pool_cash,
+    })
+}
+
+fn terminal_digest<T: Serialize + ?Sized>(domain: &[u8], value: &T) -> CoreResult<[u8; 32]> {
+    let value = serde_json::to_value(value).map_err(|_| CoreError::JournalCrypto)?;
+    let canonical = terminal_canonical_json(value);
+    let encoded = serde_json::to_vec(&canonical).map_err(|_| CoreError::JournalCrypto)?;
+    let mut hash = Sha256::new();
+    hash.update(domain);
+    hash.update((encoded.len() as u64).to_be_bytes());
+    hash.update(encoded);
+    Ok(hash.finalize().into())
+}
+
+fn terminal_canonical_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Number(number) => serde_json::Value::String(number.to_string()),
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(terminal_canonical_json).collect())
+        }
+        serde_json::Value::Object(values) => serde_json::Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, terminal_canonical_json(value)))
+                .collect(),
+        ),
+        value => value,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn offline_state_digests(
     ledger: &Ledger,
@@ -9162,6 +9633,171 @@ mod category_fee_tests {
 mod snapshot_migration_tests {
     use super::*;
     use crate::private_core::TimeInForce;
+
+    fn incident_snapshot_metadata(sequence: u64) -> EncryptedSnapshot {
+        EncryptedSnapshot {
+            sequence,
+            journal_head: incident_terminal_journal_head(),
+            state_root: incident_terminal_state_root(),
+            nonce: [0; 12],
+            ciphertext: Vec::new(),
+            ciphertext_hash: incident_terminal_ciphertext_sha256(),
+        }
+    }
+
+    #[test]
+    fn incident_terminal_restore_rejects_every_non_exact_sequence_before_decrypt() {
+        for sequence in [161_891, 161_918, 161_920] {
+            assert_eq!(
+                validate_exact_incident_terminal_snapshot(&incident_snapshot_metadata(sequence)),
+                Err(CoreError::IncidentRecoveryPolicyMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn incident_terminal_restore_rejects_root_head_and_ciphertext_substitution() {
+        let mut wrong_root = incident_snapshot_metadata(INCIDENT_TERMINAL_SEQUENCE);
+        wrong_root.state_root[0] ^= 1;
+        assert_eq!(
+            validate_exact_incident_terminal_snapshot(&wrong_root),
+            Err(CoreError::IncidentRecoveryPolicyMismatch)
+        );
+
+        let mut wrong_head = incident_snapshot_metadata(INCIDENT_TERMINAL_SEQUENCE);
+        wrong_head.journal_head[0] ^= 1;
+        assert_eq!(
+            validate_exact_incident_terminal_snapshot(&wrong_head),
+            Err(CoreError::IncidentRecoveryPolicyMismatch)
+        );
+
+        let mut wrong_ciphertext_hash = incident_snapshot_metadata(INCIDENT_TERMINAL_SEQUENCE);
+        wrong_ciphertext_hash.ciphertext_hash[0] ^= 1;
+        assert_eq!(
+            validate_exact_incident_terminal_snapshot(&wrong_ciphertext_hash),
+            Err(CoreError::IncidentRecoveryPolicyMismatch)
+        );
+
+        // Exact public metadata is still insufficient: the ciphertext bytes
+        // themselves must hash to the immutable policy value before key use.
+        assert_eq!(
+            validate_exact_incident_terminal_snapshot(&incident_snapshot_metadata(
+                INCIDENT_TERMINAL_SEQUENCE
+            )),
+            Err(CoreError::IncidentRecoveryPolicyMismatch)
+        );
+    }
+
+    #[test]
+    fn terminal_digest_decimalizes_numbers_and_separates_domains() {
+        let value = serde_json::json!({"amount": 7, "nested": [0, -2]});
+        let canonical = terminal_canonical_json(value);
+        assert_eq!(canonical["amount"], "7");
+        assert_eq!(canonical["nested"][0], "0");
+        assert_eq!(canonical["nested"][1], "-2");
+        assert_ne!(
+            terminal_digest(b"layrs.test.category-a.v1\0", &canonical).unwrap(),
+            terminal_digest(b"layrs.test.category-b.v1\0", &canonical).unwrap()
+        );
+    }
+
+    #[test]
+    fn terminal_aggregate_totals_never_emit_private_owners() {
+        let mut ledger = Ledger::default();
+        ledger
+            .seed_balance(
+                AccountKey::new("private-owner-alpha", AccountBucket::UserAvailable, "USDC"),
+                7,
+            )
+            .unwrap();
+        ledger
+            .seed_balance(
+                AccountKey::new("private-owner-beta", AccountBucket::UserAvailable, "USDC"),
+                11,
+            )
+            .unwrap();
+        let totals = ledger.terminal_public_bucket_totals().unwrap();
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[0].amount, 18);
+        let encoded = serde_json::to_string(&totals).unwrap();
+        assert!(!encoded.contains("private-owner-alpha"));
+        assert!(!encoded.contains("private-owner-beta"));
+        assert!(encoded.contains("\"amount\":\"18\""));
+    }
+
+    #[test]
+    fn terminal_certificate_schema_rejects_unknown_fields() {
+        let digests = ExactTerminalCategoryDigests {
+            users_and_sessions_sha256: "00".repeat(32),
+            available_balances_sha256: "00".repeat(32),
+            order_holds_sha256: "00".repeat(32),
+            withdrawal_holds_sha256: "00".repeat(32),
+            positions_and_cost_basis_sha256: "00".repeat(32),
+            order_books_sha256: "00".repeat(32),
+            snapshot_fill_state_sha256: "00".repeat(32),
+            resolutions_sha256: "00".repeat(32),
+            rewards_sha256: "00".repeat(32),
+            fees_sha256: "00".repeat(32),
+            markets_sha256: "00".repeat(32),
+            replay_state_sha256: "00".repeat(32),
+            custody_qualified_totals_sha256: "00".repeat(32),
+            composite_user_state_sha256: "00".repeat(32),
+        };
+        let equality = ExactTerminalCategoryEquality {
+            users_and_sessions_equal: true,
+            available_balances_equal: true,
+            order_holds_equal: true,
+            withdrawal_holds_equal: true,
+            positions_and_cost_basis_equal: true,
+            order_books_equal: true,
+            snapshot_fill_state_equal: true,
+            resolutions_equal: true,
+            rewards_equal: true,
+            fees_equal: true,
+            markets_equal: true,
+            replay_state_equal: true,
+            custody_qualified_totals_equal: true,
+            composite_user_state_equal: true,
+        };
+        let report = ExactTerminalSnapshotRestoreReport {
+            source_release_commit: EXACT_LIVE_976_RELEASE_COMMIT.into(),
+            restored_sequence: INCIDENT_TERMINAL_SEQUENCE,
+            restored_state_root: INCIDENT_TERMINAL_STATE_ROOT_HEX.into(),
+            restored_journal_head: INCIDENT_TERMINAL_JOURNAL_HEAD_HEX.into(),
+            snapshot_ciphertext_sha256: INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX.into(),
+            aggregate_bucket_totals: Vec::new(),
+            aggregate_asset_totals: Vec::new(),
+            category_counts: ExactTerminalCategoryCounts {
+                user_count: 0,
+                registered_session_count: 0,
+                sequenced_session_count: 0,
+                ledger_record_count: 0,
+                position_cost_basis_count: 0,
+                order_count: 0,
+                market_count: 0,
+                resolution_count: 0,
+                processed_command_count: 0,
+                system_key_count: 0,
+                aggregate_bucket_total_count: 0,
+                aggregate_asset_total_count: 0,
+            },
+            category_digests: digests,
+            category_equality: equality,
+            sequence_equal: true,
+            state_root_equal: true,
+            journal_head_equal: true,
+            aggregate_totals_equal: true,
+            aggregate_totals_zero_delta: true,
+            restore_floor_persisted: true,
+            no_external_state_mutation_performed: true,
+            pool_cash_opening_required: false,
+            historical_journal_replay_performed: false,
+            historical_fill_completeness_certified: false,
+        };
+        let mut value = serde_json::to_value(report).unwrap();
+        value["privateState"] = serde_json::json!({"unexpected": true});
+        assert!(serde_json::from_value::<ExactTerminalSnapshotRestoreReport>(value).is_err());
+    }
 
     fn exact_976_binding(snapshot: &EncryptedSnapshot) -> ExactLive976CheckpointBinding {
         ExactLive976CheckpointBinding {

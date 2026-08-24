@@ -207,6 +207,26 @@ pub struct CustodyLedgerTotal {
     pub amount: u128,
 }
 
+/// Privacy-safe terminal certification total. Only the public asset and bucket
+/// survive aggregation; enclave-private owners, markets and outcomes never do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicBucketTotal {
+    pub bucket: AccountBucket,
+    pub asset: String,
+    #[serde(with = "super::decimal_u128")]
+    pub amount: u128,
+}
+
+/// Asset-wide conservation total derived from every public bucket aggregate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicAssetTotal {
+    pub asset: String,
+    #[serde(with = "super::decimal_u128")]
+    pub amount: u128,
+}
+
 /// One independently reconciled custody balance used to establish the
 /// historical `PoolCash` opening without changing any user liability.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -403,6 +423,49 @@ impl Ledger {
 
     pub(crate) fn offline_replay_keys(&self) -> &BTreeSet<String> {
         &self.applied_idempotency_keys
+    }
+
+    pub(crate) fn offline_record_count(&self) -> usize {
+        self.balances.len()
+    }
+
+    pub(crate) fn terminal_public_bucket_totals(&self) -> CoreResult<Vec<PublicBucketTotal>> {
+        let mut totals = BTreeMap::<(String, AccountBucket), u128>::new();
+        for (account, amount) in &self.balances {
+            let key = (account.asset.clone(), account.bucket.clone());
+            let next = totals
+                .get(&key)
+                .copied()
+                .unwrap_or_default()
+                .checked_add(*amount)
+                .ok_or(CoreError::UnbalancedTransaction)?;
+            totals.insert(key, next);
+        }
+        Ok(totals
+            .into_iter()
+            .map(|((asset, bucket), amount)| PublicBucketTotal {
+                bucket,
+                asset,
+                amount,
+            })
+            .collect())
+    }
+
+    pub(crate) fn terminal_public_asset_totals(&self) -> CoreResult<Vec<PublicAssetTotal>> {
+        let mut totals = BTreeMap::<String, u128>::new();
+        for total in self.terminal_public_bucket_totals()? {
+            let next = totals
+                .get(&total.asset)
+                .copied()
+                .unwrap_or_default()
+                .checked_add(total.amount)
+                .ok_or(CoreError::UnbalancedTransaction)?;
+            totals.insert(total.asset, next);
+        }
+        Ok(totals
+            .into_iter()
+            .map(|(asset, amount)| PublicAssetTotal { asset, amount })
+            .collect())
     }
 
     #[cfg(test)]

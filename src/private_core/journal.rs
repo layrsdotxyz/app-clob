@@ -51,6 +51,7 @@ pub struct EncryptedJournalRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EncryptedSnapshot {
     pub sequence: u64,
     pub journal_head: [u8; 32],

@@ -5,113 +5,169 @@ usage() {
   cat <<'EOF'
 Usage:
   scripts/certify-live-976-cumulative-restore.sh \
-    --snapshot <encrypted-snapshot> \
-    --journal <immutable-journal-export> \
-    --checkpoint <checkpoint.json> \
-    --runner <attested-offline-restore-runner>
+    --client <authenticated-incident-restore-client> \
+    --kms-key-id <kms-key-arn-or-alias> \
+    --kms-ciphertext-blob <encrypted-journal-key> \
+    --certifier-release-manifest <signed-release-manifest> \
+    --expected-pcr0 <96-lowercase-hex> \
+    --evidence-dir <existing-persistent-directory> \
+    --snapshot-name <new-snapshot-basename.json> \
+    --report-name <new-report-basename.json>
 
-The runner receives the same four artifact paths plus --report <temporary-path>.
-It must write the privacy-safe JSON report described in the cumulative migration
-document. This wrapper never accepts keys and never decrypts account data.
+The client must implement the integrated BEGIN/COMPLETE_INCIDENT_TERMINAL_RESTORE
+operator flow. This wrapper supplies only the exact immutable descriptor, raw
+encrypted snapshot, KMS ciphertext and a fresh persistent challenge. It never
+accepts plaintext keys, journals, /tmp paths, or an implicit report location.
 EOF
 }
 
-snapshot=""
-journal=""
-checkpoint=""
-runner=""
+client=""
+kms_key_id=""
+kms_ciphertext_blob=""
+certifier_release_manifest=""
+expected_pcr0=""
+evidence_dir=""
+snapshot_name=""
+report_name=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --snapshot) snapshot="${2:-}"; shift 2 ;;
-    --journal) journal="${2:-}"; shift 2 ;;
-    --checkpoint) checkpoint="${2:-}"; shift 2 ;;
-    --runner) runner="${2:-}"; shift 2 ;;
+    --client) client="${2:-}"; shift 2 ;;
+    --kms-key-id) kms_key_id="${2:-}"; shift 2 ;;
+    --kms-ciphertext-blob) kms_ciphertext_blob="${2:-}"; shift 2 ;;
+    --certifier-release-manifest) certifier_release_manifest="${2:-}"; shift 2 ;;
+    --expected-pcr0) expected_pcr0="${2:-}"; shift 2 ;;
+    --evidence-dir) evidence_dir="${2:-}"; shift 2 ;;
+    --snapshot-name) snapshot_name="${2:-}"; shift 2 ;;
+    --report-name) report_name="${2:-}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    *) echo "Unknown argument." >&2; usage >&2; exit 2 ;;
   esac
 done
 
-for value in "$snapshot" "$journal" "$checkpoint" "$runner"; do
+for value in "$client" "$kms_key_id" "$kms_ciphertext_blob" "$certifier_release_manifest" \
+  "$expected_pcr0" "$evidence_dir" "$snapshot_name" "$report_name"; do
   [[ -n "$value" ]] || { usage >&2; exit 2; }
 done
-[[ -f "$snapshot" && -f "$journal" && -f "$checkpoint" ]] || {
-  echo "Snapshot, journal, or checkpoint file is missing." >&2
+[[ -f "$kms_ciphertext_blob" && -f "$certifier_release_manifest" ]] || {
+  echo "A required immutable input file is missing." >&2
   exit 2
 }
-[[ -x "$runner" ]] || { echo "Restore runner is not executable: $runner" >&2; exit 2; }
+[[ -x "$client" ]] || { echo "Incident restore client is not executable." >&2; exit 2; }
+[[ -d "$evidence_dir" ]] || { echo "Evidence directory must already exist." >&2; exit 2; }
+[[ "$evidence_dir" != /tmp && "$evidence_dir" != /tmp/* ]] || {
+  echo "Evidence directory must not be under /tmp." >&2
+  exit 2
+}
+[[ "$report_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*\.json$ && "$report_name" != *..* ]] || {
+  echo "Report name must be one safe JSON basename." >&2
+  exit 2
+}
+[[ "$snapshot_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*\.json$ && "$snapshot_name" != *..* ]] || {
+  echo "Snapshot name must be one safe JSON basename." >&2
+  exit 2
+}
+[[ "$expected_pcr0" =~ ^[0-9a-f]{96}$ ]] || {
+  echo "Expected certifier PCR0 must be 96 lowercase hex characters." >&2
+  exit 2
+}
 command -v jq >/dev/null || { echo "jq is required." >&2; exit 2; }
+command -v aws >/dev/null || { echo "aws is required." >&2; exit 2; }
+command -v openssl >/dev/null || { echo "openssl is required." >&2; exit 2; }
 command -v sha256sum >/dev/null || { echo "sha256sum is required." >&2; exit 2; }
 
-expected_release="97614f37c05089708f93bf50ac8831adde98ab2f"
-jq -e --arg release "$expected_release" '
-  .sourceReleaseCommit == $release and
-  (.sequence | type == "number") and .sequence >= 0 and
-  (.stateRoot | test("^[0-9a-f]{64}$")) and
-  (.journalHead | test("^[0-9a-f]{64}$")) and
-  (.snapshotSha256 | test("^[0-9a-f]{64}$")) and
-  (.journalSha256 | test("^[0-9a-f]{64}$")) and
-  (.eifSha384 | test("^[0-9a-f]{96}$")) and
-  (.pcr0 | test("^[0-9a-f]{96}$")) and
-  (.pcr1 | test("^[0-9a-f]{96}$")) and
-  (.pcr2 | test("^[0-9a-f]{96}$")) and
-  (.parentAmiId | test("^ami-[0-9a-f]+$"))
-' "$checkpoint" >/dev/null || {
-  echo "Checkpoint is incomplete or is not bound to exact live release $expected_release." >&2
+policy="$(dirname "$0")/../enclave/recovery-policies/2026-08-25-seq161919.json"
+expected_policy_sha="64f95c19acaf1cc760c28b598fcd7609101f756a706357ec8ec7b7c2d1cc3d95"
+[[ -f "$policy" && "$(sha256sum "$policy" | awk '{print $1}')" == "$expected_policy_sha" ]] || {
+  echo "Embedded incident policy checksum mismatch." >&2
+  exit 1
+}
+snapshot="$evidence_dir/$snapshot_name"
+snapshot_metadata="$evidence_dir/${snapshot_name%.json}.s3-get-object.json"
+[[ ! -e "$snapshot" && ! -e "$snapshot_metadata" ]] || {
+  echo "Snapshot or S3 metadata evidence already exists; refusing overwrite." >&2
+  exit 1
+}
+account="$(aws sts get-caller-identity --query Account --output text)"
+[[ "$account" == "082223548516" ]] || {
+  echo "AWS account is not the exact Layrs production account." >&2
+  exit 1
+}
+umask 077
+aws s3api get-object \
+  --bucket "layrs-production-082223548516-us-east-1-immutable" \
+  --key "enclave/snapshot/00000000000000161919-cb284d9b13bc8b17d20c75d44e4e3b68a1d29dec3a7a5b9fd80871f340ea8da9.json" \
+  --version-id "nHXxPKfOHWlyZ1UzcYeBjFpXLzq2c1Bu" \
+  --checksum-mode ENABLED \
+  "$snapshot" > "$snapshot_metadata"
+jq -e '
+  .VersionId == "nHXxPKfOHWlyZ1UzcYeBjFpXLzq2c1Bu" and
+  .ContentLength == 39930295 and
+  .ChecksumSHA256 == "koOjIAfZbCumcL8JMZHY5hmvItqIi+pOzlWcZZ5o0pA=" and
+  .ServerSideEncryption == "aws:kms" and
+  .Metadata["content-sha256"] == "9283a32007d96c2ba670bf093191d8e619af22da888bea4ece559c659e68d290"
+' "$snapshot_metadata" >/dev/null || {
+  echo "Exact S3 VersionId metadata mismatch." >&2
+  exit 1
+}
+[[ "$(wc -c < "$snapshot" | tr -d ' ')" == "39930295" ]] || {
+  echo "Exact terminal snapshot size mismatch." >&2
+  exit 1
+}
+[[ "$(sha256sum "$snapshot" | awk '{print $1}')" == \
+  "9283a32007d96c2ba670bf093191d8e619af22da888bea4ece559c659e68d290" ]] || {
+  echo "Exact terminal snapshot body checksum mismatch." >&2
   exit 1
 }
 
-snapshot_sha="$(sha256sum "$snapshot" | awk '{print $1}')"
-journal_sha="$(sha256sum "$journal" | awk '{print $1}')"
-checkpoint_sha="$(sha256sum "$checkpoint" | awk '{print $1}')"
-[[ "$snapshot_sha" == "$(jq -r .snapshotSha256 "$checkpoint")" ]] || {
-  echo "Encrypted snapshot checksum mismatch." >&2
+report="$evidence_dir/$report_name"
+challenge_file="$evidence_dir/${report_name%.json}.challenge"
+[[ ! -e "$report" && ! -e "$challenge_file" ]] || {
+  echo "Report or challenge evidence already exists; refusing overwrite." >&2
   exit 1
 }
-[[ "$journal_sha" == "$(jq -r .journalSha256 "$checkpoint")" ]] || {
-  echo "Immutable journal checksum mismatch." >&2
-  exit 1
-}
+challenge="$(openssl rand -hex 32)"
+set -o noclobber
+printf '%s\n' "$challenge" > "$challenge_file"
+set +o noclobber
 
-report="$(mktemp)"
-trap 'rm -f "$report"' EXIT
-"$runner" \
+"$client" incident-terminal-restore \
   --snapshot "$snapshot" \
-  --journal "$journal" \
-  --checkpoint "$checkpoint" \
-  --report "$report"
+  --bucket "layrs-production-082223548516-us-east-1-immutable" \
+  --key "enclave/snapshot/00000000000000161919-cb284d9b13bc8b17d20c75d44e4e3b68a1d29dec3a7a5b9fd80871f340ea8da9.json" \
+  --version-id "nHXxPKfOHWlyZ1UzcYeBjFpXLzq2c1Bu" \
+  --kms-key-id "$kms_key_id" \
+  --kms-ciphertext-blob "$kms_ciphertext_blob" \
+  --external-challenge "$challenge" \
+  --certifier-release-manifest "$certifier_release_manifest" \
+  --expected-pcr0 "$expected_pcr0" \
+  --output "$report"
 
-jq -e --arg release "$expected_release" --arg checkpoint "$checkpoint_sha" '
-  .sourceReleaseCommit == $release and
-  .checkpointSha256 == $checkpoint and
-  .sourceCheckpointEqual == true and
-  .sequenceEqual == true and
-  .journalHeadEqual == true and
-  .stateRootEqual == true and
-  .usersEqual == true and
-  .availableBalancesEqual == true and
-  .orderHoldsEqual == true and
-  .withdrawalHoldsEqual == true and
-  .positionsEqual == true and
-  .ordersEqual == true and
-  .fillsEqual == true and
-  .resolutionsEqual == true and
-  .rewardsEqual == true and
-  .feesEqual == true and
-  .marketsEqual == true and
-  .replayKeysEqual == true and
-  (.legacyZeroBalanceCount | type == "number") and
-  (.qualifiedTotalsDigest | test("^[0-9a-f]{64}$")) and
-  (.userStateDigest | test("^[0-9a-f]{64}$")) and
-  (.poolCashOpeningRequired | type == "boolean") and
-  (.evidenceSha256 | test("^[0-9a-f]{64}$")) and
-  (.artifactBindingSha256 | test("^[0-9a-f]{64}$")) and
-  (.attestationDocumentSha256 | test("^[0-9a-f]{64}$")) and
-  (.attestationDocumentBase64 | type == "string") and
-  (.attestationDocumentBase64 | length > 128)
+[[ -f "$report" ]] || { echo "Client did not create the requested report." >&2; exit 1; }
+jq -e --arg policy "$expected_policy_sha" '
+  .type == "INCIDENT_TERMINAL_RESTORE_CERTIFIED" and
+  .envelope.certificate.incidentPolicySha256 == $policy and
+  .envelope.certificate.sourceReleaseCommit == "97614f37c05089708f93bf50ac8831adde98ab2f" and
+  .envelope.certificate.snapshotVersionId == "nHXxPKfOHWlyZ1UzcYeBjFpXLzq2c1Bu" and
+  .envelope.certificate.restoredSequence == 161919 and
+  .envelope.certificate.restoredStateRoot == "647bc1b6a8f48caf6460b8cafc20baedbb208815dc52c88e9bdde70191c67f6a" and
+  .envelope.certificate.restoredJournalHead == "02c52dce702bd2e7e83b96bbe82f0169fc2fa961eef1c50ed5dc455cdd43c881" and
+  .envelope.certificate.artifactEqual == true and
+  .envelope.certificate.policyEqual == true and
+  .envelope.certificate.sourceReleaseEqual == true and
+  .envelope.certificate.certifierPcr0Equal == true and
+  .envelope.certificate.sequenceEqual == true and
+  .envelope.certificate.stateRootEqual == true and
+  .envelope.certificate.journalHeadEqual == true and
+  .envelope.certificate.aggregateTotalsEqual == true and
+  .envelope.certificate.aggregateTotalsZeroDelta == true and
+  .envelope.certificate.restoreFloorPersisted == true and
+  .envelope.certificate.noExternalStateMutationPerformed == true and
+  .envelope.certificate.historicalJournalReplayPerformed == false and
+  .envelope.certificate.historicalFillCompletenessCertified == false and
+  (.envelope.attestationDocumentSha256 | test("^[0-9a-f]{64}$"))
 ' "$report" >/dev/null || {
-  echo "Exact-live cumulative restore certification failed closed." >&2
-  jq '{sourceCheckpointEqual,sequenceEqual,journalHeadEqual,stateRootEqual,usersEqual,availableBalancesEqual,orderHoldsEqual,withdrawalHoldsEqual,positionsEqual,ordersEqual,fillsEqual,resolutionsEqual,rewardsEqual,feesEqual,marketsEqual,replayKeysEqual,legacyZeroBalanceCount,poolCashOpeningRequired}' "$report" >&2 || true
+  echo "Incident terminal restore certificate failed closed." >&2
   exit 1
 }
 
-jq '{status:"PASS_OFFLINE_RESTORE_ONLY",sourceReleaseCommit,sourceCheckpointEqual,sequenceEqual,journalHeadEqual,stateRootEqual,legacyZeroBalanceCount,poolCashOpeningRequired,qualifiedTotalsDigest,userStateDigest,evidenceSha256,artifactBindingSha256,attestationDocumentSha256,attestationDocumentBase64}' "$report"
+jq '{status:"PASS_INCIDENT_TERMINAL_RESTORE_ONLY",certificate:.envelope.certificate,certificateSha256:.envelope.certificateSha256,artifactBindingSha256:.envelope.artifactBindingSha256,attestationDocumentSha256:.envelope.attestationDocumentSha256}' "$report"
