@@ -77,11 +77,11 @@ variable "build_instance_profile_inventory_sha384" {
     error_message = "The canonical build instance-profile inventory SHA384 is required."
   }
 }
-variable "builder_source_commit" {
+variable "parent_package_commit" {
   type = string
   validation {
-    condition     = can(regex("^[0-9a-f]{40}$", var.builder_source_commit))
-    error_message = "The exact reviewed recovery-parent builder commit is required."
+    condition     = can(regex("^[0-9a-f]{40}$", var.parent_package_commit))
+    error_message = "The exact reviewed recovery-parent package commit is required."
   }
 }
 variable "parent_sha384" {
@@ -267,7 +267,7 @@ source "amazon-ebs" "seq159300_recovery_parent" {
     Environment                   = "recovery-only"
     ManagedBy                     = "Packer"
     RecoverySourceCommit          = local.recovery_source_commit
-    RecoveryBuilderSourceCommit   = var.builder_source_commit
+    RecoveryParentPackageCommit   = var.parent_package_commit
     SourceAmiProvenanceSha384     = var.source_ami_provenance_sha384
     BuildSubnetInventorySha384    = var.build_subnet_inventory_sha384
     BuildSecurityGroupSha384      = var.build_security_group_inventory_sha384
@@ -413,7 +413,7 @@ build {
     custom_data = {
       purpose                              = local.recovery_purpose
       sourceCommit                         = local.recovery_source_commit
-      builderSourceCommit                  = var.builder_source_commit
+      parentPackageCommit                  = var.parent_package_commit
       sourceAmiId                          = var.source_ami_id
       sourceAmiOwner                       = var.source_ami_owner
       sourceAmiProvenanceSha384            = var.source_ami_provenance_sha384

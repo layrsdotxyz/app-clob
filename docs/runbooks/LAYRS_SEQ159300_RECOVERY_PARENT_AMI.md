@@ -7,8 +7,12 @@ modify either runtime artifact.
 The wrapper fails closed unless all of these inputs are exact:
 
 - source commit `f282583cae7a5c873a26aa8d0c1bec10c490eb8e`;
-- `LAYRS_RECOVERY_BUILDER_COMMIT`, which must equal the clean app-clob
-  checkout's exact HEAD and must differ from f282. This commit is evidence,
+- `LAYRS_RECOVERY_PARENT_PACKAGE_COMMIT`, which must equal the clean app-clob
+  checkout's exact HEAD and must differ from f282. The wrapper emits it only as
+  `parentPackageCommit`; the older semantically overloaded
+  `builderSourceCommit` field is rejected. It is distinct from the f282 recovery
+  runtime source, the `23f92bc...` builder IaC/cleanup implementation, and the
+  separately integrated gate implementation commit. This commit is evidence,
   not authorization, and is bound by the later signed gate;
 - the exact lowercase 40-hex final integrated gate implementation commit,
   supplied only after the gate, harness and Phase2 IaC are integrated, plus
@@ -249,6 +253,30 @@ and post-build private/encrypted AMI readback hash. The two cross-repository
 commit fields are intentionally independent and must never be forced equal.
 Both are only recorded here; a later signed gate must independently require
 equality to their respective reviewed immutable evidence.
+
+Parent-package provenance is explicit rather than merely inferred from the Git
+commit. Only after `git rev-parse HEAD` equals the caller-supplied commit and
+`git status --porcelain=v1 --untracked-files=all` proves the entire worktree
+clean does the wrapper accept the checkout. It rejects missing, symlinked or
+non-regular package files and computes SHA384 directly from the checked-out
+bytes for:
+
+- `parentBuildWrapperSha384`;
+- `parentPreflightSha384`;
+- `parentBuildEvidenceRendererSha384`;
+- `parentPostBuildCleanupEvidenceRendererSha384`;
+- `parentRunbookSha384`; and
+- the existing `packerTemplateSha384`.
+
+The canonical parent-build evidence includes those hashes and
+`parentPackageCommit`. The renderer rejects malformed hashes and any
+`parentPackageCommit` equal to the f282 runtime source. The wrapper supplies
+only the clean checkout HEAD; the renderer deliberately does not contain a
+self-referential hard-coded commit or file hash. After the final tooling commit exists, the
+signed gate and two reviewer envelopes pin that exact commit and every emitted
+hash. Consequently, changing the wrapper, validator, either renderer, runbook
+or Packer template changes the evidence and fails the reviewed gate; arbitrary
+environment overrides cannot substitute these values.
 
 After the retained AMI, snapshots and parent-build evidence are durable, cleanup
 uses a separate canonical

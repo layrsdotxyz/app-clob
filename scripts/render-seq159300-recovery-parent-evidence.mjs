@@ -18,7 +18,7 @@ const ACCEPTED_CLEANUP_TEMPLATE_SHA384 = '72c5872db412726d8e56c0c078067bae19c8cf
 
 const FIELDS = Object.freeze([
   'accountId', 'amiId', 'buildCompletedAt', 'builderEvidenceIndexObjectKey',
-  'builderEvidenceIndexObjectVersionId', 'builderEvidenceIndexSha384', 'builderSourceCommit',
+  'builderEvidenceIndexObjectVersionId', 'builderEvidenceIndexSha384',
   'builderTemplateEvidenceObjectKey', 'builderTemplateEvidenceObjectVersionId',
   'builderTemplateEvidenceSha384', 'builderTemplateSha384', 'buildControlPlaneRoleInventorySha384',
   'buildInstanceProfileInventorySha384', 'buildSecurityGroupInventorySha384',
@@ -48,7 +48,9 @@ const FIELDS = Object.freeze([
   'packerInvokerEvidenceSha384', 'packerInvokerRoleInventorySha384',
   'packerInvokerTemplateSha384',
   'packerToolchainManifestSha256',
-  'parentBinarySha384', 'pcr0Sha384', 'phase2EvidenceObjectKey',
+  'parentBinarySha384', 'parentBuildEvidenceRendererSha384', 'parentBuildWrapperSha384',
+  'parentPackageCommit', 'parentPostBuildCleanupEvidenceRendererSha384',
+  'parentPreflightSha384', 'parentRunbookSha384', 'pcr0Sha384', 'phase2EvidenceObjectKey',
   'phase2EvidenceObjectVersionId', 'phase2EvidenceObjectSha384', 'phase2TemplateCommit',
   'phase2TemplateSha384', 'protocol', 'region',
   'remediationEvidenceCommit', 'remediationIndexObjectVersionId', 'sourceCommit',
@@ -107,8 +109,8 @@ export function renderRecoveryParentBuildEvidence(input) {
   if (input.protocol !== 'layrs.seq159300.recovery-parent-build-evidence.v1'
       || input.accountId !== ACCOUNT_ID || input.region !== REGION
       || input.environment !== 'production' || input.sourceCommit !== SOURCE_COMMIT
-      || !/^[0-9a-f]{40}$/u.test(input.builderSourceCommit)
-      || input.builderSourceCommit === SOURCE_COMMIT
+      || !/^[0-9a-f]{40}$/u.test(input.parentPackageCommit)
+      || input.parentPackageCommit === SOURCE_COMMIT
       || !/^[0-9a-f]{40}$/u.test(input.implementationCommit)
       || input.phase2TemplateCommit !== ACCEPTED_PHASE2_TEMPLATE_COMMIT
       || input.remediationEvidenceCommit !== REMEDIATION_COMMIT
@@ -120,6 +122,11 @@ export function renderRecoveryParentBuildEvidence(input) {
       || input.packerAmazonPluginVersion !== '1.3.9'
       || input.packerAmazonPluginSourceCommit !== '2a769c39a05940e25143098f071490732fa24f4f'
       || input.packerToolchainManifestSha256 !== '6a6d597535481836605a4cc9762755038e56e524af621356e5f5f65519c6858e'
+      || !/^[0-9a-f]{96}$/u.test(input.parentBuildWrapperSha384)
+      || !/^[0-9a-f]{96}$/u.test(input.parentPreflightSha384)
+      || !/^[0-9a-f]{96}$/u.test(input.parentBuildEvidenceRendererSha384)
+      || !/^[0-9a-f]{96}$/u.test(input.parentPostBuildCleanupEvidenceRendererSha384)
+      || !/^[0-9a-f]{96}$/u.test(input.parentRunbookSha384)
       || input.builderTemplateSha384 !== ACCEPTED_BUILDER_TEMPLATE_SHA384
       || input.builderTemplateEvidenceSha384 !== ACCEPTED_BUILDER_TEMPLATE_SHA384
       || input.packerInvokerTemplateSha384 !== ACCEPTED_INVOKER_TEMPLATE_SHA384

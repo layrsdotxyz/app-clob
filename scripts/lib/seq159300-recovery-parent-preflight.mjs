@@ -1032,7 +1032,7 @@ function validateOutputAmi(input) {
     Phase2TemplateCommit: expected.phase2TemplateCommit,
     Phase2TemplateSha384: expected.phase2TemplateSha384,
     PackerTemplateSha384: expected.packerTemplateSha384,
-    RecoveryBuilderSourceCommit: expected.builderSourceCommit,
+    RecoveryParentPackageCommit: expected.parentPackageCommit,
     RecoveryBuilderTemplateSha384: expected.builderTemplateSha384,
     RecoveryEvidenceIndexSha384: expected.recoveryEvidenceIndexSha384,
     RecoveryPackageSetSha384: expected.nitroPackageSetSha384,

@@ -37,7 +37,7 @@ const runbook = readFileSync(
 
 const SOURCE_COMMIT = 'f282583cae7a5c873a26aa8d0c1bec10c490eb8e';
 const IMPLEMENTATION_COMMIT = '9e21c925d121822019524ec3d9b4973b1a32f38a';
-const BUILDER_SOURCE_COMMIT = '24405e0da728e237dc851915bcdb60c6ee1db5bb';
+const PARENT_PACKAGE_COMMIT = '24405e0da728e237dc851915bcdb60c6ee1db5bb';
 const PHASE2_TEMPLATE_COMMIT = '23f92bc64171862abc410af953321a991e5e1515';
 const BUILDER_TEMPLATE_SHA384 = '75e536d6d138b88aaf7ef29fece2f67f3e6ffbda02841092de73726795b4d55a6fe01af492d8d8d1f0d3dc7f8db105d7';
 const INVOKER_TEMPLATE_SHA384 = 'd67e4f78be6bd679b4ab61e316215fce24035e89508baaefcf3b2df6209682fd94dc0fcd84bac1530664f02aaf7723e1';
@@ -64,7 +64,12 @@ function validEvidence(overrides = {}) {
     implementationEvidenceObjectKey: 'evidence/seq159300/recovery-only/implementation/backend.json',
     implementationEvidenceObjectVersionId: 'implementation.version.1',
     implementationEvidenceObjectSha384: SHA384,
-    builderSourceCommit: BUILDER_SOURCE_COMMIT,
+    parentPackageCommit: PARENT_PACKAGE_COMMIT,
+    parentBuildWrapperSha384: '1'.repeat(96),
+    parentPreflightSha384: '2'.repeat(96),
+    parentBuildEvidenceRendererSha384: '3'.repeat(96),
+    parentPostBuildCleanupEvidenceRendererSha384: '4'.repeat(96),
+    parentRunbookSha384: '5'.repeat(96),
     builderEvidenceIndexObjectKey: 'evidence/seq159300/recovery-only/phase2/builder/evidence-index.json',
     builderEvidenceIndexObjectVersionId: 'builder.index.version.1',
     builderEvidenceIndexSha384: SHA384,
@@ -348,6 +353,10 @@ test('Packer source is pinned, private and recovery-only', () => {
     assert.ok((packer.match(new RegExp(tag, 'gu')) ?? []).length >= 4);
   }
   assert.match(packer, /layrs-seq159300-recovery/u);
+  assert.match(packer, /variable "parent_package_commit"/u);
+  assert.match(packer, /RecoveryParentPackageCommit\s+=\s+var\.parent_package_commit/u);
+  assert.match(packer, /parentPackageCommit\s+=\s+var\.parent_package_commit/u);
+  assert.doesNotMatch(packer, /builder_source_commit|builderSourceCommit|RecoveryBuilderSourceCommit/u);
   assert.match(packer, /ProductionRouteAttached\s*=\s*"false"/u);
   assert.match(packer, new RegExp(PARENT_SHA384, 'u'));
   assert.match(
@@ -490,10 +499,19 @@ test('wrapper selects exact bytes and explicitly rejects the build-a EIF', () =>
 
 test('wrapper requires clean f282 ancestry and permits only recovery-path source changes', () => {
   assert.match(wrapper, /merge-base --is-ancestor/u);
-  assert.match(wrapper, /LAYRS_RECOVERY_BUILDER_COMMIT/u);
+  assert.match(wrapper, /LAYRS_RECOVERY_PARENT_PACKAGE_COMMIT/u);
+  assert.doesNotMatch(wrapper, /LAYRS_RECOVERY_BUILDER_COMMIT/u);
   assert.match(wrapper, /active AWS account/u);
   assert.match(wrapper, /sts get-caller-identity/u);
   assert.match(wrapper, /status --porcelain=v1 --untracked-files=all/u);
+  assert.match(wrapper, /PARENT_BUILD_WRAPPER_SHA384="\$\(sha384_file "\$\{BASH_SOURCE\[0\]\}"\)"/u);
+  assert.match(wrapper, /PARENT_PREFLIGHT_SHA384="\$\(sha384_file "\$\{PREFLIGHT_VALIDATOR\}"\)"/u);
+  assert.match(wrapper, /PARENT_BUILD_EVIDENCE_RENDERER_SHA384="\$\(sha384_file "\$\{EVIDENCE_RENDERER\}"\)"/u);
+  assert.match(wrapper, /PARENT_POST_BUILD_CLEANUP_EVIDENCE_RENDERER_SHA384="\$\(sha384_file "\$\{POST_BUILD_EVIDENCE_RENDERER\}"\)"/u);
+  assert.match(wrapper, /PARENT_RUNBOOK_SHA384="\$\(sha384_file "\$\{RECOVERY_RUNBOOK\}"\)"/u);
+  assert.match(wrapper, /parentPackageCommit:\$parentPackageCommit/u);
+  assert.match(wrapper, /build_completed_at=.*%Y-%m-%dT%H:%M:%SZ/u);
+  assert.doesNotMatch(wrapper, /build_completed_at=.*\.000Z/u);
   assert.match(wrapper, /non-recovery source differs from f282/u);
   assert.match(wrapper, /LAYRS_RECOVERY_EXPECTED_PHASE2_TEMPLATE_SHA384/u);
   assert.match(wrapper, /reviewed Phase2 template SHA384/u);
@@ -535,7 +553,14 @@ test('renderer rejects swapped artifacts and recovery bindings', () => {
     { eifSha384: REJECTED_BUILD_A_EIF },
     { pcr0Sha384: '1'.repeat(96) },
     { sourceCommit: '2'.repeat(40) },
-    { builderSourceCommit: SOURCE_COMMIT },
+    { parentPackageCommit: SOURCE_COMMIT },
+    { parentPackageCommit: 'not-a-commit' },
+    { parentBuildWrapperSha384: '0'.repeat(95) },
+    { parentPreflightSha384: '0'.repeat(95) },
+    { parentBuildEvidenceRendererSha384: '0'.repeat(95) },
+    { parentPostBuildCleanupEvidenceRendererSha384: '0'.repeat(95) },
+    { parentRunbookSha384: '0'.repeat(95) },
+    { packerTemplateSha384: '0'.repeat(95) },
     { implementationCommit: 'not-a-commit' },
     { phase2TemplateCommit: '0'.repeat(40) },
     { nitroCliRpmSha384: '0'.repeat(95) },
@@ -1352,7 +1377,7 @@ test('output AMI readback rejects public, unencrypted or provenance-swapped imag
   const expected = {
     buildControlPlaneRoleInventorySha384: SHA384, builderTemplateSha384: SHA384,
     buildInstanceProfileInventorySha384: SHA384, buildSecurityGroupInventorySha384: SHA384,
-    buildSubnetInventorySha384: SHA384, builderSourceCommit: BUILDER_SOURCE_COMMIT,
+    buildSubnetInventorySha384: SHA384, parentPackageCommit: PARENT_PACKAGE_COMMIT,
     eifSha384: EIF_SHA384,
     imageId: 'ami-0123456789abcdef0', implementationCommit: IMPLEMENTATION_COMMIT,
     parentSha384: PARENT_SHA384, pcr0Sha384: PCR0_SHA384,
@@ -1373,7 +1398,7 @@ test('output AMI readback rejects public, unencrypted or provenance-swapped imag
     ['Phase2TemplateCommit', PHASE2_TEMPLATE_COMMIT],
     ['Phase2TemplateSha384', SHA384],
     ['PackerTemplateSha384', SHA384],
-    ['RecoveryBuilderSourceCommit', BUILDER_SOURCE_COMMIT],
+    ['RecoveryParentPackageCommit', PARENT_PACKAGE_COMMIT],
     ['RecoveryEifSha384', EIF_SHA384], ['RecoveryParentSha384', PARENT_SHA384],
     ['RecoveryPcr0Sha384', PCR0_SHA384], ['RecoverySourceCommit', SOURCE_COMMIT],
     ['SourceAmiProvenanceSha384', SHA384], ['NitroCliRpmSha384', SHA384],

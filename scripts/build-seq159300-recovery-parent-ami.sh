@@ -54,13 +54,20 @@ readonly NITRO_PACKAGE_SET_MANIFEST="${REPO_ROOT}/build/seq159300-nitro-package-
 readonly NITRO_PACKAGE_SET_ARCHIVE="${REPO_ROOT}/build/seq159300-nitro-packages.tar"
 readonly NITRO_PACKAGE_DIRECTORY="${REPO_ROOT}/build/seq159300-nitro-packages"
 readonly EVIDENCE_RENDERER="${REPO_ROOT}/scripts/render-seq159300-recovery-parent-evidence.mjs"
+readonly POST_BUILD_EVIDENCE_RENDERER="${REPO_ROOT}/scripts/render-seq159300-recovery-parent-post-build-cleanup-evidence.mjs"
 readonly PREFLIGHT_VALIDATOR="${REPO_ROOT}/scripts/lib/seq159300-recovery-parent-preflight.mjs"
+readonly RECOVERY_RUNBOOK="${REPO_ROOT}/docs/runbooks/LAYRS_SEQ159300_RECOVERY_PARENT_AMI.md"
 EVIDENCE_INPUT_TEMP=""
 PREFLIGHT_TEMP_DIR=""
 PACKER_TOOLCHAIN_TEMP_DIR=""
 PACKER_BINARY=""
 PACKER_PLUGIN_BINARY=""
-BUILDER_COMMIT=""
+PARENT_PACKAGE_COMMIT=""
+PARENT_BUILD_WRAPPER_SHA384=""
+PARENT_PREFLIGHT_SHA384=""
+PARENT_BUILD_EVIDENCE_RENDERER_SHA384=""
+PARENT_POST_BUILD_CLEANUP_EVIDENCE_RENDERER_SHA384=""
+PARENT_RUNBOOK_SHA384=""
 PACKER_TEMPLATE_SHA384=""
 EXPECTED_PACKAGE_INVENTORY_SHA384=""
 NITRO_PACKAGE_SET_SHA384=""
@@ -694,14 +701,15 @@ canonical_pcr0() {
 }
 
 verify_repository() {
-  local head changed dirty
+  local head changed dirty source_file
   head="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
-  require_env LAYRS_RECOVERY_BUILDER_COMMIT
-  require_exact LAYRS_RECOVERY_BUILDER_COMMIT "${LAYRS_RECOVERY_BUILDER_COMMIT}" "${head}"
-  BUILDER_COMMIT="${head}"
-  [[ "${BUILDER_COMMIT}" != "${RECOVERY_SOURCE_COMMIT}" ]] \
-    || die "builder source commit must differ from the exact f282 runtime source commit"
-  git -C "${REPO_ROOT}" merge-base --is-ancestor "${RECOVERY_SOURCE_COMMIT}" "${BUILDER_COMMIT}" \
+  require_env LAYRS_RECOVERY_PARENT_PACKAGE_COMMIT
+  require_exact LAYRS_RECOVERY_PARENT_PACKAGE_COMMIT \
+    "${LAYRS_RECOVERY_PARENT_PACKAGE_COMMIT}" "${head}"
+  PARENT_PACKAGE_COMMIT="${head}"
+  [[ "${PARENT_PACKAGE_COMMIT}" != "${RECOVERY_SOURCE_COMMIT}" ]] \
+    || die "parent package commit must differ from the exact f282 runtime source commit"
+  git -C "${REPO_ROOT}" merge-base --is-ancestor "${RECOVERY_SOURCE_COMMIT}" "${PARENT_PACKAGE_COMMIT}" \
     || die "HEAD does not descend from exact recovery source ${RECOVERY_SOURCE_COMMIT}"
 
   dirty="$(git -C "${REPO_ROOT}" status --porcelain=v1 --untracked-files=all)"
@@ -725,6 +733,17 @@ verify_repository() {
         ;;
     esac
   done <<<"${changed}"
+
+  for source_file in "${BASH_SOURCE[0]}" "${PREFLIGHT_VALIDATOR}" "${EVIDENCE_RENDERER}" \
+      "${POST_BUILD_EVIDENCE_RENDERER}" "${RECOVERY_RUNBOOK}" "${PACKER_TEMPLATE}"; do
+    [[ -f "${source_file}" && ! -L "${source_file}" ]] \
+      || die "parent package source is missing, linked or not a regular file: ${source_file}"
+  done
+  PARENT_BUILD_WRAPPER_SHA384="$(sha384_file "${BASH_SOURCE[0]}")"
+  PARENT_PREFLIGHT_SHA384="$(sha384_file "${PREFLIGHT_VALIDATOR}")"
+  PARENT_BUILD_EVIDENCE_RENDERER_SHA384="$(sha384_file "${EVIDENCE_RENDERER}")"
+  PARENT_POST_BUILD_CLEANUP_EVIDENCE_RENDERER_SHA384="$(sha384_file "${POST_BUILD_EVIDENCE_RENDERER}")"
+  PARENT_RUNBOOK_SHA384="$(sha384_file "${RECOVERY_RUNBOOK}")"
 }
 
 verify_inputs() {
@@ -1313,7 +1332,7 @@ readback_output_ami() {
     --arg imageId "${ami_id}" \
     --arg sourceAmiId "${LAYRS_RECOVERY_SOURCE_AMI_ID}" \
     --arg sourceCommit "${RECOVERY_SOURCE_COMMIT}" \
-    --arg builderSourceCommit "${BUILDER_COMMIT}" \
+    --arg parentPackageCommit "${PARENT_PACKAGE_COMMIT}" \
     --arg builderTemplateSha384 "${LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384}" \
     --arg implementationCommit "${LAYRS_RECOVERY_IMPLEMENTATION_COMMIT}" \
     --arg parentSha384 "${EXPECTED_PARENT_SHA384}" \
@@ -1335,7 +1354,7 @@ readback_output_ami() {
     --arg recoveryEvidenceIndexSha384 "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_SHA384}" \
     --slurpfile response "${response}" \
     '{kind:"output-ami",payload:{expected:{imageId:$imageId,sourceAmiId:$sourceAmiId,
-      sourceCommit:$sourceCommit,builderSourceCommit:$builderSourceCommit,
+      sourceCommit:$sourceCommit,parentPackageCommit:$parentPackageCommit,
       implementationCommit:$implementationCommit,
       parentSha384:$parentSha384,eifSha384:$eifSha384,pcr0Sha384:$pcr0Sha384,
       phase2TemplateCommit:$phase2TemplateCommit,
@@ -1416,7 +1435,12 @@ summary() {
     --arg purpose "layrs-seq159300-recovery" \
     --arg trustedPrincipalInventorySha384 "${LAYRS_RECOVERY_TRUSTED_PRINCIPAL_INVENTORY_SHA384}" \
     --arg sourceCommit "${RECOVERY_SOURCE_COMMIT}" \
-    --arg builderSourceCommit "${BUILDER_COMMIT}" \
+    --arg parentPackageCommit "${PARENT_PACKAGE_COMMIT}" \
+    --arg parentBuildWrapperSha384 "${PARENT_BUILD_WRAPPER_SHA384}" \
+    --arg parentPreflightSha384 "${PARENT_PREFLIGHT_SHA384}" \
+    --arg parentBuildEvidenceRendererSha384 "${PARENT_BUILD_EVIDENCE_RENDERER_SHA384}" \
+    --arg parentPostBuildCleanupEvidenceRendererSha384 "${PARENT_POST_BUILD_CLEANUP_EVIDENCE_RENDERER_SHA384}" \
+    --arg parentRunbookSha384 "${PARENT_RUNBOOK_SHA384}" \
     --arg builderEvidenceIndexSha384 "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_SHA384}" \
     --arg builderEvidenceIndexObjectKey "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_KEY}" \
     --arg builderEvidenceIndexObjectVersionId "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_VERSION_ID}" \
@@ -1489,7 +1513,13 @@ summary() {
     --arg nitroPackageSetEvidenceSha384 "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_EVIDENCE_SHA384}" \
     '{accountId:$accountId,region:$region,purpose:$purpose,
       trustedPrincipalInventorySha384:$trustedPrincipalInventorySha384,
-      sourceCommit:$sourceCommit,builderSourceCommit:$builderSourceCommit,
+      sourceCommit:$sourceCommit,
+      parentPackageCommit:$parentPackageCommit,
+      parentBuildWrapperSha384:$parentBuildWrapperSha384,
+      parentPreflightSha384:$parentPreflightSha384,
+      parentBuildEvidenceRendererSha384:$parentBuildEvidenceRendererSha384,
+      parentPostBuildCleanupEvidenceRendererSha384:$parentPostBuildCleanupEvidenceRendererSha384,
+      parentRunbookSha384:$parentRunbookSha384,
       builderEvidenceIndexSha384:$builderEvidenceIndexSha384,
       builderEvidenceIndexObjectKey:$builderEvidenceIndexObjectKey,
       builderEvidenceIndexObjectVersionId:$builderEvidenceIndexObjectVersionId,
@@ -1596,7 +1626,7 @@ build_ami() {
     -var "build_control_plane_role_inventory_sha384=${BUILD_CONTROL_PLANE_ROLE_INVENTORY_SHA384}" \
     -var "builder_template_sha384=${LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384}" \
     -var "packer_invoker_role_inventory_sha384=${LAYRS_RECOVERY_PACKER_INVOKER_ROLE_INVENTORY_SHA384}" \
-    -var "builder_source_commit=${BUILDER_COMMIT}" \
+    -var "parent_package_commit=${PARENT_PACKAGE_COMMIT}" \
     -var "parent_sha384=${EXPECTED_PARENT_SHA384}" \
     -var "phase2_template_commit=${LAYRS_RECOVERY_PHASE2_TEMPLATE_COMMIT}" \
     -var "phase2_template_sha384=${LAYRS_RECOVERY_EXPECTED_PHASE2_TEMPLATE_SHA384}" \
@@ -1627,7 +1657,7 @@ build_ami() {
     -var "build_control_plane_role_inventory_sha384=${BUILD_CONTROL_PLANE_ROLE_INVENTORY_SHA384}" \
     -var "builder_template_sha384=${LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384}" \
     -var "packer_invoker_role_inventory_sha384=${LAYRS_RECOVERY_PACKER_INVOKER_ROLE_INVENTORY_SHA384}" \
-    -var "builder_source_commit=${BUILDER_COMMIT}" \
+    -var "parent_package_commit=${PARENT_PACKAGE_COMMIT}" \
     -var "parent_sha384=${EXPECTED_PARENT_SHA384}" \
     -var "phase2_template_commit=${LAYRS_RECOVERY_PHASE2_TEMPLATE_COMMIT}" \
     -var "phase2_template_sha384=${LAYRS_RECOVERY_EXPECTED_PHASE2_TEMPLATE_SHA384}" \
@@ -1650,7 +1680,7 @@ build_ami() {
   jq -e \
     --arg purpose "layrs-seq159300-recovery" \
     --arg sourceCommit "${RECOVERY_SOURCE_COMMIT}" \
-    --arg builderSourceCommit "${BUILDER_COMMIT}" \
+    --arg parentPackageCommit "${PARENT_PACKAGE_COMMIT}" \
     --arg builderEvidenceIndexSha384 "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_SHA384}" \
     --arg sourceAmiId "${LAYRS_RECOVERY_SOURCE_AMI_ID}" \
     --arg sourceAmiOwner "${LAYRS_RECOVERY_SOURCE_AMI_OWNER}" \
@@ -1681,7 +1711,7 @@ build_ami() {
     --arg nitroPackageClosureSha384 "${NITRO_PACKAGE_CLOSURE_SHA384}" \
     --arg nitroPackageInventorySha384 "${EXPECTED_PACKAGE_INVENTORY_SHA384}" \
     '.builds[0].custom_data == {
-      purpose:$purpose,sourceCommit:$sourceCommit,builderSourceCommit:$builderSourceCommit,sourceAmiId:$sourceAmiId,
+      purpose:$purpose,sourceCommit:$sourceCommit,parentPackageCommit:$parentPackageCommit,sourceAmiId:$sourceAmiId,
       sourceAmiOwner:$sourceAmiOwner,sourceAmiProvenanceSha384:$sourceAmiProvenanceSha384,
       buildSubnetInventorySha384:$buildSubnetInventorySha384,
       buildSecurityGroupInventorySha384:$buildSecurityGroupInventorySha384,
@@ -1718,7 +1748,7 @@ build_ami() {
   if (( ${#build_time} == 13 )); then
     build_time="$((build_time / 1000))"
   fi
-  build_completed_at="$(date -u -d "@${build_time}" '+%Y-%m-%dT%H:%M:%S.000Z')"
+  build_completed_at="$(date -u -d "@${build_time}" '+%Y-%m-%dT%H:%M:%SZ')"
   packer_manifest_sha384="$(sha384_file "${LAYRS_RECOVERY_PACKER_MANIFEST}")"
   installed_package_inventory="${PREFLIGHT_TEMP_DIR}/installed-package-inventory.txt"
   [[ -f "${installed_package_inventory}" && ! -L "${installed_package_inventory}" ]] \
@@ -1742,7 +1772,12 @@ build_ami() {
     --arg remediationIndexObjectVersionId "${REMEDIATION_INDEX_VERSION_ID}" \
     --arg trustedPrincipalInventorySha384 "${LAYRS_RECOVERY_TRUSTED_PRINCIPAL_INVENTORY_SHA384}" \
     --arg sourceCommit "${RECOVERY_SOURCE_COMMIT}" \
-    --arg builderSourceCommit "${BUILDER_COMMIT}" \
+    --arg parentPackageCommit "${PARENT_PACKAGE_COMMIT}" \
+    --arg parentBuildWrapperSha384 "${PARENT_BUILD_WRAPPER_SHA384}" \
+    --arg parentPreflightSha384 "${PARENT_PREFLIGHT_SHA384}" \
+    --arg parentBuildEvidenceRendererSha384 "${PARENT_BUILD_EVIDENCE_RENDERER_SHA384}" \
+    --arg parentPostBuildCleanupEvidenceRendererSha384 "${PARENT_POST_BUILD_CLEANUP_EVIDENCE_RENDERER_SHA384}" \
+    --arg parentRunbookSha384 "${PARENT_RUNBOOK_SHA384}" \
     --arg builderEvidenceIndexSha384 "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_SHA384}" \
     --arg builderEvidenceIndexObjectKey "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_KEY}" \
     --arg builderEvidenceIndexObjectVersionId "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_VERSION_ID}" \
@@ -1824,7 +1859,13 @@ build_ami() {
       parentBinarySha384:$parentBinarySha384,pcr0Sha384:$pcr0Sha384,region:$region,
       remediationEvidenceCommit:$remediationEvidenceCommit,
       remediationIndexObjectVersionId:$remediationIndexObjectVersionId,
-      sourceCommit:$sourceCommit,builderSourceCommit:$builderSourceCommit,
+      sourceCommit:$sourceCommit,
+      parentPackageCommit:$parentPackageCommit,
+      parentBuildWrapperSha384:$parentBuildWrapperSha384,
+      parentPreflightSha384:$parentPreflightSha384,
+      parentBuildEvidenceRendererSha384:$parentBuildEvidenceRendererSha384,
+      parentPostBuildCleanupEvidenceRendererSha384:$parentPostBuildCleanupEvidenceRendererSha384,
+      parentRunbookSha384:$parentRunbookSha384,
       builderEvidenceIndexObjectKey:$builderEvidenceIndexObjectKey,
       builderEvidenceIndexObjectVersionId:$builderEvidenceIndexObjectVersionId,
       builderEvidenceIndexSha384:$builderEvidenceIndexSha384,
