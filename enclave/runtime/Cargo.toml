@@ -16,10 +16,6 @@ path = "src/lib.rs"
 name = "layrs-enclave"
 path = "src/main.rs"
 
-[[bin]]
-name = "layrs-cumulative-restore-runner"
-path = "src/offline_restore.rs"
-
 [dependencies]
 aes-gcm = "0.10"
 aws-lc-rs = "1.16"

@@ -36,6 +36,10 @@ pub struct SessionGuard {
 }
 
 impl SessionGuard {
+    pub(crate) fn offline_counts(&self) -> (usize, usize) {
+        (self.registered.len(), self.last_sequences.len())
+    }
+
     pub(crate) fn registered_owner(&self, session_id: &str) -> Option<&str> {
         self.registered
             .get(session_id)

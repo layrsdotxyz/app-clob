@@ -41,7 +41,33 @@ installed. New balanced custody postings do not synthesize historical
 `PoolCash`; an independently reconciled opening balance is required before the
 new deposit and withdrawal model is activated.
 
-## Required exact-live fixture and replay evidence
+## 25 August incident terminal-snapshot exception
+
+The incident recovery build does not execute the complete-history replay below.
+It embeds `enclave/recovery-policies/2026-08-25-seq161919.json` and accepts only
+the exact immutable snapshot VersionId, body hash, ciphertext hash, sequence
+161919, state root and journal head named there. Generic provisioning is
+disabled in this build. The integrated `BEGIN_INCIDENT_TERMINAL_RESTORE` and
+`COMPLETE_INCIDENT_TERMINAL_RESTORE` operator commands hash the raw object body
+inside the enclave before parsing it, bind a fresh external challenge into
+Nitro and KMS-recipient attestation, and call
+`restore_encrypted_snapshot(..., 161919)`.
+
+The resulting privacy-safe certificate may prove the exact terminal state,
+aggregate public asset/bucket totals, domain-separated category digests and
+source-versus-restored equality. It always reports
+`historicalJournalReplayPerformed=false` and
+`historicalFillCompletenessCertified=false`. It does not prove complete
+historical journal, receipt, fill or event provenance and cannot authorize a
+state mutation, traffic, KMS-policy change or funded canary.
+
+The wrapper `scripts/certify-live-976-cumulative-restore.sh` requests the exact
+S3 VersionId into a caller-selected persistent evidence directory, refuses
+`/tmp`, supplies no plaintext key, and invokes only an authenticated client for
+the integrated incident commands. The obsolete inherited-FD standalone runner
+is not compiled or packaged in the EIF.
+
+## Deferred complete-history replay evidence
 
 Before an EIF is built for activation, export the frozen 976 encrypted snapshot
 and immutable journal together with its sequence, journal head, state root,
@@ -65,23 +91,12 @@ Perform the following offline against the candidate:
 7. save only hashes, qualified totals and signed equality evidence outside the
    enclave. Never export private account-level plaintext.
 
-The attested runner report must bind `sourceReleaseCommit` to exact 976 and
-`checkpointSha256` to the checkpoint file supplied to the wrapper; otherwise
-the wrapper rejects the report even if every equality boolean is true.
-`layrs-cumulative-restore-runner` accepts the production-lineage journal key
-only through an inherited descriptor (FD 3 by default), requires a live Nitro
-Secure Module, and places the equality-report digest in NSM attestation user
-data. Its attestation nonce is the digest binding the encrypted snapshot,
-complete encrypted journal export, checkpoint and equality report. The wrapper
-preserves that attestation document and all artifact-binding digests in its
-privacy-safe output. It never accepts the journal key as a path, argument,
-environment value or report field.
-
-Any failed restore or equality check is a hard stop. Do not canonicalize,
-rewrite or manually edit the production snapshot to make the candidate load.
-The privacy-safe wrapper for the attested runner is
-`scripts/certify-live-976-cumulative-restore.sh`; a synthetic fixture does not
-replace its real frozen-artifact report.
+This deferred replay remains a separate audit workstream. It must not be
+represented by the incident certificate or used to mutate the exact terminal
+state. Any failed incident restore or equality check is a hard stop. Do not
+canonicalize, rewrite or manually edit the production snapshot to make the
+candidate load; a synthetic fixture does not replace the real frozen-artifact
+certificate.
 
 ## Durable-command and cross-PCR gate
 

@@ -8,6 +8,7 @@ ENV LAYRS_RECOVERY_ENVIRONMENT=${LAYRS_RECOVERY_ENVIRONMENT}
 ENV LAYRS_ENCLAVE_TRANSITION_POLICY_SHA256=${LAYRS_ENCLAVE_TRANSITION_POLICY_SHA256}
 COPY enclave/runtime/Cargo.toml enclave/runtime/Cargo.lock ./enclave/runtime/
 COPY enclave/runtime/src ./enclave/runtime/src
+COPY enclave/recovery-policies ./enclave/recovery-policies
 COPY proofs/settlement/core ./proofs/settlement/core
 COPY src ./src
 RUN test "${#LAYRS_OPERATOR_PUBLIC_KEY_HEX}" -eq 64 \

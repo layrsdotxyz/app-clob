@@ -33,12 +33,15 @@ use clob_service::private_core::{
     resolution_signing_payload, AccountKey, BinanceResolutionStatement, BootstrapExecutionState,
     BootstrapPreparedVenueOrder, CommandReceiptState, CommandResult, CoreResponse,
     CustodyReconciliationSnapshot, EnclaveReceipt, EncryptedJournalRecord, EncryptedSnapshot,
-    ExactConditionResolutionStatement, ExternalFlowDirection, JournalKey, MarketConfig,
-    MarketExecution, OrderStatus, PolymarketResolutionStatement, PrivateTradingCore, ReceiptSigner,
-    RecoveryBridgeArtifact, ResolutionStatement, SignedAuditFillArtifact, SignedBinanceResolution,
-    SignedExactConditionResolution, SignedPolymarketResolution, SignedResolution,
-    SignedResolutionEvidence, SignedTaskQualificationArtifact, SystemResponse, UserCommand,
-    UserCommandAction, WithdrawalAuthorization,
+    ExactConditionResolutionStatement, ExactTerminalSnapshotRestoreReport, ExternalFlowDirection,
+    JournalKey, MarketConfig, MarketExecution, OrderStatus, PolymarketResolutionStatement,
+    PrivateTradingCore, ReceiptSigner, RecoveryBridgeArtifact, ResolutionStatement,
+    SignedAuditFillArtifact, SignedBinanceResolution, SignedExactConditionResolution,
+    SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence,
+    SignedTaskQualificationArtifact, SystemResponse, UserCommand, UserCommandAction,
+    WithdrawalAuthorization, EXACT_LIVE_976_RELEASE_COMMIT,
+    INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX, INCIDENT_TERMINAL_JOURNAL_HEAD_HEX,
+    INCIDENT_TERMINAL_SEQUENCE, INCIDENT_TERMINAL_STATE_ROOT_HEX,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use openssl::{
@@ -89,6 +92,97 @@ const RECOVERY_ENVIRONMENT: &str = "test";
 
 fn recovery_environment() -> &'static str {
     RECOVERY_ENVIRONMENT
+}
+
+const INCIDENT_RECOVERY_POLICY_BYTES: &[u8] =
+    include_bytes!("../../enclave/recovery-policies/2026-08-25-seq161919.json");
+const INCIDENT_RECOVERY_POLICY_SHA256_HEX: &str =
+    "64f95c19acaf1cc760c28b598fcd7609101f756a706357ec8ec7b7c2d1cc3d95";
+const INCIDENT_ID: &str = "layrs-seq161891-recovery-20260825";
+const INCIDENT_SNAPSHOT_BUCKET: &str = "layrs-production-082223548516-us-east-1-immutable";
+const INCIDENT_SNAPSHOT_KEY: &str = "enclave/snapshot/00000000000000161919-cb284d9b13bc8b17d20c75d44e4e3b68a1d29dec3a7a5b9fd80871f340ea8da9.json";
+const INCIDENT_SNAPSHOT_VERSION_ID: &str = "nHXxPKfOHWlyZ1UzcYeBjFpXLzq2c1Bu";
+const INCIDENT_SNAPSHOT_SIZE_BYTES: u64 = 39_930_295;
+const INCIDENT_SNAPSHOT_BODY_SHA256_HEX: &str =
+    "9283a32007d96c2ba670bf093191d8e619af22da888bea4ece559c659e68d290";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct IncidentTerminalRecoveryPolicy {
+    schema_version: String,
+    incident_id: String,
+    source_release_commit: String,
+    restore_sequence: u64,
+    rollback_floor: u64,
+    state_root: String,
+    journal_head: String,
+    snapshot: IncidentPolicySnapshot,
+    source_provenance: IncidentSourceProvenance,
+    historical_journal_replay_required: bool,
+    historical_fill_completeness_certified: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct IncidentPolicySnapshot {
+    bucket: String,
+    key: String,
+    version_id: String,
+    size_bytes: u64,
+    body_sha256: String,
+    ciphertext_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct IncidentSourceProvenance {
+    eif_sha384: String,
+    pcr0: String,
+    pcr1: String,
+    pcr2: String,
+    source_ami_id: String,
+    copied_parent_ami_id: String,
+    parent_binary_sha384: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct IncidentSnapshotDescriptor {
+    bucket: String,
+    key: String,
+    version_id: String,
+    size_bytes: u64,
+    body_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IncidentTerminalCertificationReport {
+    schema_version: String,
+    incident_id: String,
+    incident_policy_sha256: String,
+    snapshot_bucket: String,
+    snapshot_key: String,
+    snapshot_version_id: String,
+    snapshot_size_bytes: u64,
+    snapshot_body_sha256: String,
+    certifier_release_manifest_sha256: String,
+    artifact_equal: bool,
+    policy_equal: bool,
+    source_release_equal: bool,
+    certifier_pcr0_equal: bool,
+    #[serde(flatten)]
+    terminal_state: ExactTerminalSnapshotRestoreReport,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IncidentTerminalCertificationEnvelope {
+    certificate: IncidentTerminalCertificationReport,
+    certificate_sha256: String,
+    artifact_binding_sha256: String,
+    attestation_document_sha256: String,
+    attestation_document: Vec<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -236,7 +330,7 @@ struct OperatorEnvelope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 // The authenticated operator wire schema is release-bound. Boxing the durable
 // successor fields would change that schema, so retain the representation and
 // acknowledge the decode-only enum size here.
@@ -275,6 +369,20 @@ enum OperatorCommand {
         minimum_anchored_sequence: u64,
     },
     CompleteProvision {
+        ciphertext_for_recipient: Vec<u8>,
+    },
+    BeginIncidentTerminalRestore {
+        kms_key_id: String,
+        kms_ciphertext_blob: Vec<u8>,
+        snapshot_descriptor: IncidentSnapshotDescriptor,
+        #[serde(with = "serde_bytes")]
+        snapshot_body: Vec<u8>,
+        external_challenge: [u8; 32],
+        certifier_release_manifest_sha256: [u8; 32],
+        #[serde(with = "serde_bytes")]
+        expected_certifier_pcr0_sha384: Vec<u8>,
+    },
+    CompleteIncidentTerminalRestore {
         ciphertext_for_recipient: Vec<u8>,
     },
     PolymarketStatus,
@@ -718,6 +826,9 @@ enum PlainResponse {
         state_root: [u8; 32],
     },
     Provisioned,
+    IncidentTerminalRestoreCertified {
+        envelope: IncidentTerminalCertificationEnvelope,
+    },
     ProvisionStatus {
         state: &'static str,
     },
@@ -832,6 +943,8 @@ struct EnclaveState {
     minimum_writer_epoch: u64,
     writer_lease_id: Option<Uuid>,
     pending_provision: Option<PendingProvision>,
+    pending_incident_terminal_restore: Option<PendingIncidentTerminalRestore>,
+    incident_restore_floor: Option<u64>,
     pending_polymarket_provision: Option<PendingPolymarketProvision>,
     polymarket: Option<EnclavePolymarketClient>,
     pending_chain_signer_provision: Option<PendingChainSignerProvision>,
@@ -977,6 +1090,17 @@ struct PendingProvision {
     minimum_anchored_sequence: u64,
 }
 
+struct PendingIncidentTerminalRestore {
+    recipient_private_key: PKey<Private>,
+    snapshot: EncryptedSnapshot,
+    snapshot_descriptor: IncidentSnapshotDescriptor,
+    policy_sha256: [u8; 32],
+    snapshot_body_sha256: [u8; 32],
+    external_challenge: [u8; 32],
+    certifier_release_manifest_sha256: [u8; 32],
+    expected_certifier_pcr0_sha384: [u8; 48],
+}
+
 struct PendingPolymarketProvision {
     recipient_private_key: PKey<Private>,
     bundle_nonce: [u8; 12],
@@ -1028,6 +1152,8 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         minimum_writer_epoch: 0,
         writer_lease_id: None,
         pending_provision: None,
+        pending_incident_terminal_restore: None,
+        incident_restore_floor: None,
         pending_polymarket_provision: None,
         polymarket: None,
         pending_chain_signer_provision: None,
@@ -2207,6 +2333,129 @@ fn configured_transition_policy_hash() -> Option<[u8; 32]> {
         .and_then(|value| value.try_into().ok())
 }
 
+fn decode_exact_hex<const N: usize>(value: &str) -> Result<[u8; N], String> {
+    hex::decode(value)
+        .map_err(|_| "INCIDENT_RECOVERY_POLICY_INVALID".to_string())?
+        .try_into()
+        .map_err(|_| "INCIDENT_RECOVERY_POLICY_INVALID".to_string())
+}
+
+fn incident_recovery_policy_sha256() -> Result<[u8; 32], String> {
+    let actual: [u8; 32] = Sha256::digest(INCIDENT_RECOVERY_POLICY_BYTES).into();
+    let expected = decode_exact_hex(INCIDENT_RECOVERY_POLICY_SHA256_HEX)?;
+    if actual != expected {
+        return Err("INCIDENT_RECOVERY_POLICY_INVALID".into());
+    }
+    Ok(actual)
+}
+
+fn exact_incident_recovery_policy() -> Result<IncidentTerminalRecoveryPolicy, String> {
+    let policy: IncidentTerminalRecoveryPolicy =
+        serde_json::from_slice(INCIDENT_RECOVERY_POLICY_BYTES)
+            .map_err(|_| "INCIDENT_RECOVERY_POLICY_INVALID".to_string())?;
+    validate_incident_recovery_policy_fields(&policy)?;
+    Ok(policy)
+}
+
+fn validate_incident_recovery_policy_fields(
+    policy: &IncidentTerminalRecoveryPolicy,
+) -> Result<(), String> {
+    if policy.schema_version != "layrs.incident-terminal-recovery-policy.v1"
+        || policy.incident_id != INCIDENT_ID
+        || policy.source_release_commit != EXACT_LIVE_976_RELEASE_COMMIT
+        || policy.restore_sequence != INCIDENT_TERMINAL_SEQUENCE
+        || policy.rollback_floor != INCIDENT_TERMINAL_SEQUENCE
+        || policy.state_root != INCIDENT_TERMINAL_STATE_ROOT_HEX
+        || policy.journal_head != INCIDENT_TERMINAL_JOURNAL_HEAD_HEX
+        || policy.snapshot.bucket != INCIDENT_SNAPSHOT_BUCKET
+        || policy.snapshot.key != INCIDENT_SNAPSHOT_KEY
+        || policy.snapshot.version_id != INCIDENT_SNAPSHOT_VERSION_ID
+        || policy.snapshot.size_bytes != INCIDENT_SNAPSHOT_SIZE_BYTES
+        || policy.snapshot.body_sha256 != INCIDENT_SNAPSHOT_BODY_SHA256_HEX
+        || policy.snapshot.ciphertext_sha256 != INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX
+        || policy.source_provenance.eif_sha384
+            != "4c23589c8f0a09e509584e5263fedd1368827c4b48388b2519b7a4b217c82991ddf06c6380f3086db4e28c75223a8a9f"
+        || policy.source_provenance.pcr0
+            != "d144679b70ac6ea9d84130e6d27112b1cd6fc0870d93dd5d595644283df2c20cc2cd6d8cb7cf49e1b643d6245336e2ad"
+        || policy.source_provenance.pcr1
+            != "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493"
+        || policy.source_provenance.pcr2
+            != "f36c630bc592645bf86bb5ef4252c51e0dcb7d0e24af2f842dfff49fc22b0e3fd56bbb0f2d0eeff367587d0aa6605fb8"
+        || policy.source_provenance.source_ami_id != "ami-069ef36debc518fc9"
+        || policy.source_provenance.copied_parent_ami_id != "ami-03241294e5c3b3990"
+        || policy.source_provenance.parent_binary_sha384
+            != "2fc8185a132856d8bb71d955c4cdfba2dcea78144ff82fa1f9052749a2c3947e75bdbb3e6672ca2f72b1bf4a58e67283"
+        || policy.historical_journal_replay_required
+        || policy.historical_fill_completeness_certified
+    {
+        return Err("INCIDENT_RECOVERY_POLICY_INVALID".into());
+    }
+    Ok(())
+}
+
+fn ensure_generic_provisioning_disabled() -> Result<(), String> {
+    incident_recovery_policy_sha256()?;
+    exact_incident_recovery_policy()?;
+    Err("INCIDENT_RECOVERY_REQUIRES_DEDICATED_COMMAND".into())
+}
+
+fn validate_incident_terminal_input(
+    descriptor: &IncidentSnapshotDescriptor,
+    snapshot_body: &[u8],
+) -> Result<([u8; 32], [u8; 32], EncryptedSnapshot), String> {
+    let policy_sha256 = incident_recovery_policy_sha256()?;
+    let policy = exact_incident_recovery_policy()?;
+    if descriptor.bucket != policy.snapshot.bucket
+        || descriptor.key != policy.snapshot.key
+        || descriptor.version_id != policy.snapshot.version_id
+        || descriptor.size_bytes != policy.snapshot.size_bytes
+        || descriptor.body_sha256 != policy.snapshot.body_sha256
+        || snapshot_body.len() as u64 != policy.snapshot.size_bytes
+    {
+        return Err("INCIDENT_SNAPSHOT_DESCRIPTOR_MISMATCH".into());
+    }
+    let snapshot_body_sha256: [u8; 32] = Sha256::digest(snapshot_body).into();
+    if snapshot_body_sha256 != decode_exact_hex(&policy.snapshot.body_sha256)? {
+        return Err("INCIDENT_SNAPSHOT_BODY_MISMATCH".into());
+    }
+    let snapshot: EncryptedSnapshot = serde_json::from_slice(snapshot_body)
+        .map_err(|_| "INCIDENT_SNAPSHOT_ENVELOPE_INVALID".to_string())?;
+    if snapshot.sequence != INCIDENT_TERMINAL_SEQUENCE
+        || snapshot.state_root != decode_exact_hex(&policy.state_root)?
+        || snapshot.journal_head != decode_exact_hex(&policy.journal_head)?
+        || snapshot.ciphertext_hash != decode_exact_hex(&policy.snapshot.ciphertext_sha256)?
+        || Sha256::digest(&snapshot.ciphertext).as_slice() != snapshot.ciphertext_hash
+    {
+        return Err("INCIDENT_SNAPSHOT_CHECKPOINT_MISMATCH".into());
+    }
+    Ok((policy_sha256, snapshot_body_sha256, snapshot))
+}
+
+fn incident_artifact_binding(
+    policy_sha256: [u8; 32],
+    snapshot_body_sha256: [u8; 32],
+    descriptor: &IncidentSnapshotDescriptor,
+    certifier_release_manifest_sha256: [u8; 32],
+    certifier_pcr0_sha384: [u8; 48],
+    external_challenge: [u8; 32],
+    certificate_sha256: [u8; 32],
+) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.incident-terminal-certification.v1\0");
+    hash.update(policy_sha256);
+    hash.update(snapshot_body_sha256);
+    for value in [&descriptor.bucket, &descriptor.key, &descriptor.version_id] {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value.as_bytes());
+    }
+    hash.update(descriptor.size_bytes.to_be_bytes());
+    hash.update(certifier_release_manifest_sha256);
+    hash.update(certifier_pcr0_sha384);
+    hash.update(external_challenge);
+    hash.update(certificate_sha256);
+    hash.finalize().into()
+}
+
 fn verify_enclave_generation_transition(
     source: &[u8],
     target: &[u8],
@@ -2923,6 +3172,7 @@ async fn dispatch_operator(
             snapshot,
             minimum_anchored_sequence,
         } => {
+            ensure_generic_provisioning_disabled()?;
             if state.core.is_some() {
                 return Err("ALREADY_PROVISIONED".into());
             }
@@ -2991,7 +3241,7 @@ async fn dispatch_operator(
                 .ok_or_else(|| "NO_PENDING_PROVISION".to_string())?;
             let mut plaintext =
                 decrypt_recipient_key(pending.recipient_private_key, &ciphertext_for_recipient)?;
-            let journal_key: [u8; 32] = match plaintext.as_slice().try_into() {
+            let mut journal_key: [u8; 32] = match plaintext.as_slice().try_into() {
                 Ok(key) => key,
                 Err(_) => {
                     plaintext.zeroize();
@@ -3000,6 +3250,7 @@ async fn dispatch_operator(
             };
             plaintext.zeroize();
             let key = JournalKey::from_bytes(journal_key);
+            journal_key.zeroize();
             let mut receipt_seed = key.derive(b"receipt-signing-key-v1");
             let signer = ReceiptSigner::from_seed(receipt_seed, state.enclave_measurement_sha384);
             receipt_seed.zeroize();
@@ -3020,6 +3271,186 @@ async fn dispatch_operator(
                     .map_err(|error| error.to_string())?,
             });
             Ok(PlainResponse::Provisioned)
+        }
+        OperatorCommand::BeginIncidentTerminalRestore {
+            kms_key_id,
+            kms_ciphertext_blob,
+            snapshot_descriptor,
+            mut snapshot_body,
+            external_challenge,
+            certifier_release_manifest_sha256,
+            expected_certifier_pcr0_sha384,
+        } => {
+            if state.core.is_some()
+                || state.pending_provision.is_some()
+                || state.pending_incident_terminal_restore.is_some()
+            {
+                snapshot_body.zeroize();
+                return Err("INCIDENT_RESTORE_ALREADY_STARTED".into());
+            }
+            if kms_key_id.is_empty()
+                || kms_key_id.len() > 2_048
+                || !kms_key_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b":/_-".contains(&byte))
+                || kms_ciphertext_blob.is_empty()
+                || kms_ciphertext_blob.len() > 65_536
+                || external_challenge == [0; 32]
+                || certifier_release_manifest_sha256 == [0; 32]
+            {
+                snapshot_body.zeroize();
+                return Err("INCIDENT_RESTORE_REQUEST_INVALID".into());
+            }
+            let expected_certifier_pcr0_sha384: [u8; 48] = match expected_certifier_pcr0_sha384
+                .as_slice()
+                .try_into()
+            {
+                Ok(value) if value != [0; 48] && value == state.enclave_measurement_sha384 => value,
+                _ => {
+                    snapshot_body.zeroize();
+                    return Err("INCIDENT_RESTORE_REQUEST_INVALID".into());
+                }
+            };
+            let validated = validate_incident_terminal_input(&snapshot_descriptor, &snapshot_body);
+            snapshot_body.zeroize();
+            let (policy_sha256, snapshot_body_sha256, snapshot) = validated?;
+
+            let (recipient_private_key, recipient_public_key) = generate_recipient_key()?;
+            let mut binding = Vec::with_capacity(320);
+            binding.extend_from_slice(b"layrs.incident-kms-recipient.v1\0");
+            binding.extend_from_slice(&policy_sha256);
+            binding.extend_from_slice(&snapshot_body_sha256);
+            binding.extend_from_slice(&Sha256::digest(snapshot_descriptor.bucket.as_bytes()));
+            binding.extend_from_slice(&Sha256::digest(snapshot_descriptor.key.as_bytes()));
+            binding.extend_from_slice(&Sha256::digest(snapshot_descriptor.version_id.as_bytes()));
+            binding.extend_from_slice(&snapshot_descriptor.size_bytes.to_be_bytes());
+            binding.extend_from_slice(&Sha256::digest(kms_key_id.as_bytes()));
+            binding.extend_from_slice(&Sha256::digest(&kms_ciphertext_blob));
+            binding.extend_from_slice(&certifier_release_manifest_sha256);
+            binding.extend_from_slice(&expected_certifier_pcr0_sha384);
+            binding.extend_from_slice(&external_challenge);
+            let attestation_document = match nsm_process_request(
+                state.nsm_fd,
+                NsmRequest::Attestation {
+                    user_data: Some(binding.into()),
+                    nonce: Some(external_challenge.to_vec().into()),
+                    public_key: Some(recipient_public_key.into()),
+                },
+            ) {
+                NsmResponse::Attestation { document } => document,
+                _ => return Err("INCIDENT_KMS_RECIPIENT_ATTESTATION_FAILED".into()),
+            };
+            state.pending_incident_terminal_restore = Some(PendingIncidentTerminalRestore {
+                recipient_private_key,
+                snapshot,
+                snapshot_descriptor,
+                policy_sha256,
+                snapshot_body_sha256,
+                external_challenge,
+                certifier_release_manifest_sha256,
+                expected_certifier_pcr0_sha384,
+            });
+            Ok(PlainResponse::KmsRecipientRequest {
+                attestation_document,
+                kms_key_id,
+                operation: "DECRYPT",
+                kms_ciphertext_blob: Some(kms_ciphertext_blob),
+                key_encryption_algorithm: "RSAES_OAEP_SHA_256",
+            })
+        }
+        OperatorCommand::CompleteIncidentTerminalRestore {
+            ciphertext_for_recipient,
+        } => {
+            if state.core.is_some() {
+                return Err("INCIDENT_RESTORE_ALREADY_CERTIFIED".into());
+            }
+            if ciphertext_for_recipient.is_empty() || ciphertext_for_recipient.len() > 4_096 {
+                return Err("INVALID_RECIPIENT_CIPHERTEXT".into());
+            }
+            let pending = state
+                .pending_incident_terminal_restore
+                .take()
+                .ok_or_else(|| "NO_PENDING_INCIDENT_RESTORE".to_string())?;
+            if pending.expected_certifier_pcr0_sha384 != state.enclave_measurement_sha384 {
+                return Err("INCIDENT_CERTIFIER_PCR_MISMATCH".into());
+            }
+            let mut plaintext =
+                decrypt_recipient_key(pending.recipient_private_key, &ciphertext_for_recipient)?;
+            let mut journal_key: [u8; 32] = match plaintext.as_slice().try_into() {
+                Ok(key) => key,
+                Err(_) => {
+                    plaintext.zeroize();
+                    return Err("INVALID_KMS_KEY_MATERIAL".into());
+                }
+            };
+            plaintext.zeroize();
+            let key = JournalKey::from_bytes(journal_key);
+            journal_key.zeroize();
+            let mut receipt_seed = key.derive(b"receipt-signing-key-v1");
+            let signer = ReceiptSigner::from_seed(receipt_seed, state.enclave_measurement_sha384);
+            receipt_seed.zeroize();
+            let (restored, terminal_state) =
+                PrivateTradingCore::restore_exact_incident_terminal_snapshot(
+                    key,
+                    signer.clone(),
+                    &pending.snapshot,
+                )
+                .map_err(|_| "INCIDENT_TERMINAL_RESTORE_FAILED".to_string())?;
+            let certificate = IncidentTerminalCertificationReport {
+                schema_version: "layrs.incident-terminal-certification.v1".into(),
+                incident_id: INCIDENT_ID.into(),
+                incident_policy_sha256: hex::encode(pending.policy_sha256),
+                snapshot_bucket: pending.snapshot_descriptor.bucket.clone(),
+                snapshot_key: pending.snapshot_descriptor.key.clone(),
+                snapshot_version_id: pending.snapshot_descriptor.version_id.clone(),
+                snapshot_size_bytes: pending.snapshot_descriptor.size_bytes,
+                snapshot_body_sha256: hex::encode(pending.snapshot_body_sha256),
+                certifier_release_manifest_sha256: hex::encode(
+                    pending.certifier_release_manifest_sha256,
+                ),
+                artifact_equal: true,
+                policy_equal: true,
+                source_release_equal: true,
+                certifier_pcr0_equal: true,
+                terminal_state,
+            };
+            let certificate_bytes = serde_json::to_vec(&certificate)
+                .map_err(|_| "INCIDENT_CERTIFICATE_ENCODING_FAILED".to_string())?;
+            let certificate_sha256: [u8; 32] = Sha256::digest(&certificate_bytes).into();
+            let artifact_binding_sha256 = incident_artifact_binding(
+                pending.policy_sha256,
+                pending.snapshot_body_sha256,
+                &pending.snapshot_descriptor,
+                pending.certifier_release_manifest_sha256,
+                state.enclave_measurement_sha384,
+                pending.external_challenge,
+                certificate_sha256,
+            );
+            let attestation_document = match nsm_process_request(
+                state.nsm_fd,
+                NsmRequest::Attestation {
+                    user_data: Some(certificate_sha256.to_vec().into()),
+                    nonce: Some(artifact_binding_sha256.to_vec().into()),
+                    public_key: None,
+                },
+            ) {
+                NsmResponse::Attestation { document } => document,
+                _ => return Err("INCIDENT_CERTIFICATE_ATTESTATION_FAILED".into()),
+            };
+            let attestation_document_sha256 = Sha256::digest(&attestation_document);
+            state.receipt_public_key = signer.verifying_key();
+            state.receipt_signer = Some(signer);
+            state.core = Some(restored);
+            state.incident_restore_floor = Some(INCIDENT_TERMINAL_SEQUENCE);
+            Ok(PlainResponse::IncidentTerminalRestoreCertified {
+                envelope: IncidentTerminalCertificationEnvelope {
+                    certificate,
+                    certificate_sha256: hex::encode(certificate_sha256),
+                    artifact_binding_sha256: hex::encode(artifact_binding_sha256),
+                    attestation_document_sha256: hex::encode(attestation_document_sha256),
+                    attestation_document,
+                },
+            })
         }
         OperatorCommand::PolymarketStatus => Ok(PlainResponse::PolymarketStatus {
             state: if state.polymarket.is_some() {
@@ -4169,10 +4600,12 @@ async fn dispatch_operator(
                         .map_err(|error| error.to_string());
                 }
                 OperatorCommand::BeginProvision { .. }
+                | OperatorCommand::BeginIncidentTerminalRestore { .. }
                 | OperatorCommand::RecoverWithdrawalAuthorization { .. }
                 | OperatorCommand::PreparedCommandStatus { .. }
                 | OperatorCommand::FinalizePreparedCommand { .. }
                 | OperatorCommand::CompleteProvision { .. }
+                | OperatorCommand::CompleteIncidentTerminalRestore { .. }
                 | OperatorCommand::ProvisionStatus
                 | OperatorCommand::PolymarketStatus
                 | OperatorCommand::BeginPolymarketProvision { .. }
@@ -4861,9 +5294,297 @@ async fn write_frame(stream: &mut VsockStream, value: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clob_service::private_core::FeeProfileId;
+    use clob_service::private_core::{
+        ExactTerminalCategoryCounts, ExactTerminalCategoryDigests, ExactTerminalCategoryEquality,
+        FeeProfileId,
+    };
     use serde_cbor::Value;
     use std::collections::BTreeMap;
+
+    fn exact_incident_descriptor() -> IncidentSnapshotDescriptor {
+        IncidentSnapshotDescriptor {
+            bucket: INCIDENT_SNAPSHOT_BUCKET.into(),
+            key: INCIDENT_SNAPSHOT_KEY.into(),
+            version_id: INCIDENT_SNAPSHOT_VERSION_ID.into(),
+            size_bytes: INCIDENT_SNAPSHOT_SIZE_BYTES,
+            body_sha256: INCIDENT_SNAPSHOT_BODY_SHA256_HEX.into(),
+        }
+    }
+
+    fn empty_terminal_state_report() -> ExactTerminalSnapshotRestoreReport {
+        ExactTerminalSnapshotRestoreReport {
+            source_release_commit: EXACT_LIVE_976_RELEASE_COMMIT.into(),
+            restored_sequence: INCIDENT_TERMINAL_SEQUENCE,
+            restored_state_root: INCIDENT_TERMINAL_STATE_ROOT_HEX.into(),
+            restored_journal_head: INCIDENT_TERMINAL_JOURNAL_HEAD_HEX.into(),
+            snapshot_ciphertext_sha256: INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX.into(),
+            aggregate_bucket_totals: Vec::new(),
+            aggregate_asset_totals: Vec::new(),
+            category_counts: ExactTerminalCategoryCounts {
+                user_count: 0,
+                registered_session_count: 0,
+                sequenced_session_count: 0,
+                ledger_record_count: 0,
+                position_cost_basis_count: 0,
+                order_count: 0,
+                market_count: 0,
+                resolution_count: 0,
+                processed_command_count: 0,
+                system_key_count: 0,
+                aggregate_bucket_total_count: 0,
+                aggregate_asset_total_count: 0,
+            },
+            category_digests: ExactTerminalCategoryDigests {
+                users_and_sessions_sha256: "00".repeat(32),
+                available_balances_sha256: "00".repeat(32),
+                order_holds_sha256: "00".repeat(32),
+                withdrawal_holds_sha256: "00".repeat(32),
+                positions_and_cost_basis_sha256: "00".repeat(32),
+                order_books_sha256: "00".repeat(32),
+                snapshot_fill_state_sha256: "00".repeat(32),
+                resolutions_sha256: "00".repeat(32),
+                rewards_sha256: "00".repeat(32),
+                fees_sha256: "00".repeat(32),
+                markets_sha256: "00".repeat(32),
+                replay_state_sha256: "00".repeat(32),
+                custody_qualified_totals_sha256: "00".repeat(32),
+                composite_user_state_sha256: "00".repeat(32),
+            },
+            category_equality: ExactTerminalCategoryEquality {
+                users_and_sessions_equal: true,
+                available_balances_equal: true,
+                order_holds_equal: true,
+                withdrawal_holds_equal: true,
+                positions_and_cost_basis_equal: true,
+                order_books_equal: true,
+                snapshot_fill_state_equal: true,
+                resolutions_equal: true,
+                rewards_equal: true,
+                fees_equal: true,
+                markets_equal: true,
+                replay_state_equal: true,
+                custody_qualified_totals_equal: true,
+                composite_user_state_equal: true,
+            },
+            sequence_equal: true,
+            state_root_equal: true,
+            journal_head_equal: true,
+            aggregate_totals_equal: true,
+            aggregate_totals_zero_delta: true,
+            restore_floor_persisted: true,
+            no_external_state_mutation_performed: true,
+            pool_cash_opening_required: false,
+            historical_journal_replay_performed: false,
+            historical_fill_completeness_certified: false,
+        }
+    }
+
+    #[test]
+    fn terminal_certificate_has_one_unambiguous_allowlisted_release_field() {
+        let report = IncidentTerminalCertificationReport {
+            schema_version: "layrs.incident-terminal-certification.v1".into(),
+            incident_id: INCIDENT_ID.into(),
+            incident_policy_sha256: INCIDENT_RECOVERY_POLICY_SHA256_HEX.into(),
+            snapshot_bucket: INCIDENT_SNAPSHOT_BUCKET.into(),
+            snapshot_key: INCIDENT_SNAPSHOT_KEY.into(),
+            snapshot_version_id: INCIDENT_SNAPSHOT_VERSION_ID.into(),
+            snapshot_size_bytes: INCIDENT_SNAPSHOT_SIZE_BYTES,
+            snapshot_body_sha256: INCIDENT_SNAPSHOT_BODY_SHA256_HEX.into(),
+            certifier_release_manifest_sha256: "11".repeat(32),
+            artifact_equal: true,
+            policy_equal: true,
+            source_release_equal: true,
+            certifier_pcr0_equal: true,
+            terminal_state: empty_terminal_state_report(),
+        };
+
+        let encoded = serde_json::to_string(&report).unwrap();
+        assert_eq!(encoded.matches("\"sourceReleaseCommit\"").count(), 1);
+        assert!(!encoded.contains("certifierPcr0Sha384"));
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(value["sourceReleaseCommit"], EXACT_LIVE_976_RELEASE_COMMIT);
+        assert_eq!(value["restoredSequence"], INCIDENT_TERMINAL_SEQUENCE);
+        let mut actual_keys: Vec<_> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        actual_keys.sort_unstable();
+        let mut expected_keys = vec![
+            "aggregateAssetTotals",
+            "aggregateBucketTotals",
+            "aggregateTotalsEqual",
+            "aggregateTotalsZeroDelta",
+            "artifactEqual",
+            "categoryCounts",
+            "categoryDigests",
+            "categoryEquality",
+            "certifierPcr0Equal",
+            "certifierReleaseManifestSha256",
+            "historicalFillCompletenessCertified",
+            "historicalJournalReplayPerformed",
+            "incidentId",
+            "incidentPolicySha256",
+            "journalHeadEqual",
+            "noExternalStateMutationPerformed",
+            "policyEqual",
+            "poolCashOpeningRequired",
+            "restoreFloorPersisted",
+            "restoredJournalHead",
+            "restoredSequence",
+            "restoredStateRoot",
+            "schemaVersion",
+            "sequenceEqual",
+            "snapshotBodySha256",
+            "snapshotBucket",
+            "snapshotCiphertextSha256",
+            "snapshotKey",
+            "snapshotSizeBytes",
+            "snapshotVersionId",
+            "sourceReleaseCommit",
+            "sourceReleaseEqual",
+            "stateRootEqual",
+        ];
+        expected_keys.sort_unstable();
+        assert_eq!(actual_keys, expected_keys);
+    }
+
+    #[test]
+    fn incident_policy_bytes_and_every_provenance_field_are_exact() {
+        assert_eq!(
+            hex::encode(incident_recovery_policy_sha256().unwrap()),
+            INCIDENT_RECOVERY_POLICY_SHA256_HEX
+        );
+        let policy = exact_incident_recovery_policy().unwrap();
+        assert_eq!(policy.restore_sequence, INCIDENT_TERMINAL_SEQUENCE);
+        assert_eq!(policy.rollback_floor, INCIDENT_TERMINAL_SEQUENCE);
+        assert!(!policy.historical_journal_replay_required);
+        assert!(!policy.historical_fill_completeness_certified);
+
+        let mut wrong_release = policy.clone();
+        wrong_release.source_release_commit = "00".repeat(20);
+        assert!(validate_incident_recovery_policy_fields(&wrong_release).is_err());
+        let mut wrong_version = policy.clone();
+        wrong_version.snapshot.version_id.push('x');
+        assert!(validate_incident_recovery_policy_fields(&wrong_version).is_err());
+        let mut wrong_source_eif = policy.clone();
+        wrong_source_eif.source_provenance.eif_sha384 = "00".repeat(48);
+        assert!(validate_incident_recovery_policy_fields(&wrong_source_eif).is_err());
+        let mut wrong_source_pcr = policy.clone();
+        wrong_source_pcr.source_provenance.pcr0 = "00".repeat(48);
+        assert!(validate_incident_recovery_policy_fields(&wrong_source_pcr).is_err());
+        let mut wrong_source_ami = policy.clone();
+        wrong_source_ami.source_provenance.source_ami_id = "ami-00000000000000000".into();
+        assert!(validate_incident_recovery_policy_fields(&wrong_source_ami).is_err());
+        let mut wrong_copied_ami = policy.clone();
+        wrong_copied_ami.source_provenance.copied_parent_ami_id = "ami-00000000000000000".into();
+        assert!(validate_incident_recovery_policy_fields(&wrong_copied_ami).is_err());
+        let mut journal_required = policy;
+        journal_required.historical_journal_replay_required = true;
+        assert!(validate_incident_recovery_policy_fields(&journal_required).is_err());
+    }
+
+    #[test]
+    fn incident_descriptor_substitution_fails_before_snapshot_parse() {
+        let body = [];
+        let exact = exact_incident_descriptor();
+        assert_eq!(
+            validate_incident_terminal_input(&exact, &body).unwrap_err(),
+            "INCIDENT_SNAPSHOT_DESCRIPTOR_MISMATCH"
+        );
+        for substituted in [
+            IncidentSnapshotDescriptor {
+                bucket: "layrs-production-substituted".into(),
+                ..exact.clone()
+            },
+            IncidentSnapshotDescriptor {
+                key: "enclave/snapshot/substituted.json".into(),
+                ..exact.clone()
+            },
+            IncidentSnapshotDescriptor {
+                version_id: "substituted".into(),
+                ..exact.clone()
+            },
+            IncidentSnapshotDescriptor {
+                size_bytes: INCIDENT_SNAPSHOT_SIZE_BYTES - 1,
+                ..exact.clone()
+            },
+            IncidentSnapshotDescriptor {
+                body_sha256: "00".repeat(32),
+                ..exact
+            },
+        ] {
+            assert_eq!(
+                validate_incident_terminal_input(&substituted, &body).unwrap_err(),
+                "INCIDENT_SNAPSHOT_DESCRIPTOR_MISMATCH"
+            );
+        }
+    }
+
+    #[test]
+    fn incident_operator_command_rejects_unknown_fields() {
+        let command = serde_json::json!({
+            "type": "BEGIN_INCIDENT_TERMINAL_RESTORE",
+            "kms_key_id": "alias/layrs/production/journal",
+            "kms_ciphertext_blob": [1, 2, 3],
+            "snapshot_descriptor": exact_incident_descriptor(),
+            "snapshot_body": [],
+            "external_challenge": vec![1u8; 32],
+            "certifier_release_manifest_sha256": vec![2u8; 32],
+            "expected_certifier_pcr0_sha384": vec![3u8; 48],
+            "unexpected": true
+        });
+        assert!(serde_json::from_value::<OperatorCommand>(command).is_err());
+    }
+
+    #[test]
+    fn generic_provisioning_is_disabled_in_incident_build() {
+        assert_eq!(
+            ensure_generic_provisioning_disabled().unwrap_err(),
+            "INCIDENT_RECOVERY_REQUIRES_DEDICATED_COMMAND"
+        );
+    }
+
+    #[test]
+    fn terminal_attestation_binding_changes_for_replay_or_substitution() {
+        let descriptor = exact_incident_descriptor();
+        let baseline = incident_artifact_binding(
+            [1; 32],
+            [2; 32],
+            &descriptor,
+            [3; 32],
+            [4; 48],
+            [5; 32],
+            [6; 32],
+        );
+        assert_ne!(
+            baseline,
+            incident_artifact_binding(
+                [1; 32],
+                [2; 32],
+                &descriptor,
+                [3; 32],
+                [4; 48],
+                [7; 32],
+                [6; 32],
+            )
+        );
+        let mut substituted = descriptor;
+        substituted.version_id = "substituted".into();
+        assert_ne!(
+            baseline,
+            incident_artifact_binding(
+                [1; 32],
+                [2; 32],
+                &substituted,
+                [3; 32],
+                [4; 48],
+                [5; 32],
+                [6; 32],
+            )
+        );
+    }
 
     #[test]
     fn position_close_preview_is_transition_only_for_success_and_rejection() {
