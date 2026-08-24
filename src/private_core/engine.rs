@@ -1127,6 +1127,70 @@ struct CoreStateSnapshot {
     sequence: u64,
 }
 
+pub const EXACT_LIVE_976_RELEASE_COMMIT: &str = "97614f37c05089708f93bf50ac8831adde98ab2f";
+
+/// Non-secret checkpoint fields supplied by the outer certification wrapper.
+/// Artifact checksums are revalidated by the runner before this reaches the
+/// private core; the core binds the semantic report to the same checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactLive976CheckpointBinding {
+    pub source_release_commit: String,
+    pub checkpoint_sha256: String,
+    pub sequence: u64,
+    pub state_root: [u8; 32],
+    pub journal_head: [u8; 32],
+}
+
+/// Privacy-safe result of restoring an exact 976 snapshot in the cumulative
+/// candidate. No account, order, market, session, balance or replay key is
+/// serialized into this report; only equality decisions and digests leave the
+/// attested recovery process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExactLive976RestoreReport {
+    pub source_release_commit: String,
+    pub checkpoint_sha256: String,
+    pub source_checkpoint_equal: bool,
+    pub sequence_equal: bool,
+    pub journal_head_equal: bool,
+    pub state_root_equal: bool,
+    pub users_equal: bool,
+    pub available_balances_equal: bool,
+    pub order_holds_equal: bool,
+    pub withdrawal_holds_equal: bool,
+    pub positions_equal: bool,
+    pub orders_equal: bool,
+    pub fills_equal: bool,
+    pub resolutions_equal: bool,
+    pub rewards_equal: bool,
+    pub fees_equal: bool,
+    pub markets_equal: bool,
+    pub replay_keys_equal: bool,
+    pub legacy_zero_balance_count: usize,
+    pub qualified_totals_digest: String,
+    pub user_state_digest: String,
+    pub pool_cash_opening_required: bool,
+}
+
+#[derive(Debug)]
+struct OfflineStateDigests {
+    users: [u8; 32],
+    available_balances: [u8; 32],
+    order_holds: [u8; 32],
+    withdrawal_holds: [u8; 32],
+    positions: [u8; 32],
+    orders: [u8; 32],
+    fills: [u8; 32],
+    resolutions: [u8; 32],
+    rewards: [u8; 32],
+    fees: [u8; 32],
+    markets: [u8; 32],
+    replay_keys: [u8; 32],
+    qualified_totals: [u8; 32],
+    user_state: [u8; 32],
+    pool_cash_opening_required: bool,
+}
+
 #[derive(Clone)]
 pub struct PrivateTradingCore {
     ledger: Ledger,
@@ -1458,6 +1522,117 @@ impl PrivateTradingCore {
             .ok_or(CoreError::JournalCrypto)?
             .remove("recovery_capsules");
         self.journal.seal_snapshot(self.state_root(), &value)
+    }
+
+    /// Restores and compares a frozen exact-976 checkpoint without exporting
+    /// decrypted state. The supplied journal must be the complete immutable
+    /// chain through the snapshot head. Category booleans are computed from
+    /// independently digested source and restored candidate projections; they
+    /// are never caller-controlled switches.
+    pub fn certify_exact_live_976_restore(
+        journal_key: JournalKey,
+        receipt_signer: ReceiptSigner,
+        snapshot: &EncryptedSnapshot,
+        journal_records: &[EncryptedJournalRecord],
+        checkpoint: ExactLive976CheckpointBinding,
+    ) -> CoreResult<ExactLive976RestoreReport> {
+        EncryptedJournal::verify_complete_export(
+            journal_records,
+            snapshot.sequence,
+            snapshot.journal_head,
+            snapshot.state_root,
+        )?;
+
+        let source_journal = EncryptedJournal::new(journal_key.clone());
+        let (journal_fills, journal_fill_totals) = offline_journal_fill_evidence(
+            source_journal.decrypt_complete_export_json(journal_records)?,
+        )?;
+        let source: CoreStateSnapshot = source_journal.open_snapshot(snapshot)?;
+        if !source.recovery_capsules.is_empty() || source.sequence != snapshot.sequence {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        let source_digests = offline_state_digests(
+            &source.ledger,
+            &source.books,
+            &source.markets,
+            &source.sessions,
+            &source.processed_hashes,
+            &source.system_keys,
+            &source.position_cost_basis,
+            &source.resolutions,
+            &source.private_rewards,
+            &journal_fills,
+        )?;
+
+        let restored = Self::restore_encrypted_snapshot(
+            journal_key,
+            receipt_signer,
+            snapshot,
+            checkpoint.sequence,
+        )?;
+        let restored_processed = processed_hashes(&restored.processed);
+        let restored_positions: Vec<(PositionKey, u128)> = restored
+            .position_cost_basis
+            .iter()
+            .map(|(key, amount)| (key.clone(), *amount))
+            .collect();
+        let restored_digests = offline_state_digests(
+            &restored.ledger,
+            &restored.books,
+            &restored.markets,
+            &restored.sessions,
+            &restored_processed,
+            &restored.system_keys,
+            &restored_positions,
+            &restored.resolutions,
+            &restored.private_rewards,
+            &journal_fills,
+        )?;
+        let source_fills_consistent =
+            offline_fill_totals_equal(&source.books, &journal_fill_totals);
+        let restored_fills_consistent =
+            offline_fill_totals_equal(&restored.books, &journal_fill_totals);
+
+        let source_checkpoint_equal = checkpoint.source_release_commit
+            == EXACT_LIVE_976_RELEASE_COMMIT
+            && checkpoint.sequence == snapshot.sequence
+            && checkpoint.state_root == snapshot.state_root
+            && checkpoint.journal_head == snapshot.journal_head;
+        let sequence_equal =
+            source.sequence == restored.sequence && restored.sequence == checkpoint.sequence;
+        let journal_head_equal =
+            restored.journal.chain_head() == (checkpoint.sequence, checkpoint.journal_head);
+        let state_root_equal = restored.state_root() == source_state_root(&source)
+            && restored.state_root() == checkpoint.state_root;
+
+        Ok(ExactLive976RestoreReport {
+            source_release_commit: checkpoint.source_release_commit,
+            checkpoint_sha256: checkpoint.checkpoint_sha256,
+            source_checkpoint_equal,
+            sequence_equal,
+            journal_head_equal,
+            state_root_equal,
+            users_equal: source_digests.users == restored_digests.users,
+            available_balances_equal: source_digests.available_balances
+                == restored_digests.available_balances,
+            order_holds_equal: source_digests.order_holds == restored_digests.order_holds,
+            withdrawal_holds_equal: source_digests.withdrawal_holds
+                == restored_digests.withdrawal_holds,
+            positions_equal: source_digests.positions == restored_digests.positions,
+            orders_equal: source_digests.orders == restored_digests.orders,
+            fills_equal: source_digests.fills == restored_digests.fills
+                && source_fills_consistent
+                && restored_fills_consistent,
+            resolutions_equal: source_digests.resolutions == restored_digests.resolutions,
+            rewards_equal: source_digests.rewards == restored_digests.rewards,
+            fees_equal: source_digests.fees == restored_digests.fees,
+            markets_equal: source_digests.markets == restored_digests.markets,
+            replay_keys_equal: source_digests.replay_keys == restored_digests.replay_keys,
+            legacy_zero_balance_count: source.ledger.legacy_zero_balance_count(),
+            qualified_totals_digest: hex::encode(source_digests.qualified_totals),
+            user_state_digest: hex::encode(source_digests.user_state),
+            pool_cash_opening_required: source_digests.pool_cash_opening_required,
+        })
     }
 
     pub fn restore_encrypted_snapshot(
@@ -8338,6 +8513,190 @@ fn validate_recovery_capsules(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn offline_state_digests(
+    ledger: &Ledger,
+    books: &BTreeMap<String, PriceTimeBook>,
+    markets: &BTreeMap<String, MarketConfig>,
+    sessions: &SessionGuard,
+    processed_hashes: &BTreeMap<String, [u8; 32]>,
+    system_keys: &BTreeSet<String>,
+    position_cost_basis: &[(PositionKey, u128)],
+    resolutions: &BTreeMap<String, MarketResolution>,
+    private_rewards: &PrivateRewardBook,
+    journal_fills: &[Fill],
+) -> CoreResult<OfflineStateDigests> {
+    let available = ledger.offline_balances_for_buckets(&[AccountBucket::UserAvailable]);
+    let order_holds = ledger.offline_balances_for_buckets(&[AccountBucket::UserOrderHold]);
+    let withdrawal_holds =
+        ledger.offline_balances_for_buckets(&[AccountBucket::UserWithdrawalHold]);
+    let position_balances = ledger.offline_balances_for_buckets(&[AccountBucket::UserPosition]);
+    let fee_balances = ledger.offline_balances_for_buckets(&[AccountBucket::FeeRevenue]);
+    let pool_cash = ledger.offline_balances_for_buckets(&[AccountBucket::PoolCash]);
+
+    let mut user_owners = ledger.offline_user_owners();
+    for book in books.values() {
+        for order in book.offline_orders().values() {
+            user_owners.insert(order.private_user_id.clone());
+        }
+    }
+
+    let users = offline_digest(
+        b"layrs.restore-equality.users.v1\0",
+        &(user_owners, sessions),
+    )?;
+    let available_balances = offline_digest(b"layrs.restore-equality.available.v1\0", &available)?;
+    let order_holds = offline_digest(b"layrs.restore-equality.order-holds.v1\0", &order_holds)?;
+    let withdrawal_holds = offline_digest(
+        b"layrs.restore-equality.withdrawal-holds.v1\0",
+        &withdrawal_holds,
+    )?;
+    let positions = offline_digest(
+        b"layrs.restore-equality.positions.v1\0",
+        &(position_balances, position_cost_basis),
+    )?;
+    let orders = offline_digest(b"layrs.restore-equality.orders.v1\0", books)?;
+    let fills = offline_digest(b"layrs.restore-equality.fills.v1\0", journal_fills)?;
+    let resolutions = offline_digest(b"layrs.restore-equality.resolutions.v1\0", resolutions)?;
+    let rewards = offline_digest(b"layrs.restore-equality.rewards.v1\0", private_rewards)?;
+    let fees = offline_digest(
+        b"layrs.restore-equality.fees.v1\0",
+        &(fee_balances, private_rewards),
+    )?;
+    let markets = offline_digest(b"layrs.restore-equality.markets.v1\0", markets)?;
+    let replay_keys = offline_digest(
+        b"layrs.restore-equality.replay-keys.v1\0",
+        &(ledger.offline_replay_keys(), processed_hashes, system_keys),
+    )?;
+    let qualified_totals = offline_digest(
+        b"layrs.restore-equality.qualified-totals.v1\0",
+        &ledger.custody_reconciliation_totals()?,
+    )?;
+    let user_state = offline_digest(
+        b"layrs.restore-equality.user-state.v1\0",
+        &(
+            users,
+            available_balances,
+            order_holds,
+            withdrawal_holds,
+            positions,
+            orders,
+            fills,
+            resolutions,
+            rewards,
+            fees,
+            markets,
+            replay_keys,
+        ),
+    )?;
+    let has_user_liability = available.iter().any(|(_, amount)| *amount > 0)
+        || position_cost_basis.iter().any(|(_, amount)| *amount > 0)
+        || ledger
+            .offline_balances_for_buckets(&[
+                AccountBucket::UserOrderHold,
+                AccountBucket::UserWithdrawalHold,
+                AccountBucket::UserPosition,
+            ])
+            .iter()
+            .any(|(_, amount)| *amount > 0);
+    let has_pool_cash = pool_cash.iter().any(|(_, amount)| *amount > 0);
+
+    Ok(OfflineStateDigests {
+        users,
+        available_balances,
+        order_holds,
+        withdrawal_holds,
+        positions,
+        orders,
+        fills,
+        resolutions,
+        rewards,
+        fees,
+        markets,
+        replay_keys,
+        qualified_totals,
+        user_state,
+        pool_cash_opening_required: has_user_liability && !has_pool_cash,
+    })
+}
+
+fn offline_journal_fill_evidence(
+    values: Vec<serde_json::Value>,
+) -> CoreResult<(Vec<Fill>, BTreeMap<(String, Uuid), u128>)> {
+    let mut fills = Vec::new();
+    let mut totals = BTreeMap::<(String, Uuid), u128>::new();
+    for value in values {
+        let is_user_command = value.get("command").is_some() || value.get("result").is_some();
+        if !is_user_command {
+            continue;
+        }
+        let entry: JournaledUserCommand =
+            serde_json::from_value(value).map_err(|_| CoreError::JournalCrypto)?;
+        let CommandResult::Order { result } = entry.result else {
+            continue;
+        };
+        for fill in result.fills {
+            for order_id in [fill.maker_order_id, fill.taker_order_id] {
+                let key = (fill.market_id.clone(), order_id);
+                let next = totals
+                    .get(&key)
+                    .copied()
+                    .unwrap_or_default()
+                    .checked_add(fill.quantity_micros)
+                    .ok_or(CoreError::JournalChainMismatch)?;
+                totals.insert(key, next);
+            }
+            fills.push(fill);
+        }
+    }
+    Ok((fills, totals))
+}
+
+fn offline_fill_totals_equal(
+    books: &BTreeMap<String, PriceTimeBook>,
+    expected: &BTreeMap<(String, Uuid), u128>,
+) -> bool {
+    let actual: BTreeMap<(String, Uuid), u128> = books
+        .iter()
+        .flat_map(|(market_id, book)| {
+            book.offline_orders()
+                .values()
+                .map(|order| ((market_id.clone(), order.order_id), order.filled_micros))
+        })
+        .filter(|(_, amount)| *amount > 0)
+        .collect();
+    actual == *expected
+}
+
+fn offline_digest<T: Serialize + ?Sized>(domain: &[u8], value: &T) -> CoreResult<[u8; 32]> {
+    let encoded = serde_json::to_vec(value).map_err(|_| CoreError::JournalCrypto)?;
+    let mut hash = Sha256::new();
+    hash.update(domain);
+    hash.update((encoded.len() as u64).to_be_bytes());
+    hash.update(encoded);
+    Ok(hash.finalize().into())
+}
+
+fn source_state_root(source: &CoreStateSnapshot) -> [u8; 32] {
+    let position_cost_basis: BTreeMap<PositionKey, u128> =
+        source.position_cost_basis.iter().cloned().collect();
+    state_root(
+        &source.ledger,
+        &source.books,
+        &source.markets,
+        &source.sessions,
+        &source.processed_hashes,
+        &source.system_keys,
+        &position_cost_basis,
+        &source.resolutions,
+        &source.oracle_public_key,
+        &source.bootstrap_executions,
+        &source.private_rewards,
+        source.trading_frozen,
+        source.sequence,
+    )
+}
+
 fn read_only_response_hash(
     command: &UserCommand,
     result: &CommandResult,
@@ -8803,6 +9162,177 @@ mod category_fee_tests {
 mod snapshot_migration_tests {
     use super::*;
     use crate::private_core::TimeInForce;
+
+    fn exact_976_binding(snapshot: &EncryptedSnapshot) -> ExactLive976CheckpointBinding {
+        ExactLive976CheckpointBinding {
+            source_release_commit: EXACT_LIVE_976_RELEASE_COMMIT.into(),
+            checkpoint_sha256: "ab".repeat(32),
+            sequence: snapshot.sequence,
+            state_root: snapshot.state_root,
+            journal_head: snapshot.journal_head,
+        }
+    }
+
+    fn assert_exact_restore_pass(report: &ExactLive976RestoreReport) {
+        assert!(report.source_checkpoint_equal);
+        assert!(report.sequence_equal);
+        assert!(report.journal_head_equal);
+        assert!(report.state_root_equal);
+        assert!(report.users_equal);
+        assert!(report.available_balances_equal);
+        assert!(report.order_holds_equal);
+        assert!(report.withdrawal_holds_equal);
+        assert!(report.positions_equal);
+        assert!(report.orders_equal);
+        assert!(report.fills_equal);
+        assert!(report.resolutions_equal);
+        assert!(report.rewards_equal);
+        assert!(report.fees_equal);
+        assert!(report.markets_equal);
+        assert!(report.replay_keys_equal);
+    }
+
+    #[test]
+    fn attested_runner_core_derives_every_wrapper_equality_field() {
+        let journal_key = JournalKey::from_bytes([220u8; 32]);
+        let mut core =
+            PrivateTradingCore::new(journal_key.clone(), ReceiptSigner::generate([221u8; 48]));
+        core.ledger
+            .seed_balance(
+                AccountKey::new(
+                    "private-user-never-exported",
+                    AccountBucket::UserAvailable,
+                    "USDC",
+                ),
+                7_654_321,
+            )
+            .unwrap();
+        let freeze = core
+            .set_trading_freeze("offline-cert-freeze".into(), true, [8u8; 32], 1_000)
+            .unwrap();
+        let snapshot = core.export_live_976_snapshot_for_test().unwrap();
+        let report = PrivateTradingCore::certify_exact_live_976_restore(
+            journal_key,
+            ReceiptSigner::generate([222u8; 48]),
+            &snapshot,
+            &[freeze.encrypted_record],
+            exact_976_binding(&snapshot),
+        )
+        .unwrap();
+
+        assert_exact_restore_pass(&report);
+        assert!(report.pool_cash_opening_required);
+        assert_eq!(report.legacy_zero_balance_count, 0);
+        assert_eq!(report.qualified_totals_digest.len(), 64);
+        assert_eq!(report.user_state_digest.len(), 64);
+        let public_report = serde_json::to_string(&report).unwrap();
+        assert!(!public_report.contains("private-user-never-exported"));
+        assert!(!public_report.contains("7654321"));
+    }
+
+    #[test]
+    fn attested_runner_core_rejects_a_tampered_immutable_journal() {
+        let journal_key = JournalKey::from_bytes([223u8; 32]);
+        let mut core =
+            PrivateTradingCore::new(journal_key.clone(), ReceiptSigner::generate([224u8; 48]));
+        let freeze = core
+            .set_trading_freeze("offline-cert-freeze".into(), true, [9u8; 32], 1_000)
+            .unwrap();
+        let snapshot = core.export_live_976_snapshot_for_test().unwrap();
+        let mut record = freeze.encrypted_record;
+        record.ciphertext[0] ^= 1;
+
+        assert!(matches!(
+            PrivateTradingCore::certify_exact_live_976_restore(
+                journal_key,
+                ReceiptSigner::generate([225u8; 48]),
+                &snapshot,
+                &[record],
+                exact_976_binding(&snapshot),
+            ),
+            Err(CoreError::JournalChainMismatch)
+        ));
+    }
+
+    #[test]
+    fn attested_runner_core_cannot_claim_a_substituted_checkpoint_is_equal() {
+        let journal_key = JournalKey::from_bytes([226u8; 32]);
+        let mut core =
+            PrivateTradingCore::new(journal_key.clone(), ReceiptSigner::generate([227u8; 48]));
+        let freeze = core
+            .set_trading_freeze("offline-cert-freeze".into(), true, [10u8; 32], 1_000)
+            .unwrap();
+        let snapshot = core.export_live_976_snapshot_for_test().unwrap();
+        let mut binding = exact_976_binding(&snapshot);
+        binding.state_root = [0x55; 32];
+        let report = PrivateTradingCore::certify_exact_live_976_restore(
+            journal_key,
+            ReceiptSigner::generate([228u8; 48]),
+            &snapshot,
+            &[freeze.encrypted_record],
+            binding,
+        )
+        .unwrap();
+
+        assert!(!report.source_checkpoint_equal);
+        assert!(!report.state_root_equal);
+    }
+
+    #[test]
+    fn attested_runner_fill_equality_requires_every_journaled_fill_total() {
+        let market_id = "layrs:v3:ZEN:15m:offline-fill-equality";
+        let maker_id = Uuid::from_u128(1);
+        let taker_id = Uuid::from_u128(2);
+        let mut book = PriceTimeBook::default();
+        book.submit(
+            BookOrder::with_id(
+                maker_id,
+                "private-maker",
+                market_id,
+                Outcome::Up,
+                OrderAction::Sell,
+                400_000,
+                1_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+            1_000,
+        )
+        .unwrap();
+        let result = book
+            .submit(
+                BookOrder::with_id(
+                    taker_id,
+                    "private-taker",
+                    market_id,
+                    Outcome::Up,
+                    OrderAction::Buy,
+                    400_000,
+                    1_000_000,
+                    TimeInForce::Gtc,
+                    None,
+                ),
+                2_000,
+            )
+            .unwrap();
+        let books = BTreeMap::from([(market_id.into(), book)]);
+        let fill = result.fills.first().unwrap();
+        let exact = BTreeMap::from([
+            (
+                (market_id.into(), fill.maker_order_id),
+                fill.quantity_micros,
+            ),
+            (
+                (market_id.into(), fill.taker_order_id),
+                fill.quantity_micros,
+            ),
+        ]);
+        assert!(offline_fill_totals_equal(&books, &exact));
+
+        let mut diluted = exact;
+        *diluted.get_mut(&(market_id.into(), maker_id)).unwrap() -= 1;
+        assert!(!offline_fill_totals_equal(&books, &diluted));
+    }
 
     #[test]
     fn restores_exact_live_976_snapshot_shape_without_changing_checkpoint() {

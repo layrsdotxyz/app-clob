@@ -371,6 +371,40 @@ impl Ledger {
             .count()
     }
 
+    /// Returns an enclave-local, deterministically ordered projection used by
+    /// the offline snapshot equality certifier. The projection never crosses
+    /// the enclave boundary; only its domain-separated digest is reported.
+    pub(crate) fn offline_balances_for_buckets(
+        &self,
+        buckets: &[AccountBucket],
+    ) -> Vec<(AccountKey, u128)> {
+        self.balances
+            .iter()
+            .filter(|(account, _)| buckets.contains(&account.bucket))
+            .map(|(account, amount)| (account.clone(), *amount))
+            .collect()
+    }
+
+    pub(crate) fn offline_user_owners(&self) -> BTreeSet<String> {
+        self.balances
+            .keys()
+            .filter(|account| {
+                matches!(
+                    account.bucket,
+                    AccountBucket::UserAvailable
+                        | AccountBucket::UserOrderHold
+                        | AccountBucket::UserWithdrawalHold
+                        | AccountBucket::UserPosition
+                )
+            })
+            .map(|account| account.owner.clone())
+            .collect()
+    }
+
+    pub(crate) fn offline_replay_keys(&self) -> &BTreeSet<String> {
+        &self.applied_idempotency_keys
+    }
+
     #[cfg(test)]
     pub(crate) fn insert_legacy_zero_balance_for_test(&mut self, account: AccountKey) {
         self.balances.insert(account, 0);
