@@ -22,6 +22,11 @@ const parentUnit = readFileSync(
   'utf8',
 );
 const wrapper = readFileSync(resolve(ROOT, 'scripts/build-seq159300-recovery-parent-ami.sh'), 'utf8');
+const toolchainManifestBytes = readFileSync(
+  resolve(ROOT, 'enclave/packer/layrs-seq159300-packer-toolchain-provenance.v1.json'),
+  'utf8',
+);
+const toolchainManifest = JSON.parse(toolchainManifestBytes);
 const runbook = readFileSync(
   resolve(ROOT, 'docs/runbooks/LAYRS_SEQ159300_RECOVERY_PARENT_AMI.md'),
   'utf8',
@@ -50,8 +55,13 @@ function validEvidence(overrides = {}) {
     implementationEvidenceObjectVersionId: 'implementation.version.1',
     implementationEvidenceObjectSha384: SHA384,
     builderSourceCommit: BUILDER_SOURCE_COMMIT,
+    builderEvidenceIndexObjectKey: 'evidence/seq159300/recovery-only/phase2/builder/evidence-index.json',
+    builderEvidenceIndexObjectVersionId: 'builder.index.version.1',
     builderEvidenceIndexSha384: SHA384,
     builderTemplateSha384: SHA384,
+    builderTemplateEvidenceObjectKey: `evidence/seq159300/recovery-only/phase2/builder/templates/layrs-seq159300-recovery-builder-${SHA384}.yml`,
+    builderTemplateEvidenceObjectVersionId: 'builder.template.version.1',
+    builderTemplateEvidenceSha384: SHA384,
     buildControlPlaneRoleInventorySha384: SHA384,
     buildInstanceProfileInventorySha384: SHA384,
     buildSecurityGroupInventorySha384: SHA384,
@@ -65,15 +75,20 @@ function validEvidence(overrides = {}) {
     nitroPackageSetObjectVersionId: 'package.set.version.1',
     nitroPackageSetSha384: SHA384,
     nitroPackageClosureSha384: SHA384,
-    nitroPackageSigningKeyFingerprint: AMAZON_KEY_FINGERPRINT,
-    nitroPackageSigningKeySha256: AMAZON_KEY_SHA256,
     nitroPackageSetEvidenceObjectKey: 'evidence/seq159300/recovery-only/phase2/packages/nitro-package-set-evidence.json',
     nitroPackageSetEvidenceObjectVersionId: 'package.evidence.version.1',
     nitroPackageSetEvidenceSha384: SHA384,
     outputAmiInventorySha384: SHA384,
     packerManifestSha384: SHA384,
     packerInvokerRoleInventorySha384: SHA384,
+    packerInvokerTemplateSha384: SHA384,
+    packerInvokerEvidenceObjectKey: 'evidence/seq159300/recovery-only/phase2/invoker/template.yml',
+    packerInvokerEvidenceObjectVersionId: 'invoker.template.version.1',
+    packerInvokerEvidenceSha384: SHA384,
     packerTemplateSha384: SHA384,
+    packerAmazonPluginVersion: '1.3.9',
+    packerAmazonPluginSourceCommit: '2a769c39a05940e25143098f071490732fa24f4f',
+    packerToolchainManifestSha256: '6a6d597535481836605a4cc9762755038e56e524af621356e5f5f65519c6858e',
     phase2EvidenceObjectKey: 'evidence/seq159300/recovery-only/phase2/rendered-phase2.json',
     phase2EvidenceObjectVersionId: 'phase2.version.1',
     phase2EvidenceObjectSha384: SHA384,
@@ -108,6 +123,7 @@ test('Packer source is pinned, private and recovery-only', () => {
   assert.match(packer, /snapshot_tags\s*=\s*\{/u);
   for (const tag of [
     'RecoveryBuilderTemplateSha384', 'RecoveryPackageSetSha384', 'RecoveryEvidenceIndexSha384',
+    'Phase2TemplateSha384',
   ]) {
     assert.ok((packer.match(new RegExp(tag, 'gu')) ?? []).length >= 4);
   }
@@ -148,11 +164,16 @@ test('wrapper cross-checks immutable package versions and a dedicated Packer rol
   assert.match(wrapper, /rpmkeys --checksig --verbose/u);
   assert.match(wrapper, /layrs-production-recovery-seq159300-packer-control/u);
   assert.match(wrapper, /LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384/u);
+  assert.match(wrapper, /LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID/u);
+  assert.match(wrapper, /LAYRS_RECOVERY_PACKER_INVOKER_TEMPLATE_SHA384/u);
+  assert.match(wrapper, /LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_OBJECT_VERSION_ID/u);
+  assert.match(wrapper, /LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_VERSION_ID/u);
   assert.match(wrapper, /LAYRS_RECOVERY_PACKER_INVOKER_ROLE_INVENTORY_SHA384/u);
   assert.match(wrapper, /B21C50FA44A99720EAA72F7FE951904AD832C631/u);
   assert.match(wrapper, /664b632018bd84f9b249be7bd26937c560edb2f2bfc0cbc01ec5a7b4e06aad56/u);
   assert.match(wrapper, /assumed-role/u);
   assert.match(wrapper, /LAYRS_RECOVERY_NITRO_PACKAGE_SET_EVIDENCE_OBJECT_VERSION_ID/u);
+  assert.equal((wrapper.match(/s3api get-object/gu) ?? []).length, 2);
   assert.doesNotMatch(wrapper, /dnf download|reposync|curl|wget/iu);
 });
 
@@ -166,8 +187,33 @@ test('wrapper verifies under the exact invoker then gives Packer only exact shor
   assert.match(wrapper, /export AWS_SESSION_TOKEN=/u);
   assert.match(wrapper, /assumed-role\/layrs-production-recovery-seq159300-packer-control\/layrs-seq159300-packer/u);
   assert.match(wrapper, /verify_immutable_package_objects\s*\n\s*assume_packer_control_role/u);
-  assert.match(wrapper, /run_aws_preflight\s*\n\s*packer_bin=/u);
+  assert.match(wrapper, /run_aws_preflight\s*\n\s*\[\[ -n "\$\{PACKER_BINARY\}"/u);
   assert.doesNotMatch(wrapper, /LAYRS_RECOVERY_PACKER_CALLER_ROLE_ARN/u);
+});
+
+test('wrapper uses only the exact offline-reviewed Packer CLI and Amazon plugin bytes', () => {
+  for (const binding of [
+    'PACKER_CLI_VERSION="1.16.0"',
+    '5edcd14ab59b535040c512dbecd6ec9ef976a000b073c19d93e4c431c948581e',
+    '1c327cd37ce76790c9c10ebda1af3981554cc4eceaed1d6fdfdb59d5ccfe25d5',
+    'acdd742a9f7a9e32715e81e72c8d0622ac1a700779e2b1480d89544bec89761655fa07a1fc75edaf35d337fcd318d126',
+    'packer-plugin-amazon_v1.3.9_x5.0_linux_amd64',
+    'a46e0d719dfc34e51ecaf50b9b575087a8007e3df2d856ed19fb91714539b87b',
+    '72d1f95616192ce9b5f7f4011b43e2fee43c48c464fd03b99b5d1bd23b49940a9b41a2151a2240a670d063b9aa53e973',
+    '6d8797b95727c3ce85afae0dfedbbf27f6ff8a8cd780467b9fa74d2c20414083',
+    'e103534fafb5f4702f08123e0a5e190fef193e3db2c9ae26f4f80a35c12f9e3a',
+    'C874011F0AB405110D02105534365D9472D7468F',
+    '374EC75B485913604A831CC7C820C6D5CD27AB87',
+    '9f116d64eba294c61582335d74a4812b287d9a9c601787ea7454cb030ebebb33',
+  ]) assert.match(wrapper, new RegExp(binding, 'u'));
+  assert.match(wrapper, /export PACKER_PLUGIN_PATH=/u);
+  assert.match(wrapper, /CHECKPOINT_DISABLE=1/u);
+  assert.match(wrapper, /isolated installed Packer plugin/u);
+  assert.match(wrapper, /gpg --batch --status-fd 1[\s\S]*--verify/u);
+  assert.ok((wrapper.match(/install -m 0500/gu) ?? []).length >= 2);
+  assert.ok((wrapper.match(/assert_isolated_packer_toolchain\s*\n/gu) ?? []).length >= 3);
+  assert.match(wrapper, /unreviewed Packer, HCP or checkpoint environment overrides remain set/u);
+  assert.doesNotMatch(wrapper, /\bpacker init\b|plugins\s+install(?:\s|$)/u);
 });
 
 test('Packer and f282 units expose one exact runtime layout contract for Phase2 IaC', () => {
@@ -214,8 +260,8 @@ test('wrapper requires clean f282 ancestry and permits only recovery-path source
 test('wrapper keeps validation and separately authorized build modes explicit', () => {
   assert.match(wrapper, /--validate-only/u);
   assert.match(wrapper, /--build/u);
-  assert.match(wrapper, /packer_bin.*command -v packer/u);
-  assert.match(wrapper, /"\$\{packer_bin\}" build -color=false -force=false/u);
+  assert.match(wrapper, /"\$\{PACKER_BINARY\}" build -color=false -force=false/u);
+  assert.doesNotMatch(wrapper, /command -v packer|packer init/u);
   assert.doesNotMatch(wrapper, /-force=true/u);
 });
 
@@ -247,6 +293,8 @@ test('renderer rejects swapped artifacts and recovery bindings', () => {
     { nitroCliRpmSha384: '0'.repeat(95) },
     { phase2EvidenceObjectKey: '../mutable.json' },
     { remediationIndexObjectVersionId: 'different' },
+    { packerAmazonPluginSourceCommit: '0'.repeat(40) },
+    { builderTemplateEvidenceSha384: '0'.repeat(96) },
     { accountId: '111111111111' },
     { region: 'eu-west-1' },
   ]) {
@@ -263,6 +311,10 @@ test('renderer requires and faithfully emits the final external implementation c
     implementationCommit: alternateFinalCommit,
   })));
   assert.equal(rendered.implementationCommit, alternateFinalCommit);
+  const sameRepositoryCommit = JSON.parse(renderRecoveryParentBuildEvidence(validEvidence({
+    implementationCommit: PHASE2_TEMPLATE_COMMIT,
+  })));
+  assert.equal(sameRepositoryCommit.implementationCommit, PHASE2_TEMPLATE_COMMIT);
 
   const omitted = validEvidence();
   delete omitted.implementationCommit;
@@ -285,6 +337,28 @@ test('renderer rejects extra fields and noncanonical timestamps', () => {
   assert.throws(
     () => renderRecoveryParentBuildEvidence(validEvidence({ buildCompletedAt: '2026-08-24T03:30:00Z' })),
     /binding is invalid/u,
+  );
+});
+
+test('Packer toolchain provenance is canonical, strict and cryptographically complete', () => {
+  assert.equal(toolchainManifestBytes, `${canonicalJson(toolchainManifest)}\n`);
+  assert.equal(
+    createHash('sha256').update(toolchainManifestBytes).digest('hex'),
+    '6a6d597535481836605a4cc9762755038e56e524af621356e5f5f65519c6858e',
+  );
+  assert.deepEqual(
+    validatePreflight({ kind: 'packer-toolchain', payload: toolchainManifest }),
+    toolchainManifest,
+  );
+  const tampered = structuredClone(toolchainManifest);
+  tampered.cli.archiveSha256 = '0'.repeat(64);
+  assert.throws(
+    () => validatePreflight({ kind: 'packer-toolchain', payload: tampered }),
+    /exact reviewed manifest/u,
+  );
+  assert.throws(
+    () => validatePreflight({ kind: 'packer-toolchain', payload: { ...toolchainManifest, extra: true } }),
+    /exact reviewed manifest/u,
   );
 });
 

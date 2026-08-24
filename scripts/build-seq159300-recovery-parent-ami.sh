@@ -19,10 +19,29 @@ readonly PACKER_CONTROL_ROLE_NAME="layrs-production-recovery-seq159300-packer-co
 readonly AMAZON_LINUX_SIGNING_KEY_ID="D832C631"
 readonly AMAZON_LINUX_SIGNING_KEY_FINGERPRINT="B21C50FA44A99720EAA72F7FE951904AD832C631"
 readonly AMAZON_LINUX_SIGNING_KEY_SHA256="664b632018bd84f9b249be7bd26937c560edb2f2bfc0cbc01ec5a7b4e06aad56"
+readonly PACKER_CLI_VERSION="1.16.0"
+readonly PACKER_CLI_ARCHIVE_SHA256="5edcd14ab59b535040c512dbecd6ec9ef976a000b073c19d93e4c431c948581e"
+readonly PACKER_CLI_SHA256="1c327cd37ce76790c9c10ebda1af3981554cc4eceaed1d6fdfdb59d5ccfe25d5"
+readonly PACKER_CLI_SHA384="acdd742a9f7a9e32715e81e72c8d0622ac1a700779e2b1480d89544bec89761655fa07a1fc75edaf35d337fcd318d126"
+readonly PACKER_CLI_CHECKSUMS_SHA256="643b26ebd70a17ee487f789c594fc9ac87007e7aba9e863df6a10c266bdc7da0"
+readonly PACKER_CLI_SIGNATURE_SHA256="3a40ebe8397ef0a2fddb5214a6051d021c9b89db58af9cd1eac21d3e6c80f982"
+readonly PACKER_AMAZON_PLUGIN_VERSION="1.3.9"
+readonly PACKER_AMAZON_PLUGIN_FILENAME="packer-plugin-amazon_v1.3.9_x5.0_linux_amd64"
+readonly PACKER_AMAZON_PLUGIN_ARCHIVE_SHA256="c4de5f441958d02ca2a6efa6d156e3a2a8c2f556b68f7fd1832e53c90d1e605d"
+readonly PACKER_AMAZON_PLUGIN_SHA256="a46e0d719dfc34e51ecaf50b9b575087a8007e3df2d856ed19fb91714539b87b"
+readonly PACKER_AMAZON_PLUGIN_SHA384="72d1f95616192ce9b5f7f4011b43e2fee43c48c464fd03b99b5d1bd23b49940a9b41a2151a2240a670d063b9aa53e973"
+readonly PACKER_AMAZON_PLUGIN_CHECKSUMS_SHA256="6d8797b95727c3ce85afae0dfedbbf27f6ff8a8cd780467b9fa74d2c20414083"
+readonly PACKER_AMAZON_PLUGIN_SIGNATURE_SHA256="e103534fafb5f4702f08123e0a5e190fef193e3db2c9ae26f4f80a35c12f9e3a"
+readonly PACKER_TOOLCHAIN_PROVENANCE_SHA256="9f116d64eba294c61582335d74a4812b287d9a9c601787ea7454cb030ebebb33"
+readonly PACKER_TOOLCHAIN_MANIFEST_SHA256="6a6d597535481836605a4cc9762755038e56e524af621356e5f5f65519c6858e"
+readonly HASHICORP_SIGNING_KEY_SHA256="c2f5bc1163bd8d15a711616b587bcede212d045a5b8b52df01c74095897cd065"
+readonly HASHICORP_PRIMARY_FINGERPRINT="C874011F0AB405110D02105534365D9472D7468F"
+readonly HASHICORP_RELEASE_FINGERPRINT="374EC75B485913604A831CC7C820C6D5CD27AB87"
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 readonly PACKER_TEMPLATE="${REPO_ROOT}/enclave/packer/layrs-seq159300-recovery-parent.pkr.hcl"
+readonly PACKER_TOOLCHAIN_MANIFEST="${REPO_ROOT}/enclave/packer/layrs-seq159300-packer-toolchain-provenance.v1.json"
 readonly PARENT_BINARY="${REPO_ROOT}/build/layrs-enclave-parent"
 readonly EIF_BINARY="${REPO_ROOT}/build/layrsv2-clob.eif"
 readonly EIF_MEASUREMENTS="${REPO_ROOT}/build/layrsv2-clob-measurements.json"
@@ -33,6 +52,9 @@ readonly EVIDENCE_RENDERER="${REPO_ROOT}/scripts/render-seq159300-recovery-paren
 readonly PREFLIGHT_VALIDATOR="${REPO_ROOT}/scripts/lib/seq159300-recovery-parent-preflight.mjs"
 EVIDENCE_INPUT_TEMP=""
 PREFLIGHT_TEMP_DIR=""
+PACKER_TOOLCHAIN_TEMP_DIR=""
+PACKER_BINARY=""
+PACKER_PLUGIN_BINARY=""
 BUILDER_COMMIT=""
 PACKER_TEMPLATE_SHA384=""
 EXPECTED_PACKAGE_INVENTORY_SHA384=""
@@ -76,6 +98,10 @@ sha384_file() {
   sha384sum --binary "$1" | awk '{print $1}'
 }
 
+sha256_file() {
+  sha256sum --binary "$1" | awk '{print $1}'
+}
+
 cleanup() {
   if [[ -n "${EVIDENCE_INPUT_TEMP}" ]]; then
     rm -f -- "${EVIDENCE_INPUT_TEMP}"
@@ -88,6 +114,184 @@ cleanup() {
     rm -f -- "${PREFLIGHT_TEMP_DIR}"/*
     rmdir -- "${PREFLIGHT_TEMP_DIR}"
   fi
+  if [[ -n "${PACKER_TOOLCHAIN_TEMP_DIR}" && -d "${PACKER_TOOLCHAIN_TEMP_DIR}" \
+      && "$(basename -- "${PACKER_TOOLCHAIN_TEMP_DIR}")" == layrs-seq159300-packer-toolchain.* ]]; then
+    find "${PACKER_TOOLCHAIN_TEMP_DIR}" -depth -delete
+  fi
+}
+
+require_local_toolchain_file() {
+  local label="$1" path="$2" mode="$3"
+  [[ -f "${path}" && ! -L "${path}" ]] || die "${label} is missing, linked or not a regular file"
+  require_exact "${label} owner" "$(stat -c '%u' -- "${path}")" "$(id -u)"
+  require_exact "${label} mode" "$(stat -c '%a' -- "${path}")" "${mode}"
+  require_exact "${label} link count" "$(stat -c '%h' -- "${path}")" "1"
+}
+
+assert_isolated_packer_toolchain() {
+  local installed_output
+  [[ -n "${PACKER_BINARY}" && -n "${PACKER_PLUGIN_BINARY}" ]] \
+    || die "the exact reviewed Packer toolchain was not initialized"
+  require_local_toolchain_file "isolated Packer CLI" "${PACKER_BINARY}" "500"
+  require_local_toolchain_file "isolated Amazon plugin" "${PACKER_PLUGIN_BINARY}" "500"
+  require_exact "isolated Packer CLI SHA256" "$(sha256_file "${PACKER_BINARY}")" "${PACKER_CLI_SHA256}"
+  require_exact "isolated Packer CLI SHA384" "$(sha384_file "${PACKER_BINARY}")" "${PACKER_CLI_SHA384}"
+  require_exact "isolated Amazon plugin SHA256" "$(sha256_file "${PACKER_PLUGIN_BINARY}")" \
+    "${PACKER_AMAZON_PLUGIN_SHA256}"
+  require_exact "isolated Amazon plugin SHA384" "$(sha384_file "${PACKER_PLUGIN_BINARY}")" \
+    "${PACKER_AMAZON_PLUGIN_SHA384}"
+  require_exact "Packer plugin path" "${PACKER_PLUGIN_PATH:-}" "${PACKER_TOOLCHAIN_TEMP_DIR}"
+  require_exact "Packer checkpoint mode" "${CHECKPOINT_DISABLE:-}" "1"
+  installed_output="$("${PACKER_BINARY}" plugins installed)"
+  require_exact "isolated installed Packer plugin" "${installed_output}" "${PACKER_PLUGIN_BINARY}"
+}
+
+verify_packer_toolchain() {
+  local plugin_dir checksum_file version_output manifest_input manifest_output keyring_dir
+  local cli_archive_name plugin_archive_name valid_signature primary_fingerprint
+  for name in LAYRS_RECOVERY_PACKER_BINARY LAYRS_RECOVERY_PACKER_CLI_ARCHIVE \
+      LAYRS_RECOVERY_PACKER_CLI_CHECKSUMS LAYRS_RECOVERY_PACKER_CLI_CHECKSUMS_SIGNATURE \
+      LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_BINARY LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_ARCHIVE \
+      LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_CHECKSUMS \
+      LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_CHECKSUMS_SIGNATURE \
+      LAYRS_RECOVERY_HASHICORP_SIGNING_KEY LAYRS_RECOVERY_PACKER_TOOLCHAIN_EVIDENCE_FILE; do
+    require_env "${name}"
+  done
+  require_local_toolchain_file "reviewed Packer CLI" "${LAYRS_RECOVERY_PACKER_BINARY}" "755"
+  require_local_toolchain_file "reviewed Packer CLI archive" "${LAYRS_RECOVERY_PACKER_CLI_ARCHIVE}" "644"
+  require_local_toolchain_file "reviewed Packer CLI checksums" "${LAYRS_RECOVERY_PACKER_CLI_CHECKSUMS}" "644"
+  require_local_toolchain_file "reviewed Packer CLI signature" \
+    "${LAYRS_RECOVERY_PACKER_CLI_CHECKSUMS_SIGNATURE}" "644"
+  require_local_toolchain_file "reviewed Amazon plugin" \
+    "${LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_BINARY}" "755"
+  require_local_toolchain_file "reviewed Amazon plugin archive" \
+    "${LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_ARCHIVE}" "644"
+  require_local_toolchain_file "reviewed Amazon plugin checksums" \
+    "${LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_CHECKSUMS}" "644"
+  require_local_toolchain_file "reviewed Amazon plugin signature" \
+    "${LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_CHECKSUMS_SIGNATURE}" "644"
+  require_local_toolchain_file "reviewed HashiCorp signing key" \
+    "${LAYRS_RECOVERY_HASHICORP_SIGNING_KEY}" "644"
+  require_local_toolchain_file "reviewed Packer toolchain evidence" \
+    "${LAYRS_RECOVERY_PACKER_TOOLCHAIN_EVIDENCE_FILE}" "644"
+
+  require_exact "Packer toolchain manifest SHA256" "$(sha256_file "${PACKER_TOOLCHAIN_MANIFEST}")" \
+    "${PACKER_TOOLCHAIN_MANIFEST_SHA256}"
+  require_exact "Packer CLI archive name" "$(basename -- "${LAYRS_RECOVERY_PACKER_CLI_ARCHIVE}")" \
+    "packer_1.16.0_linux_amd64.zip"
+  require_exact "Packer CLI binary name" "$(basename -- "${LAYRS_RECOVERY_PACKER_BINARY}")" "packer"
+  require_exact "Packer CLI checksum-list name" \
+    "$(basename -- "${LAYRS_RECOVERY_PACKER_CLI_CHECKSUMS}")" "packer_1.16.0_SHA256SUMS"
+  require_exact "Packer CLI signature name" \
+    "$(basename -- "${LAYRS_RECOVERY_PACKER_CLI_CHECKSUMS_SIGNATURE}")" \
+    "packer_1.16.0_SHA256SUMS.sig"
+  require_exact "Amazon plugin archive name" \
+    "$(basename -- "${LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_ARCHIVE}")" \
+    "packer-plugin-amazon_v1.3.9_x5.0_linux_amd64.zip"
+  require_exact "Amazon plugin binary name" \
+    "$(basename -- "${LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_BINARY}")" \
+    "${PACKER_AMAZON_PLUGIN_FILENAME}"
+  require_exact "Amazon plugin checksum-list name" \
+    "$(basename -- "${LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_CHECKSUMS}")" \
+    "packer-plugin-amazon_v1.3.9_SHA256SUMS"
+  require_exact "Amazon plugin signature name" \
+    "$(basename -- "${LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_CHECKSUMS_SIGNATURE}")" \
+    "packer-plugin-amazon_v1.3.9_SHA256SUMS.sig"
+  require_exact "HashiCorp signing-key name" \
+    "$(basename -- "${LAYRS_RECOVERY_HASHICORP_SIGNING_KEY}")" "hashicorp-pgp-key.txt"
+  require_exact "Packer toolchain review-evidence name" \
+    "$(basename -- "${LAYRS_RECOVERY_PACKER_TOOLCHAIN_EVIDENCE_FILE}")" \
+    "LAYRS_SEQ159300_PACKER_TOOLCHAIN_PROVENANCE_20260824.md"
+  require_exact "Packer CLI archive SHA256" "$(sha256_file "${LAYRS_RECOVERY_PACKER_CLI_ARCHIVE}")" \
+    "${PACKER_CLI_ARCHIVE_SHA256}"
+  require_exact "Packer CLI checksums SHA256" "$(sha256_file "${LAYRS_RECOVERY_PACKER_CLI_CHECKSUMS}")" \
+    "${PACKER_CLI_CHECKSUMS_SHA256}"
+  require_exact "Packer CLI signature SHA256" \
+    "$(sha256_file "${LAYRS_RECOVERY_PACKER_CLI_CHECKSUMS_SIGNATURE}")" \
+    "${PACKER_CLI_SIGNATURE_SHA256}"
+  require_exact "Amazon plugin archive SHA256" \
+    "$(sha256_file "${LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_ARCHIVE}")" \
+    "${PACKER_AMAZON_PLUGIN_ARCHIVE_SHA256}"
+  require_exact "Amazon plugin checksums SHA256" \
+    "$(sha256_file "${LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_CHECKSUMS}")" \
+    "${PACKER_AMAZON_PLUGIN_CHECKSUMS_SHA256}"
+  require_exact "Amazon plugin signature SHA256" \
+    "$(sha256_file "${LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_CHECKSUMS_SIGNATURE}")" \
+    "${PACKER_AMAZON_PLUGIN_SIGNATURE_SHA256}"
+  require_exact "HashiCorp signing key SHA256" "$(sha256_file "${LAYRS_RECOVERY_HASHICORP_SIGNING_KEY}")" \
+    "${HASHICORP_SIGNING_KEY_SHA256}"
+  require_exact "Packer toolchain review evidence SHA256" \
+    "$(sha256_file "${LAYRS_RECOVERY_PACKER_TOOLCHAIN_EVIDENCE_FILE}")" \
+    "${PACKER_TOOLCHAIN_PROVENANCE_SHA256}"
+
+  PACKER_TOOLCHAIN_TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/layrs-seq159300-packer-toolchain.XXXXXX")"
+  manifest_input="${PACKER_TOOLCHAIN_TEMP_DIR}/manifest-input.json"
+  manifest_output="${PACKER_TOOLCHAIN_TEMP_DIR}/manifest-output.json"
+  jq -n --slurpfile manifest "${PACKER_TOOLCHAIN_MANIFEST}" \
+    '{kind:"packer-toolchain",payload:$manifest[0]}' >"${manifest_input}"
+  node "${PREFLIGHT_VALIDATOR}" --input "${manifest_input}" --output "${manifest_output}" \
+    || die "Packer toolchain provenance manifest is invalid"
+  require_exact "canonical Packer toolchain provenance manifest" \
+    "$(cat -- "${PACKER_TOOLCHAIN_MANIFEST}")" "$(cat -- "${manifest_output}")"
+
+  keyring_dir="${PACKER_TOOLCHAIN_TEMP_DIR}/gnupg"
+  install -d -m 0700 "${keyring_dir}"
+  GNUPGHOME="${keyring_dir}" gpg --batch --quiet --import "${LAYRS_RECOVERY_HASHICORP_SIGNING_KEY}"
+  primary_fingerprint="$(GNUPGHOME="${keyring_dir}" gpg --batch --with-colons --fingerprint \
+    | awk -F: '$1 == "fpr" {print $10; exit}')"
+  require_exact "HashiCorp primary signing fingerprint" "${primary_fingerprint}" \
+    "${HASHICORP_PRIMARY_FINGERPRINT}"
+  valid_signature="$(GNUPGHOME="${keyring_dir}" gpg --batch --status-fd 1 \
+    --verify "${LAYRS_RECOVERY_PACKER_CLI_CHECKSUMS_SIGNATURE}" \
+    "${LAYRS_RECOVERY_PACKER_CLI_CHECKSUMS}" 2>/dev/null \
+    | awk '$1 == "[GNUPG:]" && $2 == "VALIDSIG" {print $3 ":" $NF}')"
+  require_exact "Packer CLI checksum signature" "${valid_signature}" \
+    "${HASHICORP_RELEASE_FINGERPRINT}:${HASHICORP_PRIMARY_FINGERPRINT}"
+  valid_signature="$(GNUPGHOME="${keyring_dir}" gpg --batch --status-fd 1 \
+    --verify "${LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_CHECKSUMS_SIGNATURE}" \
+    "${LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_CHECKSUMS}" 2>/dev/null \
+    | awk '$1 == "[GNUPG:]" && $2 == "VALIDSIG" {print $3 ":" $NF}')"
+  require_exact "Amazon plugin checksum signature" "${valid_signature}" \
+    "${HASHICORP_RELEASE_FINGERPRINT}:${HASHICORP_PRIMARY_FINGERPRINT}"
+  cli_archive_name="$(basename -- "${LAYRS_RECOVERY_PACKER_CLI_ARCHIVE}")"
+  plugin_archive_name="$(basename -- "${LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_ARCHIVE}")"
+  [[ "$(awk -v hash="${PACKER_CLI_ARCHIVE_SHA256}" -v file="${cli_archive_name}" \
+      '$1 == hash && $2 == file {count++} END {print count + 0}' \
+      "${LAYRS_RECOVERY_PACKER_CLI_CHECKSUMS}")" == "1" ]] \
+    || die "Packer CLI archive is not bound exactly once by the signed checksum list"
+  [[ "$(awk -v hash="${PACKER_AMAZON_PLUGIN_ARCHIVE_SHA256}" -v file="${plugin_archive_name}" \
+      '$1 == hash && $2 == file {count++} END {print count + 0}' \
+      "${LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_CHECKSUMS}")" == "1" ]] \
+    || die "Amazon plugin archive is not bound exactly once by the signed checksum list"
+  unzip -p "${LAYRS_RECOVERY_PACKER_CLI_ARCHIVE}" packer \
+    | cmp -s - "${LAYRS_RECOVERY_PACKER_BINARY}" \
+    || die "reviewed Packer CLI does not equal the signed archive member"
+  unzip -p "${LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_ARCHIVE}" "${PACKER_AMAZON_PLUGIN_FILENAME}" \
+    | cmp -s - "${LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_BINARY}" \
+    || die "reviewed Amazon plugin does not equal the signed archive member"
+
+  plugin_dir="${PACKER_TOOLCHAIN_TEMP_DIR}/github.com/hashicorp/amazon"
+  install -d -m 0700 "${PACKER_TOOLCHAIN_TEMP_DIR}/bin" "${plugin_dir}"
+  PACKER_BINARY="${PACKER_TOOLCHAIN_TEMP_DIR}/bin/packer"
+  PACKER_PLUGIN_BINARY="${plugin_dir}/${PACKER_AMAZON_PLUGIN_FILENAME}"
+  checksum_file="${PACKER_PLUGIN_BINARY}_SHA256SUM"
+  install -m 0500 "${LAYRS_RECOVERY_PACKER_BINARY}" "${PACKER_BINARY}"
+  install -m 0500 "${LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_BINARY}" "${PACKER_PLUGIN_BINARY}"
+  printf '%s' "${PACKER_AMAZON_PLUGIN_SHA256}" >"${checksum_file}"
+  chmod 0400 "${checksum_file}"
+  unset PACKER_CACHE_DIR PACKER_CONFIG PACKER_CONFIG_DIR PACKER_GITHUB_API_TOKEN PACKER_HOME_DIR
+  unset PACKER_LOG PACKER_LOG_PATH PACKER_LOG_SECRET_FILTER HCP_CLIENT_ID HCP_CLIENT_SECRET
+  unset PACKER_PLUGIN_PATH CHECKPOINT_DISABLE PACKER_NO_COLOR
+  [[ -z "$(compgen -e | awk '/^(PACKER_|HCP_|CHECKPOINT_)/ {print; exit}')" ]] \
+    || die "unreviewed Packer, HCP or checkpoint environment overrides remain set"
+  export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  export PACKER_PLUGIN_PATH="${PACKER_TOOLCHAIN_TEMP_DIR}"
+  export CHECKPOINT_DISABLE=1
+  export PACKER_NO_COLOR=1
+  export LC_ALL=C LANG=C
+  version_output="$("${PACKER_BINARY}" version | sed -n '1p')"
+  require_exact "Packer CLI version" "${version_output}" "Packer v${PACKER_CLI_VERSION}"
+  assert_isolated_packer_toolchain
 }
 
 verify_nitro_package_set() {
@@ -153,7 +357,7 @@ verify_nitro_package_set() {
 }
 
 verify_immutable_package_objects() {
-  local key version expected_sha filename downloaded response
+  local downloaded response
   require_exact LAYRS_RECOVERY_EVIDENCE_BUCKET "${LAYRS_RECOVERY_EVIDENCE_BUCKET}" \
     "${IMMUTABLE_EVIDENCE_BUCKET}"
   downloaded="${PREFLIGHT_TEMP_DIR}/nitro-package-set.tar"
@@ -181,18 +385,6 @@ verify_immutable_package_objects() {
     "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_EVIDENCE_SHA384}"
   cmp -s -- "${downloaded}" "${NITRO_PACKAGE_SET_MANIFEST}" \
     || die "local Nitro package-set manifest differs from immutable evidence bytes"
-
-  while IFS=$'\t' read -r filename key version expected_sha; do
-    downloaded="${PREFLIGHT_TEMP_DIR}/remote-${filename}"
-    response="${PREFLIGHT_TEMP_DIR}/remote-${filename}.json"
-    aws_read_json s3api get-object --bucket "${IMMUTABLE_EVIDENCE_BUCKET}" \
-      --key "${key}" --version-id "${version}" "${downloaded}" >"${response}"
-    require_exact "remote RPM VersionId for ${filename}" "$(jq -er '.VersionId' "${response}")" "${version}"
-    require_exact "remote RPM SHA384 for ${filename}" "$(sha384_file "${downloaded}")" "${expected_sha}"
-    cmp -s -- "${downloaded}" "${NITRO_PACKAGE_DIRECTORY}/${filename}" \
-      || die "local RPM bytes differ from immutable object version for ${filename}"
-  done < <(jq -r '.packages[] | [.filename,.objectKey,.objectVersionId,.sha384] | @tsv' \
-    "${NITRO_PACKAGE_SET_MANIFEST}")
 }
 
 trap cleanup EXIT
@@ -224,6 +416,7 @@ verify_repository() {
     [[ -z "${file}" ]] && continue
     case "${file}" in
       docs/runbooks/LAYRS_SEQ159300_RECOVERY_PARENT_AMI.md | \
+      enclave/packer/layrs-seq159300-packer-toolchain-provenance.v1.json | \
       enclave/packer/layrs-seq159300-recovery-parent.pkr.hcl | \
       scripts/build-seq159300-recovery-parent-ami.sh | \
       scripts/lib/seq159300-recovery-parent-preflight.mjs | \
@@ -266,11 +459,20 @@ verify_inputs() {
   require_env LAYRS_RECOVERY_EXPECTED_NITRO_PACKAGE_CLOSURE_SHA384
   require_env LAYRS_RECOVERY_BUILDER_STACK_NAME
   require_env LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384
+  require_env LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_KEY
+  require_env LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID
+  require_env LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_SHA384
   require_env LAYRS_RECOVERY_PACKER_INVOKER_ROLE_ARN
   require_env LAYRS_RECOVERY_PACKER_INVOKER_ROLE_INVENTORY_SHA384
+  require_env LAYRS_RECOVERY_PACKER_INVOKER_TEMPLATE_SHA384
+  require_env LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_OBJECT_KEY
+  require_env LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_OBJECT_VERSION_ID
+  require_env LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_SHA384
   require_env LAYRS_RECOVERY_PACKER_CONTROL_APPROVED_AT
   require_env LAYRS_RECOVERY_PACKER_CONTROL_EXPIRES_AT
   require_env LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_SHA384
+  require_env LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_KEY
+  require_env LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_VERSION_ID
   require_env LAYRS_RECOVERY_EXPECTED_BUILD_CONTROL_PLANE_ROLE_INVENTORY_SHA384
   require_env LAYRS_RECOVERY_EVIDENCE_BUCKET
 
@@ -291,16 +493,37 @@ verify_inputs() {
   for value in "${LAYRS_RECOVERY_EXPECTED_NITRO_PACKAGE_CLOSURE_SHA384}" \
       "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_SHA384}" \
       "${LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384}" \
+      "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_SHA384}" \
       "${LAYRS_RECOVERY_PACKER_INVOKER_ROLE_INVENTORY_SHA384}" \
+      "${LAYRS_RECOVERY_PACKER_INVOKER_TEMPLATE_SHA384}" \
+      "${LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_SHA384}" \
       "${LAYRS_RECOVERY_EXPECTED_BUILD_CONTROL_PLANE_ROLE_INVENTORY_SHA384}"; do
     [[ "${value}" =~ ^[0-9a-f]{96}$ ]] || die "reviewed package, builder or control-role SHA384 is malformed"
+  done
+  require_exact "builder template immutable evidence SHA384" \
+    "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_SHA384}" \
+    "${LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384}"
+  require_exact "Packer invoker immutable evidence SHA384" \
+    "${LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_SHA384}" \
+    "${LAYRS_RECOVERY_PACKER_INVOKER_TEMPLATE_SHA384}"
+  require_exact "builder template immutable evidence key" \
+    "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_KEY}" \
+    "evidence/seq159300/recovery-only/phase2/builder/templates/layrs-seq159300-recovery-builder-${LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384}.yml"
+  [[ "${LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_OBJECT_KEY}" =~ ^evidence/seq159300/recovery-only/phase2/invoker/[A-Za-z0-9._/-]+$ \
+      && "${LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_OBJECT_KEY}" != *".."* \
+      && "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_KEY}" =~ ^evidence/seq159300/recovery-only/phase2/builder/[A-Za-z0-9._/-]+$ \
+      && "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_KEY}" != *".."* ]] \
+    || die "immutable invoker or builder evidence key is malformed"
+  for value in "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}" \
+      "${LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_OBJECT_VERSION_ID}" \
+      "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_VERSION_ID}"; do
+    [[ "${value}" =~ ^[A-Za-z0-9._-]{8,256}$ ]] \
+      || die "immutable builder or invoker evidence VersionId is malformed"
   done
   [[ "${LAYRS_RECOVERY_IMPLEMENTATION_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
     || die "LAYRS_RECOVERY_IMPLEMENTATION_COMMIT must be an exact lowercase commit"
   [[ "${LAYRS_RECOVERY_PHASE2_TEMPLATE_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
     || die "LAYRS_RECOVERY_PHASE2_TEMPLATE_COMMIT must be an exact lowercase commit"
-  [[ "${LAYRS_RECOVERY_PHASE2_TEMPLATE_COMMIT}" != "${LAYRS_RECOVERY_IMPLEMENTATION_COMMIT}" ]] \
-    || die "Phase2 IaC commit and final implementation commit are distinct reviewed bindings"
   [[ "${LAYRS_RECOVERY_EXPECTED_PHASE2_TEMPLATE_SHA384}" =~ ^[0-9a-f]{96}$ ]] \
     || die "LAYRS_RECOVERY_EXPECTED_PHASE2_TEMPLATE_SHA384 is malformed"
   [[ "${LAYRS_RECOVERY_PHASE2_EVIDENCE_OBJECT_SHA384}" =~ ^[0-9a-f]{96}$ \
@@ -658,11 +881,11 @@ run_aws_preflight() {
   require_exact "preflight invoker role" "arn:aws:iam::${RECOVERY_ACCOUNT_ID}:role/${BASH_REMATCH[1]}" \
     "${LAYRS_RECOVERY_PACKER_INVOKER_ROLE_ARN}"
   preflight_packer_control_role
-  preflight_source_ami
-  preflight_build_network
   preflight_instance_profile
   verify_immutable_package_objects
   assume_packer_control_role
+  preflight_source_ami
+  preflight_build_network
 }
 
 summary() {
@@ -673,8 +896,17 @@ summary() {
     --arg sourceCommit "${RECOVERY_SOURCE_COMMIT}" \
     --arg builderSourceCommit "${BUILDER_COMMIT}" \
     --arg builderEvidenceIndexSha384 "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_SHA384}" \
+    --arg builderEvidenceIndexObjectKey "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_KEY}" \
+    --arg builderEvidenceIndexObjectVersionId "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_VERSION_ID}" \
     --arg builderTemplateSha384 "${LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384}" \
+    --arg builderTemplateEvidenceObjectKey "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_KEY}" \
+    --arg builderTemplateEvidenceObjectVersionId "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}" \
+    --arg builderTemplateEvidenceSha384 "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_SHA384}" \
     --arg packerInvokerRoleInventorySha384 "${LAYRS_RECOVERY_PACKER_INVOKER_ROLE_INVENTORY_SHA384}" \
+    --arg packerInvokerTemplateSha384 "${LAYRS_RECOVERY_PACKER_INVOKER_TEMPLATE_SHA384}" \
+    --arg packerInvokerEvidenceObjectKey "${LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_OBJECT_KEY}" \
+    --arg packerInvokerEvidenceObjectVersionId "${LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_OBJECT_VERSION_ID}" \
+    --arg packerInvokerEvidenceSha384 "${LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_SHA384}" \
     --arg sourceAmiId "${LAYRS_RECOVERY_SOURCE_AMI_ID}" \
     --arg sourceAmiOwner "${LAYRS_RECOVERY_SOURCE_AMI_OWNER}" \
     --arg parentBinarySha384 "${EXPECTED_PARENT_SHA384}" \
@@ -706,7 +938,16 @@ summary() {
     --arg nitroPackageSetEvidenceSha384 "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_EVIDENCE_SHA384}" \
     '{accountId:$accountId,region:$region,purpose:$purpose,sourceCommit:$sourceCommit,builderSourceCommit:$builderSourceCommit,
       builderEvidenceIndexSha384:$builderEvidenceIndexSha384,
+      builderEvidenceIndexObjectKey:$builderEvidenceIndexObjectKey,
+      builderEvidenceIndexObjectVersionId:$builderEvidenceIndexObjectVersionId,
       builderTemplateSha384:$builderTemplateSha384,
+      builderTemplateEvidenceObjectKey:$builderTemplateEvidenceObjectKey,
+      builderTemplateEvidenceObjectVersionId:$builderTemplateEvidenceObjectVersionId,
+      builderTemplateEvidenceSha384:$builderTemplateEvidenceSha384,
+      packerInvokerTemplateSha384:$packerInvokerTemplateSha384,
+      packerInvokerEvidenceObjectKey:$packerInvokerEvidenceObjectKey,
+      packerInvokerEvidenceObjectVersionId:$packerInvokerEvidenceObjectVersionId,
+      packerInvokerEvidenceSha384:$packerInvokerEvidenceSha384,
       packerInvokerRoleInventorySha384:$packerInvokerRoleInventorySha384,
       sourceAmiId:$sourceAmiId,sourceAmiOwner:$sourceAmiOwner,
       parentBinarySha384:$parentBinarySha384,eifSha384:$eifSha384,pcr0Sha384:$pcr0Sha384,
@@ -732,7 +973,7 @@ summary() {
 }
 
 build_ami() {
-  local packer_bin build_time build_completed_at artifact_id ami_id
+  local build_time build_completed_at artifact_id ami_id
   local packer_manifest_sha384 installed_package_inventory installed_package_inventory_sha384
   require_env LAYRS_RECOVERY_BUILD_SUBNET_ID
   require_env LAYRS_RECOVERY_BUILD_SECURITY_GROUP_ID
@@ -740,7 +981,6 @@ build_ami() {
   require_env LAYRS_RECOVERY_PACKER_MANIFEST
   require_env LAYRS_RECOVERY_BUILD_EVIDENCE_OUTPUT
   require_command aws
-  require_command packer
   require_command sort
   require_command cat
 
@@ -758,9 +998,9 @@ build_ami() {
     || die "manifest and evidence outputs must be distinct"
 
   run_aws_preflight
-  packer_bin="$(command -v packer)" || die "packer is unavailable"
-  "${packer_bin}" init "${PACKER_TEMPLATE}"
-  "${packer_bin}" validate \
+  [[ -n "${PACKER_BINARY}" ]] || die "the exact reviewed Packer CLI was not initialized"
+  assert_isolated_packer_toolchain
+  "${PACKER_BINARY}" validate \
     -var "aws_region=${RECOVERY_REGION}" \
     -var "source_ami_id=${LAYRS_RECOVERY_SOURCE_AMI_ID}" \
     -var "source_ami_owner=${LAYRS_RECOVERY_SOURCE_AMI_OWNER}" \
@@ -790,7 +1030,8 @@ build_ami() {
     -var "package_inventory_output=${PREFLIGHT_TEMP_DIR}/installed-package-inventory.txt" \
     -var "manifest_output=${LAYRS_RECOVERY_PACKER_MANIFEST}" \
     "${PACKER_TEMPLATE}"
-  "${packer_bin}" build -color=false -force=false \
+  assert_isolated_packer_toolchain
+  "${PACKER_BINARY}" build -color=false -force=false \
     -var "aws_region=${RECOVERY_REGION}" \
     -var "source_ami_id=${LAYRS_RECOVERY_SOURCE_AMI_ID}" \
     -var "source_ami_owner=${LAYRS_RECOVERY_SOURCE_AMI_OWNER}" \
@@ -845,6 +1086,13 @@ build_ami() {
     --arg phase2TemplateCommit "${LAYRS_RECOVERY_PHASE2_TEMPLATE_COMMIT}" \
     --arg implementationCommit "${LAYRS_RECOVERY_IMPLEMENTATION_COMMIT}" \
     --arg packerTemplateSha384 "${PACKER_TEMPLATE_SHA384}" \
+    --arg packerCliVersion "${PACKER_CLI_VERSION}" \
+    --arg packerCliArchiveSha256 "${PACKER_CLI_ARCHIVE_SHA256}" \
+    --arg packerCliSha384 "${PACKER_CLI_SHA384}" \
+    --arg packerAmazonPluginVersion "${PACKER_AMAZON_PLUGIN_VERSION}" \
+    --arg packerAmazonPluginSha384 "${PACKER_AMAZON_PLUGIN_SHA384}" \
+    --arg packerToolchainProvenanceSha256 "${PACKER_TOOLCHAIN_PROVENANCE_SHA256}" \
+    --arg packerToolchainManifestSha256 "${PACKER_TOOLCHAIN_MANIFEST_SHA256}" \
     --arg nitroCliNevra "${NITRO_CLI_NEVRA}" \
     --arg nitroCliRpmSha384 "${NITRO_CLI_RPM_SHA384}" \
     --arg nitroPackageSetSha384 "${NITRO_PACKAGE_SET_SHA384}" \
@@ -864,6 +1112,12 @@ build_ami() {
       pcr0Sha384:$pcr0Sha384,phase2TemplateCommit:$phase2TemplateCommit,
       phase2TemplateSha384:$phase2TemplateSha384,
       implementationCommit:$implementationCommit,packerTemplateSha384:$packerTemplateSha384,
+      packerCliVersion:$packerCliVersion,packerCliArchiveSha256:$packerCliArchiveSha256,
+      packerCliSha384:$packerCliSha384,
+      packerAmazonPluginVersion:$packerAmazonPluginVersion,
+      packerAmazonPluginSha384:$packerAmazonPluginSha384,
+      packerToolchainProvenanceSha256:$packerToolchainProvenanceSha256,
+      packerToolchainManifestSha256:$packerToolchainManifestSha256,
       nitroCliNevra:$nitroCliNevra,nitroCliRpmSha384:$nitroCliRpmSha384,
       nitroPackageSetSha384:$nitroPackageSetSha384,
       nitroPackageClosureSha384:$nitroPackageClosureSha384,
@@ -927,6 +1181,9 @@ build_ami() {
     --arg implementationEvidenceObjectSha384 "${LAYRS_RECOVERY_IMPLEMENTATION_EVIDENCE_OBJECT_SHA384}" \
     --arg packerTemplateSha384 "${PACKER_TEMPLATE_SHA384}" \
     --arg packerManifestSha384 "${packer_manifest_sha384}" \
+    --arg packerAmazonPluginVersion "${PACKER_AMAZON_PLUGIN_VERSION}" \
+    --arg packerAmazonPluginSourceCommit "2a769c39a05940e25143098f071490732fa24f4f" \
+    --arg packerToolchainManifestSha256 "${PACKER_TOOLCHAIN_MANIFEST_SHA256}" \
     --arg nitroCliNevra "${NITRO_CLI_NEVRA}" \
     --arg nitroCliRpmObjectKey "${NITRO_CLI_RPM_OBJECT_KEY}" \
     --arg nitroCliRpmObjectVersionId "${NITRO_CLI_RPM_OBJECT_VERSION_ID}" \
@@ -935,8 +1192,6 @@ build_ami() {
     --arg nitroPackageSetObjectVersionId "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_OBJECT_VERSION_ID}" \
     --arg nitroPackageSetSha384 "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_SHA384}" \
     --arg nitroPackageClosureSha384 "${NITRO_PACKAGE_CLOSURE_SHA384}" \
-    --arg nitroPackageSigningKeyFingerprint "${AMAZON_LINUX_SIGNING_KEY_FINGERPRINT}" \
-    --arg nitroPackageSigningKeySha256 "${AMAZON_LINUX_SIGNING_KEY_SHA256}" \
     --arg nitroPackageSetEvidenceObjectKey "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_EVIDENCE_OBJECT_KEY}" \
     --arg nitroPackageSetEvidenceObjectVersionId "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_EVIDENCE_OBJECT_VERSION_ID}" \
     --arg nitroPackageSetEvidenceSha384 "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_EVIDENCE_SHA384}" \
@@ -948,8 +1203,17 @@ build_ami() {
       remediationEvidenceCommit:$remediationEvidenceCommit,
       remediationIndexObjectVersionId:$remediationIndexObjectVersionId,
       sourceCommit:$sourceCommit,builderSourceCommit:$builderSourceCommit,
+      builderEvidenceIndexObjectKey:$builderEvidenceIndexObjectKey,
+      builderEvidenceIndexObjectVersionId:$builderEvidenceIndexObjectVersionId,
       builderEvidenceIndexSha384:$builderEvidenceIndexSha384,
+      builderTemplateEvidenceObjectKey:$builderTemplateEvidenceObjectKey,
+      builderTemplateEvidenceObjectVersionId:$builderTemplateEvidenceObjectVersionId,
+      builderTemplateEvidenceSha384:$builderTemplateEvidenceSha384,
       builderTemplateSha384:$builderTemplateSha384,sourceAmiId:$sourceAmiId,
+      packerInvokerTemplateSha384:$packerInvokerTemplateSha384,
+      packerInvokerEvidenceObjectKey:$packerInvokerEvidenceObjectKey,
+      packerInvokerEvidenceObjectVersionId:$packerInvokerEvidenceObjectVersionId,
+      packerInvokerEvidenceSha384:$packerInvokerEvidenceSha384,
       packerInvokerRoleInventorySha384:$packerInvokerRoleInventorySha384,
       sourceAmiOwner:$sourceAmiOwner,sourceAmiProvenanceSha384:$sourceAmiProvenanceSha384,
       buildSubnetInventorySha384:$buildSubnetInventorySha384,
@@ -965,6 +1229,9 @@ build_ami() {
       implementationEvidenceObjectVersionId:$implementationEvidenceObjectVersionId,
       implementationEvidenceObjectSha384:$implementationEvidenceObjectSha384,
       packerTemplateSha384:$packerTemplateSha384,packerManifestSha384:$packerManifestSha384,
+      packerAmazonPluginVersion:$packerAmazonPluginVersion,
+      packerAmazonPluginSourceCommit:$packerAmazonPluginSourceCommit,
+      packerToolchainManifestSha256:$packerToolchainManifestSha256,
       nitroCliNevra:$nitroCliNevra,nitroPackageInventorySha384:$nitroPackageInventorySha384,
       nitroCliRpmObjectKey:$nitroCliRpmObjectKey,
       nitroCliRpmObjectVersionId:$nitroCliRpmObjectVersionId,nitroCliRpmSha384:$nitroCliRpmSha384,
@@ -972,8 +1239,6 @@ build_ami() {
       nitroPackageSetObjectVersionId:$nitroPackageSetObjectVersionId,
       nitroPackageSetSha384:$nitroPackageSetSha384,
       nitroPackageClosureSha384:$nitroPackageClosureSha384,
-      nitroPackageSigningKeyFingerprint:$nitroPackageSigningKeyFingerprint,
-      nitroPackageSigningKeySha256:$nitroPackageSigningKeySha256,
       nitroPackageSetEvidenceObjectKey:$nitroPackageSetEvidenceObjectKey,
       nitroPackageSetEvidenceObjectVersionId:$nitroPackageSetEvidenceObjectVersionId,
       nitroPackageSetEvidenceSha384:$nitroPackageSetEvidenceSha384}' \
@@ -986,6 +1251,7 @@ build_ami() {
 main() {
   require_command git
   require_command jq
+  require_command sha256sum
   require_command sha384sum
   require_command awk
   require_command date
@@ -998,10 +1264,19 @@ main() {
   require_command find
   require_command wc
   require_command cmp
+  require_command cat
+  require_command chmod
+  require_command install
+  require_command sed
+  require_command stat
+  require_command id
+  require_command gpg
+  require_command unzip
   require_command tar
   cd -- "${REPO_ROOT}"
   verify_repository
   verify_inputs
+  verify_packer_toolchain
 
   case "${1:-}" in
     --validate-only)

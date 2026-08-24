@@ -205,11 +205,18 @@ variable "manifest_output" {
 }
 
 locals {
-  recovery_source_commit = "f282583cae7a5c873a26aa8d0c1bec10c490eb8e"
-  recovery_eif_sha384    = "958e084e0a66d0aca6773193a74d40659cd258fcffa116b0117fed1fab8361046ffea6411379b72fc72c97b86f611290"
-  recovery_pcr0_sha384   = "57fc48ad4d755edda38665bc8f0a16e7fd9dc485e3b57a2bce9070f60bd3b9724711ff973175340d5ebbfed4d63b7fac"
-  recovery_purpose       = "layrs-seq159300-recovery"
-  ami_name               = "layrs-seq159300-recovery-parent-f282583cae7a"
+  recovery_source_commit    = "f282583cae7a5c873a26aa8d0c1bec10c490eb8e"
+  recovery_eif_sha384       = "958e084e0a66d0aca6773193a74d40659cd258fcffa116b0117fed1fab8361046ffea6411379b72fc72c97b86f611290"
+  recovery_pcr0_sha384      = "57fc48ad4d755edda38665bc8f0a16e7fd9dc485e3b57a2bce9070f60bd3b9724711ff973175340d5ebbfed4d63b7fac"
+  recovery_purpose          = "layrs-seq159300-recovery"
+  ami_name                  = "layrs-seq159300-recovery-parent-f282583cae7a"
+  packer_cli_version        = "1.16.0"
+  packer_cli_archive_sha256 = "5edcd14ab59b535040c512dbecd6ec9ef976a000b073c19d93e4c431c948581e"
+  packer_cli_sha384         = "acdd742a9f7a9e32715e81e72c8d0622ac1a700779e2b1480d89544bec89761655fa07a1fc75edaf35d337fcd318d126"
+  packer_amazon_version     = "1.3.9"
+  packer_amazon_sha384      = "72d1f95616192ce9b5f7f4011b43e2fee43c48c464fd03b99b5d1bd23b49940a9b41a2151a2240a670d063b9aa53e973"
+  packer_evidence_sha256    = "9f116d64eba294c61582335d74a4812b287d9a9c601787ea7454cb030ebebb33"
+  packer_manifest_sha256    = "6a6d597535481836605a4cc9762755038e56e524af621356e5f5f65519c6858e"
 }
 
 source "amazon-ebs" "seq159300_recovery_parent" {
@@ -294,6 +301,7 @@ source "amazon-ebs" "seq159300_recovery_parent" {
     RecoveryBuilderTemplateSha384 = var.builder_template_sha384
     RecoveryPackageSetSha384      = var.nitro_package_set_sha384
     RecoveryEvidenceIndexSha384   = var.recovery_evidence_index_sha384
+    Phase2TemplateSha384          = var.phase2_template_sha384
   }
 
   run_tags = {
@@ -305,6 +313,7 @@ source "amazon-ebs" "seq159300_recovery_parent" {
     RecoveryBuilderTemplateSha384 = var.builder_template_sha384
     RecoveryPackageSetSha384      = var.nitro_package_set_sha384
     RecoveryEvidenceIndexSha384   = var.recovery_evidence_index_sha384
+    Phase2TemplateSha384          = var.phase2_template_sha384
   }
 
   run_volume_tags = {
@@ -316,6 +325,7 @@ source "amazon-ebs" "seq159300_recovery_parent" {
     RecoveryBuilderTemplateSha384 = var.builder_template_sha384
     RecoveryPackageSetSha384      = var.nitro_package_set_sha384
     RecoveryEvidenceIndexSha384   = var.recovery_evidence_index_sha384
+    Phase2TemplateSha384          = var.phase2_template_sha384
   }
 }
 
@@ -421,6 +431,13 @@ build {
       implementationCommit                 = var.implementation_commit
       packerTemplateSha384                 = var.packer_template_sha384
       packerInvokerRoleInventorySha384     = var.packer_invoker_role_inventory_sha384
+      packerCliVersion                     = local.packer_cli_version
+      packerCliArchiveSha256               = local.packer_cli_archive_sha256
+      packerCliSha384                      = local.packer_cli_sha384
+      packerAmazonPluginVersion            = local.packer_amazon_version
+      packerAmazonPluginSha384             = local.packer_amazon_sha384
+      packerToolchainProvenanceSha256      = local.packer_evidence_sha256
+      packerToolchainManifestSha256        = local.packer_manifest_sha256
       nitroCliNevra                        = var.nitro_cli_nevra
       nitroCliRpmSha384                    = var.nitro_cli_rpm_sha384
       nitroPackageInventorySha384          = var.nitro_package_inventory_sha384

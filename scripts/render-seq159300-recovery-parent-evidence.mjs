@@ -12,8 +12,10 @@ const EIF_SHA384 = '958e084e0a66d0aca6773193a74d40659cd258fcffa116b0117fed1fab83
 const PCR0_SHA384 = '57fc48ad4d755edda38665bc8f0a16e7fd9dc485e3b57a2bce9070f60bd3b9724711ff973175340d5ebbfed4d63b7fac';
 
 const FIELDS = Object.freeze([
-  'accountId', 'amiId', 'buildCompletedAt', 'builderEvidenceIndexSha384', 'builderSourceCommit',
-  'builderTemplateSha384', 'buildControlPlaneRoleInventorySha384',
+  'accountId', 'amiId', 'buildCompletedAt', 'builderEvidenceIndexObjectKey',
+  'builderEvidenceIndexObjectVersionId', 'builderEvidenceIndexSha384', 'builderSourceCommit',
+  'builderTemplateEvidenceObjectKey', 'builderTemplateEvidenceObjectVersionId',
+  'builderTemplateEvidenceSha384', 'builderTemplateSha384', 'buildControlPlaneRoleInventorySha384',
   'buildInstanceProfileInventorySha384', 'buildSecurityGroupInventorySha384',
   'buildSubnetInventorySha384', 'eifSha384', 'environment', 'implementationCommit',
   'implementationEvidenceObjectKey', 'implementationEvidenceObjectVersionId',
@@ -22,10 +24,13 @@ const FIELDS = Object.freeze([
   'nitroPackageSetEvidenceObjectKey', 'nitroPackageSetEvidenceSha384',
   'nitroPackageSetEvidenceObjectVersionId', 'nitroPackageSetObjectKey',
   'nitroPackageSetSha384', 'nitroPackageSetObjectVersionId',
-  'nitroPackageClosureSha384', 'nitroPackageSigningKeyFingerprint',
-  'nitroPackageSigningKeySha256',
+  'nitroPackageClosureSha384',
   'outputAmiInventorySha384', 'packerManifestSha384', 'packerTemplateSha384',
-  'packerInvokerRoleInventorySha384',
+  'packerAmazonPluginSourceCommit', 'packerAmazonPluginVersion',
+  'packerInvokerEvidenceObjectKey', 'packerInvokerEvidenceObjectVersionId',
+  'packerInvokerEvidenceSha384', 'packerInvokerRoleInventorySha384',
+  'packerInvokerTemplateSha384',
+  'packerToolchainManifestSha256',
   'parentBinarySha384', 'pcr0Sha384', 'phase2EvidenceObjectKey',
   'phase2EvidenceObjectVersionId', 'phase2EvidenceObjectSha384', 'phase2TemplateCommit',
   'phase2TemplateSha384', 'protocol', 'region',
@@ -67,18 +72,23 @@ export function renderRecoveryParentBuildEvidence(input) {
       || input.builderSourceCommit === SOURCE_COMMIT
       || !/^[0-9a-f]{40}$/u.test(input.implementationCommit)
       || !/^[0-9a-f]{40}$/u.test(input.phase2TemplateCommit)
-      || input.phase2TemplateCommit === input.implementationCommit
       || input.remediationEvidenceCommit !== REMEDIATION_COMMIT
       || input.remediationIndexObjectVersionId !== REMEDIATION_INDEX_VERSION
       || input.parentBinarySha384 !== PARENT_SHA384 || input.eifSha384 !== EIF_SHA384
       || input.pcr0Sha384 !== PCR0_SHA384 || !/^ami-[0-9a-f]{8,17}$/u.test(input.amiId)
       || input.sourceAmiId !== 'ami-0332d564d76dbd8d6'
       || input.sourceAmiOwner !== '137112412989'
-      || input.nitroPackageSigningKeyFingerprint !== 'B21C50FA44A99720EAA72F7FE951904AD832C631'
-      || input.nitroPackageSigningKeySha256 !== '664b632018bd84f9b249be7bd26937c560edb2f2bfc0cbc01ec5a7b4e06aad56'
+      || input.packerAmazonPluginVersion !== '1.3.9'
+      || input.packerAmazonPluginSourceCommit !== '2a769c39a05940e25143098f071490732fa24f4f'
+      || input.packerToolchainManifestSha256 !== '6a6d597535481836605a4cc9762755038e56e524af621356e5f5f65519c6858e'
+      || input.builderTemplateEvidenceSha384 !== input.builderTemplateSha384
+      || input.packerInvokerEvidenceSha384 !== input.packerInvokerTemplateSha384
       || !/^aws-nitro-enclaves-cli-[0-9]+:?[A-Za-z0-9._+~]+-[A-Za-z0-9._+~]+\.x86_64$/u.test(input.nitroCliNevra)
       || !immutableObjectKey(input.phase2EvidenceObjectKey)
       || !immutableObjectKey(input.implementationEvidenceObjectKey)
+      || !immutableObjectKey(input.builderTemplateEvidenceObjectKey)
+      || !immutableObjectKey(input.packerInvokerEvidenceObjectKey)
+      || !immutableObjectKey(input.builderEvidenceIndexObjectKey)
       || !immutableObjectKey(input.nitroCliRpmObjectKey)
       || !immutableObjectKey(input.nitroPackageSetObjectKey)
       || !immutableObjectKey(input.nitroPackageSetEvidenceObjectKey)
@@ -87,20 +97,29 @@ export function renderRecoveryParentBuildEvidence(input) {
       || !input.nitroPackageSetEvidenceObjectKey.startsWith('evidence/seq159300/recovery-only/phase2/')
       || !input.phase2EvidenceObjectKey.startsWith('evidence/seq159300/recovery-only/phase2/')
       || !input.implementationEvidenceObjectKey.startsWith('evidence/seq159300/recovery-only/implementation/')
+      || input.builderTemplateEvidenceObjectKey
+        !== `evidence/seq159300/recovery-only/phase2/builder/templates/layrs-seq159300-recovery-builder-${input.builderTemplateSha384}.yml`
+      || !input.packerInvokerEvidenceObjectKey.startsWith('evidence/seq159300/recovery-only/phase2/invoker/')
+      || !input.builderEvidenceIndexObjectKey.startsWith('evidence/seq159300/recovery-only/phase2/builder/')
       || !immutableVersionId(input.phase2EvidenceObjectVersionId)
       || !immutableVersionId(input.implementationEvidenceObjectVersionId)
+      || !immutableVersionId(input.builderTemplateEvidenceObjectVersionId)
+      || !immutableVersionId(input.packerInvokerEvidenceObjectVersionId)
+      || !immutableVersionId(input.builderEvidenceIndexObjectVersionId)
       || !immutableVersionId(input.nitroCliRpmObjectVersionId)
       || !immutableVersionId(input.nitroPackageSetObjectVersionId)
       || !immutableVersionId(input.nitroPackageSetEvidenceObjectVersionId)
       || [
-        input.builderEvidenceIndexSha384, input.builderTemplateSha384,
+        input.builderEvidenceIndexSha384, input.builderTemplateEvidenceSha384,
+        input.builderTemplateSha384,
         input.buildControlPlaneRoleInventorySha384,
         input.buildInstanceProfileInventorySha384, input.buildSecurityGroupInventorySha384,
         input.buildSubnetInventorySha384, input.implementationEvidenceObjectSha384,
         input.nitroCliRpmSha384, input.nitroPackageInventorySha384, input.outputAmiInventorySha384,
         input.nitroPackageClosureSha384, input.nitroPackageSetSha384,
         input.nitroPackageSetEvidenceSha384,
-        input.packerInvokerRoleInventorySha384, input.packerManifestSha384,
+        input.packerInvokerEvidenceSha384, input.packerInvokerRoleInventorySha384,
+        input.packerInvokerTemplateSha384, input.packerManifestSha384,
         input.packerTemplateSha384, input.phase2EvidenceObjectSha384,
         input.phase2TemplateSha384, input.sourceAmiProvenanceSha384,
       ].some(value => !/^[0-9a-f]{96}$/u.test(value))

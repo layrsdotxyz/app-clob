@@ -38,12 +38,48 @@ The wrapper fails closed unless all of these inputs are exact:
   `B21C50FA44A99720EAA72F7FE951904AD832C631` and exact public-key SHA256
   `664b632018bd84f9b249be7bd26937c560edb2f2bfc0cbc01ec5a7b4e06aad56`; a
   signer asserted only by a package entry or manifest is insufficient. The build
-  caller retrieves every exact remote object version and the package-set
-  evidence object, rehashes and byte-compares them locally, and verifies the
-  RPM signature and header. Packer repeats signature/header/hash checks,
+  caller retrieves the exact-version package archive and canonical manifest,
+  rehashes and byte-compares them locally, verifies archive membership/order and
+  every member hash, then verifies each local RPM signature, header and exact
+  equality to its archived bytes. Individual RPM S3 reads are intentionally
+  redundant and forbidden by the five-object invoker contract. Packer repeats
+  signature/header/hash checks,
   installs the entire closure with `dnf --disablerepo='*'`, validates each
   installed NEVRA, and exports a canonical NEVRA-plus-package-file-hash
-  inventory. Development packages and live repositories are forbidden.
+  inventory. Development packages and live repositories are forbidden; and
+- exact offline Packer toolchain bytes: Packer CLI `1.16.0` and Amazon plugin
+  `1.3.9` (`x5.0`, linux/amd64). The wrapper mechanically verifies their pinned
+  archives, signed checksum lists, detached signatures, HashiCorp signing-key
+  fingerprints, binary SHA256/SHA384 values and the exact reviewed provenance
+  record. The strict canonical manifest rejects extra fields and binds the CLI
+  platform plus the plugin protocol and source-tag revision; it makes no claim
+  about a Packer CLI source revision. Both verified binaries are copied into a
+  private one-link toolchain directory, owner/mode/hash checked immediately
+  before validate and build, and the plugin is exposed only through its exact
+  isolated `PACKER_PLUGIN_PATH` and checksum file. Packer/HCP/checkpoint
+  overrides are cleared or rejected and `PATH` is reset. `packer init`, remote
+  plugin resolution and arbitrary `packer` from `PATH` are forbidden.
+
+The plugin checksum list and signature are the official
+`hashicorp/packer-plugin-amazon` GitHub release assets named with the `v1.3.9`
+prefix. The similarly named `releases.hashicorp.com` checksum list and detached
+signature did not verify together during review and are therefore not accepted,
+even though both distribution paths expose the same reviewed Linux archive
+hash. The CLI remains bound to the signed `releases.hashicorp.com` Packer
+`1.16.0` assets.
+
+The wrapper accepts these bytes only through the dedicated
+`LAYRS_RECOVERY_PACKER_BINARY`, `LAYRS_RECOVERY_PACKER_CLI_ARCHIVE`,
+`LAYRS_RECOVERY_PACKER_CLI_CHECKSUMS`,
+`LAYRS_RECOVERY_PACKER_CLI_CHECKSUMS_SIGNATURE`,
+`LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_BINARY`,
+`LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_ARCHIVE`,
+`LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_CHECKSUMS`,
+`LAYRS_RECOVERY_PACKER_AMAZON_PLUGIN_CHECKSUMS_SIGNATURE`,
+`LAYRS_RECOVERY_HASHICORP_SIGNING_KEY` and
+`LAYRS_RECOVERY_PACKER_TOOLCHAIN_EVIDENCE_FILE` paths. Their exact reviewed
+basenames, single-link ownership and modes are part of the gate; the signing
+key must be materialized as `hashicorp-pgp-key.txt`.
 
 The known build-a EIF SHA384
 `110c31235f36fa85e4a50d61fb89ab3a08e5b18587a35dfe4818c3615eed5a79513082df101e5c655fce8c7640d66ad8`
@@ -96,12 +132,20 @@ uses `allowed_account_ids` for the same account. The preflight fails closed unle
   `layrs-production-recovery-seq159300-*` naming contract, has one
   EC2-only role and contains only the minimal SSM message-channel and recovery
   log actions. Secret, KMS, S3, parameter read, database/data, route mutation,
-  target registration, PassRole and AssumeRole authority fail closed.
+  target registration, PassRole and AssumeRole authority fail closed; and
 - the exact Packer control role has the accepted invoker, approval and expiry
   trust, one exact inline policy, no managed policy or permissions boundary,
   exact evidence tags and exact builder-stack outputs. A canonical hash of its
   trust, policy, tags, boundary state and window must equal the separately
   reviewed `buildControlPlaneRoleInventorySha384` before Packer is invoked.
+
+The exact Amazon plugin uses `run_tags` for temporary-key creation and
+CreateImage image/snapshot TagSpecifications. Therefore AMI `tags`, `run_tags`,
+`run_volume_tags` and `snapshot_tags` cross-bind Purpose, Environment,
+recovery-builder template SHA384, package-set SHA384, evidence-index SHA384 and
+Phase2-template SHA384. This also makes the post-create snapshot retag satisfy
+the same boundary; HCL `tags` alone are not treated as CreateImage authorization
+evidence.
 
 The canonical preflight inventories are reduced to stable, non-secret fields
 and SHA384-bound in the final evidence as `sourceAmiProvenanceSha384`,
@@ -131,10 +175,12 @@ these two exact paths and start the two exact units. There is no
 `--build` is a separately authorized operation and emits canonical Phase2 AMI
 build evidence. The evidence includes the exact builder/source commits,
 Phase2 IaC commit/hash and immutable reference, final integrated backend
-implementation commit and its independent immutable reference,
-immutable reference, source AMI provenance, network/profile inventory hashes,
+implementation commit and its independent immutable reference, builder
+template, invoker-template and builder-evidence-index immutable references,
+source AMI provenance, network/profile inventory hashes,
 Packer template and manifest hashes, installed Nitro CLI NEVRA/package hash,
-exact package closure and pinned signing-key identity,
+exact package closure and pinned signing-key identity, explicit Amazon-plugin
+version/full source commit, canonical Packer-toolchain manifest SHA256,
 and post-build private/encrypted AMI readback hash. The two cross-repository
 commit fields are intentionally independent and must never be forced equal.
 Both are only recorded here; a later signed gate must independently require

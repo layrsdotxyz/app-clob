@@ -12,6 +12,52 @@ const AMAZON_LINUX_SIGNING_KEY = Object.freeze({
   keyId: 'D832C631',
   sha256: '664b632018bd84f9b249be7bd26937c560edb2f2bfc0cbc01ec5a7b4e06aad56',
 });
+const PACKER_TOOLCHAIN = Object.freeze({
+  manifestSha256: '6a6d597535481836605a4cc9762755038e56e524af621356e5f5f65519c6858e',
+  cliSha384: 'acdd742a9f7a9e32715e81e72c8d0622ac1a700779e2b1480d89544bec89761655fa07a1fc75edaf35d337fcd318d126',
+  pluginSha384: '72d1f95616192ce9b5f7f4011b43e2fee43c48c464fd03b99b5d1bd23b49940a9b41a2151a2240a670d063b9aa53e973',
+  provenanceSha256: '9f116d64eba294c61582335d74a4812b287d9a9c601787ea7454cb030ebebb33',
+});
+const PACKER_TOOLCHAIN_MANIFEST = Object.freeze({
+  amazonPlugin: {
+    archiveFilename: 'packer-plugin-amazon_v1.3.9_x5.0_linux_amd64.zip',
+    archiveSha256: 'c4de5f441958d02ca2a6efa6d156e3a2a8c2f556b68f7fd1832e53c90d1e605d',
+    binaryFilename: 'packer-plugin-amazon_v1.3.9_x5.0_linux_amd64',
+    binarySha256: 'a46e0d719dfc34e51ecaf50b9b575087a8007e3df2d856ed19fb91714539b87b',
+    binarySha384: PACKER_TOOLCHAIN.pluginSha384,
+    checksumsFilename: 'packer-plugin-amazon_v1.3.9_SHA256SUMS',
+    checksumsSha256: '6d8797b95727c3ce85afae0dfedbbf27f6ff8a8cd780467b9fa74d2c20414083',
+    protocol: 'x5.0',
+    revision: '2a769c39a05940e25143098f071490732fa24f4f',
+    signatureFilename: 'packer-plugin-amazon_v1.3.9_SHA256SUMS.sig',
+    signatureSha256: 'e103534fafb5f4702f08123e0a5e190fef193e3db2c9ae26f4f80a35c12f9e3a',
+    version: '1.3.9',
+  },
+  cli: {
+    archiveFilename: 'packer_1.16.0_linux_amd64.zip',
+    archiveSha256: '5edcd14ab59b535040c512dbecd6ec9ef976a000b073c19d93e4c431c948581e',
+    binaryFilename: 'packer',
+    binarySha256: '1c327cd37ce76790c9c10ebda1af3981554cc4eceaed1d6fdfdb59d5ccfe25d5',
+    binarySha384: PACKER_TOOLCHAIN.cliSha384,
+    checksumsFilename: 'packer_1.16.0_SHA256SUMS',
+    checksumsSha256: '643b26ebd70a17ee487f789c594fc9ac87007e7aba9e863df6a10c266bdc7da0',
+    signatureFilename: 'packer_1.16.0_SHA256SUMS.sig',
+    signatureSha256: '3a40ebe8397ef0a2fddb5214a6051d021c9b89db58af9cd1eac21d3e6c80f982',
+    version: '1.16.0',
+  },
+  platform: 'linux_amd64',
+  protocol: 'layrs.seq159300.packer-toolchain-provenance.v1',
+  reviewEvidence: {
+    filename: 'LAYRS_SEQ159300_PACKER_TOOLCHAIN_PROVENANCE_20260824.md',
+    sha256: PACKER_TOOLCHAIN.provenanceSha256,
+  },
+  signing: {
+    primaryFingerprint: 'C874011F0AB405110D02105534365D9472D7468F',
+    publicKeyFilename: 'hashicorp-pgp-key.txt',
+    publicKeySha256: 'c2f5bc1163bd8d15a711616b587bcede212d045a5b8b52df01c74095897cd065',
+    releaseSubkeyFingerprint: '374EC75B485913604A831CC7C820C6D5CD27AB87',
+  },
+});
 const SOURCE_AMI = Object.freeze({
   architecture: 'x86_64',
   bootMode: 'uefi-preferred',
@@ -772,6 +818,13 @@ function validateOutputAmi(input) {
 export function validatePreflight(input) {
   requireObject(input, 'preflight envelope');
   switch (input.kind) {
+    case 'packer-toolchain': {
+      requireExactFields(input, ['kind', 'payload'], 'Packer toolchain envelope');
+      if (canonicalJson(input.payload) !== canonicalJson(PACKER_TOOLCHAIN_MANIFEST)) {
+        throw new Error('Packer toolchain provenance does not match the exact reviewed manifest');
+      }
+      return PACKER_TOOLCHAIN_MANIFEST;
+    }
     case 'source-ami': return validateSourceAmi(input.payload);
     case 'build-network': return validateBuildNetwork(input.payload);
     case 'instance-profile': return validateInstanceProfile(input.payload);
