@@ -1278,6 +1278,14 @@ struct TerminalSnapshotDigests {
     pool_cash_opening_required: bool,
 }
 
+#[derive(Clone, Copy)]
+struct TerminalSnapshotRestorePolicy {
+    sequence: u64,
+    state_root: [u8; 32],
+    journal_head: [u8; 32],
+    ciphertext_sha256: [u8; 32],
+}
+
 #[derive(Debug)]
 struct OfflineStateDigests {
     users: [u8; 32],
@@ -1865,13 +1873,25 @@ impl PrivateTradingCore {
         receipt_signer: ReceiptSigner,
         snapshot: &EncryptedSnapshot,
     ) -> CoreResult<(Self, ExactTerminalSnapshotRestoreReport)> {
-        validate_exact_incident_terminal_snapshot(snapshot)?;
+        Self::restore_terminal_snapshot_against_policy(
+            journal_key,
+            receipt_signer,
+            snapshot,
+            incident_terminal_restore_policy(),
+        )
+    }
+
+    fn restore_terminal_snapshot_against_policy(
+        journal_key: JournalKey,
+        receipt_signer: ReceiptSigner,
+        snapshot: &EncryptedSnapshot,
+        policy: TerminalSnapshotRestorePolicy,
+    ) -> CoreResult<(Self, ExactTerminalSnapshotRestoreReport)> {
+        validate_terminal_snapshot_against_policy(snapshot, policy)?;
 
         let source_journal = EncryptedJournal::new(journal_key.clone());
         let source: CoreStateSnapshot = source_journal.open_snapshot(snapshot)?;
-        if source.sequence != INCIDENT_TERMINAL_SEQUENCE
-            || source_state_root(&source) != incident_terminal_state_root()
-        {
+        if source.sequence != policy.sequence || source_state_root(&source) != policy.state_root {
             return Err(CoreError::IncidentRecoveryPolicyMismatch);
         }
         let source_positions: Vec<(PositionKey, u128)> = source.position_cost_basis.to_vec();
@@ -1903,12 +1923,11 @@ impl PrivateTradingCore {
             journal_key,
             receipt_signer,
             snapshot,
-            INCIDENT_TERMINAL_SEQUENCE,
+            policy.sequence,
         )?;
-        if restored.sequence != INCIDENT_TERMINAL_SEQUENCE
-            || restored.state_root() != incident_terminal_state_root()
-            || restored.journal.chain_head()
-                != (INCIDENT_TERMINAL_SEQUENCE, incident_terminal_journal_head())
+        if restored.sequence != policy.sequence
+            || restored.state_root() != policy.state_root
+            || restored.journal.chain_head() != (policy.sequence, policy.journal_head)
         {
             return Err(CoreError::IncidentRecoveryPolicyMismatch);
         }
@@ -1986,10 +2005,10 @@ impl PrivateTradingCore {
             restored,
             ExactTerminalSnapshotRestoreReport {
                 source_release_commit: EXACT_LIVE_976_RELEASE_COMMIT.into(),
-                restored_sequence: INCIDENT_TERMINAL_SEQUENCE,
-                restored_state_root: INCIDENT_TERMINAL_STATE_ROOT_HEX.into(),
-                restored_journal_head: INCIDENT_TERMINAL_JOURNAL_HEAD_HEX.into(),
-                snapshot_ciphertext_sha256: INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX.into(),
+                restored_sequence: policy.sequence,
+                restored_state_root: hex::encode(policy.state_root),
+                restored_journal_head: hex::encode(policy.journal_head),
+                snapshot_ciphertext_sha256: hex::encode(policy.ciphertext_sha256),
                 aggregate_bucket_totals,
                 aggregate_asset_totals,
                 category_counts: source_counts,
@@ -8792,11 +8811,28 @@ fn incident_terminal_ciphertext_sha256() -> [u8; 32] {
         .expect("incident ciphertext hash is 32 bytes")
 }
 
+fn incident_terminal_restore_policy() -> TerminalSnapshotRestorePolicy {
+    TerminalSnapshotRestorePolicy {
+        sequence: INCIDENT_TERMINAL_SEQUENCE,
+        state_root: incident_terminal_state_root(),
+        journal_head: incident_terminal_journal_head(),
+        ciphertext_sha256: incident_terminal_ciphertext_sha256(),
+    }
+}
+
+#[cfg(test)]
 fn validate_exact_incident_terminal_snapshot(snapshot: &EncryptedSnapshot) -> CoreResult<()> {
-    if snapshot.sequence != INCIDENT_TERMINAL_SEQUENCE
-        || snapshot.state_root != incident_terminal_state_root()
-        || snapshot.journal_head != incident_terminal_journal_head()
-        || snapshot.ciphertext_hash != incident_terminal_ciphertext_sha256()
+    validate_terminal_snapshot_against_policy(snapshot, incident_terminal_restore_policy())
+}
+
+fn validate_terminal_snapshot_against_policy(
+    snapshot: &EncryptedSnapshot,
+    policy: TerminalSnapshotRestorePolicy,
+) -> CoreResult<()> {
+    if snapshot.sequence != policy.sequence
+        || snapshot.state_root != policy.state_root
+        || snapshot.journal_head != policy.journal_head
+        || snapshot.ciphertext_hash != policy.ciphertext_sha256
         || Sha256::digest(&snapshot.ciphertext).as_slice() != snapshot.ciphertext_hash
     {
         return Err(CoreError::IncidentRecoveryPolicyMismatch);
@@ -9643,6 +9679,60 @@ mod snapshot_migration_tests {
             ciphertext: Vec::new(),
             ciphertext_hash: incident_terminal_ciphertext_sha256(),
         }
+    }
+
+    #[test]
+    fn terminal_restore_route_authenticates_and_compares_a_deterministic_fixture() {
+        let journal_key = JournalKey::from_bytes([0x71; 32]);
+        let mut source =
+            PrivateTradingCore::new(journal_key.clone(), ReceiptSigner::generate([0x72; 48]));
+        source
+            .ledger
+            .seed_balance(
+                AccountKey::new("private-fixture-user", AccountBucket::UserAvailable, "USDC"),
+                6_000_000,
+            )
+            .unwrap();
+        source
+            .set_trading_freeze("terminal-fixture-freeze".into(), true, [0x73; 32], 1_000)
+            .unwrap();
+        let snapshot = source.export_encrypted_snapshot().unwrap();
+        let policy = TerminalSnapshotRestorePolicy {
+            sequence: snapshot.sequence,
+            state_root: snapshot.state_root,
+            journal_head: snapshot.journal_head,
+            ciphertext_sha256: snapshot.ciphertext_hash,
+        };
+
+        let (restored, report) = PrivateTradingCore::restore_terminal_snapshot_against_policy(
+            journal_key,
+            ReceiptSigner::generate([0x74; 48]),
+            &snapshot,
+            policy,
+        )
+        .unwrap();
+
+        assert_eq!(restored.sequence(), snapshot.sequence);
+        assert_eq!(restored.state_root(), snapshot.state_root);
+        assert_eq!(report.restored_sequence, snapshot.sequence);
+        assert_eq!(report.restored_state_root, hex::encode(snapshot.state_root));
+        assert_eq!(
+            report.restored_journal_head,
+            hex::encode(snapshot.journal_head)
+        );
+        assert_eq!(
+            report.snapshot_ciphertext_sha256,
+            hex::encode(snapshot.ciphertext_hash)
+        );
+        assert!(report.sequence_equal);
+        assert!(report.state_root_equal);
+        assert!(report.journal_head_equal);
+        assert!(report.aggregate_totals_equal);
+        assert!(report.aggregate_totals_zero_delta);
+        assert!(!report.historical_journal_replay_performed);
+        assert!(!report.historical_fill_completeness_certified);
+        assert_eq!(report.aggregate_asset_totals.len(), 1);
+        assert_eq!(report.aggregate_asset_totals[0].amount, 6_000_000);
     }
 
     #[test]

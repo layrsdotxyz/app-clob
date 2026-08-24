@@ -393,7 +393,14 @@ impl EncryptedJournal {
             )
             .map_err(|_| CoreError::JournalCrypto)?;
         let value = if let Some(compressed) = plaintext.strip_prefix(SNAPSHOT_ZSTD_MAGIC) {
-            let mut decoded = decode_snapshot_payload(compressed, MAX_SNAPSHOT_PLAINTEXT_BYTES)?;
+            let mut decoded =
+                match decode_snapshot_payload(compressed, MAX_SNAPSHOT_PLAINTEXT_BYTES) {
+                    Ok(decoded) => decoded,
+                    Err(error) => {
+                        plaintext.zeroize();
+                        return Err(error);
+                    }
+                };
             let result = serde_json::from_slice(&decoded).map_err(|_| CoreError::JournalCrypto);
             decoded.zeroize();
             result
@@ -412,10 +419,10 @@ fn decode_snapshot_payload(compressed: &[u8], maximum: u64) -> CoreResult<Vec<u8
     let decoder = zstd::stream::read::Decoder::new(Cursor::new(compressed))
         .map_err(|_| CoreError::JournalCrypto)?;
     let mut decoded = Vec::new();
-    decoder
-        .take(maximum + 1)
-        .read_to_end(&mut decoded)
-        .map_err(|_| CoreError::JournalCrypto)?;
+    if decoder.take(maximum + 1).read_to_end(&mut decoded).is_err() {
+        decoded.zeroize();
+        return Err(CoreError::JournalCrypto);
+    }
     if decoded.len() as u64 > maximum {
         decoded.zeroize();
         return Err(CoreError::JournalCrypto);

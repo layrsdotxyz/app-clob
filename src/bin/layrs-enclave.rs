@@ -39,9 +39,9 @@ use clob_service::private_core::{
     SignedAuditFillArtifact, SignedBinanceResolution, SignedExactConditionResolution,
     SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence,
     SignedTaskQualificationArtifact, SystemResponse, UserCommand, UserCommandAction,
-    WithdrawalAuthorization, EXACT_LIVE_976_RELEASE_COMMIT, INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX,
-    INCIDENT_TERMINAL_JOURNAL_HEAD_HEX, INCIDENT_TERMINAL_SEQUENCE,
-    INCIDENT_TERMINAL_STATE_ROOT_HEX,
+    WithdrawalAuthorization, EXACT_LIVE_976_RELEASE_COMMIT,
+    INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX, INCIDENT_TERMINAL_JOURNAL_HEAD_HEX,
+    INCIDENT_TERMINAL_SEQUENCE, INCIDENT_TERMINAL_STATE_ROOT_HEX,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use openssl::{
@@ -155,20 +155,18 @@ struct IncidentSnapshotDescriptor {
     body_sha256: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct IncidentTerminalCertificationReport {
     schema_version: String,
     incident_id: String,
     incident_policy_sha256: String,
-    source_release_commit: String,
     snapshot_bucket: String,
     snapshot_key: String,
     snapshot_version_id: String,
     snapshot_size_bytes: u64,
     snapshot_body_sha256: String,
     certifier_release_manifest_sha256: String,
-    certifier_pcr0_sha384: String,
     artifact_equal: bool,
     policy_equal: bool,
     source_release_equal: bool,
@@ -332,11 +330,7 @@ struct OperatorEnvelope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(
-    tag = "type",
-    rename_all = "SCREAMING_SNAKE_CASE",
-    deny_unknown_fields
-)]
+#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 // The authenticated operator wire schema is release-bound. Boxing the durable
 // successor fields would change that schema, so retain the representation and
 // acknowledge the decode-only enum size here.
@@ -3247,7 +3241,7 @@ async fn dispatch_operator(
                 .ok_or_else(|| "NO_PENDING_PROVISION".to_string())?;
             let mut plaintext =
                 decrypt_recipient_key(pending.recipient_private_key, &ciphertext_for_recipient)?;
-            let journal_key: [u8; 32] = match plaintext.as_slice().try_into() {
+            let mut journal_key: [u8; 32] = match plaintext.as_slice().try_into() {
                 Ok(key) => key,
                 Err(_) => {
                     plaintext.zeroize();
@@ -3256,6 +3250,7 @@ async fn dispatch_operator(
             };
             plaintext.zeroize();
             let key = JournalKey::from_bytes(journal_key);
+            journal_key.zeroize();
             let mut receipt_seed = key.derive(b"receipt-signing-key-v1");
             let signer = ReceiptSigner::from_seed(receipt_seed, state.enclave_measurement_sha384);
             receipt_seed.zeroize();
@@ -3316,8 +3311,7 @@ async fn dispatch_operator(
                     return Err("INCIDENT_RESTORE_REQUEST_INVALID".into());
                 }
             };
-            let validated =
-                validate_incident_terminal_input(&snapshot_descriptor, &snapshot_body);
+            let validated = validate_incident_terminal_input(&snapshot_descriptor, &snapshot_body);
             snapshot_body.zeroize();
             let (policy_sha256, snapshot_body_sha256, snapshot) = validated?;
 
@@ -3328,9 +3322,7 @@ async fn dispatch_operator(
             binding.extend_from_slice(&snapshot_body_sha256);
             binding.extend_from_slice(&Sha256::digest(snapshot_descriptor.bucket.as_bytes()));
             binding.extend_from_slice(&Sha256::digest(snapshot_descriptor.key.as_bytes()));
-            binding.extend_from_slice(&Sha256::digest(
-                snapshot_descriptor.version_id.as_bytes(),
-            ));
+            binding.extend_from_slice(&Sha256::digest(snapshot_descriptor.version_id.as_bytes()));
             binding.extend_from_slice(&snapshot_descriptor.size_bytes.to_be_bytes());
             binding.extend_from_slice(&Sha256::digest(kms_key_id.as_bytes()));
             binding.extend_from_slice(&Sha256::digest(&kms_ciphertext_blob));
@@ -3382,11 +3374,9 @@ async fn dispatch_operator(
             if pending.expected_certifier_pcr0_sha384 != state.enclave_measurement_sha384 {
                 return Err("INCIDENT_CERTIFIER_PCR_MISMATCH".into());
             }
-            let mut plaintext = decrypt_recipient_key(
-                pending.recipient_private_key,
-                &ciphertext_for_recipient,
-            )?;
-            let journal_key: [u8; 32] = match plaintext.as_slice().try_into() {
+            let mut plaintext =
+                decrypt_recipient_key(pending.recipient_private_key, &ciphertext_for_recipient)?;
+            let mut journal_key: [u8; 32] = match plaintext.as_slice().try_into() {
                 Ok(key) => key,
                 Err(_) => {
                     plaintext.zeroize();
@@ -3395,6 +3385,7 @@ async fn dispatch_operator(
             };
             plaintext.zeroize();
             let key = JournalKey::from_bytes(journal_key);
+            journal_key.zeroize();
             let mut receipt_seed = key.derive(b"receipt-signing-key-v1");
             let signer = ReceiptSigner::from_seed(receipt_seed, state.enclave_measurement_sha384);
             receipt_seed.zeroize();
@@ -3409,7 +3400,6 @@ async fn dispatch_operator(
                 schema_version: "layrs.incident-terminal-certification.v1".into(),
                 incident_id: INCIDENT_ID.into(),
                 incident_policy_sha256: hex::encode(pending.policy_sha256),
-                source_release_commit: EXACT_LIVE_976_RELEASE_COMMIT.into(),
                 snapshot_bucket: pending.snapshot_descriptor.bucket.clone(),
                 snapshot_key: pending.snapshot_descriptor.key.clone(),
                 snapshot_version_id: pending.snapshot_descriptor.version_id.clone(),
@@ -3418,7 +3408,6 @@ async fn dispatch_operator(
                 certifier_release_manifest_sha256: hex::encode(
                     pending.certifier_release_manifest_sha256,
                 ),
-                certifier_pcr0_sha384: hex::encode(state.enclave_measurement_sha384),
                 artifact_equal: true,
                 policy_equal: true,
                 source_release_equal: true,
@@ -5305,7 +5294,10 @@ async fn write_frame(stream: &mut VsockStream, value: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clob_service::private_core::FeeProfileId;
+    use clob_service::private_core::{
+        ExactTerminalCategoryCounts, ExactTerminalCategoryDigests, ExactTerminalCategoryEquality,
+        FeeProfileId,
+    };
     use serde_cbor::Value;
     use std::collections::BTreeMap;
 
@@ -5317,6 +5309,145 @@ mod tests {
             size_bytes: INCIDENT_SNAPSHOT_SIZE_BYTES,
             body_sha256: INCIDENT_SNAPSHOT_BODY_SHA256_HEX.into(),
         }
+    }
+
+    fn empty_terminal_state_report() -> ExactTerminalSnapshotRestoreReport {
+        ExactTerminalSnapshotRestoreReport {
+            source_release_commit: EXACT_LIVE_976_RELEASE_COMMIT.into(),
+            restored_sequence: INCIDENT_TERMINAL_SEQUENCE,
+            restored_state_root: INCIDENT_TERMINAL_STATE_ROOT_HEX.into(),
+            restored_journal_head: INCIDENT_TERMINAL_JOURNAL_HEAD_HEX.into(),
+            snapshot_ciphertext_sha256: INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX.into(),
+            aggregate_bucket_totals: Vec::new(),
+            aggregate_asset_totals: Vec::new(),
+            category_counts: ExactTerminalCategoryCounts {
+                user_count: 0,
+                registered_session_count: 0,
+                sequenced_session_count: 0,
+                ledger_record_count: 0,
+                position_cost_basis_count: 0,
+                order_count: 0,
+                market_count: 0,
+                resolution_count: 0,
+                processed_command_count: 0,
+                system_key_count: 0,
+                aggregate_bucket_total_count: 0,
+                aggregate_asset_total_count: 0,
+            },
+            category_digests: ExactTerminalCategoryDigests {
+                users_and_sessions_sha256: "00".repeat(32),
+                available_balances_sha256: "00".repeat(32),
+                order_holds_sha256: "00".repeat(32),
+                withdrawal_holds_sha256: "00".repeat(32),
+                positions_and_cost_basis_sha256: "00".repeat(32),
+                order_books_sha256: "00".repeat(32),
+                snapshot_fill_state_sha256: "00".repeat(32),
+                resolutions_sha256: "00".repeat(32),
+                rewards_sha256: "00".repeat(32),
+                fees_sha256: "00".repeat(32),
+                markets_sha256: "00".repeat(32),
+                replay_state_sha256: "00".repeat(32),
+                custody_qualified_totals_sha256: "00".repeat(32),
+                composite_user_state_sha256: "00".repeat(32),
+            },
+            category_equality: ExactTerminalCategoryEquality {
+                users_and_sessions_equal: true,
+                available_balances_equal: true,
+                order_holds_equal: true,
+                withdrawal_holds_equal: true,
+                positions_and_cost_basis_equal: true,
+                order_books_equal: true,
+                snapshot_fill_state_equal: true,
+                resolutions_equal: true,
+                rewards_equal: true,
+                fees_equal: true,
+                markets_equal: true,
+                replay_state_equal: true,
+                custody_qualified_totals_equal: true,
+                composite_user_state_equal: true,
+            },
+            sequence_equal: true,
+            state_root_equal: true,
+            journal_head_equal: true,
+            aggregate_totals_equal: true,
+            aggregate_totals_zero_delta: true,
+            restore_floor_persisted: true,
+            no_external_state_mutation_performed: true,
+            pool_cash_opening_required: false,
+            historical_journal_replay_performed: false,
+            historical_fill_completeness_certified: false,
+        }
+    }
+
+    #[test]
+    fn terminal_certificate_has_one_unambiguous_allowlisted_release_field() {
+        let report = IncidentTerminalCertificationReport {
+            schema_version: "layrs.incident-terminal-certification.v1".into(),
+            incident_id: INCIDENT_ID.into(),
+            incident_policy_sha256: INCIDENT_RECOVERY_POLICY_SHA256_HEX.into(),
+            snapshot_bucket: INCIDENT_SNAPSHOT_BUCKET.into(),
+            snapshot_key: INCIDENT_SNAPSHOT_KEY.into(),
+            snapshot_version_id: INCIDENT_SNAPSHOT_VERSION_ID.into(),
+            snapshot_size_bytes: INCIDENT_SNAPSHOT_SIZE_BYTES,
+            snapshot_body_sha256: INCIDENT_SNAPSHOT_BODY_SHA256_HEX.into(),
+            certifier_release_manifest_sha256: "11".repeat(32),
+            artifact_equal: true,
+            policy_equal: true,
+            source_release_equal: true,
+            certifier_pcr0_equal: true,
+            terminal_state: empty_terminal_state_report(),
+        };
+
+        let encoded = serde_json::to_string(&report).unwrap();
+        assert_eq!(encoded.matches("\"sourceReleaseCommit\"").count(), 1);
+        assert!(!encoded.contains("certifierPcr0Sha384"));
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(value["sourceReleaseCommit"], EXACT_LIVE_976_RELEASE_COMMIT);
+        assert_eq!(value["restoredSequence"], INCIDENT_TERMINAL_SEQUENCE);
+        let mut actual_keys: Vec<_> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        actual_keys.sort_unstable();
+        let mut expected_keys = vec![
+            "aggregateAssetTotals",
+            "aggregateBucketTotals",
+            "aggregateTotalsEqual",
+            "aggregateTotalsZeroDelta",
+            "artifactEqual",
+            "categoryCounts",
+            "categoryDigests",
+            "categoryEquality",
+            "certifierPcr0Equal",
+            "certifierReleaseManifestSha256",
+            "historicalFillCompletenessCertified",
+            "historicalJournalReplayPerformed",
+            "incidentId",
+            "incidentPolicySha256",
+            "journalHeadEqual",
+            "noExternalStateMutationPerformed",
+            "policyEqual",
+            "poolCashOpeningRequired",
+            "restoreFloorPersisted",
+            "restoredJournalHead",
+            "restoredSequence",
+            "restoredStateRoot",
+            "schemaVersion",
+            "sequenceEqual",
+            "snapshotBodySha256",
+            "snapshotBucket",
+            "snapshotCiphertextSha256",
+            "snapshotKey",
+            "snapshotSizeBytes",
+            "snapshotVersionId",
+            "sourceReleaseCommit",
+            "sourceReleaseEqual",
+            "stateRootEqual",
+        ];
+        expected_keys.sort_unstable();
+        assert_eq!(actual_keys, expected_keys);
     }
 
     #[test]
@@ -5347,8 +5478,7 @@ mod tests {
         wrong_source_ami.source_provenance.source_ami_id = "ami-00000000000000000".into();
         assert!(validate_incident_recovery_policy_fields(&wrong_source_ami).is_err());
         let mut wrong_copied_ami = policy.clone();
-        wrong_copied_ami.source_provenance.copied_parent_ami_id =
-            "ami-00000000000000000".into();
+        wrong_copied_ami.source_provenance.copied_parent_ami_id = "ami-00000000000000000".into();
         assert!(validate_incident_recovery_policy_fields(&wrong_copied_ami).is_err());
         let mut journal_required = policy;
         journal_required.historical_journal_replay_required = true;
