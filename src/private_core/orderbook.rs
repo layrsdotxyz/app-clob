@@ -602,6 +602,12 @@ impl PriceTimeBook {
         self.orders.get(&order_id)
     }
 
+    /// Enclave-local deterministic view for the offline restore certifier.
+    /// Callers must hash this view before it leaves the attested environment.
+    pub(crate) fn offline_orders(&self) -> &BTreeMap<Uuid, BookOrder> {
+        &self.orders
+    }
+
     pub fn orders_for_owner(&self, owner: &str) -> Vec<BookOrder> {
         self.orders
             .values()

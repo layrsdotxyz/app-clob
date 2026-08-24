@@ -249,6 +249,87 @@ impl EncryptedJournal {
         Ok(())
     }
 
+    /// Verifies a complete immutable encrypted-journal export without
+    /// decrypting it. Exact-live restore certification requires the export to
+    /// start at sequence one and end at the snapshot checkpoint; accepting a
+    /// suffix would leave an unproved gap before the supplied chain head.
+    pub fn verify_complete_export(
+        records: &[EncryptedJournalRecord],
+        expected_sequence: u64,
+        expected_head: [u8; 32],
+        expected_state_root: [u8; 32],
+    ) -> CoreResult<()> {
+        if expected_sequence == 0 {
+            return if records.is_empty()
+                && expected_head == [0u8; 32]
+                && expected_state_root != [0u8; 32]
+            {
+                Ok(())
+            } else {
+                Err(CoreError::JournalChainMismatch)
+            };
+        }
+        if records.len() as u64 != expected_sequence {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        let mut prior = [0u8; 32];
+        for (index, record) in records.iter().enumerate() {
+            let sequence = (index as u64)
+                .checked_add(1)
+                .ok_or(CoreError::JournalChainMismatch)?;
+            if record.sequence != sequence
+                || record.prior_record_hash != prior
+                || record.record_hash
+                    != hash_record(
+                        record.sequence,
+                        &record.nonce,
+                        &record.prior_record_hash,
+                        &record.state_root,
+                        &record.ciphertext,
+                    )
+            {
+                return Err(CoreError::JournalChainMismatch);
+            }
+            prior = record.record_hash;
+        }
+        let terminal = records.last().ok_or(CoreError::JournalChainMismatch)?;
+        if terminal.record_hash != expected_head || terminal.state_root != expected_state_root {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        Ok(())
+    }
+
+    /// Decrypts an already verified complete export for enclave-local semantic
+    /// certification. The returned values must never cross the attested
+    /// boundary; the restore runner reduces them to category digests.
+    pub(crate) fn decrypt_complete_export_json(
+        &self,
+        records: &[EncryptedJournalRecord],
+    ) -> CoreResult<Vec<serde_json::Value>> {
+        let mut values = Vec::with_capacity(records.len());
+        for record in records {
+            let aad = associated_data(
+                record.sequence,
+                &record.prior_record_hash,
+                &record.state_root,
+            );
+            let mut plaintext = self
+                .cipher
+                .decrypt(
+                    Nonce::from_slice(&record.nonce),
+                    Payload {
+                        msg: &record.ciphertext,
+                        aad: &aad,
+                    },
+                )
+                .map_err(|_| CoreError::JournalCrypto)?;
+            let decoded = serde_json::from_slice(&plaintext).map_err(|_| CoreError::JournalCrypto);
+            plaintext.zeroize();
+            values.push(decoded?);
+        }
+        Ok(values)
+    }
+
     pub fn seal_snapshot<T: Serialize>(
         &self,
         state_root: [u8; 32],

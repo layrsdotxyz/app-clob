@@ -68,6 +68,14 @@ Perform the following offline against the candidate:
 The attested runner report must bind `sourceReleaseCommit` to exact 976 and
 `checkpointSha256` to the checkpoint file supplied to the wrapper; otherwise
 the wrapper rejects the report even if every equality boolean is true.
+`layrs-cumulative-restore-runner` accepts the production-lineage journal key
+only through an inherited descriptor (FD 3 by default), requires a live Nitro
+Secure Module, and places the equality-report digest in NSM attestation user
+data. Its attestation nonce is the digest binding the encrypted snapshot,
+complete encrypted journal export, checkpoint and equality report. The wrapper
+preserves that attestation document and all artifact-binding digests in its
+privacy-safe output. It never accepts the journal key as a path, argument,
+environment value or report field.
 
 Any failed restore or equality check is a hard stop. Do not canonicalize,
 rewrite or manually edit the production snapshot to make the candidate load.

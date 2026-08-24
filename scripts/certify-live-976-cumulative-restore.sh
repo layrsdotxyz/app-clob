@@ -102,11 +102,16 @@ jq -e --arg release "$expected_release" --arg checkpoint "$checkpoint_sha" '
   (.legacyZeroBalanceCount | type == "number") and
   (.qualifiedTotalsDigest | test("^[0-9a-f]{64}$")) and
   (.userStateDigest | test("^[0-9a-f]{64}$")) and
-  (.poolCashOpeningRequired | type == "boolean")
+  (.poolCashOpeningRequired | type == "boolean") and
+  (.evidenceSha256 | test("^[0-9a-f]{64}$")) and
+  (.artifactBindingSha256 | test("^[0-9a-f]{64}$")) and
+  (.attestationDocumentSha256 | test("^[0-9a-f]{64}$")) and
+  (.attestationDocumentBase64 | type == "string") and
+  (.attestationDocumentBase64 | length > 128)
 ' "$report" >/dev/null || {
   echo "Exact-live cumulative restore certification failed closed." >&2
   jq '{sourceCheckpointEqual,sequenceEqual,journalHeadEqual,stateRootEqual,usersEqual,availableBalancesEqual,orderHoldsEqual,withdrawalHoldsEqual,positionsEqual,ordersEqual,fillsEqual,resolutionsEqual,rewardsEqual,feesEqual,marketsEqual,replayKeysEqual,legacyZeroBalanceCount,poolCashOpeningRequired}' "$report" >&2 || true
   exit 1
 }
 
-jq '{status:"PASS_OFFLINE_RESTORE_ONLY",sourceReleaseCommit,sourceCheckpointEqual,sequenceEqual,journalHeadEqual,stateRootEqual,legacyZeroBalanceCount,poolCashOpeningRequired,qualifiedTotalsDigest,userStateDigest}' "$report"
+jq '{status:"PASS_OFFLINE_RESTORE_ONLY",sourceReleaseCommit,sourceCheckpointEqual,sequenceEqual,journalHeadEqual,stateRootEqual,legacyZeroBalanceCount,poolCashOpeningRequired,qualifiedTotalsDigest,userStateDigest,evidenceSha256,artifactBindingSha256,attestationDocumentSha256,attestationDocumentBase64}' "$report"
