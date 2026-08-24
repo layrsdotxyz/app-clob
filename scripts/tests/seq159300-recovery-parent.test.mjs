@@ -9,6 +9,9 @@ import {
   canonicalJson,
   renderRecoveryParentBuildEvidence,
 } from '../render-seq159300-recovery-parent-evidence.mjs';
+import {
+  renderRecoveryParentPostBuildCleanupEvidence,
+} from '../render-seq159300-recovery-parent-post-build-cleanup-evidence.mjs';
 import { validatePreflight } from '../lib/seq159300-recovery-parent-preflight.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -35,7 +38,14 @@ const runbook = readFileSync(
 const SOURCE_COMMIT = 'f282583cae7a5c873a26aa8d0c1bec10c490eb8e';
 const IMPLEMENTATION_COMMIT = '9e21c925d121822019524ec3d9b4973b1a32f38a';
 const BUILDER_SOURCE_COMMIT = '24405e0da728e237dc851915bcdb60c6ee1db5bb';
-const PHASE2_TEMPLATE_COMMIT = 'e93b3658f034f07fb9d0b867d448a07813fb1fce';
+const PHASE2_TEMPLATE_COMMIT = '23f92bc64171862abc410af953321a991e5e1515';
+const BUILDER_TEMPLATE_SHA384 = '75e536d6d138b88aaf7ef29fece2f67f3e6ffbda02841092de73726795b4d55a6fe01af492d8d8d1f0d3dc7f8db105d7';
+const INVOKER_TEMPLATE_SHA384 = 'd67e4f78be6bd679b4ab61e316215fce24035e89508baaefcf3b2df6209682fd94dc0fcd84bac1530664f02aaf7723e1';
+const TEMPLATE_PUBLISHER_SHA384 = '6eefb0154b78e08949ffb677a5179782cd17ab3f9a2f3d68ddf65789ce085b73aa9f76ad13821aff06fe9d853153d529';
+const CLEANUP_TEMPLATE_SHA384 = '72c5872db412726d8e56c0c078067bae19c8cf316bba204f0849a6ae34bc504792b12601f023f76efdf81b750a6aa77c';
+const POSTBUILD_PUBLISHER_SHA384 = '329c3ad67e05dec6efff89d7ede7553e652b18d7a6727c95fc88e7766584037f6d1345210120448cccba7f56397e9361';
+const FINALIZER_TEMPLATE_SHA384 = '2eeca9da6a30bc6aef84126d8e53b70723b8b00554aa65c9da982e3fd47f82eb694c00b05a26c598eed3d5b8d110b2c9';
+const BOOTSTRAP_TEMPLATE_SHA384 = 'caae4fa5902593a3648f6755669f87e4b6b59cb3bbb027ed82991b51ff8727f02cbcfe6883e8ea7644bd57477c9a8620';
 const SHA384 = '3'.repeat(96);
 const PARENT_SHA384 = 'd9506bf11627b04bd5d220e18e78584cd5e649952fe380309346d9c6bbecd511eb318cdcdee6a1d0db989d581a742db1';
 const EIF_SHA384 = '958e084e0a66d0aca6773193a74d40659cd258fcffa116b0117fed1fab8361046ffea6411379b72fc72c97b86f611290';
@@ -58,10 +68,45 @@ function validEvidence(overrides = {}) {
     builderEvidenceIndexObjectKey: 'evidence/seq159300/recovery-only/phase2/builder/evidence-index.json',
     builderEvidenceIndexObjectVersionId: 'builder.index.version.1',
     builderEvidenceIndexSha384: SHA384,
-    builderTemplateSha384: SHA384,
-    builderTemplateEvidenceObjectKey: `evidence/seq159300/recovery-only/phase2/builder/templates/layrs-seq159300-recovery-builder-${SHA384}.yml`,
+    builderTemplateSha384: BUILDER_TEMPLATE_SHA384,
+    builderTemplateEvidenceObjectKey: `evidence/seq159300/recovery-only/phase2/builder/templates/layrs-seq159300-recovery-builder-${BUILDER_TEMPLATE_SHA384}.yml`,
     builderTemplateEvidenceObjectVersionId: 'builder.template.version.1',
-    builderTemplateEvidenceSha384: SHA384,
+    builderTemplateEvidenceSha384: BUILDER_TEMPLATE_SHA384,
+    publisherTemplateSha384: TEMPLATE_PUBLISHER_SHA384,
+    publisherTemplateEvidenceObjectKey:
+      `evidence/seq159300/recovery-only/phase2/builder/publisher/layrs-seq159300-recovery-template-publisher-${TEMPLATE_PUBLISHER_SHA384}.yml`,
+    publisherTemplateEvidenceObjectVersionId: 'publisher.template.version.1',
+    publisherTemplateEvidenceSha384: TEMPLATE_PUBLISHER_SHA384,
+    templatePublisherRoleInventoryObjectKey:
+      `evidence/seq159300/recovery-only/phase2/builder/publisher/roles/template-publisher/inventory/${'6'.repeat(40)}-${'5'.repeat(96)}.json`,
+    templatePublisherRoleInventoryObjectVersionId: 'template.publisher.inventory.version.1',
+    templatePublisherRoleInventorySha384: '5'.repeat(96),
+    cloudFormationExecutionRoleInventoryObjectKey:
+      `evidence/seq159300/recovery-only/phase2/builder/publisher/roles/cloudformation-execution/inventory/${'6'.repeat(40)}-${'5'.repeat(96)}.json`,
+    cloudFormationExecutionRoleInventoryObjectVersionId: 'cloudformation.execution.inventory.version.1',
+    cloudFormationExecutionRoleInventorySha384: '6'.repeat(96),
+    templateUploadReceiptObjectKey:
+      'evidence/seq159300/recovery-only/phase2/builder/publisher/receipts/template-upload.json',
+    templateUploadReceiptObjectVersionId: 'template.upload.receipt.version.1',
+    templateUploadReceiptSha384: '7'.repeat(96),
+    changeSetReceiptObjectKey:
+      'evidence/seq159300/recovery-only/phase2/builder/publisher/receipts/change-set.json',
+    changeSetReceiptObjectVersionId: 'change.set.receipt.version.1',
+    changeSetReceiptSha384: '8'.repeat(96),
+    cleanupTemplateSha384: CLEANUP_TEMPLATE_SHA384,
+    cleanupTemplateEvidenceObjectKey:
+      `evidence/seq159300/recovery-only/phase2/builder/cleanup/templates/layrs-seq159300-recovery-builder-cleanup-${CLEANUP_TEMPLATE_SHA384}.yml`,
+    cleanupTemplateEvidenceObjectVersionId: 'cleanup.template.version.1',
+    cleanupTemplateEvidenceSha384: CLEANUP_TEMPLATE_SHA384,
+    cleanupExecutionRoleInventoryObjectKey:
+      `evidence/seq159300/recovery-only/phase2/builder/cleanup/roles/cleanup-execution/inventory/${'6'.repeat(40)}-${'5'.repeat(96)}.json`,
+    cleanupExecutionRoleInventoryObjectVersionId: 'cleanup.execution.inventory.version.1',
+    cleanupExecutionRoleInventorySha384: 'd'.repeat(96),
+    cleanupSubmitterRoleInventoryObjectKey:
+      `evidence/seq159300/recovery-only/phase2/builder/cleanup/roles/cleanup-submitter/inventory/${'6'.repeat(40)}-${'5'.repeat(96)}.json`,
+    cleanupSubmitterRoleInventoryObjectVersionId: 'cleanup.submitter.inventory.version.1',
+    cleanupSubmitterRoleInventorySha384: 'e'.repeat(96),
+    trustedPrincipalInventorySha384: 'f'.repeat(96),
     buildControlPlaneRoleInventorySha384: SHA384,
     buildInstanceProfileInventorySha384: SHA384,
     buildSecurityGroupInventorySha384: SHA384,
@@ -81,10 +126,19 @@ function validEvidence(overrides = {}) {
     outputAmiInventorySha384: SHA384,
     packerManifestSha384: SHA384,
     packerInvokerRoleInventorySha384: SHA384,
-    packerInvokerTemplateSha384: SHA384,
+    packerInvokerTemplateSha384: INVOKER_TEMPLATE_SHA384,
     packerInvokerEvidenceObjectKey: 'evidence/seq159300/recovery-only/phase2/invoker/template.yml',
     packerInvokerEvidenceObjectVersionId: 'invoker.template.version.1',
-    packerInvokerEvidenceSha384: SHA384,
+    packerInvokerEvidenceSha384: INVOKER_TEMPLATE_SHA384,
+    packerControlInventoryPolicySha384: 'a'.repeat(96),
+    packerControlLaunchPolicySha384: 'b'.repeat(96),
+    packerControlArtifactPolicySha384: 'c'.repeat(96),
+    packerControlPlaneApprovedAt: '2026-08-24T03:00:00Z',
+    packerControlPlaneExpiresAt: '2026-08-24T04:00:00Z',
+    invokerApprovedAt: '2026-08-24T02:55:00Z',
+    invokerExpiresAt: '2026-08-24T03:55:00Z',
+    templatePublisherApprovedAt: '2026-08-24T02:50:00Z',
+    templatePublisherExpiresAt: '2026-08-24T03:50:00Z',
     packerTemplateSha384: SHA384,
     packerAmazonPluginVersion: '1.3.9',
     packerAmazonPluginSourceCommit: '2a769c39a05940e25143098f071490732fa24f4f',
@@ -104,7 +158,173 @@ function validEvidence(overrides = {}) {
     parentBinarySha384: PARENT_SHA384,
     eifSha384: EIF_SHA384,
     pcr0Sha384: PCR0_SHA384,
-    buildCompletedAt: '2026-08-24T03:30:00.000Z',
+    buildCompletedAt: '2026-08-24T03:30:00Z',
+    ...overrides,
+  };
+}
+
+function validPostBuildCleanupEvidence(overrides = {}) {
+  const record = (resourceType, resourceId, serviceErrorCode, index) => ({
+    requestId: `request-seq159300-${String(index).padStart(3, '0')}`,
+    resourceId,
+    resourceType,
+    serviceErrorCode,
+  });
+  const records = [
+    record('cloudformation-stack',
+      'arn:aws:cloudformation:us-east-1:082223548516:stack/layrs-production-recovery-seq159300-invoker/00000000-0000-0000-0000-000000000007',
+      'ValidationError', 7),
+    record('cloudformation-stack',
+      'arn:aws:cloudformation:us-east-1:082223548516:stack/layrs-production-recovery-seq159300-builder/00000000-0000-0000-0000-000000000001',
+      'ValidationError', 1),
+    record('cloudformation-stack',
+      'arn:aws:cloudformation:us-east-1:082223548516:stack/layrs-production-recovery-seq159300-template-publisher/00000000-0000-0000-0000-000000000002',
+      'ValidationError', 2),
+    record('cloudformation-stack',
+      'arn:aws:cloudformation:us-east-1:082223548516:stack/layrs-production-recovery-seq159300-builder-cleanup/00000000-0000-0000-0000-000000000003',
+      'ValidationError', 3),
+    record('cloudformation-stack',
+      'arn:aws:cloudformation:us-east-1:082223548516:stack/layrs-production-recovery-seq159300-post-build-evidence-publisher/00000000-0000-0000-0000-000000000005',
+      'ValidationError', 5),
+    record('cloudformation-change-set',
+      'arn:aws:cloudformation:us-east-1:082223548516:changeSet/layrs-seq159300-builder-123456789abc/00000000-0000-0000-0000-000000000004',
+      'ChangeSetNotFoundException', 4),
+    record('iam-instance-profile', 'layrs-production-recovery-seq159300-builder-instance', 'NoSuchEntityException', 6),
+    ...[
+      'invoker', 'invoker-window-guard',
+      'template-publisher', 'template-publisher-window-guard', 'cloudformation-execution',
+      'builder-instance', 'window-guard', 'packer-control', 'cleanup-window-guard',
+      'cleanup-execution', 'cleanup-submitter', 'post-build-evidence-publisher',
+      'post-build-publisher-window-guard', 'finalizer-window-guard',
+    ].map((name, index) => record('iam-role', `layrs-production-recovery-seq159300-${name}`,
+      'NoSuchEntityException', 10 + index)),
+    ...[
+      'packer-inventory', 'packer-launch', 'packer-artifacts', 'cfn-core-network',
+      'cfn-endpoints', 'cfn-mutation',
+    ].map((name, index) => record('iam-managed-policy',
+      `arn:aws:iam::082223548516:policy/layrs-production-recovery-seq159300-${name}`,
+      'NoSuchEntityException', 30 + index)),
+    ...['invoker-window-guard', 'template-publisher-window-guard', 'window-guard', 'cleanup-window-guard',
+      'post-build-publisher-window-guard', 'finalizer-window-guard']
+      .map((name, index) => record('lambda-function',
+        `arn:aws:lambda:us-east-1:082223548516:function:layrs-production-recovery-seq159300-${name}`,
+        'ResourceNotFoundException', 40 + index)),
+    record('ec2-vpc', 'vpc-0123456789abcdef0', 'InvalidVpcID.NotFound', 50),
+    record('ec2-subnet', 'subnet-0123456789abcdef0', 'InvalidSubnetID.NotFound', 51),
+    record('ec2-route-table', 'rtb-0123456789abcdef0', 'InvalidRouteTableID.NotFound', 52),
+    record('ec2-security-group', 'sg-0123456789abcdef0', 'InvalidGroup.NotFound', 53),
+    record('ec2-vpc-endpoint', 'vpce-0123456789abcdef0', 'InvalidVpcEndpointId.NotFound', 54),
+    record('ec2-network-interface', 'eni-0123456789abcdef0', 'InvalidNetworkInterfaceID.NotFound', 55),
+    record('packer-temporary-key-pair', 'layrs-seq159300-recovery-key-12345678', 'InvalidKeyPair.NotFound', 56),
+    record('packer-temporary-instance', 'i-0123456789abcdef0', 'InvalidInstanceID.NotFound', 57),
+  ].sort((left, right) => `${left.resourceType}\0${left.resourceId}`.localeCompare(`${right.resourceType}\0${right.resourceId}`));
+  const evidenceRefs = [
+    ['evidence/seq159300/recovery-only/phase2/parent-build/build.json', 'parent.build.version.1', '1'.repeat(96)],
+    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/templates/layrs-seq159300-recovery-builder-cleanup-${CLEANUP_TEMPLATE_SHA384}.yml`, 'cleanup.template.version.1', CLEANUP_TEMPLATE_SHA384],
+    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/receipts/${PHASE2_TEMPLATE_COMMIT}-${'5'.repeat(96)}.json`, 'cleanup.receipt.version.1', '3'.repeat(96)],
+    ['evidence/seq159300/recovery-only/phase2/builder/cleanup/inventory/pre-delete.json', 'predelete.inventory.version.1', '4'.repeat(96)],
+    ['evidence/seq159300/recovery-only/phase2/builder/cleanup/intents/cleanup.json', 'cleanup.intent.version.1', '5'.repeat(96)],
+    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/publisher/templates/layrs-seq159300-recovery-post-build-evidence-publisher-${POSTBUILD_PUBLISHER_SHA384}.yml`, 'postbuild.publisher.template.version.1', POSTBUILD_PUBLISHER_SHA384],
+    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/finalizer/templates/layrs-seq159300-recovery-finalizer-${FINALIZER_TEMPLATE_SHA384}.yml`, 'finalizer.template.version.1', FINALIZER_TEMPLATE_SHA384],
+    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/finalizer/inventory/${PHASE2_TEMPLATE_COMMIT}-${'5'.repeat(96)}.json`, 'finalizer.role.inventory.version.1', '9'.repeat(96)],
+    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/finalizer/deployer/templates/layrs-predifi-root-bootstrap-${BOOTSTRAP_TEMPLATE_SHA384}.yml`, 'production.deployer.template.version.1', BOOTSTRAP_TEMPLATE_SHA384],
+    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/finalizer/deployer/inventory/${PHASE2_TEMPLATE_COMMIT}-${'5'.repeat(96)}.json`, 'production.deployer.inventory.version.1', 'f'.repeat(96)],
+    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/finalizer/stack-inventory/${PHASE2_TEMPLATE_COMMIT}-${'5'.repeat(96)}.json`, 'finalizer.stack.inventory.version.1', 'c'.repeat(96)],
+    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/roles/cleanup-execution/inventory/${PHASE2_TEMPLATE_COMMIT}-${'5'.repeat(96)}.json`, 'cleanup.execution.inventory.version.1', 'd'.repeat(96)],
+    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/roles/cleanup-submitter/inventory/${PHASE2_TEMPLATE_COMMIT}-${'5'.repeat(96)}.json`, 'cleanup.submitter.inventory.version.1', 'e'.repeat(96)],
+    [`evidence/seq159300/recovery-only/phase2/builder/cleanup/roles/post-build-evidence-publisher/inventory/${PHASE2_TEMPLATE_COMMIT}-${'5'.repeat(96)}.json`, 'postbuild.publisher.inventory.version.1', '0'.repeat(96)],
+  ];
+  return {
+    protocol: 'layrs.seq159300.recovery-parent-post-build-cleanup-evidence.v1',
+    accountId: '082223548516', region: 'us-east-1', environment: 'production',
+    cleanupImplementationCommit: PHASE2_TEMPLATE_COMMIT, verifiedAt: '2026-08-24T08:00:00Z',
+    finalizerApprovedAt: '2026-08-24T07:59:00Z',
+    finalizerExpiresAt: '2026-08-24T08:59:00Z',
+    cleanupApprovedAt: '2026-08-24T07:56:00Z',
+    cleanupExpiresAt: '2026-08-24T08:56:00Z',
+    cleanupSubmitterExternalId: '0'.repeat(96),
+    cleanupSubmitterIdentity: {
+      accountId: '082223548516',
+      arn: 'arn:aws:sts::082223548516:assumed-role/layrs-production-recovery-seq159300-cleanup-submitter/cleanup1',
+      principalId: 'AROABCDEFGHIJKLMNOP:cleanup1',
+    },
+    cleanupSubmitterSession: {
+      durationSeconds: 3450, issuedAt: '2026-08-24T07:56:00Z', expiresAt: '2026-08-24T08:53:30Z',
+    },
+    finalizerSession: {
+      durationSeconds: 3270, issuedAt: '2026-08-24T07:59:00Z', expiresAt: '2026-08-24T08:53:30Z',
+    },
+    runnerIdentity: {
+      accountId: '082223548516',
+      arn: 'arn:aws:sts::082223548516:assumed-role/layrs-gitlab-runner-RunnerRole-1LXmWXGdTn9z/runner1',
+      principalId: 'AROABCDEFGHIJKLMNOP:runner1',
+    },
+    productionDeployerIdentity: {
+      accountId: '082223548516',
+      arn: 'arn:aws:sts::082223548516:assumed-role/layrs-production-deployer/deployer1',
+      principalId: 'AROABCDEFGHIJKLMNOP:deployer1',
+    },
+    productionDeployerSession: {
+      durationSeconds: 3600, issuedAt: '2026-08-24T07:54:00Z', expiresAt: '2026-08-24T08:54:00Z',
+    },
+    postBuildPublisherApprovedAt: '2026-08-24T07:50:00Z',
+    postBuildPublisherExpiresAt: '2026-08-24T08:50:00Z',
+    phase4Authorized: false,
+    parentBuildEvidenceObjectKey: evidenceRefs[0][0], parentBuildEvidenceObjectVersionId: evidenceRefs[0][1],
+    parentBuildEvidenceSha384: evidenceRefs[0][2],
+    cleanupTemplateEvidenceObjectKey: evidenceRefs[1][0], cleanupTemplateEvidenceObjectVersionId: evidenceRefs[1][1],
+    cleanupTemplateEvidenceSha384: evidenceRefs[1][2],
+    cleanupReceiptObjectKey: evidenceRefs[2][0], cleanupReceiptObjectVersionId: evidenceRefs[2][1],
+    cleanupReceiptSha384: evidenceRefs[2][2],
+    cleanupExecutionRoleInventoryObjectKey: evidenceRefs[11][0],
+    cleanupExecutionRoleInventoryObjectVersionId: evidenceRefs[11][1],
+    cleanupExecutionRoleInventorySha384: evidenceRefs[11][2],
+    cleanupSubmitterRoleInventoryObjectKey: evidenceRefs[12][0],
+    cleanupSubmitterRoleInventoryObjectVersionId: evidenceRefs[12][1],
+    cleanupSubmitterRoleInventorySha384: evidenceRefs[12][2],
+    postBuildPublisherRoleInventoryObjectKey: evidenceRefs[13][0],
+    postBuildPublisherRoleInventoryObjectVersionId: evidenceRefs[13][1],
+    postBuildPublisherRoleInventorySha384: evidenceRefs[13][2],
+    postBuildPublisherRoleInventoryUploadRequestId: 'req-publisher-inventory-upload-001',
+    postBuildPublisherRoleInventoryUploadedAt: '2026-08-24T07:59:20Z',
+    postBuildPublisherRoleInventoryReadbackRequestId: 'req-publisher-inventory-readback-001',
+    postBuildPublisherRoleInventoryReadbackVerifiedAt: '2026-08-24T07:59:21Z',
+    preDeletePhysicalInventoryObjectKey: evidenceRefs[3][0],
+    preDeletePhysicalInventoryObjectVersionId: evidenceRefs[3][1], preDeletePhysicalInventorySha384: evidenceRefs[3][2],
+    cleanupIntentObjectKey: evidenceRefs[4][0], cleanupIntentObjectVersionId: evidenceRefs[4][1],
+    cleanupIntentSha384: evidenceRefs[4][2],
+    postBuildEvidencePublisherTemplateObjectKey: evidenceRefs[5][0],
+    postBuildEvidencePublisherTemplateObjectVersionId: evidenceRefs[5][1],
+    postBuildEvidencePublisherTemplateSha384: evidenceRefs[5][2],
+    finalizerTemplateEvidenceObjectKey: evidenceRefs[6][0],
+    finalizerTemplateEvidenceObjectVersionId: evidenceRefs[6][1],
+    finalizerTemplateEvidenceSha384: evidenceRefs[6][2],
+    finalizerRoleInventoryObjectKey: evidenceRefs[7][0],
+    finalizerRoleInventoryObjectVersionId: evidenceRefs[7][1],
+    productionDeployerTemplateEvidenceObjectKey: evidenceRefs[8][0],
+    productionDeployerTemplateEvidenceObjectVersionId: evidenceRefs[8][1],
+    productionDeployerTemplateEvidenceSha384: evidenceRefs[8][2],
+    productionDeployerRoleInventoryObjectKey: evidenceRefs[9][0],
+    productionDeployerRoleInventoryObjectVersionId: evidenceRefs[9][1],
+    productionDeployerRoleInventorySha384: evidenceRefs[9][2],
+    retainedFinalizerStackInventoryObjectKey: evidenceRefs[10][0],
+    retainedFinalizerStackInventoryObjectVersionId: evidenceRefs[10][1],
+    retainedFinalizerStackInventorySha384: evidenceRefs[10][2],
+    retainedAmiInventory: [{ amiId: 'ami-0123456789abcdef0', outputAmiInventorySha384: '7'.repeat(96) }],
+    retainedSnapshotInventory: [{ snapshotId: 'snap-0123456789abcdef0', snapshotInventorySha384: '8'.repeat(96) }],
+    retainedEvidenceInventory: evidenceRefs.map(([objectKey, objectVersionId, sha384]) => ({
+      objectKey, objectVersionId, sha384,
+    })).sort((left, right) => `${left.objectKey}\0${left.objectVersionId}`.localeCompare(`${right.objectKey}\0${right.objectVersionId}`)),
+    exactAbsenceInventory: records,
+    exactAbsenceInventorySha384: createHash('sha384').update(canonicalJson(records)).digest('hex'),
+    verifierIdentity: {
+      accountId: '082223548516',
+      arn: 'arn:aws:sts::082223548516:assumed-role/layrs-production-recovery-seq159300-finalizer/session1',
+      principalId: 'AROABCDEFGHIJKLMNOP:session1',
+    },
+    verifierRoleInventorySha384: '9'.repeat(96),
+    finalizerRoleInventorySha384: '9'.repeat(96),
+    trustedPrincipalInventorySha384: 'b'.repeat(96),
     ...overrides,
   };
 }
@@ -166,14 +386,40 @@ test('wrapper cross-checks immutable package versions and a dedicated Packer rol
   assert.match(wrapper, /LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384/u);
   assert.match(wrapper, /LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID/u);
   assert.match(wrapper, /LAYRS_RECOVERY_PACKER_INVOKER_TEMPLATE_SHA384/u);
+  assert.match(wrapper, /LAYRS_RECOVERY_PACKER_INVOKER_TEMPLATE_FILE/u);
+  assert.match(wrapper, /LAYRS_RECOVERY_BUILDER_TEMPLATE_FILE/u);
+  assert.match(wrapper, /LAYRS_RECOVERY_INVOKER_APPROVED_AT/u);
+  assert.match(wrapper, /LAYRS_RECOVERY_INVOKER_EXPIRES_AT/u);
+  assert.match(wrapper, /LAYRS_RECOVERY_TEMPLATE_PUBLISHER_APPROVED_AT/u);
+  assert.match(wrapper, /LAYRS_RECOVERY_TEMPLATE_PUBLISHER_EXPIRES_AT/u);
   assert.match(wrapper, /LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_OBJECT_VERSION_ID/u);
   assert.match(wrapper, /LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_VERSION_ID/u);
+  assert.match(wrapper, /LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID/u);
+  assert.match(wrapper, /LAYRS_RECOVERY_TEMPLATE_UPLOAD_RECEIPT_OBJECT_VERSION_ID/u);
+  assert.match(wrapper, /LAYRS_RECOVERY_CHANGE_SET_RECEIPT_OBJECT_VERSION_ID/u);
+  assert.match(wrapper, /LAYRS_RECOVERY_TEMPLATE_PUBLISHER_ROLE_INVENTORY_SHA384/u);
+  assert.match(wrapper, /LAYRS_RECOVERY_TEMPLATE_PUBLISHER_ROLE_INVENTORY_OBJECT_VERSION_ID/u);
+  assert.match(wrapper, /LAYRS_RECOVERY_CLOUDFORMATION_EXECUTION_ROLE_INVENTORY_OBJECT_VERSION_ID/u);
+  assert.match(wrapper, /LAYRS_RECOVERY_CLOUDFORMATION_EXECUTION_ROLE_INVENTORY_SHA384/u);
+  assert.match(wrapper, /LAYRS_RECOVERY_CLEANUP_EXECUTION_ROLE_INVENTORY_OBJECT_VERSION_ID/u);
+  assert.match(wrapper, /LAYRS_RECOVERY_CLEANUP_SUBMITTER_ROLE_INVENTORY_OBJECT_VERSION_ID/u);
   assert.match(wrapper, /LAYRS_RECOVERY_PACKER_INVOKER_ROLE_INVENTORY_SHA384/u);
   assert.match(wrapper, /B21C50FA44A99720EAA72F7FE951904AD832C631/u);
   assert.match(wrapper, /664b632018bd84f9b249be7bd26937c560edb2f2bfc0cbc01ec5a7b4e06aad56/u);
   assert.match(wrapper, /assumed-role/u);
   assert.match(wrapper, /LAYRS_RECOVERY_NITRO_PACKAGE_SET_EVIDENCE_OBJECT_VERSION_ID/u);
-  assert.equal((wrapper.match(/s3api get-object/gu) ?? []).length, 2);
+  assert.equal((wrapper.match(/s3api get-object/gu) ?? []).length, 11);
+  assert.match(wrapper, /for prefix in EXECUTION SUBMITTER/u);
+  assert.match(wrapper, /for prefix in TEMPLATE_PUBLISHER CLOUDFORMATION_EXECUTION/u);
+  assert.match(wrapper, /cleanup .* role inventory is noncanonical or self-referential/u);
+  assert.match(wrapper, /\.Key == "RoleInventorySha384"/u);
+  assert.match(wrapper, /role inventory embeds its own SHA384/u);
+  assert.match(wrapper, /remote builder evidence index SHA384/u);
+  assert.match(wrapper, /reviewed builder template differs from its exact immutable object version/u);
+  assert.match(wrapper, /reviewed Packer invoker template differs from its exact immutable object version/u);
+  assert.match(wrapper, /immutable template-upload receipt is malformed/u);
+  assert.match(wrapper, /immutable change-set receipt is malformed/u);
+  assert.match(wrapper, /immutable JSON evidence is not exact canonical JSON plus one newline/u);
   assert.doesNotMatch(wrapper, /dnf download|reposync|curl|wget/iu);
 });
 
@@ -186,7 +432,8 @@ test('wrapper verifies under the exact invoker then gives Packer only exact shor
   assert.match(wrapper, /export AWS_SECRET_ACCESS_KEY=/u);
   assert.match(wrapper, /export AWS_SESSION_TOKEN=/u);
   assert.match(wrapper, /assumed-role\/layrs-production-recovery-seq159300-packer-control\/layrs-seq159300-packer/u);
-  assert.match(wrapper, /verify_immutable_package_objects\s*\n\s*assume_packer_control_role/u);
+  assert.match(wrapper,
+    /verify_immutable_package_objects\s*\n\s*verify_builder_contract_objects\s*\n\s*verify_cleanup_contract_object\s*\n\s*verify_publication_evidence_objects\s*\n\s*assume_packer_control_role/u);
   assert.match(wrapper, /run_aws_preflight\s*\n\s*\[\[ -n "\$\{PACKER_BINARY\}"/u);
   assert.doesNotMatch(wrapper, /LAYRS_RECOVERY_PACKER_CALLER_ROLE_ARN/u);
 });
@@ -290,11 +537,42 @@ test('renderer rejects swapped artifacts and recovery bindings', () => {
     { sourceCommit: '2'.repeat(40) },
     { builderSourceCommit: SOURCE_COMMIT },
     { implementationCommit: 'not-a-commit' },
+    { phase2TemplateCommit: '0'.repeat(40) },
     { nitroCliRpmSha384: '0'.repeat(95) },
     { phase2EvidenceObjectKey: '../mutable.json' },
     { remediationIndexObjectVersionId: 'different' },
     { packerAmazonPluginSourceCommit: '0'.repeat(40) },
     { builderTemplateEvidenceSha384: '0'.repeat(96) },
+    { builderTemplateSha384: '0'.repeat(96) },
+    { packerInvokerTemplateSha384: '0'.repeat(96) },
+    { packerInvokerEvidenceSha384: '0'.repeat(96) },
+    { publisherTemplateSha384: '0'.repeat(96) },
+    { publisherTemplateEvidenceSha384: '0'.repeat(96) },
+    { cleanupTemplateSha384: '0'.repeat(96) },
+    { cleanupTemplateEvidenceSha384: '0'.repeat(96) },
+    { cleanupExecutionRoleInventorySha384: 'e'.repeat(96) },
+    { cleanupExecutionRoleInventoryObjectKey:
+      `evidence/seq159300/recovery-only/phase2/builder/cleanup/roles/cleanup-execution/inventory/${'6'.repeat(40)}-${'4'.repeat(96)}.json` },
+    { cleanupSubmitterRoleInventoryObjectVersionId: 'short' },
+    { trustedPrincipalInventorySha384: 'd'.repeat(96) },
+    { cleanupTemplateEvidenceObjectVersionId: 'short' },
+    { templatePublisherRoleInventorySha384: '0'.repeat(95) },
+    { templatePublisherRoleInventoryObjectKey:
+      'evidence/seq159300/recovery-only/phase2/builder/publisher/roles/template-publisher/inventory/mutable.json' },
+    { cloudFormationExecutionRoleInventoryObjectVersionId: 'short' },
+    { cloudFormationExecutionRoleInventorySha384: '5'.repeat(96) },
+    { cloudFormationExecutionRoleInventorySha384: '0'.repeat(95) },
+    { templateUploadReceiptObjectKey: '../mutable-upload.json' },
+    { changeSetReceiptObjectVersionId: 'short' },
+    { packerControlPlaneExpiresAt: '2026-08-24T04:00:01Z' },
+    { invokerApprovedAt: '2026-08-24T03:31:00Z' },
+    { templatePublisherApprovedAt: '2026-08-24T02:50:00.000Z' },
+    { buildCompletedAt: '2026-08-24T03:30:00.000Z' },
+    {
+      changeSetReceiptObjectKey:
+        'evidence/seq159300/recovery-only/phase2/builder/publisher/receipts/template-upload.json',
+      changeSetReceiptObjectVersionId: 'template.upload.receipt.version.1',
+    },
     { accountId: '111111111111' },
     { region: 'eu-west-1' },
   ]) {
@@ -335,8 +613,179 @@ test('renderer rejects extra fields and noncanonical timestamps', () => {
     /field set is invalid/u,
   );
   assert.throws(
-    () => renderRecoveryParentBuildEvidence(validEvidence({ buildCompletedAt: '2026-08-24T03:30:00Z' })),
+    () => renderRecoveryParentBuildEvidence(validEvidence({ buildCompletedAt: '2026-08-24T03:30:00.000Z' })),
     /binding is invalid/u,
+  );
+});
+
+test('post-build cleanup renderer binds retained artifacts and exact structured absence', () => {
+  const evidence = validPostBuildCleanupEvidence();
+  const rendered = renderRecoveryParentPostBuildCleanupEvidence(evidence);
+  assert.equal(rendered.toString('utf8'), canonicalJson(evidence));
+  assert.equal(rendered.at(-1), '}'.charCodeAt(0));
+  assert.equal(JSON.parse(rendered).phase4Authorized, false);
+  assert.match(runbook, /ListAttachedRolePolicies/u);
+  assert.match(runbook, /ListInstanceProfilesForRole/u);
+  assert.match(runbook, /zero attached instance profiles/u);
+  assert.match(runbook, /\$metadata\.requestId/u);
+  assert.match(runbook, /Parsing `aws --debug` stderr/u);
+  assert.match(runbook, /`\$metadata\.httpStatusCode` values of 400 and 404/u);
+  assert.match(runbook, /ordered per-resource deletion/u);
+  assert.match(runbook, /cleanup\s+authority deletion last/u);
+  assert.match(runbook, /not counts or booleans/u);
+  assert.match(runbook, /layrs\.seq159300\.recovery-builder-cleanup-execution-receipt\.v2/u);
+  assert.match(runbook, /The only order is builder, invoker, template-publisher/u);
+  assert.match(runbook, /`cleanup-authority` is not an accepted alias/u);
+  assert.match(runbook, /`completedAt` equals the final builder-cleanup/u);
+  assert.match(runbook, /`physicalInventorySha384` must equal/u);
+  assert.match(runbook, /`deleteCallCount` \(`1`\)/u);
+  assert.match(runbook, /must\s+equal the final evidence's exact assumed-finalizer identity/u);
+  assert.match(runbook, /cleanup\/receipts\/<cleanupImplementationCommit>-<cleanupIntentSha384>\.json/u);
+  assert.match(runbook, /Finalizer creation must not require or read/u);
+  assert.match(runbook, /inside one process that deployer then role-chains/u);
+  assert.match(runbook, /runner cannot directly assume/u);
+  assert.match(runbook, /never\s+serializes\s+their credentials/u);
+  assert.match(runbook, /that same finalizer\s+session render[\s\S]*create-only upload/u);
+  assert.match(runbook, /reuse the same finalizer SDK absence calls/u);
+  assert.match(runbook, /map one-for-one/u);
+  assert.match(runbook, /A fresh or differing absence ID is\s+rejected/u);
+  assert.match(runbook, /three stable output keys/u);
+  assert.match(runbook, /must not alias\s+any structured absence request ID/u);
+  assert.match(runbook, /alternates two exact temporary principals through the bound/u);
+  assert.match(runbook, /absenceVerifiedAt` is less than or equal/u);
+  assert.match(runbook, /Single ambient-role execution/u);
+  assert.match(runbook, /post-hoc finalizer reread/u);
+  assert.match(runbook, /durationSeconds/u);
+  assert.match(runbook, /min\(roleExpiresAt, deployerSessionExpiresAt\) - preCallNow/u);
+  assert.match(runbook, /does not recompute that request/u);
+  assert.match(runbook, /Fewer than 900 safe/u);
+  assert.match(runbook, /maximum expiry across every parent-bound temporary/u);
+  assert.match(runbook, /never proves already issued STS credentials revoked/u);
+  assert.match(runbook, /runnerIdentity/u);
+  assert.match(runbook, /productionDeployerIdentity/u);
+  assert.match(runbook, /AssumeExactSeq159300CleanupSubmitter/u);
+  assert.match(runbook, /AssumeExactSeq159300Finalizer/u);
+  assert.match(runbook, /cleanupSubmitterExternalId/u);
+  assert.match(runbook, /finalizer ExternalId is exactly `cleanupIntentSha384`/u);
+  assert.match(runbook, /Both temporary session expirations must be no/u);
+  assert.doesNotMatch(runbook, /finalizer has sole trust in that runner/u);
+});
+
+test('post-build cleanup renderer fails closed on replay, drift and Phase4 substitution', () => {
+  const base = validPostBuildCleanupEvidence();
+  const missingNamedResource = base.exactAbsenceInventory.filter(value =>
+    value.resourceId !== 'layrs-production-recovery-seq159300-packer-control');
+  const missingFinalizerGuard = base.exactAbsenceInventory.filter(value =>
+    !value.resourceId.endsWith('layrs-production-recovery-seq159300-finalizer-window-guard'));
+  const unreviewedAuthority = [...base.exactAbsenceInventory, {
+    requestId: 'request-seq159300-unreviewed-role',
+    resourceId: 'layrs-production-recovery-seq159300-unreviewed-role',
+    resourceType: 'iam-role', serviceErrorCode: 'NoSuchEntityException',
+  }].sort((left, right) => `${left.resourceType}\0${left.resourceId}`.localeCompare(`${right.resourceType}\0${right.resourceId}`));
+  const duplicateRequestId = base.exactAbsenceInventory.map((value, index) => index === 1
+    ? { ...value, requestId: base.exactAbsenceInventory[0].requestId } : value);
+  const publicationRequestIdAlias = base.exactAbsenceInventory.map((value, index) => index === 0
+    ? { ...value, requestId: base.postBuildPublisherRoleInventoryUploadRequestId } : value);
+  let replacedIamCode = false;
+  const cliIamCode = base.exactAbsenceInventory.map(value => {
+    if (!replacedIamCode && value.resourceType === 'iam-role') {
+      replacedIamCode = true;
+      return { ...value, serviceErrorCode: 'NoSuchEntity' };
+    }
+    return value;
+  });
+  const stackCodeForChangeSet = base.exactAbsenceInventory.map(value =>
+    value.resourceType === 'cloudformation-change-set'
+      ? { ...value, serviceErrorCode: 'ValidationError' } : value);
+  for (const invalid of [
+    { phase4Authorized: true },
+    { cleanupImplementationCommit: 'not-a-commit' },
+    { cleanupImplementationCommit: '0'.repeat(40) },
+    { cleanupTemplateEvidenceSha384: '0'.repeat(96) },
+    { postBuildEvidencePublisherTemplateSha384: '0'.repeat(96) },
+    { finalizerTemplateEvidenceSha384: '0'.repeat(96) },
+    { productionDeployerTemplateEvidenceSha384: '0'.repeat(96) },
+    { cleanupReceiptObjectVersionId: base.cleanupIntentObjectVersionId,
+      cleanupReceiptObjectKey: base.cleanupIntentObjectKey },
+    { cleanupReceiptObjectKey:
+      'evidence/seq159300/recovery-only/phase2/builder/cleanup/receipts/cleanup.json' },
+    { postBuildEvidencePublisherTemplateObjectKey:
+      'evidence/seq159300/recovery-only/phase2/builder/cleanup/publisher/templates/mutable.yml' },
+    { finalizerTemplateEvidenceObjectKey:
+      'evidence/seq159300/recovery-only/phase2/builder/cleanup/finalizer/templates/mutable.yml' },
+    { finalizerRoleInventoryObjectKey:
+      'evidence/seq159300/recovery-only/phase2/builder/cleanup/finalizer/inventory/mutable.json' },
+    { finalizerRoleInventoryObjectVersionId: base.finalizerTemplateEvidenceObjectVersionId },
+    { productionDeployerTemplateEvidenceObjectKey:
+      'evidence/seq159300/recovery-only/phase2/builder/cleanup/finalizer/deployer/templates/mutable.yml' },
+    { productionDeployerRoleInventoryObjectKey:
+      'evidence/seq159300/recovery-only/phase2/builder/cleanup/finalizer/deployer/inventory/mutable.json' },
+    { retainedFinalizerStackInventoryObjectKey:
+      'evidence/seq159300/recovery-only/phase2/builder/cleanup/finalizer/stack-inventory/mutable.json' },
+    { finalizerExpiresAt: '2026-08-24T09:00:00Z' },
+    { finalizerApprovedAt: '2026-08-24T08:01:00Z' },
+    { cleanupExpiresAt: '2026-08-24T08:57:00Z' },
+    { cleanupSubmitterSession: { ...base.cleanupSubmitterSession,
+      expiresAt: '2026-08-24T08:55:00Z' } },
+    { cleanupSubmitterSession: { ...base.cleanupSubmitterSession,
+      durationSeconds: 899, expiresAt: '2026-08-24T08:10:59Z' } },
+    { cleanupSubmitterExternalId: base.cleanupIntentSha384 },
+    { cleanupSubmitterExternalId: 'A'.repeat(96) },
+    { cleanupExecutionRoleInventoryObjectKey:
+      'evidence/seq159300/recovery-only/phase2/builder/cleanup/roles/cleanup-execution/inventory/mutable.json' },
+    { cleanupSubmitterRoleInventorySha384: base.cleanupExecutionRoleInventorySha384 },
+    { cleanupExecutionRoleInventorySha384: base.finalizerRoleInventorySha384 },
+    { postBuildPublisherRoleInventoryObjectKey:
+      'evidence/seq159300/recovery-only/phase2/builder/cleanup/roles/post-build-evidence-publisher/inventory/mutable.json' },
+    { postBuildPublisherRoleInventorySha384: base.finalizerRoleInventorySha384 },
+    { postBuildPublisherRoleInventoryUploadRequestId:
+      base.postBuildPublisherRoleInventoryReadbackRequestId },
+    { postBuildPublisherRoleInventoryUploadedAt: '2026-08-24T07:58:59Z' },
+    { postBuildPublisherRoleInventoryReadbackVerifiedAt: '2026-08-24T08:00:01Z' },
+    { postBuildPublisherRoleInventoryUploadedAt: '2026-08-24T07:59:20.000Z' },
+    { verifiedAt: '2026-08-24T08:00:00.000Z' },
+    { finalizerSession: { ...base.finalizerSession,
+      issuedAt: '2026-08-24T08:01:00Z' } },
+    { postBuildPublisherExpiresAt: '2026-08-24T08:51:00Z' },
+    { verifierRoleInventorySha384: 'c'.repeat(96) },
+    { trustedPrincipalInventorySha384: base.finalizerRoleInventorySha384 },
+    { productionDeployerRoleInventorySha384: base.finalizerRoleInventorySha384 },
+    { productionDeployerRoleInventorySha384: base.trustedPrincipalInventorySha384 },
+    { retainedSnapshotInventory: [] },
+    { retainedEvidenceInventory: base.retainedEvidenceInventory.slice(1) },
+    { exactAbsenceInventory: missingNamedResource,
+      exactAbsenceInventorySha384: createHash('sha384').update(canonicalJson(missingNamedResource)).digest('hex') },
+    { exactAbsenceInventory: missingFinalizerGuard,
+      exactAbsenceInventorySha384: createHash('sha384').update(canonicalJson(missingFinalizerGuard)).digest('hex') },
+    { exactAbsenceInventory: unreviewedAuthority,
+      exactAbsenceInventorySha384: createHash('sha384').update(canonicalJson(unreviewedAuthority)).digest('hex') },
+    { exactAbsenceInventory: duplicateRequestId,
+      exactAbsenceInventorySha384: createHash('sha384').update(canonicalJson(duplicateRequestId)).digest('hex') },
+    { exactAbsenceInventory: publicationRequestIdAlias,
+      exactAbsenceInventorySha384:
+        createHash('sha384').update(canonicalJson(publicationRequestIdAlias)).digest('hex') },
+    { exactAbsenceInventory: cliIamCode,
+      exactAbsenceInventorySha384: createHash('sha384').update(canonicalJson(cliIamCode)).digest('hex') },
+    { exactAbsenceInventory: stackCodeForChangeSet,
+      exactAbsenceInventorySha384: createHash('sha384').update(canonicalJson(stackCodeForChangeSet)).digest('hex') },
+    { exactAbsenceInventorySha384: '0'.repeat(96) },
+    { verifierIdentity: { ...base.verifierIdentity,
+      arn: 'arn:aws:sts::082223548516:assumed-role/Admin/session1' } },
+    { verifierIdentity: { ...base.verifierIdentity,
+      principalId: 'AROABCDEFGHIJKLMNOP:different-session' } },
+    { cleanupSubmitterIdentity: { ...base.cleanupSubmitterIdentity,
+      arn: 'arn:aws:sts::082223548516:assumed-role/Admin/cleanup1' } },
+    { runnerIdentity: { ...base.runnerIdentity,
+      arn: 'arn:aws:sts::082223548516:assumed-role/Admin/runner1' } },
+    { productionDeployerIdentity: { ...base.productionDeployerIdentity,
+      arn: 'arn:aws:sts::082223548516:assumed-role/Admin/deployer1' } },
+    { productionDeployerSession: { ...base.productionDeployerSession,
+      durationSeconds: 899, expiresAt: '2026-08-24T08:08:59Z' } },
+    { productionDeployerSession: { ...base.productionDeployerSession,
+      expiresAt: '2026-08-24T08:53:00Z' } },
+  ]) assert.throws(
+    () => renderRecoveryParentPostBuildCleanupEvidence(validPostBuildCleanupEvidence(invalid)),
+    /invalid|malformed|incomplete|omits|empty|outside|unique|unreviewed/u,
   );
 });
 
@@ -494,12 +943,55 @@ function validPackerControlRoleEnvelope() {
   const expiresAt = '2026-08-24T04:00:00Z';
   const invokerArn = 'arn:aws:iam::082223548516:role/layrs-production-recovery-seq159300-reviewer';
   const roleName = 'layrs-production-recovery-seq159300-packer-control';
+  const inventoryDocument = {
+    Version: '2012-10-17', Statement: [{
+      Sid: 'DescribeExactRecoveryBuildBoundary', Effect: 'Allow',
+      Action: [
+        'ec2:DescribeAccountAttributes', 'ec2:DescribeAvailabilityZones', 'ec2:DescribeImages',
+        'ec2:DescribeImageAttribute', 'ec2:DescribeInstances', 'ec2:DescribeInstanceStatus',
+        'ec2:DescribeInstanceTypeOfferings', 'ec2:DescribeKeyPairs', 'ec2:DescribeNetworkInterfaces',
+        'ec2:DescribeRegions', 'ec2:DescribeRouteTables', 'ec2:DescribeSecurityGroups',
+        'ec2:DescribeSnapshots', 'ec2:DescribeSubnets', 'ec2:DescribeTags',
+        'ec2:DescribeVolumes', 'ec2:DescribeVolumeStatus', 'ec2:DescribeVpcEndpoints',
+        'ec2:DescribeVpcs', 'ssm:DescribeInstanceInformation',
+      ], Resource: '*', Condition: { DateLessThan: { 'aws:CurrentTime': expiresAt } },
+    }],
+  };
+  const launchDocument = { Version: '2012-10-17', Statement: [{
+    Sid: 'RunExactRecoveryInstance', Effect: 'Allow', Action: 'ec2:RunInstances',
+    Resource: 'arn:aws:ec2:us-east-1:082223548516:instance/*',
+    Condition: { DateLessThan: { 'aws:CurrentTime': expiresAt } },
+  }] };
+  const artifactDocument = { Version: '2012-10-17', Statement: [{
+    Sid: 'BuildPrivateRecoveryImage', Effect: 'Allow', Action: 'ec2:CreateImage',
+    Resource: 'arn:aws:ec2:us-east-1:082223548516:instance/*',
+    Condition: { DateLessThan: { 'aws:CurrentTime': expiresAt } },
+  }] };
+  const managedPolicy = (suffix, document) => ({
+    arn: `arn:aws:iam::082223548516:policy/layrs-production-recovery-seq159300-packer-${suffix}`,
+    defaultVersionId: 'v1', document,
+    name: `layrs-production-recovery-seq159300-packer-${suffix}`,
+    sha384: createHash('sha384').update(canonicalJson(document)).digest('hex'),
+  });
+  const attachedPolicies = [
+    managedPolicy('artifacts', artifactDocument), managedPolicy('inventory', inventoryDocument),
+    managedPolicy('launch', launchDocument),
+  ];
+  const artifactPolicySha384 = attachedPolicies[0].sha384;
+  const inventoryPolicySha384 = attachedPolicies[1].sha384;
+  const launchPolicySha384 = attachedPolicies[2].sha384;
   const tags = [
     ['Name', roleName], ['Application', 'layrs'], ['Environment', 'production'],
     ['Purpose', 'seq159300-recovery-ami-build-control'], ['RecoverySourceCommit', SOURCE_COMMIT],
     ['BuilderTemplateSha384', SHA384], ['OfflinePackageSetSha384', SHA384],
     ['OfflinePackageClosureSha384', SHA384], ['EvidenceIndexSha384', SHA384],
-    ['InvokerRoleInventorySha384', SHA384],
+    ['InvokerRoleInventorySha384', SHA384], ['InvokerTemplateSha384', SHA384],
+    ['InvokerEvidenceSha384', SHA384], ['PackerAmazonPluginVersion', '1.3.9'],
+    ['PackerAmazonPluginCommit', '2a769c39a05940e25143098f071490732fa24f4f'],
+    ['Phase2RecoveryTemplateSha384', SHA384],
+    ['PackerInventoryPolicySha384', inventoryPolicySha384],
+    ['PackerLaunchPolicySha384', launchPolicySha384],
+    ['PackerArtifactPolicySha384', artifactPolicySha384],
   ].map(([Key, Value]) => ({ Key, Value }));
   const trust = {
     Version: '2012-10-17', Statement: [{
@@ -514,10 +1006,6 @@ function validPackerControlRoleEnvelope() {
   };
   const document = {
     Version: '2012-10-17', Statement: [{
-      Sid: 'DescribeExactRecoveryBuildBoundary', Effect: 'Allow',
-      Action: ['ec2:DescribeImages'], Resource: '*',
-      Condition: { DateLessThan: { 'aws:CurrentTime': expiresAt } },
-    }, {
       Sid: 'DenyBeforeExactApproval', Effect: 'Deny', Action: '*', Resource: '*',
       Condition: { DateLessThan: { 'aws:CurrentTime': approvedAt } },
     }, {
@@ -532,13 +1020,41 @@ function validPackerControlRoleEnvelope() {
     PackerControlPlaneMaxLifetimeSeconds: '3600',
     PackerControlPlaneRoleArn: `arn:aws:iam::082223548516:role/${roleName}`,
     PackerInvokerRoleArn: invokerArn, PackerInvokerRoleInventorySha384: SHA384,
+    PackerInvokerTemplateSha384: SHA384, PackerInvokerEvidenceSha384: SHA384,
+    PackerAmazonPluginVersion: '1.3.9',
+    PackerAmazonPluginSourceCommit: '2a769c39a05940e25143098f071490732fa24f4f',
+    PackerControlInventoryPolicyArn: attachedPolicies[1].arn,
+    PackerControlInventoryPolicySha384: inventoryPolicySha384,
+    PackerControlLaunchPolicyArn: attachedPolicies[2].arn,
+    PackerControlLaunchPolicySha384: launchPolicySha384,
+    PackerControlArtifactPolicyArn: attachedPolicies[0].arn,
+    PackerControlArtifactPolicySha384: artifactPolicySha384,
+    Phase2RecoveryTemplateSha384: SHA384,
   };
   return { kind: 'packer-control-role', payload: {
-    approvedAt, attachedPolicies: [], builderEvidenceIndexSha384: SHA384,
+    approvedAt, attachedPolicies, builderEvidenceIndexSha384: SHA384,
     builderTemplateSha384: SHA384, evaluatedAt: '2026-08-24T03:30:00Z',
     expectedInvokerRoleArn: invokerArn, expiresAt, inlinePolicies: [{ name: roleName, document }],
     invokerRoleInventorySha384: SHA384, offlinePackageClosureSha384: SHA384,
-    offlinePackageSetSha384: SHA384,
+    offlinePackageSetSha384: SHA384, packerInvokerTemplateSha384: SHA384,
+    packerInvokerEvidenceSha384: SHA384, packerAmazonPluginVersion: '1.3.9',
+    packerAmazonPluginSourceCommit: '2a769c39a05940e25143098f071490732fa24f4f',
+    packerControlInventoryPolicySha384: inventoryPolicySha384,
+    packerControlLaunchPolicySha384: launchPolicySha384,
+    packerControlArtifactPolicySha384: artifactPolicySha384,
+    phase2TemplateSha384: SHA384,
+    publisherTemplateObjectKey:
+      `evidence/seq159300/recovery-only/phase2/builder/publisher/layrs-seq159300-recovery-template-publisher-${'4'.repeat(96)}.yml`,
+    publisherTemplateObjectVersionId: 'publisher.template.version.1',
+    publisherTemplateSha384: '4'.repeat(96),
+    templateUploadReceiptObjectKey:
+      'evidence/seq159300/recovery-only/phase2/builder/publisher/receipts/template-upload.json',
+    templateUploadReceiptObjectVersionId: 'template.upload.receipt.version.1',
+    templateUploadReceiptSha384: '7'.repeat(96),
+    changeSetReceiptObjectKey:
+      'evidence/seq159300/recovery-only/phase2/builder/publisher/receipts/change-set.json',
+    changeSetReceiptObjectVersionId: 'change.set.receipt.version.1',
+    changeSetReceiptSha384: '8'.repeat(96),
     roleResponse: { Role: {
       Arn: `arn:aws:iam::082223548516:role/${roleName}`, AssumeRolePolicyDocument: trust,
       MaxSessionDuration: 3600, Path: '/', RoleName: roleName, Tags: tags,
@@ -580,6 +1096,112 @@ function validPackageSetEnvelope() {
   } };
 }
 
+function validPublicationEvidenceEnvelope() {
+  const builderKey = `evidence/seq159300/recovery-only/phase2/builder/templates/layrs-seq159300-recovery-builder-${SHA384}.yml`;
+  const builderVersion = 'builder.template.version.1';
+  const bucket = 'layrs-production-082223548516-us-east-1-immutable';
+  const policyHash = document => createHash('sha384').update(canonicalJson(document)).digest('hex');
+  const inlineDocument = { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: 'ec2:DescribeVpcs', Resource: '*' }] };
+  const managed = [
+    'layrs-production-recovery-seq159300-cfn-core-network',
+    'layrs-production-recovery-seq159300-cfn-endpoints',
+    'layrs-production-recovery-seq159300-cfn-mutation',
+  ].map((name, index) => {
+    const document = { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: `ec2:Test${index}`, Resource: '*' }] };
+    return { arn: `arn:aws:iam::082223548516:policy/${name}`, defaultVersionId: 'v1', document,
+      name, sha384: policyHash(document) };
+  });
+  const executionPolicies = { inline: { document: inlineDocument,
+    name: 'layrs-seq159300-exact-builder-stack-base', sha384: policyHash(inlineDocument) }, managed };
+  const executionPolicySha384 = policyHash(executionPolicies);
+  return { kind: 'publication-evidence', payload: {
+    builderTemplateObjectKey: builderKey,
+    builderTemplateObjectVersionId: builderVersion,
+    builderTemplateSha384: SHA384,
+    publisherTemplateObjectKey:
+      `evidence/seq159300/recovery-only/phase2/builder/publisher/layrs-seq159300-recovery-template-publisher-${'4'.repeat(96)}.yml`,
+    publisherTemplateObjectVersionId: 'publisher.template.version.1',
+    publisherTemplateSha384: '4'.repeat(96),
+    publisherRoleInventorySha384: '5'.repeat(96),
+    cloudFormationExecutionRoleInventorySha384: '6'.repeat(96),
+    templateUploadReceipt: {
+      protocol: 'layrs.seq159300.recovery-builder-template-upload-receipt.v1',
+      accountId: '082223548516', region: 'us-east-1', bucket,
+      objectKey: builderKey, objectVersionId: builderVersion, objectSha384: SHA384,
+      bucketControlsSha384: 'e'.repeat(96), bucketKeyEnabled: false, createOnly: true,
+      kmsKeyArn: 'arn:aws:kms:us-east-1:082223548516:key/11111111-2222-3333-4444-555555555555',
+      retainUntil: '2026-09-24T00:00:00Z',
+      publisherPolicySha384: '7'.repeat(96), publisherRoleInventorySha384: '5'.repeat(96),
+      bucketPolicySha384: 'c'.repeat(96), kmsKeyPolicySha384: 'd'.repeat(96),
+      publisherTemplateObject: {
+        bucket,
+        key: `evidence/seq159300/recovery-only/phase2/builder/publisher/layrs-seq159300-recovery-template-publisher-${'4'.repeat(96)}.yml`,
+        versionId: 'publisher.template.version.1', sha384: '4'.repeat(96),
+      },
+    },
+    changeSetReceipt: {
+      protocol: 'layrs.seq159300.recovery-builder-change-set-receipt.v1',
+      accountId: '082223548516', region: 'us-east-1',
+      templateObject: { bucket, key: builderKey, versionId: builderVersion, sha384: SHA384 },
+      kms: { keyArn: 'arn:aws:kms:us-east-1:082223548516:key/11111111-2222-3333-4444-555555555555', bucketKeyEnabled: false },
+      templateUrl: `https://${bucket}.s3.us-east-1.amazonaws.com/${builderKey}?versionId=${builderVersion}`,
+      publisherRoleArn: 'arn:aws:iam::082223548516:role/layrs-production-recovery-seq159300-template-publisher',
+      executionRoleArn: 'arn:aws:iam::082223548516:role/layrs-production-recovery-seq159300-cloudformation-execution',
+      publisherPolicySha384: '7'.repeat(96),
+      cloudFormationExecutionPolicies: executionPolicies,
+      cloudFormationExecutionPolicySha384: executionPolicySha384,
+      publisherRoleInventorySha384: '5'.repeat(96),
+      cloudFormationExecutionRoleInventorySha384: '6'.repeat(96),
+      bucketControlsSha384: 'e'.repeat(96), bucketPolicySha384: 'c'.repeat(96),
+      kmsKeyPolicySha384: 'd'.repeat(96),
+      publisherTemplateObject: {
+        bucket,
+        key: `evidence/seq159300/recovery-only/phase2/builder/publisher/layrs-seq159300-recovery-template-publisher-${'4'.repeat(96)}.yml`,
+        versionId: 'publisher.template.version.1', sha384: '4'.repeat(96),
+      },
+      parameters: {
+        BuilderTemplateEvidenceObjectKey: builderKey,
+        BuilderTemplateEvidenceObjectVersionId: builderVersion,
+        BuilderTemplateEvidenceSha384: SHA384,
+        BuilderTemplateSha384: SHA384,
+      },
+      parametersSha384: '61c87e4c37006002a03addb662390ef6036c18a0d1acef6de4b16a4287fd726ae6ff7f9a4a6668b29faadbe2e50f10ea',
+      validationSha384: 'a'.repeat(96),
+      changeSetId: `arn:aws:cloudformation:us-east-1:082223548516:changeSet/layrs-seq159300-builder-${SHA384.slice(0, 12)}/11111111-2222-3333-4444-555555555555`,
+      changeSetName: `layrs-seq159300-builder-${SHA384.slice(0, 12)}`,
+      changeSetStatus: 'CREATE_COMPLETE', executionStatus: 'AVAILABLE', stable: true,
+      changesSha384: 'b'.repeat(96), executed: false,
+    },
+  } };
+}
+
+test('publication evidence binds exact immutable template and unexecuted receipts', () => {
+  const output = validatePreflight(validPublicationEvidenceEnvelope());
+  assert.equal(output.changeSetReceipt.executed, false);
+  for (const mutate of [
+    envelope => { envelope.payload.templateUploadReceipt.objectVersionId = 'substituted.version'; },
+    envelope => { envelope.payload.changeSetReceipt.executed = true; },
+    envelope => { envelope.payload.changeSetReceipt.changeSetStatus = 'CREATE_IN_PROGRESS'; },
+    envelope => { envelope.payload.changeSetReceipt.executionStatus = 'UNAVAILABLE'; },
+    envelope => { envelope.payload.changeSetReceipt.changeSetName = 'layrs-seq159300-builder-000000000000'; },
+    envelope => { envelope.payload.changeSetReceipt.parametersSha384 = '0'.repeat(96); },
+    envelope => { envelope.payload.changeSetReceipt.parameters.BuilderTemplateSha384 = '0'.repeat(96); },
+    envelope => { envelope.payload.changeSetReceipt.bucketControlsSha384 = '0'.repeat(96); },
+    envelope => { envelope.payload.changeSetReceipt.cloudFormationExecutionPolicies.managed[0].document.Statement[0].Action = '*'; },
+    envelope => { envelope.payload.changeSetReceipt.publisherRoleArn
+      = 'arn:aws:iam::082223548516:role/other'; },
+    envelope => { envelope.payload.changeSetReceipt.templateObject.sha384 = '0'.repeat(96); },
+    envelope => { envelope.payload.publisherRoleInventorySha384 = '0'.repeat(95); },
+    envelope => { envelope.payload.cloudFormationExecutionRoleInventorySha384
+      = envelope.payload.publisherRoleInventorySha384; },
+    envelope => { envelope.payload.changeSetReceipt.secret = 'forbidden'; },
+  ]) {
+    const envelope = validPublicationEvidenceEnvelope();
+    mutate(envelope);
+    assert.throws(() => validatePreflight(envelope));
+  }
+});
+
 test('offline Nitro manifest binds the exact signed dependency closure', () => {
   const output = validatePreflight(validPackageSetEnvelope());
   assert.equal(output.packages.length, 2);
@@ -611,6 +1233,9 @@ test('Packer control-role preflight binds exact trust, policy, tags, boundary an
       .Condition.DateGreaterThanEquals['aws:CurrentTime'] = '2026-08-24T02:59:59Z'; },
     envelope => { envelope.payload.inlinePolicies[0].document.Statement[0]
       .Condition.DateLessThan['aws:CurrentTime'] = '2026-08-24T05:00:00Z'; },
+    envelope => { envelope.payload.attachedPolicies[1].document.Statement[0].Action
+      = envelope.payload.attachedPolicies[1].document.Statement[0].Action
+        .filter(action => action !== 'ec2:DescribeVpcEndpoints'); },
     envelope => { envelope.payload.inlinePolicies[0].document.Statement
       .find(statement => statement.Sid === 'DenyBeforeExactApproval')
       .Condition.DateLessThan['aws:CurrentTime'] = '2026-08-24T02:59:59Z'; },
@@ -618,6 +1243,13 @@ test('Packer control-role preflight binds exact trust, policy, tags, boundary an
     envelope => { envelope.payload.roleResponse.Role.Tags[0].Value = 'different'; },
     envelope => { envelope.payload.stackResponse.Stacks[0].Outputs
       .find(outputItem => outputItem.OutputKey === 'OfflinePackageClosureSha384').OutputValue = '4'.repeat(96); },
+    envelope => { envelope.payload.stackResponse.Stacks[0].Outputs
+      .find(outputItem => outputItem.OutputKey === 'Phase2RecoveryTemplateSha384').OutputValue = '4'.repeat(96); },
+    envelope => { envelope.payload.stackResponse.Stacks[0].Outputs
+      .find(outputItem => outputItem.OutputKey === 'PackerControlInventoryPolicySha384').OutputValue = '0'.repeat(96); },
+    envelope => { envelope.payload.roleResponse.Role.Tags
+      .find(tag => tag.Key === 'PackerArtifactPolicySha384').Value = '0'.repeat(96); },
+    envelope => { envelope.payload.changeSetReceiptObjectVersionId = 'short'; },
     envelope => { envelope.payload.stackResponse.Stacks[0].StackStatus = 'UPDATE_ROLLBACK_IN_PROGRESS'; },
     envelope => envelope.payload.stackResponse.Stacks[0].Outputs.push({
       OutputKey: 'BuilderTemplateSha384', OutputValue: SHA384,

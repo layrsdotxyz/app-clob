@@ -7,6 +7,17 @@ const ACCOUNT_ID = '082223548516';
 const REGION = 'us-east-1';
 const SOURCE_COMMIT = 'f282583cae7a5c873a26aa8d0c1bec10c490eb8e';
 const PACKER_CONTROL_ROLE_NAME = 'layrs-production-recovery-seq159300-packer-control';
+const PACKER_AMAZON_PLUGIN_VERSION = '1.3.9';
+const PACKER_AMAZON_PLUGIN_SOURCE_COMMIT = '2a769c39a05940e25143098f071490732fa24f4f';
+const PACKER_CONTROL_DESCRIBE_ACTIONS = Object.freeze([
+  'ec2:DescribeAccountAttributes', 'ec2:DescribeAvailabilityZones', 'ec2:DescribeImages',
+  'ec2:DescribeImageAttribute', 'ec2:DescribeInstances', 'ec2:DescribeInstanceStatus',
+  'ec2:DescribeInstanceTypeOfferings', 'ec2:DescribeKeyPairs', 'ec2:DescribeNetworkInterfaces',
+  'ec2:DescribeRegions', 'ec2:DescribeRouteTables', 'ec2:DescribeSecurityGroups',
+  'ec2:DescribeSnapshots', 'ec2:DescribeSubnets', 'ec2:DescribeTags',
+  'ec2:DescribeVolumes', 'ec2:DescribeVolumeStatus', 'ec2:DescribeVpcEndpoints',
+  'ec2:DescribeVpcs', 'ssm:DescribeInstanceInformation',
+]);
 const AMAZON_LINUX_SIGNING_KEY = Object.freeze({
   fingerprint: 'B21C50FA44A99720EAA72F7FE951904AD832C631',
   keyId: 'D832C631',
@@ -607,16 +618,49 @@ function validatePackerControlRole(input) {
   requireExactFields(input, [
     'approvedAt', 'attachedPolicies', 'builderEvidenceIndexSha384', 'builderTemplateSha384', 'evaluatedAt',
     'expectedInvokerRoleArn', 'expiresAt', 'inlinePolicies', 'invokerRoleInventorySha384',
-    'offlinePackageClosureSha384', 'offlinePackageSetSha384',
+    'offlinePackageClosureSha384', 'offlinePackageSetSha384', 'packerAmazonPluginSourceCommit',
+    'packerAmazonPluginVersion', 'packerControlArtifactPolicySha384',
+    'packerControlInventoryPolicySha384', 'packerControlLaunchPolicySha384',
+    'packerInvokerEvidenceSha384', 'packerInvokerTemplateSha384',
+    'phase2TemplateSha384', 'publisherTemplateObjectKey',
+    'publisherTemplateObjectVersionId', 'publisherTemplateSha384',
+    'templateUploadReceiptObjectKey', 'templateUploadReceiptObjectVersionId',
+    'templateUploadReceiptSha384', 'changeSetReceiptObjectKey',
+    'changeSetReceiptObjectVersionId', 'changeSetReceiptSha384',
     'roleResponse', 'stackResponse',
   ], 'Packer control role preflight');
   for (const [label, value] of [
     ['builder evidence index SHA384', input.builderEvidenceIndexSha384],
     ['builder template SHA384', input.builderTemplateSha384],
     ['Packer invoker-role inventory SHA384', input.invokerRoleInventorySha384],
+    ['Packer invoker template SHA384', input.packerInvokerTemplateSha384],
+    ['Packer invoker evidence SHA384', input.packerInvokerEvidenceSha384],
+    ['Phase-2 recovery template SHA384', input.phase2TemplateSha384],
+    ['publisher template SHA384', input.publisherTemplateSha384],
+    ['template-upload receipt SHA384', input.templateUploadReceiptSha384],
+    ['change-set receipt SHA384', input.changeSetReceiptSha384],
     ['offline package closure SHA384', input.offlinePackageClosureSha384],
     ['offline package-set SHA384', input.offlinePackageSetSha384],
+    ['Packer control inventory policy SHA384', input.packerControlInventoryPolicySha384],
+    ['Packer control launch policy SHA384', input.packerControlLaunchPolicySha384],
+    ['Packer control artifact policy SHA384', input.packerControlArtifactPolicySha384],
   ]) if (!sha384(value)) throw new Error(`${label} is malformed`);
+  for (const [label, key, version] of [
+    ['publisher template', input.publisherTemplateObjectKey, input.publisherTemplateObjectVersionId],
+    ['template-upload receipt', input.templateUploadReceiptObjectKey,
+      input.templateUploadReceiptObjectVersionId],
+    ['change-set receipt', input.changeSetReceiptObjectKey, input.changeSetReceiptObjectVersionId],
+  ]) {
+    if (!immutableKey(key) || !immutableVersion(version)
+        || !key.startsWith('evidence/seq159300/recovery-only/phase2/builder/publisher/')) {
+      throw new Error(`${label} immutable binding is malformed`);
+    }
+  }
+  if (input.packerAmazonPluginVersion !== PACKER_AMAZON_PLUGIN_VERSION
+      || input.packerAmazonPluginSourceCommit !== PACKER_AMAZON_PLUGIN_SOURCE_COMMIT
+      || input.packerInvokerEvidenceSha384 !== input.packerInvokerTemplateSha384) {
+    throw new Error('Packer plugin or invoker evidence binding is invalid');
+  }
   if (!/^arn:aws:iam::082223548516:role\/layrs-production-recovery-seq159300-[A-Za-z0-9+=,.@_-]{1,64}$/u
     .test(input.expectedInvokerRoleArn)) {
     throw new Error('Packer invoker role ARN is outside the exact recovery namespace');
@@ -656,9 +700,28 @@ function validatePackerControlRole(input) {
     throw new Error('Packer control role trust is not exact');
   }
 
-  if (!Array.isArray(input.attachedPolicies) || input.attachedPolicies.length !== 0
+  if (!Array.isArray(input.attachedPolicies) || input.attachedPolicies.length !== 3
       || !Array.isArray(input.inlinePolicies) || input.inlinePolicies.length !== 1) {
-    throw new Error('Packer control role must have exactly one inline policy and no managed policies');
+    throw new Error('Packer control role must have exactly three managed allows and one inline deny policy');
+  }
+  const expectedManaged = [
+    ['artifacts', input.packerControlArtifactPolicySha384],
+    ['inventory', input.packerControlInventoryPolicySha384],
+    ['launch', input.packerControlLaunchPolicySha384],
+  ];
+  for (const [index, policy] of input.attachedPolicies.entries()) {
+    requireExactFields(policy, ['arn', 'defaultVersionId', 'document', 'name', 'sha384'],
+      `Packer control managed policy ${index}`);
+    const [suffix, expectedSha384] = expectedManaged[index];
+    const expectedName = `layrs-production-recovery-seq159300-packer-${suffix}`;
+    if (policy.name !== expectedName
+        || policy.arn !== `arn:aws:iam::${ACCOUNT_ID}:policy/${expectedName}`
+        || !/^v[1-9][0-9]*$/u.test(policy.defaultVersionId)
+        || !policy.document || typeof policy.document !== 'object' || Array.isArray(policy.document)
+        || policy.sha384 !== expectedSha384
+        || digest('sha384', canonicalJson(policy.document)) !== expectedSha384) {
+      throw new Error('Packer control managed policy binding is invalid');
+    }
   }
   const inline = requireObject(input.inlinePolicies[0], 'Packer control inline policy');
   requireExactFields(inline, ['document', 'name'], 'Packer control inline policy');
@@ -670,7 +733,9 @@ function validatePackerControlRole(input) {
   }
   let approvalDenyCount = 0;
   let expiryDenyCount = 0;
-  for (const rawStatement of document.Statement) {
+  let exactDescribeCount = 0;
+  const policyDocuments = [document, ...input.attachedPolicies.map(policy => policy.document)];
+  for (const rawStatement of policyDocuments.flatMap(policy => policy.Statement ?? [])) {
     const statement = requireObject(rawStatement, 'Packer control policy statement');
     if (Object.hasOwn(statement, 'NotAction') || Object.hasOwn(statement, 'NotResource')) {
       throw new Error('Packer control policy NotAction or NotResource is forbidden');
@@ -678,6 +743,16 @@ function validatePackerControlRole(input) {
     if (statement.Effect === 'Allow'
         && conditionValue(statement, 'DateLessThan', 'aws:CurrentTime') !== input.expiresAt) {
       throw new Error('Packer control allow is not bounded by the exact expiry');
+    }
+    if (statement.Sid === 'DescribeExactRecoveryBuildBoundary') {
+      const actualActions = Array.isArray(statement.Action) ? [...statement.Action].sort() : [];
+      const expectedActions = [...PACKER_CONTROL_DESCRIBE_ACTIONS].sort();
+      if (statement.Effect !== 'Allow' || statement.Resource !== '*'
+          || actualActions.length !== expectedActions.length
+          || actualActions.some((action, index) => action !== expectedActions[index])) {
+        throw new Error('Packer control read-only preflight action set is not exact');
+      }
+      exactDescribeCount += 1;
     }
     if (statement.Sid === 'DenyAfterExactExpiry') {
       if (statement.Effect !== 'Deny' || statement.Action !== '*' || statement.Resource !== '*'
@@ -694,8 +769,8 @@ function validatePackerControlRole(input) {
       approvalDenyCount += 1;
     }
   }
-  if (approvalDenyCount !== 1 || expiryDenyCount !== 1) {
-    throw new Error('Packer control policy requires one exact approval deny and expiry deny');
+  if (approvalDenyCount !== 1 || expiryDenyCount !== 1 || exactDescribeCount !== 1) {
+    throw new Error('Packer control policy requires exact preflight, approval and expiry statements');
   }
 
   const stacks = requireObject(input.stackResponse, 'builder stack response').Stacks;
@@ -721,6 +796,20 @@ function validatePackerControlRole(input) {
     PackerControlPlaneRoleArn: exactRoleArn,
     PackerInvokerRoleArn: input.expectedInvokerRoleArn,
     PackerInvokerRoleInventorySha384: input.invokerRoleInventorySha384,
+    PackerInvokerTemplateSha384: input.packerInvokerTemplateSha384,
+    PackerInvokerEvidenceSha384: input.packerInvokerEvidenceSha384,
+    PackerAmazonPluginVersion: input.packerAmazonPluginVersion,
+    PackerAmazonPluginSourceCommit: input.packerAmazonPluginSourceCommit,
+    PackerControlInventoryPolicyArn:
+      `arn:aws:iam::${ACCOUNT_ID}:policy/layrs-production-recovery-seq159300-packer-inventory`,
+    PackerControlInventoryPolicySha384: input.packerControlInventoryPolicySha384,
+    PackerControlLaunchPolicyArn:
+      `arn:aws:iam::${ACCOUNT_ID}:policy/layrs-production-recovery-seq159300-packer-launch`,
+    PackerControlLaunchPolicySha384: input.packerControlLaunchPolicySha384,
+    PackerControlArtifactPolicyArn:
+      `arn:aws:iam::${ACCOUNT_ID}:policy/layrs-production-recovery-seq159300-packer-artifacts`,
+    PackerControlArtifactPolicySha384: input.packerControlArtifactPolicySha384,
+    Phase2RecoveryTemplateSha384: input.phase2TemplateSha384,
   };
   if (Object.entries(expectedOutputs).some(([key, value]) => outputs.get(key) !== value)) {
     throw new Error('builder stack outputs do not match the accepted Packer control evidence');
@@ -731,9 +820,17 @@ function validatePackerControlRole(input) {
     ['Environment', 'production'],
     ['EvidenceIndexSha384', input.builderEvidenceIndexSha384],
     ['InvokerRoleInventorySha384', input.invokerRoleInventorySha384],
+    ['InvokerTemplateSha384', input.packerInvokerTemplateSha384],
+    ['InvokerEvidenceSha384', input.packerInvokerEvidenceSha384],
     ['Name', PACKER_CONTROL_ROLE_NAME],
     ['OfflinePackageClosureSha384', input.offlinePackageClosureSha384],
     ['OfflinePackageSetSha384', input.offlinePackageSetSha384],
+    ['PackerAmazonPluginVersion', input.packerAmazonPluginVersion],
+    ['PackerAmazonPluginCommit', input.packerAmazonPluginSourceCommit],
+    ['PackerInventoryPolicySha384', input.packerControlInventoryPolicySha384],
+    ['PackerLaunchPolicySha384', input.packerControlLaunchPolicySha384],
+    ['PackerArtifactPolicySha384', input.packerControlArtifactPolicySha384],
+    ['Phase2RecoveryTemplateSha384', input.phase2TemplateSha384],
     ['Purpose', 'seq159300-recovery-ami-build-control'],
     ['RecoverySourceCommit', SOURCE_COMMIT],
   ].map(([key, value]) => ({ key, value })).sort((left, right) => left.key.localeCompare(right.key));
@@ -752,6 +849,172 @@ function validatePackerControlRole(input) {
     roleName: role.RoleName,
     tags,
     trust: role.AssumeRolePolicyDocument,
+  };
+}
+
+function validatePublicationEvidence(input) {
+  requireExactFields(input, [
+    'builderTemplateObjectKey', 'builderTemplateObjectVersionId', 'builderTemplateSha384',
+    'changeSetReceipt', 'cloudFormationExecutionRoleInventorySha384',
+    'publisherRoleInventorySha384', 'publisherTemplateObjectKey',
+    'publisherTemplateObjectVersionId', 'publisherTemplateSha384', 'templateUploadReceipt',
+  ], 'publisher evidence preflight');
+  for (const [label, value] of [
+    ['builder template SHA384', input.builderTemplateSha384],
+    ['publisher template SHA384', input.publisherTemplateSha384],
+    ['publisher role inventory SHA384', input.publisherRoleInventorySha384],
+    ['CloudFormation execution role inventory SHA384', input.cloudFormationExecutionRoleInventorySha384],
+  ]) if (!sha384(value)) throw new Error(`${label} is malformed`);
+  if (input.publisherRoleInventorySha384 === input.cloudFormationExecutionRoleInventorySha384) {
+    throw new Error('publisher and CloudFormation execution role inventories are conflated');
+  }
+  for (const [label, key, version] of [
+    ['builder template', input.builderTemplateObjectKey, input.builderTemplateObjectVersionId],
+    ['publisher template', input.publisherTemplateObjectKey, input.publisherTemplateObjectVersionId],
+  ]) {
+    if (!immutableKey(key) || !immutableVersion(version)
+        || !key.startsWith('evidence/seq159300/recovery-only/phase2/')) {
+      throw new Error(`${label} immutable reference is malformed`);
+    }
+  }
+
+  const upload = requireObject(input.templateUploadReceipt, 'template-upload receipt');
+  requireExactFields(upload, [
+    'accountId', 'bucket', 'bucketControlsSha384', 'bucketKeyEnabled', 'bucketPolicySha384',
+    'createOnly', 'kmsKeyArn', 'kmsKeyPolicySha384', 'objectKey', 'objectSha384',
+    'objectVersionId', 'protocol',
+    'publisherPolicySha384', 'publisherRoleInventorySha384', 'publisherTemplateObject',
+    'region', 'retainUntil',
+  ], 'template-upload receipt');
+  requireExactFields(upload.publisherTemplateObject, ['bucket', 'key', 'sha384', 'versionId'],
+    'template-upload publisher template');
+  if (upload.protocol !== 'layrs.seq159300.recovery-builder-template-upload-receipt.v1'
+      || upload.accountId !== ACCOUNT_ID || upload.region !== REGION
+      || upload.bucket !== 'layrs-production-082223548516-us-east-1-immutable'
+      || upload.objectKey !== input.builderTemplateObjectKey
+      || upload.objectVersionId !== input.builderTemplateObjectVersionId
+      || upload.objectSha384 !== input.builderTemplateSha384
+      || upload.bucketKeyEnabled !== false || upload.createOnly !== true
+      || upload.publisherRoleInventorySha384 !== input.publisherRoleInventorySha384
+      || canonicalJson(upload.publisherTemplateObject) !== canonicalJson({
+        bucket: upload.bucket, key: input.publisherTemplateObjectKey,
+        sha384: input.publisherTemplateSha384, versionId: input.publisherTemplateObjectVersionId,
+      })
+      || !sha384(upload.publisherPolicySha384) || !sha384(upload.bucketControlsSha384)
+      || !sha384(upload.bucketPolicySha384)
+      || !sha384(upload.kmsKeyPolicySha384)
+      || !/^arn:aws:kms:us-east-1:082223548516:key\/[0-9a-f-]{36}$/u.test(upload.kmsKeyArn)
+      || !Number.isFinite(isoTime(upload.retainUntil, 'template-upload retention'))) {
+    throw new Error('template-upload receipt is not bound to the exact immutable builder template');
+  }
+
+  const changeSet = requireObject(input.changeSetReceipt, 'change-set receipt');
+  requireExactFields(changeSet, [
+    'accountId', 'bucketControlsSha384', 'bucketPolicySha384', 'changeSetId', 'changeSetName',
+    'changeSetStatus', 'changesSha384', 'cloudFormationExecutionPolicies',
+    'cloudFormationExecutionPolicySha384', 'executed', 'executionRoleArn', 'executionStatus',
+    'cloudFormationExecutionRoleInventorySha384', 'kms', 'kmsKeyPolicySha384', 'parameters',
+    'parametersSha384', 'protocol', 'publisherPolicySha384', 'publisherRoleArn',
+    'publisherRoleInventorySha384', 'publisherTemplateObject', 'region', 'stable',
+    'templateObject', 'templateUrl', 'validationSha384',
+  ], 'change-set receipt');
+  requireExactFields(changeSet.templateObject, ['bucket', 'key', 'sha384', 'versionId'],
+    'change-set template object');
+  requireExactFields(changeSet.publisherTemplateObject, ['bucket', 'key', 'sha384', 'versionId'],
+    'change-set publisher template');
+  requireExactFields(changeSet.kms, ['bucketKeyEnabled', 'keyArn'], 'change-set KMS binding');
+  const executionPolicies = requireObject(changeSet.cloudFormationExecutionPolicies,
+    'CloudFormation execution policy set');
+  requireExactFields(executionPolicies, ['inline', 'managed'], 'CloudFormation execution policy set');
+  requireExactFields(executionPolicies.inline, ['document', 'name', 'sha384'],
+    'CloudFormation execution inline policy');
+  if (!Array.isArray(executionPolicies.managed) || executionPolicies.managed.length !== 3) {
+    throw new Error('CloudFormation execution managed policy set is not exact');
+  }
+  const expectedManagedNames = [
+    'layrs-production-recovery-seq159300-cfn-core-network',
+    'layrs-production-recovery-seq159300-cfn-endpoints',
+    'layrs-production-recovery-seq159300-cfn-mutation',
+  ];
+  for (const [index, policy] of executionPolicies.managed.entries()) {
+    requireExactFields(policy, ['arn', 'defaultVersionId', 'document', 'name', 'sha384'],
+      `CloudFormation execution managed policy ${index}`);
+    const expectedName = expectedManagedNames[index];
+    if (policy.name !== expectedName
+        || policy.arn !== `arn:aws:iam::${ACCOUNT_ID}:policy/${expectedName}`
+        || !/^v[1-9][0-9]*$/u.test(policy.defaultVersionId)
+        || !policy.document || typeof policy.document !== 'object' || Array.isArray(policy.document)
+        || !sha384(policy.sha384) || digest('sha384', canonicalJson(policy.document)) !== policy.sha384) {
+      throw new Error('CloudFormation execution managed policy binding is invalid');
+    }
+  }
+  if (executionPolicies.inline.name !== 'layrs-seq159300-exact-builder-stack-base'
+      || !executionPolicies.inline.document || typeof executionPolicies.inline.document !== 'object'
+      || Array.isArray(executionPolicies.inline.document)
+      || !sha384(executionPolicies.inline.sha384)
+      || digest('sha384', canonicalJson(executionPolicies.inline.document)) !== executionPolicies.inline.sha384) {
+    throw new Error('CloudFormation execution inline policy binding is invalid');
+  }
+  const expectedChangeSetName = `layrs-seq159300-builder-${input.builderTemplateSha384.slice(0, 12)}`;
+  const canonicalParameters = Object.entries(changeSet.parameters ?? {})
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([ParameterKey, ParameterValue]) => ({ ParameterKey, ParameterValue }));
+  if (changeSet.protocol !== 'layrs.seq159300.recovery-builder-change-set-receipt.v1'
+      || changeSet.accountId !== ACCOUNT_ID || changeSet.region !== REGION
+      || changeSet.executed !== false || changeSet.executionStatus !== 'AVAILABLE'
+      || changeSet.changeSetStatus !== 'CREATE_COMPLETE' || changeSet.stable !== true
+      || changeSet.changeSetName !== expectedChangeSetName
+      || !new RegExp(`^arn:aws:cloudformation:us-east-1:${ACCOUNT_ID}:changeSet/${expectedChangeSetName}/[0-9a-f-]{36}$`, 'u')
+        .test(changeSet.changeSetId)
+      || canonicalJson(changeSet.templateObject) !== canonicalJson({
+        bucket: upload.bucket, key: input.builderTemplateObjectKey,
+        sha384: input.builderTemplateSha384, versionId: input.builderTemplateObjectVersionId,
+      })
+      || changeSet.templateUrl
+        !== `https://${upload.bucket}.s3.us-east-1.amazonaws.com/${input.builderTemplateObjectKey}?versionId=${input.builderTemplateObjectVersionId}`
+      || changeSet.kms.keyArn !== upload.kmsKeyArn || changeSet.kms.bucketKeyEnabled !== false
+      || changeSet.publisherRoleInventorySha384 !== input.publisherRoleInventorySha384
+      || changeSet.cloudFormationExecutionRoleInventorySha384
+        !== input.cloudFormationExecutionRoleInventorySha384
+      || canonicalJson(changeSet.publisherTemplateObject)
+        !== canonicalJson(upload.publisherTemplateObject)
+      || changeSet.publisherRoleArn
+        !== `arn:aws:iam::${ACCOUNT_ID}:role/layrs-production-recovery-seq159300-template-publisher`
+      || changeSet.executionRoleArn
+        !== `arn:aws:iam::${ACCOUNT_ID}:role/layrs-production-recovery-seq159300-cloudformation-execution`
+      || !sha384(changeSet.publisherPolicySha384)
+      || !sha384(changeSet.cloudFormationExecutionPolicySha384)
+      || digest('sha384', canonicalJson(executionPolicies))
+        !== changeSet.cloudFormationExecutionPolicySha384
+      || changeSet.publisherPolicySha384 === changeSet.cloudFormationExecutionPolicySha384
+      || !sha384(changeSet.bucketPolicySha384) || !sha384(changeSet.kmsKeyPolicySha384)
+      || changeSet.publisherPolicySha384 !== upload.publisherPolicySha384
+      || changeSet.bucketControlsSha384 !== upload.bucketControlsSha384
+      || changeSet.bucketPolicySha384 !== upload.bucketPolicySha384
+      || changeSet.kmsKeyPolicySha384 !== upload.kmsKeyPolicySha384
+      || !changeSet.parameters || typeof changeSet.parameters !== 'object'
+      || Array.isArray(changeSet.parameters) || Object.keys(changeSet.parameters).length < 1
+      || Object.entries(changeSet.parameters).some(([key, value]) => (
+        !/^[A-Za-z][A-Za-z0-9]{0,254}$/u.test(key) || typeof value !== 'string'))
+      || changeSet.parameters.BuilderTemplateSha384 !== input.builderTemplateSha384
+      || changeSet.parameters.BuilderTemplateEvidenceObjectKey !== input.builderTemplateObjectKey
+      || changeSet.parameters.BuilderTemplateEvidenceObjectVersionId
+        !== input.builderTemplateObjectVersionId
+      || changeSet.parameters.BuilderTemplateEvidenceSha384 !== input.builderTemplateSha384
+      || !sha384(changeSet.changesSha384) || !sha384(changeSet.parametersSha384)
+      || digest('sha384', canonicalJson(canonicalParameters)) !== changeSet.parametersSha384
+      || !sha384(changeSet.validationSha384)) {
+    throw new Error('change-set receipt is not the exact unexecuted builder change set');
+  }
+  return {
+    builderTemplateObject: { key: input.builderTemplateObjectKey,
+      versionId: input.builderTemplateObjectVersionId, sha384: input.builderTemplateSha384 },
+    changeSetReceipt: changeSet,
+    cloudFormationExecutionRoleInventorySha384: input.cloudFormationExecutionRoleInventorySha384,
+    publisherRoleInventorySha384: input.publisherRoleInventorySha384,
+    publisherTemplateObject: { key: input.publisherTemplateObjectKey,
+      versionId: input.publisherTemplateObjectVersionId, sha384: input.publisherTemplateSha384 },
+    templateUploadReceipt: upload,
   };
 }
 
@@ -829,6 +1092,7 @@ export function validatePreflight(input) {
     case 'build-network': return validateBuildNetwork(input.payload);
     case 'instance-profile': return validateInstanceProfile(input.payload);
     case 'packer-control-role': return validatePackerControlRole(input.payload);
+    case 'publication-evidence': return validatePublicationEvidence(input.payload);
     case 'output-ami': return validateOutputAmi(input.payload);
     case 'nitro-package-set': return validatePackageSet(input.payload);
     default: throw new Error('unsupported recovery-parent preflight kind');

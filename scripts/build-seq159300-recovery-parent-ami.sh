@@ -8,6 +8,11 @@ readonly RECOVERY_REGION="us-east-1"
 readonly RECOVERY_SOURCE_COMMIT="f282583cae7a5c873a26aa8d0c1bec10c490eb8e"
 readonly REMEDIATION_EVIDENCE_COMMIT="540fc566c83dee2c3226862cc71a95541bc69af7"
 readonly REMEDIATION_INDEX_VERSION_ID="oBGf0odkWa6tzYpml_UtGemDwXI6GdXy"
+readonly ACCEPTED_PHASE2_TEMPLATE_COMMIT="23f92bc64171862abc410af953321a991e5e1515"
+readonly ACCEPTED_BUILDER_TEMPLATE_SHA384="75e536d6d138b88aaf7ef29fece2f67f3e6ffbda02841092de73726795b4d55a6fe01af492d8d8d1f0d3dc7f8db105d7"
+readonly ACCEPTED_INVOKER_TEMPLATE_SHA384="d67e4f78be6bd679b4ab61e316215fce24035e89508baaefcf3b2df6209682fd94dc0fcd84bac1530664f02aaf7723e1"
+readonly ACCEPTED_TEMPLATE_PUBLISHER_SHA384="6eefb0154b78e08949ffb677a5179782cd17ab3f9a2f3d68ddf65789ce085b73aa9f76ad13821aff06fe9d853153d529"
+readonly ACCEPTED_CLEANUP_TEMPLATE_SHA384="72c5872db412726d8e56c0c078067bae19c8cf316bba204f0849a6ae34bc504792b12601f023f76efdf81b750a6aa77c"
 readonly EXPECTED_PARENT_SHA384="d9506bf11627b04bd5d220e18e78584cd5e649952fe380309346d9c6bbecd511eb318cdcdee6a1d0db989d581a742db1"
 readonly EXPECTED_EIF_SHA384="958e084e0a66d0aca6773193a74d40659cd258fcffa116b0117fed1fab8361046ffea6411379b72fc72c97b86f611290"
 readonly REJECTED_BUILD_A_EIF_SHA384="110c31235f36fa85e4a50d61fb89ab3a08e5b18587a35dfe4818c3615eed5a79513082df101e5c655fce8c7640d66ad8"
@@ -100,6 +105,14 @@ sha384_file() {
 
 sha256_file() {
   sha256sum --binary "$1" | awk '{print $1}'
+}
+
+require_canonical_json_file() {
+  local file="$1"
+  local canonical
+  canonical="$(jq -cS . "${file}")" || die "immutable JSON evidence cannot be parsed"
+  cmp -s -- "${file}" <(printf '%s\n' "${canonical}") \
+    || die "immutable JSON evidence is not exact canonical JSON plus one newline"
 }
 
 cleanup() {
@@ -387,6 +400,289 @@ verify_immutable_package_objects() {
     || die "local Nitro package-set manifest differs from immutable evidence bytes"
 }
 
+verify_builder_contract_objects() {
+  local downloaded response
+  downloaded="${PREFLIGHT_TEMP_DIR}/packer-invoker-template.yml"
+  response="${PREFLIGHT_TEMP_DIR}/packer-invoker-template-readback.json"
+  aws_read_json s3api get-object --bucket "${IMMUTABLE_EVIDENCE_BUCKET}" \
+    --key "${LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_OBJECT_KEY}" \
+    --version-id "${LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_OBJECT_VERSION_ID}" \
+    "${downloaded}" >"${response}"
+  require_exact "remote Packer invoker template VersionId" "$(jq -er '.VersionId' "${response}")" \
+    "${LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_OBJECT_VERSION_ID}"
+  require_exact "remote Packer invoker template SHA384" "$(sha384_file "${downloaded}")" \
+    "${LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_SHA384}"
+  cmp -s -- "${downloaded}" "${LAYRS_RECOVERY_PACKER_INVOKER_TEMPLATE_FILE}" \
+    || die "reviewed Packer invoker template differs from its exact immutable object version"
+
+  downloaded="${PREFLIGHT_TEMP_DIR}/builder-template.yml"
+  response="${PREFLIGHT_TEMP_DIR}/builder-template-readback.json"
+  aws_read_json s3api get-object --bucket "${IMMUTABLE_EVIDENCE_BUCKET}" \
+    --key "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_KEY}" \
+    --version-id "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}" \
+    "${downloaded}" >"${response}"
+  require_exact "remote builder template VersionId" "$(jq -er '.VersionId' "${response}")" \
+    "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}"
+  require_exact "remote builder template SHA384" "$(sha384_file "${downloaded}")" \
+    "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_SHA384}"
+  cmp -s -- "${downloaded}" "${LAYRS_RECOVERY_BUILDER_TEMPLATE_FILE}" \
+    || die "reviewed builder template differs from its exact immutable object version"
+
+  downloaded="${PREFLIGHT_TEMP_DIR}/builder-evidence-index.json"
+  response="${PREFLIGHT_TEMP_DIR}/builder-evidence-index-readback.json"
+  aws_read_json s3api get-object --bucket "${IMMUTABLE_EVIDENCE_BUCKET}" \
+    --key "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_KEY}" \
+    --version-id "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_VERSION_ID}" \
+    "${downloaded}" >"${response}"
+  require_exact "remote builder evidence index VersionId" "$(jq -er '.VersionId' "${response}")" \
+    "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_VERSION_ID}"
+  require_exact "remote builder evidence index SHA384" "$(sha384_file "${downloaded}")" \
+    "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_SHA384}"
+  jq -e 'type == "object" and (keys | length) > 0' "${downloaded}" >/dev/null \
+    || die "immutable builder evidence index is not a nonempty JSON object"
+}
+
+verify_cleanup_contract_object() {
+  local canonical downloaded expected_hash expected_role hash_variable key_variable object_key
+  local object_version policy_name prefix response version_variable
+  downloaded="${PREFLIGHT_TEMP_DIR}/cleanup-template.yml"
+  response="${PREFLIGHT_TEMP_DIR}/cleanup-template-readback.json"
+  aws_read_json s3api get-object --bucket "${IMMUTABLE_EVIDENCE_BUCKET}" \
+    --key "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_EVIDENCE_OBJECT_KEY}" \
+    --version-id "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}" \
+    "${downloaded}" >"${response}"
+  require_exact "remote cleanup template VersionId" "$(jq -er '.VersionId' "${response}")" \
+    "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}"
+  require_exact "remote cleanup template SHA384" "$(sha384_file "${downloaded}")" \
+    "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_EVIDENCE_SHA384}"
+  cmp -s -- "${downloaded}" "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_FILE}" \
+    || die "reviewed cleanup template differs from its exact immutable object version"
+
+  for prefix in EXECUTION SUBMITTER; do
+    if [[ "${prefix}" == "EXECUTION" ]]; then
+      expected_role="layrs-production-recovery-seq159300-cleanup-execution"
+      policy_name="layrs-seq159300-read-delete-only"
+    else
+      expected_role="layrs-production-recovery-seq159300-cleanup-submitter"
+      policy_name="layrs-seq159300-delete-exact-builder-stack-once"
+    fi
+    downloaded="${PREFLIGHT_TEMP_DIR}/cleanup-role-inventory-${prefix,,}.json"
+    response="${PREFLIGHT_TEMP_DIR}/cleanup-role-inventory-${prefix,,}-readback.json"
+    hash_variable="LAYRS_RECOVERY_CLEANUP_${prefix}_ROLE_INVENTORY_SHA384"
+    key_variable="LAYRS_RECOVERY_CLEANUP_${prefix}_ROLE_INVENTORY_OBJECT_KEY"
+    version_variable="LAYRS_RECOVERY_CLEANUP_${prefix}_ROLE_INVENTORY_OBJECT_VERSION_ID"
+    expected_hash="${!hash_variable}"
+    object_key="${!key_variable}"
+    object_version="${!version_variable}"
+    aws_read_json s3api get-object --bucket "${IMMUTABLE_EVIDENCE_BUCKET}" \
+      --key "${object_key}" --version-id "${object_version}" "${downloaded}" >"${response}"
+    require_exact "remote cleanup ${prefix,,} role inventory VersionId" \
+      "$(jq -er '.VersionId' "${response}")" "${object_version}"
+    require_exact "remote cleanup ${prefix,,} role inventory SHA384" \
+      "$(sha384_file "${downloaded}")" "${expected_hash}"
+    jq -e --arg role "${expected_role}" --arg policy "${policy_name}" '
+      type == "object"
+      and (keys | sort) == (["attachedPolicies","inlinePolicies","instanceProfiles",
+        "maxSessionDuration","path","permissionsBoundaryArn","roleArn","roleId","roleName",
+        "tags","trust"] | sort)
+      and .roleName == $role
+      and .roleArn == ("arn:aws:iam::082223548516:role/" + $role)
+      and .path == "/" and .maxSessionDuration == 3600
+      and .permissionsBoundaryArn == "" and .attachedPolicies == [] and .instanceProfiles == []
+      and (.roleId | type == "string" and test("^ARO[A-Z0-9]{16,}$"))
+      and (.inlinePolicies | length) == 1 and .inlinePolicies[0].name == $policy
+      and (.inlinePolicies[0] | keys | sort) == ["document","name"]
+      and (.inlinePolicies[0].document | type == "object")
+      and (.tags | type == "array")
+      and (.tags == (.tags | sort_by(.Key)))
+      and ([.tags[].Key] | length) == ([.tags[].Key] | unique | length)
+      and ([.tags[] | (keys | sort) == ["Key","Value"]] | all)
+      and ([.tags[] | select(.Key == "RoleInventorySha384")] | length) == 0
+    ' "${downloaded}" >/dev/null \
+      || die "cleanup ${prefix,,} role inventory is noncanonical or self-referential"
+    if grep -Fq -- "${expected_hash}" "${downloaded}"; then
+      die "cleanup ${prefix,,} role inventory embeds its own SHA384"
+    fi
+    canonical="$(jq -cS . "${downloaded}")" \
+      || die "cleanup ${prefix,,} role inventory cannot be canonicalized"
+    require_exact "cleanup ${prefix,,} role inventory canonical bytes" \
+      "$(<"${downloaded}")" "${canonical}"
+  done
+}
+
+verify_publication_evidence_objects() {
+  local canonical downloaded expected_hash expected_role hash_variable key_variable object_key
+  local object_version prefix publication_input publication_output response version_variable
+  downloaded="${PREFLIGHT_TEMP_DIR}/publisher-template.yml"
+  response="${PREFLIGHT_TEMP_DIR}/publisher-template-readback.json"
+  aws_read_json s3api get-object --bucket "${IMMUTABLE_EVIDENCE_BUCKET}" \
+    --key "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_OBJECT_KEY}" \
+    --version-id "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}" \
+    "${downloaded}" >"${response}"
+  require_exact "remote publisher template VersionId" "$(jq -er '.VersionId' "${response}")" \
+    "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}"
+  require_exact "remote publisher template SHA384" "$(sha384_file "${downloaded}")" \
+    "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_SHA384}"
+  cmp -s -- "${downloaded}" "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_FILE}" \
+    || die "reviewed publisher template differs from its exact immutable object version"
+
+  for prefix in TEMPLATE_PUBLISHER CLOUDFORMATION_EXECUTION; do
+    if [[ "${prefix}" == "TEMPLATE_PUBLISHER" ]]; then
+      expected_role="layrs-production-recovery-seq159300-template-publisher"
+    else
+      expected_role="layrs-production-recovery-seq159300-cloudformation-execution"
+    fi
+    downloaded="${PREFLIGHT_TEMP_DIR}/publisher-role-inventory-${prefix,,}.json"
+    response="${PREFLIGHT_TEMP_DIR}/publisher-role-inventory-${prefix,,}-readback.json"
+    hash_variable="LAYRS_RECOVERY_${prefix}_ROLE_INVENTORY_SHA384"
+    key_variable="LAYRS_RECOVERY_${prefix}_ROLE_INVENTORY_OBJECT_KEY"
+    version_variable="LAYRS_RECOVERY_${prefix}_ROLE_INVENTORY_OBJECT_VERSION_ID"
+    expected_hash="${!hash_variable}"
+    object_key="${!key_variable}"
+    object_version="${!version_variable}"
+    aws_read_json s3api get-object --bucket "${IMMUTABLE_EVIDENCE_BUCKET}" \
+      --key "${object_key}" --version-id "${object_version}" "${downloaded}" >"${response}"
+    require_exact "remote ${prefix,,} role inventory VersionId" \
+      "$(jq -er '.VersionId' "${response}")" "${object_version}"
+    require_exact "remote ${prefix,,} role inventory SHA384" \
+      "$(sha384_file "${downloaded}")" "${expected_hash}"
+    jq -e --arg role "${expected_role}" '
+      type == "object"
+      and (keys | sort) == (["attachedPolicies","inlinePolicies","instanceProfiles",
+        "maxSessionDuration","path","permissionsBoundaryArn","roleArn","roleId","roleName",
+        "tags","trust"] | sort)
+      and .roleName == $role
+      and .roleArn == ("arn:aws:iam::082223548516:role/" + $role)
+      and .path == "/" and .maxSessionDuration == 3600
+      and .permissionsBoundaryArn == "" and .instanceProfiles == []
+      and (.roleId | type == "string" and test("^ARO[A-Z0-9]{16,}$"))
+      and (.attachedPolicies | type == "array") and (.inlinePolicies | type == "array")
+      and (.tags | type == "array")
+      and (.tags == (.tags | sort_by(.Key)))
+      and ([.tags[].Key] | length) == ([.tags[].Key] | unique | length)
+      and ([.tags[] | (keys | sort) == ["Key","Value"]] | all)
+      and ([.tags[] | select(.Key == "RoleInventorySha384")] | length) == 0
+    ' "${downloaded}" >/dev/null \
+      || die "${prefix,,} role inventory is noncanonical or self-referential"
+    if grep -Fq -- "${expected_hash}" "${downloaded}"; then
+      die "${prefix,,} role inventory embeds its own SHA384"
+    fi
+    canonical="$(jq -cS . "${downloaded}")" \
+      || die "${prefix,,} role inventory cannot be canonicalized"
+    require_exact "${prefix,,} role inventory canonical bytes" "$(<"${downloaded}")" "${canonical}"
+  done
+
+  downloaded="${PREFLIGHT_TEMP_DIR}/template-upload-receipt.json"
+  response="${PREFLIGHT_TEMP_DIR}/template-upload-receipt-readback.json"
+  aws_read_json s3api get-object --bucket "${IMMUTABLE_EVIDENCE_BUCKET}" \
+    --key "${LAYRS_RECOVERY_TEMPLATE_UPLOAD_RECEIPT_OBJECT_KEY}" \
+    --version-id "${LAYRS_RECOVERY_TEMPLATE_UPLOAD_RECEIPT_OBJECT_VERSION_ID}" \
+    "${downloaded}" >"${response}"
+  require_exact "remote template-upload receipt VersionId" "$(jq -er '.VersionId' "${response}")" \
+    "${LAYRS_RECOVERY_TEMPLATE_UPLOAD_RECEIPT_OBJECT_VERSION_ID}"
+  require_exact "remote template-upload receipt SHA384" "$(sha384_file "${downloaded}")" \
+    "${LAYRS_RECOVERY_TEMPLATE_UPLOAD_RECEIPT_SHA384}"
+  require_canonical_json_file "${downloaded}"
+  jq -e \
+    --arg accountId "${RECOVERY_ACCOUNT_ID}" --arg region "${RECOVERY_REGION}" \
+    --arg bucket "${IMMUTABLE_EVIDENCE_BUCKET}" \
+    --arg key "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_KEY}" \
+    --arg versionId "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}" \
+    --arg sha384 "${LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384}" \
+    --arg publisherTemplateKey "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_OBJECT_KEY}" \
+    --arg publisherTemplateVersionId "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}" \
+    --arg publisherTemplateSha384 "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_SHA384}" \
+    --arg publisherRoleInventorySha384 "${LAYRS_RECOVERY_TEMPLATE_PUBLISHER_ROLE_INVENTORY_SHA384}" \
+    'keys == ["accountId","bucket","bucketControlsSha384","bucketKeyEnabled","bucketPolicySha384","createOnly","kmsKeyArn","kmsKeyPolicySha384","objectKey","objectSha384","objectVersionId","protocol","publisherPolicySha384","publisherRoleInventorySha384","publisherTemplateObject","region","retainUntil"]
+      and .protocol == "layrs.seq159300.recovery-builder-template-upload-receipt.v1"
+      and .accountId == $accountId and .region == $region and .bucket == $bucket
+      and .objectKey == $key and .objectVersionId == $versionId and .objectSha384 == $sha384
+      and .bucketKeyEnabled == false and .createOnly == true
+      and .publisherRoleInventorySha384 == $publisherRoleInventorySha384
+      and .publisherTemplateObject == {bucket:$bucket,key:$publisherTemplateKey,
+        versionId:$publisherTemplateVersionId,sha384:$publisherTemplateSha384}
+      and (.publisherPolicySha384 | test("^[0-9a-f]{96}$"))
+      and (.publisherRoleInventorySha384 | test("^[0-9a-f]{96}$"))
+      and (.bucketControlsSha384 | test("^[0-9a-f]{96}$"))
+      and (.bucketPolicySha384 | test("^[0-9a-f]{96}$"))
+      and (.kmsKeyPolicySha384 | test("^[0-9a-f]{96}$"))
+      and (.kmsKeyArn | test("^arn:aws:kms:us-east-1:082223548516:key/[0-9a-f-]{36}$"))
+      and (.retainUntil | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))' "${downloaded}" >/dev/null \
+    || die "immutable template-upload receipt is malformed or not bound to the exact builder template version"
+
+  downloaded="${PREFLIGHT_TEMP_DIR}/change-set-receipt.json"
+  response="${PREFLIGHT_TEMP_DIR}/change-set-receipt-readback.json"
+  aws_read_json s3api get-object --bucket "${IMMUTABLE_EVIDENCE_BUCKET}" \
+    --key "${LAYRS_RECOVERY_CHANGE_SET_RECEIPT_OBJECT_KEY}" \
+    --version-id "${LAYRS_RECOVERY_CHANGE_SET_RECEIPT_OBJECT_VERSION_ID}" \
+    "${downloaded}" >"${response}"
+  require_exact "remote change-set receipt VersionId" "$(jq -er '.VersionId' "${response}")" \
+    "${LAYRS_RECOVERY_CHANGE_SET_RECEIPT_OBJECT_VERSION_ID}"
+  require_exact "remote change-set receipt SHA384" "$(sha384_file "${downloaded}")" \
+    "${LAYRS_RECOVERY_CHANGE_SET_RECEIPT_SHA384}"
+  require_canonical_json_file "${downloaded}"
+  jq -e \
+    --arg accountId "${RECOVERY_ACCOUNT_ID}" --arg region "${RECOVERY_REGION}" \
+    --arg bucket "${IMMUTABLE_EVIDENCE_BUCKET}" \
+    --arg key "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_KEY}" \
+    --arg versionId "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}" \
+    --arg sha384 "${LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384}" \
+    --arg publisherTemplateKey "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_OBJECT_KEY}" \
+    --arg publisherTemplateVersionId "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}" \
+    --arg publisherTemplateSha384 "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_SHA384}" \
+    --arg publisherRoleInventorySha384 "${LAYRS_RECOVERY_TEMPLATE_PUBLISHER_ROLE_INVENTORY_SHA384}" \
+    --arg cloudFormationExecutionRoleInventorySha384 "${LAYRS_RECOVERY_CLOUDFORMATION_EXECUTION_ROLE_INVENTORY_SHA384}" \
+    'keys == ["accountId","bucketControlsSha384","bucketPolicySha384","changeSetId","changeSetName","changeSetStatus","changesSha384","cloudFormationExecutionPolicies","cloudFormationExecutionPolicySha384","cloudFormationExecutionRoleInventorySha384","executed","executionRoleArn","executionStatus","kms","kmsKeyPolicySha384","parameters","parametersSha384","protocol","publisherPolicySha384","publisherRoleArn","publisherRoleInventorySha384","publisherTemplateObject","region","stable","templateObject","templateUrl","validationSha384"]
+      and .protocol == "layrs.seq159300.recovery-builder-change-set-receipt.v1"
+      and .accountId == $accountId and .region == $region and .executed == false
+      and .executionStatus == "AVAILABLE" and .changeSetStatus == "CREATE_COMPLETE" and .stable == true
+      and (.changeSetName | test("^layrs-seq159300-builder-[0-9a-f]{12}$"))
+      and (.changeSetId | test("^arn:aws:cloudformation:us-east-1:082223548516:changeSet/layrs-seq159300-builder-[0-9a-f]{12}/[0-9a-f-]{36}$"))
+      and .templateObject == {bucket:$bucket,key:$key,versionId:$versionId,sha384:$sha384}
+      and .publisherTemplateObject == {bucket:$bucket,key:$publisherTemplateKey,
+        versionId:$publisherTemplateVersionId,sha384:$publisherTemplateSha384}
+      and .templateUrl == ("https://" + $bucket + ".s3.us-east-1.amazonaws.com/" + $key + "?versionId=" + $versionId)
+      and .kms.bucketKeyEnabled == false
+      and .publisherRoleInventorySha384 == $publisherRoleInventorySha384
+      and .cloudFormationExecutionRoleInventorySha384 == $cloudFormationExecutionRoleInventorySha384
+      and .publisherRoleArn == "arn:aws:iam::082223548516:role/layrs-production-recovery-seq159300-template-publisher"
+      and .executionRoleArn == "arn:aws:iam::082223548516:role/layrs-production-recovery-seq159300-cloudformation-execution"
+      and (.publisherPolicySha384 | test("^[0-9a-f]{96}$"))
+      and (.cloudFormationExecutionPolicySha384 | test("^[0-9a-f]{96}$"))
+      and (.cloudFormationExecutionPolicies | type == "object")
+      and (.bucketControlsSha384 | test("^[0-9a-f]{96}$"))
+      and (.changesSha384 | test("^[0-9a-f]{96}$"))
+      and (.parameters | type == "object") and (.parameters | length > 0)
+      and (.parametersSha384 | test("^[0-9a-f]{96}$"))
+      and (.validationSha384 | test("^[0-9a-f]{96}$"))' "${downloaded}" >/dev/null \
+    || die "immutable change-set receipt is malformed or not bound to the exact unexecuted builder change set"
+
+  publication_input="${PREFLIGHT_TEMP_DIR}/publication-evidence-input.json"
+  publication_output="${PREFLIGHT_TEMP_DIR}/publication-evidence-inventory.json"
+  jq -n \
+    --arg builderTemplateObjectKey "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_KEY}" \
+    --arg builderTemplateObjectVersionId "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}" \
+    --arg builderTemplateSha384 "${LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384}" \
+    --arg publisherTemplateObjectKey "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_OBJECT_KEY}" \
+    --arg publisherTemplateObjectVersionId "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}" \
+    --arg publisherTemplateSha384 "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_SHA384}" \
+    --arg publisherRoleInventorySha384 "${LAYRS_RECOVERY_TEMPLATE_PUBLISHER_ROLE_INVENTORY_SHA384}" \
+    --arg cloudFormationExecutionRoleInventorySha384 "${LAYRS_RECOVERY_CLOUDFORMATION_EXECUTION_ROLE_INVENTORY_SHA384}" \
+    --slurpfile templateUploadReceipt "${PREFLIGHT_TEMP_DIR}/template-upload-receipt.json" \
+    --slurpfile changeSetReceipt "${PREFLIGHT_TEMP_DIR}/change-set-receipt.json" \
+    '{kind:"publication-evidence",payload:{builderTemplateObjectKey:$builderTemplateObjectKey,
+      builderTemplateObjectVersionId:$builderTemplateObjectVersionId,
+      builderTemplateSha384:$builderTemplateSha384,
+      publisherTemplateObjectKey:$publisherTemplateObjectKey,
+      publisherTemplateObjectVersionId:$publisherTemplateObjectVersionId,
+      publisherTemplateSha384:$publisherTemplateSha384,
+      publisherRoleInventorySha384:$publisherRoleInventorySha384,
+      cloudFormationExecutionRoleInventorySha384:$cloudFormationExecutionRoleInventorySha384,
+      templateUploadReceipt:$templateUploadReceipt[0],changeSetReceipt:$changeSetReceipt[0]}}' \
+    >"${publication_input}"
+  render_preflight_inventory "${publication_input}" "${publication_output}"
+}
+
 trap cleanup EXIT
 
 canonical_pcr0() {
@@ -421,6 +717,7 @@ verify_repository() {
       scripts/build-seq159300-recovery-parent-ami.sh | \
       scripts/lib/seq159300-recovery-parent-preflight.mjs | \
       scripts/render-seq159300-recovery-parent-evidence.mjs | \
+      scripts/render-seq159300-recovery-parent-post-build-cleanup-evidence.mjs | \
       scripts/tests/seq159300-recovery-parent.test.mjs)
         ;;
       *)
@@ -458,18 +755,56 @@ verify_inputs() {
   require_env LAYRS_RECOVERY_NITRO_PACKAGE_SET_EVIDENCE_SHA384
   require_env LAYRS_RECOVERY_EXPECTED_NITRO_PACKAGE_CLOSURE_SHA384
   require_env LAYRS_RECOVERY_BUILDER_STACK_NAME
+  require_env LAYRS_RECOVERY_BUILDER_TEMPLATE_FILE
   require_env LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384
   require_env LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_KEY
   require_env LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID
   require_env LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_SHA384
+  require_env LAYRS_RECOVERY_PUBLISHER_TEMPLATE_FILE
+  require_env LAYRS_RECOVERY_PUBLISHER_TEMPLATE_SHA384
+  require_env LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_OBJECT_KEY
+  require_env LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID
+  require_env LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_SHA384
+  require_env LAYRS_RECOVERY_TEMPLATE_PUBLISHER_ROLE_INVENTORY_SHA384
+  require_env LAYRS_RECOVERY_TEMPLATE_PUBLISHER_ROLE_INVENTORY_OBJECT_KEY
+  require_env LAYRS_RECOVERY_TEMPLATE_PUBLISHER_ROLE_INVENTORY_OBJECT_VERSION_ID
+  require_env LAYRS_RECOVERY_CLOUDFORMATION_EXECUTION_ROLE_INVENTORY_SHA384
+  require_env LAYRS_RECOVERY_CLOUDFORMATION_EXECUTION_ROLE_INVENTORY_OBJECT_KEY
+  require_env LAYRS_RECOVERY_CLOUDFORMATION_EXECUTION_ROLE_INVENTORY_OBJECT_VERSION_ID
+  require_env LAYRS_RECOVERY_TRUSTED_PRINCIPAL_INVENTORY_SHA384
+  require_env LAYRS_RECOVERY_TEMPLATE_UPLOAD_RECEIPT_OBJECT_KEY
+  require_env LAYRS_RECOVERY_TEMPLATE_UPLOAD_RECEIPT_OBJECT_VERSION_ID
+  require_env LAYRS_RECOVERY_TEMPLATE_UPLOAD_RECEIPT_SHA384
+  require_env LAYRS_RECOVERY_CHANGE_SET_RECEIPT_OBJECT_KEY
+  require_env LAYRS_RECOVERY_CHANGE_SET_RECEIPT_OBJECT_VERSION_ID
+  require_env LAYRS_RECOVERY_CHANGE_SET_RECEIPT_SHA384
+  require_env LAYRS_RECOVERY_CLEANUP_TEMPLATE_FILE
+  require_env LAYRS_RECOVERY_CLEANUP_TEMPLATE_SHA384
+  require_env LAYRS_RECOVERY_CLEANUP_TEMPLATE_EVIDENCE_OBJECT_KEY
+  require_env LAYRS_RECOVERY_CLEANUP_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID
+  require_env LAYRS_RECOVERY_CLEANUP_TEMPLATE_EVIDENCE_SHA384
+  require_env LAYRS_RECOVERY_CLEANUP_EXECUTION_ROLE_INVENTORY_SHA384
+  require_env LAYRS_RECOVERY_CLEANUP_EXECUTION_ROLE_INVENTORY_OBJECT_KEY
+  require_env LAYRS_RECOVERY_CLEANUP_EXECUTION_ROLE_INVENTORY_OBJECT_VERSION_ID
+  require_env LAYRS_RECOVERY_CLEANUP_SUBMITTER_ROLE_INVENTORY_SHA384
+  require_env LAYRS_RECOVERY_CLEANUP_SUBMITTER_ROLE_INVENTORY_OBJECT_KEY
+  require_env LAYRS_RECOVERY_CLEANUP_SUBMITTER_ROLE_INVENTORY_OBJECT_VERSION_ID
   require_env LAYRS_RECOVERY_PACKER_INVOKER_ROLE_ARN
   require_env LAYRS_RECOVERY_PACKER_INVOKER_ROLE_INVENTORY_SHA384
+  require_env LAYRS_RECOVERY_PACKER_INVOKER_TEMPLATE_FILE
   require_env LAYRS_RECOVERY_PACKER_INVOKER_TEMPLATE_SHA384
   require_env LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_OBJECT_KEY
   require_env LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_OBJECT_VERSION_ID
   require_env LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_SHA384
+  require_env LAYRS_RECOVERY_PACKER_CONTROL_INVENTORY_POLICY_SHA384
+  require_env LAYRS_RECOVERY_PACKER_CONTROL_LAUNCH_POLICY_SHA384
+  require_env LAYRS_RECOVERY_PACKER_CONTROL_ARTIFACT_POLICY_SHA384
   require_env LAYRS_RECOVERY_PACKER_CONTROL_APPROVED_AT
   require_env LAYRS_RECOVERY_PACKER_CONTROL_EXPIRES_AT
+  require_env LAYRS_RECOVERY_INVOKER_APPROVED_AT
+  require_env LAYRS_RECOVERY_INVOKER_EXPIRES_AT
+  require_env LAYRS_RECOVERY_TEMPLATE_PUBLISHER_APPROVED_AT
+  require_env LAYRS_RECOVERY_TEMPLATE_PUBLISHER_EXPIRES_AT
   require_env LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_SHA384
   require_env LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_KEY
   require_env LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_VERSION_ID
@@ -483,6 +818,16 @@ verify_inputs() {
   require_exact LAYRS_RECOVERY_AWS_REGION "${LAYRS_RECOVERY_AWS_REGION}" "${RECOVERY_REGION}"
   require_exact LAYRS_RECOVERY_SOURCE_AMI_OWNER "${LAYRS_RECOVERY_SOURCE_AMI_OWNER}" "${AL2023_OWNER_ID}"
   require_exact LAYRS_RECOVERY_SOURCE_AMI_ID "${LAYRS_RECOVERY_SOURCE_AMI_ID}" "${AL2023_AMI_ID}"
+  require_exact LAYRS_RECOVERY_PHASE2_TEMPLATE_COMMIT \
+    "${LAYRS_RECOVERY_PHASE2_TEMPLATE_COMMIT}" "${ACCEPTED_PHASE2_TEMPLATE_COMMIT}"
+  require_exact LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384 \
+    "${LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384}" "${ACCEPTED_BUILDER_TEMPLATE_SHA384}"
+  require_exact LAYRS_RECOVERY_PACKER_INVOKER_TEMPLATE_SHA384 \
+    "${LAYRS_RECOVERY_PACKER_INVOKER_TEMPLATE_SHA384}" "${ACCEPTED_INVOKER_TEMPLATE_SHA384}"
+  require_exact LAYRS_RECOVERY_PUBLISHER_TEMPLATE_SHA384 \
+    "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_SHA384}" "${ACCEPTED_TEMPLATE_PUBLISHER_SHA384}"
+  require_exact LAYRS_RECOVERY_CLEANUP_TEMPLATE_SHA384 \
+    "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_SHA384}" "${ACCEPTED_CLEANUP_TEMPLATE_SHA384}"
   require_exact LAYRS_RECOVERY_BUILDER_STACK_NAME "${LAYRS_RECOVERY_BUILDER_STACK_NAME}" \
     "layrs-production-recovery-seq159300-builder"
   [[ "${LAYRS_RECOVERY_PACKER_INVOKER_ROLE_ARN}" =~ ^arn:aws:iam::082223548516:role/layrs-production-recovery-seq159300-[A-Za-z0-9+=,.@_-]{1,64}$ ]] \
@@ -490,21 +835,73 @@ verify_inputs() {
   [[ "${LAYRS_RECOVERY_PACKER_CONTROL_APPROVED_AT}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ \
       && "${LAYRS_RECOVERY_PACKER_CONTROL_EXPIRES_AT}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
     || die "Packer control approval or expiry timestamp is malformed"
+  for value in "${LAYRS_RECOVERY_INVOKER_APPROVED_AT}" "${LAYRS_RECOVERY_INVOKER_EXPIRES_AT}" \
+      "${LAYRS_RECOVERY_TEMPLATE_PUBLISHER_APPROVED_AT}" "${LAYRS_RECOVERY_TEMPLATE_PUBLISHER_EXPIRES_AT}"; do
+    [[ "${value}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+      || die "invoker or template-publisher approval/expiry timestamp is malformed"
+  done
   for value in "${LAYRS_RECOVERY_EXPECTED_NITRO_PACKAGE_CLOSURE_SHA384}" \
       "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_SHA384}" \
       "${LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384}" \
       "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_SHA384}" \
+      "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_SHA384}" \
+      "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_SHA384}" \
+      "${LAYRS_RECOVERY_TEMPLATE_PUBLISHER_ROLE_INVENTORY_SHA384}" \
+      "${LAYRS_RECOVERY_CLOUDFORMATION_EXECUTION_ROLE_INVENTORY_SHA384}" \
+      "${LAYRS_RECOVERY_TRUSTED_PRINCIPAL_INVENTORY_SHA384}" \
+      "${LAYRS_RECOVERY_TEMPLATE_UPLOAD_RECEIPT_SHA384}" \
+      "${LAYRS_RECOVERY_CHANGE_SET_RECEIPT_SHA384}" \
+      "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_SHA384}" \
+      "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_EVIDENCE_SHA384}" \
+      "${LAYRS_RECOVERY_CLEANUP_EXECUTION_ROLE_INVENTORY_SHA384}" \
+      "${LAYRS_RECOVERY_CLEANUP_SUBMITTER_ROLE_INVENTORY_SHA384}" \
       "${LAYRS_RECOVERY_PACKER_INVOKER_ROLE_INVENTORY_SHA384}" \
       "${LAYRS_RECOVERY_PACKER_INVOKER_TEMPLATE_SHA384}" \
       "${LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_SHA384}" \
+      "${LAYRS_RECOVERY_PACKER_CONTROL_INVENTORY_POLICY_SHA384}" \
+      "${LAYRS_RECOVERY_PACKER_CONTROL_LAUNCH_POLICY_SHA384}" \
+      "${LAYRS_RECOVERY_PACKER_CONTROL_ARTIFACT_POLICY_SHA384}" \
       "${LAYRS_RECOVERY_EXPECTED_BUILD_CONTROL_PLANE_ROLE_INVENTORY_SHA384}"; do
     [[ "${value}" =~ ^[0-9a-f]{96}$ ]] || die "reviewed package, builder or control-role SHA384 is malformed"
   done
+  [[ "${LAYRS_RECOVERY_CLEANUP_EXECUTION_ROLE_INVENTORY_OBJECT_KEY}" =~ ^evidence/seq159300/recovery-only/phase2/builder/cleanup/roles/cleanup-execution/inventory/[0-9a-f]{40}-[0-9a-f]{96}\.json$ ]] \
+    || die "cleanup execution role inventory object key is outside the exact immutable contract"
+  [[ "${LAYRS_RECOVERY_CLEANUP_SUBMITTER_ROLE_INVENTORY_OBJECT_KEY}" =~ ^evidence/seq159300/recovery-only/phase2/builder/cleanup/roles/cleanup-submitter/inventory/[0-9a-f]{40}-[0-9a-f]{96}\.json$ ]] \
+    || die "cleanup submitter role inventory object key is outside the exact immutable contract"
+  require_exact "cleanup role inventory stable key suffix" \
+    "${LAYRS_RECOVERY_CLEANUP_EXECUTION_ROLE_INVENTORY_OBJECT_KEY##*/}" \
+    "${LAYRS_RECOVERY_CLEANUP_SUBMITTER_ROLE_INVENTORY_OBJECT_KEY##*/}"
+  [[ "${LAYRS_RECOVERY_TEMPLATE_PUBLISHER_ROLE_INVENTORY_OBJECT_KEY}" =~ ^evidence/seq159300/recovery-only/phase2/builder/publisher/roles/template-publisher/inventory/[0-9a-f]{40}-[0-9a-f]{96}\.json$ ]] \
+    || die "template publisher role inventory object key is outside the exact immutable contract"
+  [[ "${LAYRS_RECOVERY_CLOUDFORMATION_EXECUTION_ROLE_INVENTORY_OBJECT_KEY}" =~ ^evidence/seq159300/recovery-only/phase2/builder/publisher/roles/cloudformation-execution/inventory/[0-9a-f]{40}-[0-9a-f]{96}\.json$ ]] \
+    || die "CloudFormation execution role inventory object key is outside the exact immutable contract"
+  require_exact "publisher role inventory stable key suffix" \
+    "${LAYRS_RECOVERY_TEMPLATE_PUBLISHER_ROLE_INVENTORY_OBJECT_KEY##*/}" \
+    "${LAYRS_RECOVERY_CLOUDFORMATION_EXECUTION_ROLE_INVENTORY_OBJECT_KEY##*/}"
+  require_exact "cleanup and publisher role inventory stable key suffix" \
+    "${LAYRS_RECOVERY_CLEANUP_EXECUTION_ROLE_INVENTORY_OBJECT_KEY##*/}" \
+    "${LAYRS_RECOVERY_TEMPLATE_PUBLISHER_ROLE_INVENTORY_OBJECT_KEY##*/}"
   require_exact "builder template immutable evidence SHA384" \
     "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_SHA384}" \
     "${LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384}"
   require_exact "Packer invoker immutable evidence SHA384" \
     "${LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_SHA384}" \
+    "${LAYRS_RECOVERY_PACKER_INVOKER_TEMPLATE_SHA384}"
+  require_exact "publisher template immutable evidence SHA384" \
+    "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_SHA384}" \
+    "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_SHA384}"
+  require_exact "cleanup template immutable evidence SHA384" \
+    "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_EVIDENCE_SHA384}" \
+    "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_SHA384}"
+  [[ -f "${LAYRS_RECOVERY_BUILDER_TEMPLATE_FILE}" && ! -L "${LAYRS_RECOVERY_BUILDER_TEMPLATE_FILE}" ]] \
+    || die "the reviewed builder template is not a regular file"
+  require_exact "reviewed builder template SHA384" \
+    "$(sha384_file "${LAYRS_RECOVERY_BUILDER_TEMPLATE_FILE}")" \
+    "${LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384}"
+  [[ -f "${LAYRS_RECOVERY_PACKER_INVOKER_TEMPLATE_FILE}" && ! -L "${LAYRS_RECOVERY_PACKER_INVOKER_TEMPLATE_FILE}" ]] \
+    || die "the reviewed Packer invoker template is not a regular file"
+  require_exact "reviewed Packer invoker template SHA384" \
+    "$(sha384_file "${LAYRS_RECOVERY_PACKER_INVOKER_TEMPLATE_FILE}")" \
     "${LAYRS_RECOVERY_PACKER_INVOKER_TEMPLATE_SHA384}"
   require_exact "builder template immutable evidence key" \
     "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_KEY}" \
@@ -514,9 +911,26 @@ verify_inputs() {
       && "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_KEY}" =~ ^evidence/seq159300/recovery-only/phase2/builder/[A-Za-z0-9._/-]+$ \
       && "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_KEY}" != *".."* ]] \
     || die "immutable invoker or builder evidence key is malformed"
+  require_exact "publisher template immutable evidence key" \
+    "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_OBJECT_KEY}" \
+    "evidence/seq159300/recovery-only/phase2/builder/publisher/layrs-seq159300-recovery-template-publisher-${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_SHA384}.yml"
+  require_exact "cleanup template immutable evidence key" \
+    "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_EVIDENCE_OBJECT_KEY}" \
+    "evidence/seq159300/recovery-only/phase2/builder/cleanup/templates/layrs-seq159300-recovery-builder-cleanup-${LAYRS_RECOVERY_CLEANUP_TEMPLATE_SHA384}.yml"
+  [[ "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_OBJECT_KEY}" =~ ^evidence/seq159300/recovery-only/phase2/builder/publisher/[A-Za-z0-9._/-]+$ \
+      && "${LAYRS_RECOVERY_TEMPLATE_UPLOAD_RECEIPT_OBJECT_KEY}" =~ ^evidence/seq159300/recovery-only/phase2/builder/publisher/receipts/[A-Za-z0-9._/-]+$ \
+      && "${LAYRS_RECOVERY_CHANGE_SET_RECEIPT_OBJECT_KEY}" =~ ^evidence/seq159300/recovery-only/phase2/builder/publisher/receipts/[A-Za-z0-9._/-]+$ \
+      && "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_OBJECT_KEY}" != *".."* \
+      && "${LAYRS_RECOVERY_TEMPLATE_UPLOAD_RECEIPT_OBJECT_KEY}" != *".."* \
+      && "${LAYRS_RECOVERY_CHANGE_SET_RECEIPT_OBJECT_KEY}" != *".."* ]] \
+    || die "immutable publisher template or receipt key is malformed"
   for value in "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}" \
       "${LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_OBJECT_VERSION_ID}" \
-      "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_VERSION_ID}"; do
+      "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_VERSION_ID}" \
+      "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}" \
+      "${LAYRS_RECOVERY_TEMPLATE_UPLOAD_RECEIPT_OBJECT_VERSION_ID}" \
+      "${LAYRS_RECOVERY_CHANGE_SET_RECEIPT_OBJECT_VERSION_ID}" \
+      "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}"; do
     [[ "${value}" =~ ^[A-Za-z0-9._-]{8,256}$ ]] \
       || die "immutable builder or invoker evidence VersionId is malformed"
   done
@@ -557,6 +971,32 @@ verify_inputs() {
   phase2_template_sha="$(sha384_file "${LAYRS_RECOVERY_PHASE2_TEMPLATE_FILE}")"
   require_exact "reviewed Phase2 template SHA384" "${phase2_template_sha}" \
     "${LAYRS_RECOVERY_EXPECTED_PHASE2_TEMPLATE_SHA384}"
+  [[ -f "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_FILE}" && ! -L "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_FILE}" ]] \
+    || die "the reviewed publisher template is not a regular file"
+  require_exact "reviewed publisher template SHA384" \
+    "$(sha384_file "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_FILE}")" \
+    "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_SHA384}"
+  [[ -f "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_FILE}" && ! -L "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_FILE}" ]] \
+    || die "the reviewed cleanup template is not a regular file"
+  require_exact "reviewed cleanup template SHA384" \
+    "$(sha384_file "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_FILE}")" \
+    "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_SHA384}"
+  local immutable_reference_count
+  immutable_reference_count="$(printf '%s\n' \
+    "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_KEY}@${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}" \
+    "${LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_OBJECT_KEY}@${LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_OBJECT_VERSION_ID}" \
+    "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_KEY}@${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_VERSION_ID}" \
+    "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_OBJECT_KEY}@${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}" \
+    "${LAYRS_RECOVERY_TEMPLATE_UPLOAD_RECEIPT_OBJECT_KEY}@${LAYRS_RECOVERY_TEMPLATE_UPLOAD_RECEIPT_OBJECT_VERSION_ID}" \
+    "${LAYRS_RECOVERY_CHANGE_SET_RECEIPT_OBJECT_KEY}@${LAYRS_RECOVERY_CHANGE_SET_RECEIPT_OBJECT_VERSION_ID}" \
+    "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_EVIDENCE_OBJECT_KEY}@${LAYRS_RECOVERY_CLEANUP_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}" \
+    "${LAYRS_RECOVERY_PHASE2_EVIDENCE_OBJECT_KEY}@${LAYRS_RECOVERY_PHASE2_EVIDENCE_OBJECT_VERSION_ID}" \
+    "${LAYRS_RECOVERY_IMPLEMENTATION_EVIDENCE_OBJECT_KEY}@${LAYRS_RECOVERY_IMPLEMENTATION_EVIDENCE_OBJECT_VERSION_ID}" \
+    "${LAYRS_RECOVERY_NITRO_CLI_RPM_OBJECT_KEY}@${LAYRS_RECOVERY_NITRO_CLI_RPM_OBJECT_VERSION_ID}" \
+    "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_OBJECT_KEY}@${LAYRS_RECOVERY_NITRO_PACKAGE_SET_OBJECT_VERSION_ID}" \
+    "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_EVIDENCE_OBJECT_KEY}@${LAYRS_RECOVERY_NITRO_PACKAGE_SET_EVIDENCE_OBJECT_VERSION_ID}" \
+    | sort -u | wc -l)"
+  [[ "${immutable_reference_count}" == "12" ]] || die "immutable publisher/build evidence references are not unique"
   PACKER_TEMPLATE_SHA384="$(sha384_file "${PACKER_TEMPLATE}")"
   verify_nitro_package_set
   require_exact "Nitro package-set immutable object SHA384" "${NITRO_PACKAGE_SET_SHA384}" \
@@ -733,6 +1173,7 @@ preflight_instance_profile() {
 
 preflight_packer_control_role() {
   local role_response attached_response inline_response stack_response input output inline_name document_response
+  local managed_json policy_name policy_arn policy_hash_var policy_hash metadata_response version_response
   role_response="${PREFLIGHT_TEMP_DIR}/packer-control-role-response.json"
   attached_response="${PREFLIGHT_TEMP_DIR}/packer-control-attached-policies-response.json"
   inline_response="${PREFLIGHT_TEMP_DIR}/packer-control-inline-policies-response.json"
@@ -744,13 +1185,44 @@ preflight_packer_control_role() {
   aws_read_json iam list-attached-role-policies --role-name "${PACKER_CONTROL_ROLE_NAME}" \
     >"${attached_response}"
   aws_read_json iam list-role-policies --role-name "${PACKER_CONTROL_ROLE_NAME}" >"${inline_response}"
-  [[ "$(jq -er '.AttachedPolicies | length' "${attached_response}")" == "0" ]] \
-    || die "Packer control role has a forbidden managed policy attachment"
+  [[ "$(jq -er '.AttachedPolicies | length' "${attached_response}")" == "3" ]] \
+    || die "Packer control role must have exactly three managed policy attachments"
   inline_name="$(jq -er '.PolicyNames | select(length == 1) | .[0]' "${inline_response}")" \
     || die "Packer control role must have exactly one inline policy"
   require_exact "Packer control inline policy name" "${inline_name}" "${PACKER_CONTROL_ROLE_NAME}"
   document_response="$(aws_read_json iam get-role-policy \
     --role-name "${PACKER_CONTROL_ROLE_NAME}" --policy-name "${inline_name}")"
+  managed_json='[]'
+  while IFS='|' read -r policy_name policy_hash_var; do
+    policy_arn="arn:aws:iam::${RECOVERY_ACCOUNT_ID}:policy/${policy_name}"
+    jq -e --arg arn "${policy_arn}" '.AttachedPolicies | any(.PolicyArn == $arn)' \
+      "${attached_response}" >/dev/null \
+      || die "Packer control role managed policy attachment set is not exact"
+    policy_hash="${!policy_hash_var}"
+    metadata_response="$(aws_read_json iam get-policy --policy-arn "${policy_arn}")"
+    require_exact "Packer control managed policy ARN" \
+      "$(jq -er '.Policy.Arn' <<<"${metadata_response}")" "${policy_arn}"
+    require_exact "Packer control managed policy name" \
+      "$(jq -er '.Policy.PolicyName' <<<"${metadata_response}")" "${policy_name}"
+    [[ "$(jq -er '.Policy.Path' <<<"${metadata_response}")" == "/" \
+        && "$(jq -er '.Policy.IsAttachable' <<<"${metadata_response}")" == "true" \
+        && "$(jq -er '.Policy.AttachmentCount' <<<"${metadata_response}")" == "1" ]] \
+      || die "Packer control managed policy metadata is not exact"
+    version_response="$(aws_read_json iam get-policy-version --policy-arn "${policy_arn}" \
+      --version-id "$(jq -er '.Policy.DefaultVersionId' <<<"${metadata_response}")")"
+    [[ "$(jq -er '.PolicyVersion.IsDefaultVersion' <<<"${version_response}")" == "true" ]] \
+      || die "Packer control managed policy version is not the exact default"
+    managed_json="$(jq -n -c \
+      --argjson policies "${managed_json}" --arg arn "${policy_arn}" \
+      --arg defaultVersionId "$(jq -er '.Policy.DefaultVersionId' <<<"${metadata_response}")" \
+      --argjson document "$(jq -c '.PolicyVersion.Document' <<<"${version_response}")" \
+      --arg name "${policy_name}" --arg sha384 "${policy_hash}" \
+      '$policies + [{arn:$arn,defaultVersionId:$defaultVersionId,document:$document,name:$name,sha384:$sha384}]')"
+  done <<'POLICIES'
+layrs-production-recovery-seq159300-packer-artifacts|LAYRS_RECOVERY_PACKER_CONTROL_ARTIFACT_POLICY_SHA384
+layrs-production-recovery-seq159300-packer-inventory|LAYRS_RECOVERY_PACKER_CONTROL_INVENTORY_POLICY_SHA384
+layrs-production-recovery-seq159300-packer-launch|LAYRS_RECOVERY_PACKER_CONTROL_LAUNCH_POLICY_SHA384
+POLICIES
   aws_read_json cloudformation describe-stacks --stack-name "${LAYRS_RECOVERY_BUILDER_STACK_NAME}" \
     >"${stack_response}"
 
@@ -761,18 +1233,64 @@ preflight_packer_control_role() {
     --arg evaluatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg expectedInvokerRoleArn "${LAYRS_RECOVERY_PACKER_INVOKER_ROLE_ARN}" \
     --arg invokerRoleInventorySha384 "${LAYRS_RECOVERY_PACKER_INVOKER_ROLE_INVENTORY_SHA384}" \
+    --arg packerInvokerTemplateSha384 "${LAYRS_RECOVERY_PACKER_INVOKER_TEMPLATE_SHA384}" \
+    --arg packerInvokerEvidenceSha384 "${LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_SHA384}" \
+    --arg packerControlInventoryPolicySha384 "${LAYRS_RECOVERY_PACKER_CONTROL_INVENTORY_POLICY_SHA384}" \
+    --arg packerControlLaunchPolicySha384 "${LAYRS_RECOVERY_PACKER_CONTROL_LAUNCH_POLICY_SHA384}" \
+    --arg packerControlArtifactPolicySha384 "${LAYRS_RECOVERY_PACKER_CONTROL_ARTIFACT_POLICY_SHA384}" \
+    --arg packerControlPlaneApprovedAt "${LAYRS_RECOVERY_PACKER_CONTROL_APPROVED_AT}" \
+    --arg packerControlPlaneExpiresAt "${LAYRS_RECOVERY_PACKER_CONTROL_EXPIRES_AT}" \
+    --arg invokerApprovedAt "${LAYRS_RECOVERY_INVOKER_APPROVED_AT}" \
+    --arg invokerExpiresAt "${LAYRS_RECOVERY_INVOKER_EXPIRES_AT}" \
+    --arg templatePublisherApprovedAt "${LAYRS_RECOVERY_TEMPLATE_PUBLISHER_APPROVED_AT}" \
+    --arg templatePublisherExpiresAt "${LAYRS_RECOVERY_TEMPLATE_PUBLISHER_EXPIRES_AT}" \
+    --arg packerAmazonPluginVersion "${PACKER_AMAZON_PLUGIN_VERSION}" \
+    --arg packerAmazonPluginSourceCommit "2a769c39a05940e25143098f071490732fa24f4f" \
+    --arg phase2TemplateSha384 "${LAYRS_RECOVERY_EXPECTED_PHASE2_TEMPLATE_SHA384}" \
+    --arg publisherTemplateObjectKey "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_OBJECT_KEY}" \
+    --arg publisherTemplateObjectVersionId "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}" \
+    --arg publisherTemplateSha384 "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_SHA384}" \
+    --arg templateUploadReceiptObjectKey "${LAYRS_RECOVERY_TEMPLATE_UPLOAD_RECEIPT_OBJECT_KEY}" \
+    --arg templateUploadReceiptObjectVersionId "${LAYRS_RECOVERY_TEMPLATE_UPLOAD_RECEIPT_OBJECT_VERSION_ID}" \
+    --arg templateUploadReceiptSha384 "${LAYRS_RECOVERY_TEMPLATE_UPLOAD_RECEIPT_SHA384}" \
+    --arg changeSetReceiptObjectKey "${LAYRS_RECOVERY_CHANGE_SET_RECEIPT_OBJECT_KEY}" \
+    --arg changeSetReceiptObjectVersionId "${LAYRS_RECOVERY_CHANGE_SET_RECEIPT_OBJECT_VERSION_ID}" \
+    --arg changeSetReceiptSha384 "${LAYRS_RECOVERY_CHANGE_SET_RECEIPT_SHA384}" \
     --arg expiresAt "${LAYRS_RECOVERY_PACKER_CONTROL_EXPIRES_AT}" \
     --arg offlinePackageClosureSha384 "${NITRO_PACKAGE_CLOSURE_SHA384}" \
     --arg offlinePackageSetSha384 "${NITRO_PACKAGE_SET_SHA384}" \
     --arg inlineName "${inline_name}" \
     --argjson inlineDocument "$(jq -c '.PolicyDocument' <<<"${document_response}")" \
+    --argjson managedPolicies "${managed_json}" \
     --slurpfile roleResponse "${role_response}" \
     --slurpfile stackResponse "${stack_response}" \
-    '{kind:"packer-control-role",payload:{approvedAt:$approvedAt,attachedPolicies:[],
+    '{kind:"packer-control-role",payload:{approvedAt:$approvedAt,attachedPolicies:$managedPolicies,
       builderEvidenceIndexSha384:$builderEvidenceIndexSha384,
       builderTemplateSha384:$builderTemplateSha384,evaluatedAt:$evaluatedAt,
       expectedInvokerRoleArn:$expectedInvokerRoleArn,expiresAt:$expiresAt,
       invokerRoleInventorySha384:$invokerRoleInventorySha384,
+      packerInvokerTemplateSha384:$packerInvokerTemplateSha384,
+      packerInvokerEvidenceSha384:$packerInvokerEvidenceSha384,
+      packerAmazonPluginVersion:$packerAmazonPluginVersion,
+      packerAmazonPluginSourceCommit:$packerAmazonPluginSourceCommit,
+      packerControlInventoryPolicySha384:$packerControlInventoryPolicySha384,
+      packerControlLaunchPolicySha384:$packerControlLaunchPolicySha384,
+      packerControlArtifactPolicySha384:$packerControlArtifactPolicySha384,
+      packerControlPlaneApprovedAt:$packerControlPlaneApprovedAt,
+      packerControlPlaneExpiresAt:$packerControlPlaneExpiresAt,
+      invokerApprovedAt:$invokerApprovedAt,invokerExpiresAt:$invokerExpiresAt,
+      templatePublisherApprovedAt:$templatePublisherApprovedAt,
+      templatePublisherExpiresAt:$templatePublisherExpiresAt,
+      phase2TemplateSha384:$phase2TemplateSha384,
+      publisherTemplateObjectKey:$publisherTemplateObjectKey,
+      publisherTemplateObjectVersionId:$publisherTemplateObjectVersionId,
+      publisherTemplateSha384:$publisherTemplateSha384,
+      templateUploadReceiptObjectKey:$templateUploadReceiptObjectKey,
+      templateUploadReceiptObjectVersionId:$templateUploadReceiptObjectVersionId,
+      templateUploadReceiptSha384:$templateUploadReceiptSha384,
+      changeSetReceiptObjectKey:$changeSetReceiptObjectKey,
+      changeSetReceiptObjectVersionId:$changeSetReceiptObjectVersionId,
+      changeSetReceiptSha384:$changeSetReceiptSha384,
       inlinePolicies:[{name:$inlineName,document:$inlineDocument}],
       offlinePackageClosureSha384:$offlinePackageClosureSha384,
       offlinePackageSetSha384:$offlinePackageSetSha384,
@@ -883,6 +1401,9 @@ run_aws_preflight() {
   preflight_packer_control_role
   preflight_instance_profile
   verify_immutable_package_objects
+  verify_builder_contract_objects
+  verify_cleanup_contract_object
+  verify_publication_evidence_objects
   assume_packer_control_role
   preflight_source_ami
   preflight_build_network
@@ -893,6 +1414,7 @@ summary() {
     --arg accountId "${RECOVERY_ACCOUNT_ID}" \
     --arg region "${RECOVERY_REGION}" \
     --arg purpose "layrs-seq159300-recovery" \
+    --arg trustedPrincipalInventorySha384 "${LAYRS_RECOVERY_TRUSTED_PRINCIPAL_INVENTORY_SHA384}" \
     --arg sourceCommit "${RECOVERY_SOURCE_COMMIT}" \
     --arg builderSourceCommit "${BUILDER_COMMIT}" \
     --arg builderEvidenceIndexSha384 "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_SHA384}" \
@@ -902,11 +1424,40 @@ summary() {
     --arg builderTemplateEvidenceObjectKey "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_KEY}" \
     --arg builderTemplateEvidenceObjectVersionId "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}" \
     --arg builderTemplateEvidenceSha384 "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_SHA384}" \
+    --arg publisherTemplateSha384 "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_SHA384}" \
+    --arg publisherTemplateEvidenceObjectKey "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_OBJECT_KEY}" \
+    --arg publisherTemplateEvidenceObjectVersionId "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}" \
+    --arg publisherTemplateEvidenceSha384 "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_SHA384}" \
+    --arg templatePublisherRoleInventorySha384 "${LAYRS_RECOVERY_TEMPLATE_PUBLISHER_ROLE_INVENTORY_SHA384}" \
+    --arg templatePublisherRoleInventoryObjectKey "${LAYRS_RECOVERY_TEMPLATE_PUBLISHER_ROLE_INVENTORY_OBJECT_KEY}" \
+    --arg templatePublisherRoleInventoryObjectVersionId "${LAYRS_RECOVERY_TEMPLATE_PUBLISHER_ROLE_INVENTORY_OBJECT_VERSION_ID}" \
+    --arg cloudFormationExecutionRoleInventoryObjectKey "${LAYRS_RECOVERY_CLOUDFORMATION_EXECUTION_ROLE_INVENTORY_OBJECT_KEY}" \
+    --arg cloudFormationExecutionRoleInventoryObjectVersionId "${LAYRS_RECOVERY_CLOUDFORMATION_EXECUTION_ROLE_INVENTORY_OBJECT_VERSION_ID}" \
+    --arg cloudFormationExecutionRoleInventorySha384 "${LAYRS_RECOVERY_CLOUDFORMATION_EXECUTION_ROLE_INVENTORY_SHA384}" \
+    --arg templateUploadReceiptObjectKey "${LAYRS_RECOVERY_TEMPLATE_UPLOAD_RECEIPT_OBJECT_KEY}" \
+    --arg templateUploadReceiptObjectVersionId "${LAYRS_RECOVERY_TEMPLATE_UPLOAD_RECEIPT_OBJECT_VERSION_ID}" \
+    --arg templateUploadReceiptSha384 "${LAYRS_RECOVERY_TEMPLATE_UPLOAD_RECEIPT_SHA384}" \
+    --arg changeSetReceiptObjectKey "${LAYRS_RECOVERY_CHANGE_SET_RECEIPT_OBJECT_KEY}" \
+    --arg changeSetReceiptObjectVersionId "${LAYRS_RECOVERY_CHANGE_SET_RECEIPT_OBJECT_VERSION_ID}" \
+    --arg changeSetReceiptSha384 "${LAYRS_RECOVERY_CHANGE_SET_RECEIPT_SHA384}" \
+    --arg cleanupTemplateSha384 "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_SHA384}" \
+    --arg cleanupTemplateEvidenceObjectKey "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_EVIDENCE_OBJECT_KEY}" \
+    --arg cleanupTemplateEvidenceObjectVersionId "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}" \
+    --arg cleanupTemplateEvidenceSha384 "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_EVIDENCE_SHA384}" \
+    --arg cleanupExecutionRoleInventorySha384 "${LAYRS_RECOVERY_CLEANUP_EXECUTION_ROLE_INVENTORY_SHA384}" \
+    --arg cleanupExecutionRoleInventoryObjectKey "${LAYRS_RECOVERY_CLEANUP_EXECUTION_ROLE_INVENTORY_OBJECT_KEY}" \
+    --arg cleanupExecutionRoleInventoryObjectVersionId "${LAYRS_RECOVERY_CLEANUP_EXECUTION_ROLE_INVENTORY_OBJECT_VERSION_ID}" \
+    --arg cleanupSubmitterRoleInventorySha384 "${LAYRS_RECOVERY_CLEANUP_SUBMITTER_ROLE_INVENTORY_SHA384}" \
+    --arg cleanupSubmitterRoleInventoryObjectKey "${LAYRS_RECOVERY_CLEANUP_SUBMITTER_ROLE_INVENTORY_OBJECT_KEY}" \
+    --arg cleanupSubmitterRoleInventoryObjectVersionId "${LAYRS_RECOVERY_CLEANUP_SUBMITTER_ROLE_INVENTORY_OBJECT_VERSION_ID}" \
     --arg packerInvokerRoleInventorySha384 "${LAYRS_RECOVERY_PACKER_INVOKER_ROLE_INVENTORY_SHA384}" \
     --arg packerInvokerTemplateSha384 "${LAYRS_RECOVERY_PACKER_INVOKER_TEMPLATE_SHA384}" \
     --arg packerInvokerEvidenceObjectKey "${LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_OBJECT_KEY}" \
     --arg packerInvokerEvidenceObjectVersionId "${LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_OBJECT_VERSION_ID}" \
     --arg packerInvokerEvidenceSha384 "${LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_SHA384}" \
+    --arg packerControlInventoryPolicySha384 "${LAYRS_RECOVERY_PACKER_CONTROL_INVENTORY_POLICY_SHA384}" \
+    --arg packerControlLaunchPolicySha384 "${LAYRS_RECOVERY_PACKER_CONTROL_LAUNCH_POLICY_SHA384}" \
+    --arg packerControlArtifactPolicySha384 "${LAYRS_RECOVERY_PACKER_CONTROL_ARTIFACT_POLICY_SHA384}" \
     --arg sourceAmiId "${LAYRS_RECOVERY_SOURCE_AMI_ID}" \
     --arg sourceAmiOwner "${LAYRS_RECOVERY_SOURCE_AMI_OWNER}" \
     --arg parentBinarySha384 "${EXPECTED_PARENT_SHA384}" \
@@ -936,7 +1487,9 @@ summary() {
     --arg nitroPackageSetEvidenceObjectKey "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_EVIDENCE_OBJECT_KEY}" \
     --arg nitroPackageSetEvidenceObjectVersionId "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_EVIDENCE_OBJECT_VERSION_ID}" \
     --arg nitroPackageSetEvidenceSha384 "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_EVIDENCE_SHA384}" \
-    '{accountId:$accountId,region:$region,purpose:$purpose,sourceCommit:$sourceCommit,builderSourceCommit:$builderSourceCommit,
+    '{accountId:$accountId,region:$region,purpose:$purpose,
+      trustedPrincipalInventorySha384:$trustedPrincipalInventorySha384,
+      sourceCommit:$sourceCommit,builderSourceCommit:$builderSourceCommit,
       builderEvidenceIndexSha384:$builderEvidenceIndexSha384,
       builderEvidenceIndexObjectKey:$builderEvidenceIndexObjectKey,
       builderEvidenceIndexObjectVersionId:$builderEvidenceIndexObjectVersionId,
@@ -944,11 +1497,40 @@ summary() {
       builderTemplateEvidenceObjectKey:$builderTemplateEvidenceObjectKey,
       builderTemplateEvidenceObjectVersionId:$builderTemplateEvidenceObjectVersionId,
       builderTemplateEvidenceSha384:$builderTemplateEvidenceSha384,
+      publisherTemplateSha384:$publisherTemplateSha384,
+      publisherTemplateEvidenceObjectKey:$publisherTemplateEvidenceObjectKey,
+      publisherTemplateEvidenceObjectVersionId:$publisherTemplateEvidenceObjectVersionId,
+      publisherTemplateEvidenceSha384:$publisherTemplateEvidenceSha384,
+      templatePublisherRoleInventorySha384:$templatePublisherRoleInventorySha384,
+      templatePublisherRoleInventoryObjectKey:$templatePublisherRoleInventoryObjectKey,
+      templatePublisherRoleInventoryObjectVersionId:$templatePublisherRoleInventoryObjectVersionId,
+      cloudFormationExecutionRoleInventoryObjectKey:$cloudFormationExecutionRoleInventoryObjectKey,
+      cloudFormationExecutionRoleInventoryObjectVersionId:$cloudFormationExecutionRoleInventoryObjectVersionId,
+      cloudFormationExecutionRoleInventorySha384:$cloudFormationExecutionRoleInventorySha384,
+      templateUploadReceiptObjectKey:$templateUploadReceiptObjectKey,
+      templateUploadReceiptObjectVersionId:$templateUploadReceiptObjectVersionId,
+      templateUploadReceiptSha384:$templateUploadReceiptSha384,
+      changeSetReceiptObjectKey:$changeSetReceiptObjectKey,
+      changeSetReceiptObjectVersionId:$changeSetReceiptObjectVersionId,
+      changeSetReceiptSha384:$changeSetReceiptSha384,
+      cleanupTemplateSha384:$cleanupTemplateSha384,
+      cleanupTemplateEvidenceObjectKey:$cleanupTemplateEvidenceObjectKey,
+      cleanupTemplateEvidenceObjectVersionId:$cleanupTemplateEvidenceObjectVersionId,
+      cleanupTemplateEvidenceSha384:$cleanupTemplateEvidenceSha384,
+      cleanupExecutionRoleInventorySha384:$cleanupExecutionRoleInventorySha384,
+      cleanupExecutionRoleInventoryObjectKey:$cleanupExecutionRoleInventoryObjectKey,
+      cleanupExecutionRoleInventoryObjectVersionId:$cleanupExecutionRoleInventoryObjectVersionId,
+      cleanupSubmitterRoleInventorySha384:$cleanupSubmitterRoleInventorySha384,
+      cleanupSubmitterRoleInventoryObjectKey:$cleanupSubmitterRoleInventoryObjectKey,
+      cleanupSubmitterRoleInventoryObjectVersionId:$cleanupSubmitterRoleInventoryObjectVersionId,
       packerInvokerTemplateSha384:$packerInvokerTemplateSha384,
       packerInvokerEvidenceObjectKey:$packerInvokerEvidenceObjectKey,
       packerInvokerEvidenceObjectVersionId:$packerInvokerEvidenceObjectVersionId,
       packerInvokerEvidenceSha384:$packerInvokerEvidenceSha384,
       packerInvokerRoleInventorySha384:$packerInvokerRoleInventorySha384,
+      packerControlInventoryPolicySha384:$packerControlInventoryPolicySha384,
+      packerControlLaunchPolicySha384:$packerControlLaunchPolicySha384,
+      packerControlArtifactPolicySha384:$packerControlArtifactPolicySha384,
       sourceAmiId:$sourceAmiId,sourceAmiOwner:$sourceAmiOwner,
       parentBinarySha384:$parentBinarySha384,eifSha384:$eifSha384,pcr0Sha384:$pcr0Sha384,
       phase2TemplateCommit:$phase2TemplateCommit,phase2TemplateSha384:$phase2TemplateSha384,
@@ -1158,11 +1740,50 @@ build_ami() {
     --arg region "${RECOVERY_REGION}" \
     --arg remediationEvidenceCommit "${REMEDIATION_EVIDENCE_COMMIT}" \
     --arg remediationIndexObjectVersionId "${REMEDIATION_INDEX_VERSION_ID}" \
+    --arg trustedPrincipalInventorySha384 "${LAYRS_RECOVERY_TRUSTED_PRINCIPAL_INVENTORY_SHA384}" \
     --arg sourceCommit "${RECOVERY_SOURCE_COMMIT}" \
     --arg builderSourceCommit "${BUILDER_COMMIT}" \
     --arg builderEvidenceIndexSha384 "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_SHA384}" \
+    --arg builderEvidenceIndexObjectKey "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_KEY}" \
+    --arg builderEvidenceIndexObjectVersionId "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_OBJECT_VERSION_ID}" \
     --arg builderTemplateSha384 "${LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384}" \
+    --arg builderTemplateEvidenceObjectKey "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_KEY}" \
+    --arg builderTemplateEvidenceObjectVersionId "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}" \
+    --arg builderTemplateEvidenceSha384 "${LAYRS_RECOVERY_BUILDER_TEMPLATE_EVIDENCE_SHA384}" \
     --arg packerInvokerRoleInventorySha384 "${LAYRS_RECOVERY_PACKER_INVOKER_ROLE_INVENTORY_SHA384}" \
+    --arg packerInvokerTemplateSha384 "${LAYRS_RECOVERY_PACKER_INVOKER_TEMPLATE_SHA384}" \
+    --arg packerInvokerEvidenceObjectKey "${LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_OBJECT_KEY}" \
+    --arg packerInvokerEvidenceObjectVersionId "${LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_OBJECT_VERSION_ID}" \
+    --arg packerInvokerEvidenceSha384 "${LAYRS_RECOVERY_PACKER_INVOKER_EVIDENCE_SHA384}" \
+    --arg packerControlInventoryPolicySha384 "${LAYRS_RECOVERY_PACKER_CONTROL_INVENTORY_POLICY_SHA384}" \
+    --arg packerControlLaunchPolicySha384 "${LAYRS_RECOVERY_PACKER_CONTROL_LAUNCH_POLICY_SHA384}" \
+    --arg packerControlArtifactPolicySha384 "${LAYRS_RECOVERY_PACKER_CONTROL_ARTIFACT_POLICY_SHA384}" \
+    --arg publisherTemplateSha384 "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_SHA384}" \
+    --arg publisherTemplateEvidenceObjectKey "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_OBJECT_KEY}" \
+    --arg publisherTemplateEvidenceObjectVersionId "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}" \
+    --arg publisherTemplateEvidenceSha384 "${LAYRS_RECOVERY_PUBLISHER_TEMPLATE_EVIDENCE_SHA384}" \
+    --arg templatePublisherRoleInventorySha384 "${LAYRS_RECOVERY_TEMPLATE_PUBLISHER_ROLE_INVENTORY_SHA384}" \
+    --arg templatePublisherRoleInventoryObjectKey "${LAYRS_RECOVERY_TEMPLATE_PUBLISHER_ROLE_INVENTORY_OBJECT_KEY}" \
+    --arg templatePublisherRoleInventoryObjectVersionId "${LAYRS_RECOVERY_TEMPLATE_PUBLISHER_ROLE_INVENTORY_OBJECT_VERSION_ID}" \
+    --arg cloudFormationExecutionRoleInventoryObjectKey "${LAYRS_RECOVERY_CLOUDFORMATION_EXECUTION_ROLE_INVENTORY_OBJECT_KEY}" \
+    --arg cloudFormationExecutionRoleInventoryObjectVersionId "${LAYRS_RECOVERY_CLOUDFORMATION_EXECUTION_ROLE_INVENTORY_OBJECT_VERSION_ID}" \
+    --arg cloudFormationExecutionRoleInventorySha384 "${LAYRS_RECOVERY_CLOUDFORMATION_EXECUTION_ROLE_INVENTORY_SHA384}" \
+    --arg templateUploadReceiptObjectKey "${LAYRS_RECOVERY_TEMPLATE_UPLOAD_RECEIPT_OBJECT_KEY}" \
+    --arg templateUploadReceiptObjectVersionId "${LAYRS_RECOVERY_TEMPLATE_UPLOAD_RECEIPT_OBJECT_VERSION_ID}" \
+    --arg templateUploadReceiptSha384 "${LAYRS_RECOVERY_TEMPLATE_UPLOAD_RECEIPT_SHA384}" \
+    --arg changeSetReceiptObjectKey "${LAYRS_RECOVERY_CHANGE_SET_RECEIPT_OBJECT_KEY}" \
+    --arg changeSetReceiptObjectVersionId "${LAYRS_RECOVERY_CHANGE_SET_RECEIPT_OBJECT_VERSION_ID}" \
+    --arg changeSetReceiptSha384 "${LAYRS_RECOVERY_CHANGE_SET_RECEIPT_SHA384}" \
+    --arg cleanupTemplateSha384 "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_SHA384}" \
+    --arg cleanupTemplateEvidenceObjectKey "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_EVIDENCE_OBJECT_KEY}" \
+    --arg cleanupTemplateEvidenceObjectVersionId "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_EVIDENCE_OBJECT_VERSION_ID}" \
+    --arg cleanupTemplateEvidenceSha384 "${LAYRS_RECOVERY_CLEANUP_TEMPLATE_EVIDENCE_SHA384}" \
+    --arg cleanupExecutionRoleInventorySha384 "${LAYRS_RECOVERY_CLEANUP_EXECUTION_ROLE_INVENTORY_SHA384}" \
+    --arg cleanupExecutionRoleInventoryObjectKey "${LAYRS_RECOVERY_CLEANUP_EXECUTION_ROLE_INVENTORY_OBJECT_KEY}" \
+    --arg cleanupExecutionRoleInventoryObjectVersionId "${LAYRS_RECOVERY_CLEANUP_EXECUTION_ROLE_INVENTORY_OBJECT_VERSION_ID}" \
+    --arg cleanupSubmitterRoleInventorySha384 "${LAYRS_RECOVERY_CLEANUP_SUBMITTER_ROLE_INVENTORY_SHA384}" \
+    --arg cleanupSubmitterRoleInventoryObjectKey "${LAYRS_RECOVERY_CLEANUP_SUBMITTER_ROLE_INVENTORY_OBJECT_KEY}" \
+    --arg cleanupSubmitterRoleInventoryObjectVersionId "${LAYRS_RECOVERY_CLEANUP_SUBMITTER_ROLE_INVENTORY_OBJECT_VERSION_ID}" \
     --arg sourceAmiId "${LAYRS_RECOVERY_SOURCE_AMI_ID}" \
     --arg sourceAmiOwner "${LAYRS_RECOVERY_SOURCE_AMI_OWNER}" \
     --arg sourceAmiProvenanceSha384 "${SOURCE_AMI_PROVENANCE_SHA384}" \
@@ -1199,6 +1820,7 @@ build_ami() {
     '{protocol:"layrs.seq159300.recovery-parent-build-evidence.v1",
       accountId:$accountId,amiId:$amiId,buildCompletedAt:$buildCompletedAt,
       eifSha384:$eifSha384,environment:"production",implementationCommit:$implementationCommit,
+      trustedPrincipalInventorySha384:$trustedPrincipalInventorySha384,
       parentBinarySha384:$parentBinarySha384,pcr0Sha384:$pcr0Sha384,region:$region,
       remediationEvidenceCommit:$remediationEvidenceCommit,
       remediationIndexObjectVersionId:$remediationIndexObjectVersionId,
@@ -1215,6 +1837,35 @@ build_ami() {
       packerInvokerEvidenceObjectVersionId:$packerInvokerEvidenceObjectVersionId,
       packerInvokerEvidenceSha384:$packerInvokerEvidenceSha384,
       packerInvokerRoleInventorySha384:$packerInvokerRoleInventorySha384,
+      packerControlInventoryPolicySha384:$packerControlInventoryPolicySha384,
+      packerControlLaunchPolicySha384:$packerControlLaunchPolicySha384,
+      packerControlArtifactPolicySha384:$packerControlArtifactPolicySha384,
+      publisherTemplateSha384:$publisherTemplateSha384,
+      publisherTemplateEvidenceObjectKey:$publisherTemplateEvidenceObjectKey,
+      publisherTemplateEvidenceObjectVersionId:$publisherTemplateEvidenceObjectVersionId,
+      publisherTemplateEvidenceSha384:$publisherTemplateEvidenceSha384,
+      templatePublisherRoleInventorySha384:$templatePublisherRoleInventorySha384,
+      templatePublisherRoleInventoryObjectKey:$templatePublisherRoleInventoryObjectKey,
+      templatePublisherRoleInventoryObjectVersionId:$templatePublisherRoleInventoryObjectVersionId,
+      cloudFormationExecutionRoleInventoryObjectKey:$cloudFormationExecutionRoleInventoryObjectKey,
+      cloudFormationExecutionRoleInventoryObjectVersionId:$cloudFormationExecutionRoleInventoryObjectVersionId,
+      cloudFormationExecutionRoleInventorySha384:$cloudFormationExecutionRoleInventorySha384,
+      templateUploadReceiptObjectKey:$templateUploadReceiptObjectKey,
+      templateUploadReceiptObjectVersionId:$templateUploadReceiptObjectVersionId,
+      templateUploadReceiptSha384:$templateUploadReceiptSha384,
+      changeSetReceiptObjectKey:$changeSetReceiptObjectKey,
+      changeSetReceiptObjectVersionId:$changeSetReceiptObjectVersionId,
+      changeSetReceiptSha384:$changeSetReceiptSha384,
+      cleanupTemplateSha384:$cleanupTemplateSha384,
+      cleanupTemplateEvidenceObjectKey:$cleanupTemplateEvidenceObjectKey,
+      cleanupTemplateEvidenceObjectVersionId:$cleanupTemplateEvidenceObjectVersionId,
+      cleanupTemplateEvidenceSha384:$cleanupTemplateEvidenceSha384,
+      cleanupExecutionRoleInventorySha384:$cleanupExecutionRoleInventorySha384,
+      cleanupExecutionRoleInventoryObjectKey:$cleanupExecutionRoleInventoryObjectKey,
+      cleanupExecutionRoleInventoryObjectVersionId:$cleanupExecutionRoleInventoryObjectVersionId,
+      cleanupSubmitterRoleInventorySha384:$cleanupSubmitterRoleInventorySha384,
+      cleanupSubmitterRoleInventoryObjectKey:$cleanupSubmitterRoleInventoryObjectKey,
+      cleanupSubmitterRoleInventoryObjectVersionId:$cleanupSubmitterRoleInventoryObjectVersionId,
       sourceAmiOwner:$sourceAmiOwner,sourceAmiProvenanceSha384:$sourceAmiProvenanceSha384,
       buildSubnetInventorySha384:$buildSubnetInventorySha384,
       buildSecurityGroupInventorySha384:$buildSecurityGroupInventorySha384,
