@@ -12,10 +12,28 @@ const EIF_SHA384 = '958e084e0a66d0aca6773193a74d40659cd258fcffa116b0117fed1fab83
 const PCR0_SHA384 = '57fc48ad4d755edda38665bc8f0a16e7fd9dc485e3b57a2bce9070f60bd3b9724711ff973175340d5ebbfed4d63b7fac';
 
 const FIELDS = Object.freeze([
-  'accountId', 'amiId', 'buildCompletedAt', 'eifSha384', 'environment',
-  'implementationCommit', 'parentBinarySha384', 'pcr0Sha384', 'protocol', 'region',
+  'accountId', 'amiId', 'buildCompletedAt', 'builderSourceCommit',
+  'buildInstanceProfileInventorySha384', 'buildSecurityGroupInventorySha384',
+  'buildSubnetInventorySha384', 'eifSha384', 'environment', 'implementationCommit',
+  'implementationEvidenceObjectKey', 'implementationEvidenceObjectVersionId',
+  'implementationEvidenceSha384', 'nitroCliNevra', 'nitroCliRpmObjectKey',
+  'nitroCliRpmObjectVersionId', 'nitroCliRpmSha384', 'nitroPackageInventorySha384',
+  'outputAmiInventorySha384', 'packerManifestSha384', 'packerTemplateSha384',
+  'parentBinarySha384', 'pcr0Sha384', 'phase2EvidenceObjectKey',
+  'phase2EvidenceObjectVersionId', 'phase2EvidenceSha384', 'phase2TemplateCommit',
+  'phase2TemplateSha384', 'protocol', 'region',
   'remediationEvidenceCommit', 'remediationIndexObjectVersionId', 'sourceCommit',
+  'sourceAmiId', 'sourceAmiOwner', 'sourceAmiProvenanceSha384',
 ]);
+
+function immutableObjectKey(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._/-]{0,1023}$/u.test(value)
+    && !value.includes('..');
+}
+
+function immutableVersionId(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9._-]{1,1024}$/u.test(value);
+}
 
 export function canonicalJson(value) {
   if (value === null || typeof value === 'boolean' || typeof value === 'string') {
@@ -38,11 +56,30 @@ export function renderRecoveryParentBuildEvidence(input) {
   if (input.protocol !== 'layrs.seq159300.recovery-parent-build-evidence.v1'
       || input.accountId !== ACCOUNT_ID || input.region !== REGION
       || input.environment !== 'production' || input.sourceCommit !== SOURCE_COMMIT
+      || !/^[0-9a-f]{40}$/u.test(input.builderSourceCommit)
+      || input.builderSourceCommit === SOURCE_COMMIT
       || !/^[0-9a-f]{40}$/u.test(input.implementationCommit)
+      || !/^[0-9a-f]{40}$/u.test(input.phase2TemplateCommit)
       || input.remediationEvidenceCommit !== REMEDIATION_COMMIT
       || input.remediationIndexObjectVersionId !== REMEDIATION_INDEX_VERSION
       || input.parentBinarySha384 !== PARENT_SHA384 || input.eifSha384 !== EIF_SHA384
       || input.pcr0Sha384 !== PCR0_SHA384 || !/^ami-[0-9a-f]{8,17}$/u.test(input.amiId)
+      || !/^ami-[0-9a-f]{8,17}$/u.test(input.sourceAmiId)
+      || input.sourceAmiOwner !== '137112412989'
+      || !/^aws-nitro-enclaves-cli-[0-9]+:?[A-Za-z0-9._+~]+-[A-Za-z0-9._+~]+\.x86_64$/u.test(input.nitroCliNevra)
+      || !immutableObjectKey(input.phase2EvidenceObjectKey)
+      || !immutableObjectKey(input.implementationEvidenceObjectKey)
+      || !immutableObjectKey(input.nitroCliRpmObjectKey)
+      || !immutableVersionId(input.phase2EvidenceObjectVersionId)
+      || !immutableVersionId(input.implementationEvidenceObjectVersionId)
+      || !immutableVersionId(input.nitroCliRpmObjectVersionId)
+      || [
+        input.buildInstanceProfileInventorySha384, input.buildSecurityGroupInventorySha384,
+        input.buildSubnetInventorySha384, input.implementationEvidenceSha384,
+        input.nitroCliRpmSha384, input.nitroPackageInventorySha384, input.outputAmiInventorySha384,
+        input.packerManifestSha384, input.packerTemplateSha384, input.phase2EvidenceSha384,
+        input.phase2TemplateSha384, input.sourceAmiProvenanceSha384,
+      ].some(value => !/^[0-9a-f]{96}$/u.test(value))
       || !Number.isFinite(completedAt.getTime())
       || completedAt.toISOString() !== input.buildCompletedAt) {
     throw new Error('recovery parent build evidence binding is invalid');

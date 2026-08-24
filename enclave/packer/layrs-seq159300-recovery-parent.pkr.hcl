@@ -28,6 +28,13 @@ variable "source_ami_owner" {
     error_message = "The source AMI owner must be the official AL2023 owner."
   }
 }
+variable "source_ami_provenance_sha384" {
+  type = string
+  validation {
+    condition     = can(regex("^[0-9a-f]{96}$", var.source_ami_provenance_sha384))
+    error_message = "The canonical source AMI provenance SHA384 is required."
+  }
+}
 variable "build_subnet_id" {
   type = string
   validation {
@@ -49,6 +56,34 @@ variable "build_instance_profile" {
     error_message = "The build instance profile must be recovery-specific."
   }
 }
+variable "build_subnet_inventory_sha384" {
+  type = string
+  validation {
+    condition     = can(regex("^[0-9a-f]{96}$", var.build_subnet_inventory_sha384))
+    error_message = "The canonical build subnet inventory SHA384 is required."
+  }
+}
+variable "build_security_group_inventory_sha384" {
+  type = string
+  validation {
+    condition     = can(regex("^[0-9a-f]{96}$", var.build_security_group_inventory_sha384))
+    error_message = "The canonical build security-group inventory SHA384 is required."
+  }
+}
+variable "build_instance_profile_inventory_sha384" {
+  type = string
+  validation {
+    condition     = can(regex("^[0-9a-f]{96}$", var.build_instance_profile_inventory_sha384))
+    error_message = "The canonical build instance-profile inventory SHA384 is required."
+  }
+}
+variable "builder_source_commit" {
+  type = string
+  validation {
+    condition     = can(regex("^[0-9a-f]{40}$", var.builder_source_commit))
+    error_message = "The exact reviewed recovery-parent builder commit is required."
+  }
+}
 variable "parent_sha384" {
   type = string
   validation {
@@ -63,11 +98,53 @@ variable "phase2_template_sha384" {
     error_message = "The reviewed Phase2 template SHA384 is required."
   }
 }
+variable "phase2_template_commit" {
+  type = string
+  validation {
+    condition     = can(regex("^[0-9a-f]{40}$", var.phase2_template_commit))
+    error_message = "The exact reviewed Phase2 template commit is required."
+  }
+}
 variable "implementation_commit" {
   type = string
   validation {
     condition     = can(regex("^[0-9a-f]{40}$", var.implementation_commit))
     error_message = "The final integrated recovery implementation commit is required."
+  }
+}
+variable "packer_template_sha384" {
+  type = string
+  validation {
+    condition     = can(regex("^[0-9a-f]{96}$", var.packer_template_sha384))
+    error_message = "The exact Packer template SHA384 is required."
+  }
+}
+variable "nitro_cli_nevra" {
+  type = string
+  validation {
+    condition     = can(regex("^aws-nitro-enclaves-cli-[0-9]+:?[A-Za-z0-9._+~]+-[A-Za-z0-9._+~]+\\.x86_64$", var.nitro_cli_nevra))
+    error_message = "One exact reviewed x86_64 Nitro CLI NEVRA is required."
+  }
+}
+variable "nitro_cli_rpm_sha384" {
+  type = string
+  validation {
+    condition     = can(regex("^[0-9a-f]{96}$", var.nitro_cli_rpm_sha384))
+    error_message = "The exact reviewed Nitro CLI RPM SHA384 is required."
+  }
+}
+variable "nitro_package_inventory_sha384" {
+  type = string
+  validation {
+    condition     = can(regex("^[0-9a-f]{96}$", var.nitro_package_inventory_sha384))
+    error_message = "The expected installed-package inventory SHA384 is required."
+  }
+}
+variable "package_inventory_output" {
+  type = string
+  validation {
+    condition     = length(trimspace(var.package_inventory_output)) > 0
+    error_message = "A local installed-package inventory output path is required."
   }
 }
 variable "manifest_output" {
@@ -87,10 +164,11 @@ locals {
 }
 
 source "amazon-ebs" "seq159300_recovery_parent" {
-  region        = var.aws_region
-  instance_type = "m6i.xlarge"
-  ssh_username  = "ec2-user"
-  ssh_interface = "session_manager"
+  region              = var.aws_region
+  instance_type       = "m6i.xlarge"
+  ssh_username        = "ec2-user"
+  ssh_interface       = "session_manager"
+  allowed_account_ids = ["082223548516"]
 
   ami_name        = local.ami_name
   ami_description = "Isolated Layrs sequence-159300 recovery-only Nitro parent from f282583cae7a"
@@ -121,19 +199,29 @@ source "amazon-ebs" "seq159300_recovery_parent" {
   }
 
   tags = {
-    Name                     = local.ami_name
-    Project                  = "Layrs"
-    Purpose                  = local.recovery_purpose
-    Environment              = "recovery-only"
-    ManagedBy                = "Packer"
-    RecoverySourceCommit     = local.recovery_source_commit
-    RecoveryParentSha384     = var.parent_sha384
-    RecoveryEifSha384        = local.recovery_eif_sha384
-    RecoveryPcr0Sha384       = local.recovery_pcr0_sha384
-    Phase2TemplateSha384     = var.phase2_template_sha384
-    GateImplementationCommit = var.implementation_commit
-    ProductionRouteAttached  = "false"
-    Visibility               = "private"
+    Name                        = local.ami_name
+    Project                     = "Layrs"
+    Purpose                     = local.recovery_purpose
+    Environment                 = "recovery-only"
+    ManagedBy                   = "Packer"
+    RecoverySourceCommit        = local.recovery_source_commit
+    RecoveryBuilderSourceCommit = var.builder_source_commit
+    SourceAmiProvenanceSha384   = var.source_ami_provenance_sha384
+    BuildSubnetInventorySha384  = var.build_subnet_inventory_sha384
+    BuildSecurityGroupSha384    = var.build_security_group_inventory_sha384
+    BuildInstanceProfileSha384  = var.build_instance_profile_inventory_sha384
+    RecoveryParentSha384        = var.parent_sha384
+    RecoveryEifSha384           = local.recovery_eif_sha384
+    RecoveryPcr0Sha384          = local.recovery_pcr0_sha384
+    Phase2TemplateSha384        = var.phase2_template_sha384
+    Phase2TemplateCommit        = var.phase2_template_commit
+    GateImplementationCommit    = var.implementation_commit
+    PackerTemplateSha384        = var.packer_template_sha384
+    NitroCliNevra               = var.nitro_cli_nevra
+    NitroCliRpmSha384           = var.nitro_cli_rpm_sha384
+    NitroPackageInventorySha384 = var.nitro_package_inventory_sha384
+    ProductionRouteAttached     = "false"
+    Visibility                  = "private"
   }
 
   run_tags = {
@@ -188,12 +276,20 @@ build {
     source      = "enclave/allocator.yaml"
     destination = "/tmp/allocator.yaml"
   }
+  provisioner "file" {
+    source      = "build/aws-nitro-enclaves-cli.rpm"
+    destination = "/tmp/aws-nitro-enclaves-cli.rpm"
+  }
 
   provisioner "shell" {
     inline = [
       "printf '%s  %s\\n' 'd9506bf11627b04bd5d220e18e78584cd5e649952fe380309346d9c6bbecd511eb318cdcdee6a1d0db989d581a742db1' '/tmp/layrs-enclave-parent' | sha384sum -c -",
       "printf '%s  %s\\n' '958e084e0a66d0aca6773193a74d40659cd258fcffa116b0117fed1fab8361046ffea6411379b72fc72c97b86f611290' '/tmp/layrsv2-clob.eif' | sha384sum -c -",
-      "sudo dnf install -y aws-nitro-enclaves-cli aws-nitro-enclaves-cli-devel",
+      "printf '%s  %s\\n' '${var.nitro_cli_rpm_sha384}' '/tmp/aws-nitro-enclaves-cli.rpm' | sha384sum -c -",
+      "sudo dnf install -y --disablerepo='*' /tmp/aws-nitro-enclaves-cli.rpm",
+      "test \"$(rpm -q --qf '%%{NAME}-%%{EPOCHNUM}:%%{VERSION}-%%{RELEASE}.%%{ARCH}' aws-nitro-enclaves-cli)\" = '${var.nitro_cli_nevra}'",
+      "printf '%s\\n' '${var.nitro_cli_nevra}' > /tmp/layrs-seq159300-installed-package-inventory.txt",
+      "printf '%s  %s\\n' '${var.nitro_package_inventory_sha384}' '/tmp/layrs-seq159300-installed-package-inventory.txt' | sha384sum -c -",
       "sudo useradd --system --home-dir /nonexistent --shell /sbin/nologin layrsv2 || true",
       "sudo usermod -aG ne ec2-user",
       "sudo install -d -o root -g root -m 0755 /opt/layrsv2",
@@ -210,21 +306,37 @@ build {
     ]
   }
 
+  provisioner "file" {
+    direction   = "download"
+    source      = "/tmp/layrs-seq159300-installed-package-inventory.txt"
+    destination = var.package_inventory_output
+  }
+
   post-processor "manifest" {
     output     = var.manifest_output
     strip_path = true
     custom_data = {
-      purpose                   = local.recovery_purpose
-      sourceCommit              = local.recovery_source_commit
-      sourceAmiId               = var.source_ami_id
-      sourceAmiOwner            = var.source_ami_owner
-      parentSha384              = var.parent_sha384
-      eifSha384                 = local.recovery_eif_sha384
-      pcr0Sha384                = local.recovery_pcr0_sha384
-      phase2TemplateSha384      = var.phase2_template_sha384
-      implementationCommit      = var.implementation_commit
-      productionRouteAttached   = "false"
-      recoveryServicesUnchanged = "true"
+      purpose                             = local.recovery_purpose
+      sourceCommit                        = local.recovery_source_commit
+      builderSourceCommit                 = var.builder_source_commit
+      sourceAmiId                         = var.source_ami_id
+      sourceAmiOwner                      = var.source_ami_owner
+      sourceAmiProvenanceSha384           = var.source_ami_provenance_sha384
+      buildSubnetInventorySha384          = var.build_subnet_inventory_sha384
+      buildSecurityGroupInventorySha384   = var.build_security_group_inventory_sha384
+      buildInstanceProfileInventorySha384 = var.build_instance_profile_inventory_sha384
+      parentSha384                        = var.parent_sha384
+      eifSha384                           = local.recovery_eif_sha384
+      pcr0Sha384                          = local.recovery_pcr0_sha384
+      phase2TemplateSha384                = var.phase2_template_sha384
+      phase2TemplateCommit                = var.phase2_template_commit
+      implementationCommit                = var.implementation_commit
+      packerTemplateSha384                = var.packer_template_sha384
+      nitroCliNevra                       = var.nitro_cli_nevra
+      nitroCliRpmSha384                   = var.nitro_cli_rpm_sha384
+      nitroPackageInventorySha384         = var.nitro_package_inventory_sha384
+      productionRouteAttached             = "false"
+      recoveryServicesUnchanged           = "true"
     }
   }
 }
