@@ -147,6 +147,41 @@ variable "nitro_package_set_sha384" {
     error_message = "The exact immutable Nitro dependency-closure manifest SHA384 is required."
   }
 }
+variable "nitro_package_closure_sha384" {
+  type = string
+  validation {
+    condition     = can(regex("^[0-9a-f]{96}$", var.nitro_package_closure_sha384))
+    error_message = "The independently reviewed Nitro package name and NEVRA closure SHA384 is required."
+  }
+}
+variable "recovery_evidence_index_sha384" {
+  type = string
+  validation {
+    condition     = can(regex("^[0-9a-f]{96}$", var.recovery_evidence_index_sha384))
+    error_message = "The exact recovery evidence-index SHA384 is required."
+  }
+}
+variable "build_control_plane_role_inventory_sha384" {
+  type = string
+  validation {
+    condition     = can(regex("^[0-9a-f]{96}$", var.build_control_plane_role_inventory_sha384))
+    error_message = "The exact Packer control-role inventory SHA384 is required."
+  }
+}
+variable "builder_template_sha384" {
+  type = string
+  validation {
+    condition     = can(regex("^[0-9a-f]{96}$", var.builder_template_sha384))
+    error_message = "The exact recovery-builder CloudFormation template SHA384 is required."
+  }
+}
+variable "packer_invoker_role_inventory_sha384" {
+  type = string
+  validation {
+    condition     = can(regex("^[0-9a-f]{96}$", var.packer_invoker_role_inventory_sha384))
+    error_message = "The exact Packer invoker-role inventory SHA384 is required."
+  }
+}
 variable "package_install_plan" {
   type = string
   validation {
@@ -186,9 +221,6 @@ source "amazon-ebs" "seq159300_recovery_parent" {
 
   ami_name        = local.ami_name
   ami_description = "Isolated Layrs sequence-159300 recovery-only Nitro parent from f282583cae7a"
-  encrypt_boot    = true
-  kms_key_id      = "alias/aws/ebs"
-  ena_support     = true
   imds_support    = "v2.0"
 
   associate_public_ip_address = false
@@ -196,6 +228,15 @@ source "amazon-ebs" "seq159300_recovery_parent" {
   security_group_id           = var.build_security_group_id
   iam_instance_profile        = var.build_instance_profile
   ssh_clear_authorized_keys   = true
+  temporary_key_pair_name     = "layrs-seq159300-recovery-${substr(uuidv4(), 0, 16)}"
+
+  launch_block_device_mappings {
+    delete_on_termination = true
+    device_name           = "/dev/xvda"
+    encrypted             = true
+    volume_size           = 8
+    volume_type           = "gp3"
+  }
 
   deregistration_protection {
     enabled       = true
@@ -213,46 +254,68 @@ source "amazon-ebs" "seq159300_recovery_parent" {
   }
 
   tags = {
-    Name                        = local.ami_name
-    Project                     = "Layrs"
-    Purpose                     = local.recovery_purpose
-    Environment                 = "recovery-only"
-    ManagedBy                   = "Packer"
-    RecoverySourceCommit        = local.recovery_source_commit
-    RecoveryBuilderSourceCommit = var.builder_source_commit
-    SourceAmiProvenanceSha384   = var.source_ami_provenance_sha384
-    BuildSubnetInventorySha384  = var.build_subnet_inventory_sha384
-    BuildSecurityGroupSha384    = var.build_security_group_inventory_sha384
-    BuildInstanceProfileSha384  = var.build_instance_profile_inventory_sha384
-    RecoveryParentSha384        = var.parent_sha384
-    RecoveryEifSha384           = local.recovery_eif_sha384
-    RecoveryPcr0Sha384          = local.recovery_pcr0_sha384
-    Phase2TemplateSha384        = var.phase2_template_sha384
-    Phase2TemplateCommit        = var.phase2_template_commit
-    GateImplementationCommit    = var.implementation_commit
-    PackerTemplateSha384        = var.packer_template_sha384
-    NitroCliNevra               = var.nitro_cli_nevra
-    NitroCliRpmSha384           = var.nitro_cli_rpm_sha384
-    NitroPackageInventorySha384 = var.nitro_package_inventory_sha384
-    NitroPackageSetSha384       = var.nitro_package_set_sha384
-    ProductionRouteAttached     = "false"
-    Visibility                  = "private"
+    Name                          = local.ami_name
+    Project                       = "Layrs"
+    Purpose                       = local.recovery_purpose
+    Environment                   = "recovery-only"
+    ManagedBy                     = "Packer"
+    RecoverySourceCommit          = local.recovery_source_commit
+    RecoveryBuilderSourceCommit   = var.builder_source_commit
+    SourceAmiProvenanceSha384     = var.source_ami_provenance_sha384
+    BuildSubnetInventorySha384    = var.build_subnet_inventory_sha384
+    BuildSecurityGroupSha384      = var.build_security_group_inventory_sha384
+    BuildInstanceProfileSha384    = var.build_instance_profile_inventory_sha384
+    BuildControlPlaneRoleSha384   = var.build_control_plane_role_inventory_sha384
+    PackerInvokerRoleSha384       = var.packer_invoker_role_inventory_sha384
+    RecoveryBuilderTemplateSha384 = var.builder_template_sha384
+    RecoveryPackageSetSha384      = var.nitro_package_set_sha384
+    RecoveryEvidenceIndexSha384   = var.recovery_evidence_index_sha384
+    RecoveryParentSha384          = var.parent_sha384
+    RecoveryEifSha384             = local.recovery_eif_sha384
+    RecoveryPcr0Sha384            = local.recovery_pcr0_sha384
+    Phase2TemplateSha384          = var.phase2_template_sha384
+    Phase2TemplateCommit          = var.phase2_template_commit
+    GateImplementationCommit      = var.implementation_commit
+    PackerTemplateSha384          = var.packer_template_sha384
+    NitroCliNevra                 = var.nitro_cli_nevra
+    NitroCliRpmSha384             = var.nitro_cli_rpm_sha384
+    NitroPackageInventorySha384   = var.nitro_package_inventory_sha384
+    NitroPackageSetSha384         = var.nitro_package_set_sha384
+    NitroPackageClosureSha384     = var.nitro_package_closure_sha384
+    ProductionRouteAttached       = "false"
+    Visibility                    = "private"
+  }
+
+  snapshot_tags = {
+    Project                       = "Layrs"
+    Purpose                       = local.recovery_purpose
+    Environment                   = "recovery-only"
+    ManagedBy                     = "Packer"
+    RecoveryBuilderTemplateSha384 = var.builder_template_sha384
+    RecoveryPackageSetSha384      = var.nitro_package_set_sha384
+    RecoveryEvidenceIndexSha384   = var.recovery_evidence_index_sha384
   }
 
   run_tags = {
-    Name        = "layrs-seq159300-recovery-parent-build"
-    Project     = "Layrs"
-    Purpose     = local.recovery_purpose
-    Environment = "recovery-only"
-    ManagedBy   = "Packer"
+    Name                          = "layrs-seq159300-recovery-parent-build"
+    Project                       = "Layrs"
+    Purpose                       = local.recovery_purpose
+    Environment                   = "recovery-only"
+    ManagedBy                     = "Packer"
+    RecoveryBuilderTemplateSha384 = var.builder_template_sha384
+    RecoveryPackageSetSha384      = var.nitro_package_set_sha384
+    RecoveryEvidenceIndexSha384   = var.recovery_evidence_index_sha384
   }
 
   run_volume_tags = {
-    Name        = "layrs-seq159300-recovery-parent-build"
-    Project     = "Layrs"
-    Purpose     = local.recovery_purpose
-    Environment = "recovery-only"
-    ManagedBy   = "Packer"
+    Name                          = "layrs-seq159300-recovery-parent-build"
+    Project                       = "Layrs"
+    Purpose                       = local.recovery_purpose
+    Environment                   = "recovery-only"
+    ManagedBy                     = "Packer"
+    RecoveryBuilderTemplateSha384 = var.builder_template_sha384
+    RecoveryPackageSetSha384      = var.nitro_package_set_sha384
+    RecoveryEvidenceIndexSha384   = var.recovery_evidence_index_sha384
   }
 }
 
@@ -305,9 +368,11 @@ build {
       "printf '%s  %s\\n' 'd9506bf11627b04bd5d220e18e78584cd5e649952fe380309346d9c6bbecd511eb318cdcdee6a1d0db989d581a742db1' '/tmp/layrs-enclave-parent' | sha384sum -c -",
       "printf '%s  %s\\n' '958e084e0a66d0aca6773193a74d40659cd258fcffa116b0117fed1fab8361046ffea6411379b72fc72c97b86f611290' '/tmp/layrsv2-clob.eif' | sha384sum -c -",
       "test \"$(find /tmp/seq159300-nitro-packages -mindepth 1 -maxdepth 1 -type f -name '*.rpm' | wc -l)\" = \"$(wc -l < /tmp/seq159300-package-install-plan.tsv)\"",
-      "while IFS='\t' read -r file sha nevra key; do test -f \"/tmp/seq159300-nitro-packages/$file\"; printf '%s  %s\\n' \"$sha\" \"/tmp/seq159300-nitro-packages/$file\" | sha384sum -c -; rpmkeys --checksig --verbose \"/tmp/seq159300-nitro-packages/$file\" | grep -iF \"key ID $key\" | grep -F ': OK'; test \"$(rpm -qp --qf '%%{NAME}-%%{EPOCHNUM}:%%{VERSION}-%%{RELEASE}.%%{ARCH}' \"/tmp/seq159300-nitro-packages/$file\")\" = \"$nevra\"; done < /tmp/seq159300-package-install-plan.tsv",
+      "test \"$(sha256sum /etc/pki/rpm-gpg/RPM-GPG-KEY-amazon-linux-2023 | awk '{print $1}')\" = '664b632018bd84f9b249be7bd26937c560edb2f2bfc0cbc01ec5a7b4e06aad56'",
+      "rpm -q gpg-pubkey-d832c631-6515c85e",
+      "while IFS='\t' read -r file sha nevra name; do test -f \"/tmp/seq159300-nitro-packages/$file\"; printf '%s  %s\\n' \"$sha\" \"/tmp/seq159300-nitro-packages/$file\" | sha384sum -c -; rpmkeys --checksig --verbose \"/tmp/seq159300-nitro-packages/$file\" | grep -iF 'key ID D832C631' | grep -F ': OK'; test \"$(rpm -qp --qf '%%{NAME}' \"/tmp/seq159300-nitro-packages/$file\")\" = \"$name\"; test \"$(rpm -qp --qf '%%{NAME}-%%{EPOCHNUM}:%%{VERSION}-%%{RELEASE}.%%{ARCH}' \"/tmp/seq159300-nitro-packages/$file\")\" = \"$nevra\"; done < /tmp/seq159300-package-install-plan.tsv",
       "sudo dnf install -y --disablerepo='*' $(awk -F '\t' '{printf \"/tmp/seq159300-nitro-packages/%%s \", $1}' /tmp/seq159300-package-install-plan.tsv)",
-      "while IFS='\t' read -r file sha nevra key; do name=$(rpm -qp --qf '%%{NAME}' \"/tmp/seq159300-nitro-packages/$file\"); test \"$(rpm -q --qf '%%{NAME}-%%{EPOCHNUM}:%%{VERSION}-%%{RELEASE}.%%{ARCH}' \"$name\")\" = \"$nevra\"; printf '%s\t%s\\n' \"$nevra\" \"$sha\"; done < /tmp/seq159300-package-install-plan.tsv > /tmp/layrs-seq159300-installed-package-inventory.txt",
+      "while IFS='\t' read -r file sha nevra name; do test \"$(rpm -q --qf '%%{NAME}-%%{EPOCHNUM}:%%{VERSION}-%%{RELEASE}.%%{ARCH}' \"$name\")\" = \"$nevra\"; printf '%s\t%s\\n' \"$nevra\" \"$sha\"; done < /tmp/seq159300-package-install-plan.tsv > /tmp/layrs-seq159300-installed-package-inventory.txt",
       "test \"$(rpm -q --qf '%%{NAME}-%%{EPOCHNUM}:%%{VERSION}-%%{RELEASE}.%%{ARCH}' aws-nitro-enclaves-cli)\" = '${var.nitro_cli_nevra}'",
       "printf '%s  %s\\n' '${var.nitro_package_inventory_sha384}' '/tmp/layrs-seq159300-installed-package-inventory.txt' | sha384sum -c -",
       "sudo useradd --system --home-dir /nonexistent --shell /sbin/nologin layrsv2 || true",
@@ -336,28 +401,33 @@ build {
     output     = var.manifest_output
     strip_path = true
     custom_data = {
-      purpose                             = local.recovery_purpose
-      sourceCommit                        = local.recovery_source_commit
-      builderSourceCommit                 = var.builder_source_commit
-      sourceAmiId                         = var.source_ami_id
-      sourceAmiOwner                      = var.source_ami_owner
-      sourceAmiProvenanceSha384           = var.source_ami_provenance_sha384
-      buildSubnetInventorySha384          = var.build_subnet_inventory_sha384
-      buildSecurityGroupInventorySha384   = var.build_security_group_inventory_sha384
-      buildInstanceProfileInventorySha384 = var.build_instance_profile_inventory_sha384
-      parentSha384                        = var.parent_sha384
-      eifSha384                           = local.recovery_eif_sha384
-      pcr0Sha384                          = local.recovery_pcr0_sha384
-      phase2TemplateSha384                = var.phase2_template_sha384
-      phase2TemplateCommit                = var.phase2_template_commit
-      implementationCommit                = var.implementation_commit
-      packerTemplateSha384                = var.packer_template_sha384
-      nitroCliNevra                       = var.nitro_cli_nevra
-      nitroCliRpmSha384                   = var.nitro_cli_rpm_sha384
-      nitroPackageInventorySha384         = var.nitro_package_inventory_sha384
-      nitroPackageSetSha384               = var.nitro_package_set_sha384
-      productionRouteAttached             = "false"
-      recoveryServicesUnchanged           = "true"
+      purpose                              = local.recovery_purpose
+      sourceCommit                         = local.recovery_source_commit
+      builderSourceCommit                  = var.builder_source_commit
+      sourceAmiId                          = var.source_ami_id
+      sourceAmiOwner                       = var.source_ami_owner
+      sourceAmiProvenanceSha384            = var.source_ami_provenance_sha384
+      buildSubnetInventorySha384           = var.build_subnet_inventory_sha384
+      buildSecurityGroupInventorySha384    = var.build_security_group_inventory_sha384
+      buildInstanceProfileInventorySha384  = var.build_instance_profile_inventory_sha384
+      buildControlPlaneRoleInventorySha384 = var.build_control_plane_role_inventory_sha384
+      builderEvidenceIndexSha384           = var.recovery_evidence_index_sha384
+      builderTemplateSha384                = var.builder_template_sha384
+      parentSha384                         = var.parent_sha384
+      eifSha384                            = local.recovery_eif_sha384
+      pcr0Sha384                           = local.recovery_pcr0_sha384
+      phase2TemplateSha384                 = var.phase2_template_sha384
+      phase2TemplateCommit                 = var.phase2_template_commit
+      implementationCommit                 = var.implementation_commit
+      packerTemplateSha384                 = var.packer_template_sha384
+      packerInvokerRoleInventorySha384     = var.packer_invoker_role_inventory_sha384
+      nitroCliNevra                        = var.nitro_cli_nevra
+      nitroCliRpmSha384                    = var.nitro_cli_rpm_sha384
+      nitroPackageInventorySha384          = var.nitro_package_inventory_sha384
+      nitroPackageSetSha384                = var.nitro_package_set_sha384
+      nitroPackageClosureSha384            = var.nitro_package_closure_sha384
+      productionRouteAttached              = "false"
+      recoveryServicesUnchanged            = "true"
     }
   }
 }

@@ -1,9 +1,17 @@
 #!/usr/bin/env node
+import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
 const ACCOUNT_ID = '082223548516';
 const REGION = 'us-east-1';
+const SOURCE_COMMIT = 'f282583cae7a5c873a26aa8d0c1bec10c490eb8e';
+const PACKER_CONTROL_ROLE_NAME = 'layrs-production-recovery-seq159300-packer-control';
+const AMAZON_LINUX_SIGNING_KEY = Object.freeze({
+  fingerprint: 'B21C50FA44A99720EAA72F7FE951904AD832C631',
+  keyId: 'D832C631',
+  sha256: '664b632018bd84f9b249be7bd26937c560edb2f2bfc0cbc01ec5a7b4e06aad56',
+});
 const SOURCE_AMI = Object.freeze({
   architecture: 'x86_64',
   bootMode: 'uefi-preferred',
@@ -62,6 +70,10 @@ export function canonicalJson(value) {
     return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
   }
   throw new Error('unsupported canonical JSON value');
+}
+
+function digest(algorithm, value) {
+  return createHash(algorithm).update(value).digest('hex');
 }
 
 function requireObject(value, label) {
@@ -191,13 +203,24 @@ function validateBuildNetwork(input) {
   requireExactFields(
     input,
     ['expectedSecurityGroupId', 'expectedSubnetId', 'networkInterfacesResponse',
-      'routeTablesResponse', 'securityGroupsResponse', 'subnetsResponse', 'vpcEndpointsResponse'],
+      'routeTablesResponse', 'securityGroupsResponse', 'subnetsResponse', 'vpcEndpointsResponse',
+      'vpcsResponse'],
     'build network preflight',
   );
   const subnet = one(requireObject(input.subnetsResponse, 'subnets response').Subnets, 'subnets response.Subnets');
   if (subnet.SubnetId !== input.expectedSubnetId || subnet.State !== 'available'
-      || subnet.MapPublicIpOnLaunch !== false || !/^vpc-[0-9a-f]{8,17}$/u.test(String(subnet.VpcId ?? ''))) {
+      || subnet.MapPublicIpOnLaunch !== false || subnet.AssignIpv6AddressOnCreation !== false
+      || !Array.isArray(subnet.Ipv6CidrBlockAssociationSet)
+      || subnet.Ipv6CidrBlockAssociationSet.length !== 0
+      || subnet.Ipv6Native !== false || subnet.EnableDns64 !== false
+      || !/^vpc-[0-9a-f]{8,17}$/u.test(String(subnet.VpcId ?? ''))) {
     throw new Error('build subnet is not the exact private available subnet');
+  }
+  const vpc = one(requireObject(input.vpcsResponse, 'VPCs response').Vpcs, 'VPCs response.Vpcs');
+  if (vpc.VpcId !== subnet.VpcId || vpc.State !== 'available'
+      || !Array.isArray(vpc.Ipv6CidrBlockAssociationSet)
+      || vpc.Ipv6CidrBlockAssociationSet.length !== 0) {
+    throw new Error('build VPC has an unreviewed IPv6 association or is not exact and available');
   }
 
   const routeTables = requireObject(input.routeTablesResponse, 'route tables response').RouteTables;
@@ -213,9 +236,10 @@ function validateBuildNetwork(input) {
     if (!applies) throw new Error('route table is not associated with the build subnet or its VPC main route');
     for (const route of table.Routes) {
       if (route.State && route.State !== 'active') throw new Error('build route is not active');
-      if (route.DestinationCidrBlock === '0.0.0.0/0' || route.DestinationIpv6CidrBlock === '::/0') {
+      if (route.DestinationCidrBlock === '0.0.0.0/0') {
         throw new Error('build route permits public default egress');
       }
+      if (route.DestinationIpv6CidrBlock) throw new Error('build route contains forbidden IPv6 reachability');
       const target = routeTarget(route);
       routes.push({
         destination: String(route.DestinationCidrBlock ?? route.DestinationIpv6CidrBlock
@@ -295,6 +319,8 @@ function validateBuildNetwork(input) {
     for (const endpoint of matches) {
       if (endpoint.VpcId !== subnet.VpcId || endpoint.VpcEndpointType !== 'Interface'
           || endpoint.State !== 'available' || endpoint.PrivateDnsEnabled !== true
+          || endpoint.IpAddressType !== 'ipv4'
+          || !['ipv4', undefined].includes(endpoint.DnsOptions?.DnsRecordIpType)
           || !allowedServices.has(endpoint.ServiceName)
           || !Array.isArray(endpoint.SubnetIds) || endpoint.SubnetIds.length !== 1
           || endpoint.SubnetIds[0] !== subnet.SubnetId
@@ -309,6 +335,8 @@ function validateBuildNetwork(input) {
   for (const networkInterface of interfaces) {
     if (networkInterface.VpcId !== subnet.VpcId || networkInterface.InterfaceType !== 'vpc_endpoint'
         || networkInterface.RequesterManaged !== true
+        || !Array.isArray(networkInterface.Ipv6Addresses)
+        || networkInterface.Ipv6Addresses.length !== 0
         || networkInterface.SubnetId !== subnet.SubnetId
         || networkInterface.AvailabilityZone !== subnet.AvailabilityZone
         || !endpointInterfaceIds.has(networkInterface.NetworkInterfaceId)) {
@@ -331,6 +359,8 @@ function validateBuildNetwork(input) {
       .some(group => referencedIds.has(group.GroupId))).map(endpoint => ({
       networkInterfaceIds: [...(endpoint.NetworkInterfaceIds ?? [])].sort(),
       privateDnsEnabled: endpoint.PrivateDnsEnabled,
+      dnsRecordIpType: String(endpoint.DnsOptions?.DnsRecordIpType ?? 'ipv4'),
+      ipAddressType: endpoint.IpAddressType,
       serviceName: endpoint.ServiceName,
       state: endpoint.State,
       subnetIds: [...endpoint.SubnetIds].sort(),
@@ -351,52 +381,80 @@ function validateBuildNetwork(input) {
       vpcId: String(group.VpcId ?? ''),
     })).sort((left, right) => left.groupId.localeCompare(right.groupId)),
     subnet: {
+      assignIpv6AddressOnCreation: subnet.AssignIpv6AddressOnCreation,
       availabilityZone: String(subnet.AvailabilityZone ?? ''),
+      enableDns64: Boolean(subnet.EnableDns64),
+      ipv6CidrBlockAssociationSet: [...(subnet.Ipv6CidrBlockAssociationSet ?? [])],
+      ipv6Native: Boolean(subnet.Ipv6Native),
       mapPublicIpOnLaunch: subnet.MapPublicIpOnLaunch,
       subnetId: subnet.SubnetId,
       vpcId: subnet.VpcId,
+    },
+    vpc: {
+      cidrBlock: String(vpc.CidrBlock ?? ''),
+      ipv6CidrBlockAssociationSet: [...(vpc.Ipv6CidrBlockAssociationSet ?? [])],
+      state: vpc.State,
+      tags: normalizedTags(vpc.Tags),
+      vpcId: vpc.VpcId,
     },
   };
 }
 
 function validatePackageSet(input) {
-  requireExactFields(input, ['manifest'], 'Nitro package-set preflight');
+  requireExactFields(input, ['expectedPackageClosureSha384', 'manifest'], 'Nitro package-set preflight');
+  if (!sha384(input.expectedPackageClosureSha384)) {
+    throw new Error('reviewed Nitro package closure SHA384 is malformed');
+  }
   const manifest = requireObject(input.manifest, 'Nitro package-set manifest');
   requireExactFields(manifest, [
-    'accountId', 'environment', 'packages', 'protocol', 'region',
+    'accountId', 'environment', 'packageClosureSha384', 'packages', 'protocol', 'region',
+    'signingKeyFingerprint', 'signingKeySha256',
   ], 'Nitro package-set manifest');
-  if (manifest.protocol !== 'layrs.seq159300.nitro-offline-package-set.v1'
+  if (manifest.protocol !== 'layrs.seq159300.nitro-offline-package-set.v2'
       || manifest.accountId !== ACCOUNT_ID || manifest.region !== REGION
       || manifest.environment !== 'production'
-      || !Array.isArray(manifest.packages) || manifest.packages.length < 2) {
+      || manifest.signingKeyFingerprint !== AMAZON_LINUX_SIGNING_KEY.fingerprint
+      || manifest.signingKeySha256 !== AMAZON_LINUX_SIGNING_KEY.sha256
+      || manifest.packageClosureSha384 !== input.expectedPackageClosureSha384
+      || !Array.isArray(manifest.packages) || manifest.packages.length < 1) {
     throw new Error('Nitro package-set manifest binding is invalid');
   }
   const seenFiles = new Set();
+  const seenNames = new Set();
   const seenNevras = new Set();
-  let hasCli = false;
+  let cliCount = 0;
   const packages = manifest.packages.map((entry, index) => {
     requireExactFields(entry, [
-      'filename', 'nevra', 'objectKey', 'objectVersionId', 'sha384', 'signatureKeyId',
+      'filename', 'name', 'nevra', 'objectKey', 'objectVersionId', 'sha384',
     ], `Nitro package-set packages[${index}]`);
     if (!/^[A-Za-z0-9][A-Za-z0-9._+-]{0,180}\.rpm$/u.test(entry.filename)
+        || !/^[A-Za-z0-9][A-Za-z0-9+_.-]{0,120}$/u.test(entry.name)
         || !/^[A-Za-z0-9][A-Za-z0-9+_.:-]{0,220}\.(?:x86_64|noarch)$/u.test(entry.nevra)
+        || !entry.nevra.startsWith(`${entry.name}-`)
         || !immutableKey(entry.objectKey) || !immutableVersion(entry.objectVersionId)
         || !entry.objectKey.startsWith('evidence/seq159300/recovery-only/phase2/')
-        || !sha384(entry.sha384) || !/^[0-9A-F]{8,16}$/u.test(entry.signatureKeyId)
-        || seenFiles.has(entry.filename) || seenNevras.has(entry.nevra)) {
+        || !sha384(entry.sha384) || seenFiles.has(entry.filename)
+        || seenNames.has(entry.name) || seenNevras.has(entry.nevra)) {
       throw new Error('Nitro package-set package entry is invalid or duplicated');
     }
     seenFiles.add(entry.filename);
+    seenNames.add(entry.name);
     seenNevras.add(entry.nevra);
-    if (entry.nevra.startsWith('aws-nitro-enclaves-cli-')) hasCli = true;
-    if (entry.nevra.startsWith('aws-nitro-enclaves-cli-devel-')) {
-      throw new Error('Nitro development package is forbidden');
+    if (entry.name === 'aws-nitro-enclaves-cli') cliCount += 1;
+    if (entry.name === 'aws-nitro-enclaves-cli-devel'
+        || entry.name === 'aws-nitro-enclaves-cli-integration-tests'
+        || /(?:^|[-_.])devel(?:[-_.]|$)/u.test(entry.name)) {
+      throw new Error('Nitro development or test package is forbidden');
     }
     return { ...entry };
-  }).sort((left, right) => left.nevra.localeCompare(right.nevra));
-  if (!hasCli) throw new Error('Nitro package set must contain the exact CLI package');
+  }).sort((left, right) => left.name.localeCompare(right.name) || left.nevra.localeCompare(right.nevra));
+  if (cliCount !== 1) throw new Error('Nitro package set must contain exactly one CLI package');
+  const closure = packages.map(entry => ({ name: entry.name, nevra: entry.nevra }));
+  if (digest('sha384', canonicalJson(closure)) !== input.expectedPackageClosureSha384) {
+    throw new Error('Nitro package set differs from the exact independently reviewed name and NEVRA closure');
+  }
   if (canonicalJson(packages) !== canonicalJson(manifest.packages)) {
-    throw new Error('Nitro package-set packages must be canonical NEVRA order');
+    throw new Error('Nitro package-set packages must be canonical name and NEVRA order');
   }
   return { ...manifest, packages };
 }
@@ -483,12 +541,181 @@ function validateInstanceProfile(input) {
   };
 }
 
+function isoTime(value, label) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/u.test(value)) {
+    throw new Error(`${label} must be an exact whole-second UTC timestamp`);
+  }
+  const millis = Date.parse(value);
+  if (!Number.isFinite(millis) || new Date(millis).toISOString() !== value.replace('Z', '.000Z')) {
+    throw new Error(`${label} is invalid`);
+  }
+  return millis;
+}
+
+function conditionValue(statement, operator, key) {
+  const condition = requireObject(statement.Condition, 'Packer control policy condition');
+  return requireObject(condition[operator], `Packer control policy ${operator}`)[key];
+}
+
+function validatePackerControlRole(input) {
+  requireExactFields(input, [
+    'approvedAt', 'attachedPolicies', 'builderEvidenceIndexSha384', 'builderTemplateSha384', 'evaluatedAt',
+    'expectedInvokerRoleArn', 'expiresAt', 'inlinePolicies', 'invokerRoleInventorySha384',
+    'offlinePackageClosureSha384', 'offlinePackageSetSha384',
+    'roleResponse', 'stackResponse',
+  ], 'Packer control role preflight');
+  for (const [label, value] of [
+    ['builder evidence index SHA384', input.builderEvidenceIndexSha384],
+    ['builder template SHA384', input.builderTemplateSha384],
+    ['Packer invoker-role inventory SHA384', input.invokerRoleInventorySha384],
+    ['offline package closure SHA384', input.offlinePackageClosureSha384],
+    ['offline package-set SHA384', input.offlinePackageSetSha384],
+  ]) if (!sha384(value)) throw new Error(`${label} is malformed`);
+  if (!/^arn:aws:iam::082223548516:role\/layrs-production-recovery-seq159300-[A-Za-z0-9+=,.@_-]{1,64}$/u
+    .test(input.expectedInvokerRoleArn)) {
+    throw new Error('Packer invoker role ARN is outside the exact recovery namespace');
+  }
+  const approvedAt = isoTime(input.approvedAt, 'Packer control approval');
+  const evaluatedAt = isoTime(input.evaluatedAt, 'Packer control evaluation');
+  const expiresAt = isoTime(input.expiresAt, 'Packer control expiry');
+  if (approvedAt > evaluatedAt || evaluatedAt >= expiresAt || expiresAt - approvedAt > 3_600_000) {
+    throw new Error('Packer control role is not inside its reviewed maximum 3600-second window');
+  }
+
+  const role = requireObject(requireObject(input.roleResponse, 'Packer control role response').Role,
+    'Packer control role');
+  const exactRoleArn = `arn:aws:iam::${ACCOUNT_ID}:role/${PACKER_CONTROL_ROLE_NAME}`;
+  if (role.RoleName !== PACKER_CONTROL_ROLE_NAME || role.Arn !== exactRoleArn || role.Path !== '/'
+      || role.MaxSessionDuration !== 3600 || role.PermissionsBoundary !== undefined) {
+    throw new Error('Packer control role identity, session duration or permissions boundary is not exact');
+  }
+  const expectedTrust = {
+    Statement: [{
+      Action: 'sts:AssumeRole',
+      Condition: {
+        ArnEquals: { 'aws:PrincipalArn': input.expectedInvokerRoleArn },
+        DateGreaterThanEquals: { 'aws:CurrentTime': input.approvedAt },
+        DateLessThan: { 'aws:CurrentTime': input.expiresAt },
+        StringEquals: {
+          'aws:PrincipalAccount': ACCOUNT_ID,
+          'sts:ExternalId': input.builderEvidenceIndexSha384,
+        },
+      },
+      Effect: 'Allow',
+      Principal: { AWS: input.expectedInvokerRoleArn },
+    }],
+    Version: '2012-10-17',
+  };
+  if (canonicalJson(role.AssumeRolePolicyDocument) !== canonicalJson(expectedTrust)) {
+    throw new Error('Packer control role trust is not exact');
+  }
+
+  if (!Array.isArray(input.attachedPolicies) || input.attachedPolicies.length !== 0
+      || !Array.isArray(input.inlinePolicies) || input.inlinePolicies.length !== 1) {
+    throw new Error('Packer control role must have exactly one inline policy and no managed policies');
+  }
+  const inline = requireObject(input.inlinePolicies[0], 'Packer control inline policy');
+  requireExactFields(inline, ['document', 'name'], 'Packer control inline policy');
+  if (inline.name !== PACKER_CONTROL_ROLE_NAME) throw new Error('Packer control inline policy name is not exact');
+  const document = requireObject(inline.document, 'Packer control inline policy document');
+  if (document.Version !== '2012-10-17' || !Array.isArray(document.Statement)
+      || document.Statement.length < 1) {
+    throw new Error('Packer control inline policy document is malformed');
+  }
+  let approvalDenyCount = 0;
+  let expiryDenyCount = 0;
+  for (const rawStatement of document.Statement) {
+    const statement = requireObject(rawStatement, 'Packer control policy statement');
+    if (Object.hasOwn(statement, 'NotAction') || Object.hasOwn(statement, 'NotResource')) {
+      throw new Error('Packer control policy NotAction or NotResource is forbidden');
+    }
+    if (statement.Effect === 'Allow'
+        && conditionValue(statement, 'DateLessThan', 'aws:CurrentTime') !== input.expiresAt) {
+      throw new Error('Packer control allow is not bounded by the exact expiry');
+    }
+    if (statement.Sid === 'DenyAfterExactExpiry') {
+      if (statement.Effect !== 'Deny' || statement.Action !== '*' || statement.Resource !== '*'
+          || conditionValue(statement, 'DateGreaterThanEquals', 'aws:CurrentTime') !== input.expiresAt) {
+        throw new Error('Packer control expiry deny is not exact');
+      }
+      expiryDenyCount += 1;
+    }
+    if (statement.Sid === 'DenyBeforeExactApproval') {
+      if (statement.Effect !== 'Deny' || statement.Action !== '*' || statement.Resource !== '*'
+          || conditionValue(statement, 'DateLessThan', 'aws:CurrentTime') !== input.approvedAt) {
+        throw new Error('Packer control approval deny is not exact');
+      }
+      approvalDenyCount += 1;
+    }
+  }
+  if (approvalDenyCount !== 1 || expiryDenyCount !== 1) {
+    throw new Error('Packer control policy requires one exact approval deny and expiry deny');
+  }
+
+  const stacks = requireObject(input.stackResponse, 'builder stack response').Stacks;
+  const stack = one(stacks, 'builder stack response.Stacks');
+  if (stack.StackName !== 'layrs-production-recovery-seq159300-builder'
+      || !['CREATE_COMPLETE', 'UPDATE_COMPLETE'].includes(stack.StackStatus)
+      || !Array.isArray(stack.Outputs)) {
+    throw new Error('builder stack identity or stable status is not exact');
+  }
+  const outputKeys = stack.Outputs.map(output => output.OutputKey);
+  if (new Set(outputKeys).size !== outputKeys.length) {
+    throw new Error('builder stack outputs contain a duplicate key');
+  }
+  const outputs = new Map(stack.Outputs.map(output => [output.OutputKey, output.OutputValue]));
+  const expectedOutputs = {
+    BuilderEvidenceIndexSha384: input.builderEvidenceIndexSha384,
+    BuilderTemplateSha384: input.builderTemplateSha384,
+    OfflinePackageClosureSha384: input.offlinePackageClosureSha384,
+    OfflinePackageSetSha384: input.offlinePackageSetSha384,
+    PackerControlPlaneApprovedAt: input.approvedAt,
+    PackerControlPlaneExpiresAt: input.expiresAt,
+    PackerControlPlaneMaxLifetimeSeconds: '3600',
+    PackerControlPlaneRoleArn: exactRoleArn,
+    PackerInvokerRoleArn: input.expectedInvokerRoleArn,
+    PackerInvokerRoleInventorySha384: input.invokerRoleInventorySha384,
+  };
+  if (Object.entries(expectedOutputs).some(([key, value]) => outputs.get(key) !== value)) {
+    throw new Error('builder stack outputs do not match the accepted Packer control evidence');
+  }
+  const expectedTags = [
+    ['Application', 'layrs'],
+    ['BuilderTemplateSha384', input.builderTemplateSha384],
+    ['Environment', 'production'],
+    ['EvidenceIndexSha384', input.builderEvidenceIndexSha384],
+    ['InvokerRoleInventorySha384', input.invokerRoleInventorySha384],
+    ['Name', PACKER_CONTROL_ROLE_NAME],
+    ['OfflinePackageClosureSha384', input.offlinePackageClosureSha384],
+    ['OfflinePackageSetSha384', input.offlinePackageSetSha384],
+    ['Purpose', 'seq159300-recovery-ami-build-control'],
+    ['RecoverySourceCommit', SOURCE_COMMIT],
+  ].map(([key, value]) => ({ key, value })).sort((left, right) => left.key.localeCompare(right.key));
+  const tags = normalizedTags(role.Tags);
+  if (canonicalJson(tags) !== canonicalJson(expectedTags)) {
+    throw new Error('Packer control role tags do not match exact accepted builder evidence');
+  }
+  return {
+    approvedAt: input.approvedAt,
+    attachedPolicies: input.attachedPolicies,
+    expiresAt: input.expiresAt,
+    inlinePolicies: [{ document, name: inline.name }],
+    maxSessionDuration: role.MaxSessionDuration,
+    permissionsBoundaryArn: '',
+    roleArn: role.Arn,
+    roleName: role.RoleName,
+    tags,
+    trust: role.AssumeRolePolicyDocument,
+  };
+}
+
 function validateOutputAmi(input) {
   requireExactFields(input, ['expected', 'response'], 'output AMI readback');
   const expected = requireObject(input.expected, 'output AMI expected values');
   const image = one(requireObject(input.response, 'output AMI response').Images, 'output AMI response.Images');
   const tags = new Map(normalizedTags(image.Tags).map(tag => [tag.key, tag.value]));
   const requiredTags = {
+    BuildControlPlaneRoleSha384: expected.buildControlPlaneRoleInventorySha384,
     BuildInstanceProfileSha384: expected.buildInstanceProfileInventorySha384,
     BuildSecurityGroupSha384: expected.buildSecurityGroupInventorySha384,
     BuildSubnetInventorySha384: expected.buildSubnetInventorySha384,
@@ -497,6 +724,9 @@ function validateOutputAmi(input) {
     Phase2TemplateSha384: expected.phase2TemplateSha384,
     PackerTemplateSha384: expected.packerTemplateSha384,
     RecoveryBuilderSourceCommit: expected.builderSourceCommit,
+    RecoveryBuilderTemplateSha384: expected.builderTemplateSha384,
+    RecoveryEvidenceIndexSha384: expected.recoveryEvidenceIndexSha384,
+    RecoveryPackageSetSha384: expected.nitroPackageSetSha384,
     RecoveryEifSha384: expected.eifSha384,
     RecoveryParentSha384: expected.parentSha384,
     RecoveryPcr0Sha384: expected.pcr0Sha384,
@@ -505,6 +735,8 @@ function validateOutputAmi(input) {
     NitroCliRpmSha384: expected.nitroCliRpmSha384,
     NitroPackageInventorySha384: expected.nitroPackageInventorySha384,
     NitroPackageSetSha384: expected.nitroPackageSetSha384,
+    NitroPackageClosureSha384: expected.nitroPackageClosureSha384,
+    PackerInvokerRoleSha384: expected.packerInvokerRoleInventorySha384,
     Visibility: 'private',
   };
   if (image.ImageId !== expected.imageId || image.OwnerId !== ACCOUNT_ID || image.Public !== false
@@ -543,6 +775,7 @@ export function validatePreflight(input) {
     case 'source-ami': return validateSourceAmi(input.payload);
     case 'build-network': return validateBuildNetwork(input.payload);
     case 'instance-profile': return validateInstanceProfile(input.payload);
+    case 'packer-control-role': return validatePackerControlRole(input.payload);
     case 'output-ami': return validateOutputAmi(input.payload);
     case 'nitro-package-set': return validatePackageSet(input.payload);
     default: throw new Error('unsupported recovery-parent preflight kind');

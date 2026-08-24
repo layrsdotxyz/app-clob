@@ -15,6 +15,10 @@ readonly EXPECTED_PCR0_SHA384="57fc48ad4d755edda38665bc8f0a16e7fd9dc485e3b57a2bc
 readonly AL2023_OWNER_ID="137112412989"
 readonly AL2023_AMI_ID="ami-0332d564d76dbd8d6"
 readonly IMMUTABLE_EVIDENCE_BUCKET="layrs-production-082223548516-us-east-1-immutable"
+readonly PACKER_CONTROL_ROLE_NAME="layrs-production-recovery-seq159300-packer-control"
+readonly AMAZON_LINUX_SIGNING_KEY_ID="D832C631"
+readonly AMAZON_LINUX_SIGNING_KEY_FINGERPRINT="B21C50FA44A99720EAA72F7FE951904AD832C631"
+readonly AMAZON_LINUX_SIGNING_KEY_SHA256="664b632018bd84f9b249be7bd26937c560edb2f2bfc0cbc01ec5a7b4e06aad56"
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
@@ -34,6 +38,7 @@ PACKER_TEMPLATE_SHA384=""
 EXPECTED_PACKAGE_INVENTORY_SHA384=""
 NITRO_PACKAGE_SET_SHA384=""
 NITRO_PACKAGE_SET_EVIDENCE_SHA384=""
+NITRO_PACKAGE_CLOSURE_SHA384=""
 NITRO_CLI_NEVRA=""
 NITRO_CLI_RPM_SHA384=""
 NITRO_CLI_RPM_OBJECT_KEY=""
@@ -43,6 +48,7 @@ SOURCE_AMI_PROVENANCE_SHA384=""
 BUILD_SUBNET_INVENTORY_SHA384=""
 BUILD_SECURITY_GROUP_INVENTORY_SHA384=""
 BUILD_INSTANCE_PROFILE_INVENTORY_SHA384=""
+BUILD_CONTROL_PLANE_ROLE_INVENTORY_SHA384=""
 OUTPUT_AMI_INVENTORY_SHA384=""
 
 die() {
@@ -85,7 +91,7 @@ cleanup() {
 }
 
 verify_nitro_package_set() {
-  local input output package_count filename expected_sha expected_nevra expected_key actual_nevra check_output archive_listing
+  local input output package_count filename package_name expected_sha expected_nevra actual_nevra check_output archive_listing
   [[ -f "${NITRO_PACKAGE_SET_MANIFEST}" && ! -L "${NITRO_PACKAGE_SET_MANIFEST}" ]] \
     || die "missing immutable Nitro dependency-closure manifest"
   [[ -d "${NITRO_PACKAGE_DIRECTORY}" && ! -L "${NITRO_PACKAGE_DIRECTORY}" ]] \
@@ -96,7 +102,9 @@ verify_nitro_package_set() {
   output="$(mktemp "${TMPDIR:-/tmp}/layrs-seq159300-package-set-output.XXXXXX")"
   rm -f -- "${output}"
   jq -n --slurpfile manifest "${NITRO_PACKAGE_SET_MANIFEST}" \
-    '{kind:"nitro-package-set",payload:{manifest:$manifest[0]}}' >"${input}"
+    --arg expectedPackageClosureSha384 "${LAYRS_RECOVERY_EXPECTED_NITRO_PACKAGE_CLOSURE_SHA384}" \
+    '{kind:"nitro-package-set",payload:{expectedPackageClosureSha384:$expectedPackageClosureSha384,
+      manifest:$manifest[0]}}' >"${input}"
   node "${PREFLIGHT_VALIDATOR}" --input "${input}" --output "${output}" \
     || { rm -f -- "${input}" "${output}"; die "Nitro package-set manifest is invalid"; }
   rm -f -- "${input}"
@@ -104,6 +112,7 @@ verify_nitro_package_set() {
     || die "Nitro package-set manifest is not the exact canonical JSON encoding"
   NITRO_PACKAGE_SET_SHA384="$(sha384_file "${NITRO_PACKAGE_SET_ARCHIVE}")"
   NITRO_PACKAGE_SET_EVIDENCE_SHA384="$(sha384_file "${NITRO_PACKAGE_SET_MANIFEST}")"
+  NITRO_PACKAGE_CLOSURE_SHA384="$(jq -er '.packageClosureSha384' "${output}")"
   package_count="$(jq -er '.packages | length' "${output}")"
   [[ "$(find "${NITRO_PACKAGE_DIRECTORY}" -mindepth 1 -maxdepth 1 -type f -name '*.rpm' | wc -l)" == "${package_count}" ]] \
     || die "offline Nitro package directory differs from the exact manifest closure"
@@ -114,7 +123,7 @@ verify_nitro_package_set() {
   [[ "${archive_listing}" == "$(jq -r '.packages[].filename' "${output}")" ]] \
     || die "Nitro package-set archive membership/order differs from the canonical manifest"
   PACKAGE_INSTALL_PLAN="$(mktemp "${TMPDIR:-/tmp}/layrs-seq159300-package-plan.XXXXXX")"
-  while IFS=$'\t' read -r filename expected_sha expected_nevra expected_key; do
+  while IFS=$'\t' read -r filename package_name expected_sha expected_nevra; do
     [[ -f "${NITRO_PACKAGE_DIRECTORY}/${filename}" && ! -L "${NITRO_PACKAGE_DIRECTORY}/${filename}" ]] \
       || die "offline Nitro package is missing or unsafe: ${filename}"
     require_exact "RPM SHA384 for ${filename}" "$(sha384_file "${NITRO_PACKAGE_DIRECTORY}/${filename}")" "${expected_sha}"
@@ -123,21 +132,23 @@ verify_nitro_package_set() {
       "${expected_sha}"
     check_output="$(rpmkeys --checksig --verbose "${NITRO_PACKAGE_DIRECTORY}/${filename}" 2>&1)" \
       || die "RPM signature/header verification failed for ${filename}"
-    [[ "${check_output,,}" == *"key id ${expected_key,,}"* && "${check_output}" == *": OK"* ]] \
+    [[ "${check_output,,}" == *"key id ${AMAZON_LINUX_SIGNING_KEY_ID,,}"* && "${check_output}" == *": OK"* ]] \
       || die "RPM signature does not bind the reviewed key for ${filename}"
     actual_nevra="$(rpm -qp --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}' \
       "${NITRO_PACKAGE_DIRECTORY}/${filename}")" || die "RPM header query failed for ${filename}"
     require_exact "RPM NEVRA for ${filename}" "${actual_nevra}" "${expected_nevra}"
-    printf '%s\t%s\t%s\t%s\n' "${filename}" "${expected_sha}" "${expected_nevra}" "${expected_key}" >>"${PACKAGE_INSTALL_PLAN}"
-  done < <(jq -r '.packages[] | [.filename,.sha384,.nevra,.signatureKeyId] | @tsv' "${output}")
+    require_exact "RPM name for ${filename}" \
+      "$(rpm -qp --qf '%{NAME}' "${NITRO_PACKAGE_DIRECTORY}/${filename}")" "${package_name}"
+    printf '%s\t%s\t%s\t%s\n' "${filename}" "${expected_sha}" "${expected_nevra}" "${package_name}" >>"${PACKAGE_INSTALL_PLAN}"
+  done < <(jq -r '.packages[] | [.filename,.name,.sha384,.nevra] | @tsv' "${output}")
   EXPECTED_PACKAGE_INVENTORY_SHA384="$(awk -F '\t' '{print $3 "\t" $2}' "${PACKAGE_INSTALL_PLAN}" \
     | sha384sum --binary | awk '{print $1}')"
-  NITRO_CLI_NEVRA="$(jq -er '.packages[] | select(.nevra | startswith("aws-nitro-enclaves-cli-")) | .nevra' "${output}")"
-  [[ "$(jq '[.packages[] | select(.nevra | startswith("aws-nitro-enclaves-cli-"))] | length' "${output}")" == "1" ]] \
+  NITRO_CLI_NEVRA="$(jq -er '.packages[] | select(.name == "aws-nitro-enclaves-cli") | .nevra' "${output}")"
+  [[ "$(jq '[.packages[] | select(.name == "aws-nitro-enclaves-cli")] | length' "${output}")" == "1" ]] \
     || die "Nitro package set must contain exactly one CLI package"
-  NITRO_CLI_RPM_SHA384="$(jq -er '.packages[] | select(.nevra | startswith("aws-nitro-enclaves-cli-")) | .sha384' "${output}")"
-  NITRO_CLI_RPM_OBJECT_KEY="$(jq -er '.packages[] | select(.nevra | startswith("aws-nitro-enclaves-cli-")) | .objectKey' "${output}")"
-  NITRO_CLI_RPM_OBJECT_VERSION_ID="$(jq -er '.packages[] | select(.nevra | startswith("aws-nitro-enclaves-cli-")) | .objectVersionId' "${output}")"
+  NITRO_CLI_RPM_SHA384="$(jq -er '.packages[] | select(.name == "aws-nitro-enclaves-cli") | .sha384' "${output}")"
+  NITRO_CLI_RPM_OBJECT_KEY="$(jq -er '.packages[] | select(.name == "aws-nitro-enclaves-cli") | .objectKey' "${output}")"
+  NITRO_CLI_RPM_OBJECT_VERSION_ID="$(jq -er '.packages[] | select(.name == "aws-nitro-enclaves-cli") | .objectVersionId' "${output}")"
   rm -f -- "${output}"
 }
 
@@ -252,6 +263,15 @@ verify_inputs() {
   require_env LAYRS_RECOVERY_NITRO_PACKAGE_SET_EVIDENCE_OBJECT_KEY
   require_env LAYRS_RECOVERY_NITRO_PACKAGE_SET_EVIDENCE_OBJECT_VERSION_ID
   require_env LAYRS_RECOVERY_NITRO_PACKAGE_SET_EVIDENCE_SHA384
+  require_env LAYRS_RECOVERY_EXPECTED_NITRO_PACKAGE_CLOSURE_SHA384
+  require_env LAYRS_RECOVERY_BUILDER_STACK_NAME
+  require_env LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384
+  require_env LAYRS_RECOVERY_PACKER_INVOKER_ROLE_ARN
+  require_env LAYRS_RECOVERY_PACKER_INVOKER_ROLE_INVENTORY_SHA384
+  require_env LAYRS_RECOVERY_PACKER_CONTROL_APPROVED_AT
+  require_env LAYRS_RECOVERY_PACKER_CONTROL_EXPIRES_AT
+  require_env LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_SHA384
+  require_env LAYRS_RECOVERY_EXPECTED_BUILD_CONTROL_PLANE_ROLE_INVENTORY_SHA384
   require_env LAYRS_RECOVERY_EVIDENCE_BUCKET
 
   [[ -f "${PREFLIGHT_VALIDATOR}" && ! -L "${PREFLIGHT_VALIDATOR}" ]] \
@@ -261,6 +281,20 @@ verify_inputs() {
   require_exact LAYRS_RECOVERY_AWS_REGION "${LAYRS_RECOVERY_AWS_REGION}" "${RECOVERY_REGION}"
   require_exact LAYRS_RECOVERY_SOURCE_AMI_OWNER "${LAYRS_RECOVERY_SOURCE_AMI_OWNER}" "${AL2023_OWNER_ID}"
   require_exact LAYRS_RECOVERY_SOURCE_AMI_ID "${LAYRS_RECOVERY_SOURCE_AMI_ID}" "${AL2023_AMI_ID}"
+  require_exact LAYRS_RECOVERY_BUILDER_STACK_NAME "${LAYRS_RECOVERY_BUILDER_STACK_NAME}" \
+    "layrs-production-recovery-seq159300-builder"
+  [[ "${LAYRS_RECOVERY_PACKER_INVOKER_ROLE_ARN}" =~ ^arn:aws:iam::082223548516:role/layrs-production-recovery-seq159300-[A-Za-z0-9+=,.@_-]{1,64}$ ]] \
+    || die "LAYRS_RECOVERY_PACKER_INVOKER_ROLE_ARN is outside the exact recovery namespace"
+  [[ "${LAYRS_RECOVERY_PACKER_CONTROL_APPROVED_AT}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ \
+      && "${LAYRS_RECOVERY_PACKER_CONTROL_EXPIRES_AT}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+    || die "Packer control approval or expiry timestamp is malformed"
+  for value in "${LAYRS_RECOVERY_EXPECTED_NITRO_PACKAGE_CLOSURE_SHA384}" \
+      "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_SHA384}" \
+      "${LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384}" \
+      "${LAYRS_RECOVERY_PACKER_INVOKER_ROLE_INVENTORY_SHA384}" \
+      "${LAYRS_RECOVERY_EXPECTED_BUILD_CONTROL_PLANE_ROLE_INVENTORY_SHA384}"; do
+    [[ "${value}" =~ ^[0-9a-f]{96}$ ]] || die "reviewed package, builder or control-role SHA384 is malformed"
+  done
   [[ "${LAYRS_RECOVERY_IMPLEMENTATION_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
     || die "LAYRS_RECOVERY_IMPLEMENTATION_COMMIT must be an exact lowercase commit"
   [[ "${LAYRS_RECOVERY_PHASE2_TEMPLATE_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
@@ -363,9 +397,10 @@ preflight_source_ami() {
 }
 
 preflight_build_network() {
-  local subnet_response routes_response security_group_response endpoints_response interfaces_response input output vpc_id
+  local subnet_response vpc_response routes_response security_group_response endpoints_response interfaces_response input output vpc_id
   local -a referenced_group_ids all_group_ids
   subnet_response="${PREFLIGHT_TEMP_DIR}/subnet-response.json"
+  vpc_response="${PREFLIGHT_TEMP_DIR}/vpc-response.json"
   routes_response="${PREFLIGHT_TEMP_DIR}/routes-response.json"
   security_group_response="${PREFLIGHT_TEMP_DIR}/security-groups-response.json"
   endpoints_response="${PREFLIGHT_TEMP_DIR}/vpc-endpoints-response.json"
@@ -377,6 +412,7 @@ preflight_build_network() {
     --subnet-ids "${LAYRS_RECOVERY_BUILD_SUBNET_ID}" >"${subnet_response}"
   vpc_id="$(jq -er '.Subnets | select(length == 1) | .[0].VpcId' "${subnet_response}")" \
     || die "build subnet did not resolve to one VPC"
+  aws_read_json ec2 describe-vpcs --vpc-ids "${vpc_id}" >"${vpc_response}"
   aws_read_json ec2 describe-route-tables \
     --filters "Name=association.subnet-id,Values=${LAYRS_RECOVERY_BUILD_SUBNET_ID}" >"${routes_response}"
   if [[ "$(jq -er '.RouteTables | length' "${routes_response}")" == "0" ]]; then
@@ -403,17 +439,19 @@ preflight_build_network() {
     --arg expectedSubnetId "${LAYRS_RECOVERY_BUILD_SUBNET_ID}" \
     --arg expectedSecurityGroupId "${LAYRS_RECOVERY_BUILD_SECURITY_GROUP_ID}" \
     --slurpfile subnetsResponse "${subnet_response}" \
+    --slurpfile vpcsResponse "${vpc_response}" \
     --slurpfile routeTablesResponse "${routes_response}" \
     --slurpfile securityGroupsResponse "${security_group_response}" \
     --slurpfile vpcEndpointsResponse "${endpoints_response}" \
     --slurpfile networkInterfacesResponse "${interfaces_response}" \
     '{kind:"build-network",payload:{expectedSubnetId:$expectedSubnetId,
       expectedSecurityGroupId:$expectedSecurityGroupId,subnetsResponse:$subnetsResponse[0],
+      vpcsResponse:$vpcsResponse[0],
       routeTablesResponse:$routeTablesResponse[0],securityGroupsResponse:$securityGroupsResponse[0],
       vpcEndpointsResponse:$vpcEndpointsResponse[0],networkInterfacesResponse:$networkInterfacesResponse[0]}}' \
     >"${input}"
   render_preflight_inventory "${input}" "${output}"
-  jq -cS '{subnet,routeTables,routes}' "${output}" \
+  jq -cS '{subnet,vpc,routeTables,routes}' "${output}" \
     >"${PREFLIGHT_TEMP_DIR}/subnet-inventory.json"
   jq -cS '{securityGroups,endpoints}' "${output}" \
     >"${PREFLIGHT_TEMP_DIR}/security-group-inventory.json"
@@ -470,6 +508,59 @@ preflight_instance_profile() {
   BUILD_INSTANCE_PROFILE_INVENTORY_SHA384="$(sha384_file "${output}")"
 }
 
+preflight_packer_control_role() {
+  local role_response attached_response inline_response stack_response input output inline_name document_response
+  role_response="${PREFLIGHT_TEMP_DIR}/packer-control-role-response.json"
+  attached_response="${PREFLIGHT_TEMP_DIR}/packer-control-attached-policies-response.json"
+  inline_response="${PREFLIGHT_TEMP_DIR}/packer-control-inline-policies-response.json"
+  stack_response="${PREFLIGHT_TEMP_DIR}/packer-control-stack-response.json"
+  input="${PREFLIGHT_TEMP_DIR}/packer-control-input.json"
+  output="${PREFLIGHT_TEMP_DIR}/packer-control-inventory.json"
+
+  aws_read_json iam get-role --role-name "${PACKER_CONTROL_ROLE_NAME}" >"${role_response}"
+  aws_read_json iam list-attached-role-policies --role-name "${PACKER_CONTROL_ROLE_NAME}" \
+    >"${attached_response}"
+  aws_read_json iam list-role-policies --role-name "${PACKER_CONTROL_ROLE_NAME}" >"${inline_response}"
+  [[ "$(jq -er '.AttachedPolicies | length' "${attached_response}")" == "0" ]] \
+    || die "Packer control role has a forbidden managed policy attachment"
+  inline_name="$(jq -er '.PolicyNames | select(length == 1) | .[0]' "${inline_response}")" \
+    || die "Packer control role must have exactly one inline policy"
+  require_exact "Packer control inline policy name" "${inline_name}" "${PACKER_CONTROL_ROLE_NAME}"
+  document_response="$(aws_read_json iam get-role-policy \
+    --role-name "${PACKER_CONTROL_ROLE_NAME}" --policy-name "${inline_name}")"
+  aws_read_json cloudformation describe-stacks --stack-name "${LAYRS_RECOVERY_BUILDER_STACK_NAME}" \
+    >"${stack_response}"
+
+  jq -n \
+    --arg approvedAt "${LAYRS_RECOVERY_PACKER_CONTROL_APPROVED_AT}" \
+    --arg builderEvidenceIndexSha384 "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_SHA384}" \
+    --arg builderTemplateSha384 "${LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384}" \
+    --arg evaluatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg expectedInvokerRoleArn "${LAYRS_RECOVERY_PACKER_INVOKER_ROLE_ARN}" \
+    --arg invokerRoleInventorySha384 "${LAYRS_RECOVERY_PACKER_INVOKER_ROLE_INVENTORY_SHA384}" \
+    --arg expiresAt "${LAYRS_RECOVERY_PACKER_CONTROL_EXPIRES_AT}" \
+    --arg offlinePackageClosureSha384 "${NITRO_PACKAGE_CLOSURE_SHA384}" \
+    --arg offlinePackageSetSha384 "${NITRO_PACKAGE_SET_SHA384}" \
+    --arg inlineName "${inline_name}" \
+    --argjson inlineDocument "$(jq -c '.PolicyDocument' <<<"${document_response}")" \
+    --slurpfile roleResponse "${role_response}" \
+    --slurpfile stackResponse "${stack_response}" \
+    '{kind:"packer-control-role",payload:{approvedAt:$approvedAt,attachedPolicies:[],
+      builderEvidenceIndexSha384:$builderEvidenceIndexSha384,
+      builderTemplateSha384:$builderTemplateSha384,evaluatedAt:$evaluatedAt,
+      expectedInvokerRoleArn:$expectedInvokerRoleArn,expiresAt:$expiresAt,
+      invokerRoleInventorySha384:$invokerRoleInventorySha384,
+      inlinePolicies:[{name:$inlineName,document:$inlineDocument}],
+      offlinePackageClosureSha384:$offlinePackageClosureSha384,
+      offlinePackageSetSha384:$offlinePackageSetSha384,
+      roleResponse:$roleResponse[0],stackResponse:$stackResponse[0]}}' >"${input}"
+  render_preflight_inventory "${input}" "${output}"
+  BUILD_CONTROL_PLANE_ROLE_INVENTORY_SHA384="$(sha384_file "${output}")"
+  require_exact "Packer control role inventory SHA384" \
+    "${BUILD_CONTROL_PLANE_ROLE_INVENTORY_SHA384}" \
+    "${LAYRS_RECOVERY_EXPECTED_BUILD_CONTROL_PLANE_ROLE_INVENTORY_SHA384}"
+}
+
 readback_output_ami() {
   local ami_id="$1"
   local response input output
@@ -482,6 +573,7 @@ readback_output_ami() {
     --arg sourceAmiId "${LAYRS_RECOVERY_SOURCE_AMI_ID}" \
     --arg sourceCommit "${RECOVERY_SOURCE_COMMIT}" \
     --arg builderSourceCommit "${BUILDER_COMMIT}" \
+    --arg builderTemplateSha384 "${LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384}" \
     --arg implementationCommit "${LAYRS_RECOVERY_IMPLEMENTATION_COMMIT}" \
     --arg parentSha384 "${EXPECTED_PARENT_SHA384}" \
     --arg eifSha384 "${EXPECTED_EIF_SHA384}" \
@@ -492,10 +584,14 @@ readback_output_ami() {
     --arg buildSubnetInventorySha384 "${BUILD_SUBNET_INVENTORY_SHA384}" \
     --arg buildSecurityGroupInventorySha384 "${BUILD_SECURITY_GROUP_INVENTORY_SHA384}" \
     --arg buildInstanceProfileInventorySha384 "${BUILD_INSTANCE_PROFILE_INVENTORY_SHA384}" \
+    --arg buildControlPlaneRoleInventorySha384 "${BUILD_CONTROL_PLANE_ROLE_INVENTORY_SHA384}" \
+    --arg packerInvokerRoleInventorySha384 "${LAYRS_RECOVERY_PACKER_INVOKER_ROLE_INVENTORY_SHA384}" \
     --arg packerTemplateSha384 "${PACKER_TEMPLATE_SHA384}" \
     --arg nitroCliRpmSha384 "${NITRO_CLI_RPM_SHA384}" \
     --arg nitroPackageInventorySha384 "${EXPECTED_PACKAGE_INVENTORY_SHA384}" \
     --arg nitroPackageSetSha384 "${NITRO_PACKAGE_SET_SHA384}" \
+    --arg nitroPackageClosureSha384 "${NITRO_PACKAGE_CLOSURE_SHA384}" \
+    --arg recoveryEvidenceIndexSha384 "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_SHA384}" \
     --slurpfile response "${response}" \
     '{kind:"output-ami",payload:{expected:{imageId:$imageId,sourceAmiId:$sourceAmiId,
       sourceCommit:$sourceCommit,builderSourceCommit:$builderSourceCommit,
@@ -507,32 +603,66 @@ readback_output_ami() {
       buildSubnetInventorySha384:$buildSubnetInventorySha384,
       buildSecurityGroupInventorySha384:$buildSecurityGroupInventorySha384,
       buildInstanceProfileInventorySha384:$buildInstanceProfileInventorySha384,
+      buildControlPlaneRoleInventorySha384:$buildControlPlaneRoleInventorySha384,
+      packerInvokerRoleInventorySha384:$packerInvokerRoleInventorySha384,
+      builderTemplateSha384:$builderTemplateSha384,
       packerTemplateSha384:$packerTemplateSha384,nitroCliRpmSha384:$nitroCliRpmSha384,
       nitroPackageInventorySha384:$nitroPackageInventorySha384,
-      nitroPackageSetSha384:$nitroPackageSetSha384},response:$response[0]}}' >"${input}"
+      nitroPackageSetSha384:$nitroPackageSetSha384,
+      nitroPackageClosureSha384:$nitroPackageClosureSha384,
+      recoveryEvidenceIndexSha384:$recoveryEvidenceIndexSha384},response:$response[0]}}' >"${input}"
   render_preflight_inventory "${input}" "${output}"
   OUTPUT_AMI_INVENTORY_SHA384="$(sha384_file "${output}")"
+}
+
+assume_packer_control_role() {
+  local assume_response caller_identity caller_account caller_arn expires_epoch now_epoch duration_seconds credential_expiry
+  assume_response="${PREFLIGHT_TEMP_DIR}/packer-control-assume-response.json"
+  now_epoch="$(date -u +%s)"
+  expires_epoch="$(date -u -d "${LAYRS_RECOVERY_PACKER_CONTROL_EXPIRES_AT}" +%s)" \
+    || die "Packer control expiry cannot be parsed"
+  duration_seconds="$((expires_epoch - now_epoch))"
+  (( duration_seconds >= 900 && duration_seconds <= 3600 )) \
+    || die "Packer control role has less than the safe STS minimum or exceeds 3600 seconds"
+  aws_read_json sts assume-role \
+    --role-arn "arn:aws:iam::${RECOVERY_ACCOUNT_ID}:role/${PACKER_CONTROL_ROLE_NAME}" \
+    --role-session-name "layrs-seq159300-packer" \
+    --external-id "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_SHA384}" \
+    --duration-seconds "${duration_seconds}" >"${assume_response}"
+  export AWS_ACCESS_KEY_ID="$(jq -er '.Credentials.AccessKeyId' "${assume_response}")"
+  export AWS_SECRET_ACCESS_KEY="$(jq -er '.Credentials.SecretAccessKey' "${assume_response}")"
+  export AWS_SESSION_TOKEN="$(jq -er '.Credentials.SessionToken' "${assume_response}")"
+  credential_expiry="$(jq -er '.Credentials.Expiration' "${assume_response}")"
+  (( $(date -u -d "${credential_expiry}" +%s) <= expires_epoch )) \
+    || die "assumed Packer credentials outlive the exact reviewed expiry"
+  caller_identity="$(aws_read_json sts get-caller-identity)"
+  caller_account="$(jq -er '.Account' <<<"${caller_identity}")" \
+    || die "assumed Packer account could not be read"
+  caller_arn="$(jq -er '.Arn' <<<"${caller_identity}")" \
+    || die "assumed Packer caller ARN could not be read"
+  require_exact "assumed Packer account" "${caller_account}" "${RECOVERY_ACCOUNT_ID}"
+  [[ "${caller_arn}" =~ ^arn:aws:sts::082223548516:assumed-role/layrs-production-recovery-seq159300-packer-control/layrs-seq159300-packer$ ]] \
+    || die "Packer process credentials are not the exact dedicated control role and session"
 }
 
 run_aws_preflight() {
   local caller_account caller_arn caller_identity
   PREFLIGHT_TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/layrs-seq159300-parent-preflight.XXXXXX")"
-  require_env LAYRS_RECOVERY_PACKER_CALLER_ROLE_ARN
-  [[ "${LAYRS_RECOVERY_PACKER_CALLER_ROLE_ARN}" =~ ^arn:aws:iam::082223548516:role/layrs-production-recovery-seq159300-packer-[A-Za-z0-9+=,.@_-]+$ ]] \
-    || die "the Packer caller must be the exact dedicated recovery control-plane role"
   caller_identity="$(aws_read_json sts get-caller-identity)"
   caller_account="$(jq -er '.Account' <<<"${caller_identity}")" \
     || die "AWS caller identity could not be read"
   caller_arn="$(jq -er '.Arn' <<<"${caller_identity}")" || die "AWS caller ARN could not be read"
   require_exact "active AWS account" "${caller_account}" "${RECOVERY_ACCOUNT_ID}"
   [[ "${caller_arn}" =~ ^arn:aws:sts::082223548516:assumed-role/([^/]+)/[^/]+$ ]] \
-    || die "Packer caller is not an assumed dedicated role"
-  require_exact "Packer caller role" "arn:aws:iam::${RECOVERY_ACCOUNT_ID}:role/${BASH_REMATCH[1]}" \
-    "${LAYRS_RECOVERY_PACKER_CALLER_ROLE_ARN}"
+    || die "preflight caller is not an assumed dedicated invoker role"
+  require_exact "preflight invoker role" "arn:aws:iam::${RECOVERY_ACCOUNT_ID}:role/${BASH_REMATCH[1]}" \
+    "${LAYRS_RECOVERY_PACKER_INVOKER_ROLE_ARN}"
+  preflight_packer_control_role
   preflight_source_ami
   preflight_build_network
   preflight_instance_profile
   verify_immutable_package_objects
+  assume_packer_control_role
 }
 
 summary() {
@@ -542,6 +672,9 @@ summary() {
     --arg purpose "layrs-seq159300-recovery" \
     --arg sourceCommit "${RECOVERY_SOURCE_COMMIT}" \
     --arg builderSourceCommit "${BUILDER_COMMIT}" \
+    --arg builderEvidenceIndexSha384 "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_SHA384}" \
+    --arg builderTemplateSha384 "${LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384}" \
+    --arg packerInvokerRoleInventorySha384 "${LAYRS_RECOVERY_PACKER_INVOKER_ROLE_INVENTORY_SHA384}" \
     --arg sourceAmiId "${LAYRS_RECOVERY_SOURCE_AMI_ID}" \
     --arg sourceAmiOwner "${LAYRS_RECOVERY_SOURCE_AMI_OWNER}" \
     --arg parentBinarySha384 "${EXPECTED_PARENT_SHA384}" \
@@ -565,10 +698,16 @@ summary() {
     --arg nitroPackageSetObjectKey "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_OBJECT_KEY}" \
     --arg nitroPackageSetObjectVersionId "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_OBJECT_VERSION_ID}" \
     --arg nitroPackageSetSha384 "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_SHA384}" \
+    --arg nitroPackageClosureSha384 "${NITRO_PACKAGE_CLOSURE_SHA384}" \
+    --arg nitroPackageSigningKeyFingerprint "${AMAZON_LINUX_SIGNING_KEY_FINGERPRINT}" \
+    --arg nitroPackageSigningKeySha256 "${AMAZON_LINUX_SIGNING_KEY_SHA256}" \
     --arg nitroPackageSetEvidenceObjectKey "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_EVIDENCE_OBJECT_KEY}" \
     --arg nitroPackageSetEvidenceObjectVersionId "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_EVIDENCE_OBJECT_VERSION_ID}" \
     --arg nitroPackageSetEvidenceSha384 "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_EVIDENCE_SHA384}" \
     '{accountId:$accountId,region:$region,purpose:$purpose,sourceCommit:$sourceCommit,builderSourceCommit:$builderSourceCommit,
+      builderEvidenceIndexSha384:$builderEvidenceIndexSha384,
+      builderTemplateSha384:$builderTemplateSha384,
+      packerInvokerRoleInventorySha384:$packerInvokerRoleInventorySha384,
       sourceAmiId:$sourceAmiId,sourceAmiOwner:$sourceAmiOwner,
       parentBinarySha384:$parentBinarySha384,eifSha384:$eifSha384,pcr0Sha384:$pcr0Sha384,
       phase2TemplateCommit:$phase2TemplateCommit,phase2TemplateSha384:$phase2TemplateSha384,
@@ -583,6 +722,9 @@ summary() {
       nitroPackageSetObjectKey:$nitroPackageSetObjectKey,
       nitroPackageSetObjectVersionId:$nitroPackageSetObjectVersionId,
       nitroPackageSetSha384:$nitroPackageSetSha384,
+      nitroPackageClosureSha384:$nitroPackageClosureSha384,
+      nitroPackageSigningKeyFingerprint:$nitroPackageSigningKeyFingerprint,
+      nitroPackageSigningKeySha256:$nitroPackageSigningKeySha256,
       nitroPackageSetEvidenceObjectKey:$nitroPackageSetEvidenceObjectKey,
       nitroPackageSetEvidenceObjectVersionId:$nitroPackageSetEvidenceObjectVersionId,
       nitroPackageSetEvidenceSha384:$nitroPackageSetEvidenceSha384,
@@ -629,6 +771,9 @@ build_ami() {
     -var "build_subnet_inventory_sha384=${BUILD_SUBNET_INVENTORY_SHA384}" \
     -var "build_security_group_inventory_sha384=${BUILD_SECURITY_GROUP_INVENTORY_SHA384}" \
     -var "build_instance_profile_inventory_sha384=${BUILD_INSTANCE_PROFILE_INVENTORY_SHA384}" \
+    -var "build_control_plane_role_inventory_sha384=${BUILD_CONTROL_PLANE_ROLE_INVENTORY_SHA384}" \
+    -var "builder_template_sha384=${LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384}" \
+    -var "packer_invoker_role_inventory_sha384=${LAYRS_RECOVERY_PACKER_INVOKER_ROLE_INVENTORY_SHA384}" \
     -var "builder_source_commit=${BUILDER_COMMIT}" \
     -var "parent_sha384=${EXPECTED_PARENT_SHA384}" \
     -var "phase2_template_commit=${LAYRS_RECOVERY_PHASE2_TEMPLATE_COMMIT}" \
@@ -639,6 +784,8 @@ build_ami() {
     -var "nitro_cli_rpm_sha384=${NITRO_CLI_RPM_SHA384}" \
     -var "nitro_package_inventory_sha384=${EXPECTED_PACKAGE_INVENTORY_SHA384}" \
     -var "nitro_package_set_sha384=${NITRO_PACKAGE_SET_SHA384}" \
+    -var "nitro_package_closure_sha384=${NITRO_PACKAGE_CLOSURE_SHA384}" \
+    -var "recovery_evidence_index_sha384=${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_SHA384}" \
     -var "package_install_plan=${PACKAGE_INSTALL_PLAN}" \
     -var "package_inventory_output=${PREFLIGHT_TEMP_DIR}/installed-package-inventory.txt" \
     -var "manifest_output=${LAYRS_RECOVERY_PACKER_MANIFEST}" \
@@ -654,6 +801,9 @@ build_ami() {
     -var "build_subnet_inventory_sha384=${BUILD_SUBNET_INVENTORY_SHA384}" \
     -var "build_security_group_inventory_sha384=${BUILD_SECURITY_GROUP_INVENTORY_SHA384}" \
     -var "build_instance_profile_inventory_sha384=${BUILD_INSTANCE_PROFILE_INVENTORY_SHA384}" \
+    -var "build_control_plane_role_inventory_sha384=${BUILD_CONTROL_PLANE_ROLE_INVENTORY_SHA384}" \
+    -var "builder_template_sha384=${LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384}" \
+    -var "packer_invoker_role_inventory_sha384=${LAYRS_RECOVERY_PACKER_INVOKER_ROLE_INVENTORY_SHA384}" \
     -var "builder_source_commit=${BUILDER_COMMIT}" \
     -var "parent_sha384=${EXPECTED_PARENT_SHA384}" \
     -var "phase2_template_commit=${LAYRS_RECOVERY_PHASE2_TEMPLATE_COMMIT}" \
@@ -664,6 +814,8 @@ build_ami() {
     -var "nitro_cli_rpm_sha384=${NITRO_CLI_RPM_SHA384}" \
     -var "nitro_package_inventory_sha384=${EXPECTED_PACKAGE_INVENTORY_SHA384}" \
     -var "nitro_package_set_sha384=${NITRO_PACKAGE_SET_SHA384}" \
+    -var "nitro_package_closure_sha384=${NITRO_PACKAGE_CLOSURE_SHA384}" \
+    -var "recovery_evidence_index_sha384=${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_SHA384}" \
     -var "package_install_plan=${PACKAGE_INSTALL_PLAN}" \
     -var "package_inventory_output=${PREFLIGHT_TEMP_DIR}/installed-package-inventory.txt" \
     -var "manifest_output=${LAYRS_RECOVERY_PACKER_MANIFEST}" \
@@ -676,12 +828,16 @@ build_ami() {
     --arg purpose "layrs-seq159300-recovery" \
     --arg sourceCommit "${RECOVERY_SOURCE_COMMIT}" \
     --arg builderSourceCommit "${BUILDER_COMMIT}" \
+    --arg builderEvidenceIndexSha384 "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_SHA384}" \
     --arg sourceAmiId "${LAYRS_RECOVERY_SOURCE_AMI_ID}" \
     --arg sourceAmiOwner "${LAYRS_RECOVERY_SOURCE_AMI_OWNER}" \
     --arg sourceAmiProvenanceSha384 "${SOURCE_AMI_PROVENANCE_SHA384}" \
     --arg buildSubnetInventorySha384 "${BUILD_SUBNET_INVENTORY_SHA384}" \
     --arg buildSecurityGroupInventorySha384 "${BUILD_SECURITY_GROUP_INVENTORY_SHA384}" \
     --arg buildInstanceProfileInventorySha384 "${BUILD_INSTANCE_PROFILE_INVENTORY_SHA384}" \
+    --arg buildControlPlaneRoleInventorySha384 "${BUILD_CONTROL_PLANE_ROLE_INVENTORY_SHA384}" \
+    --arg builderTemplateSha384 "${LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384}" \
+    --arg packerInvokerRoleInventorySha384 "${LAYRS_RECOVERY_PACKER_INVOKER_ROLE_INVENTORY_SHA384}" \
     --arg parentSha384 "${EXPECTED_PARENT_SHA384}" \
     --arg eifSha384 "${EXPECTED_EIF_SHA384}" \
     --arg pcr0Sha384 "${EXPECTED_PCR0_SHA384}" \
@@ -692,6 +848,7 @@ build_ami() {
     --arg nitroCliNevra "${NITRO_CLI_NEVRA}" \
     --arg nitroCliRpmSha384 "${NITRO_CLI_RPM_SHA384}" \
     --arg nitroPackageSetSha384 "${NITRO_PACKAGE_SET_SHA384}" \
+    --arg nitroPackageClosureSha384 "${NITRO_PACKAGE_CLOSURE_SHA384}" \
     --arg nitroPackageInventorySha384 "${EXPECTED_PACKAGE_INVENTORY_SHA384}" \
     '.builds[0].custom_data == {
       purpose:$purpose,sourceCommit:$sourceCommit,builderSourceCommit:$builderSourceCommit,sourceAmiId:$sourceAmiId,
@@ -699,12 +856,17 @@ build_ami() {
       buildSubnetInventorySha384:$buildSubnetInventorySha384,
       buildSecurityGroupInventorySha384:$buildSecurityGroupInventorySha384,
       buildInstanceProfileInventorySha384:$buildInstanceProfileInventorySha384,
+      buildControlPlaneRoleInventorySha384:$buildControlPlaneRoleInventorySha384,
+      builderEvidenceIndexSha384:$builderEvidenceIndexSha384,
+      builderTemplateSha384:$builderTemplateSha384,
+      packerInvokerRoleInventorySha384:$packerInvokerRoleInventorySha384,
       parentSha384:$parentSha384,eifSha384:$eifSha384,
       pcr0Sha384:$pcr0Sha384,phase2TemplateCommit:$phase2TemplateCommit,
       phase2TemplateSha384:$phase2TemplateSha384,
       implementationCommit:$implementationCommit,packerTemplateSha384:$packerTemplateSha384,
       nitroCliNevra:$nitroCliNevra,nitroCliRpmSha384:$nitroCliRpmSha384,
       nitroPackageSetSha384:$nitroPackageSetSha384,
+      nitroPackageClosureSha384:$nitroPackageClosureSha384,
       nitroPackageInventorySha384:$nitroPackageInventorySha384,
       productionRouteAttached:"false",
       recoveryServicesUnchanged:"true"}' \
@@ -744,12 +906,16 @@ build_ami() {
     --arg remediationIndexObjectVersionId "${REMEDIATION_INDEX_VERSION_ID}" \
     --arg sourceCommit "${RECOVERY_SOURCE_COMMIT}" \
     --arg builderSourceCommit "${BUILDER_COMMIT}" \
+    --arg builderEvidenceIndexSha384 "${LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_SHA384}" \
+    --arg builderTemplateSha384 "${LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384}" \
+    --arg packerInvokerRoleInventorySha384 "${LAYRS_RECOVERY_PACKER_INVOKER_ROLE_INVENTORY_SHA384}" \
     --arg sourceAmiId "${LAYRS_RECOVERY_SOURCE_AMI_ID}" \
     --arg sourceAmiOwner "${LAYRS_RECOVERY_SOURCE_AMI_OWNER}" \
     --arg sourceAmiProvenanceSha384 "${SOURCE_AMI_PROVENANCE_SHA384}" \
     --arg buildSubnetInventorySha384 "${BUILD_SUBNET_INVENTORY_SHA384}" \
     --arg buildSecurityGroupInventorySha384 "${BUILD_SECURITY_GROUP_INVENTORY_SHA384}" \
     --arg buildInstanceProfileInventorySha384 "${BUILD_INSTANCE_PROFILE_INVENTORY_SHA384}" \
+    --arg buildControlPlaneRoleInventorySha384 "${BUILD_CONTROL_PLANE_ROLE_INVENTORY_SHA384}" \
     --arg outputAmiInventorySha384 "${OUTPUT_AMI_INVENTORY_SHA384}" \
     --arg phase2TemplateSha384 "${LAYRS_RECOVERY_EXPECTED_PHASE2_TEMPLATE_SHA384}" \
     --arg phase2TemplateCommit "${LAYRS_RECOVERY_PHASE2_TEMPLATE_COMMIT}" \
@@ -768,6 +934,9 @@ build_ami() {
     --arg nitroPackageSetObjectKey "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_OBJECT_KEY}" \
     --arg nitroPackageSetObjectVersionId "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_OBJECT_VERSION_ID}" \
     --arg nitroPackageSetSha384 "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_SHA384}" \
+    --arg nitroPackageClosureSha384 "${NITRO_PACKAGE_CLOSURE_SHA384}" \
+    --arg nitroPackageSigningKeyFingerprint "${AMAZON_LINUX_SIGNING_KEY_FINGERPRINT}" \
+    --arg nitroPackageSigningKeySha256 "${AMAZON_LINUX_SIGNING_KEY_SHA256}" \
     --arg nitroPackageSetEvidenceObjectKey "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_EVIDENCE_OBJECT_KEY}" \
     --arg nitroPackageSetEvidenceObjectVersionId "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_EVIDENCE_OBJECT_VERSION_ID}" \
     --arg nitroPackageSetEvidenceSha384 "${LAYRS_RECOVERY_NITRO_PACKAGE_SET_EVIDENCE_SHA384}" \
@@ -778,11 +947,15 @@ build_ami() {
       parentBinarySha384:$parentBinarySha384,pcr0Sha384:$pcr0Sha384,region:$region,
       remediationEvidenceCommit:$remediationEvidenceCommit,
       remediationIndexObjectVersionId:$remediationIndexObjectVersionId,
-      sourceCommit:$sourceCommit,builderSourceCommit:$builderSourceCommit,sourceAmiId:$sourceAmiId,
+      sourceCommit:$sourceCommit,builderSourceCommit:$builderSourceCommit,
+      builderEvidenceIndexSha384:$builderEvidenceIndexSha384,
+      builderTemplateSha384:$builderTemplateSha384,sourceAmiId:$sourceAmiId,
+      packerInvokerRoleInventorySha384:$packerInvokerRoleInventorySha384,
       sourceAmiOwner:$sourceAmiOwner,sourceAmiProvenanceSha384:$sourceAmiProvenanceSha384,
       buildSubnetInventorySha384:$buildSubnetInventorySha384,
       buildSecurityGroupInventorySha384:$buildSecurityGroupInventorySha384,
       buildInstanceProfileInventorySha384:$buildInstanceProfileInventorySha384,
+      buildControlPlaneRoleInventorySha384:$buildControlPlaneRoleInventorySha384,
       outputAmiInventorySha384:$outputAmiInventorySha384,
       phase2TemplateCommit:$phase2TemplateCommit,phase2TemplateSha384:$phase2TemplateSha384,
       phase2EvidenceObjectKey:$phase2EvidenceObjectKey,
@@ -798,6 +971,9 @@ build_ami() {
       nitroPackageSetObjectKey:$nitroPackageSetObjectKey,
       nitroPackageSetObjectVersionId:$nitroPackageSetObjectVersionId,
       nitroPackageSetSha384:$nitroPackageSetSha384,
+      nitroPackageClosureSha384:$nitroPackageClosureSha384,
+      nitroPackageSigningKeyFingerprint:$nitroPackageSigningKeyFingerprint,
+      nitroPackageSigningKeySha256:$nitroPackageSigningKeySha256,
       nitroPackageSetEvidenceObjectKey:$nitroPackageSetEvidenceObjectKey,
       nitroPackageSetEvidenceObjectVersionId:$nitroPackageSetEvidenceObjectVersionId,
       nitroPackageSetEvidenceSha384:$nitroPackageSetEvidenceSha384}' \

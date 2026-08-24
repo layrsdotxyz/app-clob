@@ -12,7 +12,8 @@ const EIF_SHA384 = '958e084e0a66d0aca6773193a74d40659cd258fcffa116b0117fed1fab83
 const PCR0_SHA384 = '57fc48ad4d755edda38665bc8f0a16e7fd9dc485e3b57a2bce9070f60bd3b9724711ff973175340d5ebbfed4d63b7fac';
 
 const FIELDS = Object.freeze([
-  'accountId', 'amiId', 'buildCompletedAt', 'builderSourceCommit',
+  'accountId', 'amiId', 'buildCompletedAt', 'builderEvidenceIndexSha384', 'builderSourceCommit',
+  'builderTemplateSha384', 'buildControlPlaneRoleInventorySha384',
   'buildInstanceProfileInventorySha384', 'buildSecurityGroupInventorySha384',
   'buildSubnetInventorySha384', 'eifSha384', 'environment', 'implementationCommit',
   'implementationEvidenceObjectKey', 'implementationEvidenceObjectVersionId',
@@ -21,7 +22,10 @@ const FIELDS = Object.freeze([
   'nitroPackageSetEvidenceObjectKey', 'nitroPackageSetEvidenceSha384',
   'nitroPackageSetEvidenceObjectVersionId', 'nitroPackageSetObjectKey',
   'nitroPackageSetSha384', 'nitroPackageSetObjectVersionId',
+  'nitroPackageClosureSha384', 'nitroPackageSigningKeyFingerprint',
+  'nitroPackageSigningKeySha256',
   'outputAmiInventorySha384', 'packerManifestSha384', 'packerTemplateSha384',
+  'packerInvokerRoleInventorySha384',
   'parentBinarySha384', 'pcr0Sha384', 'phase2EvidenceObjectKey',
   'phase2EvidenceObjectVersionId', 'phase2EvidenceObjectSha384', 'phase2TemplateCommit',
   'phase2TemplateSha384', 'protocol', 'region',
@@ -70,6 +74,8 @@ export function renderRecoveryParentBuildEvidence(input) {
       || input.pcr0Sha384 !== PCR0_SHA384 || !/^ami-[0-9a-f]{8,17}$/u.test(input.amiId)
       || input.sourceAmiId !== 'ami-0332d564d76dbd8d6'
       || input.sourceAmiOwner !== '137112412989'
+      || input.nitroPackageSigningKeyFingerprint !== 'B21C50FA44A99720EAA72F7FE951904AD832C631'
+      || input.nitroPackageSigningKeySha256 !== '664b632018bd84f9b249be7bd26937c560edb2f2bfc0cbc01ec5a7b4e06aad56'
       || !/^aws-nitro-enclaves-cli-[0-9]+:?[A-Za-z0-9._+~]+-[A-Za-z0-9._+~]+\.x86_64$/u.test(input.nitroCliNevra)
       || !immutableObjectKey(input.phase2EvidenceObjectKey)
       || !immutableObjectKey(input.implementationEvidenceObjectKey)
@@ -87,11 +93,15 @@ export function renderRecoveryParentBuildEvidence(input) {
       || !immutableVersionId(input.nitroPackageSetObjectVersionId)
       || !immutableVersionId(input.nitroPackageSetEvidenceObjectVersionId)
       || [
+        input.builderEvidenceIndexSha384, input.builderTemplateSha384,
+        input.buildControlPlaneRoleInventorySha384,
         input.buildInstanceProfileInventorySha384, input.buildSecurityGroupInventorySha384,
         input.buildSubnetInventorySha384, input.implementationEvidenceObjectSha384,
         input.nitroCliRpmSha384, input.nitroPackageInventorySha384, input.outputAmiInventorySha384,
-        input.nitroPackageSetSha384, input.nitroPackageSetEvidenceSha384,
-        input.packerManifestSha384, input.packerTemplateSha384, input.phase2EvidenceObjectSha384,
+        input.nitroPackageClosureSha384, input.nitroPackageSetSha384,
+        input.nitroPackageSetEvidenceSha384,
+        input.packerInvokerRoleInventorySha384, input.packerManifestSha384,
+        input.packerTemplateSha384, input.phase2EvidenceObjectSha384,
         input.phase2TemplateSha384, input.sourceAmiProvenanceSha384,
       ].some(value => !/^[0-9a-f]{96}$/u.test(value))
       || !Number.isFinite(completedAt.getTime())

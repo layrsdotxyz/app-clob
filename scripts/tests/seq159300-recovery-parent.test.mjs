@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import test from 'node:test';
@@ -35,6 +36,8 @@ const PARENT_SHA384 = 'd9506bf11627b04bd5d220e18e78584cd5e649952fe380309346d9c6b
 const EIF_SHA384 = '958e084e0a66d0aca6773193a74d40659cd258fcffa116b0117fed1fab8361046ffea6411379b72fc72c97b86f611290';
 const REJECTED_BUILD_A_EIF = '110c31235f36fa85e4a50d61fb89ab3a08e5b18587a35dfe4818c3615eed5a79513082df101e5c655fce8c7640d66ad8';
 const PCR0_SHA384 = '57fc48ad4d755edda38665bc8f0a16e7fd9dc485e3b57a2bce9070f60bd3b9724711ff973175340d5ebbfed4d63b7fac';
+const AMAZON_KEY_FINGERPRINT = 'B21C50FA44A99720EAA72F7FE951904AD832C631';
+const AMAZON_KEY_SHA256 = '664b632018bd84f9b249be7bd26937c560edb2f2bfc0cbc01ec5a7b4e06aad56';
 
 function validEvidence(overrides = {}) {
   return {
@@ -47,6 +50,9 @@ function validEvidence(overrides = {}) {
     implementationEvidenceObjectVersionId: 'implementation.version.1',
     implementationEvidenceObjectSha384: SHA384,
     builderSourceCommit: BUILDER_SOURCE_COMMIT,
+    builderEvidenceIndexSha384: SHA384,
+    builderTemplateSha384: SHA384,
+    buildControlPlaneRoleInventorySha384: SHA384,
     buildInstanceProfileInventorySha384: SHA384,
     buildSecurityGroupInventorySha384: SHA384,
     buildSubnetInventorySha384: SHA384,
@@ -58,11 +64,15 @@ function validEvidence(overrides = {}) {
     nitroPackageSetObjectKey: 'evidence/seq159300/recovery-only/phase2/packages/nitro-packages.tar',
     nitroPackageSetObjectVersionId: 'package.set.version.1',
     nitroPackageSetSha384: SHA384,
+    nitroPackageClosureSha384: SHA384,
+    nitroPackageSigningKeyFingerprint: AMAZON_KEY_FINGERPRINT,
+    nitroPackageSigningKeySha256: AMAZON_KEY_SHA256,
     nitroPackageSetEvidenceObjectKey: 'evidence/seq159300/recovery-only/phase2/packages/nitro-package-set-evidence.json',
     nitroPackageSetEvidenceObjectVersionId: 'package.evidence.version.1',
     nitroPackageSetEvidenceSha384: SHA384,
     outputAmiInventorySha384: SHA384,
     packerManifestSha384: SHA384,
+    packerInvokerRoleInventorySha384: SHA384,
     packerTemplateSha384: SHA384,
     phase2EvidenceObjectKey: 'evidence/seq159300/recovery-only/phase2/rendered-phase2.json',
     phase2EvidenceObjectVersionId: 'phase2.version.1',
@@ -92,6 +102,15 @@ test('Packer source is pinned, private and recovery-only', () => {
   assert.match(packer, /associate_public_ip_address\s*=\s*false/u);
   assert.match(packer, /allowed_account_ids\s*=\s*\["082223548516"\]/u);
   assert.match(packer, /ssh_interface\s*=\s*"session_manager"/u);
+  assert.match(packer, /temporary_key_pair_name\s*=\s*"layrs-seq159300-recovery-/u);
+  assert.match(packer, /launch_block_device_mappings\s*\{[\s\S]*encrypted\s*=\s*true/u);
+  assert.doesNotMatch(packer, /\bencrypt_boot\b|\bena_support\b|\bkms_key_id\b/u);
+  assert.match(packer, /snapshot_tags\s*=\s*\{/u);
+  for (const tag of [
+    'RecoveryBuilderTemplateSha384', 'RecoveryPackageSetSha384', 'RecoveryEvidenceIndexSha384',
+  ]) {
+    assert.ok((packer.match(new RegExp(tag, 'gu')) ?? []).length >= 4);
+  }
   assert.match(packer, /layrs-seq159300-recovery/u);
   assert.match(packer, /ProductionRouteAttached\s*=\s*"false"/u);
   assert.match(packer, new RegExp(PARENT_SHA384, 'u'));
@@ -127,10 +146,28 @@ test('wrapper cross-checks immutable package versions and a dedicated Packer rol
   assert.match(wrapper, /s3api get-object[\s\S]*--version-id/u);
   assert.match(wrapper, /cmp -s/u);
   assert.match(wrapper, /rpmkeys --checksig --verbose/u);
-  assert.match(wrapper, /layrs-production-recovery-seq159300-packer-/u);
+  assert.match(wrapper, /layrs-production-recovery-seq159300-packer-control/u);
+  assert.match(wrapper, /LAYRS_RECOVERY_BUILDER_TEMPLATE_SHA384/u);
+  assert.match(wrapper, /LAYRS_RECOVERY_PACKER_INVOKER_ROLE_INVENTORY_SHA384/u);
+  assert.match(wrapper, /B21C50FA44A99720EAA72F7FE951904AD832C631/u);
+  assert.match(wrapper, /664b632018bd84f9b249be7bd26937c560edb2f2bfc0cbc01ec5a7b4e06aad56/u);
   assert.match(wrapper, /assumed-role/u);
   assert.match(wrapper, /LAYRS_RECOVERY_NITRO_PACKAGE_SET_EVIDENCE_OBJECT_VERSION_ID/u);
   assert.doesNotMatch(wrapper, /dnf download|reposync|curl|wget/iu);
+});
+
+test('wrapper verifies under the exact invoker then gives Packer only exact short-lived control credentials', () => {
+  assert.match(wrapper, /preflight invoker role[\s\S]*LAYRS_RECOVERY_PACKER_INVOKER_ROLE_ARN/u);
+  assert.match(wrapper, /sts assume-role[\s\S]*--role-arn[\s\S]*PACKER_CONTROL_ROLE_NAME/u);
+  assert.match(wrapper, /--external-id "\$\{LAYRS_RECOVERY_BUILDER_EVIDENCE_INDEX_SHA384\}"/u);
+  assert.match(wrapper, /duration_seconds >= 900 && duration_seconds <= 3600/u);
+  assert.match(wrapper, /export AWS_ACCESS_KEY_ID=/u);
+  assert.match(wrapper, /export AWS_SECRET_ACCESS_KEY=/u);
+  assert.match(wrapper, /export AWS_SESSION_TOKEN=/u);
+  assert.match(wrapper, /assumed-role\/layrs-production-recovery-seq159300-packer-control\/layrs-seq159300-packer/u);
+  assert.match(wrapper, /verify_immutable_package_objects\s*\n\s*assume_packer_control_role/u);
+  assert.match(wrapper, /run_aws_preflight\s*\n\s*packer_bin=/u);
+  assert.doesNotMatch(wrapper, /LAYRS_RECOVERY_PACKER_CALLER_ROLE_ARN/u);
 });
 
 test('Packer and f282 units expose one exact runtime layout contract for Phase2 IaC', () => {
@@ -286,8 +323,14 @@ function validNetworkEnvelope() {
       expectedSubnetId: 'subnet-0123456789abcdef0',
       expectedSecurityGroupId: 'sg-0123456789abcdef0',
       subnetsResponse: { Subnets: [{
-        AvailabilityZone: 'us-east-1a', MapPublicIpOnLaunch: false,
+        AssignIpv6AddressOnCreation: false, AvailabilityZone: 'us-east-1a', EnableDns64: false,
+        Ipv6CidrBlockAssociationSet: [], Ipv6Native: false, MapPublicIpOnLaunch: false,
         State: 'available', SubnetId: 'subnet-0123456789abcdef0', VpcId: 'vpc-0123456789abcdef0',
+      }] },
+      vpcsResponse: { Vpcs: [{
+        CidrBlock: '10.0.0.0/16', Ipv6CidrBlockAssociationSet: [], State: 'available',
+        Tags: [{ Key: 'Purpose', Value: 'seq159300-recovery-build' }],
+        VpcId: 'vpc-0123456789abcdef0',
       }] },
       routeTablesResponse: { RouteTables: [{
         Associations: [{ SubnetId: 'subnet-0123456789abcdef0' }],
@@ -299,6 +342,7 @@ function validNetworkEnvelope() {
       vpcEndpointsResponse: { VpcEndpoints: ['ec2messages', 'ssm', 'ssmmessages'].map((service, index) => ({
         Groups: [{ GroupId: 'sg-0fedcba9876543210' }],
         NetworkInterfaceIds: [`eni-0123456789abcde${index}`], PrivateDnsEnabled: true,
+        DnsOptions: { DnsRecordIpType: 'ipv4' }, IpAddressType: 'ipv4',
         ServiceName: `com.amazonaws.us-east-1.${service}`, State: 'available',
         SubnetIds: ['subnet-0123456789abcdef0'],
         VpcEndpointId: `vpce-0123456789abcde${index}`, VpcEndpointType: 'Interface',
@@ -307,7 +351,7 @@ function validNetworkEnvelope() {
       networkInterfacesResponse: { NetworkInterfaces: [0, 1, 2].map(index => ({
         AvailabilityZone: 'us-east-1a', Groups: [{ GroupId: 'sg-0fedcba9876543210' }],
         InterfaceType: 'vpc_endpoint', NetworkInterfaceId: `eni-0123456789abcde${index}`,
-        RequesterManaged: true, SubnetId: 'subnet-0123456789abcdef0',
+        Ipv6Addresses: [], RequesterManaged: true, SubnetId: 'subnet-0123456789abcdef0',
         VpcId: 'vpc-0123456789abcdef0',
       })) },
       securityGroupsResponse: { SecurityGroups: [
@@ -371,24 +415,95 @@ function validProfileEnvelope() {
   };
 }
 
+function validPackerControlRoleEnvelope() {
+  const approvedAt = '2026-08-24T03:00:00Z';
+  const expiresAt = '2026-08-24T04:00:00Z';
+  const invokerArn = 'arn:aws:iam::082223548516:role/layrs-production-recovery-seq159300-reviewer';
+  const roleName = 'layrs-production-recovery-seq159300-packer-control';
+  const tags = [
+    ['Name', roleName], ['Application', 'layrs'], ['Environment', 'production'],
+    ['Purpose', 'seq159300-recovery-ami-build-control'], ['RecoverySourceCommit', SOURCE_COMMIT],
+    ['BuilderTemplateSha384', SHA384], ['OfflinePackageSetSha384', SHA384],
+    ['OfflinePackageClosureSha384', SHA384], ['EvidenceIndexSha384', SHA384],
+    ['InvokerRoleInventorySha384', SHA384],
+  ].map(([Key, Value]) => ({ Key, Value }));
+  const trust = {
+    Version: '2012-10-17', Statement: [{
+      Effect: 'Allow', Principal: { AWS: invokerArn }, Action: 'sts:AssumeRole',
+      Condition: {
+        ArnEquals: { 'aws:PrincipalArn': invokerArn },
+        StringEquals: { 'aws:PrincipalAccount': '082223548516', 'sts:ExternalId': SHA384 },
+        DateGreaterThanEquals: { 'aws:CurrentTime': approvedAt },
+        DateLessThan: { 'aws:CurrentTime': expiresAt },
+      },
+    }],
+  };
+  const document = {
+    Version: '2012-10-17', Statement: [{
+      Sid: 'DescribeExactRecoveryBuildBoundary', Effect: 'Allow',
+      Action: ['ec2:DescribeImages'], Resource: '*',
+      Condition: { DateLessThan: { 'aws:CurrentTime': expiresAt } },
+    }, {
+      Sid: 'DenyBeforeExactApproval', Effect: 'Deny', Action: '*', Resource: '*',
+      Condition: { DateLessThan: { 'aws:CurrentTime': approvedAt } },
+    }, {
+      Sid: 'DenyAfterExactExpiry', Effect: 'Deny', Action: '*', Resource: '*',
+      Condition: { DateGreaterThanEquals: { 'aws:CurrentTime': expiresAt } },
+    }],
+  };
+  const outputs = {
+    BuilderEvidenceIndexSha384: SHA384, BuilderTemplateSha384: SHA384,
+    OfflinePackageClosureSha384: SHA384, OfflinePackageSetSha384: SHA384,
+    PackerControlPlaneApprovedAt: approvedAt, PackerControlPlaneExpiresAt: expiresAt,
+    PackerControlPlaneMaxLifetimeSeconds: '3600',
+    PackerControlPlaneRoleArn: `arn:aws:iam::082223548516:role/${roleName}`,
+    PackerInvokerRoleArn: invokerArn, PackerInvokerRoleInventorySha384: SHA384,
+  };
+  return { kind: 'packer-control-role', payload: {
+    approvedAt, attachedPolicies: [], builderEvidenceIndexSha384: SHA384,
+    builderTemplateSha384: SHA384, evaluatedAt: '2026-08-24T03:30:00Z',
+    expectedInvokerRoleArn: invokerArn, expiresAt, inlinePolicies: [{ name: roleName, document }],
+    invokerRoleInventorySha384: SHA384, offlinePackageClosureSha384: SHA384,
+    offlinePackageSetSha384: SHA384,
+    roleResponse: { Role: {
+      Arn: `arn:aws:iam::082223548516:role/${roleName}`, AssumeRolePolicyDocument: trust,
+      MaxSessionDuration: 3600, Path: '/', RoleName: roleName, Tags: tags,
+    } },
+    stackResponse: { Stacks: [{
+      StackName: 'layrs-production-recovery-seq159300-builder', StackStatus: 'CREATE_COMPLETE',
+      Outputs: Object.entries(outputs)
+      .map(([OutputKey, OutputValue]) => ({ OutputKey, OutputValue })) }] },
+  } };
+}
+
 function validPackageSetEnvelope() {
   const packages = [
     {
       filename: 'aws-nitro-enclaves-cli-1.4.2.rpm',
+      name: 'aws-nitro-enclaves-cli',
       nevra: 'aws-nitro-enclaves-cli-0:1.4.2-1.amzn2023.x86_64',
       objectKey: 'evidence/seq159300/recovery-only/phase2/packages/aws-nitro-enclaves-cli-1.4.2.rpm',
-      objectVersionId: 'package.cli.version.1', sha384: SHA384, signatureKeyId: 'D832C631',
+      objectVersionId: 'package.cli.version.1', sha384: SHA384,
     },
     {
-      filename: 'libnsm-1.4.2.rpm', nevra: 'libnsm-0:1.4.2-1.amzn2023.x86_64',
+      filename: 'libnsm-1.4.2.rpm', name: 'libnsm',
+      nevra: 'libnsm-0:1.4.2-1.amzn2023.x86_64',
       objectKey: 'evidence/seq159300/recovery-only/phase2/packages/libnsm-1.4.2.rpm',
-      objectVersionId: 'package.libnsm.version.1', sha384: '4'.repeat(96), signatureKeyId: 'D832C631',
+      objectVersionId: 'package.libnsm.version.1', sha384: '4'.repeat(96),
     },
   ];
-  return { kind: 'nitro-package-set', payload: { manifest: {
-    protocol: 'layrs.seq159300.nitro-offline-package-set.v1', accountId: '082223548516',
-    region: 'us-east-1', environment: 'production', packages,
-  } } };
+  const packageClosureSha384 = createHash('sha384').update(canonicalJson(
+    packages.map(({ name, nevra }) => ({ name, nevra })),
+  )).digest('hex');
+  return { kind: 'nitro-package-set', payload: {
+    expectedPackageClosureSha384: packageClosureSha384,
+    manifest: {
+      protocol: 'layrs.seq159300.nitro-offline-package-set.v2', accountId: '082223548516',
+      region: 'us-east-1', environment: 'production', packageClosureSha384,
+      signingKeyFingerprint: AMAZON_KEY_FINGERPRINT, signingKeySha256: AMAZON_KEY_SHA256,
+      packages,
+    },
+  } };
 }
 
 test('offline Nitro manifest binds the exact signed dependency closure', () => {
@@ -400,8 +515,42 @@ test('offline Nitro manifest binds the exact signed dependency closure', () => {
     envelope => { envelope.payload.manifest.packages[1].nevra = 'aws-nitro-enclaves-cli-devel-0:1-1.x86_64'; },
     envelope => { envelope.payload.manifest.packages.splice(1, 1); },
     envelope => { envelope.payload.manifest.packages.reverse(); },
+    envelope => { envelope.payload.manifest.signingKeyFingerprint = '0'.repeat(40); },
+    envelope => { envelope.payload.manifest.signingKeySha256 = '0'.repeat(64); },
+    envelope => { envelope.payload.expectedPackageClosureSha384 = '0'.repeat(96); },
   ]) {
     const envelope = validPackageSetEnvelope();
+    mutate(envelope);
+    assert.throws(() => validatePreflight(envelope));
+  }
+});
+
+test('Packer control-role preflight binds exact trust, policy, tags, boundary and expiry', () => {
+  const output = validatePreflight(validPackerControlRoleEnvelope());
+  assert.equal(output.roleName, 'layrs-production-recovery-seq159300-packer-control');
+  assert.equal(output.permissionsBoundaryArn, '');
+  assert.equal(Object.hasOwn(output, 'evaluatedAt'), false);
+  for (const mutate of [
+    envelope => { envelope.payload.roleResponse.Role.RoleName = 'layrs-production-recovery-seq159300-other'; },
+    envelope => { envelope.payload.roleResponse.Role.PermissionsBoundary = { PermissionsBoundaryArn: 'arn:aws:iam::aws:policy/AdministratorAccess' }; },
+    envelope => { envelope.payload.roleResponse.Role.AssumeRolePolicyDocument.Statement[0]
+      .Condition.DateGreaterThanEquals['aws:CurrentTime'] = '2026-08-24T02:59:59Z'; },
+    envelope => { envelope.payload.inlinePolicies[0].document.Statement[0]
+      .Condition.DateLessThan['aws:CurrentTime'] = '2026-08-24T05:00:00Z'; },
+    envelope => { envelope.payload.inlinePolicies[0].document.Statement
+      .find(statement => statement.Sid === 'DenyBeforeExactApproval')
+      .Condition.DateLessThan['aws:CurrentTime'] = '2026-08-24T02:59:59Z'; },
+    envelope => envelope.payload.attachedPolicies.push({ PolicyArn: 'arn:aws:iam::aws:policy/AdministratorAccess' }),
+    envelope => { envelope.payload.roleResponse.Role.Tags[0].Value = 'different'; },
+    envelope => { envelope.payload.stackResponse.Stacks[0].Outputs
+      .find(outputItem => outputItem.OutputKey === 'OfflinePackageClosureSha384').OutputValue = '4'.repeat(96); },
+    envelope => { envelope.payload.stackResponse.Stacks[0].StackStatus = 'UPDATE_ROLLBACK_IN_PROGRESS'; },
+    envelope => envelope.payload.stackResponse.Stacks[0].Outputs.push({
+      OutputKey: 'BuilderTemplateSha384', OutputValue: SHA384,
+    }),
+    envelope => { envelope.payload.evaluatedAt = envelope.payload.expiresAt; },
+  ]) {
+    const envelope = validPackerControlRoleEnvelope();
     mutate(envelope);
     assert.throws(() => validatePreflight(envelope));
   }
@@ -447,7 +596,19 @@ test('read-only preflight rejects public/NAT routes and public security-group eg
     envelope => { envelope.payload.vpcEndpointsResponse.VpcEndpoints[0].ServiceName = 'com.amazonaws.us-east-1.kms'; },
     envelope => { envelope.payload.networkInterfacesResponse.NetworkInterfaces[0].InterfaceType = 'interface'; },
     envelope => { envelope.payload.networkInterfacesResponse.NetworkInterfaces[0].AvailabilityZone = 'us-east-1b'; },
+    envelope => { envelope.payload.networkInterfacesResponse.NetworkInterfaces[0].Ipv6Addresses = [{ Ipv6Address: '2001:db8::1' }]; },
     envelope => { envelope.payload.vpcEndpointsResponse.VpcEndpoints[0].SubnetIds = ['subnet-0aaaaaaaaaaaaaaaa']; },
+    envelope => { envelope.payload.vpcEndpointsResponse.VpcEndpoints[0].IpAddressType = 'dualstack'; },
+    envelope => { envelope.payload.subnetsResponse.Subnets[0].AssignIpv6AddressOnCreation = true; },
+    envelope => envelope.payload.subnetsResponse.Subnets[0].Ipv6CidrBlockAssociationSet.push({
+      AssociationId: 'subnet-cidr-assoc-1', Ipv6CidrBlock: '2001:db8::/64',
+    }),
+    envelope => envelope.payload.vpcsResponse.Vpcs[0].Ipv6CidrBlockAssociationSet.push({
+      AssociationId: 'vpc-cidr-assoc-1', Ipv6CidrBlock: '2001:db8::/56',
+    }),
+    envelope => envelope.payload.routeTablesResponse.RouteTables[0].Routes.push({
+      DestinationIpv6CidrBlock: '::/0', EgressOnlyInternetGatewayId: 'eigw-0123456789abcdef0', State: 'active',
+    }),
     envelope => { envelope.payload.vpcEndpointsResponse.VpcEndpoints.pop(); },
     envelope => envelope.payload.routeTablesResponse.RouteTables[0].Routes.push({
       DestinationPrefixListId: 'pl-0123456789abcdef0', VpcEndpointId: 'vpce-0123456789abcde0', State: 'active',
@@ -457,7 +618,7 @@ test('read-only preflight rejects public/NAT routes and public security-group eg
     mutate(envelope);
     assert.throws(
       () => validatePreflight(envelope),
-      /public|endpoint-SG-only|private available|private control-plane endpoint|attached outside|three exact SSM|forbidden target/u,
+      /public|IPv6|endpoint-SG-only|private available|private control-plane endpoint|attached outside|three exact SSM|forbidden target/u,
     );
   }
 });
@@ -483,19 +644,23 @@ test('read-only preflight rejects secret, KMS, data and production-route authori
 
 test('output AMI readback rejects public, unencrypted or provenance-swapped images', () => {
   const expected = {
+    buildControlPlaneRoleInventorySha384: SHA384, builderTemplateSha384: SHA384,
     buildInstanceProfileInventorySha384: SHA384, buildSecurityGroupInventorySha384: SHA384,
     buildSubnetInventorySha384: SHA384, builderSourceCommit: BUILDER_SOURCE_COMMIT,
     eifSha384: EIF_SHA384,
     imageId: 'ami-0123456789abcdef0', implementationCommit: IMPLEMENTATION_COMMIT,
     parentSha384: PARENT_SHA384, pcr0Sha384: PCR0_SHA384,
     nitroCliRpmSha384: SHA384, nitroPackageInventorySha384: SHA384,
-    nitroPackageSetSha384: SHA384,
+    nitroPackageSetSha384: SHA384, nitroPackageClosureSha384: SHA384,
+    packerInvokerRoleInventorySha384: SHA384,
     packerTemplateSha384: SHA384,
     phase2TemplateCommit: PHASE2_TEMPLATE_COMMIT, phase2TemplateSha384: SHA384,
+    recoveryEvidenceIndexSha384: SHA384,
     sourceAmiId: 'ami-0332d564d76dbd8d6', sourceAmiProvenanceSha384: SHA384,
     sourceCommit: SOURCE_COMMIT,
   };
   const tags = [
+    ['BuildControlPlaneRoleSha384', SHA384],
     ['BuildInstanceProfileSha384', SHA384], ['BuildSecurityGroupSha384', SHA384],
     ['BuildSubnetInventorySha384', SHA384],
     ['GateImplementationCommit', IMPLEMENTATION_COMMIT],
@@ -508,6 +673,10 @@ test('output AMI readback rejects public, unencrypted or provenance-swapped imag
     ['SourceAmiProvenanceSha384', SHA384], ['NitroCliRpmSha384', SHA384],
     ['NitroPackageInventorySha384', SHA384],
     ['NitroPackageSetSha384', SHA384],
+    ['NitroPackageClosureSha384', SHA384],
+    ['PackerInvokerRoleSha384', SHA384],
+    ['RecoveryBuilderTemplateSha384', SHA384],
+    ['RecoveryEvidenceIndexSha384', SHA384], ['RecoveryPackageSetSha384', SHA384],
     ['Visibility', 'private'],
   ].map(([Key, Value]) => ({ Key, Value }));
   const valid = { kind: 'output-ami', payload: { expected, response: { Images: [{

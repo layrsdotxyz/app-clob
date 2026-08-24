@@ -27,11 +27,17 @@ The wrapper fails closed unless all of these inputs are exact:
   8-GiB gp3 source snapshot `snap-0bc9cf3f9e4893b60`; and
 - the app-backend/IaC commit and SHA384 of the separately reviewed Phase2 isolation template,
   plus the immutable object key, VersionId and SHA384 of its evidence;
+- the separate SHA384 of the accepted recovery-builder CloudFormation template;
 - the SHA384 calculated directly from this Packer template; and
 - one canonical immutable Nitro package-set manifest at
   `build/seq159300-nitro-package-set.json` and its complete regular-file RPM
   closure at `build/seq159300-nitro-packages/`. Every entry binds filename,
-  NEVRA, immutable object key, VersionId, SHA384 and signing-key ID. The build
+  package name, NEVRA, immutable object key, VersionId and SHA384. The complete
+  canonical name-plus-NEVRA closure is independently SHA384-bound. The manifest
+  must bind the pinned Amazon Linux 2023 signing fingerprint
+  `B21C50FA44A99720EAA72F7FE951904AD832C631` and exact public-key SHA256
+  `664b632018bd84f9b249be7bd26937c560edb2f2bfc0cbc01ec5a7b4e06aad56`; a
+  signer asserted only by a package entry or manifest is insufficient. The build
   caller retrieves every exact remote object version and the package-set
   evidence object, rehashes and byte-compares them locally, and verifies the
   RPM signature and header. Packer repeats signature/header/hash checks,
@@ -60,16 +66,23 @@ group and instance profile. The Packer source uses SSM Session Manager, requests
 no public address or user data, produces a private AMI and adds no credentials,
 services, DNS or target-group registrations.
 
-`--build` first performs read-only AWS preflight in account `082223548516` and
-region `us-east-1`. It additionally requires the current STS session to resolve
-to the exact separately reviewed
-`layrs-production-recovery-seq159300-packer-*` control-plane role; arbitrary
-account credentials and root are rejected. Packer independently uses
-`allowed_account_ids` for the same account. The preflight fails closed unless:
+`--build` first performs read-only AWS and immutable-object preflight in account
+`082223548516` and region `us-east-1` using the exact reviewed invoker role;
+arbitrary account credentials, admin sessions and root are rejected. Only after
+all exact-version S3/KMS-backed package bytes, IAM/CloudFormation state and
+infrastructure inventories pass does the wrapper call `sts:AssumeRole` for
+`layrs-production-recovery-seq159300-packer-control`, using the evidence-index
+SHA384 as external ID and a session bounded by the accepted expiry. It then
+read-backs the exact assumed-role/session identity. Packer and its AWS calls run
+only with those short-lived control credentials and use the already verified
+local package bytes; the control role has no S3 or KMS authority. Packer also
+uses `allowed_account_ids` for the same account. The preflight fails closed unless:
 
 - the source AMI has the exact ID and AWS AL2023 owner, is available, x86_64,
   HVM/EBS and has a valid root mapping;
-- the build subnet disables automatic public IPs and every active route is
+- the build VPC and subnet have no IPv6 CIDR associations, the subnet disables
+  IPv6 auto-assignment, DNS64 and automatic public IPs, every endpoint is
+  IPv4-only, every endpoint ENI has no IPv6 address, and every active route is
   VPC-local. Endpoint, internet-gateway, NAT, transit, peering,
   network-interface and public-default routes fail; interface endpoints do not
   require route entries, so any purported endpoint route is rejected rather
@@ -84,11 +97,17 @@ account credentials and root are rejected. Packer independently uses
   EC2-only role and contains only the minimal SSM message-channel and recovery
   log actions. Secret, KMS, S3, parameter read, database/data, route mutation,
   target registration, PassRole and AssumeRole authority fail closed.
+- the exact Packer control role has the accepted invoker, approval and expiry
+  trust, one exact inline policy, no managed policy or permissions boundary,
+  exact evidence tags and exact builder-stack outputs. A canonical hash of its
+  trust, policy, tags, boundary state and window must equal the separately
+  reviewed `buildControlPlaneRoleInventorySha384` before Packer is invoked.
 
 The canonical preflight inventories are reduced to stable, non-secret fields
 and SHA384-bound in the final evidence as `sourceAmiProvenanceSha384`,
 `buildSubnetInventorySha384`, `buildSecurityGroupInventorySha384` and
-`buildInstanceProfileInventorySha384`.
+`buildInstanceProfileInventorySha384`, plus the separate
+`buildControlPlaneRoleInventorySha384`.
 
 ## Runtime layout contract
 
@@ -115,6 +134,7 @@ Phase2 IaC commit/hash and immutable reference, final integrated backend
 implementation commit and its independent immutable reference,
 immutable reference, source AMI provenance, network/profile inventory hashes,
 Packer template and manifest hashes, installed Nitro CLI NEVRA/package hash,
+exact package closure and pinned signing-key identity,
 and post-build private/encrypted AMI readback hash. The two cross-repository
 commit fields are intentionally independent and must never be forced equal.
 Both are only recorded here; a later signed gate must independently require
