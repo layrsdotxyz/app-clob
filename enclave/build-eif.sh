@@ -26,7 +26,13 @@ image_tag=${LAYRS_ENCLAVE_IMAGE_TAG:-layrsv2-clob-enclave:local}
 output_eif=${LAYRS_EIF_OUTPUT:-build/layrsv2-clob.eif}
 measurement_file=${LAYRS_MEASUREMENT_OUTPUT:-build/layrsv2-clob-measurements.json}
 nitro_cli_artifacts=${NITRO_CLI_ARTIFACTS:-/usr/share/nitro_enclaves/blobs}
+source_date_epoch=${SOURCE_DATE_EPOCH:-1787611129}
 mkdir -p "$(dirname "${output_eif}")" "$(dirname "${measurement_file}")"
+
+if [[ ${source_date_epoch} != 1787611129 ]]; then
+  echo "SOURCE_DATE_EPOCH must equal the frozen release epoch 1787611129" >&2
+  exit 1
+fi
 
 if [[ ! -d ${nitro_cli_artifacts} ]]; then
   echo "Nitro CLI artifacts directory does not exist: ${nitro_cli_artifacts}" >&2
@@ -40,6 +46,7 @@ docker build \
   --build-arg "LAYRS_OPERATOR_PUBLIC_KEY_HEX=${LAYRS_OPERATOR_PUBLIC_KEY_HEX}" \
   --build-arg "LAYRS_RECOVERY_ENVIRONMENT=${LAYRS_RECOVERY_ENVIRONMENT}" \
   --build-arg "LAYRS_ENCLAVE_TRANSITION_POLICY_SHA256=${LAYRS_ENCLAVE_TRANSITION_POLICY_SHA256:-}" \
+  --build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}" \
   --tag "${image_tag}" \
   .
 
