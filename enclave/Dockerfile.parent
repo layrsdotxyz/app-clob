@@ -1,13 +1,35 @@
+ARG SOURCE_DATE_EPOCH=1787611129
+
 FROM rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55 AS builder
 WORKDIR /build
+ARG SOURCE_DATE_EPOCH
 COPY enclave/parent-runtime/Cargo.toml enclave/parent-runtime/Cargo.lock ./enclave/parent-runtime/
 COPY enclave/parent-runtime/src ./enclave/parent-runtime/src
 COPY proofs/settlement/core ./proofs/settlement/core
 COPY src ./src
-RUN cargo build --locked --release --manifest-path enclave/parent-runtime/Cargo.toml --bin layrs-enclave-parent
+RUN test "${SOURCE_DATE_EPOCH}" = "1787611129" \
+    && cargo build --locked --release --manifest-path enclave/parent-runtime/Cargo.toml --bin layrs-enclave-parent \
+    && touch --date="@${SOURCE_DATE_EPOCH}" --no-dereference \
+        /build/enclave/parent-runtime/target/release/layrs-enclave-parent
 
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e
-COPY --from=builder --chown=nonroot:nonroot /build/enclave/parent-runtime/target/release/layrs-enclave-parent /usr/local/bin/layrs-enclave-parent
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e AS runtime-base
+
+FROM builder AS normalizer
+ARG SOURCE_DATE_EPOCH
+COPY --from=runtime-base / /normalized-rootfs
+RUN test "${SOURCE_DATE_EPOCH}" = "1787611129" \
+    && install -D --owner=65532 --group=65532 --mode=0755 \
+        /build/enclave/parent-runtime/target/release/layrs-enclave-parent \
+        /normalized-rootfs/usr/local/bin/layrs-enclave-parent \
+    && find /normalized-rootfs -xdev -newermt "@${SOURCE_DATE_EPOCH}" \
+        -writable -print0 \
+        | xargs -0 -r touch --date="@${SOURCE_DATE_EPOCH}" --no-dereference
+
+FROM scratch
+COPY --from=normalizer /normalized-rootfs /
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+WORKDIR /home/nonroot
 USER nonroot:nonroot
 EXPOSE 8443
 ENV PORT=8443 LAYRS_ENCLAVE_CID=16 LAYRS_PARENT_MAX_CONCURRENCY=8 LAYRS_PARENT_MAX_WAITERS=32 LAYRS_PARENT_QUEUE_WAIT_MILLIS=3000
