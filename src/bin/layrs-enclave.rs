@@ -2698,12 +2698,15 @@ fn parse_nsm_attestation_timestamp(
     use serde_cbor::Value;
 
     let value: Value = serde_cbor::from_slice(document).map_err(|_| ())?;
-    let sign1 = match value {
-        Value::Tag(18, inner) => *inner,
+    // NSM emits the standard untagged COSE_Sign1 array. Accept the optional
+    // tag-18 wrapper as well, while rejecting every other tagged/value shape.
+    let fields = match value {
+        Value::Array(fields) => fields,
+        Value::Tag(18, inner) => match *inner {
+            Value::Array(fields) => fields,
+            _ => return Err(()),
+        },
         _ => return Err(()),
-    };
-    let Value::Array(fields) = sign1 else {
-        return Err(());
     };
     if fields.len() != 4 {
         return Err(());
@@ -6021,6 +6024,19 @@ mod tests {
         assert_eq!(
             parse_nsm_attestation_timestamp(
                 &document,
+                &nonce,
+                TRUSTED_TIME_ATTESTATION_DOMAIN,
+                &pcr0,
+            ),
+            Ok(1_787_000_000_123),
+        );
+        let Value::Tag(18, inner) = serde_cbor::from_slice::<Value>(&document).unwrap() else {
+            panic!("synthetic document must be tagged");
+        };
+        let untagged = serde_cbor::to_vec(&*inner).unwrap();
+        assert_eq!(
+            parse_nsm_attestation_timestamp(
+                &untagged,
                 &nonce,
                 TRUSTED_TIME_ATTESTATION_DOMAIN,
                 &pcr0,
