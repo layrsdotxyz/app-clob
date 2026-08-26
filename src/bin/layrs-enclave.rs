@@ -2393,10 +2393,36 @@ fn validate_incident_recovery_policy_fields(
     Ok(())
 }
 
-fn ensure_generic_provisioning_disabled() -> Result<(), String> {
-    incident_recovery_policy_sha256()?;
-    exact_incident_recovery_policy()?;
-    Err("INCIDENT_RECOVERY_REQUIRES_DEDICATED_COMMAND".into())
+fn generic_provisioning_policy(deployment_mode: Option<&str>) -> Result<(), String> {
+    match deployment_mode {
+        Some("FRESH_EPOCH") => Ok(()),
+        None | Some("INCIDENT_RECOVERY") => {
+            incident_recovery_policy_sha256()?;
+            exact_incident_recovery_policy()?;
+            Err("INCIDENT_RECOVERY_REQUIRES_DEDICATED_COMMAND".into())
+        }
+        Some(_) => Err("ENCLAVE_DEPLOYMENT_MODE_INVALID".into()),
+    }
+}
+
+fn ensure_generic_provisioning_allowed() -> Result<(), String> {
+    generic_provisioning_policy(option_env!("LAYRS_ENCLAVE_DEPLOYMENT_MODE"))
+}
+
+fn incident_recovery_policy(deployment_mode: Option<&str>) -> Result<(), String> {
+    match deployment_mode {
+        Some("FRESH_EPOCH") => Err("INCIDENT_RECOVERY_DISABLED_IN_FRESH_EPOCH".into()),
+        None | Some("INCIDENT_RECOVERY") => {
+            incident_recovery_policy_sha256()?;
+            exact_incident_recovery_policy()?;
+            Ok(())
+        }
+        Some(_) => Err("ENCLAVE_DEPLOYMENT_MODE_INVALID".into()),
+    }
+}
+
+fn ensure_incident_recovery_allowed() -> Result<(), String> {
+    incident_recovery_policy(option_env!("LAYRS_ENCLAVE_DEPLOYMENT_MODE"))
 }
 
 fn validate_incident_terminal_input(
@@ -3175,7 +3201,7 @@ async fn dispatch_operator(
             snapshot,
             minimum_anchored_sequence,
         } => {
-            ensure_generic_provisioning_disabled()?;
+            ensure_generic_provisioning_allowed()?;
             if state.core.is_some() {
                 return Err("ALREADY_PROVISIONED".into());
             }
@@ -3284,6 +3310,10 @@ async fn dispatch_operator(
             certifier_release_manifest_sha256,
             expected_certifier_pcr0_sha384,
         } => {
+            if let Err(error) = ensure_incident_recovery_allowed() {
+                snapshot_body.zeroize();
+                return Err(error);
+            }
             if state.core.is_some()
                 || state.pending_provision.is_some()
                 || state.pending_incident_terminal_restore.is_some()
@@ -5544,9 +5574,54 @@ mod tests {
     #[test]
     fn generic_provisioning_is_disabled_in_incident_build() {
         assert_eq!(
-            ensure_generic_provisioning_disabled().unwrap_err(),
+            generic_provisioning_policy(None).unwrap_err(),
             "INCIDENT_RECOVERY_REQUIRES_DEDICATED_COMMAND"
         );
+        assert_eq!(
+            generic_provisioning_policy(Some("INCIDENT_RECOVERY")).unwrap_err(),
+            "INCIDENT_RECOVERY_REQUIRES_DEDICATED_COMMAND"
+        );
+    }
+
+    #[test]
+    fn fresh_epoch_build_allows_clean_generic_provisioning_only() {
+        assert!(generic_provisioning_policy(Some("FRESH_EPOCH")).is_ok());
+        assert_eq!(
+            incident_recovery_policy(Some("FRESH_EPOCH")).unwrap_err(),
+            "INCIDENT_RECOVERY_DISABLED_IN_FRESH_EPOCH"
+        );
+        assert_eq!(
+            generic_provisioning_policy(Some("fresh_epoch")).unwrap_err(),
+            "ENCLAVE_DEPLOYMENT_MODE_INVALID"
+        );
+    }
+
+    #[test]
+    fn compiled_deployment_mode_enforces_the_selected_provisioning_boundary() {
+        match option_env!("LAYRS_ENCLAVE_DEPLOYMENT_MODE") {
+            Some("FRESH_EPOCH") => assert!(ensure_generic_provisioning_allowed().is_ok()),
+            None | Some("INCIDENT_RECOVERY") => assert_eq!(
+                ensure_generic_provisioning_allowed().unwrap_err(),
+                "INCIDENT_RECOVERY_REQUIRES_DEDICATED_COMMAND"
+            ),
+            Some(_) => assert_eq!(
+                ensure_generic_provisioning_allowed().unwrap_err(),
+                "ENCLAVE_DEPLOYMENT_MODE_INVALID"
+            ),
+        }
+        match option_env!("LAYRS_ENCLAVE_DEPLOYMENT_MODE") {
+            Some("FRESH_EPOCH") => assert_eq!(
+                ensure_incident_recovery_allowed().unwrap_err(),
+                "INCIDENT_RECOVERY_DISABLED_IN_FRESH_EPOCH"
+            ),
+            None | Some("INCIDENT_RECOVERY") => {
+                assert!(ensure_incident_recovery_allowed().is_ok())
+            }
+            Some(_) => assert_eq!(
+                ensure_incident_recovery_allowed().unwrap_err(),
+                "ENCLAVE_DEPLOYMENT_MODE_INVALID"
+            ),
+        }
     }
 
     #[test]

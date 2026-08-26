@@ -22,6 +22,11 @@ if [[ -n ${LAYRS_ENCLAVE_TRANSITION_POLICY_SHA256:-}
   exit 1
 fi
 
+case "${LAYRS_ENCLAVE_DEPLOYMENT_MODE:-INCIDENT_RECOVERY}" in
+  INCIDENT_RECOVERY|FRESH_EPOCH) ;;
+  *) echo "LAYRS_ENCLAVE_DEPLOYMENT_MODE must be INCIDENT_RECOVERY or FRESH_EPOCH" >&2; exit 1 ;;
+esac
+
 image_tag=${LAYRS_ENCLAVE_IMAGE_TAG:-layrsv2-clob-enclave:local}
 output_eif=${LAYRS_EIF_OUTPUT:-build/layrsv2-clob.eif}
 measurement_file=${LAYRS_MEASUREMENT_OUTPUT:-build/layrsv2-clob-measurements.json}
@@ -46,6 +51,7 @@ docker build \
   --build-arg "LAYRS_OPERATOR_PUBLIC_KEY_HEX=${LAYRS_OPERATOR_PUBLIC_KEY_HEX}" \
   --build-arg "LAYRS_RECOVERY_ENVIRONMENT=${LAYRS_RECOVERY_ENVIRONMENT}" \
   --build-arg "LAYRS_ENCLAVE_TRANSITION_POLICY_SHA256=${LAYRS_ENCLAVE_TRANSITION_POLICY_SHA256:-}" \
+  --build-arg "LAYRS_ENCLAVE_DEPLOYMENT_MODE=${LAYRS_ENCLAVE_DEPLOYMENT_MODE:-INCIDENT_RECOVERY}" \
   --build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}" \
   --tag "${image_tag}" \
   .
