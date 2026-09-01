@@ -1717,7 +1717,11 @@ async fn handle_encrypted(
                     .collect(),
                 _ => Vec::new(),
             };
-            if requires_recovery_artifact && recovery_artifacts.is_empty() {
+            if recovery_artifact_failure_required(
+                requires_recovery_artifact,
+                !recovery_artifacts.is_empty(),
+                matches!(response, PlainResponse::User { .. }),
+            ) {
                 if let Some(core) = rollback_core.take() {
                     state.core = Some(core);
                     state.transport_nonces.forget(&replay_key);
@@ -1966,6 +1970,21 @@ fn rollback_wire_error(
         state.operator_nonces.forget(&nonce);
     }
     WireResponse::Error { code }
+}
+
+fn recovery_artifact_failure_required(
+    submit_order_requires_recovery_artifact: bool,
+    has_recovery_artifact: bool,
+    response_is_journaled_user_command: bool,
+) -> bool {
+    // SubmitOrder response recovery bridges are mandatory only after the core
+    // has produced a journaled user response. Pre-journal validation failures
+    // are emitted as signed durable rejections below; masking them here as an
+    // unsigned RECOVERY_ARTIFACT_FAILED leaves the coordinator unable to
+    // terminalize the command safely.
+    submit_order_requires_recovery_artifact
+        && response_is_journaled_user_command
+        && !has_recovery_artifact
 }
 
 fn request_envelope_hash(
@@ -6198,6 +6217,14 @@ mod tests {
             assert_eq!(parsed["type"], "ERROR");
             assert_eq!(parsed["code"], expected);
         }
+    }
+
+    #[test]
+    fn submit_order_recovery_artifact_gate_does_not_mask_signed_rejections() {
+        assert!(!recovery_artifact_failure_required(true, false, false));
+        assert!(!recovery_artifact_failure_required(true, true, true));
+        assert!(!recovery_artifact_failure_required(false, false, true));
+        assert!(recovery_artifact_failure_required(true, false, true));
     }
 
     #[test]
