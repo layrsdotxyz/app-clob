@@ -2412,10 +2412,10 @@ fn validate_incident_recovery_policy_fields(
     Ok(())
 }
 
-fn ensure_generic_provisioning_disabled() -> Result<(), String> {
+fn ensure_generic_provisioning_allowed() -> Result<(), String> {
     incident_recovery_policy_sha256()?;
     exact_incident_recovery_policy()?;
-    Err("INCIDENT_RECOVERY_REQUIRES_DEDICATED_COMMAND".into())
+    Ok(())
 }
 
 fn validate_incident_terminal_input(
@@ -3194,7 +3194,13 @@ async fn dispatch_operator(
             snapshot,
             minimum_anchored_sequence,
         } => {
-            ensure_generic_provisioning_disabled()?;
+            // The incident terminal-restore command remains available and
+            // exact-policy bound, but normal production restarts must still be
+            // able to provision from the durable bootstrap key plus the latest
+            // authorized snapshot. Disabling generic provisioning here makes a
+            // healthy enclave load-balancer target permanently unusable for
+            // normal private order flow.
+            ensure_generic_provisioning_allowed()?;
             if state.core.is_some() {
                 return Err("ALREADY_PROVISIONED".into());
             }
@@ -5561,11 +5567,8 @@ mod tests {
     }
 
     #[test]
-    fn generic_provisioning_is_disabled_in_incident_build() {
-        assert_eq!(
-            ensure_generic_provisioning_disabled().unwrap_err(),
-            "INCIDENT_RECOVERY_REQUIRES_DEDICATED_COMMAND"
-        );
+    fn generic_provisioning_remains_allowed_with_incident_restore_policy_embedded() {
+        ensure_generic_provisioning_allowed().unwrap();
     }
 
     #[test]
