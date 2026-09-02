@@ -76,7 +76,8 @@ enum WireRequest {
         #[serde(with = "serde_bytes")]
         ciphertext: Vec<u8>,
         request_context: EncryptedRequestContext,
-        writer_authorization: DurableWriterAuthorization,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        writer_authorization: Option<DurableWriterAuthorization>,
     },
     EncryptedOperator {
         client_public_key: [u8; 32],
@@ -206,7 +207,8 @@ struct PrivateEnvelope {
     nonce: String,
     ciphertext: String,
     request_context: EncryptedRequestContext,
-    writer_authorization: DurableWriterAuthorization,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    writer_authorization: Option<DurableWriterAuthorization>,
 }
 
 #[derive(Deserialize)]
@@ -800,7 +802,7 @@ mod tests {
                 expected_transfer_id: None,
                 expected_command_commitment: Some(format!("0x{}", "77".repeat(32))),
             },
-            writer_authorization: DurableWriterAuthorization {
+            writer_authorization: Some(DurableWriterAuthorization {
                 protocol_version: "layrs.durable-writer-authorization.v1".into(),
                 environment: "test".into(),
                 epoch: 1,
@@ -813,7 +815,7 @@ mod tests {
                 request_context_sha256: [8; 32],
                 request_envelope_sha256: [9; 32],
                 signature: vec![10; 64],
-            },
+            }),
         };
         let encoded = serde_cbor::to_vec(&request).expect("wire request encodes");
         assert!(encoded.len() < 21 * 1024 * 1024);

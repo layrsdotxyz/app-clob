@@ -198,7 +198,8 @@ enum WireRequest {
         #[serde(with = "serde_bytes")]
         ciphertext: Vec<u8>,
         request_context: EncryptedRequestContext,
-        writer_authorization: DurableWriterAuthorization,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        writer_authorization: Option<DurableWriterAuthorization>,
     },
     EncryptedOperator {
         client_public_key: [u8; 32],
@@ -1196,7 +1197,7 @@ async fn serve_connection(
                 nonce,
                 ciphertext,
                 EncryptedOuterContext::User(request_context),
-                Some(writer_authorization),
+                writer_authorization,
             )
             .await
         }
@@ -1364,7 +1365,10 @@ async fn handle_encrypted(
             code: "PRIVATE_COMMAND_CONTEXT_MISMATCH",
         };
     }
-    let writer_trusted_now_millis = if request_requires_writer_authorization(&request) {
+    let direct_execution = direct_execution_request(&state, &request);
+    let writer_trusted_now_millis = if request_requires_writer_authorization(&request)
+        && !direct_execution
+    {
         let Some(authorization) = writer_authorization.as_ref() else {
             return WireResponse::Error {
                 code: "DURABLE_WRITER_AUTHORIZATION_REQUIRED",
@@ -1391,6 +1395,15 @@ async fn handle_encrypted(
             return WireResponse::Error { code };
         }
         Some(now)
+    } else if direct_execution {
+        match trusted_nsm_now_millis(state.nsm_fd, &state.enclave_measurement_sha384) {
+            Ok(value) => Some(value),
+            Err(()) => {
+                return WireResponse::Error {
+                    code: "TRUSTED_TIME_UNAVAILABLE",
+                }
+            }
+        }
     } else {
         None
     };
@@ -1735,7 +1748,7 @@ async fn handle_encrypted(
             }
             let mut preparation_artifacts = Vec::new();
             let mut rejection_artifacts = Vec::new();
-            if !journal_artifacts.is_empty() {
+            if !journal_artifacts.is_empty() && !direct_execution {
                 let Some(snapshot) = snapshot_artifacts.first() else {
                     return rollback_wire_error(
                         &mut state,
@@ -1856,7 +1869,7 @@ async fn handle_encrypted(
                     writer_lease_id: writer.lease_id,
                 });
             }
-            if journal_artifacts.is_empty() {
+            if journal_artifacts.is_empty() && !direct_execution {
                 if let PlainResponse::Error { code, receipt, .. } = &response {
                     if actor_domain == "USER" || actor_domain == "OPERATOR" {
                         let Some(signer) = state.receipt_signer.as_ref() else {
@@ -2105,6 +2118,72 @@ fn durable_control_request(request: &PlainRequest) -> bool {
         ),
         PlainRequest::AggregateDepth { .. } => false,
     }
+}
+
+/// Quest-only migration seam. This is embedded into the EIF at build time and
+/// is disabled unless the release build explicitly opts in. The decrypted
+/// command and the enclave's registered market definition are both checked so
+/// the untrusted parent cannot route a non-BTC mutation through this path.
+fn direct_execution_request(state: &EnclaveState, request: &PlainRequest) -> bool {
+    if !matches!(option_env!("LAYRS_DIRECT_BTC_EXECUTION_ENABLED"), Some("1")) {
+        return false;
+    }
+    match request {
+        PlainRequest::User { command, .. } => state
+            .core
+            .as_ref()
+            .is_some_and(|core| direct_btc_order_action(core, &command.action)),
+        // Direct SubmitOrder responses reserve a bounded recovery capsule. The
+        // existing signed archive proof remains mandatory, but its exact ACK
+        // must not depend on Durable Command or the window would eventually
+        // stop accepting otherwise healthy direct orders.
+        PlainRequest::Operator { envelope } => matches!(
+            envelope.command,
+            OperatorCommand::AcknowledgeRecoveryArchive { .. }
+        ),
+        PlainRequest::AggregateDepth { .. } => false,
+    }
+}
+
+fn direct_btc_order_action(core: &PrivateTradingCore, action: &UserCommandAction) -> bool {
+    let market = |market_id: &str| registered_btc_usdc_market(core, market_id);
+    match action {
+        UserCommandAction::SubmitOrder { order } => market(&order.market_id),
+        UserCommandAction::ReplaceOrder {
+            market_id,
+            replacement,
+            ..
+        } => market_id == &replacement.market_id && market(market_id),
+        UserCommandAction::CancelOrder { market_id, .. } => market(market_id),
+        UserCommandAction::CancelAllOrders {
+            filter: clob_service::private_core::CancelAllOrdersFilter::Market { market_id },
+        } => market(market_id),
+        _ => false,
+    }
+}
+
+fn registered_btc_usdc_market(core: &PrivateTradingCore, market_id: &str) -> bool {
+    let mut segments = market_id.split(':');
+    let structurally_btc = matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next()
+        ),
+        (
+            Some("layrs"),
+            Some("v5"),
+            Some("BTC"),
+            Some("USDC"),
+            Some(_)
+        )
+    );
+    structurally_btc
+        && core.market_config(market_id).is_some_and(|market| {
+            market.market_id == market_id && market.settlement_asset == "USDC"
+        })
 }
 
 fn request_requires_writer_authorization(request: &PlainRequest) -> bool {
@@ -6905,6 +6984,88 @@ mod tests {
         ] {
             assert!(!readonly_user_action(&action));
         }
+    }
+
+    #[test]
+    fn direct_order_gate_accepts_only_registered_v5_btc_usdc_market_mutations() {
+        use clob_service::private_core::{
+            BookOrder, JournalKey, OrderAction, Outcome, TimeInForce,
+        };
+
+        let mut core = PrivateTradingCore::new(
+            JournalKey::from_bytes([91u8; 32]),
+            ReceiptSigner::generate([92u8; 48]),
+        );
+        let btc_market = "layrs:v5:BTC:USDC:15m:quest-gate";
+        core.register_market(
+            "sys:direct-btc-market".into(),
+            MarketConfig {
+                market_id: btc_market.into(),
+                settlement_asset: "USDC".into(),
+                settlement_decimals: 6,
+                public_settlement_chain: Some("horizen".into()),
+                opens_at_millis: 1,
+                closes_at_millis: 10_000,
+                minimum_quantity_micros: 1,
+                maximum_quantity_micros: 10_000_000,
+                minimum_order_notional_micros: 1,
+                maximum_order_notional_micros: 10_000_000,
+                maximum_user_position_micros: 10_000_000,
+                maximum_pending_bootstrap_notional_micros: 10_000_000,
+                tick_size_micros: 1_000,
+                oracle_feed_id: 9002,
+                fee_profile_id: FeeProfileId::LegacyProfitV1,
+                execution: MarketExecution::NativeExactCondition {
+                    condition_id: format!("0x{}", "51".repeat(32)),
+                    up_outcome_index: 0,
+                    down_outcome_index: 1,
+                },
+            },
+            0,
+        )
+        .expect("register BTC market");
+        let order = BookOrder::new(
+            "private-user",
+            btc_market,
+            Outcome::Up,
+            OrderAction::Buy,
+            500_000,
+            1_000_000,
+            TimeInForce::Gtc,
+            None,
+        );
+        assert!(direct_btc_order_action(
+            &core,
+            &UserCommandAction::SubmitOrder {
+                order: order.clone()
+            }
+        ));
+        assert!(direct_btc_order_action(
+            &core,
+            &UserCommandAction::CancelOrder {
+                market_id: btc_market.into(),
+                order_id: order.order_id,
+            }
+        ));
+        assert!(!direct_btc_order_action(
+            &core,
+            &UserCommandAction::SubmitOrder {
+                order: BookOrder {
+                    market_id: "layrs:v5:ETH:USDC:15m:quest-gate".into(),
+                    ..order.clone()
+                }
+            }
+        ));
+        assert!(!direct_btc_order_action(
+            &core,
+            &UserCommandAction::RequestWithdrawal {
+                withdrawal_id: Uuid::nil(),
+                chain: "base".into(),
+                asset: "USDC".into(),
+                amount_atomic: 1,
+                destination: "0x0000000000000000000000000000000000000001".into(),
+            }
+        ));
     }
 
     #[test]
