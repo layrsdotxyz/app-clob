@@ -34,12 +34,12 @@ use clob_service::private_core::{
     BootstrapPreparedVenueOrder, CommandReceiptState, CommandResult, CoreResponse,
     CustodyReconciliationSnapshot, EnclaveReceipt, EncryptedJournalRecord, EncryptedSnapshot,
     ExactConditionResolutionStatement, ExactTerminalSnapshotRestoreReport, ExternalFlowDirection,
-    JournalKey, MarketConfig, MarketExecution, OrderStatus, PolymarketResolutionStatement,
-    PrivateTradingCore, ReceiptSigner, RecoveryBridgeArtifact, ResolutionStatement,
-    SignedAuditFillArtifact, SignedBinanceResolution, SignedExactConditionResolution,
-    SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence,
-    SignedTaskQualificationArtifact, SystemResponse, UserCommand, UserCommandAction,
-    WithdrawalAuthorization, EXACT_LIVE_976_RELEASE_COMMIT,
+    FeeProfileId, JournalKey, MarketConfig, MarketExecution, OrderStatus,
+    PolymarketResolutionStatement, PrivateTradingCore, ReceiptSigner, RecoveryBridgeArtifact,
+    ResolutionStatement, SignedAuditFillArtifact, SignedBinanceResolution,
+    SignedExactConditionResolution, SignedPolymarketResolution, SignedResolution,
+    SignedResolutionEvidence, SignedTaskQualificationArtifact, SystemResponse, UserCommand,
+    UserCommandAction, WithdrawalAuthorization, EXACT_LIVE_976_RELEASE_COMMIT,
     INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX, INCIDENT_TERMINAL_JOURNAL_HEAD_HEX,
     INCIDENT_TERMINAL_SEQUENCE, INCIDENT_TERMINAL_STATE_ROOT_HEX,
 };
@@ -2150,13 +2150,119 @@ fn direct_execution_request(state: &EnclaveState, request: &PlainRequest) -> boo
 /// market-scoped order allowlist: these are the only operator commands allowed
 /// to bypass an unrelated occupied Durable preparation.
 fn direct_quest_operator_command(command: &OperatorCommand) -> bool {
-    matches!(
-        command,
+    match command {
         OperatorCommand::AcknowledgeRecoveryArchive { .. }
-            | OperatorCommand::RegisterSession { .. }
-            | OperatorCommand::RegisterTransferAccount { .. }
-            | OperatorCommand::TransferAccountStatus { .. }
-    )
+        | OperatorCommand::RegisterSession { .. }
+        | OperatorCommand::RegisterTransferAccount { .. }
+        | OperatorCommand::TransferAccountStatus { .. } => true,
+        // Crypto rollover must not inherit a protocol-wide Durable preparation.
+        // Keep this escape hatch narrower than the general operator surface:
+        // only the immutable recurring-crypto namespaces and their exact
+        // registration shapes may execute directly.
+        OperatorCommand::MarketStatus { market_id } => recurring_crypto_window(market_id).is_some(),
+        OperatorCommand::RegisterMarket {
+            idempotency_key,
+            market,
+            now_millis,
+        } => direct_crypto_market_registration(idempotency_key, market, *now_millis),
+        _ => false,
+    }
+}
+
+fn direct_crypto_market_registration(
+    idempotency_key: &str,
+    market: &MarketConfig,
+    now_millis: i64,
+) -> bool {
+    let Some((asset, timeframe, window_start_millis)) = recurring_crypto_window(&market.market_id)
+    else {
+        return false;
+    };
+    let content_hash = idempotency_key.strip_prefix("market:");
+    content_hash.is_some_and(|value| {
+        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) && market.opens_at_millis == window_start_millis
+        && valid_recurring_window_duration(
+            timeframe,
+            market.closes_at_millis.checked_sub(market.opens_at_millis),
+        )
+        && now_millis == market.opens_at_millis
+        && valid_recurring_asset_config(asset, market)
+        && market.public_settlement_chain.as_deref() == Some("horizen")
+        && market.fee_profile_id == FeeProfileId::LayrsCryptoV2
+        && matches!(market.execution, MarketExecution::NativeClob)
+}
+
+fn recurring_crypto_window(market_id: &str) -> Option<(&str, &str, i64)> {
+    let segments = market_id.split(':').collect::<Vec<_>>();
+    let (asset, timeframe, epoch) = match segments.as_slice() {
+        ["layrs", "v4", "ZEN", timeframe, epoch] => ("ZEN", *timeframe, *epoch),
+        ["layrs", "v5", asset @ ("BTC" | "ETH" | "SOL" | "ZEC" | "HYPE"), "USDC", timeframe, epoch] => {
+            (*asset, *timeframe, *epoch)
+        }
+        _ => return None,
+    };
+    let timeframe_matches = match asset {
+        "ZEN" => matches!(timeframe, "15m" | "1h" | "4h" | "1d" | "1w" | "1mo"),
+        _ => matches!(timeframe, "5m" | "15m" | "1h" | "1d" | "1w" | "1mo"),
+    };
+    if !timeframe_matches {
+        return None;
+    }
+    let epoch_seconds = epoch.parse::<i64>().ok()?;
+    if epoch_seconds < 0 {
+        return None;
+    }
+    Some((asset, timeframe, epoch_seconds.checked_mul(1_000)?))
+}
+
+fn valid_recurring_window_duration(timeframe: &str, duration_millis: Option<i64>) -> bool {
+    match (timeframe, duration_millis) {
+        ("5m", Some(300_000))
+        | ("15m", Some(900_000))
+        | ("1h", Some(3_600_000))
+        | ("4h", Some(14_400_000))
+        | ("1d", Some(86_400_000))
+        | ("1w", Some(604_800_000)) => true,
+        ("1mo", Some(duration)) => (2_419_200_000..=2_678_400_000).contains(&duration),
+        _ => false,
+    }
+}
+
+fn valid_recurring_asset_config(asset: &str, market: &MarketConfig) -> bool {
+    let expected_feed = match asset {
+        "ZEN" => 9_001,
+        "BTC" => 9_002,
+        "ETH" => 9_003,
+        "SOL" => 9_004,
+        "ZEC" => 9_005,
+        "HYPE" => 9_006,
+        _ => return false,
+    };
+    if market.oracle_feed_id != expected_feed {
+        return false;
+    }
+    if asset == "ZEN" {
+        market.settlement_asset == "ZEN"
+            && market.settlement_decimals == 18
+            && market.minimum_quantity_micros == 250_000
+            && market.maximum_quantity_micros == 100_000_000
+            && market.minimum_order_notional_micros == 250_000
+            && market.maximum_order_notional_micros == 100_000_000
+            && market.maximum_user_position_micros == 250_000_000
+            && market.maximum_pending_bootstrap_notional_micros == 100_000_000
+            && market.tick_size_micros == 1_000
+    } else {
+        market.settlement_asset == "USDC"
+            && market.settlement_decimals == 6
+            && market.minimum_quantity_micros == 1_000
+            && market.maximum_quantity_micros == 1_000_000_000
+            && market.minimum_order_notional_micros == 1_000_000
+            && market.maximum_order_notional_micros == 1_000_000_000
+            && market.maximum_user_position_micros == 2_500_000_000
+            && market.maximum_pending_bootstrap_notional_micros == 1_000_000_000
+            && market.tick_size_micros == 1_000
+    }
 }
 
 fn direct_btc_order_action(core: &PrivateTradingCore, action: &UserCommandAction) -> bool {
@@ -7083,7 +7189,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_quest_operator_gate_allows_only_session_setup_and_archive_ack() {
+    fn direct_quest_operator_gate_allows_only_session_setup_archive_ack_and_crypto_rollover() {
         let identity_commitment = [7u8; 32];
         assert!(direct_quest_operator_command(
             &OperatorCommand::RegisterSession {
@@ -7105,6 +7211,81 @@ mod tests {
         assert!(direct_quest_operator_command(
             &OperatorCommand::TransferAccountStatus {
                 identity_commitment
+            }
+        ));
+        let opens_at_millis = 1_788_390_000_000;
+        let btc_market = MarketConfig {
+            market_id: "layrs:v5:BTC:USDC:1h:1788390000".into(),
+            settlement_asset: "USDC".into(),
+            settlement_decimals: 6,
+            public_settlement_chain: Some("horizen".into()),
+            opens_at_millis,
+            closes_at_millis: opens_at_millis + 3_600_000,
+            minimum_quantity_micros: 1_000,
+            maximum_quantity_micros: 1_000_000_000,
+            minimum_order_notional_micros: 1_000_000,
+            maximum_order_notional_micros: 1_000_000_000,
+            maximum_user_position_micros: 2_500_000_000,
+            maximum_pending_bootstrap_notional_micros: 1_000_000_000,
+            tick_size_micros: 1_000,
+            oracle_feed_id: 9_002,
+            fee_profile_id: FeeProfileId::LayrsCryptoV2,
+            execution: MarketExecution::NativeClob,
+        };
+        assert!(direct_quest_operator_command(
+            &OperatorCommand::MarketStatus {
+                market_id: btc_market.market_id.clone(),
+            }
+        ));
+        assert!(direct_quest_operator_command(
+            &OperatorCommand::RegisterMarket {
+                idempotency_key: format!("market:{}", "ab".repeat(32)),
+                market: btc_market.clone(),
+                now_millis: opens_at_millis,
+            }
+        ));
+        let zen_market = MarketConfig {
+            market_id: "layrs:v4:ZEN:4h:1788390000".into(),
+            settlement_asset: "ZEN".into(),
+            settlement_decimals: 18,
+            public_settlement_chain: Some("horizen".into()),
+            opens_at_millis,
+            closes_at_millis: opens_at_millis + 14_400_000,
+            minimum_quantity_micros: 250_000,
+            maximum_quantity_micros: 100_000_000,
+            minimum_order_notional_micros: 250_000,
+            maximum_order_notional_micros: 100_000_000,
+            maximum_user_position_micros: 250_000_000,
+            maximum_pending_bootstrap_notional_micros: 100_000_000,
+            tick_size_micros: 1_000,
+            oracle_feed_id: 9_001,
+            fee_profile_id: FeeProfileId::LayrsCryptoV2,
+            execution: MarketExecution::NativeClob,
+        };
+        assert!(direct_quest_operator_command(
+            &OperatorCommand::RegisterMarket {
+                idempotency_key: format!("market:{}", "cd".repeat(32)),
+                market: zen_market,
+                now_millis: opens_at_millis,
+            }
+        ));
+        let mut wrong_feed = btc_market.clone();
+        wrong_feed.oracle_feed_id = 9_003;
+        assert!(!direct_quest_operator_command(
+            &OperatorCommand::RegisterMarket {
+                idempotency_key: format!("market:{}", "ef".repeat(32)),
+                market: wrong_feed,
+                now_millis: opens_at_millis,
+            }
+        ));
+        let mut unsupported_window = btc_market;
+        unsupported_window.market_id = "layrs:v5:BTC:USDC:4h:1788390000".into();
+        unsupported_window.closes_at_millis = opens_at_millis + 14_400_000;
+        assert!(!direct_quest_operator_command(
+            &OperatorCommand::RegisterMarket {
+                idempotency_key: format!("market:{}", "12".repeat(32)),
+                market: unsupported_window,
+                now_millis: opens_at_millis,
             }
         ));
         assert!(!direct_quest_operator_command(
