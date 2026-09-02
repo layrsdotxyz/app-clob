@@ -22,6 +22,11 @@ if [[ -n ${LAYRS_ENCLAVE_TRANSITION_POLICY_SHA256:-}
   exit 1
 fi
 
+case "${LAYRS_DIRECT_BTC_EXECUTION_ENABLED:-0}" in
+  0|1) ;;
+  *) echo "LAYRS_DIRECT_BTC_EXECUTION_ENABLED must be 0 or 1" >&2; exit 1 ;;
+esac
+
 image_tag=${LAYRS_ENCLAVE_IMAGE_TAG:-layrsv2-clob-enclave:local}
 output_eif=${LAYRS_EIF_OUTPUT:-build/layrsv2-clob.eif}
 measurement_file=${LAYRS_MEASUREMENT_OUTPUT:-build/layrsv2-clob-measurements.json}
@@ -46,6 +51,7 @@ docker build \
   --build-arg "LAYRS_OPERATOR_PUBLIC_KEY_HEX=${LAYRS_OPERATOR_PUBLIC_KEY_HEX}" \
   --build-arg "LAYRS_RECOVERY_ENVIRONMENT=${LAYRS_RECOVERY_ENVIRONMENT}" \
   --build-arg "LAYRS_ENCLAVE_TRANSITION_POLICY_SHA256=${LAYRS_ENCLAVE_TRANSITION_POLICY_SHA256:-}" \
+  --build-arg "LAYRS_DIRECT_BTC_EXECUTION_ENABLED=${LAYRS_DIRECT_BTC_EXECUTION_ENABLED:-0}" \
   --build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}" \
   --tag "${image_tag}" \
   .
