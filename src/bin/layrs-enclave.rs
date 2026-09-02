@@ -1465,7 +1465,10 @@ async fn handle_encrypted(
             .response
             .wire_response();
     }
-    if state.pending_preparation.is_some() && !durable_control_request(&request) {
+    if state.pending_preparation.is_some()
+        && !durable_control_request(&request)
+        && !direct_execution
+    {
         return WireResponse::Error {
             code: "DURABLE_PREPARATION_IN_PROGRESS",
         };
