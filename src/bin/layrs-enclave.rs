@@ -2140,12 +2140,23 @@ fn direct_execution_request(state: &EnclaveState, request: &PlainRequest) -> boo
         // existing signed archive proof remains mandatory, but its exact ACK
         // must not depend on Durable Command or the window would eventually
         // stop accepting otherwise healthy direct orders.
-        PlainRequest::Operator { envelope } => matches!(
-            envelope.command,
-            OperatorCommand::AcknowledgeRecoveryArchive { .. }
-        ),
+        PlainRequest::Operator { envelope } => direct_quest_operator_command(&envelope.command),
         PlainRequest::AggregateDepth { .. } => false,
     }
+}
+
+/// The quest browser must establish its authenticated private session before
+/// it can construct a BTC order. Keep this allowlist separate from the
+/// market-scoped order allowlist: these are the only operator commands allowed
+/// to bypass an unrelated occupied Durable preparation.
+fn direct_quest_operator_command(command: &OperatorCommand) -> bool {
+    matches!(
+        command,
+        OperatorCommand::AcknowledgeRecoveryArchive { .. }
+            | OperatorCommand::RegisterSession { .. }
+            | OperatorCommand::RegisterTransferAccount { .. }
+            | OperatorCommand::TransferAccountStatus { .. }
+    )
 }
 
 fn direct_btc_order_action(core: &PrivateTradingCore, action: &UserCommandAction) -> bool {
@@ -7068,6 +7079,36 @@ mod tests {
                 amount_atomic: 1,
                 destination: "0x0000000000000000000000000000000000000001".into(),
             }
+        ));
+    }
+
+    #[test]
+    fn direct_quest_operator_gate_allows_only_session_setup_and_archive_ack() {
+        let identity_commitment = [7u8; 32];
+        assert!(direct_quest_operator_command(
+            &OperatorCommand::RegisterSession {
+                idempotency_key: "session:test".into(),
+                session_id: "session_test".into(),
+                identity_commitment,
+                public_key: [8u8; 32],
+                expires_at_millis: 10_000,
+                now_millis: 1,
+            }
+        ));
+        assert!(direct_quest_operator_command(
+            &OperatorCommand::RegisterTransferAccount {
+                idempotency_key: "transfer-account:session_test".into(),
+                identity_commitment,
+                now_millis: 1,
+            }
+        ));
+        assert!(direct_quest_operator_command(
+            &OperatorCommand::TransferAccountStatus {
+                identity_commitment
+            }
+        ));
+        assert!(!direct_quest_operator_command(
+            &OperatorCommand::ProvisionStatus
         ));
     }
 
