@@ -35,6 +35,7 @@ pub enum OrderStatus {
     PartiallyFilled,
     Filled,
     Cancelled,
+    Expired,
     Rejected,
 }
 
@@ -404,7 +405,10 @@ impl PriceTimeBook {
                 {
                     return Err(CoreError::SnapshotMigrationRequired);
                 }
-                OrderStatus::Open | OrderStatus::PartiallyFilled | OrderStatus::Cancelled
+                OrderStatus::Open
+                | OrderStatus::PartiallyFilled
+                | OrderStatus::Cancelled
+                | OrderStatus::Expired
                     if matches!(order.time_in_force, TimeInForce::Gtc | TimeInForce::Gtd) =>
                 {
                     order
@@ -412,7 +416,7 @@ impl PriceTimeBook {
                         .checked_sub(order.remaining_micros)
                         .ok_or(CoreError::JournalChainMismatch)?
                 }
-                OrderStatus::Rejected | OrderStatus::Cancelled => 0,
+                OrderStatus::Rejected | OrderStatus::Cancelled | OrderStatus::Expired => 0,
                 OrderStatus::Open | OrderStatus::PartiallyFilled => {
                     return Err(CoreError::SnapshotMigrationRequired);
                 }
@@ -598,6 +602,12 @@ impl PriceTimeBook {
         self.orders.get(&order_id)
     }
 
+    /// Enclave-local deterministic view for the offline restore certifier.
+    /// Callers must hash this view before it leaves the attested environment.
+    pub(crate) fn offline_orders(&self) -> &BTreeMap<Uuid, BookOrder> {
+        &self.orders
+    }
+
     pub fn orders_for_owner(&self, owner: &str) -> Vec<BookOrder> {
         self.orders
             .values()
@@ -625,6 +635,32 @@ impl PriceTimeBook {
         cancelled
     }
 
+    /// Deterministically expires every active order whose signed deadline has
+    /// elapsed. Time does not mutate enclave state by itself, so callers run
+    /// this at a journalled market write boundary and release the associated
+    /// grouped holds in the same atomic transition.
+    pub fn cancel_expired(&mut self, market_id: &str, now_millis: i64) -> Vec<BookOrder> {
+        let ids: Vec<Uuid> = self
+            .active
+            .iter()
+            .filter(|id| {
+                let order = &self.orders[*id];
+                order.market_id == market_id && is_expired(order, now_millis)
+            })
+            .copied()
+            .collect();
+        let mut cancelled = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(order) = self.orders.get_mut(&id) {
+                order.status = OrderStatus::Expired;
+                order.updated_at_millis = now_millis;
+                cancelled.push(order.clone());
+            }
+            self.active.remove(&id);
+        }
+        cancelled
+    }
+
     fn validate(&self, order: &BookOrder, now_millis: i64) -> CoreResult<()> {
         if order.price_micros == 0 || u128::from(order.price_micros) >= PRICE_SCALE {
             return Err(CoreError::InvalidOrder(
@@ -639,8 +675,14 @@ impl PriceTimeBook {
                 "identity and market are required".into(),
             ));
         }
-        if order.time_in_force == TimeInForce::Gtd && order.expires_at_millis.is_none() {
-            return Err(CoreError::InvalidOrder("GTD requires an expiry".into()));
+        match (order.time_in_force, order.expires_at_millis) {
+            (TimeInForce::Gtd, None) => {
+                return Err(CoreError::InvalidOrder("GTD requires an expiry".into()));
+            }
+            (TimeInForce::Gtc | TimeInForce::Fak | TimeInForce::Fok, Some(_)) => {
+                return Err(CoreError::InvalidOrder("only GTD accepts an expiry".into()));
+            }
+            _ => {}
         }
         if is_expired(order, now_millis) {
             return Err(CoreError::InvalidOrder("order is expired".into()));

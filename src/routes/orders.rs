@@ -5,7 +5,7 @@ use crate::{
     AppState,
 };
 use axum::{
-    extract::{Extension, Path, Query, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -15,178 +15,34 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-#[derive(Debug, Deserialize)]
-pub struct CreateOrderRequest {
-    pub user_id: String,
-    pub market_id: String,
-    pub side: OrderSide,
-    #[serde(default = "default_order_type")]
-    pub order_type: OrderType,
-    #[serde(default = "default_time_in_force")]
-    pub time_in_force: TimeInForce,
-    pub price: rust_decimal::Decimal,
-    pub size: rust_decimal::Decimal,
-    #[serde(default)]
-    pub note_witness: Option<serde_json::Value>,
+/// Deterministic tombstone for the retired plaintext order API. It accepts no
+/// identity, order economics, or state handle, so spoofed bodies/headers cannot
+/// reach matching, storage, or WebSocket publication. The authenticated API
+/// and UI use the encrypted enclave relay instead.
+pub async fn legacy_order_api_retired() -> impl IntoResponse {
+    (
+        StatusCode::GONE,
+        Json(serde_json::json!({
+            "error": { "code": "PRIVATE_ENCLAVE_REQUIRED" }
+        })),
+    )
 }
 
-fn default_order_type() -> OrderType {
-    OrderType::Limit
-}
-
-fn default_time_in_force() -> TimeInForce {
-    TimeInForce::Gtc
-}
-
+// Retained only for the now-unmounted commit/reveal implementation below so
+// historical fixtures continue to compile. No router exposes this response.
 #[derive(Debug, Serialize)]
-pub struct CreateOrderResponse {
-    pub order: Order,
-    pub fills: Vec<Fill>,
-    pub trades: Vec<Trade>,
+struct CreateOrderResponse {
+    order: Order,
+    fills: Vec<Fill>,
+    trades: Vec<Trade>,
 }
 
-/// Extract the numeric on-chain market ID from a PM market string.
-/// "BTC-757-YES" → 757, "ETH-788-NO" → 788, "BTC-790" → 790, "USDC" → None.
 fn parse_pm_market_id(market_id: &str) -> Option<ethers::types::U256> {
-    let parsed = market_id
+    market_id
         .split('-')
         .nth(1)
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(ethers::types::U256::from);
-    if parsed.is_none() {
-        tracing::warn!(
-            market_id = %market_id,
-            "failed to parse on-chain market id; PM settlement will be skipped for orders in this market"
-        );
-    }
-    parsed
-}
-
-pub async fn create_order(
-    State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
-    Json(req): Json<CreateOrderRequest>,
-) -> ClobResult<impl IntoResponse> {
-    // Phase 3a (optional) → Phase 3c (required): internal service key guard.
-    // Only the market-maker (and internal tooling) may use this endpoint.
-    let expected_key = std::env::var("INTERNAL_SERVICE_KEY").unwrap_or_default();
-    if !expected_key.is_empty() {
-        let provided = headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "));
-        match provided {
-            Some(key) if key == expected_key => {} // valid
-            Some(_) => {
-                return Err(ClobError::Unauthorized(
-                    "invalid internal service key".to_string(),
-                ));
-            }
-            None => {
-                return Err(ClobError::Unauthorized(
-                    "Authorization header required".to_string(),
-                ));
-            }
-        }
-    }
-
-    // Create order — normalize user_id to lowercase to match balance_service key
-    // (deposit_balance always stores at lowercase; mixed EIP-55 casing would miss the bucket)
-    let user_id = req.user_id.trim().to_lowercase();
-
-    // Resolve note_witness: use the one supplied in the request, or fall back to
-    // any pending witness stored by the balance-proof step (keyed by user+market).
-    let note_witness: Option<serde_json::Value> = if req.note_witness.is_some() {
-        req.note_witness
-    } else {
-        let pending_key = format!("pending_witness:{}:{}", user_id, req.market_id);
-        match state.redis_store.get_optional(&pending_key).await {
-            Ok(Some(raw)) => {
-                // consume the one-time witness so it cannot be replayed
-                let _ = state.redis_store.delete_key(&pending_key).await;
-                serde_json::from_str(&raw).ok()
-            }
-            _ => None,
-        }
-    };
-
-    let mut order = Order::new(
-        user_id,
-        req.market_id.clone(),
-        req.side,
-        req.order_type,
-        req.time_in_force,
-        req.price,
-        req.size,
-    );
-    order.note_witness = note_witness;
-    order.market_id_uint = parse_pm_market_id(&req.market_id);
-
-    // Submit to matching engine
-    let result = state.matching_engine.submit_order(order).await?;
-
-    // Broadcast order updates
-    state
-        .ws_manager
-        .send_order_update(&result.order.user_id, &result.order);
-
-    // Broadcast trades
-    for trade in &result.trades {
-        state.ws_manager.broadcast_trade(trade);
-    }
-
-    let response = CreateOrderResponse {
-        order: result.order,
-        fills: result.fills,
-        trades: result.trades,
-    };
-
-    Ok((StatusCode::CREATED, Json(response)))
-}
-
-pub async fn cancel_order(
-    State(state): State<Arc<AppState>>,
-    Path(order_id): Path<Uuid>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-) -> ClobResult<impl IntoResponse> {
-    let raw_user_id = params.get("user_id").ok_or_else(|| {
-        crate::error::ClobError::Unauthorized("user_id query parameter required".to_string())
-    })?;
-    let user_id = raw_user_id.trim().to_lowercase();
-
-    let order = state
-        .matching_engine
-        .cancel_order(order_id, &user_id)
-        .await?;
-
-    // Broadcast order update
-    state.ws_manager.send_order_update(&order.user_id, &order);
-
-    Ok(Json(order))
-}
-
-pub async fn get_order(
-    State(state): State<Arc<AppState>>,
-    Path(order_id): Path<Uuid>,
-) -> ClobResult<impl IntoResponse> {
-    let order_store = &state.orderbook_manager.store;
-    let order = order_store
-        .get_order(order_id)
-        .await?
-        .ok_or_else(|| crate::error::ClobError::OrderNotFound(order_id.to_string()))?;
-
-    Ok(Json(order))
-}
-
-pub async fn get_user_orders(
-    State(state): State<Arc<AppState>>,
-    Path(user_id): Path<String>,
-) -> ClobResult<impl IntoResponse> {
-    let orders = state
-        .orderbook_manager
-        .get_user_orders(&user_id.trim().to_lowercase())
-        .await?;
-    Ok(Json(orders))
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(ethers::types::U256::from)
 }
 
 /// DELETE /v1/admin/markets/:market_id/orderbook
@@ -198,6 +54,9 @@ pub async fn flush_market_orderbook(
     Path(market_id): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let expected = std::env::var("INTERNAL_SERVICE_KEY").unwrap_or_default();
+    if expected.is_empty() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     let token = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -215,6 +74,22 @@ pub async fn flush_market_orderbook(
     Ok(Json(
         serde_json::json!({ "market_id": market_id, "flushed": flushed }),
     ))
+}
+
+#[cfg(test)]
+mod legacy_route_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    #[tokio::test]
+    async fn plaintext_order_surface_is_a_state_free_generic_tombstone() {
+        let response = legacy_order_api_retired().await.into_response();
+        assert_eq!(response.status(), StatusCode::GONE);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+    }
 }
 
 // ─── Commit-Reveal order placement ──────────────────────────────────────────

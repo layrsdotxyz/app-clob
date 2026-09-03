@@ -1,10 +1,11 @@
 use clob_service::private_core::{
     command_request_hash, polymarket_resolution_signing_payload, resolution_signing_payload,
-    signing_payload, AccountBucket, AccountKey, BookOrder, BoundaryEvidence, CommandResult,
+    signing_payload, AccountBucket, AccountKey, BookOrder, BootstrapPreparedVenueOrder,
+    BoundaryEvidence, CancelAllOrdersFilter, CommandReceiptState, CommandResult,
     CompleteSetDirection, CoreError, EncryptedJournal, ExternalFlowDirection, FeeProfileId,
     JournalKey, Ledger, LedgerTransaction, MarketConfig, MarketExecution, OrderAction, OrderStatus,
-    Outcome, PolymarketResolutionStatement, PriceTimeBook, PrivateTradingCore, ReceiptSigner,
-    ResolutionOutcome, ResolutionStatement, SessionGuard, SessionRequest,
+    Outcome, PolymarketResolutionStatement, PostingSide, PriceTimeBook, PrivateTradingCore,
+    ReceiptSigner, ResolutionOutcome, ResolutionStatement, SessionGuard, SessionRequest,
     SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence, SignedSessionRequest,
     TimeInForce, Transfer, UserCommand, UserCommandAction,
 };
@@ -23,6 +24,48 @@ fn derived_private_user(journal_key: [u8; 32], commitment: [u8; 32]) -> String {
     user_hash.update(identity_key);
     user_hash.update(commitment);
     format!("usr_{}", hex::encode(user_hash.finalize()))
+}
+
+#[test]
+fn delegated_portfolio_snapshot_is_strictly_identity_scoped() {
+    let mut core = PrivateTradingCore::new(
+        JournalKey::from_bytes([211u8; 32]),
+        ReceiptSigner::generate([212u8; 48]),
+    );
+    let alice = [1u8; 32];
+    let bob = [2u8; 32];
+    core.apply_user_external_flow(
+        "delegated-read:alice".into(),
+        alice,
+        "USDC".into(),
+        AccountBucket::UserAvailable,
+        5_000_000,
+        ExternalFlowDirection::Inflow,
+        [3u8; 32],
+        1_000,
+    )
+    .unwrap();
+    core.apply_user_external_flow(
+        "delegated-read:bob".into(),
+        bob,
+        "USDC".into(),
+        AccountBucket::UserAvailable,
+        9_000_000,
+        ExternalFlowDirection::Inflow,
+        [4u8; 32],
+        1_001,
+    )
+    .unwrap();
+
+    let alice_view = core.portfolio_snapshot_for_identity(alice, 2_000);
+    let bob_view = core.portfolio_snapshot_for_identity(bob, 2_000);
+    assert_eq!(alice_view.balances.len(), 1);
+    assert_eq!(alice_view.balances[0].amount_atomic, "5000000");
+    assert_eq!(bob_view.balances.len(), 1);
+    assert_eq!(bob_view.balances[0].amount_atomic, "9000000");
+    assert_ne!(alice_view.balances, bob_view.balances);
+    assert!(alice_view.positions.is_empty() && alice_view.orders.is_empty());
+    assert!(bob_view.positions.is_empty() && bob_view.orders.is_empty());
 }
 
 #[test]
@@ -49,6 +92,13 @@ fn ledger_is_atomic_conservative_and_idempotent() {
     assert_eq!(ledger.balance(&hold), 400);
     assert_eq!(ledger.total_for_asset("ZEN"), total_before);
     assert_ne!(applied.prior_state_root, applied.state_root);
+    assert_eq!(applied.postings.len(), 2);
+    assert_eq!(applied.postings[0].account, user);
+    assert_eq!(applied.postings[0].side, PostingSide::Debit);
+    assert_eq!(applied.postings[0].amount, 400);
+    assert_eq!(applied.postings[1].account, hold);
+    assert_eq!(applied.postings[1].side, PostingSide::Credit);
+    assert_eq!(applied.postings[1].amount, 400);
 
     let duplicate = ledger.apply(LedgerTransaction {
         idempotency_key: "order:reserve:001".into(),
@@ -91,6 +141,206 @@ fn insufficient_transfer_does_not_partially_mutate_ledger() {
     assert_eq!(ledger.balance(&first), 0);
     assert_eq!(ledger.balance(&second), 0);
     assert_eq!(ledger.state_root(), root_before);
+}
+
+#[test]
+fn order_hold_postings_are_atomic_exact_and_race_safe() {
+    let user = AccountKey::new("usr_hold", AccountBucket::UserAvailable, "USDC");
+    let mut hold = AccountKey::new("usr_hold", AccountBucket::UserOrderHold, "USDC");
+    hold.market_id = Some("layrs:v5:BTC:USDC:15m:1".into());
+    hold.outcome = Some("UP".into());
+    let mut collateral = AccountKey::new("layrs", AccountBucket::MarketCollateral, "USDC");
+    collateral.market_id = hold.market_id.clone();
+
+    let mut ledger = Ledger::default();
+    ledger.seed_balance(user.clone(), 1_000).unwrap();
+    let reserve = ledger
+        .apply(LedgerTransaction {
+            idempotency_key: "order-hold:reserve:1".into(),
+            business_reference: "private-order:1".into(),
+            transfers: vec![Transfer {
+                from: user.clone(),
+                to: hold.clone(),
+                amount: 700,
+            }],
+        })
+        .unwrap();
+    assert_eq!(ledger.balance(&user), 300);
+    assert_eq!(ledger.balance(&hold), 700);
+    assert_balanced_postings(&reserve, 700);
+
+    let partial_fill = ledger
+        .apply(LedgerTransaction {
+            idempotency_key: "order-hold:partial-fill:1".into(),
+            business_reference: "private-fill:1".into(),
+            transfers: vec![Transfer {
+                from: hold.clone(),
+                to: collateral.clone(),
+                amount: 250,
+            }],
+        })
+        .unwrap();
+    assert_eq!(ledger.balance(&hold), 450);
+    assert_balanced_postings(&partial_fill, 250);
+
+    let release = ledger
+        .apply(LedgerTransaction {
+            idempotency_key: "order-hold:cancel:1".into(),
+            business_reference: "private-order:1".into(),
+            transfers: vec![Transfer {
+                from: hold.clone(),
+                to: user.clone(),
+                amount: 450,
+            }],
+        })
+        .unwrap();
+    assert_eq!(ledger.balance(&hold), 0);
+    assert_eq!(ledger.balance(&user), 750);
+    assert_eq!(ledger.balance(&collateral), 250);
+    assert_eq!(ledger.total_for_asset("USDC"), 1_000);
+    assert_balanced_postings(&release, 450);
+
+    // The command replay cannot reserve a second time, even after the order's
+    // remaining hold has been released.
+    let root = ledger.state_root();
+    assert_eq!(
+        ledger
+            .apply(LedgerTransaction {
+                idempotency_key: "order-hold:reserve:1".into(),
+                business_reference: "private-order:1".into(),
+                transfers: vec![Transfer {
+                    from: user.clone(),
+                    to: hold.clone(),
+                    amount: 700
+                }],
+            })
+            .unwrap_err(),
+        CoreError::DuplicateCommand
+    );
+    assert_eq!(ledger.state_root(), root);
+
+    // A one-atomic-unit remainder remains representable and releases exactly;
+    // no settlement-precision dust is rounded into or out of the hold bucket.
+    let dust_reserve = ledger
+        .apply(LedgerTransaction {
+            idempotency_key: "order-hold:dust-reserve".into(),
+            business_reference: "private-order:dust".into(),
+            transfers: vec![Transfer {
+                from: user.clone(),
+                to: hold.clone(),
+                amount: 1,
+            }],
+        })
+        .unwrap();
+    assert_balanced_postings(&dust_reserve, 1);
+    ledger
+        .apply(LedgerTransaction {
+            idempotency_key: "order-hold:dust-release".into(),
+            business_reference: "private-order:dust".into(),
+            transfers: vec![Transfer {
+                from: hold.clone(),
+                to: user.clone(),
+                amount: 1,
+            }],
+        })
+        .unwrap();
+    assert_eq!(ledger.balance(&hold), 0);
+
+    // Cancel and full-fill are mutually exclusive consumers of the same hold.
+    // Whichever serializable transition wins leaves the loser unable to debit
+    // the now-zero bucket, with no partial state mutation.
+    let mut race_base = Ledger::default();
+    race_base.seed_balance(user.clone(), 100).unwrap();
+    race_base
+        .apply(LedgerTransaction {
+            idempotency_key: "race:reserve".into(),
+            business_reference: "private-order:race".into(),
+            transfers: vec![Transfer {
+                from: user.clone(),
+                to: hold.clone(),
+                amount: 100,
+            }],
+        })
+        .unwrap();
+
+    let mut cancel_wins = race_base.clone();
+    cancel_wins
+        .apply(LedgerTransaction {
+            idempotency_key: "race:cancel".into(),
+            business_reference: "private-order:race".into(),
+            transfers: vec![Transfer {
+                from: hold.clone(),
+                to: user.clone(),
+                amount: 100,
+            }],
+        })
+        .unwrap();
+    let cancel_root = cancel_wins.state_root();
+    assert_eq!(
+        cancel_wins
+            .apply(LedgerTransaction {
+                idempotency_key: "race:fill".into(),
+                business_reference: "private-fill:race".into(),
+                transfers: vec![Transfer {
+                    from: hold.clone(),
+                    to: collateral.clone(),
+                    amount: 100
+                }],
+            })
+            .unwrap_err(),
+        CoreError::InsufficientBalance
+    );
+    assert_eq!(cancel_wins.state_root(), cancel_root);
+
+    let mut fill_wins = race_base;
+    fill_wins
+        .apply(LedgerTransaction {
+            idempotency_key: "race:fill".into(),
+            business_reference: "private-fill:race".into(),
+            transfers: vec![Transfer {
+                from: hold.clone(),
+                to: collateral,
+                amount: 100,
+            }],
+        })
+        .unwrap();
+    let fill_root = fill_wins.state_root();
+    assert_eq!(
+        fill_wins
+            .apply(LedgerTransaction {
+                idempotency_key: "race:cancel".into(),
+                business_reference: "private-order:race".into(),
+                transfers: vec![Transfer {
+                    from: hold,
+                    to: user,
+                    amount: 100
+                }],
+            })
+            .unwrap_err(),
+        CoreError::InsufficientBalance
+    );
+    assert_eq!(fill_wins.state_root(), fill_root);
+}
+
+fn assert_balanced_postings(
+    applied: &clob_service::private_core::AppliedLedgerTransaction,
+    amount: u128,
+) {
+    let debits: u128 = applied
+        .postings
+        .iter()
+        .filter(|posting| posting.side == PostingSide::Debit)
+        .map(|posting| posting.amount)
+        .sum();
+    let credits: u128 = applied
+        .postings
+        .iter()
+        .filter(|posting| posting.side == PostingSide::Credit)
+        .map(|posting| posting.amount)
+        .sum();
+    assert_eq!(debits, amount);
+    assert_eq!(credits, amount);
+    assert_eq!(applied.postings.len(), applied.transfers.len() * 2);
 }
 
 #[test]
@@ -225,6 +475,72 @@ fn duplicate_order_id_is_rejected_before_it_can_replace_resting_liquidity() {
     let (bids, asks) = book.aggregate_depth(market_id, Outcome::Up, now);
     assert_eq!(bids, vec![(500_000, 1_000_000, 1)]);
     assert!(asks.is_empty());
+}
+
+#[test]
+fn cancelled_then_replaced_order_receives_fresh_deterministic_priority() {
+    let mut book = PriceTimeBook::default();
+    let market_id = "layrs:v5:BTC:USDC:15m:replace-priority";
+    let old_id = uuid::Uuid::from_u128(1);
+    let peer_id = uuid::Uuid::from_u128(2);
+    let replacement_id = uuid::Uuid::from_u128(3);
+    for (order_id, owner, now) in [(old_id, "usr_a", 1_000), (peer_id, "usr_b", 1_100)] {
+        book.submit(
+            BookOrder::with_id(
+                order_id,
+                owner,
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                400_000,
+                1_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+            now,
+        )
+        .unwrap();
+    }
+    book.cancel(old_id, "usr_a", 1_200).unwrap();
+    book.submit(
+        BookOrder::with_id(
+            replacement_id,
+            "usr_a",
+            market_id,
+            Outcome::Up,
+            OrderAction::Buy,
+            400_000,
+            1_000_000,
+            TimeInForce::Gtc,
+            None,
+        ),
+        1_200,
+    )
+    .unwrap();
+
+    let fill = book
+        .submit(
+            BookOrder::with_id(
+                uuid::Uuid::from_u128(4),
+                "usr_c",
+                market_id,
+                Outcome::Up,
+                OrderAction::Sell,
+                400_000,
+                1_000_000,
+                TimeInForce::Fak,
+                None,
+            ),
+            1_300,
+        )
+        .unwrap();
+    assert_eq!(fill.fills.len(), 1);
+    assert_eq!(fill.fills[0].maker_order_id, peer_id);
+    assert_eq!(book.order(old_id).unwrap().status, OrderStatus::Cancelled);
+    assert_eq!(
+        book.order(replacement_id).unwrap().status,
+        OrderStatus::Open
+    );
 }
 
 #[test]
@@ -554,6 +870,25 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
         .unwrap_err(),
         CoreError::TradingFrozen
     );
+    assert_eq!(
+        execute_signed_result(
+            &mut core,
+            &bob,
+            "session:2",
+            1,
+            "cmd:frozen-withdrawal",
+            UserCommandAction::RequestWithdrawal {
+                withdrawal_id: uuid::Uuid::from_u128(9001),
+                chain: "horizen".into(),
+                asset: "ZEN".into(),
+                amount_atomic: 1,
+                destination: "0x1111111111111111111111111111111111111111".into(),
+            },
+            960,
+        )
+        .unwrap_err(),
+        CoreError::TradingFrozen
+    );
     core.set_trading_freeze("sys:unfreeze:1".into(), false, [92u8; 32], 975)
         .unwrap();
     assert!(!core.trading_frozen());
@@ -571,7 +906,7 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
         },
         1_000,
     );
-    execute_signed(
+    let resting_order = execute_signed_response(
         &mut core,
         &bob,
         "session:2",
@@ -590,6 +925,15 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
             ),
         },
         1_100,
+    );
+    assert!(resting_order.audit_fills.is_empty());
+    assert_eq!(resting_order.task_qualifications.len(), 1);
+    assert_eq!(
+        resting_order.task_qualifications[0]
+            .statement
+            .market_id
+            .as_deref(),
+        Some(market_id)
     );
     let buy_action = UserCommandAction::SubmitOrder {
         order: BookOrder::new(
@@ -612,7 +956,10 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
         buy_action.clone(),
         1_200,
     );
-    assert_eq!(fill_response.receipt.protocol_version, "layrs.v2");
+    assert_eq!(fill_response.receipt.protocol_version, "layrs.v3");
+    assert!(fill_response.receipt.result_commitment_sha256.is_some());
+    assert_eq!(fill_response.receipt.journal_committed, Some(true));
+    assert_eq!(fill_response.receipt_state, CommandReceiptState::Filled);
     assert_eq!(fill_response.receipt.publication_eligible, Some(true));
     assert_eq!(
         fill_response.receipt.command_commitment_sha256,
@@ -645,12 +992,13 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
     assert_eq!(fill_response.task_qualifications.len(), 1);
     let task = &fill_response.task_qualifications[0];
     assert_eq!(task.statement.event_type, "ORDER_ACCEPTED");
+    assert_eq!(task.statement.market_id.as_deref(), Some(market_id));
     assert_eq!(task.statement.settlement_asset, "ZEN");
     assert_eq!(task.statement.asset_notional_micros, 400_000);
     assert_eq!(task.statement.filled_quantity_micros, 1_000_000);
     assert_eq!(task.receipt_id, fill_response.receipt.receipt_id);
     let serialized_task = serde_json::to_string(task).unwrap();
-    for private_value in ["usr_", market_id, "BUY", "UP"] {
+    for private_value in ["usr_", "BUY", "UP"] {
         assert!(
             !serialized_task.contains(private_value),
             "task qualification leaked private order field: {private_value}"
@@ -924,6 +1272,8 @@ fn native_clob_partial_fill_locks_remainder_and_cancel_releases_once() {
     );
     assert_eq!(overdraw.unwrap_err(), CoreError::InsufficientBalance);
 
+    core.set_trading_freeze("sys:freeze:cancel-only".into(), true, [93u8; 32], 1_175)
+        .unwrap();
     execute_signed(
         &mut core,
         &alice,
@@ -936,6 +1286,8 @@ fn native_clob_partial_fill_locks_remainder_and_cancel_releases_once() {
         },
         1_200,
     );
+    core.set_trading_freeze("sys:unfreeze:cancel-only".into(), false, [94u8; 32], 1_225)
+        .unwrap();
     assert_eq!(core.balance(&alice_cash_hold), 0);
     assert_eq!(
         core.balance(&AccountKey::new(
@@ -970,6 +1322,238 @@ fn native_clob_partial_fill_locks_remainder_and_cancel_releases_once() {
             "ZEN"
         )),
         799_600_000_000_000_000
+    );
+
+    // Fill the seller's remaining UP claim completely. The second order
+    // proves that a prior partial fill plus a later full fill preserve the
+    // collateral account and book the exact buyer position, seller proceeds
+    // and taker fees.
+    execute_signed(
+        &mut core,
+        &bob,
+        "session:bob",
+        3,
+        "cmd:bob-final-ask",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Sell,
+                500_000,
+                600_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_300,
+    );
+    let full_buy_action = UserCommandAction::SubmitOrder {
+        order: BookOrder::new(
+            "ignored",
+            market_id,
+            Outcome::Up,
+            OrderAction::Buy,
+            500_000,
+            600_000,
+            TimeInForce::Gtc,
+            None,
+        ),
+    };
+    let full_fill = execute_signed_response(
+        &mut core,
+        &alice,
+        "session:alice",
+        5,
+        "cmd:alice-full-buy",
+        full_buy_action.clone(),
+        // The stale close above used 1_340 but failed. A successful command at
+        // 1_335 proves failed execution did not burn the durable time fence.
+        1_335,
+    );
+    assert!(matches!(
+        full_fill.result,
+        CommandResult::Order { ref result }
+            if result.fills.len() == 1
+                && result.accepted_order.as_ref().is_some_and(|order|
+                    order.status == OrderStatus::Filled
+                        && order.remaining_micros == 0
+                        && order.filled_micros == 600_000)
+    ));
+
+    let mut collateral = AccountKey::new("layrs", AccountBucket::MarketCollateral, "ZEN");
+    collateral.market_id = Some(market_id.into());
+    assert_eq!(core.balance(&collateral), 1_000_000_000_000_000_000);
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &alice_owner,
+            AccountBucket::UserAvailable,
+            "ZEN"
+        )),
+        499_000_000_000_000_000
+    );
+    assert_eq!(core.balance(&alice_cash_hold), 0);
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &bob_owner,
+            AccountBucket::UserAvailable,
+            "ZEN"
+        )),
+        500_000_000_000_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new("layrs", AccountBucket::FeeRevenue, "ZEN")),
+        1_000_000_000_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::position(
+            &alice_owner,
+            format!("CLAIM:{market_id}:UP"),
+            market_id,
+            "UP"
+        )),
+        1_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::position(
+            &bob_owner,
+            format!("CLAIM:{market_id}:UP"),
+            market_id,
+            "UP"
+        )),
+        0
+    );
+
+    // Exercise the opposite fee direction: the resting BUY maker funds the
+    // gross notional from its hold, while the incoming SELL taker receives
+    // net proceeds and the fee is split to protocol revenue atomically.
+    execute_signed(
+        &mut core,
+        &bob,
+        "session:bob",
+        4,
+        "cmd:bob-resting-bid",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                500_000,
+                200_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_400,
+    );
+    let sell_taker_action = UserCommandAction::SubmitOrder {
+        order: BookOrder::new(
+            "ignored",
+            market_id,
+            Outcome::Up,
+            OrderAction::Sell,
+            500_000,
+            200_000,
+            TimeInForce::Gtc,
+            None,
+        ),
+    };
+    let sell_taker_fill = execute_signed_response(
+        &mut core,
+        &alice,
+        "session:alice",
+        6,
+        "cmd:alice-sell-taker",
+        sell_taker_action.clone(),
+        1_450,
+    );
+    assert!(matches!(
+        sell_taker_fill.result,
+        CommandResult::Order { ref result }
+            if result.fills.len() == 1
+                && result.accepted_order.as_ref().is_some_and(|order|
+                    order.status == OrderStatus::Filled
+                        && order.remaining_micros == 0
+                        && order.filled_micros == 200_000)
+    ));
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &alice_owner,
+            AccountBucket::UserAvailable,
+            "ZEN"
+        )),
+        598_800_000_000_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &bob_owner,
+            AccountBucket::UserAvailable,
+            "ZEN"
+        )),
+        400_000_000_000_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new("layrs", AccountBucket::FeeRevenue, "ZEN")),
+        1_200_000_000_000_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::position(
+            &alice_owner,
+            format!("CLAIM:{market_id}:UP"),
+            market_id,
+            "UP"
+        )),
+        800_000
+    );
+    assert_eq!(
+        core.balance(&AccountKey::position(
+            &bob_owner,
+            format!("CLAIM:{market_id}:UP"),
+            market_id,
+            "UP"
+        )),
+        200_000
+    );
+    assert_eq!(core.balance(&collateral), 1_000_000_000_000_000_000);
+
+    // A committed SubmitOrder response may be lost between the enclave and
+    // API. Its bounded recovery capsule preserves the exact private semantic
+    // result and receipt across restore without applying the fill, fee or
+    // position transfer a second time.
+    let snapshot = core.export_encrypted_snapshot().unwrap();
+    let snapshot_sequence = snapshot.sequence;
+    let mut restored = PrivateTradingCore::restore_encrypted_snapshot(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([67u8; 48]),
+        &snapshot,
+        snapshot_sequence,
+    )
+    .unwrap();
+    let restored_root = restored.state_root();
+    let lost_response_retry = execute_signed_result(
+        &mut restored,
+        &alice,
+        "session:alice",
+        6,
+        "cmd:alice-sell-taker",
+        sell_taker_action,
+        1_450,
+    );
+    let recovered = lost_response_retry.expect("recover committed submit result");
+    assert_eq!(recovered.result, sell_taker_fill.result);
+    assert_eq!(recovered.receipt, sell_taker_fill.receipt);
+    assert_eq!(recovered.audit_fills, sell_taker_fill.audit_fills);
+    assert_eq!(
+        recovered.task_qualifications,
+        sell_taker_fill.task_qualifications
+    );
+    assert!(recovered.encrypted_record.is_none());
+    assert_eq!(restored.state_root(), restored_root);
+    assert_eq!(restored.balance(&collateral), 1_000_000_000_000_000_000);
+    assert_eq!(
+        restored.balance(&AccountKey::new("layrs", AccountBucket::FeeRevenue, "ZEN")),
+        1_200_000_000_000_000
     );
 }
 
@@ -1073,7 +1657,7 @@ fn rolling_zen_markets_handle_many_small_multi_user_trades_cancellation_and_lock
                 quantity_micros: 1_000_000,
                 direction: CompleteSetDirection::Mint,
             },
-            1_000 + market_index as i64 * 100,
+            1_000 + market_index as i64 * 300,
         );
         execute_signed(
             &mut core,
@@ -1093,7 +1677,7 @@ fn rolling_zen_markets_handle_many_small_multi_user_trades_cancellation_and_lock
                     None,
                 ),
             },
-            1_025 + market_index as i64 * 100,
+            1_025 + market_index as i64 * 300,
         );
 
         for trade_index in 0..20 {
@@ -1372,6 +1956,67 @@ fn public_depth_hides_thin_levels_buckets_size_and_clears_at_market_close() {
     let (closed_bids, closed_asks) = core.aggregate_depth(market_id, Outcome::Up, 3_000, 1_000_000);
     assert!(closed_bids.is_empty());
     assert!(closed_asks.is_empty());
+
+    if matches!(option_env!("LAYRS_DIRECT_BTC_EXECUTION_ENABLED"), Some("1")) {
+        let quest_market_id = "layrs:v5:BTC:USDC:1h:1788397200";
+        core.register_market(
+            "sys:market:quest-public-depth".into(),
+            MarketConfig {
+                market_id: quest_market_id.into(),
+                settlement_asset: "USDC".into(),
+                settlement_decimals: 6,
+                public_settlement_chain: Some("base".into()),
+                opens_at_millis: 1_000,
+                closes_at_millis: 3_000,
+                minimum_quantity_micros: 1,
+                maximum_quantity_micros: 100_000_000,
+                minimum_order_notional_micros: 1,
+                maximum_order_notional_micros: 100_000_000,
+                maximum_user_position_micros: 100_000_000,
+                maximum_pending_bootstrap_notional_micros: 100_000_000,
+                tick_size_micros: 10_000,
+                oracle_feed_id: 9002,
+                fee_profile_id: FeeProfileId::PolymarketCryptoV2,
+                execution: MarketExecution::NativeClob,
+            },
+            1_510,
+        )
+        .unwrap();
+        let (key, commitment) = &users[0];
+        core.apply_user_external_flow(
+            "sys:deposit:quest-public-depth".into(),
+            *commitment,
+            "USDC".into(),
+            AccountBucket::UserAvailable,
+            10_000_000,
+            ExternalFlowDirection::Inflow,
+            [220u8; 32],
+            1_520,
+        )
+        .unwrap();
+        execute_signed(
+            &mut core,
+            key,
+            "session:privacy-depth:0",
+            2,
+            "cmd:quest-public-depth",
+            UserCommandAction::SubmitOrder {
+                order: BookOrder::new(
+                    "ignored",
+                    quest_market_id,
+                    Outcome::Up,
+                    OrderAction::Buy,
+                    150_000,
+                    6_666_667,
+                    TimeInForce::Gtc,
+                    None,
+                ),
+            },
+            1_530,
+        );
+        let (quest_bids, _) = core.aggregate_depth(quest_market_id, Outcome::Up, 1_600, 5_000_000);
+        assert_eq!(quest_bids, vec![(150_000, 5_000_000)]);
+    }
 }
 
 #[test]
@@ -1795,10 +2440,39 @@ fn polymarket_bootstrap_never_credits_an_unconfirmed_fill() {
         0
     );
 
+    assert!(core.bootstrap_prepared_venue_order(execution_id).is_err());
+    let exact_body = "{".to_string() + &"x".repeat(80) + "}";
+    core.mark_bootstrap_venue_intent_durable(
+        "sys:venue-intent:47".into(),
+        execution_id,
+        BootstrapPreparedVenueOrder {
+            deterministic_order_id: format!("0x{}", "ab".repeat(32)),
+            request_body_sha256: Sha256::digest(exact_body.as_bytes()).into(),
+            exact_request_body: exact_body.clone(),
+            credential_generation_sha256: [50u8; 32],
+        },
+        1_140,
+    )
+    .unwrap();
+    let root_before_unauthorized_submit = core.state_root();
+    assert!(core
+        .mark_bootstrap_submitted(
+            "sys:venue-submitted-before-attempt:47".into(),
+            execution_id,
+            format!("0x{}", "ab".repeat(32)),
+            1_142,
+        )
+        .is_err());
+    assert_eq!(core.state_root(), root_before_unauthorized_submit);
+    core.authorize_bootstrap_submission_attempt("sys:venue-attempt:47".into(), execution_id, 1_145)
+        .unwrap();
+    let prepared = core.bootstrap_prepared_venue_order(execution_id).unwrap();
+    assert_eq!(prepared.exact_request_body, exact_body);
+    assert_eq!(prepared.credential_generation_sha256, [50u8; 32]);
     core.mark_bootstrap_submitted(
         "sys:venue-submitted:47".into(),
         execution_id,
-        "pm-order-47".into(),
+        format!("0x{}", "ab".repeat(32)),
         1_150,
     )
     .unwrap();
@@ -2021,6 +2695,9 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
     assert_eq!(response.receipt.protocol_version, "layrs.v2");
     assert_eq!(response.receipt.publication_eligible, Some(true));
     assert!(response.encrypted_record.is_some());
+    let public_receipt = serde_json::to_string(&response.receipt).unwrap();
+    assert!(!public_receipt.contains("0x1111111111111111111111111111111111111111"));
+    assert!(!public_receipt.contains(&hex::encode(identity_commitment)));
     let authorization = response.withdrawal_authorization.unwrap();
     assert_eq!(authorization.intent.receipt_id, response.receipt.receipt_id);
     assert_eq!(
@@ -2107,6 +2784,225 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
             "USDC"
         )),
         0
+    );
+
+    let release_snapshot = core.export_encrypted_snapshot().unwrap();
+    let mut release_restored = PrivateTradingCore::restore_encrypted_snapshot(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([32u8; 48]),
+        &release_snapshot,
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        release_restored
+            .release_user_withdrawal(
+                "sys:withdrawal-release:35:retry".into(),
+                identity_commitment,
+                "USDC".into(),
+                10_000_000,
+                [36u8; 32],
+                1_410,
+            )
+            .unwrap_err(),
+        clob_service::private_core::CoreError::DuplicateCommand
+    );
+
+    execute_signed_response(
+        &mut core,
+        &user,
+        "session:withdrawal",
+        3,
+        "cmd:withdrawal-confirmed",
+        UserCommandAction::RequestWithdrawal {
+            withdrawal_id: uuid::Uuid::from_u128(36),
+            chain: "base".into(),
+            asset: "USDC".into(),
+            amount_atomic: 10_000_000,
+            destination: "0x2222222222222222222222222222222222222222".into(),
+        },
+        1_500,
+    );
+    core.apply_user_external_flow(
+        "withdrawal-final:36".into(),
+        identity_commitment,
+        "USDC".into(),
+        AccountBucket::UserWithdrawalHold,
+        10_000_000,
+        ExternalFlowDirection::Outflow,
+        [38u8; 32],
+        1_600,
+    )
+    .unwrap();
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &private_user,
+            AccountBucket::UserWithdrawalHold,
+            "USDC"
+        )),
+        0
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new("layrs", AccountBucket::PoolCash, "USDC")),
+        40_000_000
+    );
+    let confirmed_snapshot = core.export_encrypted_snapshot().unwrap();
+    let mut confirmed_restored = PrivateTradingCore::restore_encrypted_snapshot(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([32u8; 48]),
+        &confirmed_snapshot,
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        confirmed_restored
+            .apply_user_external_flow(
+                "withdrawal-final:36:retry".into(),
+                identity_commitment,
+                "USDC".into(),
+                AccountBucket::UserWithdrawalHold,
+                10_000_000,
+                ExternalFlowDirection::Outflow,
+                [38u8; 32],
+                1_610,
+            )
+            .unwrap_err(),
+        clob_service::private_core::CoreError::DuplicateCommand
+    );
+}
+
+#[test]
+fn committed_withdrawal_authorization_recovers_exactly_after_restart_and_expiry() {
+    let user = SigningKey::from_bytes(&[121u8; 32]);
+    let receipt_signer = ReceiptSigner::generate([122u8; 48]);
+    let journal_key = [123u8; 32];
+    let identity_commitment = [124u8; 32];
+    let private_user = derived_private_user(journal_key, identity_commitment);
+    let session_id = "session:withdrawal-restart";
+    let withdrawal_id = uuid::Uuid::from_u128(125);
+    let mut core =
+        PrivateTradingCore::new(JournalKey::from_bytes(journal_key), receipt_signer.clone());
+    core.register_session(
+        "sys:session:withdrawal-restart".into(),
+        session_id.into(),
+        identity_commitment,
+        user.verifying_key().to_bytes(),
+        4_000,
+        1_000,
+    )
+    .unwrap();
+    core.apply_user_external_flow(
+        "sys:deposit:withdrawal-restart".into(),
+        identity_commitment,
+        "USDC".into(),
+        AccountBucket::UserAvailable,
+        25_000_000,
+        ExternalFlowDirection::Inflow,
+        [126u8; 32],
+        1_100,
+    )
+    .unwrap();
+
+    let mut committed = execute_signed_response(
+        &mut core,
+        &user,
+        session_id,
+        1,
+        "cmd:withdrawal-restart",
+        UserCommandAction::RequestWithdrawal {
+            withdrawal_id,
+            chain: "base".into(),
+            asset: "USDC".into(),
+            amount_atomic: 13_799_435,
+            destination: "0x1111111111111111111111111111111111111111".into(),
+        },
+        1_200,
+    );
+    let sequence = core.sequence();
+    let state_root = core.state_root();
+    let terminal_record = committed.encrypted_record.clone().unwrap();
+    let snapshot = core.export_encrypted_snapshot().unwrap();
+
+    let restored = PrivateTradingCore::restore_encrypted_snapshot(
+        JournalKey::from_bytes(journal_key),
+        receipt_signer,
+        &snapshot,
+        sequence,
+    )
+    .unwrap();
+    // Recovery is deliberately independent of the current clock/session and
+    // authorization expiry because it returns only the already-signed result.
+    let recovered = restored
+        .recover_withdrawal_authorization(withdrawal_id, session_id)
+        .unwrap()
+        .unwrap();
+    // Journal ciphertext is already durably archived outside the enclave and
+    // is intentionally not duplicated in the bounded snapshot capsule.
+    committed.encrypted_record = None;
+    assert_eq!(recovered, committed);
+    assert_eq!(restored.sequence(), sequence);
+    assert_eq!(restored.state_root(), state_root);
+    assert_eq!(
+        restored.balance(&AccountKey::new(
+            &private_user,
+            AccountBucket::UserAvailable,
+            "USDC"
+        )),
+        11_200_565
+    );
+    assert_eq!(
+        restored.balance(&AccountKey::new(
+            &private_user,
+            AccountBucket::UserWithdrawalHold,
+            "USDC"
+        )),
+        13_799_435
+    );
+    assert!(restored
+        .recover_withdrawal_authorization(withdrawal_id, "session:wrong-owner")
+        .unwrap()
+        .is_none());
+    assert!(restored
+        .recover_withdrawal_authorization(uuid::Uuid::from_u128(999), session_id)
+        .unwrap()
+        .is_none());
+
+    let journal_recovery = restored
+        .recover_terminal_withdrawal_authorization(
+            &terminal_record,
+            withdrawal_id,
+            session_id,
+            1_000_000,
+        )
+        .unwrap();
+    let journal_authorization = journal_recovery.withdrawal_authorization.unwrap();
+    assert_eq!(
+        journal_authorization.intent.protocol_version,
+        "layrs.withdrawal-recovery.v1"
+    );
+    let proof = journal_authorization.intent.recovery_proof.unwrap();
+    assert_eq!(
+        proof.original_idempotency_key,
+        "idem:cmd:withdrawal-restart"
+    );
+    assert_eq!(proof.terminal_enclave_sequence, sequence);
+    assert_eq!(proof.terminal_state_root, state_root);
+    assert_eq!(proof.terminal_journal_head, terminal_record.record_hash);
+    assert_eq!(restored.sequence(), sequence);
+    assert_eq!(restored.state_root(), state_root);
+
+    let mut tampered_record = terminal_record.clone();
+    tampered_record.ciphertext[0] ^= 1;
+    assert_eq!(
+        restored
+            .recover_terminal_withdrawal_authorization(
+                &tampered_record,
+                withdrawal_id,
+                session_id,
+                1_000_000,
+            )
+            .unwrap_err(),
+        CoreError::JournalChainMismatch
     );
 }
 
@@ -2531,6 +3427,12 @@ fn private_rewards_accrue_cumulatively_and_authorize_only_the_bound_account() {
         reward_token.into(),
         100,
         [45u8; 32],
+        [55u8; 32],
+        "trader-reward-v1".into(),
+        "TRADER_REWARD".into(),
+        "layrs-fee-v2".into(),
+        1,
+        "LAYRS_FEE_V2".into(),
         1_100,
     )
     .unwrap();
@@ -2541,6 +3443,12 @@ fn private_rewards_accrue_cumulatively_and_authorize_only_the_bound_account() {
         reward_token.into(),
         25,
         [46u8; 32],
+        [56u8; 32],
+        "trader-reward-v1".into(),
+        "TRADER_REWARD".into(),
+        "layrs-fee-v2".into(),
+        1,
+        "LAYRS_FEE_V2".into(),
         1_200,
     )
     .unwrap();
@@ -2564,8 +3472,7 @@ fn private_rewards_accrue_cumulatively_and_authorize_only_the_bound_account() {
 
     let account = "0x0000000000000000000000000000000000000022";
     let recipient = "0x0000000000000000000000000000000000000033";
-    let authorized = execute_signed_response(
-        &mut core,
+    let reward_claim_command = signed_user_command(
         &user,
         "session:rewards",
         2,
@@ -2579,16 +3486,45 @@ fn private_rewards_accrue_cumulatively_and_authorize_only_the_bound_account() {
         },
         1_400,
     );
-    match authorized.result {
+    let authorized = core.execute(reward_claim_command.clone(), 1_400).unwrap();
+    let claim_intent = match &authorized.result {
         CommandResult::RewardClaimAuthorized { intent } => {
             assert_eq!(intent.account, account);
             assert_eq!(intent.recipient, recipient);
             assert_eq!(intent.cumulative_amount_atomic, "125");
             assert_ne!(intent.context_hash, [0u8; 32]);
+            intent.clone()
         }
         _ => panic!("expected reward claim authorization"),
-    }
+    };
     assert!(authorized.reward_claim_authorization.is_none());
+
+    // The wrapper signs only after the financial core commits. The exact
+    // signed response must be cached without another sequence/root mutation so
+    // a dropped first response can be returned byte-for-byte on retry.
+    let signed_authorization = clob_service::private_core::RewardClaimAuthorization {
+        intent: claim_intent,
+        chain_id: 8_453,
+        distributor: "0x0000000000000000000000000000000000000055".into(),
+        signer: "0x0000000000000000000000000000000000000066".into(),
+        signature: vec![0x77; 65],
+    };
+    let root_before_authorization = core.state_root();
+    core.attach_reward_claim_authorization(&reward_claim_command, signed_authorization.clone())
+        .unwrap();
+    assert_eq!(core.state_root(), root_before_authorization);
+    let recovered = core
+        .recover_exact_user_command(&reward_claim_command)
+        .unwrap()
+        .expect("exact reward claim retry");
+    assert_eq!(
+        recovered.reward_claim_authorization,
+        Some(signed_authorization)
+    );
+    assert_eq!(
+        recovered.receipt.enclave_sequence,
+        authorized.receipt.enclave_sequence
+    );
 
     let changed_account = execute_signed_result(
         &mut core,
@@ -2615,6 +3551,44 @@ fn private_rewards_accrue_cumulatively_and_authorize_only_the_bound_account() {
         snapshot.sequence,
     )
     .unwrap();
+    // A scheduler may lose the first response after the enclave committed it.
+    // Retrying under a new transport idempotency key must not double-accrue,
+    // and an altered payload under the same evidence must fail closed.
+    restored
+        .accrue_private_reward(
+            "sys:reward:lost-response-retry".into(),
+            identity_commitment,
+            "base".into(),
+            reward_token.into(),
+            100,
+            [45u8; 32],
+            [55u8; 32],
+            "trader-reward-v1".into(),
+            "TRADER_REWARD".into(),
+            "layrs-fee-v2".into(),
+            1,
+            "LAYRS_FEE_V2".into(),
+            1_550,
+        )
+        .unwrap();
+    assert!(matches!(
+        restored.accrue_private_reward(
+            "sys:reward:conflicting-retry".into(),
+            identity_commitment,
+            "base".into(),
+            reward_token.into(),
+            101,
+            [45u8; 32],
+            [55u8; 32],
+            "trader-reward-v1".into(),
+            "TRADER_REWARD".into(),
+            "layrs-fee-v2".into(),
+            1,
+            "LAYRS_FEE_V2".into(),
+            1_560,
+        ),
+        Err(CoreError::InvalidOrder(message)) if message.contains("immutable accrual")
+    ));
     match execute_signed(
         &mut restored,
         &user,
@@ -2849,6 +3823,1860 @@ fn expired_market_rejects_position_close_but_allows_unfilled_hold_release() {
     assert_eq!(core.balance(&up_position), 1_000_000);
 }
 
+#[test]
+fn api_order_creation_enforces_funded_hold_limits_tif_and_replay() {
+    let user_key = SigningKey::from_bytes(&[101u8; 32]);
+    let journal_key = [102u8; 32];
+    let commitment = [103u8; 32];
+    let owner = derived_private_user(journal_key, commitment);
+    let market_id = "layrs:v5:BTC:USDC:15m:2000";
+    let mut core = PrivateTradingCore::new(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([104u8; 48]),
+    );
+    core.register_market(
+        "sys:market:api-order".into(),
+        MarketConfig {
+            market_id: market_id.into(),
+            settlement_asset: "USDC".into(),
+            settlement_decimals: 6,
+            public_settlement_chain: Some("horizen".into()),
+            opens_at_millis: 900,
+            closes_at_millis: 2_000,
+            minimum_quantity_micros: 250_000,
+            maximum_quantity_micros: 10_000_000,
+            minimum_order_notional_micros: 250_000,
+            maximum_order_notional_micros: 5_000_000,
+            maximum_user_position_micros: 10_000_000,
+            maximum_pending_bootstrap_notional_micros: 10_000_000,
+            tick_size_micros: 10_000,
+            oracle_feed_id: 9002,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
+            execution: MarketExecution::NativeClob,
+        },
+        800,
+    )
+    .unwrap();
+    core.register_session(
+        "sys:session:api-order".into(),
+        "session:api-order".into(),
+        commitment,
+        user_key.verifying_key().to_bytes(),
+        3_000,
+        850,
+    )
+    .unwrap();
+    core.apply_user_external_flow(
+        "sys:deposit:api-order".into(),
+        commitment,
+        "USDC".into(),
+        AccountBucket::UserAvailable,
+        5_000_000,
+        ExternalFlowDirection::Inflow,
+        [105u8; 32],
+        875,
+    )
+    .unwrap();
+
+    let limit = UserCommandAction::SubmitOrder {
+        order: BookOrder::new(
+            "client-placeholder",
+            market_id,
+            Outcome::Up,
+            OrderAction::Buy,
+            400_000,
+            2_500_000,
+            TimeInForce::Gtc,
+            None,
+        ),
+    };
+    let first = execute_signed_response(
+        &mut core,
+        &user_key,
+        "session:api-order",
+        1,
+        "cmd:api-limit",
+        limit.clone(),
+        1_000,
+    );
+    assert!(matches!(first.result, CommandResult::Order { .. }));
+    let available = AccountKey::new(&owner, AccountBucket::UserAvailable, "USDC");
+    let mut hold = AccountKey::new(&owner, AccountBucket::UserOrderHold, "USDC");
+    hold.market_id = Some(market_id.into());
+    hold.outcome = Some("UP".into());
+    assert!(core.balance(&hold) >= 1_000_000);
+    assert_eq!(core.balance(&available) + core.balance(&hold), 5_000_000);
+
+    let committed_root = core.state_root();
+    let replay = execute_signed_response(
+        &mut core,
+        &user_key,
+        "session:api-order",
+        1,
+        "cmd:api-limit",
+        limit,
+        1_000,
+    );
+    assert_eq!(replay.receipt.state_root, first.receipt.state_root);
+    assert_eq!(core.state_root(), committed_root);
+
+    let protected = UserCommandAction::SubmitOrder {
+        order: BookOrder::new(
+            "client-placeholder",
+            market_id,
+            Outcome::Down,
+            OrderAction::Buy,
+            200_000,
+            1_250_000,
+            TimeInForce::Fak,
+            None,
+        ),
+    };
+    let before_protected = core.balance(&available);
+    let result = execute_signed(
+        &mut core,
+        &user_key,
+        "session:api-order",
+        2,
+        "cmd:api-protected",
+        protected,
+        1_100,
+    );
+    let CommandResult::Order { result } = result else {
+        panic!("order result")
+    };
+    assert_eq!(result.cancelled_remainder_micros, 1_250_000);
+    assert!(result.fills.is_empty());
+    assert_eq!(core.balance(&available), before_protected);
+
+    let invalid_root = core.state_root();
+    let invalid = execute_signed_result(
+        &mut core,
+        &user_key,
+        "session:api-order",
+        3,
+        "cmd:api-invalid-tif",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "client-placeholder",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                400_000,
+                1_000_000,
+                TimeInForce::Gtd,
+                None,
+            ),
+        },
+        1_200,
+    );
+    assert!(matches!(invalid, Err(CoreError::InvalidOrder(_))));
+    assert_eq!(core.state_root(), invalid_root);
+}
+
+#[test]
+fn api_order_replacement_is_atomic_replay_safe_and_releases_exact_collateral() {
+    let user_key = SigningKey::from_bytes(&[111u8; 32]);
+    let journal_key = [112u8; 32];
+    let commitment = [113u8; 32];
+    let owner = derived_private_user(journal_key, commitment);
+    let market_id = "layrs:v5:BTC:USDC:15m:3000";
+    let mut core = PrivateTradingCore::new(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([114u8; 48]),
+    );
+    core.register_market(
+        "sys:market:replace-atomic".into(),
+        MarketConfig {
+            market_id: market_id.into(),
+            settlement_asset: "USDC".into(),
+            settlement_decimals: 6,
+            public_settlement_chain: Some("horizen".into()),
+            opens_at_millis: 900,
+            closes_at_millis: 3_000,
+            minimum_quantity_micros: 250_000,
+            maximum_quantity_micros: 10_000_000,
+            minimum_order_notional_micros: 250_000,
+            maximum_order_notional_micros: 5_000_000,
+            maximum_user_position_micros: 10_000_000,
+            maximum_pending_bootstrap_notional_micros: 10_000_000,
+            tick_size_micros: 10_000,
+            oracle_feed_id: 9002,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
+            execution: MarketExecution::NativeClob,
+        },
+        800,
+    )
+    .unwrap();
+    core.register_session(
+        "sys:session:replace-atomic".into(),
+        "session:replace-atomic".into(),
+        commitment,
+        user_key.verifying_key().to_bytes(),
+        4_000,
+        850,
+    )
+    .unwrap();
+    core.apply_user_external_flow(
+        "sys:deposit:replace-atomic".into(),
+        commitment,
+        "USDC".into(),
+        AccountBucket::UserAvailable,
+        5_000_000,
+        ExternalFlowDirection::Inflow,
+        [115u8; 32],
+        875,
+    )
+    .unwrap();
+
+    let original_response = execute_signed_response(
+        &mut core,
+        &user_key,
+        "session:replace-atomic",
+        1,
+        "cmd:replace-original",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                400_000,
+                2_500_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_000,
+    );
+    let original = match original_response.result {
+        CommandResult::Order { result } => result.accepted_order.unwrap(),
+        _ => panic!("expected original order"),
+    };
+    let available = AccountKey::new(&owner, AccountBucket::UserAvailable, "USDC");
+    let mut hold = AccountKey::new(&owner, AccountBucket::UserOrderHold, "USDC");
+    hold.market_id = Some(market_id.into());
+    hold.outcome = Some("UP".into());
+    let root_before_failure = core.state_root();
+    let available_before_failure = core.balance(&available);
+    let hold_before_failure = core.balance(&hold);
+
+    let invalid = execute_signed_result(
+        &mut core,
+        &user_key,
+        "session:replace-atomic",
+        2,
+        "cmd:replace-invalid",
+        UserCommandAction::ReplaceOrder {
+            market_id: market_id.into(),
+            order_id: original.order_id,
+            replacement: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                400_000,
+                20_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_100,
+    );
+    assert!(matches!(invalid, Err(CoreError::InvalidOrder(_))));
+    assert_eq!(core.state_root(), root_before_failure);
+    assert_eq!(core.balance(&available), available_before_failure);
+    assert_eq!(core.balance(&hold), hold_before_failure);
+
+    let rejected_fok = execute_signed_result(
+        &mut core,
+        &user_key,
+        "session:replace-atomic",
+        2,
+        "cmd:replace-rejected-fok",
+        UserCommandAction::ReplaceOrder {
+            market_id: market_id.into(),
+            order_id: original.order_id,
+            replacement: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                500_000,
+                1_000_000,
+                TimeInForce::Fok,
+                None,
+            ),
+        },
+        1_150,
+    );
+    assert!(matches!(rejected_fok, Err(CoreError::InvalidOrder(_))));
+    assert_eq!(core.state_root(), root_before_failure);
+    assert_eq!(core.balance(&available), available_before_failure);
+    assert_eq!(core.balance(&hold), hold_before_failure);
+
+    let replacement = BookOrder::new(
+        "ignored",
+        market_id,
+        Outcome::Up,
+        OrderAction::Buy,
+        500_000,
+        1_000_000,
+        TimeInForce::Gtc,
+        None,
+    );
+    let action = UserCommandAction::ReplaceOrder {
+        market_id: market_id.into(),
+        order_id: original.order_id,
+        replacement: replacement.clone(),
+    };
+    let replaced = execute_signed_response(
+        &mut core,
+        &user_key,
+        "session:replace-atomic",
+        2,
+        "cmd:replace-success",
+        action.clone(),
+        1_200,
+    );
+    let (cancelled, accepted) = match &replaced.result {
+        CommandResult::Replaced { cancelled, result } => {
+            (cancelled, result.accepted_order.as_ref().unwrap())
+        }
+        _ => panic!("expected replacement result"),
+    };
+    assert_eq!(cancelled.order_id, original.order_id);
+    assert_eq!(cancelled.status, OrderStatus::Cancelled);
+    assert_eq!(accepted.order_id, replacement.order_id);
+    assert_eq!(accepted.status, OrderStatus::Open);
+    assert!(accepted.sequence > original.sequence);
+    assert_eq!(core.balance(&available) + core.balance(&hold), 5_000_000);
+    assert!(core.balance(&hold) < hold_before_failure);
+
+    let committed_root = core.state_root();
+    let available_after = core.balance(&available);
+    let hold_after = core.balance(&hold);
+    let replay = execute_signed_response(
+        &mut core,
+        &user_key,
+        "session:replace-atomic",
+        2,
+        "cmd:replace-success",
+        action,
+        1_200,
+    );
+    assert_eq!(replay.receipt.state_root, replaced.receipt.state_root);
+    assert_eq!(core.state_root(), committed_root);
+    assert_eq!(core.balance(&available), available_after);
+    assert_eq!(core.balance(&hold), hold_after);
+}
+
+#[test]
+fn api_order_cancellation_bypasses_placement_freeze_and_releases_hold_once() {
+    let user_key = SigningKey::from_bytes(&[121u8; 32]);
+    let journal_key = [122u8; 32];
+    let commitment = [123u8; 32];
+    let owner = derived_private_user(journal_key, commitment);
+    let market_id = "layrs:v5:BTC:USDC:15m:4000";
+    let mut core = PrivateTradingCore::new(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([124u8; 48]),
+    );
+    core.register_market(
+        "sys:market:cancel-priority".into(),
+        MarketConfig {
+            market_id: market_id.into(),
+            settlement_asset: "USDC".into(),
+            settlement_decimals: 6,
+            public_settlement_chain: Some("horizen".into()),
+            opens_at_millis: 900,
+            closes_at_millis: 4_000,
+            minimum_quantity_micros: 250_000,
+            maximum_quantity_micros: 10_000_000,
+            minimum_order_notional_micros: 250_000,
+            maximum_order_notional_micros: 5_000_000,
+            maximum_user_position_micros: 10_000_000,
+            maximum_pending_bootstrap_notional_micros: 10_000_000,
+            tick_size_micros: 10_000,
+            oracle_feed_id: 9002,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
+            execution: MarketExecution::NativeClob,
+        },
+        800,
+    )
+    .unwrap();
+    core.register_session(
+        "sys:session:cancel-priority".into(),
+        "session:cancel-priority".into(),
+        commitment,
+        user_key.verifying_key().to_bytes(),
+        5_000,
+        850,
+    )
+    .unwrap();
+    core.apply_user_external_flow(
+        "sys:deposit:cancel-priority".into(),
+        commitment,
+        "USDC".into(),
+        AccountBucket::UserAvailable,
+        5_000_000,
+        ExternalFlowDirection::Inflow,
+        [125u8; 32],
+        875,
+    )
+    .unwrap();
+
+    let created = execute_signed_response(
+        &mut core,
+        &user_key,
+        "session:cancel-priority",
+        1,
+        "cmd:cancel-priority-create",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                400_000,
+                2_500_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_000,
+    );
+    let resting = match created.result {
+        CommandResult::Order { result } => result.accepted_order.unwrap(),
+        _ => panic!("expected resting order"),
+    };
+    let available = AccountKey::new(&owner, AccountBucket::UserAvailable, "USDC");
+    let mut hold = AccountKey::new(&owner, AccountBucket::UserOrderHold, "USDC");
+    hold.market_id = Some(market_id.into());
+    hold.outcome = Some("UP".into());
+    assert_eq!(core.balance(&available), 4_000_000);
+    assert_eq!(core.balance(&hold), 1_000_000);
+
+    core.set_trading_freeze(
+        "sys:freeze:cancel-priority".into(),
+        true,
+        [126u8; 32],
+        1_050,
+    )
+    .unwrap();
+    let blocked = execute_signed_result(
+        &mut core,
+        &user_key,
+        "session:cancel-priority",
+        2,
+        "cmd:cancel-priority-blocked-placement",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Down,
+                OrderAction::Buy,
+                400_000,
+                1_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_100,
+    );
+    assert_eq!(blocked.unwrap_err(), CoreError::TradingFrozen);
+
+    let cancel_action = UserCommandAction::CancelOrder {
+        market_id: market_id.into(),
+        order_id: resting.order_id,
+    };
+    let cancelled = execute_signed_response(
+        &mut core,
+        &user_key,
+        "session:cancel-priority",
+        2,
+        "cmd:cancel-priority-release",
+        cancel_action.clone(),
+        1_150,
+    );
+    assert!(matches!(cancelled.result, CommandResult::Cancelled { .. }));
+    assert_eq!(core.balance(&available), 5_000_000);
+    assert_eq!(core.balance(&hold), 0);
+
+    let committed_root = core.state_root();
+    let replay = execute_signed_response(
+        &mut core,
+        &user_key,
+        "session:cancel-priority",
+        2,
+        "cmd:cancel-priority-release",
+        cancel_action,
+        1_150,
+    );
+    assert_eq!(replay.receipt.state_root, cancelled.receipt.state_root);
+    assert_eq!(core.state_root(), committed_root);
+    assert_eq!(core.balance(&available), 5_000_000);
+    assert_eq!(core.balance(&hold), 0);
+}
+
+#[test]
+fn api_cancel_all_filters_owner_orders_releases_holds_and_replays_once() {
+    let alice_key = SigningKey::from_bytes(&[127u8; 32]);
+    let bob_key = SigningKey::from_bytes(&[128u8; 32]);
+    let journal_key = [129u8; 32];
+    let alice_commitment = [130u8; 32];
+    let bob_commitment = [131u8; 32];
+    let alice = derived_private_user(journal_key, alice_commitment);
+    let bob = derived_private_user(journal_key, bob_commitment);
+    let btc = "layrs:v5:BTC:USDC:15m:5000";
+    let eth = "layrs:v5:ETH:USDC:15m:5000";
+    let zen = "layrs:v5:ZEN:ZEN:15m:5000";
+    let mut core = PrivateTradingCore::new(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([132u8; 48]),
+    );
+    for (index, (market_id, asset, decimals)) in
+        [(btc, "USDC", 6), (eth, "USDC", 6), (zen, "ZEN", 18)]
+            .into_iter()
+            .enumerate()
+    {
+        core.register_market(
+            format!("sys:market:cancel-all:{index}"),
+            MarketConfig {
+                market_id: market_id.into(),
+                settlement_asset: asset.into(),
+                settlement_decimals: decimals,
+                public_settlement_chain: Some("horizen".into()),
+                opens_at_millis: 900,
+                closes_at_millis: 5_000,
+                minimum_quantity_micros: 250_000,
+                maximum_quantity_micros: 10_000_000,
+                minimum_order_notional_micros: 250_000,
+                maximum_order_notional_micros: 5_000_000,
+                maximum_user_position_micros: 10_000_000,
+                maximum_pending_bootstrap_notional_micros: 10_000_000,
+                tick_size_micros: 10_000,
+                oracle_feed_id: [9_002, 9_003, 9_001][index],
+                fee_profile_id: FeeProfileId::LegacyProfitV1,
+                execution: MarketExecution::NativeClob,
+            },
+            800,
+        )
+        .unwrap();
+    }
+    for (index, (session, commitment, key)) in [
+        ("session:cancel-all:alice", alice_commitment, &alice_key),
+        ("session:cancel-all:bob", bob_commitment, &bob_key),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        core.register_session(
+            format!("sys:session:cancel-all:{index}"),
+            session.into(),
+            commitment,
+            key.verifying_key().to_bytes(),
+            6_000,
+            825 + index as i64,
+        )
+        .unwrap();
+    }
+    for (index, (commitment, asset, amount)) in [
+        (alice_commitment, "USDC", 5_000_000),
+        (alice_commitment, "ZEN", 3_000_000_000_000_000_000),
+        (bob_commitment, "USDC", 1_000_000),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        core.apply_user_external_flow(
+            format!("sys:deposit:cancel-all:{index}"),
+            commitment,
+            asset.into(),
+            AccountBucket::UserAvailable,
+            amount,
+            ExternalFlowDirection::Inflow,
+            [133 + index as u8; 32],
+            850 + index as i64,
+        )
+        .unwrap();
+    }
+
+    let mut create_at_millis = 1_000_i64;
+    let mut create = |core: &mut PrivateTradingCore,
+                      key: &SigningKey,
+                      session: &str,
+                      sequence: u64,
+                      command_id: &str,
+                      market_id: &str,
+                      price: u64,
+                      quantity: u128| {
+        let now_millis = create_at_millis;
+        create_at_millis += 1;
+        let response = execute_signed_response(
+            core,
+            key,
+            session,
+            sequence,
+            command_id,
+            UserCommandAction::SubmitOrder {
+                order: BookOrder::new(
+                    "ignored",
+                    market_id,
+                    Outcome::Up,
+                    OrderAction::Buy,
+                    price,
+                    quantity,
+                    TimeInForce::Gtc,
+                    None,
+                ),
+            },
+            now_millis,
+        );
+        match response.result {
+            CommandResult::Order { result } => result.accepted_order.unwrap(),
+            _ => panic!("expected resting order"),
+        }
+    };
+    let alice_btc = create(
+        &mut core,
+        &alice_key,
+        "session:cancel-all:alice",
+        1,
+        "cmd:cancel-all:alice-btc",
+        btc,
+        400_000,
+        2_500_000,
+    );
+    let alice_btc_second = create(
+        &mut core,
+        &alice_key,
+        "session:cancel-all:alice",
+        2,
+        "cmd:cancel-all:alice-btc-second",
+        btc,
+        250_000,
+        1_000_000,
+    );
+    let alice_eth = create(
+        &mut core,
+        &alice_key,
+        "session:cancel-all:alice",
+        3,
+        "cmd:cancel-all:alice-eth",
+        eth,
+        500_000,
+        2_000_000,
+    );
+    let alice_zen = create(
+        &mut core,
+        &alice_key,
+        "session:cancel-all:alice",
+        4,
+        "cmd:cancel-all:alice-zen",
+        zen,
+        500_000,
+        2_000_000,
+    );
+    let bob_btc = create(
+        &mut core,
+        &bob_key,
+        "session:cancel-all:bob",
+        1,
+        "cmd:cancel-all:bob-btc",
+        btc,
+        300_000,
+        1_000_000,
+    );
+
+    let alice_usdc = AccountKey::new(&alice, AccountBucket::UserAvailable, "USDC");
+    let alice_zen_available = AccountKey::new(&alice, AccountBucket::UserAvailable, "ZEN");
+    let bob_usdc = AccountKey::new(&bob, AccountBucket::UserAvailable, "USDC");
+    assert_eq!(core.balance(&alice_usdc), 2_750_000);
+    assert_eq!(
+        core.balance(&alice_zen_available),
+        2_000_000_000_000_000_000
+    );
+    assert_eq!(core.balance(&bob_usdc), 700_000);
+
+    core.set_trading_freeze("sys:freeze:cancel-all".into(), true, [136u8; 32], 1_100)
+        .unwrap();
+    let by_market = execute_signed_response(
+        &mut core,
+        &alice_key,
+        "session:cancel-all:alice",
+        5,
+        "cmd:cancel-all:market",
+        UserCommandAction::CancelAllOrders {
+            filter: CancelAllOrdersFilter::Market {
+                market_id: btc.into(),
+            },
+        },
+        1_150,
+    );
+    assert_eq!(by_market.receipt.protocol_version, "layrs.v3");
+    assert_eq!(by_market.receipt_state, CommandReceiptState::Cancelled);
+    assert_eq!(by_market.receipt.publication_eligible, Some(true));
+    match by_market.result {
+        CommandResult::OrdersCancelled { filter, outcomes } => {
+            assert_eq!(
+                filter,
+                Some(CancelAllOrdersFilter::Market {
+                    market_id: btc.into()
+                })
+            );
+            assert_eq!(outcomes.len(), 2);
+            assert_eq!(outcomes[0].order_id, alice_btc.order_id);
+            assert_eq!(outcomes[0].status, OrderStatus::Cancelled);
+            assert_eq!(outcomes[1].order_id, alice_btc_second.order_id);
+            assert_eq!(outcomes[1].status, OrderStatus::Cancelled);
+        }
+        _ => panic!("expected market cancellation outcomes"),
+    }
+    assert_eq!(core.balance(&alice_usdc), 4_000_000);
+    assert_eq!(core.balance(&bob_usdc), 700_000);
+
+    let asset_action = UserCommandAction::CancelAllOrders {
+        filter: CancelAllOrdersFilter::Asset {
+            asset: "USDC".into(),
+        },
+    };
+    let by_asset = execute_signed_response(
+        &mut core,
+        &alice_key,
+        "session:cancel-all:alice",
+        6,
+        "cmd:cancel-all:asset",
+        asset_action.clone(),
+        1_200,
+    );
+    match &by_asset.result {
+        CommandResult::OrdersCancelled { outcomes, .. } => {
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(outcomes[0].order_id, alice_eth.order_id);
+        }
+        _ => panic!("expected asset cancellation outcomes"),
+    }
+    assert_eq!(core.balance(&alice_usdc), 5_000_000);
+    let root = core.state_root();
+    let replay = execute_signed_response(
+        &mut core,
+        &alice_key,
+        "session:cancel-all:alice",
+        6,
+        "cmd:cancel-all:asset",
+        asset_action,
+        1_200,
+    );
+    assert_eq!(replay.result, by_asset.result);
+    assert_eq!(replay.receipt.state_root, by_asset.receipt.state_root);
+    assert_eq!(core.state_root(), root);
+    assert_eq!(core.balance(&alice_usdc), 5_000_000);
+
+    let all = execute_signed_response(
+        &mut core,
+        &alice_key,
+        "session:cancel-all:alice",
+        7,
+        "cmd:cancel-all:all",
+        UserCommandAction::CancelAllOrders {
+            filter: CancelAllOrdersFilter::All,
+        },
+        1_250,
+    );
+    match all.result {
+        CommandResult::OrdersCancelled { outcomes, .. } => {
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(outcomes[0].order_id, alice_zen.order_id);
+        }
+        _ => panic!("expected all-market cancellation outcomes"),
+    }
+    assert_eq!(
+        core.balance(&alice_zen_available),
+        3_000_000_000_000_000_000
+    );
+
+    let root_before_invalid_filter = core.state_root();
+    let invalid = execute_signed_result(
+        &mut core,
+        &alice_key,
+        "session:cancel-all:alice",
+        8,
+        "cmd:cancel-all:unknown-market",
+        UserCommandAction::CancelAllOrders {
+            filter: CancelAllOrdersFilter::Market {
+                market_id: "layrs:v5:BTC:USDC:15m:unknown".into(),
+            },
+        },
+        1_275,
+    )
+    .unwrap_err();
+    assert_eq!(invalid, CoreError::InvalidOrder("unknown market".into()));
+    assert_eq!(core.state_root(), root_before_invalid_filter);
+    assert_eq!(core.balance(&alice_usdc), 5_000_000);
+    assert_eq!(
+        core.balance(&alice_zen_available),
+        3_000_000_000_000_000_000
+    );
+
+    let bob_portfolio = execute_signed(
+        &mut core,
+        &bob_key,
+        "session:cancel-all:bob",
+        2,
+        "cmd:cancel-all:bob-portfolio",
+        UserCommandAction::Portfolio,
+        1_300,
+    );
+    match bob_portfolio {
+        CommandResult::Portfolio { snapshot } => {
+            assert!(snapshot
+                .orders
+                .iter()
+                .any(|order| order.order_id == bob_btc.order_id));
+        }
+        _ => panic!("expected Bob portfolio"),
+    }
+}
+
+#[test]
+fn legacy_command_results_restore_without_s08_private_binding_echoes() {
+    let cancel_all: CommandResult = serde_json::from_value(serde_json::json!({
+        "type": "ORDERS_CANCELLED",
+        "outcomes": [{
+            "order_id": "00000000-0000-4000-8000-000000000001",
+            "market_id": "market-1",
+            "status": "CANCELLED"
+        }]
+    }))
+    .unwrap();
+    let CommandResult::OrdersCancelled { filter, .. } = &cancel_all else {
+        panic!("expected legacy cancel-all result");
+    };
+    assert_eq!(filter, &None);
+    assert!(serde_json::to_value(cancel_all)
+        .unwrap()
+        .get("filter")
+        .is_none());
+
+    let preview: CommandResult = serde_json::from_value(serde_json::json!({
+        "type": "POSITION_CLOSE_PREVIEW",
+        "preview": {
+            "position_id": "pos_legacy", "quantity_micros": "1", "minimum_price_micros": 1,
+            "average_price_micros": 1, "gross_payout_atomic": "1", "fee_atomic": "0",
+            "net_payout_atomic": "1", "book_commitment_sha256": vec![0; 32], "book_sequence": 0,
+            "expires_at_millis": 1, "quote_commitment_sha256": vec![0; 32]
+        }
+    }))
+    .unwrap();
+    let CommandResult::PositionClosePreview {
+        market_id,
+        outcome,
+        session_tag,
+        ..
+    } = preview
+    else {
+        panic!("expected legacy close preview");
+    };
+    assert_eq!((market_id, outcome, session_tag), (None, None, None));
+}
+
+#[test]
+fn api_position_close_previews_and_executes_exact_protected_payout_atomically() {
+    let alice = SigningKey::from_bytes(&[141u8; 32]);
+    let bob = SigningKey::from_bytes(&[142u8; 32]);
+    let oracle = SigningKey::from_bytes(&[143u8; 32]);
+    let journal_key = [144u8; 32];
+    let alice_commitment = [145u8; 32];
+    let bob_commitment = [146u8; 32];
+    let alice_owner = derived_private_user(journal_key, alice_commitment);
+    let market_id = "layrs:v5:BTC:USDC:15m:2500";
+    let mut core = PrivateTradingCore::new_with_oracle(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([147u8; 48]),
+        oracle.verifying_key().to_bytes(),
+    )
+    .unwrap();
+    core.register_market(
+        "sys:market:position-close".into(),
+        MarketConfig {
+            market_id: market_id.into(),
+            settlement_asset: "USDC".into(),
+            settlement_decimals: 6,
+            public_settlement_chain: Some("horizen".into()),
+            opens_at_millis: 900,
+            closes_at_millis: 100_000,
+            minimum_quantity_micros: 250_000,
+            maximum_quantity_micros: 10_000_000,
+            minimum_order_notional_micros: 1,
+            maximum_order_notional_micros: 10_000_000,
+            maximum_user_position_micros: 10_000_000,
+            maximum_pending_bootstrap_notional_micros: 100_000_000,
+            tick_size_micros: 1_000,
+            oracle_feed_id: 9002,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
+            execution: MarketExecution::NativeClob,
+        },
+        800,
+    )
+    .unwrap();
+    for (label, key, commitment) in [
+        ("alice", &alice, alice_commitment),
+        ("bob", &bob, bob_commitment),
+    ] {
+        core.register_session(
+            format!("sys:session:position-close:{label}"),
+            format!("session:position-close:{label}"),
+            commitment,
+            key.verifying_key().to_bytes(),
+            120_000,
+            850,
+        )
+        .unwrap();
+        core.apply_user_external_flow(
+            format!("sys:deposit:position-close:{label}"),
+            commitment,
+            "USDC".into(),
+            AccountBucket::UserAvailable,
+            2_000_000,
+            ExternalFlowDirection::Inflow,
+            [label.as_bytes()[0]; 32],
+            875,
+        )
+        .unwrap();
+    }
+
+    execute_signed(
+        &mut core,
+        &alice,
+        "session:position-close:alice",
+        1,
+        "cmd:position-close:mint",
+        UserCommandAction::CompleteSet {
+            market_id: market_id.into(),
+            quantity_micros: 2_000_000,
+            direction: CompleteSetDirection::Mint,
+        },
+        1_000,
+    );
+    let first_bid = execute_signed(
+        &mut core,
+        &bob,
+        "session:position-close:bob",
+        1,
+        "cmd:position-close:bid",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                400_000,
+                2_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_100,
+    );
+    let CommandResult::Order { result: first_bid } = first_bid else {
+        panic!("expected first close-liquidity bid");
+    };
+    let first_bid_id = first_bid.accepted_order.expect("accepted bid").order_id;
+    let portfolio = execute_signed(
+        &mut core,
+        &alice,
+        "session:position-close:alice",
+        2,
+        "cmd:position-close:portfolio",
+        UserCommandAction::Portfolio,
+        1_200,
+    );
+    let CommandResult::Portfolio { snapshot } = portfolio else {
+        panic!("expected portfolio");
+    };
+    let position_id = snapshot
+        .positions
+        .iter()
+        .find(|position| position.market_id == market_id && position.outcome == "UP")
+        .expect("UP position")
+        .position_id
+        .clone();
+    assert!(position_id.starts_with("pos_"));
+    assert_eq!(position_id.len(), 68);
+
+    let preview = execute_signed_response(
+        &mut core,
+        &alice,
+        "session:position-close:alice",
+        2,
+        "cmd:position-close:preview",
+        UserCommandAction::PreviewPositionClose {
+            position_id: position_id.clone(),
+            market_id: market_id.into(),
+            outcome: Outcome::Up,
+            session_tag: "test-session-tag".into(),
+            quantity_micros: 2_000_000,
+            minimum_price_micros: 350_000,
+        },
+        1_300,
+    );
+    assert_ne!(preview.receipt.prior_state_root, preview.receipt.state_root);
+    assert!(preview.encrypted_record.is_some());
+    assert_eq!(preview.receipt.publication_eligible, Some(false));
+    assert_eq!(preview.receipt.protocol_version, "layrs.v2");
+    assert_eq!(preview.receipt.result_commitment_sha256, None);
+    assert_eq!(preview.receipt_state, CommandReceiptState::Accepted);
+    let CommandResult::PositionClosePreview { preview: quote, .. } = preview.result else {
+        panic!("expected close preview");
+    };
+    assert_eq!(quote.position_id, position_id);
+    assert_eq!(quote.quantity_micros, 2_000_000);
+    assert_eq!(quote.minimum_price_micros, 350_000);
+    assert_eq!(quote.average_price_micros, 400_000);
+    assert_eq!(quote.gross_payout_atomic, 800_000);
+    assert_eq!(quote.fee_atomic, 1_600);
+    assert_eq!(quote.net_payout_atomic, 798_400);
+    assert_ne!(quote.book_commitment_sha256, [0u8; 32]);
+    assert_ne!(quote.quote_commitment_sha256, [0u8; 32]);
+    assert_eq!(quote.expires_at_millis, 31_300);
+    let alice_up = AccountKey::position(
+        &alice_owner,
+        format!("CLAIM:{market_id}:UP"),
+        market_id,
+        "UP",
+    );
+    assert_eq!(core.balance(&alice_up), 2_000_000);
+
+    let close_action = UserCommandAction::ClosePosition {
+        position_id: position_id.clone(),
+        market_id: market_id.into(),
+        outcome: Outcome::Up,
+        session_tag: "test-session-tag".into(),
+        quantity_micros: 2_000_000,
+        minimum_price_micros: 350_000,
+        quote: quote.clone(),
+    };
+    core.set_trading_freeze("sys:freeze:position-close".into(), true, [148u8; 32], 1_310)
+        .unwrap();
+    assert_eq!(
+        execute_signed_result(
+            &mut core,
+            &alice,
+            "session:position-close:alice",
+            3,
+            "cmd:position-close:frozen",
+            close_action.clone(),
+            1_315,
+        )
+        .unwrap_err(),
+        CoreError::TradingFrozen
+    );
+    core.set_trading_freeze(
+        "sys:unfreeze:position-close".into(),
+        false,
+        [149u8; 32],
+        1_320,
+    )
+    .unwrap();
+
+    let second_bid = execute_signed(
+        &mut core,
+        &bob,
+        "session:position-close:bob",
+        2,
+        "cmd:position-close:second-bid",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                410_000,
+                1_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_330,
+    );
+    let CommandResult::Order { result: second_bid } = second_bid else {
+        panic!("expected second close-liquidity bid");
+    };
+    let second_bid_id = second_bid
+        .accepted_order
+        .expect("accepted second bid")
+        .order_id;
+    let root_before_stale = core.state_root();
+    let stale = execute_signed_result(
+        &mut core,
+        &alice,
+        "session:position-close:alice",
+        3,
+        "cmd:position-close:stale",
+        close_action,
+        1_340,
+    );
+    assert!(matches!(
+        stale.unwrap_err(),
+        CoreError::InvalidOrder(message) if message == "position close quote is stale"
+    ));
+    assert_eq!(core.state_root(), root_before_stale);
+
+    let refreshed = execute_signed_response(
+        &mut core,
+        &alice,
+        "session:position-close:alice",
+        3,
+        "cmd:position-close:preview-refreshed",
+        UserCommandAction::PreviewPositionClose {
+            position_id: position_id.clone(),
+            market_id: market_id.into(),
+            outcome: Outcome::Up,
+            session_tag: "test-session-tag".into(),
+            quantity_micros: 2_000_000,
+            minimum_price_micros: 350_000,
+        },
+        1_350,
+    );
+    let CommandResult::PositionClosePreview {
+        preview: refreshed_quote,
+        ..
+    } = refreshed.result
+    else {
+        panic!("expected refreshed preview");
+    };
+    execute_signed(
+        &mut core,
+        &bob,
+        "session:position-close:bob",
+        3,
+        "cmd:position-close:cancel-first-bid",
+        UserCommandAction::CancelOrder {
+            market_id: market_id.into(),
+            order_id: first_bid_id,
+        },
+        1_360,
+    );
+    let root_before_partial_fok = core.state_root();
+    let partial_fok = execute_signed_result(
+        &mut core,
+        &alice,
+        "session:position-close:alice",
+        4,
+        "cmd:position-close:partial-fok",
+        UserCommandAction::ClosePosition {
+            position_id: position_id.clone(),
+            market_id: market_id.into(),
+            outcome: Outcome::Up,
+            session_tag: "test-session-tag".into(),
+            quantity_micros: 2_000_000,
+            minimum_price_micros: 350_000,
+            quote: refreshed_quote,
+        },
+        1_370,
+    );
+    assert!(matches!(
+        partial_fok.unwrap_err(),
+        CoreError::InvalidOrder(message)
+            if message == "insufficient protected liquidity for position close"
+    ));
+    assert_eq!(core.state_root(), root_before_partial_fok);
+
+    execute_signed(
+        &mut core,
+        &bob,
+        "session:position-close:bob",
+        4,
+        "cmd:position-close:cancel-second-bid",
+        UserCommandAction::CancelOrder {
+            market_id: market_id.into(),
+            order_id: second_bid_id,
+        },
+        1_375,
+    );
+
+    execute_signed(
+        &mut core,
+        &bob,
+        "session:position-close:bob",
+        5,
+        "cmd:position-close:replacement-bid",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                400_000,
+                2_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_380,
+    );
+
+    let insufficient = execute_signed_result(
+        &mut core,
+        &alice,
+        "session:position-close:alice",
+        4,
+        "cmd:position-close:protected",
+        UserCommandAction::PreviewPositionClose {
+            position_id: position_id.clone(),
+            market_id: market_id.into(),
+            outcome: Outcome::Up,
+            session_tag: "test-session-tag".into(),
+            quantity_micros: 2_000_000,
+            minimum_price_micros: 450_000,
+        },
+        1_390,
+    );
+    assert!(matches!(
+        insufficient.unwrap_err(),
+        CoreError::InvalidOrder(message)
+            if message == "insufficient protected liquidity for position close"
+    ));
+
+    let final_preview = execute_signed_response(
+        &mut core,
+        &alice,
+        "session:position-close:alice",
+        4,
+        "cmd:position-close:preview-final",
+        UserCommandAction::PreviewPositionClose {
+            position_id: position_id.clone(),
+            market_id: market_id.into(),
+            outcome: Outcome::Up,
+            session_tag: "test-session-tag".into(),
+            quantity_micros: 2_000_000,
+            minimum_price_micros: 350_000,
+        },
+        1_400,
+    );
+    let CommandResult::PositionClosePreview { preview: quote, .. } = final_preview.result else {
+        panic!("expected final close preview");
+    };
+
+    // The quote TTL is half-open and evaluated against enclave-trusted time.
+    // Both equality and any later instant reject without mutating state.
+    let pre_close_snapshot = core.export_encrypted_snapshot().unwrap();
+    for (label, now) in [
+        ("at-expiry", quote.expires_at_millis),
+        ("after-expiry", quote.expires_at_millis + 1),
+    ] {
+        let mut expiry_core = PrivateTradingCore::restore_encrypted_snapshot(
+            JournalKey::from_bytes(journal_key),
+            ReceiptSigner::generate([147u8; 48]),
+            &pre_close_snapshot,
+            pre_close_snapshot.sequence,
+        )
+        .unwrap();
+        let root_before = expiry_core.state_root();
+        let command = signed_user_command_with_expiry(
+            &alice,
+            "session:position-close:alice",
+            5,
+            &format!("cmd:position-close:{label}"),
+            UserCommandAction::ClosePosition {
+                position_id: position_id.clone(),
+                market_id: market_id.into(),
+                outcome: Outcome::Up,
+                session_tag: "test-session-tag".into(),
+                quantity_micros: 2_000_000,
+                minimum_price_micros: 350_000,
+                quote: quote.clone(),
+            },
+            now,
+            90_000,
+        );
+        assert!(matches!(
+            expiry_core.execute(command, now).unwrap_err(),
+            CoreError::InvalidOrder(message) if message == "position close quote is stale"
+        ));
+        assert_eq!(expiry_core.state_root(), root_before);
+    }
+
+    // Every quoted field and the HMAC itself are authenticated. Forgery fails
+    // without consuming session sequence, clock fence, collateral, or journal.
+    for (label, forged_quote) in [
+        ("forged-economics", {
+            let mut forged = quote.clone();
+            forged.net_payout_atomic += 1;
+            forged
+        }),
+        ("forged-hmac", {
+            let mut forged = quote.clone();
+            forged.quote_commitment_sha256[0] ^= 1;
+            forged
+        }),
+    ] {
+        let root_before = core.state_root();
+        let forged = execute_signed_result(
+            &mut core,
+            &alice,
+            "session:position-close:alice",
+            5,
+            &format!("cmd:position-close:{label}"),
+            UserCommandAction::ClosePosition {
+                position_id: position_id.clone(),
+                market_id: market_id.into(),
+                outcome: Outcome::Up,
+                session_tag: "test-session-tag".into(),
+                quantity_micros: 2_000_000,
+                minimum_price_micros: 350_000,
+                quote: forged_quote,
+            },
+            1_405,
+        );
+        assert!(matches!(
+            forged.unwrap_err(),
+            CoreError::InvalidOrder(message) if message == "position close quote is stale"
+        ));
+        assert_eq!(core.state_root(), root_before);
+    }
+
+    // A worse, unconsumed dust order changes the whole book but not the exact
+    // executable slice protected by the quote. It must not create a cheap quote
+    // invalidation DoS.
+    execute_signed(
+        &mut core,
+        &bob,
+        "session:position-close:bob",
+        6,
+        "cmd:position-close:irrelevant-dust",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                300_000,
+                250_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_407,
+    );
+    let close_action = UserCommandAction::ClosePosition {
+        position_id: position_id.clone(),
+        market_id: market_id.into(),
+        outcome: Outcome::Up,
+        session_tag: "test-session-tag".into(),
+        quantity_micros: 2_000_000,
+        minimum_price_micros: 350_000,
+        quote: quote.clone(),
+    };
+    let close_command = signed_user_command(
+        &alice,
+        "session:position-close:alice",
+        5,
+        "cmd:position-close:execute",
+        close_action.clone(),
+        1_410,
+    );
+    let closed = core.execute(close_command.clone(), 1_410).unwrap();
+    assert!(core
+        .recover_exact_user_command(&close_command)
+        .unwrap()
+        .is_some());
+    assert_eq!(closed.receipt.publication_eligible, Some(true));
+    let CommandResult::PositionClosed {
+        preview: actual,
+        order_id,
+        ..
+    } = &closed.result
+    else {
+        panic!("expected closed position");
+    };
+    assert_ne!(*order_id, uuid::Uuid::nil());
+    assert_eq!(actual, &quote);
+    assert_eq!(closed.audit_fills.len(), 1);
+    assert_eq!(
+        closed.audit_fills[0].statement.match_type.as_deref(),
+        Some("NORMAL")
+    );
+    assert_eq!(closed.audit_fills[0].statement.fee_atomic, "1600");
+    assert_eq!(core.balance(&alice_up), 0);
+    let alice_available = AccountKey::new(&alice_owner, AccountBucket::UserAvailable, "USDC");
+    assert_eq!(core.balance(&alice_available), 798_400);
+    assert_eq!(
+        core.balance(&AccountKey::new("layrs", AccountBucket::FeeRevenue, "USDC",)),
+        1_600
+    );
+    let bob_owner = derived_private_user(journal_key, bob_commitment);
+    assert_eq!(
+        core.balance(&AccountKey::position(
+            &bob_owner,
+            format!("CLAIM:{market_id}:UP"),
+            market_id,
+            "UP",
+        )),
+        2_000_000
+    );
+    let bob_portfolio = execute_signed(
+        &mut core,
+        &bob,
+        "session:position-close:bob",
+        7,
+        "cmd:position-close:bob-portfolio",
+        UserCommandAction::Portfolio,
+        1_415,
+    );
+    let CommandResult::Portfolio { snapshot } = bob_portfolio else {
+        panic!("expected Bob portfolio after position close");
+    };
+    let acquired = snapshot
+        .positions
+        .iter()
+        .find(|position| position.market_id == market_id && position.outcome == "UP")
+        .expect("Bob acquired UP position");
+    assert_eq!(acquired.quantity_micros, "2000000");
+    assert_eq!(acquired.cost_basis_micros, "800000");
+    let replay = core.execute(close_command.clone(), 1_420).unwrap();
+    assert_eq!(replay.result, closed.result);
+    assert_eq!(replay.receipt.state_root, closed.receipt.state_root);
+    assert_eq!(core.balance(&alice_available), 798_400);
+
+    let mut mismatched_retry = close_command.clone();
+    if let UserCommandAction::ClosePosition {
+        quantity_micros, ..
+    } = &mut mismatched_retry.action
+    {
+        *quantity_micros = 1_000_000;
+    } else {
+        panic!("expected close command");
+    }
+    mismatched_retry.session.request.request_hash = command_request_hash(
+        &mismatched_retry.command_id,
+        &mismatched_retry.idempotency_key,
+        &mismatched_retry.action,
+    )
+    .unwrap();
+    mismatched_retry.session.signature = alice
+        .sign(&signing_payload(&mismatched_retry.session.request))
+        .to_bytes()
+        .to_vec();
+    assert_eq!(
+        core.recover_exact_user_command(&mismatched_retry)
+            .unwrap_err(),
+        CoreError::DuplicateCommand
+    );
+    assert_eq!(
+        core.execute(mismatched_retry, 1_420).unwrap_err(),
+        CoreError::DuplicateCommand
+    );
+
+    let snapshot = core.export_encrypted_snapshot().unwrap();
+    let snapshot_sequence = snapshot.sequence;
+    let mut restored = PrivateTradingCore::restore_encrypted_snapshot(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([147u8; 48]),
+        &snapshot,
+        snapshot_sequence,
+    )
+    .unwrap();
+    let restored_root = restored.state_root();
+    assert_eq!(restored_root, core.state_root());
+    assert_eq!(
+        restored.execute(close_command, 1_420).unwrap_err(),
+        CoreError::PreviouslyProcessed
+    );
+    assert_eq!(restored.state_root(), restored_root);
+    assert_eq!(restored.balance(&alice_available), 798_400);
+
+    let rewind_root = restored.state_root();
+    assert_eq!(
+        execute_signed_result(
+            &mut restored,
+            &alice,
+            "session:position-close:alice",
+            6,
+            "cmd:position-close:rewound-clock",
+            UserCommandAction::PreviewPositionClose {
+                position_id: format!("pos_{}", "00".repeat(32)),
+                market_id: market_id.into(),
+                outcome: Outcome::Up,
+                session_tag: "test-session-tag".into(),
+                quantity_micros: 250_000,
+                minimum_price_micros: 350_000,
+            },
+            1_409,
+        )
+        .unwrap_err(),
+        CoreError::RollbackDetected
+    );
+    assert_eq!(restored.state_root(), rewind_root);
+
+    let wrong_owner = execute_signed_result(
+        &mut core,
+        &alice,
+        "session:position-close:alice",
+        6,
+        "cmd:position-close:wrong-owner",
+        UserCommandAction::PreviewPositionClose {
+            position_id: format!("pos_{}", "00".repeat(32)),
+            market_id: market_id.into(),
+            outcome: Outcome::Up,
+            session_tag: "test-session-tag".into(),
+            quantity_micros: 250_000,
+            minimum_price_micros: 350_000,
+        },
+        1_500,
+    );
+    assert!(matches!(
+        wrong_owner.unwrap_err(),
+        CoreError::InvalidOrder(message) if message == "position owner mismatch"
+    ));
+
+    let closed_market = core.execute(
+        signed_user_command_with_expiry(
+            &alice,
+            "session:position-close:alice",
+            6,
+            "cmd:position-close:closed-market",
+            close_action.clone(),
+            100_001,
+            110_000,
+        ),
+        100_001,
+    );
+    assert!(matches!(
+        closed_market.unwrap_err(),
+        CoreError::InvalidOrder(message) if message == "market is closed"
+    ));
+
+    let boundary = |end: i64, price: i64, marker: u8| BoundaryEvidence {
+        window_start_micros: end * 1_000 - 5_000_000,
+        window_end_micros: end * 1_000,
+        median_price_e8: price,
+        sample_count: 25,
+        minimum_publisher_count: 3,
+        signed_payload_commitment: [marker; 32],
+    };
+    let statement = ResolutionStatement {
+        market_id: market_id.into(),
+        oracle_feed_id: 9002,
+        opening: boundary(900, 1_000_000_000, 151),
+        closing: boundary(100_000, 1_100_000_000, 152),
+        issued_at_millis: 100_100,
+    };
+    let signature = oracle
+        .sign(&resolution_signing_payload(&statement).unwrap())
+        .to_bytes()
+        .to_vec();
+    core.resolve_market(
+        "sys:resolve:position-close".into(),
+        SignedResolution {
+            statement,
+            signature,
+        },
+        100_100,
+    )
+    .unwrap();
+    let resolving = core.execute(
+        signed_user_command_with_expiry(
+            &alice,
+            "session:position-close:alice",
+            6,
+            "cmd:position-close:resolving",
+            close_action,
+            100_200,
+            110_000,
+        ),
+        100_200,
+    );
+    assert!(matches!(
+        resolving.unwrap_err(),
+        CoreError::InvalidOrder(message) if message == "market is resolving or resolved"
+    ));
+}
+
+#[test]
+fn api_position_close_mixes_normal_and_merge_zen_liquidity_with_exact_conservation() {
+    const ZEN: u128 = 1_000_000_000_000_000_000;
+    let alice = SigningKey::from_bytes(&[161u8; 32]);
+    let bob = SigningKey::from_bytes(&[162u8; 32]);
+    let journal_key = [163u8; 32];
+    let alice_commitment = [164u8; 32];
+    let bob_commitment = [165u8; 32];
+    let alice_owner = derived_private_user(journal_key, alice_commitment);
+    let bob_owner = derived_private_user(journal_key, bob_commitment);
+    let market_id = "layrs:v5:ZEN:ZEN:15m:10000";
+    let mut core = PrivateTradingCore::new(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([166u8; 48]),
+    );
+    core.register_market(
+        "sys:market:position-close-mixed".into(),
+        MarketConfig {
+            market_id: market_id.into(),
+            settlement_asset: "ZEN".into(),
+            settlement_decimals: 18,
+            public_settlement_chain: Some("horizen".into()),
+            opens_at_millis: 900,
+            closes_at_millis: 10_000,
+            minimum_quantity_micros: 250_000,
+            maximum_quantity_micros: 10_000_000,
+            minimum_order_notional_micros: 1,
+            maximum_order_notional_micros: 10_000_000,
+            maximum_user_position_micros: 10_000_000,
+            maximum_pending_bootstrap_notional_micros: 100_000_000,
+            tick_size_micros: 1_000,
+            oracle_feed_id: 9001,
+            fee_profile_id: FeeProfileId::LayrsCryptoV2,
+            execution: MarketExecution::NativeClob,
+        },
+        800,
+    )
+    .unwrap();
+    for (label, key, commitment) in [
+        ("alice", &alice, alice_commitment),
+        ("bob", &bob, bob_commitment),
+    ] {
+        core.register_session(
+            format!("sys:session:position-close-mixed:{label}"),
+            format!("session:position-close-mixed:{label}"),
+            commitment,
+            key.verifying_key().to_bytes(),
+            20_000,
+            850,
+        )
+        .unwrap();
+        core.apply_user_external_flow(
+            format!("sys:deposit:position-close-mixed:{label}"),
+            commitment,
+            "ZEN".into(),
+            AccountBucket::UserAvailable,
+            5 * ZEN,
+            ExternalFlowDirection::Inflow,
+            [label.as_bytes()[0]; 32],
+            875,
+        )
+        .unwrap();
+    }
+
+    for (key, session, command) in [
+        (
+            &alice,
+            "session:position-close-mixed:alice",
+            "cmd:position-close-mixed:alice-mint",
+        ),
+        (
+            &bob,
+            "session:position-close-mixed:bob",
+            "cmd:position-close-mixed:bob-mint",
+        ),
+    ] {
+        execute_signed(
+            &mut core,
+            key,
+            session,
+            1,
+            command,
+            UserCommandAction::CompleteSet {
+                market_id: market_id.into(),
+                quantity_micros: 2_000_000,
+                direction: CompleteSetDirection::Mint,
+            },
+            1_000,
+        );
+    }
+    execute_signed(
+        &mut core,
+        &bob,
+        "session:position-close-mixed:bob",
+        2,
+        "cmd:position-close-mixed:normal-bid",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                410_000,
+                1_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_100,
+    );
+    execute_signed(
+        &mut core,
+        &bob,
+        "session:position-close-mixed:bob",
+        3,
+        "cmd:position-close-mixed:merge-ask",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::new(
+                "ignored",
+                market_id,
+                Outcome::Down,
+                OrderAction::Sell,
+                600_000,
+                1_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+        },
+        1_200,
+    );
+
+    let portfolio = execute_signed(
+        &mut core,
+        &alice,
+        "session:position-close-mixed:alice",
+        2,
+        "cmd:position-close-mixed:portfolio",
+        UserCommandAction::Portfolio,
+        1_250,
+    );
+    let CommandResult::Portfolio { snapshot } = portfolio else {
+        panic!("expected Alice portfolio");
+    };
+    let position_id = snapshot
+        .positions
+        .iter()
+        .find(|position| position.market_id == market_id && position.outcome == "UP")
+        .expect("Alice UP position")
+        .position_id
+        .clone();
+    let preview = execute_signed_response(
+        &mut core,
+        &alice,
+        "session:position-close-mixed:alice",
+        2,
+        "cmd:position-close-mixed:preview",
+        UserCommandAction::PreviewPositionClose {
+            position_id: position_id.clone(),
+            market_id: market_id.into(),
+            outcome: Outcome::Up,
+            session_tag: "test-session-tag".into(),
+            quantity_micros: 2_000_000,
+            minimum_price_micros: 390_000,
+        },
+        1_300,
+    );
+    let CommandResult::PositionClosePreview { preview: quote, .. } = preview.result else {
+        panic!("expected mixed close preview");
+    };
+    assert_eq!(quote.average_price_micros, 405_000);
+    assert_eq!(quote.gross_payout_atomic, 810_000_000_000_000_000);
+    assert_eq!(quote.fee_atomic, 33_730_000_000_000_000);
+    assert_eq!(quote.net_payout_atomic, 776_270_000_000_000_000);
+
+    let closed = execute_signed_response(
+        &mut core,
+        &alice,
+        "session:position-close-mixed:alice",
+        3,
+        "cmd:position-close-mixed:close",
+        UserCommandAction::ClosePosition {
+            position_id,
+            market_id: market_id.into(),
+            outcome: Outcome::Up,
+            session_tag: "test-session-tag".into(),
+            quantity_micros: 2_000_000,
+            minimum_price_micros: 390_000,
+            quote: quote.clone(),
+        },
+        1_350,
+    );
+    let CommandResult::PositionClosed {
+        preview: executed, ..
+    } = closed.result
+    else {
+        panic!("expected mixed position close");
+    };
+    assert_eq!(executed, quote);
+    assert_eq!(closed.audit_fills.len(), 2);
+    assert_eq!(
+        closed
+            .audit_fills
+            .iter()
+            .map(|fill| fill.statement.match_type.as_deref().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["NORMAL", "MERGE"]
+    );
+    assert_eq!(
+        closed
+            .audit_fills
+            .iter()
+            .map(|fill| fill.statement.fee_atomic.as_str())
+            .collect::<Vec<_>>(),
+        vec!["16930000000000000", "16800000000000000"]
+    );
+
+    let available =
+        |owner: &str| core.balance(&AccountKey::new(owner, AccountBucket::UserAvailable, "ZEN"));
+    let position = |owner: &str, outcome: Outcome| {
+        core.balance(&AccountKey::position(
+            owner,
+            format!(
+                "CLAIM:{market_id}:{}",
+                if outcome == Outcome::Up { "UP" } else { "DOWN" }
+            ),
+            market_id,
+            if outcome == Outcome::Up { "UP" } else { "DOWN" },
+        ))
+    };
+    let mut collateral = AccountKey::new("layrs", AccountBucket::MarketCollateral, "ZEN");
+    collateral.market_id = Some(market_id.into());
+    let fee_revenue = core.balance(&AccountKey::new("layrs", AccountBucket::FeeRevenue, "ZEN"));
+    assert_eq!(available(&alice_owner), 3_776_270_000_000_000_000);
+    assert_eq!(available(&bob_owner), 3_190_000_000_000_000_000);
+    assert_eq!(position(&alice_owner, Outcome::Up), 0);
+    assert_eq!(position(&alice_owner, Outcome::Down), 2_000_000);
+    assert_eq!(position(&bob_owner, Outcome::Up), 3_000_000);
+    assert_eq!(position(&bob_owner, Outcome::Down), 1_000_000);
+    assert_eq!(core.balance(&collateral), 3 * ZEN);
+    assert_eq!(fee_revenue, 33_730_000_000_000_000);
+    assert_eq!(
+        available(&alice_owner) + available(&bob_owner) + core.balance(&collateral) + fee_revenue,
+        10 * ZEN
+    );
+
+    let bob_rewards = execute_signed(
+        &mut core,
+        &bob,
+        "session:position-close-mixed:bob",
+        4,
+        "cmd:position-close-mixed:bob-rewards",
+        UserCommandAction::Rewards,
+        1_400,
+    );
+    let CommandResult::Rewards { entitlements } = bob_rewards else {
+        panic!("expected Bob reward attribution");
+    };
+    assert_eq!(entitlements.len(), 1);
+    assert_eq!(
+        entitlements[0].cumulative_maker_rebate_atomic,
+        "6746000000000000"
+    );
+    assert_eq!(entitlements[0].cumulative_maker_volume_micros, "2000000");
+    let alice_rewards = execute_signed(
+        &mut core,
+        &alice,
+        "session:position-close-mixed:alice",
+        4,
+        "cmd:position-close-mixed:alice-rewards",
+        UserCommandAction::Rewards,
+        1_400,
+    );
+    let CommandResult::Rewards { entitlements } = alice_rewards else {
+        panic!("expected Alice fee attribution");
+    };
+    assert_eq!(entitlements.len(), 1);
+    assert_eq!(
+        entitlements[0].cumulative_taker_fees_atomic,
+        "33730000000000000"
+    );
+    assert_eq!(entitlements[0].cumulative_taker_volume_micros, "2000000");
+}
+
 fn execute_signed(
     core: &mut PrivateTradingCore,
     key: &SigningKey,
@@ -2890,23 +5718,55 @@ fn execute_signed_result(
     action: UserCommandAction,
     now_millis: i64,
 ) -> Result<clob_service::private_core::CoreResponse, CoreError> {
+    core.execute(
+        signed_user_command(key, session_id, sequence, command_id, action, now_millis),
+        now_millis,
+    )
+}
+
+fn signed_user_command(
+    key: &SigningKey,
+    session_id: &str,
+    sequence: u64,
+    command_id: &str,
+    action: UserCommandAction,
+    issued_at_millis: i64,
+) -> UserCommand {
+    signed_user_command_with_expiry(
+        key,
+        session_id,
+        sequence,
+        command_id,
+        action,
+        issued_at_millis,
+        2_900,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn signed_user_command_with_expiry(
+    key: &SigningKey,
+    session_id: &str,
+    sequence: u64,
+    command_id: &str,
+    action: UserCommandAction,
+    issued_at_millis: i64,
+    expires_at_millis: i64,
+) -> UserCommand {
     let idempotency_key = format!("idem:{command_id}");
     let request_hash = command_request_hash(command_id, &idempotency_key, &action).unwrap();
     let request = SessionRequest {
         session_id: session_id.into(),
         sequence,
-        issued_at_millis: now_millis,
-        expires_at_millis: 2_900,
+        issued_at_millis,
+        expires_at_millis,
         request_hash,
     };
     let signature = key.sign(&signing_payload(&request)).to_bytes().to_vec();
-    core.execute(
-        UserCommand {
-            command_id: command_id.into(),
-            idempotency_key,
-            session: SignedSessionRequest { request, signature },
-            action,
-        },
-        now_millis,
-    )
+    UserCommand {
+        command_id: command_id.into(),
+        idempotency_key,
+        session: SignedSessionRequest { request, signature },
+        action,
+    }
 }

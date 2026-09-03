@@ -51,6 +51,7 @@ pub struct EncryptedJournalRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EncryptedSnapshot {
     pub sequence: u64,
     pub journal_head: [u8; 32],
@@ -84,6 +85,7 @@ mod wire_tests {
     }
 }
 
+#[derive(Clone)]
 pub struct EncryptedJournal {
     cipher: Aes256Gcm,
     records: Vec<EncryptedJournalRecord>,
@@ -189,6 +191,47 @@ impl EncryptedJournal {
         serde_json::from_slice(&plaintext).map_err(|_| CoreError::JournalCrypto)
     }
 
+    /// Decrypts only the record already committed as this journal's current
+    /// chain head. This supports recovery from a sealed snapshot, where older
+    /// in-memory records are intentionally absent, without accepting an
+    /// unanchored record or extending the chain.
+    pub fn decrypt_current_head<T: for<'de> Deserialize<'de>>(
+        &self,
+        record: &EncryptedJournalRecord,
+        expected_state_root: [u8; 32],
+    ) -> CoreResult<T> {
+        if record.sequence != self.sequence
+            || record.record_hash != self.head
+            || record.state_root != expected_state_root
+            || record.record_hash
+                != hash_record(
+                    record.sequence,
+                    &record.nonce,
+                    &record.prior_record_hash,
+                    &record.state_root,
+                    &record.ciphertext,
+                )
+        {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        let aad = associated_data(
+            record.sequence,
+            &record.prior_record_hash,
+            &record.state_root,
+        );
+        let plaintext = self
+            .cipher
+            .decrypt(
+                Nonce::from_slice(&record.nonce),
+                Payload {
+                    msg: &record.ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| CoreError::JournalCrypto)?;
+        serde_json::from_slice(&plaintext).map_err(|_| CoreError::JournalCrypto)
+    }
+
     pub fn records(&self) -> &[EncryptedJournalRecord] {
         &self.records
     }
@@ -205,6 +248,87 @@ impl EncryptedJournal {
         self.head = head;
         self.records.clear();
         Ok(())
+    }
+
+    /// Verifies a complete immutable encrypted-journal export without
+    /// decrypting it. Exact-live restore certification requires the export to
+    /// start at sequence one and end at the snapshot checkpoint; accepting a
+    /// suffix would leave an unproved gap before the supplied chain head.
+    pub fn verify_complete_export(
+        records: &[EncryptedJournalRecord],
+        expected_sequence: u64,
+        expected_head: [u8; 32],
+        expected_state_root: [u8; 32],
+    ) -> CoreResult<()> {
+        if expected_sequence == 0 {
+            return if records.is_empty()
+                && expected_head == [0u8; 32]
+                && expected_state_root != [0u8; 32]
+            {
+                Ok(())
+            } else {
+                Err(CoreError::JournalChainMismatch)
+            };
+        }
+        if records.len() as u64 != expected_sequence {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        let mut prior = [0u8; 32];
+        for (index, record) in records.iter().enumerate() {
+            let sequence = (index as u64)
+                .checked_add(1)
+                .ok_or(CoreError::JournalChainMismatch)?;
+            if record.sequence != sequence
+                || record.prior_record_hash != prior
+                || record.record_hash
+                    != hash_record(
+                        record.sequence,
+                        &record.nonce,
+                        &record.prior_record_hash,
+                        &record.state_root,
+                        &record.ciphertext,
+                    )
+            {
+                return Err(CoreError::JournalChainMismatch);
+            }
+            prior = record.record_hash;
+        }
+        let terminal = records.last().ok_or(CoreError::JournalChainMismatch)?;
+        if terminal.record_hash != expected_head || terminal.state_root != expected_state_root {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        Ok(())
+    }
+
+    /// Decrypts an already verified complete export for enclave-local semantic
+    /// certification. The returned values must never cross the attested
+    /// boundary; the restore runner reduces them to category digests.
+    pub(crate) fn decrypt_complete_export_json(
+        &self,
+        records: &[EncryptedJournalRecord],
+    ) -> CoreResult<Vec<serde_json::Value>> {
+        let mut values = Vec::with_capacity(records.len());
+        for record in records {
+            let aad = associated_data(
+                record.sequence,
+                &record.prior_record_hash,
+                &record.state_root,
+            );
+            let mut plaintext = self
+                .cipher
+                .decrypt(
+                    Nonce::from_slice(&record.nonce),
+                    Payload {
+                        msg: &record.ciphertext,
+                        aad: &aad,
+                    },
+                )
+                .map_err(|_| CoreError::JournalCrypto)?;
+            let decoded = serde_json::from_slice(&plaintext).map_err(|_| CoreError::JournalCrypto);
+            plaintext.zeroize();
+            values.push(decoded?);
+        }
+        Ok(values)
     }
 
     pub fn seal_snapshot<T: Serialize>(
@@ -269,7 +393,14 @@ impl EncryptedJournal {
             )
             .map_err(|_| CoreError::JournalCrypto)?;
         let value = if let Some(compressed) = plaintext.strip_prefix(SNAPSHOT_ZSTD_MAGIC) {
-            let mut decoded = decode_snapshot_payload(compressed, MAX_SNAPSHOT_PLAINTEXT_BYTES)?;
+            let mut decoded =
+                match decode_snapshot_payload(compressed, MAX_SNAPSHOT_PLAINTEXT_BYTES) {
+                    Ok(decoded) => decoded,
+                    Err(error) => {
+                        plaintext.zeroize();
+                        return Err(error);
+                    }
+                };
             let result = serde_json::from_slice(&decoded).map_err(|_| CoreError::JournalCrypto);
             decoded.zeroize();
             result
@@ -288,10 +419,10 @@ fn decode_snapshot_payload(compressed: &[u8], maximum: u64) -> CoreResult<Vec<u8
     let decoder = zstd::stream::read::Decoder::new(Cursor::new(compressed))
         .map_err(|_| CoreError::JournalCrypto)?;
     let mut decoded = Vec::new();
-    decoder
-        .take(maximum + 1)
-        .read_to_end(&mut decoded)
-        .map_err(|_| CoreError::JournalCrypto)?;
+    if decoder.take(maximum + 1).read_to_end(&mut decoded).is_err() {
+        decoded.zeroize();
+        return Err(CoreError::JournalCrypto);
+    }
     if decoded.len() as u64 > maximum {
         decoded.zeroize();
         return Err(CoreError::JournalCrypto);
@@ -380,6 +511,16 @@ pub struct EnclaveReceipt {
     /// portfolio/status receipts remain user-verifiable but are never anchored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publication_eligible: Option<bool>,
+    /// Commitment to a nonce-salted, canonical result disclosure carried only
+    /// inside the owner-encrypted response. It proves ACCEPTED/REJECTED/
+    /// CANCELLED/FILLED without revealing that state to the parent, archive or
+    /// public receipt batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_commitment_sha256: Option<[u8; 32]>,
+    /// True when the receipt is bound to an appended encrypted journal record.
+    /// A signed terminal rejection is false and must preserve the prior root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_committed: Option<bool>,
     pub enclave_sequence: u64,
     pub prior_state_root: [u8; 32],
     pub state_root: [u8; 32],
@@ -389,6 +530,71 @@ pub struct EnclaveReceipt {
     pub signature: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CommandReceiptState {
+    #[default]
+    Accepted,
+    Rejected,
+    Cancelled,
+    Filled,
+}
+
+/// Cross-language commitment to the exact private command result. Object keys
+/// are sorted recursively so Rust, TypeScript and offline receipt verifiers
+/// hash identical bytes independent of serializer insertion order.
+pub fn command_result_commitment<T: Serialize>(
+    state: CommandReceiptState,
+    disclosure_nonce: [u8; 32],
+    result: &T,
+) -> CoreResult<[u8; 32]> {
+    let value = serde_json::json!({
+        "disclosure_nonce": disclosure_nonce,
+        "protocol_version": "layrs.command-result.v1",
+        "result": result,
+        "state": state,
+    });
+    let canonical = canonical_json(&value)?;
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.command-receipt-result.v1\0");
+    hash.update((canonical.len() as u64).to_be_bytes());
+    hash.update(canonical.as_bytes());
+    Ok(hash.finalize().into())
+}
+
+fn canonical_json(value: &serde_json::Value) -> CoreResult<String> {
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::String(_) => {
+            serde_json::to_string(value).map_err(|_| CoreError::RequestHashMismatch)
+        }
+        serde_json::Value::Number(number) => {
+            if !number.is_i64() && !number.is_u64() {
+                return Err(CoreError::RequestHashMismatch);
+            }
+            Ok(number.to_string())
+        }
+        serde_json::Value::Array(items) => {
+            let encoded = items
+                .iter()
+                .map(canonical_json)
+                .collect::<CoreResult<Vec<_>>>()?;
+            Ok(format!("[{}]", encoded.join(",")))
+        }
+        serde_json::Value::Object(fields) => {
+            let mut keys: Vec<_> = fields.keys().collect();
+            keys.sort_unstable();
+            let mut encoded = Vec::with_capacity(keys.len());
+            for key in keys {
+                let name =
+                    serde_json::to_string(key).map_err(|_| CoreError::RequestHashMismatch)?;
+                encoded.push(format!("{name}:{}", canonical_json(&fields[key])?));
+            }
+            Ok(format!("{{{}}}", encoded.join(",")))
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct ReceiptSigner {
     signing_key: SigningKey,
     enclave_measurement_sha384: [u8; 48],
@@ -420,6 +626,8 @@ impl ReceiptSigner {
         idempotency_key: String,
         command_commitment_sha256: Option<[u8; 32]>,
         publication_eligible: Option<bool>,
+        result_commitment_sha256: Option<[u8; 32]>,
+        journal_committed: Option<bool>,
         enclave_sequence: u64,
         prior_state_root: [u8; 32],
         state_root: [u8; 32],
@@ -431,8 +639,22 @@ impl ReceiptSigner {
             publication_eligible.is_some(),
             "receipt command commitment and publication policy must be versioned together"
         );
+        assert_eq!(
+            result_commitment_sha256.is_some(),
+            journal_committed.is_some()
+        );
+        assert!(
+            result_commitment_sha256.is_none() || command_commitment_sha256.is_some(),
+            "semantic command receipts require an exact command commitment"
+        );
+        if journal_committed == Some(false) {
+            assert_eq!(prior_state_root, state_root);
+            assert_eq!(publication_eligible, Some(false));
+        }
         let mut receipt = EnclaveReceipt {
-            protocol_version: if command_commitment_sha256.is_some() {
+            protocol_version: if result_commitment_sha256.is_some() {
+                "layrs.v3".into()
+            } else if command_commitment_sha256.is_some() {
                 "layrs.v2".into()
             } else {
                 "layrs.v1".into()
@@ -447,6 +669,8 @@ impl ReceiptSigner {
             idempotency_key,
             command_commitment_sha256,
             publication_eligible,
+            result_commitment_sha256,
+            journal_committed,
             enclave_sequence,
             prior_state_root,
             state_root,
@@ -462,6 +686,21 @@ impl ReceiptSigner {
 
     pub fn verifying_key(&self) -> [u8; 32] {
         self.signing_key.verifying_key().to_bytes()
+    }
+
+    pub fn result_disclosure_nonce(
+        &self,
+        command_commitment_sha256: [u8; 32],
+        enclave_sequence: u64,
+        state_root: [u8; 32],
+    ) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(b"layrs.command-receipt-disclosure.v1\0");
+        hash.update(self.signing_key.to_bytes());
+        hash.update(command_commitment_sha256);
+        hash.update(enclave_sequence.to_be_bytes());
+        hash.update(state_root);
+        hash.finalize().into()
     }
 
     pub fn sign_domain_payload<T: Serialize>(&self, domain: &[u8], value: &T) -> Vec<u8> {
@@ -488,6 +727,85 @@ fn deterministic_receipt_id(
     hash.update(sequence.to_be_bytes());
     hash.update(state_root);
     format!("receipt_{}", hex::encode(hash.finalize()))
+}
+
+#[cfg(test)]
+mod semantic_receipt_tests {
+    use super::*;
+    use ed25519_dalek::{Signature, Verifier};
+
+    #[test]
+    fn result_commitment_matches_the_browser_golden_vector() {
+        let result = serde_json::json!({
+            "type": "ORDER",
+            "result": {
+                "accepted_order": {
+                    "order_id": "order-open", "market_id": "market-1", "outcome": "UP",
+                    "action": "BUY", "price_micros": 400000,
+                    "quantity_micros": "1000000", "filled_micros": "0",
+                    "remaining_micros": "1000000", "time_in_force": "GTC",
+                    "expires_at_millis": null, "status": "OPEN"
+                },
+                "fills": [],
+                "cancelled_remainder_micros": "0",
+            },
+        });
+        assert_eq!(
+            hex::encode(
+                command_result_commitment(CommandReceiptState::Accepted, [9u8; 32], &result)
+                    .unwrap()
+            ),
+            "2817d0b7a7d0ae84a0ff05c652c42acf8aff7552dadd4a979f91508a8e49761a"
+        );
+    }
+
+    #[test]
+    fn disclosure_nonce_and_semantic_state_are_binding() {
+        let result = serde_json::json!({"type":"CANCELLED","order":{"order_id":"order-1"}});
+        let accepted =
+            command_result_commitment(CommandReceiptState::Accepted, [1u8; 32], &result).unwrap();
+        let cancelled =
+            command_result_commitment(CommandReceiptState::Cancelled, [1u8; 32], &result).unwrap();
+        let changed_nonce =
+            command_result_commitment(CommandReceiptState::Cancelled, [2u8; 32], &result).unwrap();
+        assert_ne!(accepted, cancelled);
+        assert_ne!(cancelled, changed_nonce);
+    }
+
+    #[test]
+    fn v3_signature_binds_result_commitment_and_journal_policy() {
+        let signer = ReceiptSigner::from_seed([3u8; 32], [4u8; 48]);
+        let receipt = signer.sign(
+            "018f1d5e-7b6d-4c31-8b0f-111111111111".into(),
+            "private:receipt:01234567".into(),
+            Some([5u8; 32]),
+            Some(true),
+            Some([6u8; 32]),
+            Some(true),
+            7,
+            [8u8; 32],
+            [9u8; 32],
+            [10u8; 32],
+            1_786_000_000_000,
+        );
+        assert_eq!(receipt.protocol_version, "layrs.v3");
+        let signature = Signature::from_slice(&receipt.signature).unwrap();
+        let mut unsigned = receipt.clone();
+        unsigned.signature.clear();
+        let payload = serde_json::to_vec(&unsigned).unwrap();
+        signer
+            .signing_key
+            .verifying_key()
+            .verify(&payload, &signature)
+            .unwrap();
+
+        unsigned.result_commitment_sha256 = Some([7u8; 32]);
+        assert!(signer
+            .signing_key
+            .verifying_key()
+            .verify(&serde_json::to_vec(&unsigned).unwrap(), &signature)
+            .is_err());
+    }
 }
 
 fn associated_data(sequence: u64, prior: &[u8; 32], root: &[u8; 32]) -> Vec<u8> {

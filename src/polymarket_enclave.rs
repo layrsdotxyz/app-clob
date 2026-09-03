@@ -13,7 +13,10 @@ use base64::{
 use ethers_core::{
     abi::{encode, Token},
     types::{
-        transaction::{eip2718::TypedTransaction, eip712::TypedData},
+        transaction::{
+            eip2718::TypedTransaction,
+            eip712::{Eip712, TypedData},
+        },
         Address, Bytes, TransactionRequest, U256,
     },
     utils::keccak256,
@@ -69,6 +72,14 @@ pub struct VenueOrderIntent {
     pub fee_rate_bps: u64,
     pub negative_risk: bool,
     pub order_salt: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedPolymarketOrder {
+    pub deterministic_order_id: String,
+    pub exact_request_body: String,
+    pub request_body_sha256: [u8; 32],
+    pub credential_generation_sha256: [u8; 32],
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +156,12 @@ pub enum VenueConfirmation {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VenueOrderObservation {
+    Found,
+    AuthoritativelyAbsent,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct OpenOrder {
     id: String,
@@ -193,8 +210,16 @@ impl EnclavePolymarketClient {
         intent: &VenueOrderIntent,
         timestamp_seconds: u64,
     ) -> Result<(PolymarketOrderResponse, [u8; 32]), String> {
+        let prepared = self.prepare_fok(intent).await?;
+        self.submit_prepared_fok(&prepared, timestamp_seconds).await
+    }
+
+    pub async fn prepare_fok(
+        &self,
+        intent: &VenueOrderIntent,
+    ) -> Result<PreparedPolymarketOrder, String> {
         validate_intent(intent)?;
-        let order = build_signed_order(&self.wallet, intent).await?;
+        let (order, deterministic_order_id) = build_signed_order(&self.wallet, intent).await?;
         let body = serde_json::to_string(&PostOrder {
             order: &order,
             owner: &self.secrets.api_key,
@@ -203,21 +228,109 @@ impl EnclavePolymarketClient {
             post_only: false,
         })
         .map_err(|_| "cannot encode Polymarket order")?;
+        let credential_generation_sha256 = Sha256::digest(
+            [
+                b"layrs.polymarket-credential-generation.v1\0".as_slice(),
+                format!("{:#x}", self.wallet.address()).as_bytes(),
+                self.secrets.api_key.as_bytes(),
+            ]
+            .concat(),
+        )
+        .into();
+        Ok(PreparedPolymarketOrder {
+            deterministic_order_id,
+            request_body_sha256: Sha256::digest(body.as_bytes()).into(),
+            exact_request_body: body,
+            credential_generation_sha256,
+        })
+    }
+
+    pub async fn submit_prepared_fok(
+        &self,
+        prepared: &PreparedPolymarketOrder,
+        timestamp_seconds: u64,
+    ) -> Result<(PolymarketOrderResponse, [u8; 32]), String> {
+        if Sha256::digest(prepared.exact_request_body.as_bytes()).as_slice()
+            != prepared.request_body_sha256
+        {
+            return Err("prepared Polymarket body mismatch".into());
+        }
+        let current_generation: [u8; 32] = Sha256::digest(
+            [
+                b"layrs.polymarket-credential-generation.v1\0".as_slice(),
+                format!("{:#x}", self.wallet.address()).as_bytes(),
+                self.secrets.api_key.as_bytes(),
+            ]
+            .concat(),
+        )
+        .into();
+        if current_generation != prepared.credential_generation_sha256 {
+            return Err("POLYMARKET_CREDENTIAL_GENERATION_CHANGED".into());
+        }
+        // A pre-attempt lookup may prove that the deterministic signed order
+        // already exists. Any non-404 lookup error is UNKNOWN and forbids POST.
+        let path = format!("/data/order/{}", prepared.deterministic_order_id);
+        let lookup_headers = authenticated_headers(
+            &self.wallet,
+            &self.secrets,
+            timestamp_seconds,
+            "GET",
+            &path,
+            None,
+        )?;
+        let lookup = request("GET", &path, &lookup_headers, None).await?;
+        if (200..300).contains(&lookup.status) {
+            let parsed: OpenOrder = serde_json::from_slice(&lookup.body)
+                .map_err(|_| "invalid existing Polymarket order".to_string())?;
+            if parsed.id != prepared.deterministic_order_id {
+                return Err("Polymarket deterministic order identity mismatch".into());
+            }
+            let order_id = parsed.id.clone();
+            return Ok((
+                PolymarketOrderResponse {
+                    success: true,
+                    error_msg: String::new(),
+                    order_id: order_id.clone(),
+                    transactions_hashes: Vec::new(),
+                    status: parsed.status,
+                    taking_amount: parsed.size_matched,
+                    making_amount: parsed.original_size,
+                },
+                Sha256::digest(order_id.as_bytes()).into(),
+            ));
+        }
+        if lookup.status != 404 {
+            return Err("POLYMARKET_ORDER_LOOKUP_UNKNOWN".into());
+        }
         let headers = authenticated_headers(
             &self.wallet,
             &self.secrets,
             timestamp_seconds,
             "POST",
             "/order",
-            Some(&body),
+            Some(&prepared.exact_request_body),
         )?;
-        let response = request("POST", "/order", &headers, Some(&body)).await?;
+        let response = match request(
+            "POST",
+            "/order",
+            &headers,
+            Some(&prepared.exact_request_body),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                // Never blindly resend after an ambiguous network outcome. A
+                // later execution attempt will query the deterministic hash.
+                return Err("POLYMARKET_SUBMISSION_OUTCOME_UNKNOWN".into());
+            }
+        };
         if !(200..300).contains(&response.status) {
             return Err(format!("Polymarket HTTP status {}", response.status));
         }
         let parsed: PolymarketOrderResponse = serde_json::from_slice(&response.body)
             .map_err(|_| "invalid Polymarket order response")?;
-        if !parsed.success || parsed.order_id.is_empty() {
+        if !parsed.success || parsed.order_id != prepared.deterministic_order_id {
             return Err("Polymarket rejected FOK order".into());
         }
         let commitment = Sha256::digest(parsed.order_id.as_bytes()).into();
@@ -252,6 +365,38 @@ impl EnclavePolymarketClient {
         }
         serde_json::from_slice(&response.body)
             .map_err(|_| "invalid Polymarket status response".into())
+    }
+
+    pub async fn observe_order(
+        &self,
+        order_id: &str,
+        timestamp_seconds: u64,
+    ) -> Result<VenueOrderObservation, String> {
+        if !order_id.starts_with("0x") || order_id.len() != 66 {
+            return Err("invalid deterministic Polymarket order id".into());
+        }
+        let path = format!("/data/order/{order_id}");
+        let headers = authenticated_headers(
+            &self.wallet,
+            &self.secrets,
+            timestamp_seconds,
+            "GET",
+            &path,
+            None,
+        )?;
+        let response = request("GET", &path, &headers, None).await?;
+        if response.status == 404 {
+            return Ok(VenueOrderObservation::AuthoritativelyAbsent);
+        }
+        if !(200..300).contains(&response.status) {
+            return Err("POLYMARKET_ORDER_LOOKUP_UNKNOWN".into());
+        }
+        let order: OpenOrder = serde_json::from_slice(&response.body)
+            .map_err(|_| "invalid Polymarket order response".to_string())?;
+        if order.id != order_id {
+            return Err("Polymarket order identity mismatch".into());
+        }
+        Ok(VenueOrderObservation::Found)
     }
 
     pub async fn confirmed_fill(
@@ -478,7 +623,7 @@ fn validate_intent(intent: &VenueOrderIntent) -> Result<(), String> {
 async fn build_signed_order(
     wallet: &LocalWallet,
     intent: &VenueOrderIntent,
-) -> Result<SignedOrder, String> {
+) -> Result<(SignedOrder, String), String> {
     let notional = intent
         .quantity_atomic
         .checked_mul(u128::from(intent.limit_price_micros))
@@ -544,25 +689,36 @@ async fn build_signed_order(
         }
     }))
     .map_err(|_| "cannot construct Polymarket EIP-712 order")?;
+    let deterministic_order_id = format!(
+        "0x{}",
+        hex::encode(
+            typed
+                .encode_eip712()
+                .map_err(|_| "cannot hash Polymarket order")?
+        ),
+    );
     let signature = wallet
         .sign_typed_data(&typed)
         .await
         .map_err(|_| "cannot sign Polymarket order")?;
-    Ok(SignedOrder {
-        salt,
-        maker: maker.clone(),
-        signer: maker,
-        taker: ZERO_ADDRESS,
-        token_id: intent.token_id.clone(),
-        maker_amount: maker_amount.to_string(),
-        taker_amount: taker_amount.to_string(),
-        expiration: "0",
-        nonce: "0",
-        fee_rate_bps: intent.fee_rate_bps.to_string(),
-        side,
-        signature_type: 0,
-        signature: signature.to_string(),
-    })
+    Ok((
+        SignedOrder {
+            salt,
+            maker: maker.clone(),
+            signer: maker,
+            taker: ZERO_ADDRESS,
+            token_id: intent.token_id.clone(),
+            maker_amount: maker_amount.to_string(),
+            taker_amount: taker_amount.to_string(),
+            expiration: "0",
+            nonce: "0",
+            fee_rate_bps: intent.fee_rate_bps.to_string(),
+            side,
+            signature_type: 0,
+            signature: signature.to_string(),
+        },
+        deterministic_order_id,
+    ))
 }
 
 fn authenticated_headers(

@@ -1,11 +1,17 @@
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+use std::time::Instant;
+
 use clob_service::private_core::{
     command_request_hash, exact_condition_resolution_signing_payload, resolution_signing_payload,
-    signing_payload, AccountBucket, AccountKey, BookOrder, BoundaryEvidence, CommandResult,
-    ExactConditionResolutionStatement, ExternalFlowDirection, FeeProfileId, JournalKey,
-    MarketConfig, MarketExecution, MatchType, OrderAction, OrderStatus, Outcome, PriceTimeBook,
-    PrivateTradingCore, ReceiptSigner, ResolutionOutcome, ResolutionStatement, SessionRequest,
-    SignedExactConditionResolution, SignedResolution, SignedSessionRequest, TimeInForce,
-    UserCommand, UserCommandAction,
+    signing_payload, AccountBucket, AccountKey, BookOrder, BoundaryEvidence, CommandReceiptState,
+    CommandResult, ExactConditionResolutionStatement, ExternalFlowDirection, FeeProfileId,
+    JournalKey, MarketConfig, MarketExecution, MatchType, OrderAction, OrderStatus, Outcome,
+    PriceTimeBook, PrivateTradingCore, ReceiptSigner, ResolutionOutcome, ResolutionStatement,
+    SessionRequest, SignedExactConditionResolution, SignedResolution, SignedSessionRequest,
+    TimeInForce, UserCommand, UserCommandAction,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use proptest::prelude::*;
@@ -800,7 +806,7 @@ fn two_internal_market_maker_identities_can_stress_native_usdc_without_privilege
                     None,
                 ),
             },
-            1_000 + index as i64,
+            1_000 + (index as i64 * 2),
         );
         let crossed = execute(
             &mut core,
@@ -821,7 +827,7 @@ fn two_internal_market_maker_identities_can_stress_native_usdc_without_privilege
                     None,
                 ),
             },
-            1_050 + index as i64,
+            1_001 + (index as i64 * 2),
         );
         assert_eq!(order_result(&crossed.result).fills.len(), 1);
         assert_eq!(
@@ -1002,6 +1008,558 @@ fn complete_set_command_replay_produces_identical_fill_and_state_root() {
     assert_eq!(
         first.audit_fills[0].statement,
         second.audit_fills[0].statement
+    );
+}
+
+#[test]
+fn btc_direct_execution_feasibility_survives_replay_and_restart() {
+    const BTC_MARKET: &str = "layrs:v5:BTC:USDC:15m:quest-gate";
+    const INITIAL_USDC: u128 = 10_000_000;
+    let journal_key = [201u8; 32];
+    let maker_key = SigningKey::from_bytes(&[202u8; 32]);
+    let taker_key = SigningKey::from_bytes(&[203u8; 32]);
+    let maker_commitment = [204u8; 32];
+    let taker_commitment = [205u8; 32];
+    let maker_owner = derived_private_user(journal_key, maker_commitment);
+    let taker_owner = derived_private_user(journal_key, taker_commitment);
+    let mut core = PrivateTradingCore::new(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([206u8; 48]),
+    );
+    core.register_market(
+        "sys:market:btc-direct-gate".into(),
+        MarketConfig {
+            market_id: BTC_MARKET.into(),
+            settlement_asset: "USDC".into(),
+            settlement_decimals: 6,
+            public_settlement_chain: Some("horizen".into()),
+            opens_at_millis: 900,
+            closes_at_millis: 3_000,
+            minimum_quantity_micros: 250_000,
+            maximum_quantity_micros: 10_000_000,
+            minimum_order_notional_micros: 1,
+            maximum_order_notional_micros: 10_000_000,
+            maximum_user_position_micros: 10_000_000,
+            maximum_pending_bootstrap_notional_micros: 20_000_000,
+            tick_size_micros: 10_000,
+            oracle_feed_id: 9002,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
+            execution: MarketExecution::NativeExactCondition {
+                condition_id: format!("0x{}", "42".repeat(32)),
+                up_outcome_index: 0,
+                down_outcome_index: 1,
+            },
+        },
+        800,
+    )
+    .unwrap();
+    for (label, key, commitment, evidence) in [
+        ("maker", &maker_key, maker_commitment, [207u8; 32]),
+        ("taker", &taker_key, taker_commitment, [208u8; 32]),
+    ] {
+        core.register_session(
+            format!("sys:session:btc-direct:{label}"),
+            format!("session:btc-direct:{label}"),
+            commitment,
+            key.verifying_key().to_bytes(),
+            4_000,
+            850,
+        )
+        .unwrap();
+        core.apply_user_external_flow(
+            format!("sys:deposit:btc-direct:{label}"),
+            commitment,
+            "USDC".into(),
+            AccountBucket::UserAvailable,
+            INITIAL_USDC,
+            ExternalFlowDirection::Inflow,
+            evidence,
+            875,
+        )
+        .unwrap();
+    }
+
+    let maker_order = BookOrder::with_id(
+        Uuid::from_u128(10_001),
+        "ignored",
+        BTC_MARKET,
+        Outcome::Up,
+        OrderAction::Buy,
+        400_000,
+        5_000_000,
+        TimeInForce::Gtc,
+        None,
+    );
+    let maker = execute(
+        &mut core,
+        &maker_key,
+        "session:btc-direct:maker",
+        1,
+        "cmd:btc-direct:maker",
+        UserCommandAction::SubmitOrder {
+            order: maker_order.clone(),
+        },
+        1_000,
+    );
+    assert!(order_result(&maker.result).fills.is_empty());
+    assert_eq!(maker.receipt_state, CommandReceiptState::Accepted);
+    assert_eq!(maker.receipt.journal_committed, Some(true));
+    assert!(!maker.receipt.signature.is_empty());
+
+    let taker_action = UserCommandAction::SubmitOrder {
+        order: BookOrder::with_id(
+            Uuid::from_u128(10_002),
+            "ignored",
+            BTC_MARKET,
+            Outcome::Down,
+            OrderAction::Buy,
+            600_000,
+            1_000_000,
+            TimeInForce::Fok,
+            None,
+        ),
+    };
+    let taker_command = signed_command(
+        &taker_key,
+        "session:btc-direct:taker",
+        1,
+        "cmd:btc-direct:taker",
+        taker_action,
+        1_050,
+    );
+    let fill = core.execute(taker_command.clone(), 1_050).unwrap();
+    assert_eq!(fill.receipt_state, CommandReceiptState::Filled);
+    assert_eq!(fill.receipt.journal_committed, Some(true));
+    assert_eq!(order_result(&fill.result).fills.len(), 1);
+    assert_eq!(
+        order_result(&fill.result).fills[0].match_type,
+        MatchType::Mint
+    );
+    assert_eq!(fill.audit_fills.len(), 1);
+    assert_eq!(fill.audit_fills[0].statement.market_id, BTC_MARKET);
+    assert_eq!(fill.audit_fills[0].statement.quantity_atomic, "1000000");
+    assert!(!fill.audit_fills[0].signature.is_empty());
+
+    let committed_root = core.state_root();
+    let replay = core.execute(taker_command.clone(), 1_050).unwrap();
+    assert_eq!(replay, fill);
+    assert_eq!(core.state_root(), committed_root);
+
+    let maker_available = AccountKey::new(&maker_owner, AccountBucket::UserAvailable, "USDC");
+    let taker_available = AccountKey::new(&taker_owner, AccountBucket::UserAvailable, "USDC");
+    let mut maker_hold = AccountKey::new(&maker_owner, AccountBucket::UserOrderHold, "USDC");
+    maker_hold.market_id = Some(BTC_MARKET.into());
+    maker_hold.outcome = Some("UP".into());
+    let mut collateral = AccountKey::new("layrs", AccountBucket::MarketCollateral, "USDC");
+    collateral.market_id = Some(BTC_MARKET.into());
+    let fees = AccountKey::new("layrs", AccountBucket::FeeRevenue, "USDC");
+    let maker_up = AccountKey::position(
+        &maker_owner,
+        format!("CLAIM:{BTC_MARKET}:UP"),
+        BTC_MARKET,
+        "UP",
+    );
+    let taker_down = AccountKey::position(
+        &taker_owner,
+        format!("CLAIM:{BTC_MARKET}:DOWN"),
+        BTC_MARKET,
+        "DOWN",
+    );
+    assert_eq!(core.balance(&maker_up), 1_000_000);
+    assert_eq!(core.balance(&taker_down), 1_000_000);
+    assert_eq!(core.balance(&collateral), 1_000_000);
+    assert_eq!(
+        core.balance(&maker_available)
+            + core.balance(&maker_hold)
+            + core.balance(&taker_available)
+            + core.balance(&collateral)
+            + core.balance(&fees),
+        INITIAL_USDC * 2
+    );
+    let maker_portfolio = core.portfolio_snapshot_for_identity(maker_commitment, 1_060);
+    let taker_portfolio = core.portfolio_snapshot_for_identity(taker_commitment, 1_060);
+    assert!(maker_portfolio
+        .orders
+        .iter()
+        .any(|order| order.order_id == maker_order.order_id
+            && order.status == OrderStatus::PartiallyFilled));
+    assert!(maker_portfolio
+        .positions
+        .iter()
+        .any(|position| position.market_id == BTC_MARKET && position.outcome == "UP"));
+    assert!(taker_portfolio
+        .positions
+        .iter()
+        .any(|position| position.market_id == BTC_MARKET && position.outcome == "DOWN"));
+
+    let replacement = BookOrder::with_id(
+        Uuid::from_u128(10_003),
+        "ignored",
+        BTC_MARKET,
+        Outcome::Up,
+        OrderAction::Buy,
+        390_000,
+        4_000_000,
+        TimeInForce::Gtc,
+        None,
+    );
+    let replaced = execute(
+        &mut core,
+        &maker_key,
+        "session:btc-direct:maker",
+        2,
+        "cmd:btc-direct:replace",
+        UserCommandAction::ReplaceOrder {
+            market_id: BTC_MARKET.into(),
+            order_id: maker_order.order_id,
+            replacement: replacement.clone(),
+        },
+        1_100,
+    );
+    assert!(matches!(replaced.result, CommandResult::Replaced { .. }));
+    let cancelled = execute(
+        &mut core,
+        &maker_key,
+        "session:btc-direct:maker",
+        3,
+        "cmd:btc-direct:cancel",
+        UserCommandAction::CancelOrder {
+            market_id: BTC_MARKET.into(),
+            order_id: replacement.order_id,
+        },
+        1_150,
+    );
+    assert!(matches!(cancelled.result, CommandResult::Cancelled { .. }));
+    assert_eq!(core.balance(&maker_hold), 0);
+
+    let before_restart_maker = core.portfolio_snapshot_for_identity(maker_commitment, 1_160);
+    let before_restart_taker = core.portfolio_snapshot_for_identity(taker_commitment, 1_160);
+    let snapshot = core.export_encrypted_snapshot().unwrap();
+    let mut restored = PrivateTradingCore::restore_encrypted_snapshot(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([209u8; 48]),
+        &snapshot,
+        snapshot.sequence,
+    )
+    .unwrap();
+    assert_eq!(restored.state_root(), core.state_root());
+    assert_eq!(
+        restored.portfolio_snapshot_for_identity(maker_commitment, 1_160),
+        before_restart_maker
+    );
+    assert_eq!(
+        restored.portfolio_snapshot_for_identity(taker_commitment, 1_160),
+        before_restart_taker
+    );
+    assert_eq!(restored.balance(&maker_up), 1_000_000);
+    assert_eq!(restored.balance(&taker_down), 1_000_000);
+    assert_eq!(restored.balance(&collateral), 1_000_000);
+    let restored_root = restored.state_root();
+    let restored_replay = restored.execute(taker_command, 1_160).unwrap();
+    assert_eq!(restored_replay.result, fill.result);
+    assert_eq!(restored_replay.receipt, fill.receipt);
+    assert_eq!(restored_replay.receipt_state, fill.receipt_state);
+    assert_eq!(restored_replay.audit_fills, fill.audit_fills);
+    assert_eq!(
+        restored_replay.task_qualifications,
+        fill.task_qualifications
+    );
+    assert!(restored_replay.encrypted_record.is_none());
+    assert_eq!(restored.state_root(), restored_root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn btc_direct_execution_handles_one_thousand_orders_from_concurrent_sessions() {
+    const BTC_MARKET: &str = "layrs:v5:BTC:USDC:15m:quest-scale";
+    const INITIAL_USDC: u128 = 10_000_000;
+    const ORDER_QUANTITY: u128 = 250_000;
+    let makers = std::env::var("LAYRS_SCALE_MAKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(50);
+    let takers = std::env::var("LAYRS_SCALE_TAKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(50);
+    let orders_per_session = std::env::var("LAYRS_SCALE_ORDERS_PER_SESSION")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(10);
+    assert!(makers > 0 && takers > 0 && orders_per_session > 0);
+    assert_eq!(makers * orders_per_session, takers * orders_per_session);
+    let journal_key = [210u8; 32];
+    let mut core = PrivateTradingCore::new(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([211u8; 48]),
+    );
+    core.register_market(
+        "sys:market:btc-direct-scale".into(),
+        MarketConfig {
+            market_id: BTC_MARKET.into(),
+            settlement_asset: "USDC".into(),
+            settlement_decimals: 6,
+            public_settlement_chain: Some("horizen".into()),
+            opens_at_millis: 900,
+            closes_at_millis: 3_000,
+            minimum_quantity_micros: ORDER_QUANTITY,
+            maximum_quantity_micros: 10_000_000,
+            minimum_order_notional_micros: 1,
+            maximum_order_notional_micros: 10_000_000,
+            maximum_user_position_micros: 10_000_000,
+            maximum_pending_bootstrap_notional_micros: 1_000_000_000,
+            tick_size_micros: 10_000,
+            oracle_feed_id: 9002,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
+            execution: MarketExecution::NativeExactCondition {
+                condition_id: format!("0x{}", "43".repeat(32)),
+                up_outcome_index: 0,
+                down_outcome_index: 1,
+            },
+        },
+        800,
+    )
+    .unwrap();
+
+    let mut maker_identities = Vec::with_capacity(makers);
+    let mut taker_identities = Vec::with_capacity(takers);
+    for index in 0..(makers + takers) {
+        let key_bytes: [u8; 32] =
+            Sha256::digest(format!("btc-scale:key:{index}").as_bytes()).into();
+        let key = SigningKey::from_bytes(&key_bytes);
+        let commitment: [u8; 32] =
+            Sha256::digest(format!("btc-scale:commitment:{index}").as_bytes()).into();
+        let evidence: [u8; 32] =
+            Sha256::digest(format!("btc-scale:evidence:{index}").as_bytes()).into();
+        let label = if index < makers {
+            format!("maker:{index}")
+        } else {
+            format!("taker:{}", index - makers)
+        };
+        core.register_session(
+            format!("sys:session:btc-scale:{label}"),
+            format!("session:btc-scale:{label}"),
+            commitment,
+            key.verifying_key().to_bytes(),
+            4_000,
+            850,
+        )
+        .unwrap();
+        core.apply_user_external_flow(
+            format!("sys:deposit:btc-scale:{label}"),
+            commitment,
+            "USDC".into(),
+            AccountBucket::UserAvailable,
+            INITIAL_USDC,
+            ExternalFlowDirection::Inflow,
+            evidence,
+            875,
+        )
+        .unwrap();
+        let identity = (
+            key,
+            commitment,
+            derived_private_user(journal_key, commitment),
+        );
+        if index < makers {
+            maker_identities.push(identity);
+        } else {
+            taker_identities.push(identity);
+        }
+    }
+
+    let core = Arc::new(tokio::sync::Mutex::new(core));
+    let started = Instant::now();
+    let mut maker_tasks = Vec::with_capacity(makers);
+    for (maker_index, (key, _, _)) in maker_identities.iter().cloned().enumerate() {
+        let core = Arc::clone(&core);
+        maker_tasks.push(tokio::spawn(async move {
+            for order_index in 0..orders_per_session {
+                let command_id = format!("cmd:btc-scale:maker:{maker_index}:{order_index}");
+                let command = signed_command(
+                    &key,
+                    &format!("session:btc-scale:maker:{maker_index}"),
+                    u64::try_from(order_index + 1).unwrap(),
+                    &command_id,
+                    UserCommandAction::SubmitOrder {
+                        order: BookOrder::with_id(
+                            Uuid::from_u128(
+                                100_000
+                                    + u128::try_from(
+                                        maker_index * orders_per_session + order_index,
+                                    )
+                                    .unwrap(),
+                            ),
+                            "ignored",
+                            BTC_MARKET,
+                            Outcome::Up,
+                            OrderAction::Buy,
+                            400_000,
+                            ORDER_QUANTITY,
+                            TimeInForce::Gtc,
+                            None,
+                        ),
+                    },
+                    1_000,
+                );
+                let idempotency_key = command.idempotency_key.clone();
+                let mut core = core.lock().await;
+                let response = core.execute(command, 1_000).unwrap();
+                assert!(order_result(&response.result).fills.is_empty());
+                let recovery = core
+                    .signed_recovery_bridge_artifact(
+                        &idempotency_key,
+                        "test",
+                        Sha256::digest(command_id.as_bytes()).into(),
+                        1,
+                    )
+                    .unwrap();
+                core.acknowledge_recovery_archive(
+                    format!("sys:ack:{command_id}"),
+                    idempotency_key,
+                    recovery.result_digest,
+                    Sha256::digest(format!("archive:{command_id}").as_bytes()).into(),
+                    1_000,
+                )
+                .unwrap();
+            }
+        }));
+    }
+    for task in maker_tasks {
+        task.await.unwrap();
+    }
+
+    let fill_count = Arc::new(AtomicUsize::new(0));
+    let mut taker_tasks = Vec::with_capacity(takers);
+    for (taker_index, (key, _, _)) in taker_identities.iter().cloned().enumerate() {
+        let core = Arc::clone(&core);
+        let fill_count = Arc::clone(&fill_count);
+        taker_tasks.push(tokio::spawn(async move {
+            for order_index in 0..orders_per_session {
+                let command_id = format!("cmd:btc-scale:taker:{taker_index}:{order_index}");
+                let command = signed_command(
+                    &key,
+                    &format!("session:btc-scale:taker:{taker_index}"),
+                    u64::try_from(order_index + 1).unwrap(),
+                    &command_id,
+                    UserCommandAction::SubmitOrder {
+                        order: BookOrder::with_id(
+                            Uuid::from_u128(
+                                200_000
+                                    + u128::try_from(
+                                        taker_index * orders_per_session + order_index,
+                                    )
+                                    .unwrap(),
+                            ),
+                            "ignored",
+                            BTC_MARKET,
+                            Outcome::Down,
+                            OrderAction::Buy,
+                            600_000,
+                            ORDER_QUANTITY,
+                            TimeInForce::Fok,
+                            None,
+                        ),
+                    },
+                    1_100,
+                );
+                let idempotency_key = command.idempotency_key.clone();
+                let mut core = core.lock().await;
+                let response = core.execute(command, 1_100).unwrap();
+                assert_eq!(response.receipt_state, CommandReceiptState::Filled);
+                assert_eq!(order_result(&response.result).fills.len(), 1);
+                let recovery = core
+                    .signed_recovery_bridge_artifact(
+                        &idempotency_key,
+                        "test",
+                        Sha256::digest(command_id.as_bytes()).into(),
+                        1,
+                    )
+                    .unwrap();
+                core.acknowledge_recovery_archive(
+                    format!("sys:ack:{command_id}"),
+                    idempotency_key,
+                    recovery.result_digest,
+                    Sha256::digest(format!("archive:{command_id}").as_bytes()).into(),
+                    1_100,
+                )
+                .unwrap();
+                fill_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+    for task in taker_tasks {
+        task.await.unwrap();
+    }
+    let elapsed = started.elapsed();
+    assert_eq!(
+        fill_count.load(Ordering::Relaxed),
+        takers * orders_per_session
+    );
+
+    let core = match Arc::try_unwrap(core) {
+        Ok(core) => core.into_inner(),
+        Err(_) => panic!("all concurrent BTC order tasks must release the core"),
+    };
+    let mut collateral = AccountKey::new("layrs", AccountBucket::MarketCollateral, "USDC");
+    collateral.market_id = Some(BTC_MARKET.into());
+    let fees = AccountKey::new("layrs", AccountBucket::FeeRevenue, "USDC");
+    assert_eq!(
+        core.balance(&collateral),
+        u128::try_from(takers * orders_per_session).unwrap() * ORDER_QUANTITY
+    );
+    let available_total = maker_identities
+        .iter()
+        .chain(&taker_identities)
+        .map(|(_, _, owner)| {
+            core.balance(&AccountKey::new(
+                owner,
+                AccountBucket::UserAvailable,
+                "USDC",
+            ))
+        })
+        .sum::<u128>();
+    assert_eq!(
+        available_total + core.balance(&collateral) + core.balance(&fees),
+        u128::try_from(makers + takers).unwrap() * INITIAL_USDC
+    );
+    let first_maker = &maker_identities[0];
+    let first_taker = &taker_identities[0];
+    let maker_portfolio = core.portfolio_snapshot_for_identity(first_maker.1, 1_200);
+    let taker_portfolio = core.portfolio_snapshot_for_identity(first_taker.1, 1_200);
+    let expected_position =
+        (u128::try_from(orders_per_session).unwrap() * ORDER_QUANTITY).to_string();
+    assert_eq!(
+        maker_portfolio.positions[0].quantity_micros,
+        expected_position
+    );
+    assert_eq!(
+        taker_portfolio.positions[0].quantity_micros,
+        expected_position
+    );
+
+    let snapshot = core.export_encrypted_snapshot().unwrap();
+    let restored = PrivateTradingCore::restore_encrypted_snapshot(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([212u8; 48]),
+        &snapshot,
+        snapshot.sequence,
+    )
+    .unwrap();
+    assert_eq!(restored.state_root(), core.state_root());
+    assert_eq!(
+        restored.portfolio_snapshot_for_identity(first_maker.1, 1_200),
+        maker_portfolio
+    );
+    assert_eq!(
+        restored.portfolio_snapshot_for_identity(first_taker.1, 1_200),
+        taker_portfolio
+    );
+    eprintln!(
+        "completed {} signed BTC orders with up to {} simultaneous callers across {} sessions in {:?}",
+        (makers + takers) * orders_per_session,
+        makers.max(takers),
+        makers + takers,
+        elapsed
     );
 }
 
@@ -1208,6 +1766,17 @@ fn layrs_curve_fee_and_maker_rebate_are_private_and_conserved_on_mint() {
         taker_fill.audit_fills[0].statement.fee_atomic,
         "16800000000000000"
     );
+    // S05 posts the full governed LAYRS_FEE_V2 taker fee to private fee
+    // revenue. The maker rebate remains a separately accrued entitlement and
+    // is neither netted from collateral nor paid during the fill.
+    assert_eq!(
+        core.balance(&AccountKey::new("layrs", AccountBucket::FeeRevenue, "ZEN")),
+        16_800_000_000_000_000
+    );
+    assert_eq!(
+        core.balance(&market_collateral()),
+        1_000_000_000_000_000_000
+    );
 
     let maker_rewards = execute(
         &mut core,
@@ -1409,6 +1978,22 @@ fn execute(
     action: UserCommandAction,
     now_millis: i64,
 ) -> clob_service::private_core::CoreResponse {
+    core.execute(
+        signed_command(key, session_id, sequence, command_id, action, now_millis),
+        now_millis,
+    )
+    .unwrap()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn signed_command(
+    key: &SigningKey,
+    session_id: &str,
+    sequence: u64,
+    command_id: &str,
+    action: UserCommandAction,
+    now_millis: i64,
+) -> UserCommand {
     let idempotency_key = format!("idem:{command_id}");
     let request_hash = command_request_hash(command_id, &idempotency_key, &action).unwrap();
     let request = SessionRequest {
@@ -1419,16 +2004,12 @@ fn execute(
         request_hash,
     };
     let signature = key.sign(&signing_payload(&request)).to_bytes().to_vec();
-    core.execute(
-        UserCommand {
-            command_id: command_id.into(),
-            idempotency_key,
-            session: SignedSessionRequest { request, signature },
-            action,
-        },
-        now_millis,
-    )
-    .unwrap()
+    UserCommand {
+        command_id: command_id.into(),
+        idempotency_key,
+        session: SignedSessionRequest { request, signature },
+        action,
+    }
 }
 
 fn order_result(result: &CommandResult) -> &clob_service::private_core::MatchResult {

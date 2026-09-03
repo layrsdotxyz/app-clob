@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -13,12 +14,14 @@ use super::rewards::{
     PrivateRewardBook, PrivateRewardEntitlement, RewardClaimAuthorization, RewardClaimIntent,
 };
 use super::{
-    AccountBucket, AccountKey, BookOrder, ClaimPayout, CompleteSetDirection,
-    CompleteSetTransaction, CoreError, CoreResult, EnclaveReceipt, EncryptedJournal,
+    command_result_commitment, AccountBucket, AccountKey, BookOrder, ClaimPayout,
+    CommandReceiptState, CompleteSetDirection, CompleteSetFillPosting, CompleteSetTransaction,
+    CoreError, CoreResult, CustodyLedgerTotal, EnclaveReceipt, EncryptedJournal,
     EncryptedJournalRecord, EncryptedSnapshot, ExternalFlowDirection, ExternalFlowTransaction,
-    Fill, JournalKey, Ledger, LedgerTransaction, MatchResult, MatchType, OrderAction, OrderStatus,
-    Outcome, PriceTimeBook, ReceiptSigner, SessionGuard, SignedSessionRequest, Transfer,
-    PRICE_SCALE,
+    Fill, JournalKey, Ledger, LedgerTransaction, MatchResult, MatchType, NormalFillPosting,
+    OrderAction, OrderStatus, Outcome, PoolCashOpening, PriceTimeBook, PublicAssetTotal,
+    PublicBucketTotal, ReceiptSigner, ResolutionPayoutKind, SessionGuard, SignedSessionRequest,
+    TimeInForce, Transfer, VaultStrategyTransaction, VaultStrategyTransition, PRICE_SCALE,
 };
 
 /// Public depth is deliberately less precise than the enclave's private book.
@@ -26,6 +29,92 @@ use super::{
 /// owners before it can leave the enclave. This prevents a thin public level
 /// from acting as an oracle for one user's exact order size and arrival time.
 const MIN_PUBLIC_DEPTH_DISTINCT_OWNERS: usize = 3;
+/// The quest liquidity account is the sole funded maker for the rolling BTC
+/// one-hour market. When the same build-time quest gate that permits direct
+/// crypto execution is enabled, publish its bucketed BTC/USDC 1h depth without
+/// weakening the privacy floor for any other market namespace.
+const QUEST_BTC_1H_PUBLIC_DEPTH_DISTINCT_OWNERS: usize = 1;
+
+fn minimum_public_depth_distinct_owners(market_id: &str) -> usize {
+    if matches!(option_env!("LAYRS_DIRECT_BTC_EXECUTION_ENABLED"), Some("1"))
+        && is_quest_btc_one_hour_market(market_id)
+    {
+        QUEST_BTC_1H_PUBLIC_DEPTH_DISTINCT_OWNERS
+    } else {
+        MIN_PUBLIC_DEPTH_DISTINCT_OWNERS
+    }
+}
+
+fn is_quest_btc_one_hour_market(market_id: &str) -> bool {
+    let mut segments = market_id.split(':');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (
+            Some("layrs"),
+            Some("v5"),
+            Some("BTC"),
+            Some("USDC"),
+            Some("1h"),
+            Some(slot),
+            None,
+        ) if slot.parse::<i64>().is_ok()
+    )
+}
+
+#[cfg(test)]
+mod quest_public_depth_policy_tests {
+    use super::*;
+
+    #[test]
+    fn quest_visibility_scope_accepts_only_exact_recurring_btc_usdc_one_hour_ids() {
+        assert!(is_quest_btc_one_hour_market(
+            "layrs:v5:BTC:USDC:1h:1788397200"
+        ));
+        for market_id in [
+            "layrs:v5:BTC:USDC:15m:1788397200",
+            "layrs:v5:ETH:USDC:1h:1788397200",
+            "layrs:v4:BTC:USDC:1h:1788397200",
+            "layrs:v5:BTC:USDC:1h:not-a-slot",
+            "layrs:v5:BTC:USDC:1h:1788397200:extra",
+        ] {
+            assert!(!is_quest_btc_one_hour_market(market_id), "{market_id}");
+        }
+    }
+
+    #[test]
+    fn quest_build_relaxes_only_the_exact_btc_one_hour_owner_floor() {
+        let expected_btc_floor =
+            if matches!(option_env!("LAYRS_DIRECT_BTC_EXECUTION_ENABLED"), Some("1")) {
+                QUEST_BTC_1H_PUBLIC_DEPTH_DISTINCT_OWNERS
+            } else {
+                MIN_PUBLIC_DEPTH_DISTINCT_OWNERS
+            };
+        assert_eq!(
+            minimum_public_depth_distinct_owners("layrs:v5:BTC:USDC:1h:1788397200"),
+            expected_btc_floor
+        );
+        assert_eq!(
+            minimum_public_depth_distinct_owners("layrs:v5:BTC:USDC:15m:1788397200"),
+            MIN_PUBLIC_DEPTH_DISTINCT_OWNERS
+        );
+        assert_eq!(
+            minimum_public_depth_distinct_owners("layrs:v5:ETH:USDC:1h:1788397200"),
+            MIN_PUBLIC_DEPTH_DISTINCT_OWNERS
+        );
+    }
+}
+/// Position-close quotes are deliberately short lived. They commit to the
+/// exact private book state and economics seen by the enclave, so a quote can
+/// neither be replayed after the book moves nor extended by an API client.
+const POSITION_CLOSE_QUOTE_TTL_MILLIS: i64 = 30_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketConfig {
@@ -114,6 +203,25 @@ pub enum FeeProfileId {
 impl FeeProfileId {
     fn is_legacy(&self) -> bool {
         matches!(self, Self::LegacyProfitV1)
+    }
+
+    /// Canonical immutable policy family persisted with each private fill.
+    /// The legacy `POLYMARKET_*` enum aliases execute the same governed Layrs
+    /// curve and are deliberately normalized so new evidence never revives the
+    /// obsolete provider-facing policy name.
+    fn fee_policy_version(self) -> &'static str {
+        if self.has_layrs_curve_fees() {
+            "LAYRS_FEE_V2"
+        } else {
+            "LAYRS_FEE_V1"
+        }
+    }
+
+    fn immutable_profile_id(self) -> String {
+        serde_json::to_string(&self)
+            .expect("fee profile enum serialization cannot fail")
+            .trim_matches('"')
+            .replace("POLYMARKET_", "LAYRS_")
     }
 
     fn parameters(self) -> Option<FeeProfileParameters> {
@@ -258,6 +366,8 @@ pub struct PolymarketRedemptionIntent {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum BootstrapExecutionState {
     FundsReserved,
+    VenueIntentDurable,
+    VenueSubmissionAttempted,
     VenueSubmitted,
     VenueConfirmed,
     Failed,
@@ -280,12 +390,22 @@ pub struct BootstrapExecutionView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapPreparedVenueOrder {
+    pub deterministic_order_id: String,
+    pub exact_request_body: String,
+    pub request_body_sha256: [u8; 32],
+    pub credential_generation_sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct BootstrapExecution {
     view: BootstrapExecutionView,
     private_user_id: String,
     reserved_atomic: u128,
     venue_order_id: Option<String>,
     venue_evidence_hash: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepared_venue_order: Option<BootstrapPreparedVenueOrder>,
     created_at_millis: i64,
 }
 
@@ -456,9 +576,36 @@ pub enum UserCommandAction {
     SubmitOrder {
         order: BookOrder,
     },
+    ReplaceOrder {
+        market_id: String,
+        order_id: Uuid,
+        replacement: BookOrder,
+    },
     CancelOrder {
         market_id: String,
         order_id: Uuid,
+    },
+    CancelAllOrders {
+        filter: CancelAllOrdersFilter,
+    },
+    PreviewPositionClose {
+        position_id: String,
+        market_id: String,
+        outcome: Outcome,
+        session_tag: String,
+        #[serde(with = "super::decimal_u128")]
+        quantity_micros: u128,
+        minimum_price_micros: u64,
+    },
+    ClosePosition {
+        position_id: String,
+        market_id: String,
+        outcome: Outcome,
+        session_tag: String,
+        #[serde(with = "super::decimal_u128")]
+        quantity_micros: u128,
+        minimum_price_micros: u64,
+        quote: PositionClosePreview,
     },
     CompleteSet {
         market_id: String,
@@ -499,6 +646,21 @@ pub enum UserCommandAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CancelAllOrdersFilter {
+    All,
+    Market { market_id: String },
+    Asset { asset: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelledOrderOutcome {
+    pub order_id: Uuid,
+    pub market_id: String,
+    pub status: OrderStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrivateBalance {
     pub asset: String,
     pub bucket: AccountBucket,
@@ -507,10 +669,30 @@ pub struct PrivateBalance {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrivatePosition {
+    pub position_id: String,
     pub market_id: String,
     pub outcome: String,
     pub quantity_micros: String,
     pub cost_basis_micros: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PositionClosePreview {
+    pub position_id: String,
+    #[serde(with = "super::decimal_u128")]
+    pub quantity_micros: u128,
+    pub minimum_price_micros: u64,
+    pub average_price_micros: u64,
+    #[serde(with = "super::decimal_u128")]
+    pub gross_payout_atomic: u128,
+    #[serde(with = "super::decimal_u128")]
+    pub fee_atomic: u128,
+    #[serde(with = "super::decimal_u128")]
+    pub net_payout_atomic: u128,
+    pub book_commitment_sha256: [u8; 32],
+    pub book_sequence: u64,
+    pub expires_at_millis: i64,
+    pub quote_commitment_sha256: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -519,6 +701,20 @@ pub struct PortfolioSnapshot {
     pub positions: Vec<PrivatePosition>,
     pub orders: Vec<BookOrder>,
     pub as_of_millis: i64,
+}
+
+/// Aggregate-only custody view returned over the authenticated enclave
+/// operator channel. It binds every amount to the exact private state root and
+/// sequence without exposing owners, positions, markets or orders.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustodyReconciliationSnapshot {
+    pub checkpoint_commitment: [u8; 32],
+    pub chain_finality_commitments: Vec<[u8; 32]>,
+    pub enclave_sequence: u64,
+    pub state_root: [u8; 32],
+    pub totals: Vec<CustodyLedgerTotal>,
+    pub receipt_public_key: [u8; 32],
+    pub signature: Vec<u8>,
 }
 
 /// Privacy-safe aggregate preflight for a market settlement. It deliberately
@@ -559,6 +755,19 @@ pub struct WithdrawalIntent {
     pub enclave_sequence: u64,
     pub state_root: [u8; 32],
     pub expires_at_millis: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_proof: Option<WithdrawalRecoveryProof>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WithdrawalRecoveryProof {
+    pub protocol_version: String,
+    pub original_idempotency_key: String,
+    pub terminal_enclave_sequence: u64,
+    pub terminal_state_root: [u8; 32],
+    pub terminal_journal_head: [u8; 32],
+    pub terminal_record_hash: [u8; 32],
+    pub recovered_at_millis: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -613,6 +822,34 @@ pub enum CommandResult {
     Cancelled {
         order: BookOrder,
     },
+    OrdersCancelled {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<CancelAllOrdersFilter>,
+        outcomes: Vec<CancelledOrderOutcome>,
+    },
+    PositionClosePreview {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        market_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<Outcome>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_tag: Option<String>,
+        preview: PositionClosePreview,
+    },
+    PositionClosed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        market_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<Outcome>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_tag: Option<String>,
+        preview: PositionClosePreview,
+        order_id: Uuid,
+    },
+    Replaced {
+        cancelled: BookOrder,
+        result: MatchResult,
+    },
     CompleteSet {
         market_id: String,
         #[serde(with = "super::decimal_u128")]
@@ -658,6 +895,8 @@ pub enum CommandResult {
 pub struct CoreResponse {
     pub result: CommandResult,
     pub receipt: EnclaveReceipt,
+    pub receipt_state: CommandReceiptState,
+    pub receipt_disclosure_nonce: [u8; 32],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_record: Option<EncryptedJournalRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -668,6 +907,25 @@ pub struct CoreResponse {
     pub audit_fills: Vec<SignedAuditFillArtifact>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub task_qualifications: Vec<SignedTaskQualificationArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryBridgeArtifact {
+    pub protocol_version: String,
+    pub environment: String,
+    pub command_idempotency_key: String,
+    pub result_digest: [u8; 32],
+    pub enclave_sequence: u64,
+    pub command_commitment_sha256: [u8; 32],
+    pub state_root: [u8; 32],
+    pub receipt_id: String,
+    pub response_envelope_sha256: [u8; 32],
+    pub response_envelope_bytes: u64,
+    pub response_status: u16,
+    pub content_type: String,
+    pub observed_at_millis: i64,
+    pub expires_at_millis: i64,
+    pub signature: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -713,13 +971,16 @@ struct AuditFillDraft {
 
 /// Privacy-minimized evidence that an encrypted order was accepted by the attested core.
 ///
-/// The statement deliberately omits the user, market, side, outcome and limit price. The
-/// commitment binds those private fields inside the enclave, while the public notional is the
-/// minimum disclosure required for an external quest verifier.
+/// The statement deliberately omits the user, side, outcome and limit price. A market identifier
+/// is disclosed only for newly accepted orders so the backend can publish that exact active
+/// market rather than spending registry gas on speculative inventory. Historical artifacts omit
+/// it and remain byte-compatible.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskQualificationStatement {
     pub protocol_version: String,
     pub event_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_id: Option<String>,
     pub order_commitment: [u8; 32],
     pub settlement_asset: String,
     #[serde(with = "super::decimal_u128")]
@@ -761,6 +1022,50 @@ struct ProcessedCommand {
     response: Option<CoreResponse>,
 }
 
+const MAX_RECOVERY_CAPSULES: usize = 256;
+const MAX_RECOVERY_CAPSULE_BYTES: usize = 64 * 1024;
+const MAX_RECOVERY_WINDOW_BYTES: usize = 16 * 1024 * 1024;
+const MAX_RECOVERY_FILLS: usize = 64;
+
+/// A bounded, encrypted-snapshot recovery record for a committed private
+/// command. The exact command/context binding remains in the rooted
+/// `processed-command` marker; the result hash has its own rooted marker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RecoveryCapsule {
+    sequence: u64,
+    request_hash: [u8; 32],
+    result_digest: [u8; 32],
+    result: CommandResult,
+    receipt: EnclaveReceipt,
+    #[serde(default)]
+    receipt_state: CommandReceiptState,
+    #[serde(default)]
+    receipt_disclosure_nonce: [u8; 32],
+    /// The exact signed withdrawal authorization returned by the committed
+    /// command. Keeping it inside the encrypted snapshot lets an exact replay
+    /// survive an enclave restart without minting a replacement withdrawal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    withdrawal_authorization: Option<WithdrawalAuthorization>,
+    audit_fills: Vec<SignedAuditFillArtifact>,
+    task_qualifications: Vec<SignedTaskQualificationArtifact>,
+}
+
+impl RecoveryCapsule {
+    fn response(&self) -> CoreResponse {
+        CoreResponse {
+            result: self.result.clone(),
+            receipt: self.receipt.clone(),
+            receipt_state: self.receipt_state,
+            receipt_disclosure_nonce: self.receipt_disclosure_nonce,
+            encrypted_record: None,
+            withdrawal_authorization: self.withdrawal_authorization.clone(),
+            reward_claim_authorization: None,
+            audit_fills: self.audit_fills.clone(),
+            task_qualifications: self.task_qualifications.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 enum JournaledSystemCommand {
@@ -789,6 +1094,26 @@ enum JournaledSystemCommand {
         idempotency_key: String,
         flow: ExternalFlowTransaction,
     },
+    ConfirmedDeposit {
+        idempotency_key: String,
+        flow: ExternalFlowTransaction,
+    },
+    ConfirmedWithdrawal {
+        idempotency_key: String,
+        flow: ExternalFlowTransaction,
+    },
+    VaultStrategyTransition {
+        idempotency_key: String,
+        transaction: VaultStrategyTransaction,
+    },
+    HistoricalPoolCashOpening {
+        idempotency_key: String,
+        evidence_hash: [u8; 32],
+        openings: Vec<PoolCashOpening>,
+        source_sequence: u64,
+        source_state_root: [u8; 32],
+        source_journal_head: [u8; 32],
+    },
     AccrueReward {
         idempotency_key: String,
         identity_commitment: [u8; 32],
@@ -797,6 +1122,12 @@ enum JournaledSystemCommand {
         #[serde(with = "super::decimal_u128")]
         amount_atomic: u128,
         evidence_hash: [u8; 32],
+        source_id_hash: [u8; 32],
+        program_id: String,
+        program_type: String,
+        policy_id: String,
+        policy_version: u32,
+        fee_policy_version: String,
     },
     ReleaseWithdrawal {
         idempotency_key: String,
@@ -816,6 +1147,17 @@ enum JournaledSystemCommand {
         idempotency_key: String,
         resolution: MarketResolution,
     },
+    MarkBootstrapVenueIntentDurable {
+        idempotency_key: String,
+        execution_id: Uuid,
+        deterministic_order_id: String,
+        request_body_sha256: [u8; 32],
+        credential_generation_sha256: [u8; 32],
+    },
+    AuthorizeBootstrapSubmissionAttempt {
+        idempotency_key: String,
+        execution_id: Uuid,
+    },
     MarkBootstrapSubmitted {
         idempotency_key: String,
         execution_id: Uuid,
@@ -833,15 +1175,27 @@ enum JournaledSystemCommand {
         failure_code: String,
         evidence_hash: [u8; 32],
     },
+    AcknowledgeRecoveryArchive {
+        idempotency_key: String,
+        command_idempotency_key: String,
+        result_digest: [u8; 32],
+        archive_row_commitment: [u8; 32],
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CoreStateSnapshot {
+    #[serde(deserialize_with = "Ledger::deserialize_snapshot_compatible")]
     ledger: Ledger,
     books: BTreeMap<String, PriceTimeBook>,
     markets: BTreeMap<String, MarketConfig>,
     sessions: SessionGuard,
     processed_hashes: BTreeMap<String, [u8; 32]>,
+    /// Recent exact private results only. This window is deterministically
+    /// bounded before a snapshot is sealed; older commands remain committed
+    /// and return `PreviouslyProcessed` rather than being executed twice.
+    #[serde(default)]
+    recovery_capsules: BTreeMap<String, RecoveryCapsule>,
     system_keys: BTreeSet<String>,
     position_cost_basis: Vec<(PositionKey, u128)>,
     resolutions: BTreeMap<String, MarketResolution>,
@@ -855,12 +1209,192 @@ struct CoreStateSnapshot {
     sequence: u64,
 }
 
+pub const EXACT_LIVE_976_RELEASE_COMMIT: &str = "97614f37c05089708f93bf50ac8831adde98ab2f";
+pub const INCIDENT_TERMINAL_SEQUENCE: u64 = 161_919;
+pub const INCIDENT_TERMINAL_STATE_ROOT_HEX: &str =
+    "647bc1b6a8f48caf6460b8cafc20baedbb208815dc52c88e9bdde70191c67f6a";
+pub const INCIDENT_TERMINAL_JOURNAL_HEAD_HEX: &str =
+    "02c52dce702bd2e7e83b96bbe82f0169fc2fa961eef1c50ed5dc455cdd43c881";
+pub const INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX: &str =
+    "cb284d9b13bc8b17d20c75d44e4e3b68a1d29dec3a7a5b9fd80871f340ea8da9";
+
+/// Non-secret checkpoint fields supplied by the outer certification wrapper.
+/// Artifact checksums are revalidated by the runner before this reaches the
+/// private core; the core binds the semantic report to the same checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactLive976CheckpointBinding {
+    pub source_release_commit: String,
+    pub checkpoint_sha256: String,
+    pub sequence: u64,
+    pub state_root: [u8; 32],
+    pub journal_head: [u8; 32],
+}
+
+/// Privacy-safe result of restoring an exact 976 snapshot in the cumulative
+/// candidate. No account, order, market, session, balance or replay key is
+/// serialized into this report; only equality decisions and digests leave the
+/// attested recovery process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExactLive976RestoreReport {
+    pub source_release_commit: String,
+    pub checkpoint_sha256: String,
+    pub source_checkpoint_equal: bool,
+    pub sequence_equal: bool,
+    pub journal_head_equal: bool,
+    pub state_root_equal: bool,
+    pub users_equal: bool,
+    pub available_balances_equal: bool,
+    pub order_holds_equal: bool,
+    pub withdrawal_holds_equal: bool,
+    pub positions_equal: bool,
+    pub orders_equal: bool,
+    pub fills_equal: bool,
+    pub resolutions_equal: bool,
+    pub rewards_equal: bool,
+    pub fees_equal: bool,
+    pub markets_equal: bool,
+    pub replay_keys_equal: bool,
+    pub legacy_zero_balance_count: usize,
+    pub qualified_totals_digest: String,
+    pub user_state_digest: String,
+    pub pool_cash_opening_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExactTerminalCategoryDigests {
+    pub users_and_sessions_sha256: String,
+    pub available_balances_sha256: String,
+    pub order_holds_sha256: String,
+    pub withdrawal_holds_sha256: String,
+    pub positions_and_cost_basis_sha256: String,
+    pub order_books_sha256: String,
+    pub snapshot_fill_state_sha256: String,
+    pub resolutions_sha256: String,
+    pub rewards_sha256: String,
+    pub fees_sha256: String,
+    pub markets_sha256: String,
+    pub replay_state_sha256: String,
+    pub custody_qualified_totals_sha256: String,
+    pub composite_user_state_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExactTerminalCategoryEquality {
+    pub users_and_sessions_equal: bool,
+    pub available_balances_equal: bool,
+    pub order_holds_equal: bool,
+    pub withdrawal_holds_equal: bool,
+    pub positions_and_cost_basis_equal: bool,
+    pub order_books_equal: bool,
+    pub snapshot_fill_state_equal: bool,
+    pub resolutions_equal: bool,
+    pub rewards_equal: bool,
+    pub fees_equal: bool,
+    pub markets_equal: bool,
+    pub replay_state_equal: bool,
+    pub custody_qualified_totals_equal: bool,
+    pub composite_user_state_equal: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExactTerminalCategoryCounts {
+    pub user_count: usize,
+    pub registered_session_count: usize,
+    pub sequenced_session_count: usize,
+    pub ledger_record_count: usize,
+    pub position_cost_basis_count: usize,
+    pub order_count: usize,
+    pub market_count: usize,
+    pub resolution_count: usize,
+    pub processed_command_count: usize,
+    pub system_key_count: usize,
+    pub aggregate_bucket_total_count: usize,
+    pub aggregate_asset_total_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExactTerminalSnapshotRestoreReport {
+    pub source_release_commit: String,
+    pub restored_sequence: u64,
+    pub restored_state_root: String,
+    pub restored_journal_head: String,
+    pub snapshot_ciphertext_sha256: String,
+    pub aggregate_bucket_totals: Vec<PublicBucketTotal>,
+    pub aggregate_asset_totals: Vec<PublicAssetTotal>,
+    pub category_counts: ExactTerminalCategoryCounts,
+    pub category_digests: ExactTerminalCategoryDigests,
+    pub category_equality: ExactTerminalCategoryEquality,
+    pub sequence_equal: bool,
+    pub state_root_equal: bool,
+    pub journal_head_equal: bool,
+    pub aggregate_totals_equal: bool,
+    pub aggregate_totals_zero_delta: bool,
+    pub restore_floor_persisted: bool,
+    pub no_external_state_mutation_performed: bool,
+    pub pool_cash_opening_required: bool,
+    pub historical_journal_replay_performed: bool,
+    pub historical_fill_completeness_certified: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalSnapshotDigests {
+    users_and_sessions: [u8; 32],
+    available_balances: [u8; 32],
+    order_holds: [u8; 32],
+    withdrawal_holds: [u8; 32],
+    positions_and_cost_basis: [u8; 32],
+    order_books: [u8; 32],
+    snapshot_fill_state: [u8; 32],
+    resolutions: [u8; 32],
+    rewards: [u8; 32],
+    fees: [u8; 32],
+    markets: [u8; 32],
+    replay_state: [u8; 32],
+    custody_qualified_totals: [u8; 32],
+    composite_user_state: [u8; 32],
+    pool_cash_opening_required: bool,
+}
+
+#[derive(Clone, Copy)]
+struct TerminalSnapshotRestorePolicy {
+    sequence: u64,
+    state_root: [u8; 32],
+    journal_head: [u8; 32],
+    ciphertext_sha256: [u8; 32],
+}
+
+#[derive(Debug)]
+struct OfflineStateDigests {
+    users: [u8; 32],
+    available_balances: [u8; 32],
+    order_holds: [u8; 32],
+    withdrawal_holds: [u8; 32],
+    positions: [u8; 32],
+    orders: [u8; 32],
+    fills: [u8; 32],
+    resolutions: [u8; 32],
+    rewards: [u8; 32],
+    fees: [u8; 32],
+    markets: [u8; 32],
+    replay_keys: [u8; 32],
+    qualified_totals: [u8; 32],
+    user_state: [u8; 32],
+    pool_cash_opening_required: bool,
+}
+
+#[derive(Clone)]
 pub struct PrivateTradingCore {
     ledger: Ledger,
     books: BTreeMap<String, PriceTimeBook>,
     markets: BTreeMap<String, MarketConfig>,
     sessions: SessionGuard,
     processed: BTreeMap<String, ProcessedCommand>,
+    recovery_capsules: BTreeMap<String, RecoveryCapsule>,
     system_keys: BTreeSet<String>,
     journal: EncryptedJournal,
     receipt_signer: ReceiptSigner,
@@ -872,6 +1406,7 @@ pub struct PrivateTradingCore {
     trading_frozen: bool,
     sequence: u64,
     identity_key: [u8; 32],
+    custody_totals_cache: RefCell<Option<(u64, [u8; 32], Vec<CustodyLedgerTotal>)>>,
 }
 
 impl PrivateTradingCore {
@@ -883,6 +1418,7 @@ impl PrivateTradingCore {
             markets: BTreeMap::new(),
             sessions: SessionGuard::default(),
             processed: BTreeMap::new(),
+            recovery_capsules: BTreeMap::new(),
             system_keys: BTreeSet::new(),
             journal: EncryptedJournal::new(journal_key),
             receipt_signer,
@@ -894,6 +1430,7 @@ impl PrivateTradingCore {
             trading_frozen: false,
             sequence: 0,
             identity_key,
+            custody_totals_cache: RefCell::new(None),
         }
     }
 
@@ -1031,6 +1568,7 @@ impl PrivateTradingCore {
                 markets: self.markets.clone(),
                 sessions: self.sessions.clone(),
                 processed_hashes: processed_hashes(&self.processed),
+                recovery_capsules: self.recovery_capsules.clone(),
                 system_keys: self.system_keys.clone(),
                 position_cost_basis: self
                     .position_cost_basis
@@ -1059,6 +1597,7 @@ impl PrivateTradingCore {
             markets: self.markets.clone(),
             sessions: self.sessions.clone(),
             processed_hashes: processed_hashes(&self.processed),
+            recovery_capsules: self.recovery_capsules.clone(),
             system_keys: self.system_keys.clone(),
             position_cost_basis: self
                 .position_cost_basis
@@ -1106,6 +1645,7 @@ impl PrivateTradingCore {
             markets: self.markets.clone(),
             sessions: self.sessions.clone(),
             processed_hashes: processed_hashes(&self.processed),
+            recovery_capsules: self.recovery_capsules.clone(),
             system_keys: self.system_keys.clone(),
             position_cost_basis: self
                 .position_cost_basis
@@ -1141,6 +1681,156 @@ impl PrivateTradingCore {
         )
     }
 
+    /// Emits the persisted JSON shape used by the exact production source
+    /// release 97614f37. This synthetic fixture proves the additive
+    /// `recovery_capsules` default and root continuity; release operations must
+    /// still replay the real frozen production snapshot because the candidate
+    /// ledger decoder intentionally enforces stricter legacy-data invariants.
+    #[cfg(test)]
+    pub fn export_live_976_snapshot_for_test(&self) -> CoreResult<EncryptedSnapshot> {
+        let (journal_sequence, _) = self.journal.chain_head();
+        if journal_sequence != self.sequence {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        let mut value = serde_json::to_value(CoreStateSnapshot {
+            ledger: self.ledger.clone(),
+            books: self.books.clone(),
+            markets: self.markets.clone(),
+            sessions: self.sessions.clone(),
+            processed_hashes: processed_hashes(&self.processed),
+            recovery_capsules: self.recovery_capsules.clone(),
+            system_keys: self.system_keys.clone(),
+            position_cost_basis: self
+                .position_cost_basis
+                .iter()
+                .map(|(key, value)| (key.clone(), *value))
+                .collect(),
+            resolutions: self.resolutions.clone(),
+            oracle_public_key: self.oracle_public_key,
+            bootstrap_executions: self.bootstrap_executions.clone(),
+            private_rewards: self.private_rewards.clone(),
+            trading_frozen: self.trading_frozen,
+            sequence: self.sequence,
+        })
+        .map_err(|_| CoreError::JournalCrypto)?;
+        value
+            .as_object_mut()
+            .ok_or(CoreError::JournalCrypto)?
+            .remove("recovery_capsules");
+        self.journal.seal_snapshot(self.state_root(), &value)
+    }
+
+    /// Restores and compares a frozen exact-976 checkpoint without exporting
+    /// decrypted state. The supplied journal must be the complete immutable
+    /// chain through the snapshot head. Category booleans are computed from
+    /// independently digested source and restored candidate projections; they
+    /// are never caller-controlled switches.
+    pub fn certify_exact_live_976_restore(
+        journal_key: JournalKey,
+        receipt_signer: ReceiptSigner,
+        snapshot: &EncryptedSnapshot,
+        journal_records: &[EncryptedJournalRecord],
+        checkpoint: ExactLive976CheckpointBinding,
+    ) -> CoreResult<ExactLive976RestoreReport> {
+        EncryptedJournal::verify_complete_export(
+            journal_records,
+            snapshot.sequence,
+            snapshot.journal_head,
+            snapshot.state_root,
+        )?;
+
+        let source_journal = EncryptedJournal::new(journal_key.clone());
+        let (journal_fills, journal_fill_totals) = offline_journal_fill_evidence(
+            source_journal.decrypt_complete_export_json(journal_records)?,
+        )?;
+        let source: CoreStateSnapshot = source_journal.open_snapshot(snapshot)?;
+        if !source.recovery_capsules.is_empty() || source.sequence != snapshot.sequence {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        let source_digests = offline_state_digests(
+            &source.ledger,
+            &source.books,
+            &source.markets,
+            &source.sessions,
+            &source.processed_hashes,
+            &source.system_keys,
+            &source.position_cost_basis,
+            &source.resolutions,
+            &source.private_rewards,
+            &journal_fills,
+        )?;
+
+        let restored = Self::restore_encrypted_snapshot(
+            journal_key,
+            receipt_signer,
+            snapshot,
+            checkpoint.sequence,
+        )?;
+        let restored_processed = processed_hashes(&restored.processed);
+        let restored_positions: Vec<(PositionKey, u128)> = restored
+            .position_cost_basis
+            .iter()
+            .map(|(key, amount)| (key.clone(), *amount))
+            .collect();
+        let restored_digests = offline_state_digests(
+            &restored.ledger,
+            &restored.books,
+            &restored.markets,
+            &restored.sessions,
+            &restored_processed,
+            &restored.system_keys,
+            &restored_positions,
+            &restored.resolutions,
+            &restored.private_rewards,
+            &journal_fills,
+        )?;
+        let source_fills_consistent =
+            offline_fill_totals_equal(&source.books, &journal_fill_totals);
+        let restored_fills_consistent =
+            offline_fill_totals_equal(&restored.books, &journal_fill_totals);
+
+        let source_checkpoint_equal = checkpoint.source_release_commit
+            == EXACT_LIVE_976_RELEASE_COMMIT
+            && checkpoint.sequence == snapshot.sequence
+            && checkpoint.state_root == snapshot.state_root
+            && checkpoint.journal_head == snapshot.journal_head;
+        let sequence_equal =
+            source.sequence == restored.sequence && restored.sequence == checkpoint.sequence;
+        let journal_head_equal =
+            restored.journal.chain_head() == (checkpoint.sequence, checkpoint.journal_head);
+        let state_root_equal = restored.state_root() == source_state_root(&source)
+            && restored.state_root() == checkpoint.state_root;
+
+        Ok(ExactLive976RestoreReport {
+            source_release_commit: checkpoint.source_release_commit,
+            checkpoint_sha256: checkpoint.checkpoint_sha256,
+            source_checkpoint_equal,
+            sequence_equal,
+            journal_head_equal,
+            state_root_equal,
+            users_equal: source_digests.users == restored_digests.users,
+            available_balances_equal: source_digests.available_balances
+                == restored_digests.available_balances,
+            order_holds_equal: source_digests.order_holds == restored_digests.order_holds,
+            withdrawal_holds_equal: source_digests.withdrawal_holds
+                == restored_digests.withdrawal_holds,
+            positions_equal: source_digests.positions == restored_digests.positions,
+            orders_equal: source_digests.orders == restored_digests.orders,
+            fills_equal: source_digests.fills == restored_digests.fills
+                && source_fills_consistent
+                && restored_fills_consistent,
+            resolutions_equal: source_digests.resolutions == restored_digests.resolutions,
+            rewards_equal: source_digests.rewards == restored_digests.rewards,
+            fees_equal: source_digests.fees == restored_digests.fees,
+            markets_equal: source_digests.markets == restored_digests.markets,
+            replay_keys_equal: source_digests.replay_keys == restored_digests.replay_keys,
+            legacy_zero_balance_count: source.ledger.legacy_zero_balance_count(),
+            qualified_totals_digest: hex::encode(source_digests.qualified_totals),
+            user_state_digest: hex::encode(source_digests.user_state),
+            pool_cash_opening_required: source_digests.pool_cash_opening_required,
+        })
+    }
+
     pub fn restore_encrypted_snapshot(
         journal_key: JournalKey,
         receipt_signer: ReceiptSigner,
@@ -1158,15 +1848,26 @@ impl PrivateTradingCore {
         }
         let position_cost_basis: BTreeMap<PositionKey, u128> =
             state.position_cost_basis.into_iter().collect();
+        validate_recovery_capsules(
+            &state.recovery_capsules,
+            &state.processed_hashes,
+            &state.system_keys,
+            &identity_key,
+            state.sequence,
+        )?;
         let processed: BTreeMap<String, ProcessedCommand> = state
             .processed_hashes
             .into_iter()
             .map(|(key, request_hash)| {
+                let response = state
+                    .recovery_capsules
+                    .get(&key)
+                    .map(RecoveryCapsule::response);
                 (
                     key,
                     ProcessedCommand {
                         request_hash,
-                        response: None,
+                        response,
                     },
                 )
             })
@@ -1230,6 +1931,7 @@ impl PrivateTradingCore {
             markets: state.markets,
             sessions: state.sessions,
             processed,
+            recovery_capsules: state.recovery_capsules,
             system_keys: state.system_keys,
             journal,
             receipt_signer,
@@ -1241,6 +1943,255 @@ impl PrivateTradingCore {
             trading_frozen: state.trading_frozen,
             sequence: state.sequence,
             identity_key,
+            custody_totals_cache: RefCell::new(None),
+        })
+    }
+
+    /// Restores only the immutable terminal snapshot approved for the
+    /// 2026-08-25 incident. Every public checkpoint field is rejected before
+    /// decryption unless it is the exact sequence-161919 tuple.
+    pub fn restore_exact_incident_terminal_snapshot(
+        journal_key: JournalKey,
+        receipt_signer: ReceiptSigner,
+        snapshot: &EncryptedSnapshot,
+    ) -> CoreResult<(Self, ExactTerminalSnapshotRestoreReport)> {
+        Self::restore_terminal_snapshot_against_policy(
+            journal_key,
+            receipt_signer,
+            snapshot,
+            incident_terminal_restore_policy(),
+        )
+    }
+
+    fn restore_terminal_snapshot_against_policy(
+        journal_key: JournalKey,
+        receipt_signer: ReceiptSigner,
+        snapshot: &EncryptedSnapshot,
+        policy: TerminalSnapshotRestorePolicy,
+    ) -> CoreResult<(Self, ExactTerminalSnapshotRestoreReport)> {
+        validate_terminal_snapshot_against_policy(snapshot, policy)?;
+
+        let source_journal = EncryptedJournal::new(journal_key.clone());
+        let source: CoreStateSnapshot = source_journal.open_snapshot(snapshot)?;
+        if source.sequence != policy.sequence || source_state_root(&source) != policy.state_root {
+            return Err(CoreError::IncidentRecoveryPolicyMismatch);
+        }
+        let source_positions: Vec<(PositionKey, u128)> = source.position_cost_basis.to_vec();
+        let source_digests = terminal_snapshot_digests(
+            &source.ledger,
+            &source.books,
+            &source.markets,
+            &source.sessions,
+            &source.processed_hashes,
+            &source.system_keys,
+            &source_positions,
+            &source.resolutions,
+            &source.private_rewards,
+        )?;
+        let source_counts = terminal_category_counts(
+            &source.ledger,
+            &source.books,
+            &source.markets,
+            &source.sessions,
+            &source.processed_hashes,
+            &source.system_keys,
+            &source_positions,
+            &source.resolutions,
+        )?;
+        let aggregate_bucket_totals = source.ledger.terminal_public_bucket_totals()?;
+        let aggregate_asset_totals = source.ledger.terminal_public_asset_totals()?;
+
+        let restored = Self::restore_encrypted_snapshot(
+            journal_key,
+            receipt_signer,
+            snapshot,
+            policy.sequence,
+        )?;
+        if restored.sequence != policy.sequence
+            || restored.state_root() != policy.state_root
+            || restored.journal.chain_head() != (policy.sequence, policy.journal_head)
+        {
+            return Err(CoreError::IncidentRecoveryPolicyMismatch);
+        }
+        let restored_positions: Vec<(PositionKey, u128)> = restored
+            .position_cost_basis
+            .iter()
+            .map(|(key, amount)| (key.clone(), *amount))
+            .collect();
+        let restored_processed = processed_hashes(&restored.processed);
+        let restored_digests = terminal_snapshot_digests(
+            &restored.ledger,
+            &restored.books,
+            &restored.markets,
+            &restored.sessions,
+            &restored_processed,
+            &restored.system_keys,
+            &restored_positions,
+            &restored.resolutions,
+            &restored.private_rewards,
+        )?;
+        let restored_counts = terminal_category_counts(
+            &restored.ledger,
+            &restored.books,
+            &restored.markets,
+            &restored.sessions,
+            &restored_processed,
+            &restored.system_keys,
+            &restored_positions,
+            &restored.resolutions,
+        )?;
+        let restored_bucket_totals = restored.ledger.terminal_public_bucket_totals()?;
+        let restored_asset_totals = restored.ledger.terminal_public_asset_totals()?;
+        if source_digests != restored_digests
+            || source_counts != restored_counts
+            || aggregate_bucket_totals != restored_bucket_totals
+            || aggregate_asset_totals != restored_asset_totals
+        {
+            return Err(CoreError::IncidentRecoveryPolicyMismatch);
+        }
+
+        let category_equality = ExactTerminalCategoryEquality {
+            users_and_sessions_equal: true,
+            available_balances_equal: true,
+            order_holds_equal: true,
+            withdrawal_holds_equal: true,
+            positions_and_cost_basis_equal: true,
+            order_books_equal: true,
+            snapshot_fill_state_equal: true,
+            resolutions_equal: true,
+            rewards_equal: true,
+            fees_equal: true,
+            markets_equal: true,
+            replay_state_equal: true,
+            custody_qualified_totals_equal: true,
+            composite_user_state_equal: true,
+        };
+        let category_digests = ExactTerminalCategoryDigests {
+            users_and_sessions_sha256: hex::encode(source_digests.users_and_sessions),
+            available_balances_sha256: hex::encode(source_digests.available_balances),
+            order_holds_sha256: hex::encode(source_digests.order_holds),
+            withdrawal_holds_sha256: hex::encode(source_digests.withdrawal_holds),
+            positions_and_cost_basis_sha256: hex::encode(source_digests.positions_and_cost_basis),
+            order_books_sha256: hex::encode(source_digests.order_books),
+            snapshot_fill_state_sha256: hex::encode(source_digests.snapshot_fill_state),
+            resolutions_sha256: hex::encode(source_digests.resolutions),
+            rewards_sha256: hex::encode(source_digests.rewards),
+            fees_sha256: hex::encode(source_digests.fees),
+            markets_sha256: hex::encode(source_digests.markets),
+            replay_state_sha256: hex::encode(source_digests.replay_state),
+            custody_qualified_totals_sha256: hex::encode(source_digests.custody_qualified_totals),
+            composite_user_state_sha256: hex::encode(source_digests.composite_user_state),
+        };
+
+        Ok((
+            restored,
+            ExactTerminalSnapshotRestoreReport {
+                source_release_commit: EXACT_LIVE_976_RELEASE_COMMIT.into(),
+                restored_sequence: policy.sequence,
+                restored_state_root: hex::encode(policy.state_root),
+                restored_journal_head: hex::encode(policy.journal_head),
+                snapshot_ciphertext_sha256: hex::encode(policy.ciphertext_sha256),
+                aggregate_bucket_totals,
+                aggregate_asset_totals,
+                category_counts: source_counts,
+                category_digests,
+                category_equality,
+                sequence_equal: true,
+                state_root_equal: true,
+                journal_head_equal: true,
+                aggregate_totals_equal: true,
+                aggregate_totals_zero_delta: true,
+                restore_floor_persisted: true,
+                no_external_state_mutation_performed: true,
+                pool_cash_opening_required: source_digests.pool_cash_opening_required,
+                historical_journal_replay_performed: false,
+                historical_fill_completeness_certified: false,
+            },
+        ))
+    }
+
+    /// Restores an authenticated direct successor of the current committed
+    /// state. This is used only by the durable-command finalizer after the
+    /// encrypted successor snapshot and journal record have been made durable
+    /// outside the enclave. It deliberately refuses gaps, forks and rollback.
+    pub fn restore_successor_snapshot(&self, snapshot: &EncryptedSnapshot) -> CoreResult<Self> {
+        if snapshot.sequence
+            != self
+                .sequence
+                .checked_add(1)
+                .ok_or(CoreError::JournalChainMismatch)?
+        {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        let mut journal = self.journal.clone();
+        let state: CoreStateSnapshot = journal.open_snapshot(snapshot)?;
+        if state.sequence != snapshot.sequence {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        let position_cost_basis: BTreeMap<PositionKey, u128> =
+            state.position_cost_basis.into_iter().collect();
+        validate_recovery_capsules(
+            &state.recovery_capsules,
+            &state.processed_hashes,
+            &state.system_keys,
+            &self.identity_key,
+            state.sequence,
+        )?;
+        let processed: BTreeMap<String, ProcessedCommand> = state
+            .processed_hashes
+            .into_iter()
+            .map(|(key, request_hash)| {
+                let response = state
+                    .recovery_capsules
+                    .get(&key)
+                    .map(RecoveryCapsule::response);
+                (
+                    key,
+                    ProcessedCommand {
+                        request_hash,
+                        response,
+                    },
+                )
+            })
+            .collect();
+        let computed_root = state_root(
+            &state.ledger,
+            &state.books,
+            &state.markets,
+            &state.sessions,
+            &processed_hashes(&processed),
+            &state.system_keys,
+            &position_cost_basis,
+            &state.resolutions,
+            &state.oracle_public_key,
+            &state.bootstrap_executions,
+            &state.private_rewards,
+            state.trading_frozen,
+            state.sequence,
+        );
+        if computed_root != snapshot.state_root {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        journal.restore_chain_head(snapshot.sequence, snapshot.journal_head)?;
+        Ok(Self {
+            ledger: state.ledger,
+            books: state.books,
+            markets: state.markets,
+            sessions: state.sessions,
+            processed,
+            recovery_capsules: state.recovery_capsules,
+            system_keys: state.system_keys,
+            journal,
+            receipt_signer: self.receipt_signer.clone(),
+            position_cost_basis,
+            resolutions: state.resolutions,
+            oracle_public_key: state.oracle_public_key,
+            bootstrap_executions: state.bootstrap_executions,
+            private_rewards: state.private_rewards,
+            trading_frozen: state.trading_frozen,
+            sequence: state.sequence,
+            identity_key: self.identity_key,
+            custody_totals_cache: RefCell::new(None),
         })
     }
 
@@ -1262,8 +2213,392 @@ impl PrivateTradingCore {
         )
     }
 
+    pub fn custody_reconciliation_snapshot(
+        &self,
+        checkpoint_commitment: [u8; 32],
+        chain_finality_commitments: Vec<[u8; 32]>,
+    ) -> CoreResult<CustodyReconciliationSnapshot> {
+        if checkpoint_commitment == [0; 32]
+            || chain_finality_commitments.len() != 2
+            || chain_finality_commitments.contains(&[0; 32])
+            || chain_finality_commitments[0] == chain_finality_commitments[1]
+        {
+            return Err(CoreError::InvalidOrder(
+                "custody snapshot requires one checkpoint and two distinct finality commitments"
+                    .into(),
+            ));
+        }
+        let state_root = self.state_root();
+        let totals = self
+            .custody_totals_cache
+            .borrow()
+            .as_ref()
+            .filter(|(sequence, root, _)| *sequence == self.sequence && *root == state_root)
+            .map(|(_, _, totals)| totals.clone())
+            .unwrap_or(self.ledger.custody_reconciliation_totals()?);
+        *self.custody_totals_cache.borrow_mut() = Some((self.sequence, state_root, totals.clone()));
+        let mut snapshot = CustodyReconciliationSnapshot {
+            checkpoint_commitment,
+            chain_finality_commitments,
+            enclave_sequence: self.sequence,
+            state_root,
+            totals,
+            receipt_public_key: self.receipt_signer.verifying_key(),
+            signature: Vec::new(),
+        };
+        snapshot.signature = self
+            .receipt_signer
+            .sign_domain_payload(b"layrs.custody-reconciliation-snapshot.v1\0", &snapshot);
+        Ok(snapshot)
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
     pub fn trading_frozen(&self) -> bool {
         self.trading_frozen
+    }
+
+    /// Recovers only a byte-for-byte identical committed user command.
+    ///
+    /// This check is intentionally available before a fresh NSM clock read so a
+    /// lost HTTP response can be recovered even during a temporary NSM failure.
+    /// Legacy processed entries without the rooted full-command marker remain
+    /// non-recoverable and return `PreviouslyProcessed`.
+    pub fn recover_exact_user_command(
+        &self,
+        command: &UserCommand,
+    ) -> CoreResult<Option<CoreResponse>> {
+        let expected_hash = command_request_hash(
+            &command.command_id,
+            &command.idempotency_key,
+            &command.action,
+        )?;
+        if command.session.request.request_hash != expected_hash {
+            return Err(CoreError::RequestHashMismatch);
+        }
+        let Some(processed) = self.processed.get(&command.idempotency_key) else {
+            return Ok(None);
+        };
+        if processed.request_hash != expected_hash {
+            return Err(CoreError::DuplicateCommand);
+        }
+        if !self.system_keys.contains(&processed_command_marker(
+            &command.idempotency_key,
+            full_user_command_commitment(command)?,
+        )) {
+            return Err(CoreError::PreviouslyProcessed);
+        }
+        processed
+            .response
+            .clone()
+            .map(Some)
+            .ok_or(CoreError::PreviouslyProcessed)
+    }
+
+    /// Returns the exact cached response for a committed withdrawal, bound to
+    /// both its public identifier and originating private session. This is a
+    /// read-only operator recovery primitive: it never releases a hold, creates
+    /// a replacement command, or advances the enclave sequence/state root.
+    pub fn recover_withdrawal_authorization(
+        &self,
+        withdrawal_id: Uuid,
+        session_id: &str,
+    ) -> CoreResult<Option<CoreResponse>> {
+        if session_id.is_empty() {
+            return Err(CoreError::InvalidOrder(
+                "withdrawal recovery requires a session".into(),
+            ));
+        }
+        let mut match_found = None;
+        for processed in self.processed.values() {
+            let Some(response) = &processed.response else {
+                continue;
+            };
+            let CommandResult::WithdrawalReserved {
+                withdrawal_id: candidate_id,
+                chain,
+                asset,
+                amount_atomic,
+                destination,
+            } = &response.result
+            else {
+                continue;
+            };
+            if *candidate_id != withdrawal_id {
+                continue;
+            }
+            let authorization = response
+                .withdrawal_authorization
+                .as_ref()
+                .ok_or(CoreError::InvalidRecoveryCapsule)?;
+            if authorization.intent.session_id != session_id {
+                continue;
+            }
+            if authorization.intent.withdrawal_id != withdrawal_id
+                || authorization.intent.chain != *chain
+                || authorization.intent.asset != *asset
+                || authorization.intent.amount_atomic != amount_atomic.to_string()
+                || authorization.intent.destination != *destination
+                || authorization.intent.receipt_id != response.receipt.receipt_id
+                || authorization.intent.enclave_sequence != response.receipt.enclave_sequence
+                || authorization.intent.state_root != response.receipt.state_root
+            {
+                return Err(CoreError::InvalidRecoveryCapsule);
+            }
+            if match_found.replace(response.clone()).is_some() {
+                return Err(CoreError::InvalidRecoveryCapsule);
+            }
+        }
+        Ok(match_found)
+    }
+
+    /// Reissues a short-lived authorization for the exact withdrawal already
+    /// committed by the terminal encrypted journal record. This is a read-only
+    /// recovery: every command/result/marker/hold binding is verified and no
+    /// ledger, sequence, root, journal, or processed-command state is changed.
+    pub fn recover_terminal_withdrawal_authorization(
+        &self,
+        terminal_record: &EncryptedJournalRecord,
+        withdrawal_id: Uuid,
+        session_id: &str,
+        now_millis: i64,
+    ) -> CoreResult<CoreResponse> {
+        let entry: JournaledUserCommand = self
+            .journal
+            .decrypt_current_head(terminal_record, self.state_root())?;
+        let UserCommandAction::RequestWithdrawal {
+            withdrawal_id: command_withdrawal_id,
+            chain,
+            asset,
+            amount_atomic,
+            destination,
+        } = &entry.command.action
+        else {
+            return Err(CoreError::InvalidRecoveryCapsule);
+        };
+        let CommandResult::WithdrawalReserved {
+            withdrawal_id: result_withdrawal_id,
+            chain: result_chain,
+            asset: result_asset,
+            amount_atomic: result_amount,
+            destination: result_destination,
+        } = &entry.result
+        else {
+            return Err(CoreError::InvalidRecoveryCapsule);
+        };
+        if *command_withdrawal_id != withdrawal_id
+            || *result_withdrawal_id != withdrawal_id
+            || entry.command.session.request.session_id != session_id
+            || chain != result_chain
+            || asset != result_asset
+            || amount_atomic != result_amount
+            || destination != result_destination
+        {
+            return Err(CoreError::InvalidRecoveryCapsule);
+        }
+        let expected_hash = command_request_hash(
+            &entry.command.command_id,
+            &entry.command.idempotency_key,
+            &entry.command.action,
+        )?;
+        if entry.command.session.request.request_hash != expected_hash
+            || self
+                .processed
+                .get(&entry.command.idempotency_key)
+                .map(|processed| processed.request_hash)
+                != Some(expected_hash)
+            || !self.system_keys.contains(&processed_command_marker(
+                &entry.command.idempotency_key,
+                full_user_command_commitment(&entry.command)?,
+            ))
+            || !self.system_keys.contains(&withdrawal_reservation_marker(
+                session_id,
+                withdrawal_id,
+                chain,
+                asset,
+                &amount_atomic.to_string(),
+                destination,
+            )?)
+        {
+            return Err(CoreError::InvalidRecoveryCapsule);
+        }
+        let owner = self
+            .sessions
+            .registered_owner(session_id)
+            .ok_or(CoreError::UnknownSession)?;
+        if self.ledger.balance(&AccountKey::new(
+            owner,
+            AccountBucket::UserWithdrawalHold,
+            asset,
+        )) < *amount_atomic
+        {
+            return Err(CoreError::InvalidRecoveryCapsule);
+        }
+        let root = self.state_root();
+        let recovery_receipt = self.receipt_signer.sign(
+            format!("recover-withdrawal:{withdrawal_id}"),
+            format!("recovery:{}", entry.command.idempotency_key),
+            Some(expected_hash),
+            Some(false),
+            None,
+            None,
+            self.sequence,
+            root,
+            root,
+            terminal_record.record_hash,
+            now_millis,
+        );
+        let intent = WithdrawalIntent {
+            protocol_version: "layrs.withdrawal-recovery.v1".into(),
+            withdrawal_id,
+            session_id: session_id.to_owned(),
+            chain: chain.clone(),
+            asset: asset.clone(),
+            amount_atomic: amount_atomic.to_string(),
+            destination: destination.clone(),
+            receipt_id: recovery_receipt.receipt_id.clone(),
+            enclave_sequence: self.sequence,
+            state_root: root,
+            expires_at_millis: now_millis.saturating_add(15 * 60_000),
+            recovery_proof: Some(WithdrawalRecoveryProof {
+                protocol_version: "layrs.withdrawal-terminal-journal-proof.v1".into(),
+                original_idempotency_key: entry.command.idempotency_key,
+                terminal_enclave_sequence: terminal_record.sequence,
+                terminal_state_root: terminal_record.state_root,
+                terminal_journal_head: terminal_record.record_hash,
+                terminal_record_hash: terminal_record.record_hash,
+                recovered_at_millis: now_millis,
+            }),
+        };
+        let authorization = WithdrawalAuthorization {
+            signature: self
+                .receipt_signer
+                .sign_domain_payload(b"layrs.withdrawal-recovery-authorization.v1\0", &intent),
+            intent,
+        };
+        Ok(CoreResponse {
+            result: entry.result,
+            receipt: recovery_receipt,
+            receipt_state: CommandReceiptState::Accepted,
+            receipt_disclosure_nonce: [0; 32],
+            encrypted_record: None,
+            withdrawal_authorization: Some(authorization),
+            reward_claim_authorization: None,
+            audit_fills: Vec::new(),
+            task_qualifications: Vec::new(),
+        })
+    }
+
+    /// Attaches the chain signer output to the exact cached reward-claim
+    /// response after signing succeeds outside the financial core.
+    ///
+    /// The financial mutation and its rooted request marker are already
+    /// committed by `execute`. This method may only enrich that exact cached
+    /// response with an authorization whose intent is byte-for-byte identical
+    /// to the rooted command result. It does not alter financial state, journal
+    /// sequence, or the state root. This makes a byte-identical transport retry
+    /// return the original signed authorization instead of authorizing twice.
+    pub fn attach_reward_claim_authorization(
+        &mut self,
+        command: &UserCommand,
+        authorization: RewardClaimAuthorization,
+    ) -> CoreResult<()> {
+        let expected_hash = command_request_hash(
+            &command.command_id,
+            &command.idempotency_key,
+            &command.action,
+        )?;
+        if command.session.request.request_hash != expected_hash {
+            return Err(CoreError::RequestHashMismatch);
+        }
+        let processed = self
+            .processed
+            .get_mut(&command.idempotency_key)
+            .ok_or(CoreError::PreviouslyProcessed)?;
+        if processed.request_hash != expected_hash {
+            return Err(CoreError::DuplicateCommand);
+        }
+        let response = processed
+            .response
+            .as_mut()
+            .ok_or(CoreError::PreviouslyProcessed)?;
+        let CommandResult::RewardClaimAuthorized { intent } = &response.result else {
+            return Err(CoreError::InvalidOrder(
+                "reward authorization does not match command result".into(),
+            ));
+        };
+        if authorization.intent != *intent {
+            return Err(CoreError::InvalidOrder(
+                "reward authorization intent mismatch".into(),
+            ));
+        }
+        match &response.reward_claim_authorization {
+            Some(existing) if existing != &authorization => {
+                return Err(CoreError::InvalidOrder(
+                    "reward authorization already differs".into(),
+                ));
+            }
+            Some(_) => return Ok(()),
+            None => {}
+        }
+        response.reward_claim_authorization = Some(authorization);
+        Ok(())
+    }
+
+    pub fn signed_recovery_bridge_artifact(
+        &self,
+        command_idempotency_key: &str,
+        environment: &str,
+        response_envelope_sha256: [u8; 32],
+        response_envelope_bytes: u64,
+    ) -> Option<RecoveryBridgeArtifact> {
+        self.recovery_capsules
+            .get(command_idempotency_key)
+            .and_then(|capsule| {
+                let mut artifact = RecoveryBridgeArtifact {
+                    protocol_version: "layrs.private-response-recovery.v1".into(),
+                    environment: environment.to_owned(),
+                    command_idempotency_key: command_idempotency_key.to_owned(),
+                    result_digest: capsule.result_digest,
+                    enclave_sequence: capsule.sequence,
+                    command_commitment_sha256: capsule.request_hash,
+                    state_root: capsule.receipt.state_root,
+                    receipt_id: capsule.receipt.receipt_id.clone(),
+                    response_envelope_sha256,
+                    response_envelope_bytes,
+                    response_status: 200,
+                    content_type: "application/json".into(),
+                    observed_at_millis: capsule.receipt.occurred_at_millis,
+                    expires_at_millis: capsule
+                        .receipt
+                        .occurred_at_millis
+                        .checked_add(24 * 60 * 60 * 1_000)?,
+                    signature: Vec::new(),
+                };
+                artifact.signature = self.receipt_signer.sign_domain_payload(
+                    b"layrs.private-response-recovery-artifact.v1\0",
+                    &artifact,
+                );
+                Some(artifact)
+            })
+    }
+
+    /// Read-only reconciliation proof for an archive ACK whose response may
+    /// have been lost after the enclave committed it. The exact marker is
+    /// rooted by `acknowledge_recovery_archive`; absence never implies success.
+    pub fn recovery_archive_acknowledged(
+        &self,
+        command_idempotency_key: &str,
+        result_digest: [u8; 32],
+        archive_row_commitment: [u8; 32],
+    ) -> bool {
+        self.system_keys.contains(&recovery_archive_ack_marker(
+            command_idempotency_key,
+            result_digest,
+            archive_row_commitment,
+        ))
     }
 
     pub fn set_trading_freeze(
@@ -1313,6 +2648,90 @@ impl PrivateTradingCore {
             } else {
                 "trading-unfreeze"
             },
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
+    }
+
+    /// Removes one exact SubmitOrder recovery bridge only after the governed
+    /// operator attests that the padded opaque response is durably archived.
+    /// The archive commitment and result digest are rooted and journaled; an
+    /// ACK for another command/result can never free capacity.
+    pub fn acknowledge_recovery_archive(
+        &mut self,
+        idempotency_key: String,
+        command_idempotency_key: String,
+        result_digest: [u8; 32],
+        archive_row_commitment: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        if archive_row_commitment == [0u8; 32] {
+            return Err(CoreError::InvalidRecoveryCapsule);
+        }
+        let capsule = self
+            .recovery_capsules
+            .get(&command_idempotency_key)
+            .ok_or(CoreError::InvalidRecoveryCapsule)?;
+        if capsule.result_digest != result_digest {
+            return Err(CoreError::InvalidRecoveryCapsule);
+        }
+        let capsule_request_hash = capsule.request_hash;
+
+        let prior_root = self.state_root();
+        let mut capsules = self.recovery_capsules.clone();
+        capsules.remove(&command_idempotency_key);
+        let mut processed = self.processed.clone();
+        let processed_command = processed
+            .get_mut(&command_idempotency_key)
+            .ok_or(CoreError::InvalidRecoveryCapsule)?;
+        if processed_command.request_hash != capsule_request_hash {
+            return Err(CoreError::InvalidRecoveryCapsule);
+        }
+        processed_command.response = None;
+        let mut keys = self.system_keys.clone();
+        keys.remove(&recovery_result_marker(
+            &command_idempotency_key,
+            result_digest,
+        ));
+        keys.insert(idempotency_key.clone());
+        keys.insert(recovery_archive_ack_marker(
+            &command_idempotency_key,
+            result_digest,
+            archive_row_commitment,
+        ));
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &self.ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::AcknowledgeRecoveryArchive {
+            idempotency_key: idempotency_key.clone(),
+            command_idempotency_key,
+            result_digest,
+            archive_row_commitment,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.recovery_capsules = capsules;
+        self.processed = processed;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            "acknowledge-recovery-archive",
             idempotency_key,
             prior_root,
             next_root,
@@ -1430,6 +2849,8 @@ impl PrivateTradingCore {
             idempotency_key,
             Some(command_commitment),
             Some(true),
+            None,
+            None,
             next_sequence,
             prior_root,
             next_root,
@@ -1512,7 +2933,194 @@ impl PrivateTradingCore {
         }
     }
 
+    /// Produce the owner-scoped portfolio projection used by an enclave-only
+    /// delegated read. Authorization and response encryption are enforced by
+    /// the enclave command boundary; this method only derives the private
+    /// owner from the immutable identity commitment and never persists a
+    /// plaintext identity-to-financial projection.
+    pub fn portfolio_snapshot_for_identity(
+        &self,
+        identity_commitment: [u8; 32],
+        now_millis: i64,
+    ) -> PortfolioSnapshot {
+        let private_user_id = derive_private_user_id(&self.identity_key, &identity_commitment);
+        portfolio_snapshot(
+            &self.ledger,
+            &self.books,
+            &self.position_cost_basis,
+            &self.identity_key,
+            &private_user_id,
+            now_millis,
+        )
+    }
+
+    /// Performs the one-time, freeze-only historical custody opening after an
+    /// exact 976 checkpoint has been restored and independently reconciled.
+    /// The expected checkpoint tuple prevents applying an opening to a drifted
+    /// or substituted snapshot. No public operator command exposes this method;
+    /// release tooling must add a separately reviewed, attested invocation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn migrate_historical_pool_cash_opening(
+        &mut self,
+        idempotency_key: String,
+        evidence_hash: [u8; 32],
+        openings: Vec<PoolCashOpening>,
+        expected_sequence: u64,
+        expected_state_root: [u8; 32],
+        expected_journal_head: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        if !self.trading_frozen
+            || self.sequence != expected_sequence
+            || self.state_root() != expected_state_root
+            || self.journal.chain_head() != (expected_sequence, expected_journal_head)
+        {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        self.validate_new_system_key(&idempotency_key)?;
+        let prior_root = self.state_root();
+        let mut ledger = self.ledger.clone();
+        ledger.apply_historical_pool_cash_opening(
+            format!("historical-opening:{idempotency_key}"),
+            evidence_hash,
+            openings.clone(),
+        )?;
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::HistoricalPoolCashOpening {
+            idempotency_key: idempotency_key.clone(),
+            evidence_hash,
+            openings,
+            source_sequence: expected_sequence,
+            source_state_root: expected_state_root,
+            source_journal_head: expected_journal_head,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.ledger = ledger;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            "historical-pool-cash-opening",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
+    }
+
     pub fn apply_external_flow(
+        &mut self,
+        idempotency_key: String,
+        account: AccountKey,
+        amount: u128,
+        direction: ExternalFlowDirection,
+        evidence_hash: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        if matches!(
+            account.bucket,
+            AccountBucket::UserAvailable
+                | AccountBucket::UserWithdrawalHold
+                | AccountBucket::VaultCash
+                | AccountBucket::VaultStrategyInTransit
+                | AccountBucket::VaultStrategyReceivable
+        ) {
+            return Err(CoreError::InvalidOrder(
+                "custody flows require their dedicated balanced command".into(),
+            ));
+        }
+        self.apply_external_flow_internal(
+            idempotency_key,
+            account,
+            amount,
+            direction,
+            evidence_hash,
+            now_millis,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_vault_strategy_transition(
+        &mut self,
+        idempotency_key: String,
+        evidence_hash: [u8; 32],
+        vault_commitment: [u8; 32],
+        strategy_commitment: [u8; 32],
+        operation_commitment: [u8; 32],
+        asset: String,
+        amount: u128,
+        transition: VaultStrategyTransition,
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        let prior_root = self.state_root();
+        let transaction = VaultStrategyTransaction {
+            idempotency_key: format!("vault-strategy:{idempotency_key}"),
+            evidence_hash,
+            vault_commitment,
+            strategy_commitment,
+            operation_commitment,
+            asset,
+            amount,
+            transition,
+        };
+        let mut ledger = self.ledger.clone();
+        ledger.apply_vault_strategy_transition(transaction.clone())?;
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::VaultStrategyTransition {
+            idempotency_key: idempotency_key.clone(),
+            transaction,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.ledger = ledger;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            "vault-strategy-transition",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_external_flow_internal(
         &mut self,
         idempotency_key: String,
         account: AccountKey,
@@ -1568,6 +3176,118 @@ impl PrivateTradingCore {
         ))
     }
 
+    fn apply_confirmed_deposit(
+        &mut self,
+        idempotency_key: String,
+        account: AccountKey,
+        amount: u128,
+        evidence_hash: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        let prior_root = self.state_root();
+        let flow = ExternalFlowTransaction {
+            idempotency_key: format!("deposit:{idempotency_key}"),
+            evidence_hash,
+            account,
+            amount,
+            direction: ExternalFlowDirection::Inflow,
+        };
+        let mut ledger = self.ledger.clone();
+        ledger.apply_confirmed_deposit(flow.clone())?;
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::ConfirmedDeposit {
+            idempotency_key: idempotency_key.clone(),
+            flow,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.ledger = ledger;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            "confirmed-deposit",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
+    }
+
+    fn apply_confirmed_withdrawal(
+        &mut self,
+        idempotency_key: String,
+        account: AccountKey,
+        amount: u128,
+        evidence_hash: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        let prior_root = self.state_root();
+        let flow = ExternalFlowTransaction {
+            idempotency_key: format!("withdrawal:{idempotency_key}"),
+            evidence_hash,
+            account,
+            amount,
+            direction: ExternalFlowDirection::Outflow,
+        };
+        let mut ledger = self.ledger.clone();
+        ledger.apply_confirmed_withdrawal(flow.clone())?;
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::ConfirmedWithdrawal {
+            idempotency_key: idempotency_key.clone(),
+            flow,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.ledger = ledger;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        // Keep the existing receipt command ID stable because the backend's
+        // deterministic archive lookup uses this public protocol identifier.
+        Ok(self.system_response(
+            "external-flow",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn apply_user_external_flow(
         &mut self,
@@ -1589,14 +3309,28 @@ impl PrivateTradingCore {
             ));
         }
         let owner = derive_private_user_id(&self.identity_key, &identity_commitment);
-        self.apply_external_flow(
-            idempotency_key,
-            AccountKey::new(owner, bucket, asset),
-            amount,
-            direction,
-            evidence_hash,
-            now_millis,
-        )
+        let account = AccountKey::new(owner, bucket.clone(), asset);
+        match (bucket, direction) {
+            (AccountBucket::UserAvailable, ExternalFlowDirection::Inflow) => self
+                .apply_confirmed_deposit(
+                    idempotency_key,
+                    account,
+                    amount,
+                    evidence_hash,
+                    now_millis,
+                ),
+            (AccountBucket::UserWithdrawalHold, ExternalFlowDirection::Outflow) => self
+                .apply_confirmed_withdrawal(
+                    idempotency_key,
+                    account,
+                    amount,
+                    evidence_hash,
+                    now_millis,
+                ),
+            _ => Err(CoreError::InvalidOrder(
+                "invalid external user-flow direction".into(),
+            )),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1608,6 +3342,12 @@ impl PrivateTradingCore {
         reward_token: String,
         amount_atomic: u128,
         evidence_hash: [u8; 32],
+        source_id_hash: [u8; 32],
+        program_id: String,
+        program_type: String,
+        policy_id: String,
+        policy_version: u32,
+        fee_policy_version: String,
         now_millis: i64,
     ) -> CoreResult<SystemResponse> {
         self.validate_new_system_key(&idempotency_key)?;
@@ -1619,7 +3359,19 @@ impl PrivateTradingCore {
         let owner = derive_private_user_id(&self.identity_key, &identity_commitment);
         let prior_root = self.state_root();
         let mut private_rewards = self.private_rewards.clone();
-        private_rewards.accrue(&owner, &chain, &reward_token, amount_atomic)?;
+        private_rewards.accrue(
+            &owner,
+            &chain,
+            &reward_token,
+            amount_atomic,
+            evidence_hash,
+            source_id_hash,
+            &program_id,
+            &program_type,
+            &policy_id,
+            policy_version,
+            &fee_policy_version,
+        )?;
         let mut keys = self.system_keys.clone();
         keys.insert(idempotency_key.clone());
         let next_sequence = checked_sequence(self.sequence)?;
@@ -1645,6 +3397,12 @@ impl PrivateTradingCore {
             reward_token,
             amount_atomic,
             evidence_hash,
+            source_id_hash,
+            program_id,
+            program_type,
+            policy_id,
+            policy_version,
+            fee_policy_version,
         };
         let record = self.journal.append(next_root, &entry)?;
         self.private_rewards = private_rewards;
@@ -1678,15 +3436,13 @@ impl PrivateTradingCore {
         let owner = derive_private_user_id(&self.identity_key, &identity_commitment);
         let prior_root = self.state_root();
         let mut ledger = self.ledger.clone();
-        ledger.apply(LedgerTransaction {
-            idempotency_key: format!("withdrawal-release:{idempotency_key}"),
-            business_reference: hex::encode(evidence_hash),
-            transfers: vec![Transfer {
-                from: AccountKey::new(&owner, AccountBucket::UserWithdrawalHold, &asset),
-                to: AccountKey::new(owner, AccountBucket::UserAvailable, &asset),
-                amount: amount_atomic,
-            }],
-        })?;
+        ledger.release_withdrawal(
+            format!("withdrawal-release:{idempotency_key}"),
+            evidence_hash,
+            AccountKey::new(&owner, AccountBucket::UserWithdrawalHold, &asset),
+            AccountKey::new(owner, AccountBucket::UserAvailable, &asset),
+            amount_atomic,
+        )?;
         let mut keys = self.system_keys.clone();
         keys.insert(idempotency_key.clone());
         let next_sequence = checked_sequence(self.sequence)?;
@@ -1936,6 +3692,12 @@ impl PrivateTradingCore {
             ));
         }
         let outcome = resolution.outcome;
+        let payout_evidence_hash = resolution_payout_evidence_hash(&resolution)?;
+        let payout_kind = match outcome {
+            ResolutionOutcome::Up => ResolutionPayoutKind::Up,
+            ResolutionOutcome::Down => ResolutionPayoutKind::Down,
+            ResolutionOutcome::Push => ResolutionPayoutKind::Push,
+        };
 
         let prior_root = self.state_root();
         let mut ledger = self.ledger.clone();
@@ -2024,6 +3786,8 @@ impl PrivateTradingCore {
             ledger.apply_claim_payouts(
                 format!("resolution-payout:{idempotency_key}"),
                 market.market_id.clone(),
+                payout_evidence_hash,
+                payout_kind,
                 collateral.clone(),
                 AccountKey::new("layrs", AccountBucket::FeeRevenue, &market.settlement_asset),
                 payouts,
@@ -2124,6 +3888,154 @@ impl PrivateTradingCore {
             negative_risk: *neg_risk,
             order_salt: bootstrap_order_salt(execution_id),
         })
+    }
+
+    /// Commits the deterministic external-venue intent before any network I/O.
+    /// The coordinator must finalize this transition before asking the enclave
+    /// to submit the venue order.
+    pub fn mark_bootstrap_venue_intent_durable(
+        &mut self,
+        idempotency_key: String,
+        execution_id: Uuid,
+        prepared_order: BootstrapPreparedVenueOrder,
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        let prior_root = self.state_root();
+        let mut executions = self.bootstrap_executions.clone();
+        let execution = executions
+            .get_mut(&execution_id)
+            .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
+        if execution.view.state != BootstrapExecutionState::FundsReserved {
+            return Err(CoreError::InvalidOrder(
+                "bootstrap execution is not awaiting a durable venue intent".into(),
+            ));
+        }
+        if !prepared_order.deterministic_order_id.starts_with("0x")
+            || prepared_order.deterministic_order_id.len() != 66
+            || prepared_order.exact_request_body.len() < 64
+            || prepared_order.exact_request_body.len() > 65_536
+            || Sha256::digest(prepared_order.exact_request_body.as_bytes()).as_slice()
+                != prepared_order.request_body_sha256
+        {
+            return Err(CoreError::InvalidOrder(
+                "invalid prepared venue order".into(),
+            ));
+        }
+        execution.view.state = BootstrapExecutionState::VenueIntentDurable;
+        execution.prepared_venue_order = Some(prepared_order.clone());
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &self.ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::MarkBootstrapVenueIntentDurable {
+            idempotency_key: idempotency_key.clone(),
+            execution_id,
+            deterministic_order_id: prepared_order.deterministic_order_id,
+            request_body_sha256: prepared_order.request_body_sha256,
+            credential_generation_sha256: prepared_order.credential_generation_sha256,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.bootstrap_executions = executions;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            "bootstrap-venue-intent-durable",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
+    }
+
+    pub fn bootstrap_prepared_venue_order(
+        &self,
+        execution_id: Uuid,
+    ) -> CoreResult<BootstrapPreparedVenueOrder> {
+        let execution = self
+            .bootstrap_executions
+            .get(&execution_id)
+            .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
+        if execution.view.state != BootstrapExecutionState::VenueSubmissionAttempted {
+            return Err(CoreError::InvalidOrder(
+                "venue submission is not authorized".into(),
+            ));
+        }
+        execution
+            .prepared_venue_order
+            .clone()
+            .ok_or_else(|| CoreError::InvalidOrder("prepared venue order is unavailable".into()))
+    }
+
+    pub fn authorize_bootstrap_submission_attempt(
+        &mut self,
+        idempotency_key: String,
+        execution_id: Uuid,
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        let prior_root = self.state_root();
+        let mut executions = self.bootstrap_executions.clone();
+        let execution = executions
+            .get_mut(&execution_id)
+            .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
+        if execution.view.state != BootstrapExecutionState::VenueIntentDurable
+            || execution.prepared_venue_order.is_none()
+        {
+            return Err(CoreError::InvalidOrder(
+                "durable venue intent is required".into(),
+            ));
+        }
+        execution.view.state = BootstrapExecutionState::VenueSubmissionAttempted;
+        let mut keys = self.system_keys.clone();
+        keys.insert(idempotency_key.clone());
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &self.ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::AuthorizeBootstrapSubmissionAttempt {
+            idempotency_key: idempotency_key.clone(),
+            execution_id,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.bootstrap_executions = executions;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            "bootstrap-submission-attempt-authorized",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
     }
 
     /// Produces the exact public venue-redemption intent that backs the outstanding private
@@ -2295,15 +4207,17 @@ impl PrivateTradingCore {
             .bootstrap_executions
             .get(&execution_id)
             .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
-        if execution.view.state != BootstrapExecutionState::VenueSubmitted {
-            return Err(CoreError::InvalidOrder(
-                "bootstrap execution is not awaiting venue confirmation".into(),
-            ));
+        match execution.view.state {
+            BootstrapExecutionState::VenueSubmitted => execution.venue_order_id.clone(),
+            BootstrapExecutionState::VenueSubmissionAttempted => execution
+                .prepared_venue_order
+                .as_ref()
+                .map(|prepared| prepared.deterministic_order_id.clone()),
+            _ => None,
         }
-        execution
-            .venue_order_id
-            .clone()
-            .ok_or_else(|| CoreError::InvalidOrder("venue order id is unavailable".into()))
+        .ok_or_else(|| {
+            CoreError::InvalidOrder("bootstrap execution is not awaiting venue confirmation".into())
+        })
     }
 
     pub fn bootstrap_execution_view(
@@ -2355,7 +4269,7 @@ impl PrivateTradingCore {
         let execution = executions
             .get_mut(&execution_id)
             .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
-        if execution.view.state != BootstrapExecutionState::FundsReserved {
+        if execution.view.state != BootstrapExecutionState::VenueSubmissionAttempted {
             return Err(CoreError::InvalidOrder(
                 "bootstrap execution is not awaiting venue submission".into(),
             ));
@@ -2625,10 +4539,14 @@ impl PrivateTradingCore {
         };
         let (reward_chain, reward_token) = reward_rail(market)?;
         private_rewards.record_fill(
+            &execution_id.to_string(),
             &execution.private_user_id,
             None,
             reward_chain,
             reward_token,
+            market.fee_profile_id.fee_policy_version(),
+            &market.fee_profile_id.immutable_profile_id(),
+            "NORMAL",
             quantity,
             taker_fee,
             0,
@@ -2713,7 +4631,10 @@ impl PrivateTradingCore {
             .ok_or_else(|| CoreError::InvalidOrder("unknown bootstrap execution".into()))?;
         if !matches!(
             execution.view.state,
-            BootstrapExecutionState::FundsReserved | BootstrapExecutionState::VenueSubmitted
+            BootstrapExecutionState::FundsReserved
+                | BootstrapExecutionState::VenueIntentDurable
+                | BootstrapExecutionState::VenueSubmissionAttempted
+                | BootstrapExecutionState::VenueSubmitted
         ) {
             return Err(CoreError::InvalidOrder(
                 "bootstrap execution is already terminal".into(),
@@ -2794,6 +4715,12 @@ impl PrivateTradingCore {
             if processed.request_hash != expected_hash {
                 return Err(CoreError::DuplicateCommand);
             }
+            if !self.system_keys.contains(&processed_command_marker(
+                &command.idempotency_key,
+                full_user_command_commitment(&command)?,
+            )) {
+                return Err(CoreError::PreviouslyProcessed);
+            }
             return processed
                 .response
                 .clone()
@@ -2802,10 +4729,20 @@ impl PrivateTradingCore {
         if self.trading_frozen
             && matches!(
                 &command.action,
-                UserCommandAction::SubmitOrder { .. } | UserCommandAction::CompleteSet { .. }
+                UserCommandAction::SubmitOrder { .. }
+                    | UserCommandAction::ReplaceOrder { .. }
+                    | UserCommandAction::ClosePosition { .. }
+                    | UserCommandAction::CompleteSet { .. }
+                    | UserCommandAction::RequestWithdrawal { .. }
             )
         {
             return Err(CoreError::TradingFrozen);
+        }
+        if matches!(
+            command.action,
+            UserCommandAction::SubmitOrder { .. } | UserCommandAction::RequestWithdrawal { .. }
+        ) {
+            reserve_recovery_capacity(&self.recovery_capsules)?;
         }
 
         let prior_root = self.state_root();
@@ -2817,10 +4754,14 @@ impl PrivateTradingCore {
         let mut bootstrap_executions = self.bootstrap_executions.clone();
         let mut private_rewards = self.private_rewards.clone();
         let mut system_keys = self.system_keys.clone();
+        advance_trusted_time_high_water(&mut system_keys, now_millis)?;
         let mut audit_drafts = Vec::new();
         let task_order_commitment = match &command.action {
             UserCommandAction::SubmitOrder { order } => {
                 Some(private_order_commitment(order, &private_user_id))
+            }
+            UserCommandAction::ReplaceOrder { replacement, .. } => {
+                Some(private_order_commitment(replacement, &private_user_id))
             }
             _ => None,
         };
@@ -2833,15 +4774,35 @@ impl PrivateTradingCore {
                     .get(&order.market_id)
                     .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
                 validate_order_for_market(&order, market, now_millis)?;
-                enforce_user_position_limit(
-                    &ledger,
-                    &books,
-                    &bootstrap_executions,
-                    market,
-                    &order,
-                )?;
                 match &market.execution {
                     MarketExecution::NativeClob | MarketExecution::NativeExactCondition { .. } => {
+                        // GTD deadlines are consensus inputs, but wall-clock
+                        // passage alone cannot mutate the enclave state. At the
+                        // next valid write for this market, expire all elapsed
+                        // orders and release their grouped holds atomically
+                        // before position-limit validation or matching.
+                        {
+                            let book = books.entry(order.market_id.clone()).or_default();
+                            let expired = book.cancel_expired(&order.market_id, now_millis);
+                            let releases = cancellation_transfers(&ledger, book, market, &expired)?;
+                            if !releases.is_empty() {
+                                ledger.apply(LedgerTransaction {
+                                    idempotency_key: format!(
+                                        "expire-orders:{}",
+                                        command.idempotency_key
+                                    ),
+                                    business_reference: command.command_id.clone(),
+                                    transfers: releases,
+                                })?;
+                            }
+                        }
+                        enforce_user_position_limit(
+                            &ledger,
+                            &books,
+                            &bootstrap_executions,
+                            market,
+                            &order,
+                        )?;
                         let book = books.entry(order.market_id.clone()).or_default();
                         let match_result = book.submit(order.clone(), now_millis)?;
                         if match_result
@@ -2857,7 +4818,7 @@ impl PrivateTradingCore {
                                 // Preserve the exact legacy transition (including one ledger
                                 // sequence increment) so old NORMAL-only journal replay remains
                                 // byte-for-byte stable after the complete-set feature ships.
-                                let transfers = settlement_transfers(
+                                let (transfers, fill_postings) = settlement_transfers(
                                     &self.books,
                                     &books,
                                     market,
@@ -2873,11 +4834,17 @@ impl PrivateTradingCore {
                                     &match_result,
                                     &mut position_cost_basis,
                                 )?;
-                                ledger.apply(LedgerTransaction {
+                                let transaction = LedgerTransaction {
                                     idempotency_key: format!("order:{}", command.idempotency_key),
                                     business_reference: command.command_id.clone(),
                                     transfers,
-                                })?;
+                                };
+                                if fill_postings.is_empty() {
+                                    ledger.apply(transaction)?;
+                                } else {
+                                    ledger
+                                        .apply_normal_fill_settlement(transaction, fill_postings)?;
+                                }
                             } else {
                                 apply_complete_set_match_settlement(
                                     &mut ledger,
@@ -2904,6 +4871,13 @@ impl PrivateTradingCore {
                         }
                     }
                     MarketExecution::PolymarketBootstrap { .. } => {
+                        enforce_user_position_limit(
+                            &ledger,
+                            &books,
+                            &bootstrap_executions,
+                            market,
+                            &order,
+                        )?;
                         if !matches!(order.time_in_force, super::TimeInForce::Fok) {
                             return Err(CoreError::InvalidOrder(
                                 "bootstrap execution requires fill-or-kill".into(),
@@ -2952,6 +4926,7 @@ impl PrivateTradingCore {
                                 reserved_atomic,
                                 venue_order_id: None,
                                 venue_evidence_hash: None,
+                                prepared_venue_order: None,
                                 created_at_millis: now_millis,
                             },
                         );
@@ -2982,6 +4957,412 @@ impl PrivateTradingCore {
                 public_order.private_user_id.clear();
                 CommandResult::Cancelled {
                     order: public_order,
+                }
+            }
+            UserCommandAction::CancelAllOrders { filter } => {
+                let market_ids: Vec<String> = match filter {
+                    CancelAllOrdersFilter::All => self.markets.keys().cloned().collect(),
+                    CancelAllOrdersFilter::Market { market_id } => {
+                        if !self.markets.contains_key(market_id) {
+                            return Err(CoreError::InvalidOrder("unknown market".into()));
+                        }
+                        vec![market_id.clone()]
+                    }
+                    CancelAllOrdersFilter::Asset { asset } => {
+                        if asset.is_empty() || asset.len() > 64 || !asset.is_ascii() {
+                            return Err(CoreError::InvalidOrder("invalid asset filter".into()));
+                        }
+                        let matching: Vec<String> = self
+                            .markets
+                            .iter()
+                            .filter(|(_, market)| market.settlement_asset == *asset)
+                            .map(|(market_id, _)| market_id.clone())
+                            .collect();
+                        if matching.is_empty() {
+                            return Err(CoreError::InvalidOrder("unknown asset".into()));
+                        }
+                        matching
+                    }
+                };
+
+                let mut cancelled_by_market = BTreeMap::<String, Vec<BookOrder>>::new();
+                for market_id in market_ids {
+                    let Some(book) = books.get_mut(&market_id) else {
+                        continue;
+                    };
+                    let mut owned: Vec<BookOrder> = book
+                        .orders_for_owner(&private_user_id)
+                        .into_iter()
+                        .filter(|order| {
+                            matches!(
+                                order.status,
+                                OrderStatus::Open | OrderStatus::PartiallyFilled
+                            )
+                        })
+                        .collect();
+                    owned.sort_by_key(|order| (order.sequence, order.order_id));
+                    for order in owned {
+                        let cancelled =
+                            book.cancel(order.order_id, &private_user_id, now_millis)?;
+                        cancelled_by_market
+                            .entry(market_id.clone())
+                            .or_default()
+                            .push(cancelled);
+                    }
+                }
+
+                let mut transfers = Vec::new();
+                let mut outcomes = Vec::new();
+                for (market_id, cancelled) in &cancelled_by_market {
+                    let market = self
+                        .markets
+                        .get(market_id)
+                        .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
+                    let book = books.get(market_id).ok_or_else(|| {
+                        CoreError::InvalidOrder("order book does not exist".into())
+                    })?;
+                    transfers.extend(cancellation_transfers(&ledger, book, market, cancelled)?);
+                    outcomes.extend(cancelled.iter().map(|order| CancelledOrderOutcome {
+                        order_id: order.order_id,
+                        market_id: order.market_id.clone(),
+                        status: order.status,
+                    }));
+                }
+                if !outcomes.is_empty() && transfers.is_empty() {
+                    return Err(CoreError::UnbalancedTransaction);
+                }
+                if !transfers.is_empty() {
+                    ledger.apply(LedgerTransaction {
+                        idempotency_key: format!("cancel-all:{}", command.idempotency_key),
+                        business_reference: command.command_id.clone(),
+                        transfers,
+                    })?;
+                }
+                CommandResult::OrdersCancelled {
+                    filter: Some(filter.clone()),
+                    outcomes,
+                }
+            }
+            UserCommandAction::PreviewPositionClose {
+                position_id,
+                market_id,
+                outcome,
+                session_tag,
+                quantity_micros,
+                minimum_price_micros,
+            } => {
+                let order = position_close_order(
+                    &self.identity_key,
+                    &ledger,
+                    &self.markets,
+                    &self.resolutions,
+                    &private_user_id,
+                    position_id,
+                    market_id,
+                    *outcome,
+                    *quantity_micros,
+                    *minimum_price_micros,
+                    position_close_order_id(
+                        &command.command_id,
+                        &command.idempotency_key,
+                        position_id,
+                    ),
+                    now_millis,
+                )?;
+                let market = self
+                    .markets
+                    .get(market_id)
+                    .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
+                if !matches!(
+                    market.execution,
+                    MarketExecution::NativeClob | MarketExecution::NativeExactCondition { .. }
+                ) {
+                    return Err(CoreError::InvalidOrder(
+                        "position close is unavailable for bootstrap execution".into(),
+                    ));
+                }
+                let prior_book = books.get(market_id).cloned().unwrap_or_default();
+                let mut book = prior_book.clone();
+                let match_result = book.submit(order.clone(), now_millis)?;
+                CommandResult::PositionClosePreview {
+                    market_id: Some(market_id.clone()),
+                    outcome: Some(*outcome),
+                    session_tag: Some(session_tag.clone()),
+                    preview: position_close_preview(
+                        &self.identity_key,
+                        &private_user_id,
+                        *outcome,
+                        position_id,
+                        market,
+                        &prior_book,
+                        &order,
+                        &match_result,
+                        now_millis.saturating_add(POSITION_CLOSE_QUOTE_TTL_MILLIS),
+                    )?,
+                }
+            }
+            UserCommandAction::ClosePosition {
+                position_id,
+                market_id,
+                outcome,
+                session_tag,
+                quantity_micros,
+                minimum_price_micros,
+                quote,
+            } => {
+                let order_id = position_close_order_id(
+                    &command.command_id,
+                    &command.idempotency_key,
+                    position_id,
+                );
+                let order = position_close_order(
+                    &self.identity_key,
+                    &ledger,
+                    &self.markets,
+                    &self.resolutions,
+                    &private_user_id,
+                    position_id,
+                    market_id,
+                    *outcome,
+                    *quantity_micros,
+                    *minimum_price_micros,
+                    order_id,
+                    now_millis,
+                )?;
+                let market = self
+                    .markets
+                    .get(market_id)
+                    .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
+                if !matches!(
+                    market.execution,
+                    MarketExecution::NativeClob | MarketExecution::NativeExactCondition { .. }
+                ) {
+                    return Err(CoreError::InvalidOrder(
+                        "position close is unavailable for bootstrap execution".into(),
+                    ));
+                }
+                let prior_book = books.get(market_id).cloned().unwrap_or_default();
+                let book = books.entry(market_id.clone()).or_default();
+                let match_result = book.submit(order.clone(), now_millis)?;
+                let preview = position_close_preview(
+                    &self.identity_key,
+                    &private_user_id,
+                    *outcome,
+                    position_id,
+                    market,
+                    &prior_book,
+                    &order,
+                    &match_result,
+                    quote.expires_at_millis,
+                )?;
+                // Quote validity is half-open: it is valid strictly before the
+                // enclave-trusted expiry instant and stale at equality.
+                if quote.expires_at_millis <= now_millis || preview != *quote {
+                    return Err(CoreError::InvalidOrder(
+                        "position close quote is stale".into(),
+                    ));
+                }
+                if match_result
+                    .fills
+                    .iter()
+                    .all(|fill| fill.match_type == MatchType::Normal)
+                {
+                    let (transfers, fill_postings) =
+                        settlement_transfers(&self.books, &books, market, &order, &match_result)?;
+                    apply_fill_cost_basis(
+                        &self.ledger,
+                        &self.books,
+                        &books,
+                        market,
+                        &order,
+                        &match_result,
+                        &mut position_cost_basis,
+                    )?;
+                    let transaction = LedgerTransaction {
+                        idempotency_key: format!("position-close:{}", command.idempotency_key),
+                        business_reference: command.command_id.clone(),
+                        transfers,
+                    };
+                    if fill_postings.is_empty() {
+                        ledger.apply(transaction)?;
+                    } else {
+                        ledger.apply_normal_fill_settlement(transaction, fill_postings)?;
+                    }
+                } else {
+                    apply_complete_set_match_settlement(
+                        &mut ledger,
+                        &self.books,
+                        &books,
+                        market,
+                        &order,
+                        &match_result,
+                        &mut position_cost_basis,
+                        &command.idempotency_key,
+                        &command.command_id,
+                    )?;
+                }
+                record_native_fill_economics(
+                    &mut private_rewards,
+                    market,
+                    &match_result,
+                    now_millis,
+                )?;
+                audit_drafts = native_audit_drafts(&order, &match_result, market)?;
+                CommandResult::PositionClosed {
+                    market_id: Some(market_id.clone()),
+                    outcome: Some(*outcome),
+                    session_tag: Some(session_tag.clone()),
+                    preview,
+                    order_id,
+                }
+            }
+            UserCommandAction::ReplaceOrder {
+                market_id,
+                order_id,
+                replacement,
+            } => {
+                let market = self
+                    .markets
+                    .get(market_id)
+                    .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
+                if !matches!(
+                    market.execution,
+                    MarketExecution::NativeClob | MarketExecution::NativeExactCondition { .. }
+                ) {
+                    return Err(CoreError::InvalidOrder(
+                        "order replacement is unavailable for bootstrap execution".into(),
+                    ));
+                }
+
+                let book = books
+                    .get_mut(market_id)
+                    .ok_or_else(|| CoreError::InvalidOrder("order book does not exist".into()))?;
+                let original = book
+                    .order(*order_id)
+                    .cloned()
+                    .ok_or_else(|| CoreError::InvalidOrder("order does not exist".into()))?;
+                if original.private_user_id != private_user_id {
+                    return Err(CoreError::InvalidOrder("order owner mismatch".into()));
+                }
+                if replacement.order_id == *order_id {
+                    return Err(CoreError::InvalidOrder(
+                        "replacement requires a new order id".into(),
+                    ));
+                }
+                if replacement.market_id != *market_id
+                    || replacement.outcome != original.outcome
+                    || replacement.action != original.action
+                {
+                    return Err(CoreError::InvalidOrder(
+                        "replacement cannot change market, outcome, or action".into(),
+                    ));
+                }
+
+                let cancelled = book.cancel(*order_id, &private_user_id, now_millis)?;
+                let release = cancellation_transfers(
+                    &ledger,
+                    book,
+                    market,
+                    std::slice::from_ref(&cancelled),
+                )?;
+                ledger.apply(LedgerTransaction {
+                    idempotency_key: format!("replace-cancel:{}", command.idempotency_key),
+                    business_reference: command.command_id.clone(),
+                    transfers: release,
+                })?;
+
+                // The replacement is always a new order and therefore receives fresh
+                // sequence priority. Client-supplied timestamps, fill counters and owner
+                // fields are discarded at this trust boundary.
+                let mut incoming = replacement.clone();
+                incoming.private_user_id = private_user_id.clone();
+                incoming.created_at_millis = 0;
+                incoming.updated_at_millis = 0;
+                incoming.sequence = 0;
+                incoming.filled_micros = 0;
+                incoming.remaining_micros = incoming.quantity_micros;
+                incoming.status = OrderStatus::Open;
+                validate_order_for_market(&incoming, market, now_millis)?;
+                enforce_user_position_limit(
+                    &ledger,
+                    &books,
+                    &bootstrap_executions,
+                    market,
+                    &incoming,
+                )?;
+
+                let replacement_prior_books = books.clone();
+                let match_result = books
+                    .get_mut(market_id)
+                    .expect("replacement book remains present")
+                    .submit(incoming.clone(), now_millis)?;
+                if match_result
+                    .accepted_order
+                    .as_ref()
+                    .is_some_and(|accepted| accepted.status == OrderStatus::Rejected)
+                {
+                    return Err(CoreError::InvalidOrder(
+                        "replacement order was rejected".into(),
+                    ));
+                }
+                if match_result.accepted_order.as_ref().is_some() {
+                    if match_result
+                        .fills
+                        .iter()
+                        .all(|fill| fill.match_type == MatchType::Normal)
+                    {
+                        let (transfers, fill_postings) = settlement_transfers(
+                            &replacement_prior_books,
+                            &books,
+                            market,
+                            &incoming,
+                            &match_result,
+                        )?;
+                        apply_fill_cost_basis(
+                            &ledger,
+                            &replacement_prior_books,
+                            &books,
+                            market,
+                            &incoming,
+                            &match_result,
+                            &mut position_cost_basis,
+                        )?;
+                        let transaction = LedgerTransaction {
+                            idempotency_key: format!("replace-order:{}", command.idempotency_key),
+                            business_reference: command.command_id.clone(),
+                            transfers,
+                        };
+                        if fill_postings.is_empty() {
+                            ledger.apply(transaction)?;
+                        } else {
+                            ledger.apply_normal_fill_settlement(transaction, fill_postings)?;
+                        }
+                    } else {
+                        apply_complete_set_match_settlement(
+                            &mut ledger,
+                            &replacement_prior_books,
+                            &books,
+                            market,
+                            &incoming,
+                            &match_result,
+                            &mut position_cost_basis,
+                            &format!("replace:{}", command.idempotency_key),
+                            &command.command_id,
+                        )?;
+                    }
+                    record_native_fill_economics(
+                        &mut private_rewards,
+                        market,
+                        &match_result,
+                        now_millis,
+                    )?;
+                }
+                audit_drafts = native_audit_drafts(&incoming, &match_result, market)?;
+                let mut public_cancelled = cancelled;
+                public_cancelled.private_user_id.clear();
+                CommandResult::Replaced {
+                    cancelled: public_cancelled,
+                    result: redact_match_result(match_result),
                 }
             }
             UserCommandAction::CompleteSet {
@@ -3048,6 +5429,7 @@ impl PrivateTradingCore {
                     &ledger,
                     &books,
                     &position_cost_basis,
+                    &self.identity_key,
                     &private_user_id,
                     now_millis,
                 ),
@@ -3208,6 +5590,29 @@ impl PrivateTradingCore {
             }
         };
 
+        if let CommandResult::Order { result } = &result {
+            if result.fills.len() > MAX_RECOVERY_FILLS {
+                return Err(CoreError::RecoveryCapsuleTooLarge);
+            }
+        }
+
+        system_keys.insert(processed_command_marker(
+            &command.idempotency_key,
+            full_user_command_commitment(&command)?,
+        ));
+        let recovery_result_digest = matches!(
+            command.action,
+            UserCommandAction::SubmitOrder { .. } | UserCommandAction::RequestWithdrawal { .. }
+        )
+        .then(|| private_recovery_result_digest(&self.identity_key, &result))
+        .transpose()?;
+        if let Some(result_digest) = recovery_result_digest {
+            system_keys.insert(recovery_result_marker(
+                &command.idempotency_key,
+                result_digest,
+            ));
+        }
+
         let mut processed_hash_map = processed_hashes(&self.processed);
         processed_hash_map.insert(command.idempotency_key.clone(), expected_hash);
         let next_sequence = checked_sequence(self.sequence)?;
@@ -3230,21 +5635,43 @@ impl PrivateTradingCore {
             command: command.clone(),
             result: result.clone(),
         };
-        let record = self.journal.append(next_root, &journal_value)?;
+        // Append against a command-local journal clone. Later audit/task
+        // artifact construction remains fallible; assigning this clone only at
+        // the final commit point prevents a failed command from advancing the
+        // journal/time fence without its financial state.
+        let mut journal = self.journal.clone();
+        let record = journal.append(next_root, &journal_value)?;
+        let command_state = command_receipt_state(&command.action, &result)?;
+        let disclosure_nonce =
+            self.receipt_signer
+                .result_disclosure_nonce(expected_hash, next_sequence, next_root);
+        let semantic_receipt = is_s08_semantic_result(&command.action, &result);
+        let result_commitment = semantic_receipt
+            .then(|| command_result_commitment(command_state, disclosure_nonce, &result))
+            .transpose()?;
+        // The leaf exposes only opaque commitments. A journal-committed FOK
+        // rejection therefore remains safe to batch and can still be verified
+        // after a governed receipt-key rotation.
+        let publication_eligible = matches!(
+            command.action,
+            UserCommandAction::SubmitOrder { .. }
+                | UserCommandAction::ReplaceOrder { .. }
+                | UserCommandAction::CancelOrder { .. }
+                | UserCommandAction::CancelAllOrders { .. }
+                | UserCommandAction::ClosePosition { .. }
+                | UserCommandAction::CompleteSet { .. }
+                | UserCommandAction::RequestRewardClaim { .. }
+                | UserCommandAction::CancelBootstrap { .. }
+                | UserCommandAction::RequestWithdrawal { .. }
+                | UserCommandAction::TransferFunds { .. }
+        );
         let receipt = self.receipt_signer.sign(
             command.command_id,
             command.idempotency_key.clone(),
             Some(expected_hash),
-            Some(matches!(
-                command.action,
-                UserCommandAction::SubmitOrder { .. }
-                    | UserCommandAction::CancelOrder { .. }
-                    | UserCommandAction::CompleteSet { .. }
-                    | UserCommandAction::RequestRewardClaim { .. }
-                    | UserCommandAction::CancelBootstrap { .. }
-                    | UserCommandAction::RequestWithdrawal { .. }
-                    | UserCommandAction::TransferFunds { .. }
-            )),
+            Some(publication_eligible),
+            result_commitment,
+            semantic_receipt.then_some(true),
             next_sequence,
             prior_root,
             next_root,
@@ -3271,6 +5698,7 @@ impl PrivateTradingCore {
                     enclave_sequence: next_sequence,
                     state_root: next_root,
                     expires_at_millis: now_millis.saturating_add(15 * 60_000),
+                    recovery_proof: None,
                 };
                 Some(WithdrawalAuthorization {
                     signature: self
@@ -3299,12 +5727,37 @@ impl PrivateTradingCore {
         let response = CoreResponse {
             result,
             receipt,
+            receipt_state: command_state,
+            receipt_disclosure_nonce: disclosure_nonce,
             encrypted_record: Some(record),
             withdrawal_authorization,
             reward_claim_authorization: None,
             audit_fills,
             task_qualifications,
         };
+        let mut recovery_capsules = self.recovery_capsules.clone();
+        if matches!(
+            command.action,
+            UserCommandAction::SubmitOrder { .. } | UserCommandAction::RequestWithdrawal { .. }
+        ) {
+            insert_recovery_capsule(
+                &mut recovery_capsules,
+                command.idempotency_key.clone(),
+                RecoveryCapsule {
+                    sequence: next_sequence,
+                    request_hash: expected_hash,
+                    result_digest: recovery_result_digest
+                        .expect("SubmitOrder recovery digest was derived before commit"),
+                    result: response.result.clone(),
+                    receipt: response.receipt.clone(),
+                    receipt_state: response.receipt_state,
+                    receipt_disclosure_nonce: response.receipt_disclosure_nonce,
+                    withdrawal_authorization: response.withdrawal_authorization.clone(),
+                    audit_fills: response.audit_fills.clone(),
+                    task_qualifications: response.task_qualifications.clone(),
+                },
+            )?;
+        }
         self.ledger = ledger;
         self.books = books;
         self.sessions = sessions;
@@ -3312,6 +5765,7 @@ impl PrivateTradingCore {
         self.bootstrap_executions = bootstrap_executions;
         self.private_rewards = private_rewards;
         self.system_keys = system_keys;
+        self.journal = journal;
         self.sequence = next_sequence;
         self.processed.insert(
             command.idempotency_key,
@@ -3320,6 +5774,7 @@ impl PrivateTradingCore {
                 response: Some(response.clone()),
             },
         );
+        self.recovery_capsules = recovery_capsules;
         Ok(response)
     }
 
@@ -3335,12 +5790,14 @@ impl PrivateTradingCore {
         let private_user_id = self
             .sessions
             .verify_signed_readonly(&command.session, now_millis)?;
+        let root = self.state_root();
         let result = match &command.action {
             UserCommandAction::Portfolio => CommandResult::Portfolio {
                 snapshot: portfolio_snapshot(
                     &self.ledger,
                     &self.books,
                     &self.position_cost_basis,
+                    &self.identity_key,
                     &private_user_id,
                     now_millis,
                 ),
@@ -3360,13 +5817,17 @@ impl PrivateTradingCore {
             }
             _ => return Err(CoreError::InvalidOrder("command is not read-only".into())),
         };
-        let root = self.state_root();
         let journal_hash = read_only_response_hash(&command, &result, root)?;
+        let disclosure_nonce =
+            self.receipt_signer
+                .result_disclosure_nonce(expected_hash, self.sequence, root);
         let receipt = self.receipt_signer.sign(
             command.command_id,
             command.idempotency_key,
             Some(expected_hash),
             Some(false),
+            None,
+            None,
             self.sequence,
             root,
             root,
@@ -3376,6 +5837,8 @@ impl PrivateTradingCore {
         Ok(CoreResponse {
             result,
             receipt,
+            receipt_state: CommandReceiptState::Accepted,
+            receipt_disclosure_nonce: disclosure_nonce,
             encrypted_record: None,
             withdrawal_authorization: None,
             reward_claim_authorization: None,
@@ -3403,12 +5866,13 @@ impl PrivateTradingCore {
             || (Vec::new(), Vec::new()),
             |book| {
                 let (bids, asks) = book.aggregate_depth(market_id, outcome, now_millis);
+                let minimum_distinct_owners = minimum_public_depth_distinct_owners(market_id);
                 let filter = |levels: Vec<(u64, u128, usize)>| {
                     levels
                         .into_iter()
                         .filter(|(_, quantity, distinct_owners)| {
                             *quantity >= minimum_level_quantity_micros
-                                && *distinct_owners >= MIN_PUBLIC_DEPTH_DISTINCT_OWNERS
+                                && *distinct_owners >= minimum_distinct_owners
                         })
                         .filter_map(|(price, quantity, _)| {
                             // Publish only whole privacy buckets. Observers see
@@ -3446,6 +5910,8 @@ impl PrivateTradingCore {
             idempotency_key,
             None,
             None,
+            None,
+            None,
             self.sequence,
             prior_root,
             state_root,
@@ -3467,6 +5933,20 @@ fn system_command_commitment(command: &JournaledSystemCommand) -> CoreResult<[u8
     let encoded = serde_json::to_vec(command).map_err(|_| CoreError::RequestHashMismatch)?;
     let mut hash = Sha256::new();
     hash.update(b"layrs.system-command.v1\0");
+    hash.update((encoded.len() as u64).to_be_bytes());
+    hash.update(encoded);
+    Ok(hash.finalize().into())
+}
+
+/// Stable replay identity for the financial payout caused by signed resolution evidence.
+/// This is deliberately independent of the operator-supplied command idempotency key: if the
+/// enclave committed the payout but its response was lost, a redispatch with a new key cannot
+/// debit market collateral a second time.
+fn resolution_payout_evidence_hash(resolution: &MarketResolution) -> CoreResult<[u8; 32]> {
+    let encoded = serde_json::to_vec(resolution)
+        .map_err(|_| CoreError::InvalidResolution("cannot encode payout evidence".into()))?;
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.resolution-payout.v1\0");
     hash.update((encoded.len() as u64).to_be_bytes());
     hash.update(encoded);
     Ok(hash.finalize().into())
@@ -3513,8 +5993,9 @@ fn settlement_transfers(
     market: &MarketConfig,
     incoming: &BookOrder,
     result: &MatchResult,
-) -> CoreResult<Vec<Transfer>> {
+) -> CoreResult<(Vec<Transfer>, Vec<NormalFillPosting>)> {
     let mut transfers = Vec::new();
+    let mut fill_postings = Vec::new();
     let incoming_cash_hold = cash_hold(incoming, &market.settlement_asset);
     let incoming_claim_hold = claim_hold(incoming);
     let initial_notional_micros = notional(incoming.price_micros, incoming.quantity_micros)?;
@@ -3573,26 +6054,42 @@ fn settlement_transfers(
         } else {
             fill_notional
         };
-        transfers.push(Transfer {
-            from: buyer_hold.clone(),
-            to: available(&seller.private_user_id, &market.settlement_asset),
-            amount: seller_proceeds,
-        });
+        let seller_available = available(&seller.private_user_id, &market.settlement_asset);
+        let buyer_position = claim_position_for(
+            &buyer.private_user_id,
+            &incoming.market_id,
+            incoming.outcome,
+        );
+        let fee_account = fee_revenue(&market.settlement_asset);
+        if seller_proceeds > 0 {
+            transfers.push(Transfer {
+                from: buyer_hold.clone(),
+                to: seller_available.clone(),
+                amount: seller_proceeds,
+            });
+        }
         if taker_fee > 0 {
             transfers.push(Transfer {
-                from: buyer_hold,
-                to: AccountKey::new("layrs", AccountBucket::FeeRevenue, &market.settlement_asset),
+                from: buyer_hold.clone(),
+                to: fee_account.clone(),
                 amount: taker_fee,
             });
         }
         transfers.push(Transfer {
-            from: seller_hold,
-            to: claim_position_for(
-                &buyer.private_user_id,
-                &incoming.market_id,
-                incoming.outcome,
-            ),
+            from: seller_hold.clone(),
+            to: buyer_position.clone(),
             amount: fill.quantity_micros,
+        });
+        fill_postings.push(NormalFillPosting {
+            fill_id: fill.fill_id.to_string(),
+            buyer_cash_hold: buyer_hold,
+            seller_available,
+            seller_claim_hold: seller_hold,
+            buyer_position,
+            fee_revenue: fee_account,
+            seller_proceeds_atomic: seller_proceeds,
+            fee_atomic: taker_fee,
+            quantity_micros: fill.quantity_micros,
         });
         if incoming.action == OrderAction::Buy {
             incoming_cash_used = incoming_cash_used
@@ -3651,7 +6148,7 @@ fn settlement_transfers(
             }
         }
     }
-    Ok(transfers)
+    Ok((transfers, fill_postings))
 }
 
 /// Settles a match result containing at least one complete-set fill. The engine
@@ -3733,11 +6230,20 @@ fn apply_complete_set_match_settlement(
                 let taker_fee =
                     taker_fee_atomic(market, fill.quantity_micros, fill.taker_price_micros())?;
                 let mut transfers = Vec::with_capacity(3);
+                let normal_posting;
                 match incoming.action {
                     OrderAction::Buy => {
+                        let seller_available =
+                            available(&maker.private_user_id, &market.settlement_asset);
+                        let seller_claim_hold = claim_hold(&maker);
+                        let buyer_position = claim_position_for(
+                            &incoming.private_user_id,
+                            &incoming.market_id,
+                            incoming.outcome,
+                        );
                         transfers.push(Transfer {
                             from: incoming_cash_hold.clone(),
-                            to: available(&maker.private_user_id, &market.settlement_asset),
+                            to: seller_available.clone(),
                             amount: fill_notional,
                         });
                         if taker_fee > 0 {
@@ -3748,14 +6254,21 @@ fn apply_complete_set_match_settlement(
                             });
                         }
                         transfers.push(Transfer {
-                            from: claim_hold(&maker),
-                            to: claim_position_for(
-                                &incoming.private_user_id,
-                                &incoming.market_id,
-                                incoming.outcome,
-                            ),
+                            from: seller_claim_hold.clone(),
+                            to: buyer_position.clone(),
                             amount: fill.quantity_micros,
                         });
+                        normal_posting = NormalFillPosting {
+                            fill_id: fill.fill_id.to_string(),
+                            buyer_cash_hold: incoming_cash_hold.clone(),
+                            seller_available,
+                            seller_claim_hold,
+                            buyer_position,
+                            fee_revenue: fee_revenue(&market.settlement_asset),
+                            seller_proceeds_atomic: fill_notional,
+                            fee_atomic: taker_fee,
+                            quantity_micros: fill.quantity_micros,
+                        };
                         incoming_cash_used = incoming_cash_used
                             .checked_add(fill_notional)
                             .and_then(|value| value.checked_add(taker_fee))
@@ -3765,42 +6278,60 @@ fn apply_complete_set_match_settlement(
                         let seller_proceeds = fill_notional
                             .checked_sub(taker_fee)
                             .ok_or(CoreError::UnbalancedTransaction)?;
+                        let buyer_cash_hold = cash_hold(&maker, &market.settlement_asset);
+                        let seller_available =
+                            available(&incoming.private_user_id, &market.settlement_asset);
+                        let buyer_position = claim_position_for(
+                            &maker.private_user_id,
+                            &incoming.market_id,
+                            incoming.outcome,
+                        );
                         if seller_proceeds > 0 {
                             transfers.push(Transfer {
-                                from: cash_hold(&maker, &market.settlement_asset),
-                                to: available(&incoming.private_user_id, &market.settlement_asset),
+                                from: buyer_cash_hold.clone(),
+                                to: seller_available.clone(),
                                 amount: seller_proceeds,
                             });
                         }
                         if taker_fee > 0 {
                             transfers.push(Transfer {
-                                from: cash_hold(&maker, &market.settlement_asset),
+                                from: buyer_cash_hold.clone(),
                                 to: fee_revenue(&market.settlement_asset),
                                 amount: taker_fee,
                             });
                         }
                         transfers.push(Transfer {
                             from: incoming_claim_hold.clone(),
-                            to: claim_position_for(
-                                &maker.private_user_id,
-                                &incoming.market_id,
-                                incoming.outcome,
-                            ),
+                            to: buyer_position.clone(),
                             amount: fill.quantity_micros,
                         });
+                        normal_posting = NormalFillPosting {
+                            fill_id: fill.fill_id.to_string(),
+                            buyer_cash_hold,
+                            seller_available,
+                            seller_claim_hold: incoming_claim_hold.clone(),
+                            buyer_position,
+                            fee_revenue: fee_revenue(&market.settlement_asset),
+                            seller_proceeds_atomic: seller_proceeds,
+                            fee_atomic: taker_fee,
+                            quantity_micros: fill.quantity_micros,
+                        };
                         incoming_claim_used = incoming_claim_used
                             .checked_add(fill.quantity_micros)
                             .ok_or(CoreError::UnbalancedTransaction)?;
                     }
                 }
-                ledger.apply(LedgerTransaction {
-                    idempotency_key: format!(
-                        "order:{command_idempotency_key}:normal:{}",
-                        fill.sequence
-                    ),
-                    business_reference: business_reference.into(),
-                    transfers,
-                })?;
+                ledger.apply_normal_fill_settlement(
+                    LedgerTransaction {
+                        idempotency_key: format!(
+                            "order:{command_idempotency_key}:normal:{}",
+                            fill.sequence
+                        ),
+                        business_reference: business_reference.into(),
+                        transfers,
+                    },
+                    vec![normal_posting],
+                )?;
             }
             MatchType::Mint => {
                 if incoming.action != OrderAction::Buy
@@ -3812,65 +6343,36 @@ fn apply_complete_set_match_settlement(
                     ));
                 }
                 let amounts = complete_set_fill_amounts(market, fill)?;
-                let mut funding = vec![
-                    Transfer {
-                        from: cash_hold(&maker, &market.settlement_asset),
-                        to: available(&maker.private_user_id, &market.settlement_asset),
-                        amount: amounts.maker_atomic,
-                    },
-                    Transfer {
-                        from: incoming_cash_hold.clone(),
-                        to: available(&maker.private_user_id, &market.settlement_asset),
-                        amount: amounts.taker_atomic,
-                    },
-                ];
-                if amounts.taker_fee_atomic > 0 {
-                    funding.push(Transfer {
-                        from: incoming_cash_hold.clone(),
-                        to: fee_revenue(&market.settlement_asset),
-                        amount: amounts.taker_fee_atomic,
-                    });
-                }
-                ledger.apply(LedgerTransaction {
-                    idempotency_key: format!(
-                        "order:{command_idempotency_key}:mint-fund:{}",
-                        fill.sequence
-                    ),
-                    business_reference: business_reference.into(),
-                    transfers: funding,
-                })?;
-                ledger.apply_complete_set(CompleteSetTransaction {
-                    idempotency_key: format!(
-                        "order:{command_idempotency_key}:mint-set:{}",
-                        fill.sequence
-                    ),
-                    owner: maker.private_user_id.clone(),
-                    market_id: incoming.market_id.clone(),
-                    settlement_asset: market.settlement_asset.clone(),
-                    quantity_micros: fill.quantity_micros,
-                    collateral_amount_atomic: amounts.collateral_atomic,
-                    direction: CompleteSetDirection::Mint,
-                })?;
-                ledger.apply(LedgerTransaction {
-                    idempotency_key: format!(
-                        "order:{command_idempotency_key}:mint-claim:{}",
-                        fill.sequence
-                    ),
-                    business_reference: business_reference.into(),
-                    transfers: vec![Transfer {
-                        from: claim_position_for(
+                ledger.apply_complete_set_fill(
+                    format!("order:{command_idempotency_key}:mint:{}", fill.sequence),
+                    business_reference.into(),
+                    CompleteSetFillPosting {
+                        fill_id: fill.fill_id.to_string(),
+                        direction: CompleteSetDirection::Mint,
+                        maker_hold: cash_hold(&maker, &market.settlement_asset),
+                        taker_hold: incoming_cash_hold.clone(),
+                        maker_destination: claim_position_for(
                             &maker.private_user_id,
                             &incoming.market_id,
-                            incoming.outcome,
+                            maker.outcome,
                         ),
-                        to: claim_position_for(
+                        taker_destination: claim_position_for(
                             &incoming.private_user_id,
                             &incoming.market_id,
                             incoming.outcome,
                         ),
-                        amount: fill.quantity_micros,
-                    }],
-                })?;
+                        market_collateral: market_collateral(
+                            &incoming.market_id,
+                            &market.settlement_asset,
+                        ),
+                        fee_revenue: fee_revenue(&market.settlement_asset),
+                        quantity_micros: fill.quantity_micros,
+                        collateral_amount_atomic: amounts.collateral_atomic,
+                        maker_amount_atomic: amounts.maker_atomic,
+                        taker_amount_atomic: amounts.taker_atomic,
+                        taker_fee_atomic: amounts.taker_fee_atomic,
+                    },
+                )?;
                 add_basis(
                     cost_basis,
                     position_key(&maker.private_user_id, &incoming.market_id, maker.outcome),
@@ -3900,11 +6402,6 @@ fn apply_complete_set_match_settlement(
                     ));
                 }
                 let amounts = complete_set_fill_amounts(market, fill)?;
-                let taker_proceeds = amounts
-                    .taker_atomic
-                    .checked_sub(amounts.taker_fee_atomic)
-                    .ok_or(CoreError::UnbalancedTransaction)?;
-
                 reduce_basis_for_held_quantity(
                     ledger,
                     cost_basis,
@@ -3928,71 +6425,34 @@ fn apply_complete_set_match_settlement(
                     fill.quantity_micros,
                 )?;
 
-                ledger.apply(LedgerTransaction {
-                    idempotency_key: format!(
-                        "order:{command_idempotency_key}:merge-claims:{}",
-                        fill.sequence
-                    ),
-                    business_reference: business_reference.into(),
-                    transfers: vec![
-                        Transfer {
-                            from: claim_hold(&maker),
-                            to: claim_position_for(
-                                &maker.private_user_id,
-                                &incoming.market_id,
-                                maker.outcome,
-                            ),
-                            amount: fill.quantity_micros,
-                        },
-                        Transfer {
-                            from: incoming_claim_hold.clone(),
-                            to: claim_position_for(
-                                &maker.private_user_id,
-                                &incoming.market_id,
-                                incoming.outcome,
-                            ),
-                            amount: fill.quantity_micros,
-                        },
-                    ],
-                })?;
-                ledger.apply_complete_set(CompleteSetTransaction {
-                    idempotency_key: format!(
-                        "order:{command_idempotency_key}:merge-set:{}",
-                        fill.sequence
-                    ),
-                    owner: maker.private_user_id.clone(),
-                    market_id: incoming.market_id.clone(),
-                    settlement_asset: market.settlement_asset.clone(),
-                    quantity_micros: fill.quantity_micros,
-                    collateral_amount_atomic: amounts.collateral_atomic,
-                    direction: CompleteSetDirection::Burn,
-                })?;
-                let mut payout = Vec::with_capacity(2);
-                if taker_proceeds > 0 {
-                    payout.push(Transfer {
-                        from: available(&maker.private_user_id, &market.settlement_asset),
-                        to: available(&incoming.private_user_id, &market.settlement_asset),
-                        amount: taker_proceeds,
-                    });
-                }
-                if amounts.taker_fee_atomic > 0 {
-                    payout.push(Transfer {
-                        from: available(&maker.private_user_id, &market.settlement_asset),
-                        to: fee_revenue(&market.settlement_asset),
-                        amount: amounts.taker_fee_atomic,
-                    });
-                }
-                if payout.is_empty() {
-                    return Err(CoreError::ZeroAmount);
-                }
-                ledger.apply(LedgerTransaction {
-                    idempotency_key: format!(
-                        "order:{command_idempotency_key}:merge-payout:{}",
-                        fill.sequence
-                    ),
-                    business_reference: business_reference.into(),
-                    transfers: payout,
-                })?;
+                ledger.apply_complete_set_fill(
+                    format!("order:{command_idempotency_key}:merge:{}", fill.sequence),
+                    business_reference.into(),
+                    CompleteSetFillPosting {
+                        fill_id: fill.fill_id.to_string(),
+                        direction: CompleteSetDirection::Burn,
+                        maker_hold: claim_hold(&maker),
+                        taker_hold: incoming_claim_hold.clone(),
+                        maker_destination: available(
+                            &maker.private_user_id,
+                            &market.settlement_asset,
+                        ),
+                        taker_destination: available(
+                            &incoming.private_user_id,
+                            &market.settlement_asset,
+                        ),
+                        market_collateral: market_collateral(
+                            &incoming.market_id,
+                            &market.settlement_asset,
+                        ),
+                        fee_revenue: fee_revenue(&market.settlement_asset),
+                        quantity_micros: fill.quantity_micros,
+                        collateral_amount_atomic: amounts.collateral_atomic,
+                        maker_amount_atomic: amounts.maker_atomic,
+                        taker_amount_atomic: amounts.taker_atomic,
+                        taker_fee_atomic: amounts.taker_fee_atomic,
+                    },
+                )?;
                 incoming_claim_used = incoming_claim_used
                     .checked_add(fill.quantity_micros)
                     .ok_or(CoreError::UnbalancedTransaction)?;
@@ -4451,6 +6911,8 @@ fn enforce_user_position_limit(
                 && matches!(
                     execution.view.state,
                     BootstrapExecutionState::FundsReserved
+                        | BootstrapExecutionState::VenueIntentDurable
+                        | BootstrapExecutionState::VenueSubmissionAttempted
                         | BootstrapExecutionState::VenueSubmitted
                 )
         })
@@ -4484,6 +6946,8 @@ fn enforce_pending_bootstrap_limit(
                 && matches!(
                     execution.view.state,
                     BootstrapExecutionState::FundsReserved
+                        | BootstrapExecutionState::VenueIntentDurable
+                        | BootstrapExecutionState::VenueSubmissionAttempted
                         | BootstrapExecutionState::VenueSubmitted
                 )
         })
@@ -4770,14 +7234,23 @@ fn record_native_fill_economics(
     occurred_at_millis: i64,
 ) -> CoreResult<()> {
     let (chain, reward_token) = reward_rail(market)?;
+    let fee_profile_id = market.fee_profile_id.immutable_profile_id();
     for fill in &result.fills {
         let taker_fee = taker_fee_atomic(market, fill.quantity_micros, fill.taker_price_micros())?;
         let maker_rebate = floor_bps(taker_fee, maker_rebate_bps(market.fee_profile_id))?;
         rewards.record_fill(
+            &fill.fill_id.to_string(),
             &fill.taker_private_user_id,
             Some(&fill.maker_private_user_id),
             chain,
             reward_token,
+            market.fee_profile_id.fee_policy_version(),
+            &fee_profile_id,
+            match fill.match_type {
+                MatchType::Normal => "NORMAL",
+                MatchType::Mint => "MINT",
+                MatchType::Merge => "MERGE",
+            },
             fill.quantity_micros,
             taker_fee,
             maker_rebate,
@@ -4919,6 +7392,295 @@ fn redact_match_result(mut result: MatchResult) -> MatchResult {
     result
 }
 
+fn command_receipt_state(
+    action: &UserCommandAction,
+    result: &CommandResult,
+) -> CoreResult<CommandReceiptState> {
+    validate_trading_receipt_binding(action, result)?;
+    let state = match result {
+        CommandResult::Order { result } => match_receipt_state(result)?,
+        CommandResult::Cancelled { .. } => CommandReceiptState::Cancelled,
+        CommandResult::OrdersCancelled { outcomes, .. } => {
+            if outcomes.is_empty() {
+                CommandReceiptState::Accepted
+            } else {
+                CommandReceiptState::Cancelled
+            }
+        }
+        CommandResult::Replaced { result, .. } => match_receipt_state(result)?,
+        CommandResult::PositionClosed { .. } => CommandReceiptState::Filled,
+        _ => CommandReceiptState::Accepted,
+    };
+    // A result must remain paired with the action which produced it. This
+    // prevents a future refactor from signing a plausible state for the wrong
+    // command variant while the result commitment still hashes correctly.
+    let compatible = matches!(
+        (action, result),
+        (
+            UserCommandAction::SubmitOrder { .. },
+            CommandResult::Order { .. }
+        ) | (
+            UserCommandAction::CancelOrder { .. },
+            CommandResult::Cancelled { .. }
+        ) | (
+            UserCommandAction::CancelAllOrders { .. },
+            CommandResult::OrdersCancelled { .. }
+        ) | (
+            UserCommandAction::ReplaceOrder { .. },
+            CommandResult::Replaced { .. }
+        ) | (
+            UserCommandAction::PreviewPositionClose { .. },
+            CommandResult::PositionClosePreview { .. }
+        ) | (
+            UserCommandAction::ClosePosition { .. },
+            CommandResult::PositionClosed { .. }
+        ) | (
+            UserCommandAction::CompleteSet { .. },
+            CommandResult::CompleteSet { .. }
+        ) | (
+            UserCommandAction::Portfolio,
+            CommandResult::Portfolio { .. }
+        ) | (UserCommandAction::Rewards, CommandResult::Rewards { .. })
+            | (
+                UserCommandAction::RequestRewardClaim { .. },
+                CommandResult::RewardClaimAuthorized { .. }
+            )
+            | (
+                UserCommandAction::BootstrapStatus { .. },
+                CommandResult::BootstrapStatus { .. }
+            )
+            | (
+                UserCommandAction::CancelBootstrap { .. },
+                CommandResult::BootstrapCancelled { .. }
+            )
+            | (
+                UserCommandAction::RequestWithdrawal { .. },
+                CommandResult::WithdrawalReserved { .. }
+            )
+            | (
+                UserCommandAction::TransferFunds { .. },
+                CommandResult::FundsTransferred { .. }
+            )
+            | (
+                UserCommandAction::SubmitOrder { .. },
+                CommandResult::BootstrapPending { .. }
+            )
+    );
+    if !compatible {
+        return Err(CoreError::InvalidOrder(
+            "command result does not match the requested action".into(),
+        ));
+    }
+    Ok(state)
+}
+
+fn is_s08_semantic_result(action: &UserCommandAction, result: &CommandResult) -> bool {
+    matches!(
+        (action, result),
+        (
+            UserCommandAction::SubmitOrder { .. },
+            CommandResult::Order { .. }
+        ) | (
+            UserCommandAction::ReplaceOrder { .. },
+            CommandResult::Replaced { .. }
+        ) | (
+            UserCommandAction::CancelOrder { .. },
+            CommandResult::Cancelled { .. }
+        ) | (
+            UserCommandAction::CancelAllOrders { .. },
+            CommandResult::OrdersCancelled { .. }
+        ) | (
+            UserCommandAction::ClosePosition { .. },
+            CommandResult::PositionClosed { .. }
+        )
+    )
+}
+
+fn validate_trading_receipt_binding(
+    action: &UserCommandAction,
+    result: &CommandResult,
+) -> CoreResult<()> {
+    let valid = match (action, result) {
+        (UserCommandAction::SubmitOrder { order }, CommandResult::Order { result }) => result
+            .accepted_order
+            .as_ref()
+            .is_some_and(|accepted| order_intent_matches(order, accepted)),
+        (
+            UserCommandAction::ReplaceOrder {
+                market_id,
+                order_id,
+                replacement,
+            },
+            CommandResult::Replaced { cancelled, result },
+        ) => {
+            cancelled.order_id == *order_id
+                && cancelled.market_id == *market_id
+                && cancelled.status == OrderStatus::Cancelled
+                && result
+                    .accepted_order
+                    .as_ref()
+                    .is_some_and(|accepted| order_intent_matches(replacement, accepted))
+        }
+        (
+            UserCommandAction::CancelOrder {
+                market_id,
+                order_id,
+            },
+            CommandResult::Cancelled { order },
+        ) => {
+            order.order_id == *order_id
+                && order.market_id == *market_id
+                && order.status == OrderStatus::Cancelled
+        }
+        (
+            UserCommandAction::CancelAllOrders { filter },
+            CommandResult::OrdersCancelled {
+                filter: echoed,
+                outcomes,
+            },
+        ) => {
+            Some(filter) == echoed.as_ref()
+                && outcomes
+                    .iter()
+                    .all(|outcome| outcome.status == OrderStatus::Cancelled)
+                && match filter {
+                    CancelAllOrdersFilter::Market { market_id } => outcomes
+                        .iter()
+                        .all(|outcome| outcome.market_id == *market_id),
+                    CancelAllOrdersFilter::All | CancelAllOrdersFilter::Asset { .. } => true,
+                }
+        }
+        (
+            UserCommandAction::PreviewPositionClose {
+                position_id,
+                market_id,
+                outcome,
+                session_tag,
+                quantity_micros,
+                minimum_price_micros,
+            },
+            CommandResult::PositionClosePreview {
+                market_id: echoed_market,
+                outcome: echoed_outcome,
+                session_tag: echoed_session,
+                preview,
+            },
+        ) => {
+            preview.position_id == *position_id
+                && preview.quantity_micros == *quantity_micros
+                && preview.minimum_price_micros == *minimum_price_micros
+                && echoed_market.as_ref() == Some(market_id)
+                && echoed_outcome.as_ref() == Some(outcome)
+                && echoed_session.as_ref() == Some(session_tag)
+        }
+        (
+            UserCommandAction::ClosePosition {
+                position_id,
+                market_id,
+                outcome,
+                session_tag,
+                quantity_micros,
+                minimum_price_micros,
+                quote,
+            },
+            CommandResult::PositionClosed {
+                market_id: echoed_market,
+                outcome: echoed_outcome,
+                session_tag: echoed_session,
+                preview,
+                ..
+            },
+        ) => {
+            preview == quote
+                && preview.position_id == *position_id
+                && preview.quantity_micros == *quantity_micros
+                && preview.minimum_price_micros == *minimum_price_micros
+                && echoed_market.as_ref() == Some(market_id)
+                && echoed_outcome.as_ref() == Some(outcome)
+                && echoed_session.as_ref() == Some(session_tag)
+        }
+        // Non-trading command/result compatibility is still enforced below,
+        // but S08 does not advertise a semantic outcome proof for it.
+        _ => true,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(CoreError::InvalidOrder(
+            "command receipt action/result binding failed".into(),
+        ))
+    }
+}
+
+fn order_intent_matches(expected: &BookOrder, actual: &BookOrder) -> bool {
+    expected.order_id == actual.order_id
+        && expected.market_id == actual.market_id
+        && expected.outcome == actual.outcome
+        && expected.action == actual.action
+        && expected.price_micros == actual.price_micros
+        && expected.quantity_micros == actual.quantity_micros
+        && expected.time_in_force == actual.time_in_force
+        && expected.expires_at_millis == actual.expires_at_millis
+}
+
+fn match_receipt_state(result: &MatchResult) -> CoreResult<CommandReceiptState> {
+    let order = result.accepted_order.as_ref().ok_or_else(|| {
+        CoreError::InvalidOrder("order result must contain accepted_order".into())
+    })?;
+    let fill_quantity = result.fills.iter().try_fold(0u128, |total, fill| {
+        total
+            .checked_add(fill.quantity_micros)
+            .ok_or_else(|| CoreError::InvalidOrder("order result fill quantity overflow".into()))
+    })?;
+    let accounted = order
+        .filled_micros
+        .checked_add(order.remaining_micros)
+        .and_then(|value| value.checked_add(result.cancelled_remainder_micros))
+        .ok_or_else(|| CoreError::InvalidOrder("order result quantity overflow".into()))?;
+    let fills_match = fill_quantity == order.filled_micros;
+    let quantity_matches = accounted == order.quantity_micros;
+
+    let valid = match order.status {
+        OrderStatus::Rejected | OrderStatus::Open => {
+            result.fills.is_empty()
+                && order.filled_micros == 0
+                && order.remaining_micros == order.quantity_micros
+                && result.cancelled_remainder_micros == 0
+        }
+        OrderStatus::Cancelled | OrderStatus::Expired => {
+            result.fills.is_empty()
+                && order.filled_micros == 0
+                && order.remaining_micros == 0
+                && result.cancelled_remainder_micros == order.quantity_micros
+        }
+        OrderStatus::PartiallyFilled => {
+            !result.fills.is_empty()
+                && order.filled_micros > 0
+                && order.filled_micros < order.quantity_micros
+                && fills_match
+                && quantity_matches
+        }
+        OrderStatus::Filled => {
+            !result.fills.is_empty()
+                && order.filled_micros == order.quantity_micros
+                && order.remaining_micros == 0
+                && result.cancelled_remainder_micros == 0
+                && fills_match
+        }
+    };
+    if !valid {
+        return Err(CoreError::InvalidOrder(
+            "order result status/fill/remaining invariant failed".into(),
+        ));
+    }
+    Ok(match order.status {
+        OrderStatus::Rejected => CommandReceiptState::Rejected,
+        OrderStatus::Cancelled | OrderStatus::Expired => CommandReceiptState::Cancelled,
+        OrderStatus::Filled | OrderStatus::PartiallyFilled => CommandReceiptState::Filled,
+        OrderStatus::Open => CommandReceiptState::Accepted,
+    })
+}
+
 fn signed_audit_fills(
     signer: &ReceiptSigner,
     identity_key: &[u8; 32],
@@ -5012,6 +7774,7 @@ fn signed_task_qualifications(
     let statement = TaskQualificationStatement {
         protocol_version: "layrs.task-qualification.v1".into(),
         event_type: "ORDER_ACCEPTED".into(),
+        market_id: Some(order.market_id.clone()),
         order_commitment: order_commitment
             .ok_or_else(|| CoreError::InvalidOrder("missing private order commitment".into()))?,
         settlement_asset: market.settlement_asset.clone(),
@@ -5639,6 +8402,67 @@ fn validate_private_transfer(
     Ok(())
 }
 
+const TRUSTED_TIME_HIGH_WATER_PREFIX: &str = "trusted-time-high-water:";
+
+/// Advances the enclave-trusted clock fence in command-local state.
+///
+/// `system_keys` is already encrypted in snapshots, committed by the state root,
+/// and assigned to the live core only after the complete user command succeeds.
+/// Keeping the single high-water marker here therefore makes a failed command
+/// non-consuming while detecting rollback/regression after a restored snapshot.
+fn advance_trusted_time_high_water(
+    system_keys: &mut BTreeSet<String>,
+    now_millis: i64,
+) -> CoreResult<()> {
+    if now_millis < 0 {
+        return Err(CoreError::InvalidOrder(
+            "trusted time is unavailable".into(),
+        ));
+    }
+    let mut matching = system_keys
+        .range(TRUSTED_TIME_HIGH_WATER_PREFIX.to_owned()..)
+        .take_while(|key| key.starts_with(TRUSTED_TIME_HIGH_WATER_PREFIX));
+    let existing = matching.next().cloned();
+    if matching.next().is_some() {
+        return Err(CoreError::RollbackDetected);
+    }
+    if let Some(marker) = existing.as_ref() {
+        let encoded = marker
+            .strip_prefix(TRUSTED_TIME_HIGH_WATER_PREFIX)
+            .ok_or(CoreError::RollbackDetected)?;
+        let high_water = encoded
+            .parse::<i64>()
+            .map_err(|_| CoreError::RollbackDetected)?;
+        if now_millis < high_water {
+            return Err(CoreError::RollbackDetected);
+        }
+        system_keys.remove(marker);
+    }
+    system_keys.insert(format!("{TRUSTED_TIME_HIGH_WATER_PREFIX}{now_millis:020}"));
+    Ok(())
+}
+
+fn full_user_command_commitment(command: &UserCommand) -> CoreResult<[u8; 32]> {
+    let encoded = serde_json::to_vec(command).map_err(|_| CoreError::RequestHashMismatch)?;
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.full-user-command.v1\0");
+    hash.update((encoded.len() as u64).to_be_bytes());
+    hash.update(encoded);
+    Ok(hash.finalize().into())
+}
+
+fn processed_command_marker(idempotency_key: &str, commitment: [u8; 32]) -> String {
+    let mut key_hash = Sha256::new();
+    key_hash.update(b"layrs.processed-command-key.v1\0");
+    key_hash.update((idempotency_key.len() as u32).to_be_bytes());
+    key_hash.update(idempotency_key.as_bytes());
+    format!(
+        "processed-command-commitment:{}:{}",
+        hex::encode(key_hash.finalize()),
+        hex::encode(commitment),
+    )
+}
+
 fn derive_private_user_id(identity_key: &[u8; 32], commitment: &[u8; 32]) -> String {
     let mut hash = Sha256::new();
     hash.update(b"layrs.private-user-id.v1\0");
@@ -5647,10 +8471,242 @@ fn derive_private_user_id(identity_key: &[u8; 32], commitment: &[u8; 32]) -> Str
     format!("usr_{}", hex::encode(hash.finalize()))
 }
 
+fn derive_private_position_id(
+    identity_key: &[u8; 32],
+    owner: &str,
+    market_id: &str,
+    outcome: Outcome,
+) -> String {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(identity_key)
+        .expect("identity key has fixed HMAC length");
+    mac.update(b"layrs.private-position-id.v1\0");
+    mac.update(&(owner.len() as u32).to_be_bytes());
+    mac.update(owner.as_bytes());
+    mac.update(&(market_id.len() as u32).to_be_bytes());
+    mac.update(market_id.as_bytes());
+    mac.update(match outcome {
+        Outcome::Up => b"UP",
+        Outcome::Down => b"DOWN",
+    });
+    format!("pos_{}", hex::encode(mac.finalize().into_bytes()))
+}
+
+fn position_close_order_id(command_id: &str, idempotency_key: &str, position_id: &str) -> Uuid {
+    let mut name =
+        Vec::with_capacity(command_id.len() + idempotency_key.len() + position_id.len() + 32);
+    name.extend_from_slice(b"layrs.position-close-order.v1\0");
+    name.extend_from_slice(command_id.as_bytes());
+    name.push(0);
+    name.extend_from_slice(idempotency_key.as_bytes());
+    name.push(0);
+    name.extend_from_slice(position_id.as_bytes());
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, &name)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn position_close_order(
+    identity_key: &[u8; 32],
+    ledger: &Ledger,
+    markets: &BTreeMap<String, MarketConfig>,
+    resolutions: &BTreeMap<String, MarketResolution>,
+    owner: &str,
+    position_id: &str,
+    market_id: &str,
+    outcome: Outcome,
+    quantity_micros: u128,
+    minimum_price_micros: u64,
+    order_id: Uuid,
+    now_millis: i64,
+) -> CoreResult<BookOrder> {
+    let market = markets
+        .get(market_id)
+        .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
+    if resolutions.contains_key(market_id) {
+        return Err(CoreError::InvalidOrder(
+            "market is resolving or resolved".into(),
+        ));
+    }
+    if now_millis >= market.closes_at_millis {
+        return Err(CoreError::InvalidOrder("market is closed".into()));
+    }
+    if now_millis < market.opens_at_millis {
+        return Err(CoreError::InvalidOrder("market is not open".into()));
+    }
+    let expected_position_id = derive_private_position_id(identity_key, owner, market_id, outcome);
+    if position_id != expected_position_id {
+        return Err(CoreError::InvalidOrder("position owner mismatch".into()));
+    }
+    if quantity_micros == 0
+        || ledger.balance(&claim_position_for(owner, market_id, outcome)) < quantity_micros
+    {
+        return Err(CoreError::InsufficientBalance);
+    }
+    let order = BookOrder::with_id(
+        order_id,
+        owner,
+        market_id,
+        outcome,
+        OrderAction::Sell,
+        minimum_price_micros,
+        quantity_micros,
+        TimeInForce::Fok,
+        None,
+    );
+    validate_order_for_market(&order, market, now_millis)?;
+    Ok(order)
+}
+
+fn position_close_preview(
+    identity_key: &[u8; 32],
+    owner: &str,
+    outcome: Outcome,
+    position_id: &str,
+    market: &MarketConfig,
+    prior_book: &PriceTimeBook,
+    order: &BookOrder,
+    result: &MatchResult,
+    expires_at_millis: i64,
+) -> CoreResult<PositionClosePreview> {
+    let accepted = result
+        .accepted_order
+        .as_ref()
+        .ok_or_else(|| CoreError::InvalidOrder("position close result is missing".into()))?;
+    let executed_quantity = result.fills.iter().try_fold(0u128, |total, fill| {
+        total
+            .checked_add(fill.quantity_micros)
+            .ok_or(CoreError::UnbalancedTransaction)
+    })?;
+    if accepted.status != OrderStatus::Filled || executed_quantity != order.quantity_micros {
+        return Err(CoreError::InvalidOrder(
+            "insufficient protected liquidity for position close".into(),
+        ));
+    }
+    let mut weighted_price = 0u128;
+    let mut gross_payout_atomic = 0u128;
+    let mut fee_atomic = 0u128;
+    for fill in &result.fills {
+        let taker_price = fill.taker_price_micros();
+        weighted_price = weighted_price
+            .checked_add(
+                u128::from(taker_price)
+                    .checked_mul(fill.quantity_micros)
+                    .ok_or(CoreError::UnbalancedTransaction)?,
+            )
+            .ok_or(CoreError::UnbalancedTransaction)?;
+        gross_payout_atomic = gross_payout_atomic
+            .checked_add(settlement_atomic(
+                market,
+                notional(taker_price, fill.quantity_micros)?,
+            )?)
+            .ok_or(CoreError::UnbalancedTransaction)?;
+        fee_atomic = fee_atomic
+            .checked_add(taker_fee_atomic(market, fill.quantity_micros, taker_price)?)
+            .ok_or(CoreError::UnbalancedTransaction)?;
+    }
+    let average_price_micros = u64::try_from(weighted_price / executed_quantity)
+        .map_err(|_| CoreError::UnbalancedTransaction)?;
+    if average_price_micros < order.price_micros {
+        return Err(CoreError::InvalidOrder(
+            "position close violated price protection".into(),
+        ));
+    }
+    // Commit only to the exact protected liquidity slice consumed by this FOK
+    // close. Hashing the entire private book lets an unrelated dust order or
+    // cancellation invalidate every outstanding quote, creating a cheap DoS.
+    // Each contributing maker's immutable priority plus current executable
+    // state is included, so altering/cancelling any consumed liquidity, or
+    // introducing a better executable level, still changes the commitment.
+    let mut book_hash = Sha256::new();
+    book_hash.update(b"layrs.position-close-executable-slice.v2\0");
+    book_hash.update((market.market_id.len() as u32).to_be_bytes());
+    book_hash.update(market.market_id.as_bytes());
+    book_hash.update((result.fills.len() as u32).to_be_bytes());
+    let mut protected_sequence = 0u64;
+    for fill in &result.fills {
+        let maker = prior_book
+            .order(fill.maker_order_id)
+            .ok_or_else(|| CoreError::InvalidOrder("position close quote is unavailable".into()))?;
+        protected_sequence = protected_sequence.max(maker.sequence);
+        book_hash.update(fill.maker_order_id.as_bytes());
+        book_hash.update([match fill.match_type {
+            MatchType::Normal => 0,
+            MatchType::Mint => 1,
+            MatchType::Merge => 2,
+        }]);
+        book_hash.update([match maker.outcome {
+            Outcome::Up => 0,
+            Outcome::Down => 1,
+        }]);
+        book_hash.update([match maker.action {
+            OrderAction::Buy => 0,
+            OrderAction::Sell => 1,
+        }]);
+        book_hash.update(maker.price_micros.to_be_bytes());
+        book_hash.update(maker.remaining_micros.to_be_bytes());
+        book_hash.update(maker.sequence.to_be_bytes());
+        book_hash.update(maker.expires_at_millis.unwrap_or(i64::MAX).to_be_bytes());
+        book_hash.update(fill.quantity_micros.to_be_bytes());
+    }
+    let book_commitment_sha256: [u8; 32] = book_hash.finalize().into();
+    let mut preview = PositionClosePreview {
+        position_id: position_id.to_owned(),
+        quantity_micros: executed_quantity,
+        minimum_price_micros: order.price_micros,
+        average_price_micros,
+        gross_payout_atomic,
+        fee_atomic,
+        net_payout_atomic: gross_payout_atomic
+            .checked_sub(fee_atomic)
+            .ok_or(CoreError::UnbalancedTransaction)?,
+        book_commitment_sha256,
+        // This is the highest maker-priority sequence in the protected slice,
+        // not the mutable whole-book sequence.
+        book_sequence: protected_sequence,
+        expires_at_millis,
+        quote_commitment_sha256: [0u8; 32],
+    };
+    preview.quote_commitment_sha256 =
+        position_close_quote_commitment(identity_key, owner, &market.market_id, outcome, &preview);
+    Ok(preview)
+}
+
+fn position_close_quote_commitment(
+    identity_key: &[u8; 32],
+    owner: &str,
+    market_id: &str,
+    outcome: Outcome,
+    preview: &PositionClosePreview,
+) -> [u8; 32] {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(identity_key)
+        .expect("identity key has fixed HMAC length");
+    mac.update(b"layrs.position-close-quote.v1\0");
+    mac.update(&(owner.len() as u32).to_be_bytes());
+    mac.update(owner.as_bytes());
+    mac.update(&(market_id.len() as u32).to_be_bytes());
+    mac.update(market_id.as_bytes());
+    mac.update(match outcome {
+        Outcome::Up => b"UP",
+        Outcome::Down => b"DOWN",
+    });
+    mac.update(&(preview.position_id.len() as u32).to_be_bytes());
+    mac.update(preview.position_id.as_bytes());
+    mac.update(&preview.quantity_micros.to_be_bytes());
+    mac.update(&preview.minimum_price_micros.to_be_bytes());
+    mac.update(&preview.average_price_micros.to_be_bytes());
+    mac.update(&preview.gross_payout_atomic.to_be_bytes());
+    mac.update(&preview.fee_atomic.to_be_bytes());
+    mac.update(&preview.net_payout_atomic.to_be_bytes());
+    mac.update(&preview.book_commitment_sha256);
+    mac.update(&preview.book_sequence.to_be_bytes());
+    mac.update(&preview.expires_at_millis.to_be_bytes());
+    mac.finalize().into_bytes().into()
+}
+
 fn portfolio_snapshot(
     ledger: &Ledger,
     books: &BTreeMap<String, PriceTimeBook>,
     cost_basis: &BTreeMap<PositionKey, u128>,
+    identity_key: &[u8; 32],
     owner: &str,
     now_millis: i64,
 ) -> PortfolioSnapshot {
@@ -5665,6 +8721,12 @@ fn portfolio_snapshot(
                     Outcome::Down
                 };
                 positions.push(PrivatePosition {
+                    position_id: derive_private_position_id(
+                        identity_key,
+                        owner,
+                        &market_id,
+                        parsed,
+                    ),
                     cost_basis_micros: cost_basis
                         .get(&position_key(owner, &market_id, parsed))
                         .copied()
@@ -5704,6 +8766,525 @@ fn processed_hashes(processed: &BTreeMap<String, ProcessedCommand>) -> BTreeMap<
         .iter()
         .map(|(key, value)| (key.clone(), value.request_hash))
         .collect()
+}
+
+fn recovery_result_marker(idempotency_key: &str, digest: [u8; 32]) -> String {
+    format!("recovery-result:{idempotency_key}:{}", hex::encode(digest))
+}
+
+fn private_recovery_result_digest(
+    identity_key: &[u8; 32],
+    result: &CommandResult,
+) -> CoreResult<[u8; 32]> {
+    let encoded = serde_json::to_vec(result).map_err(|_| CoreError::InvalidRecoveryCapsule)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(identity_key)
+        .map_err(|_| CoreError::InvalidRecoveryCapsule)?;
+    mac.update(b"layrs.private-recovery-result.v1\0");
+    mac.update(&(encoded.len() as u64).to_be_bytes());
+    mac.update(&encoded);
+    Ok(mac.finalize().into_bytes().into())
+}
+
+fn recovery_archive_ack_marker(
+    idempotency_key: &str,
+    result_digest: [u8; 32],
+    archive_row_commitment: [u8; 32],
+) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.private-recovery-archive-ack.v1\0");
+    hash.update((idempotency_key.len() as u64).to_be_bytes());
+    hash.update(idempotency_key.as_bytes());
+    hash.update(result_digest);
+    hash.update(archive_row_commitment);
+    format!("recovery-archive-ack:{}", hex::encode(hash.finalize()))
+}
+
+fn recovery_capsule_size(capsule: &RecoveryCapsule) -> CoreResult<usize> {
+    serde_json::to_vec(capsule)
+        .map(|encoded| encoded.len())
+        .map_err(|_| CoreError::InvalidRecoveryCapsule)
+}
+
+fn recovery_window_size(capsules: &BTreeMap<String, RecoveryCapsule>) -> CoreResult<usize> {
+    serde_json::to_vec(capsules)
+        .map(|encoded| encoded.len())
+        .map_err(|_| CoreError::InvalidRecoveryCapsule)
+}
+
+fn insert_recovery_capsule(
+    capsules: &mut BTreeMap<String, RecoveryCapsule>,
+    idempotency_key: String,
+    capsule: RecoveryCapsule,
+) -> CoreResult<()> {
+    if recovery_capsule_size(&capsule)? > MAX_RECOVERY_CAPSULE_BYTES {
+        return Err(CoreError::RecoveryCapsuleTooLarge);
+    }
+    capsules.insert(idempotency_key.clone(), capsule);
+    if capsules.len() > MAX_RECOVERY_CAPSULES
+        || recovery_window_size(capsules)? > MAX_RECOVERY_WINDOW_BYTES
+    {
+        capsules.remove(&idempotency_key);
+        return Err(CoreError::RecoveryWindowFull);
+    }
+    Ok(())
+}
+
+fn reserve_recovery_capacity(capsules: &BTreeMap<String, RecoveryCapsule>) -> CoreResult<()> {
+    if capsules.len() >= MAX_RECOVERY_CAPSULES
+        || recovery_window_size(capsules)?
+            .checked_add(MAX_RECOVERY_CAPSULE_BYTES + 128 + 8)
+            .ok_or(CoreError::RecoveryWindowFull)?
+            > MAX_RECOVERY_WINDOW_BYTES
+    {
+        return Err(CoreError::RecoveryWindowFull);
+    }
+    Ok(())
+}
+
+fn validate_recovery_capsules(
+    capsules: &BTreeMap<String, RecoveryCapsule>,
+    processed: &BTreeMap<String, [u8; 32]>,
+    system_keys: &BTreeSet<String>,
+    identity_key: &[u8; 32],
+    snapshot_sequence: u64,
+) -> CoreResult<()> {
+    if capsules.len() > MAX_RECOVERY_CAPSULES
+        || recovery_window_size(capsules)? > MAX_RECOVERY_WINDOW_BYTES
+    {
+        return Err(CoreError::InvalidRecoveryCapsule);
+    }
+    for (idempotency_key, capsule) in capsules {
+        if recovery_capsule_size(capsule)? > MAX_RECOVERY_CAPSULE_BYTES
+            || capsule.sequence > snapshot_sequence
+            || capsule.receipt.idempotency_key != *idempotency_key
+            || capsule.receipt.enclave_sequence != capsule.sequence
+            || capsule.receipt.command_commitment_sha256 != Some(capsule.request_hash)
+            || processed.get(idempotency_key).copied() != Some(capsule.request_hash)
+            || private_recovery_result_digest(identity_key, &capsule.result)?
+                != capsule.result_digest
+            || !system_keys.contains(&recovery_result_marker(
+                idempotency_key,
+                capsule.result_digest,
+            ))
+        {
+            return Err(CoreError::InvalidRecoveryCapsule);
+        }
+    }
+    Ok(())
+}
+
+fn incident_terminal_state_root() -> [u8; 32] {
+    hex::decode(INCIDENT_TERMINAL_STATE_ROOT_HEX)
+        .expect("incident state root is compile-time checked hex")
+        .try_into()
+        .expect("incident state root is 32 bytes")
+}
+
+fn incident_terminal_journal_head() -> [u8; 32] {
+    hex::decode(INCIDENT_TERMINAL_JOURNAL_HEAD_HEX)
+        .expect("incident journal head is compile-time checked hex")
+        .try_into()
+        .expect("incident journal head is 32 bytes")
+}
+
+fn incident_terminal_ciphertext_sha256() -> [u8; 32] {
+    hex::decode(INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX)
+        .expect("incident ciphertext hash is compile-time checked hex")
+        .try_into()
+        .expect("incident ciphertext hash is 32 bytes")
+}
+
+fn incident_terminal_restore_policy() -> TerminalSnapshotRestorePolicy {
+    TerminalSnapshotRestorePolicy {
+        sequence: INCIDENT_TERMINAL_SEQUENCE,
+        state_root: incident_terminal_state_root(),
+        journal_head: incident_terminal_journal_head(),
+        ciphertext_sha256: incident_terminal_ciphertext_sha256(),
+    }
+}
+
+#[cfg(test)]
+fn validate_exact_incident_terminal_snapshot(snapshot: &EncryptedSnapshot) -> CoreResult<()> {
+    validate_terminal_snapshot_against_policy(snapshot, incident_terminal_restore_policy())
+}
+
+fn validate_terminal_snapshot_against_policy(
+    snapshot: &EncryptedSnapshot,
+    policy: TerminalSnapshotRestorePolicy,
+) -> CoreResult<()> {
+    if snapshot.sequence != policy.sequence
+        || snapshot.state_root != policy.state_root
+        || snapshot.journal_head != policy.journal_head
+        || snapshot.ciphertext_hash != policy.ciphertext_sha256
+        || Sha256::digest(&snapshot.ciphertext).as_slice() != snapshot.ciphertext_hash
+    {
+        return Err(CoreError::IncidentRecoveryPolicyMismatch);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn terminal_category_counts(
+    ledger: &Ledger,
+    books: &BTreeMap<String, PriceTimeBook>,
+    markets: &BTreeMap<String, MarketConfig>,
+    sessions: &SessionGuard,
+    processed_hashes: &BTreeMap<String, [u8; 32]>,
+    system_keys: &BTreeSet<String>,
+    position_cost_basis: &[(PositionKey, u128)],
+    resolutions: &BTreeMap<String, MarketResolution>,
+) -> CoreResult<ExactTerminalCategoryCounts> {
+    let mut users = ledger.offline_user_owners();
+    let mut order_count = 0usize;
+    for book in books.values() {
+        order_count = order_count
+            .checked_add(book.offline_orders().len())
+            .ok_or(CoreError::UnbalancedTransaction)?;
+        for order in book.offline_orders().values() {
+            users.insert(order.private_user_id.clone());
+        }
+    }
+    let (registered_session_count, sequenced_session_count) = sessions.offline_counts();
+    Ok(ExactTerminalCategoryCounts {
+        user_count: users.len(),
+        registered_session_count,
+        sequenced_session_count,
+        ledger_record_count: ledger.offline_record_count(),
+        position_cost_basis_count: position_cost_basis.len(),
+        order_count,
+        market_count: markets.len(),
+        resolution_count: resolutions.len(),
+        processed_command_count: processed_hashes.len(),
+        system_key_count: system_keys.len(),
+        aggregate_bucket_total_count: ledger.terminal_public_bucket_totals()?.len(),
+        aggregate_asset_total_count: ledger.terminal_public_asset_totals()?.len(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn terminal_snapshot_digests(
+    ledger: &Ledger,
+    books: &BTreeMap<String, PriceTimeBook>,
+    markets: &BTreeMap<String, MarketConfig>,
+    sessions: &SessionGuard,
+    processed_hashes: &BTreeMap<String, [u8; 32]>,
+    system_keys: &BTreeSet<String>,
+    position_cost_basis: &[(PositionKey, u128)],
+    resolutions: &BTreeMap<String, MarketResolution>,
+    private_rewards: &PrivateRewardBook,
+) -> CoreResult<TerminalSnapshotDigests> {
+    let available = ledger.offline_balances_for_buckets(&[AccountBucket::UserAvailable]);
+    let order_holds = ledger.offline_balances_for_buckets(&[AccountBucket::UserOrderHold]);
+    let withdrawal_holds =
+        ledger.offline_balances_for_buckets(&[AccountBucket::UserWithdrawalHold]);
+    let position_balances = ledger.offline_balances_for_buckets(&[AccountBucket::UserPosition]);
+    let fee_balances = ledger.offline_balances_for_buckets(&[AccountBucket::FeeRevenue]);
+    let pool_cash = ledger.offline_balances_for_buckets(&[AccountBucket::PoolCash]);
+
+    let mut users = ledger.offline_user_owners();
+    let mut snapshot_fill_state = BTreeMap::<(String, Uuid), u128>::new();
+    for (market_id, book) in books {
+        for order in book.offline_orders().values() {
+            users.insert(order.private_user_id.clone());
+            snapshot_fill_state.insert((market_id.clone(), order.order_id), order.filled_micros);
+        }
+    }
+
+    let users_and_sessions = terminal_digest(
+        b"layrs.terminal-snapshot.users-and-sessions.v1\0",
+        &(users, sessions),
+    )?;
+    let available_balances = terminal_digest(
+        b"layrs.terminal-snapshot.available-balances.v1\0",
+        &available,
+    )?;
+    let order_holds = terminal_digest(b"layrs.terminal-snapshot.order-holds.v1\0", &order_holds)?;
+    let withdrawal_holds = terminal_digest(
+        b"layrs.terminal-snapshot.withdrawal-holds.v1\0",
+        &withdrawal_holds,
+    )?;
+    let positions_and_cost_basis = terminal_digest(
+        b"layrs.terminal-snapshot.positions-and-cost-basis.v1\0",
+        &(position_balances, position_cost_basis),
+    )?;
+    let order_books = terminal_digest(b"layrs.terminal-snapshot.order-books.v1\0", books)?;
+    let snapshot_fill_state = terminal_digest(
+        b"layrs.terminal-snapshot.fill-state.v1\0",
+        &snapshot_fill_state,
+    )?;
+    let resolutions = terminal_digest(b"layrs.terminal-snapshot.resolutions.v1\0", resolutions)?;
+    let rewards = terminal_digest(b"layrs.terminal-snapshot.rewards.v1\0", private_rewards)?;
+    let fees = terminal_digest(
+        b"layrs.terminal-snapshot.fees.v1\0",
+        &(fee_balances, private_rewards),
+    )?;
+    let markets = terminal_digest(b"layrs.terminal-snapshot.markets.v1\0", markets)?;
+    let replay_state = terminal_digest(
+        b"layrs.terminal-snapshot.replay-state.v1\0",
+        &(ledger.offline_replay_keys(), processed_hashes, system_keys),
+    )?;
+    let custody_qualified_totals = terminal_digest(
+        b"layrs.terminal-snapshot.custody-qualified-totals.v1\0",
+        &ledger.custody_reconciliation_totals()?,
+    )?;
+    let composite_user_state = terminal_digest(
+        b"layrs.terminal-snapshot.composite-user-state.v1\0",
+        &[
+            users_and_sessions,
+            available_balances,
+            order_holds,
+            withdrawal_holds,
+            positions_and_cost_basis,
+            order_books,
+            snapshot_fill_state,
+            resolutions,
+            rewards,
+            fees,
+            markets,
+            replay_state,
+            custody_qualified_totals,
+        ],
+    )?;
+    let has_user_liability = available.iter().any(|(_, amount)| *amount > 0)
+        || position_cost_basis.iter().any(|(_, amount)| *amount > 0)
+        || ledger
+            .offline_balances_for_buckets(&[
+                AccountBucket::UserOrderHold,
+                AccountBucket::UserWithdrawalHold,
+                AccountBucket::UserPosition,
+            ])
+            .iter()
+            .any(|(_, amount)| *amount > 0);
+    let has_pool_cash = pool_cash.iter().any(|(_, amount)| *amount > 0);
+
+    Ok(TerminalSnapshotDigests {
+        users_and_sessions,
+        available_balances,
+        order_holds,
+        withdrawal_holds,
+        positions_and_cost_basis,
+        order_books,
+        snapshot_fill_state,
+        resolutions,
+        rewards,
+        fees,
+        markets,
+        replay_state,
+        custody_qualified_totals,
+        composite_user_state,
+        pool_cash_opening_required: has_user_liability && !has_pool_cash,
+    })
+}
+
+fn terminal_digest<T: Serialize + ?Sized>(domain: &[u8], value: &T) -> CoreResult<[u8; 32]> {
+    let value = serde_json::to_value(value).map_err(|_| CoreError::JournalCrypto)?;
+    let canonical = terminal_canonical_json(value);
+    let encoded = serde_json::to_vec(&canonical).map_err(|_| CoreError::JournalCrypto)?;
+    let mut hash = Sha256::new();
+    hash.update(domain);
+    hash.update((encoded.len() as u64).to_be_bytes());
+    hash.update(encoded);
+    Ok(hash.finalize().into())
+}
+
+fn terminal_canonical_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Number(number) => serde_json::Value::String(number.to_string()),
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(terminal_canonical_json).collect())
+        }
+        serde_json::Value::Object(values) => serde_json::Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, terminal_canonical_json(value)))
+                .collect(),
+        ),
+        value => value,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn offline_state_digests(
+    ledger: &Ledger,
+    books: &BTreeMap<String, PriceTimeBook>,
+    markets: &BTreeMap<String, MarketConfig>,
+    sessions: &SessionGuard,
+    processed_hashes: &BTreeMap<String, [u8; 32]>,
+    system_keys: &BTreeSet<String>,
+    position_cost_basis: &[(PositionKey, u128)],
+    resolutions: &BTreeMap<String, MarketResolution>,
+    private_rewards: &PrivateRewardBook,
+    journal_fills: &[Fill],
+) -> CoreResult<OfflineStateDigests> {
+    let available = ledger.offline_balances_for_buckets(&[AccountBucket::UserAvailable]);
+    let order_holds = ledger.offline_balances_for_buckets(&[AccountBucket::UserOrderHold]);
+    let withdrawal_holds =
+        ledger.offline_balances_for_buckets(&[AccountBucket::UserWithdrawalHold]);
+    let position_balances = ledger.offline_balances_for_buckets(&[AccountBucket::UserPosition]);
+    let fee_balances = ledger.offline_balances_for_buckets(&[AccountBucket::FeeRevenue]);
+    let pool_cash = ledger.offline_balances_for_buckets(&[AccountBucket::PoolCash]);
+
+    let mut user_owners = ledger.offline_user_owners();
+    for book in books.values() {
+        for order in book.offline_orders().values() {
+            user_owners.insert(order.private_user_id.clone());
+        }
+    }
+
+    let users = offline_digest(
+        b"layrs.restore-equality.users.v1\0",
+        &(user_owners, sessions),
+    )?;
+    let available_balances = offline_digest(b"layrs.restore-equality.available.v1\0", &available)?;
+    let order_holds = offline_digest(b"layrs.restore-equality.order-holds.v1\0", &order_holds)?;
+    let withdrawal_holds = offline_digest(
+        b"layrs.restore-equality.withdrawal-holds.v1\0",
+        &withdrawal_holds,
+    )?;
+    let positions = offline_digest(
+        b"layrs.restore-equality.positions.v1\0",
+        &(position_balances, position_cost_basis),
+    )?;
+    let orders = offline_digest(b"layrs.restore-equality.orders.v1\0", books)?;
+    let fills = offline_digest(b"layrs.restore-equality.fills.v1\0", journal_fills)?;
+    let resolutions = offline_digest(b"layrs.restore-equality.resolutions.v1\0", resolutions)?;
+    let rewards = offline_digest(b"layrs.restore-equality.rewards.v1\0", private_rewards)?;
+    let fees = offline_digest(
+        b"layrs.restore-equality.fees.v1\0",
+        &(fee_balances, private_rewards),
+    )?;
+    let markets = offline_digest(b"layrs.restore-equality.markets.v1\0", markets)?;
+    let replay_keys = offline_digest(
+        b"layrs.restore-equality.replay-keys.v1\0",
+        &(ledger.offline_replay_keys(), processed_hashes, system_keys),
+    )?;
+    let qualified_totals = offline_digest(
+        b"layrs.restore-equality.qualified-totals.v1\0",
+        &ledger.custody_reconciliation_totals()?,
+    )?;
+    let user_state = offline_digest(
+        b"layrs.restore-equality.user-state.v1\0",
+        &(
+            users,
+            available_balances,
+            order_holds,
+            withdrawal_holds,
+            positions,
+            orders,
+            fills,
+            resolutions,
+            rewards,
+            fees,
+            markets,
+            replay_keys,
+        ),
+    )?;
+    let has_user_liability = available.iter().any(|(_, amount)| *amount > 0)
+        || position_cost_basis.iter().any(|(_, amount)| *amount > 0)
+        || ledger
+            .offline_balances_for_buckets(&[
+                AccountBucket::UserOrderHold,
+                AccountBucket::UserWithdrawalHold,
+                AccountBucket::UserPosition,
+            ])
+            .iter()
+            .any(|(_, amount)| *amount > 0);
+    let has_pool_cash = pool_cash.iter().any(|(_, amount)| *amount > 0);
+
+    Ok(OfflineStateDigests {
+        users,
+        available_balances,
+        order_holds,
+        withdrawal_holds,
+        positions,
+        orders,
+        fills,
+        resolutions,
+        rewards,
+        fees,
+        markets,
+        replay_keys,
+        qualified_totals,
+        user_state,
+        pool_cash_opening_required: has_user_liability && !has_pool_cash,
+    })
+}
+
+fn offline_journal_fill_evidence(
+    values: Vec<serde_json::Value>,
+) -> CoreResult<(Vec<Fill>, BTreeMap<(String, Uuid), u128>)> {
+    let mut fills = Vec::new();
+    let mut totals = BTreeMap::<(String, Uuid), u128>::new();
+    for value in values {
+        let is_user_command = value.get("command").is_some() || value.get("result").is_some();
+        if !is_user_command {
+            continue;
+        }
+        let entry: JournaledUserCommand =
+            serde_json::from_value(value).map_err(|_| CoreError::JournalCrypto)?;
+        let CommandResult::Order { result } = entry.result else {
+            continue;
+        };
+        for fill in result.fills {
+            for order_id in [fill.maker_order_id, fill.taker_order_id] {
+                let key = (fill.market_id.clone(), order_id);
+                let next = totals
+                    .get(&key)
+                    .copied()
+                    .unwrap_or_default()
+                    .checked_add(fill.quantity_micros)
+                    .ok_or(CoreError::JournalChainMismatch)?;
+                totals.insert(key, next);
+            }
+            fills.push(fill);
+        }
+    }
+    Ok((fills, totals))
+}
+
+fn offline_fill_totals_equal(
+    books: &BTreeMap<String, PriceTimeBook>,
+    expected: &BTreeMap<(String, Uuid), u128>,
+) -> bool {
+    let actual: BTreeMap<(String, Uuid), u128> = books
+        .iter()
+        .flat_map(|(market_id, book)| {
+            book.offline_orders()
+                .values()
+                .map(|order| ((market_id.clone(), order.order_id), order.filled_micros))
+        })
+        .filter(|(_, amount)| *amount > 0)
+        .collect();
+    actual == *expected
+}
+
+fn offline_digest<T: Serialize + ?Sized>(domain: &[u8], value: &T) -> CoreResult<[u8; 32]> {
+    let encoded = serde_json::to_vec(value).map_err(|_| CoreError::JournalCrypto)?;
+    let mut hash = Sha256::new();
+    hash.update(domain);
+    hash.update((encoded.len() as u64).to_be_bytes());
+    hash.update(encoded);
+    Ok(hash.finalize().into())
+}
+
+fn source_state_root(source: &CoreStateSnapshot) -> [u8; 32] {
+    let position_cost_basis: BTreeMap<PositionKey, u128> =
+        source.position_cost_basis.iter().cloned().collect();
+    state_root(
+        &source.ledger,
+        &source.books,
+        &source.markets,
+        &source.sessions,
+        &source.processed_hashes,
+        &source.system_keys,
+        &position_cost_basis,
+        &source.resolutions,
+        &source.oracle_public_key,
+        &source.bootstrap_executions,
+        &source.private_rewards,
+        source.trading_frozen,
+        source.sequence,
+    )
 }
 
 fn read_only_response_hash(
@@ -5867,9 +9448,29 @@ fn state_root_with_serialized_books(
         hash.update(&(encoded.len() as u64).to_be_bytes());
         hash.update(&encoded);
     }
+    // Preserve byte-for-byte legacy roots until the first enclave-trusted user
+    // command installs the clock fence. Thereafter this explicit versioned
+    // domain makes the accepted high-water part of every state root while the
+    // encrypted snapshot continues to persist the marker in `system_keys`.
+    if let Some(high_water) = trusted_time_high_water(system_keys) {
+        hash.update(b"layrs.trusted-time-state.v1\0");
+        hash.update(&high_water.to_be_bytes());
+    }
     let mut output = [0u8; 32];
     hash.finalize(&mut output);
     output
+}
+
+fn trusted_time_high_water(system_keys: &BTreeSet<String>) -> Option<i64> {
+    let mut matching = system_keys
+        .range(TRUSTED_TIME_HIGH_WATER_PREFIX.to_owned()..)
+        .take_while(|key| key.starts_with(TRUSTED_TIME_HIGH_WATER_PREFIX));
+    let value = matching
+        .next()?
+        .strip_prefix(TRUSTED_TIME_HIGH_WATER_PREFIX)?
+        .parse::<i64>()
+        .ok()?;
+    matching.next().is_none().then_some(value)
 }
 
 fn withdrawal_reservation_marker(
@@ -6151,6 +9752,505 @@ mod category_fee_tests {
 mod snapshot_migration_tests {
     use super::*;
     use crate::private_core::TimeInForce;
+
+    fn incident_snapshot_metadata(sequence: u64) -> EncryptedSnapshot {
+        EncryptedSnapshot {
+            sequence,
+            journal_head: incident_terminal_journal_head(),
+            state_root: incident_terminal_state_root(),
+            nonce: [0; 12],
+            ciphertext: Vec::new(),
+            ciphertext_hash: incident_terminal_ciphertext_sha256(),
+        }
+    }
+
+    #[test]
+    fn terminal_restore_route_authenticates_and_compares_a_deterministic_fixture() {
+        let journal_key = JournalKey::from_bytes([0x71; 32]);
+        let mut source =
+            PrivateTradingCore::new(journal_key.clone(), ReceiptSigner::generate([0x72; 48]));
+        source
+            .ledger
+            .seed_balance(
+                AccountKey::new("private-fixture-user", AccountBucket::UserAvailable, "USDC"),
+                6_000_000,
+            )
+            .unwrap();
+        source
+            .set_trading_freeze("terminal-fixture-freeze".into(), true, [0x73; 32], 1_000)
+            .unwrap();
+        let snapshot = source.export_encrypted_snapshot().unwrap();
+        let policy = TerminalSnapshotRestorePolicy {
+            sequence: snapshot.sequence,
+            state_root: snapshot.state_root,
+            journal_head: snapshot.journal_head,
+            ciphertext_sha256: snapshot.ciphertext_hash,
+        };
+
+        let (restored, report) = PrivateTradingCore::restore_terminal_snapshot_against_policy(
+            journal_key,
+            ReceiptSigner::generate([0x74; 48]),
+            &snapshot,
+            policy,
+        )
+        .unwrap();
+
+        assert_eq!(restored.sequence(), snapshot.sequence);
+        assert_eq!(restored.state_root(), snapshot.state_root);
+        assert_eq!(report.restored_sequence, snapshot.sequence);
+        assert_eq!(report.restored_state_root, hex::encode(snapshot.state_root));
+        assert_eq!(
+            report.restored_journal_head,
+            hex::encode(snapshot.journal_head)
+        );
+        assert_eq!(
+            report.snapshot_ciphertext_sha256,
+            hex::encode(snapshot.ciphertext_hash)
+        );
+        assert!(report.sequence_equal);
+        assert!(report.state_root_equal);
+        assert!(report.journal_head_equal);
+        assert!(report.aggregate_totals_equal);
+        assert!(report.aggregate_totals_zero_delta);
+        assert!(!report.historical_journal_replay_performed);
+        assert!(!report.historical_fill_completeness_certified);
+        assert_eq!(report.aggregate_asset_totals.len(), 1);
+        assert_eq!(report.aggregate_asset_totals[0].amount, 6_000_000);
+    }
+
+    #[test]
+    fn incident_terminal_restore_rejects_every_non_exact_sequence_before_decrypt() {
+        for sequence in [161_891, 161_918, 161_920] {
+            assert_eq!(
+                validate_exact_incident_terminal_snapshot(&incident_snapshot_metadata(sequence)),
+                Err(CoreError::IncidentRecoveryPolicyMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn incident_terminal_restore_rejects_root_head_and_ciphertext_substitution() {
+        let mut wrong_root = incident_snapshot_metadata(INCIDENT_TERMINAL_SEQUENCE);
+        wrong_root.state_root[0] ^= 1;
+        assert_eq!(
+            validate_exact_incident_terminal_snapshot(&wrong_root),
+            Err(CoreError::IncidentRecoveryPolicyMismatch)
+        );
+
+        let mut wrong_head = incident_snapshot_metadata(INCIDENT_TERMINAL_SEQUENCE);
+        wrong_head.journal_head[0] ^= 1;
+        assert_eq!(
+            validate_exact_incident_terminal_snapshot(&wrong_head),
+            Err(CoreError::IncidentRecoveryPolicyMismatch)
+        );
+
+        let mut wrong_ciphertext_hash = incident_snapshot_metadata(INCIDENT_TERMINAL_SEQUENCE);
+        wrong_ciphertext_hash.ciphertext_hash[0] ^= 1;
+        assert_eq!(
+            validate_exact_incident_terminal_snapshot(&wrong_ciphertext_hash),
+            Err(CoreError::IncidentRecoveryPolicyMismatch)
+        );
+
+        // Exact public metadata is still insufficient: the ciphertext bytes
+        // themselves must hash to the immutable policy value before key use.
+        assert_eq!(
+            validate_exact_incident_terminal_snapshot(&incident_snapshot_metadata(
+                INCIDENT_TERMINAL_SEQUENCE
+            )),
+            Err(CoreError::IncidentRecoveryPolicyMismatch)
+        );
+    }
+
+    #[test]
+    fn terminal_digest_decimalizes_numbers_and_separates_domains() {
+        let value = serde_json::json!({"amount": 7, "nested": [0, -2]});
+        let canonical = terminal_canonical_json(value);
+        assert_eq!(canonical["amount"], "7");
+        assert_eq!(canonical["nested"][0], "0");
+        assert_eq!(canonical["nested"][1], "-2");
+        assert_ne!(
+            terminal_digest(b"layrs.test.category-a.v1\0", &canonical).unwrap(),
+            terminal_digest(b"layrs.test.category-b.v1\0", &canonical).unwrap()
+        );
+    }
+
+    #[test]
+    fn terminal_aggregate_totals_never_emit_private_owners() {
+        let mut ledger = Ledger::default();
+        ledger
+            .seed_balance(
+                AccountKey::new("private-owner-alpha", AccountBucket::UserAvailable, "USDC"),
+                7,
+            )
+            .unwrap();
+        ledger
+            .seed_balance(
+                AccountKey::new("private-owner-beta", AccountBucket::UserAvailable, "USDC"),
+                11,
+            )
+            .unwrap();
+        let totals = ledger.terminal_public_bucket_totals().unwrap();
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[0].amount, 18);
+        let encoded = serde_json::to_string(&totals).unwrap();
+        assert!(!encoded.contains("private-owner-alpha"));
+        assert!(!encoded.contains("private-owner-beta"));
+        assert!(encoded.contains("\"amount\":\"18\""));
+    }
+
+    #[test]
+    fn terminal_certificate_schema_rejects_unknown_fields() {
+        let digests = ExactTerminalCategoryDigests {
+            users_and_sessions_sha256: "00".repeat(32),
+            available_balances_sha256: "00".repeat(32),
+            order_holds_sha256: "00".repeat(32),
+            withdrawal_holds_sha256: "00".repeat(32),
+            positions_and_cost_basis_sha256: "00".repeat(32),
+            order_books_sha256: "00".repeat(32),
+            snapshot_fill_state_sha256: "00".repeat(32),
+            resolutions_sha256: "00".repeat(32),
+            rewards_sha256: "00".repeat(32),
+            fees_sha256: "00".repeat(32),
+            markets_sha256: "00".repeat(32),
+            replay_state_sha256: "00".repeat(32),
+            custody_qualified_totals_sha256: "00".repeat(32),
+            composite_user_state_sha256: "00".repeat(32),
+        };
+        let equality = ExactTerminalCategoryEquality {
+            users_and_sessions_equal: true,
+            available_balances_equal: true,
+            order_holds_equal: true,
+            withdrawal_holds_equal: true,
+            positions_and_cost_basis_equal: true,
+            order_books_equal: true,
+            snapshot_fill_state_equal: true,
+            resolutions_equal: true,
+            rewards_equal: true,
+            fees_equal: true,
+            markets_equal: true,
+            replay_state_equal: true,
+            custody_qualified_totals_equal: true,
+            composite_user_state_equal: true,
+        };
+        let report = ExactTerminalSnapshotRestoreReport {
+            source_release_commit: EXACT_LIVE_976_RELEASE_COMMIT.into(),
+            restored_sequence: INCIDENT_TERMINAL_SEQUENCE,
+            restored_state_root: INCIDENT_TERMINAL_STATE_ROOT_HEX.into(),
+            restored_journal_head: INCIDENT_TERMINAL_JOURNAL_HEAD_HEX.into(),
+            snapshot_ciphertext_sha256: INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX.into(),
+            aggregate_bucket_totals: Vec::new(),
+            aggregate_asset_totals: Vec::new(),
+            category_counts: ExactTerminalCategoryCounts {
+                user_count: 0,
+                registered_session_count: 0,
+                sequenced_session_count: 0,
+                ledger_record_count: 0,
+                position_cost_basis_count: 0,
+                order_count: 0,
+                market_count: 0,
+                resolution_count: 0,
+                processed_command_count: 0,
+                system_key_count: 0,
+                aggregate_bucket_total_count: 0,
+                aggregate_asset_total_count: 0,
+            },
+            category_digests: digests,
+            category_equality: equality,
+            sequence_equal: true,
+            state_root_equal: true,
+            journal_head_equal: true,
+            aggregate_totals_equal: true,
+            aggregate_totals_zero_delta: true,
+            restore_floor_persisted: true,
+            no_external_state_mutation_performed: true,
+            pool_cash_opening_required: false,
+            historical_journal_replay_performed: false,
+            historical_fill_completeness_certified: false,
+        };
+        let mut value = serde_json::to_value(report).unwrap();
+        value["privateState"] = serde_json::json!({"unexpected": true});
+        assert!(serde_json::from_value::<ExactTerminalSnapshotRestoreReport>(value).is_err());
+    }
+
+    fn exact_976_binding(snapshot: &EncryptedSnapshot) -> ExactLive976CheckpointBinding {
+        ExactLive976CheckpointBinding {
+            source_release_commit: EXACT_LIVE_976_RELEASE_COMMIT.into(),
+            checkpoint_sha256: "ab".repeat(32),
+            sequence: snapshot.sequence,
+            state_root: snapshot.state_root,
+            journal_head: snapshot.journal_head,
+        }
+    }
+
+    fn assert_exact_restore_pass(report: &ExactLive976RestoreReport) {
+        assert!(report.source_checkpoint_equal);
+        assert!(report.sequence_equal);
+        assert!(report.journal_head_equal);
+        assert!(report.state_root_equal);
+        assert!(report.users_equal);
+        assert!(report.available_balances_equal);
+        assert!(report.order_holds_equal);
+        assert!(report.withdrawal_holds_equal);
+        assert!(report.positions_equal);
+        assert!(report.orders_equal);
+        assert!(report.fills_equal);
+        assert!(report.resolutions_equal);
+        assert!(report.rewards_equal);
+        assert!(report.fees_equal);
+        assert!(report.markets_equal);
+        assert!(report.replay_keys_equal);
+    }
+
+    #[test]
+    fn attested_runner_core_derives_every_wrapper_equality_field() {
+        let journal_key = JournalKey::from_bytes([220u8; 32]);
+        let mut core =
+            PrivateTradingCore::new(journal_key.clone(), ReceiptSigner::generate([221u8; 48]));
+        core.ledger
+            .seed_balance(
+                AccountKey::new(
+                    "private-user-never-exported",
+                    AccountBucket::UserAvailable,
+                    "USDC",
+                ),
+                7_654_321,
+            )
+            .unwrap();
+        let freeze = core
+            .set_trading_freeze("offline-cert-freeze".into(), true, [8u8; 32], 1_000)
+            .unwrap();
+        let snapshot = core.export_live_976_snapshot_for_test().unwrap();
+        let report = PrivateTradingCore::certify_exact_live_976_restore(
+            journal_key,
+            ReceiptSigner::generate([222u8; 48]),
+            &snapshot,
+            &[freeze.encrypted_record],
+            exact_976_binding(&snapshot),
+        )
+        .unwrap();
+
+        assert_exact_restore_pass(&report);
+        assert!(report.pool_cash_opening_required);
+        assert_eq!(report.legacy_zero_balance_count, 0);
+        assert_eq!(report.qualified_totals_digest.len(), 64);
+        assert_eq!(report.user_state_digest.len(), 64);
+        let public_report = serde_json::to_string(&report).unwrap();
+        assert!(!public_report.contains("private-user-never-exported"));
+        assert!(!public_report.contains("7654321"));
+    }
+
+    #[test]
+    fn attested_runner_core_rejects_a_tampered_immutable_journal() {
+        let journal_key = JournalKey::from_bytes([223u8; 32]);
+        let mut core =
+            PrivateTradingCore::new(journal_key.clone(), ReceiptSigner::generate([224u8; 48]));
+        let freeze = core
+            .set_trading_freeze("offline-cert-freeze".into(), true, [9u8; 32], 1_000)
+            .unwrap();
+        let snapshot = core.export_live_976_snapshot_for_test().unwrap();
+        let mut record = freeze.encrypted_record;
+        record.ciphertext[0] ^= 1;
+
+        assert!(matches!(
+            PrivateTradingCore::certify_exact_live_976_restore(
+                journal_key,
+                ReceiptSigner::generate([225u8; 48]),
+                &snapshot,
+                &[record],
+                exact_976_binding(&snapshot),
+            ),
+            Err(CoreError::JournalChainMismatch)
+        ));
+    }
+
+    #[test]
+    fn attested_runner_core_cannot_claim_a_substituted_checkpoint_is_equal() {
+        let journal_key = JournalKey::from_bytes([226u8; 32]);
+        let mut core =
+            PrivateTradingCore::new(journal_key.clone(), ReceiptSigner::generate([227u8; 48]));
+        let freeze = core
+            .set_trading_freeze("offline-cert-freeze".into(), true, [10u8; 32], 1_000)
+            .unwrap();
+        let snapshot = core.export_live_976_snapshot_for_test().unwrap();
+        let mut binding = exact_976_binding(&snapshot);
+        binding.state_root = [0x55; 32];
+        let report = PrivateTradingCore::certify_exact_live_976_restore(
+            journal_key,
+            ReceiptSigner::generate([228u8; 48]),
+            &snapshot,
+            &[freeze.encrypted_record],
+            binding,
+        )
+        .unwrap();
+
+        assert!(!report.source_checkpoint_equal);
+        assert!(!report.state_root_equal);
+    }
+
+    #[test]
+    fn attested_runner_fill_equality_requires_every_journaled_fill_total() {
+        let market_id = "layrs:v3:ZEN:15m:offline-fill-equality";
+        let maker_id = Uuid::from_u128(1);
+        let taker_id = Uuid::from_u128(2);
+        let mut book = PriceTimeBook::default();
+        book.submit(
+            BookOrder::with_id(
+                maker_id,
+                "private-maker",
+                market_id,
+                Outcome::Up,
+                OrderAction::Sell,
+                400_000,
+                1_000_000,
+                TimeInForce::Gtc,
+                None,
+            ),
+            1_000,
+        )
+        .unwrap();
+        let result = book
+            .submit(
+                BookOrder::with_id(
+                    taker_id,
+                    "private-taker",
+                    market_id,
+                    Outcome::Up,
+                    OrderAction::Buy,
+                    400_000,
+                    1_000_000,
+                    TimeInForce::Gtc,
+                    None,
+                ),
+                2_000,
+            )
+            .unwrap();
+        let books = BTreeMap::from([(market_id.into(), book)]);
+        let fill = result.fills.first().unwrap();
+        let exact = BTreeMap::from([
+            (
+                (market_id.into(), fill.maker_order_id),
+                fill.quantity_micros,
+            ),
+            (
+                (market_id.into(), fill.taker_order_id),
+                fill.quantity_micros,
+            ),
+        ]);
+        assert!(offline_fill_totals_equal(&books, &exact));
+
+        let mut diluted = exact;
+        *diluted.get_mut(&(market_id.into(), maker_id)).unwrap() -= 1;
+        assert!(!offline_fill_totals_equal(&books, &diluted));
+    }
+
+    #[test]
+    fn restores_exact_live_976_snapshot_shape_without_changing_checkpoint() {
+        let journal_key = JournalKey::from_bytes([210u8; 32]);
+        let mut core =
+            PrivateTradingCore::new(journal_key.clone(), ReceiptSigner::generate([211u8; 48]));
+        core.ledger
+            .seed_balance(
+                AccountKey::new("private-user", AccountBucket::UserAvailable, "USDC"),
+                5_000_000,
+            )
+            .unwrap();
+
+        let expected_sequence = core.sequence();
+        let expected_root = core.state_root();
+        let snapshot = core.export_live_976_snapshot_for_test().unwrap();
+        let expected_head = snapshot.journal_head;
+
+        let restored = PrivateTradingCore::restore_encrypted_snapshot(
+            journal_key,
+            ReceiptSigner::generate([212u8; 48]),
+            &snapshot,
+            expected_sequence,
+        )
+        .unwrap();
+
+        assert_eq!(restored.sequence(), expected_sequence);
+        assert_eq!(restored.state_root(), expected_root);
+        assert_eq!(
+            restored.journal.chain_head(),
+            (expected_sequence, expected_head)
+        );
+        assert!(restored.recovery_capsules.is_empty());
+    }
+
+    #[test]
+    fn restores_976_zero_balance_and_journals_pool_cash_opening_without_user_drift() {
+        let journal_key = JournalKey::from_bytes([213u8; 32]);
+        let mut core =
+            PrivateTradingCore::new(journal_key.clone(), ReceiptSigner::generate([214u8; 48]));
+        let user = AccountKey::new("private-user", AccountBucket::UserAvailable, "USDC");
+        let depleted = AccountKey::new("depleted-user", AccountBucket::UserAvailable, "USDC");
+        core.ledger.seed_balance(user.clone(), 5_000_000).unwrap();
+        core.ledger
+            .insert_legacy_zero_balance_for_test(depleted.clone());
+        core.set_trading_freeze("freeze-for-opening".into(), true, [9u8; 32], 1_000)
+            .unwrap();
+        let snapshot = core.export_live_976_snapshot_for_test().unwrap();
+
+        let mut restored = PrivateTradingCore::restore_encrypted_snapshot(
+            journal_key,
+            ReceiptSigner::generate([215u8; 48]),
+            &snapshot,
+            snapshot.sequence,
+        )
+        .unwrap();
+        assert_eq!(restored.ledger.legacy_zero_balance_count(), 1);
+        assert_eq!(restored.balance(&user), 5_000_000);
+        assert_eq!(restored.balance(&depleted), 0);
+
+        let source_sequence = restored.sequence();
+        let source_root = restored.state_root();
+        let source_head = restored.journal.chain_head().1;
+        let response = restored
+            .migrate_historical_pool_cash_opening(
+                "opening-usdc".into(),
+                [10u8; 32],
+                vec![PoolCashOpening {
+                    asset: "USDC".into(),
+                    amount: 25_000_000,
+                }],
+                source_sequence,
+                source_root,
+                source_head,
+                2_000,
+            )
+            .unwrap();
+
+        assert_eq!(restored.balance(&user), 5_000_000);
+        assert_eq!(restored.balance(&depleted), 0);
+        assert_eq!(restored.ledger.legacy_zero_balance_count(), 0);
+        assert_eq!(
+            restored.balance(&AccountKey::new("layrs", AccountBucket::PoolCash, "USDC")),
+            25_000_000
+        );
+        assert_eq!(restored.sequence(), source_sequence + 1);
+        assert_eq!(response.receipt.prior_state_root, source_root);
+        assert_eq!(response.receipt.state_root, restored.state_root());
+        assert_eq!(
+            restored.journal.chain_head(),
+            (restored.sequence(), response.encrypted_record.record_hash)
+        );
+
+        assert!(matches!(
+            restored.migrate_historical_pool_cash_opening(
+                "opening-usdc-replay".into(),
+                [10u8; 32],
+                vec![PoolCashOpening {
+                    asset: "USDC".into(),
+                    amount: 25_000_000,
+                }],
+                source_sequence,
+                source_root,
+                source_head,
+                3_000,
+            ),
+            Err(CoreError::JournalChainMismatch)
+        ));
+    }
 
     #[test]
     fn restores_legacy_book_root_and_reconstructs_deterministic_fill_history() {

@@ -41,23 +41,33 @@ pub use engine::{
     exact_condition_resolution_signing_payload, polymarket_resolution_signing_payload,
     resolution_signing_payload, AuditFillStatement, BinanceBoundaryEvidence,
     BinanceResolutionStatement, BootstrapExecutionState, BootstrapExecutionView,
-    BootstrapVenueIntent, BoundaryEvidence, CommandResult, CoreResponse,
-    ExactConditionResolutionStatement, FeeProfileId, MarketConfig, MarketExecution,
+    BootstrapPreparedVenueOrder, BootstrapVenueIntent, BoundaryEvidence, CancelAllOrdersFilter,
+    CancelledOrderOutcome, CommandResult, CoreResponse, CustodyReconciliationSnapshot,
+    ExactConditionResolutionStatement, ExactLive976CheckpointBinding, ExactLive976RestoreReport,
+    ExactTerminalCategoryCounts, ExactTerminalCategoryDigests, ExactTerminalCategoryEquality,
+    ExactTerminalSnapshotRestoreReport, FeeProfileId, MarketConfig, MarketExecution,
     MarketResolution, MarketSettlementReadiness, PolymarketRedemptionIntent,
-    PolymarketResolutionStatement, PortfolioSnapshot, PrivateBalance, PrivatePosition,
-    PrivateTradingCore, ResolutionEvidence, ResolutionOutcome, ResolutionStatement,
-    SignedAuditFillArtifact, SignedBinanceResolution, SignedExactConditionResolution,
-    SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence,
-    SignedTaskQualificationArtifact, SystemResponse, TaskQualificationStatement, UserCommand,
-    UserCommandAction, WithdrawalAuthorization, WithdrawalIntent,
+    PolymarketResolutionStatement, PortfolioSnapshot, PositionClosePreview, PrivateBalance,
+    PrivatePosition, PrivateTradingCore, RecoveryBridgeArtifact, ResolutionEvidence,
+    ResolutionOutcome, ResolutionStatement, SignedAuditFillArtifact, SignedBinanceResolution,
+    SignedExactConditionResolution, SignedPolymarketResolution, SignedResolution,
+    SignedResolutionEvidence, SignedTaskQualificationArtifact, SystemResponse,
+    TaskQualificationStatement, UserCommand, UserCommandAction, WithdrawalAuthorization,
+    WithdrawalIntent, EXACT_LIVE_976_RELEASE_COMMIT, INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX,
+    INCIDENT_TERMINAL_JOURNAL_HEAD_HEX, INCIDENT_TERMINAL_SEQUENCE,
+    INCIDENT_TERMINAL_STATE_ROOT_HEX,
 };
 pub use journal::{
-    EnclaveReceipt, EncryptedJournal, EncryptedJournalRecord, EncryptedSnapshot, JournalKey,
-    ReceiptSigner,
+    command_result_commitment, CommandReceiptState, EnclaveReceipt, EncryptedJournal,
+    EncryptedJournalRecord, EncryptedSnapshot, JournalKey, ReceiptSigner,
 };
+#[allow(unused_imports)]
 pub use ledger::{
-    AccountBucket, AccountKey, ClaimPayout, CompleteSetDirection, CompleteSetTransaction,
-    ExternalFlowDirection, ExternalFlowTransaction, Ledger, LedgerTransaction, Transfer,
+    AccountBucket, AccountKey, AppliedLedgerTransaction, ClaimPayout, CompleteSetDirection,
+    CompleteSetFillPosting, CompleteSetTransaction, CustodyLedgerTotal, ExternalFlowDirection,
+    ExternalFlowTransaction, Ledger, LedgerPosting, LedgerTransaction, NormalFillPosting,
+    PoolCashOpening, PostingSide, PublicAssetTotal, PublicBucketTotal, ResolutionPayoutKind,
+    Transfer, VaultStrategyTransaction, VaultStrategyTransition,
 };
 #[allow(unused_imports)]
 pub use orderbook::{
@@ -109,8 +119,16 @@ pub enum CoreError {
     InvalidResolution(String),
     #[error("encrypted snapshot is older than the anchored checkpoint")]
     RollbackDetected,
+    #[error("incident terminal recovery policy mismatch")]
+    IncidentRecoveryPolicyMismatch,
     #[error("command was processed before the restored checkpoint; query its receipt archive")]
     PreviouslyProcessed,
+    #[error("private command recovery record exceeds the certified bound")]
+    RecoveryCapsuleTooLarge,
+    #[error("private command recovery window is full pending durable archive acknowledgement")]
+    RecoveryWindowFull,
+    #[error("private command recovery window is inconsistent")]
+    InvalidRecoveryCapsule,
 }
 
 pub type CoreResult<T> = Result<T, CoreError>;
