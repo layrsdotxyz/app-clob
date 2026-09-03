@@ -1956,6 +1956,67 @@ fn public_depth_hides_thin_levels_buckets_size_and_clears_at_market_close() {
     let (closed_bids, closed_asks) = core.aggregate_depth(market_id, Outcome::Up, 3_000, 1_000_000);
     assert!(closed_bids.is_empty());
     assert!(closed_asks.is_empty());
+
+    if matches!(option_env!("LAYRS_DIRECT_BTC_EXECUTION_ENABLED"), Some("1")) {
+        let quest_market_id = "layrs:v5:BTC:USDC:1h:1788397200";
+        core.register_market(
+            "sys:market:quest-public-depth".into(),
+            MarketConfig {
+                market_id: quest_market_id.into(),
+                settlement_asset: "USDC".into(),
+                settlement_decimals: 6,
+                public_settlement_chain: Some("base".into()),
+                opens_at_millis: 1_000,
+                closes_at_millis: 3_000,
+                minimum_quantity_micros: 1,
+                maximum_quantity_micros: 100_000_000,
+                minimum_order_notional_micros: 1,
+                maximum_order_notional_micros: 100_000_000,
+                maximum_user_position_micros: 100_000_000,
+                maximum_pending_bootstrap_notional_micros: 100_000_000,
+                tick_size_micros: 10_000,
+                oracle_feed_id: 9002,
+                fee_profile_id: FeeProfileId::PolymarketCryptoV2,
+                execution: MarketExecution::NativeClob,
+            },
+            1_510,
+        )
+        .unwrap();
+        let (key, commitment) = &users[0];
+        core.apply_user_external_flow(
+            "sys:deposit:quest-public-depth".into(),
+            *commitment,
+            "USDC".into(),
+            AccountBucket::UserAvailable,
+            10_000_000,
+            ExternalFlowDirection::Inflow,
+            [220u8; 32],
+            1_520,
+        )
+        .unwrap();
+        execute_signed(
+            &mut core,
+            key,
+            "session:privacy-depth:0",
+            2,
+            "cmd:quest-public-depth",
+            UserCommandAction::SubmitOrder {
+                order: BookOrder::new(
+                    "ignored",
+                    quest_market_id,
+                    Outcome::Up,
+                    OrderAction::Buy,
+                    150_000,
+                    6_666_667,
+                    TimeInForce::Gtc,
+                    None,
+                ),
+            },
+            1_530,
+        );
+        let (quest_bids, _) = core.aggregate_depth(quest_market_id, Outcome::Up, 1_600, 5_000_000);
+        assert_eq!(quest_bids, vec![(150_000, 5_000_000)]);
+    }
 }
 
 #[test]

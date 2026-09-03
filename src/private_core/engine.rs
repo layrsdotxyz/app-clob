@@ -29,6 +29,88 @@ use super::{
 /// owners before it can leave the enclave. This prevents a thin public level
 /// from acting as an oracle for one user's exact order size and arrival time.
 const MIN_PUBLIC_DEPTH_DISTINCT_OWNERS: usize = 3;
+/// The quest liquidity account is the sole funded maker for the rolling BTC
+/// one-hour market. When the same build-time quest gate that permits direct
+/// crypto execution is enabled, publish its bucketed BTC/USDC 1h depth without
+/// weakening the privacy floor for any other market namespace.
+const QUEST_BTC_1H_PUBLIC_DEPTH_DISTINCT_OWNERS: usize = 1;
+
+fn minimum_public_depth_distinct_owners(market_id: &str) -> usize {
+    if matches!(option_env!("LAYRS_DIRECT_BTC_EXECUTION_ENABLED"), Some("1"))
+        && is_quest_btc_one_hour_market(market_id)
+    {
+        QUEST_BTC_1H_PUBLIC_DEPTH_DISTINCT_OWNERS
+    } else {
+        MIN_PUBLIC_DEPTH_DISTINCT_OWNERS
+    }
+}
+
+fn is_quest_btc_one_hour_market(market_id: &str) -> bool {
+    let mut segments = market_id.split(':');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (
+            Some("layrs"),
+            Some("v5"),
+            Some("BTC"),
+            Some("USDC"),
+            Some("1h"),
+            Some(slot),
+            None,
+        ) if slot.parse::<i64>().is_ok()
+    )
+}
+
+#[cfg(test)]
+mod quest_public_depth_policy_tests {
+    use super::*;
+
+    #[test]
+    fn quest_visibility_scope_accepts_only_exact_recurring_btc_usdc_one_hour_ids() {
+        assert!(is_quest_btc_one_hour_market(
+            "layrs:v5:BTC:USDC:1h:1788397200"
+        ));
+        for market_id in [
+            "layrs:v5:BTC:USDC:15m:1788397200",
+            "layrs:v5:ETH:USDC:1h:1788397200",
+            "layrs:v4:BTC:USDC:1h:1788397200",
+            "layrs:v5:BTC:USDC:1h:not-a-slot",
+            "layrs:v5:BTC:USDC:1h:1788397200:extra",
+        ] {
+            assert!(!is_quest_btc_one_hour_market(market_id), "{market_id}");
+        }
+    }
+
+    #[test]
+    fn quest_build_relaxes_only_the_exact_btc_one_hour_owner_floor() {
+        let expected_btc_floor =
+            if matches!(option_env!("LAYRS_DIRECT_BTC_EXECUTION_ENABLED"), Some("1")) {
+                QUEST_BTC_1H_PUBLIC_DEPTH_DISTINCT_OWNERS
+            } else {
+                MIN_PUBLIC_DEPTH_DISTINCT_OWNERS
+            };
+        assert_eq!(
+            minimum_public_depth_distinct_owners("layrs:v5:BTC:USDC:1h:1788397200"),
+            expected_btc_floor
+        );
+        assert_eq!(
+            minimum_public_depth_distinct_owners("layrs:v5:BTC:USDC:15m:1788397200"),
+            MIN_PUBLIC_DEPTH_DISTINCT_OWNERS
+        );
+        assert_eq!(
+            minimum_public_depth_distinct_owners("layrs:v5:ETH:USDC:1h:1788397200"),
+            MIN_PUBLIC_DEPTH_DISTINCT_OWNERS
+        );
+    }
+}
 /// Position-close quotes are deliberately short lived. They commit to the
 /// exact private book state and economics seen by the enclave, so a quote can
 /// neither be replayed after the book moves nor extended by an API client.
@@ -5784,12 +5866,13 @@ impl PrivateTradingCore {
             || (Vec::new(), Vec::new()),
             |book| {
                 let (bids, asks) = book.aggregate_depth(market_id, outcome, now_millis);
+                let minimum_distinct_owners = minimum_public_depth_distinct_owners(market_id);
                 let filter = |levels: Vec<(u64, u128, usize)>| {
                     levels
                         .into_iter()
                         .filter(|(_, quantity, distinct_owners)| {
                             *quantity >= minimum_level_quantity_micros
-                                && *distinct_owners >= MIN_PUBLIC_DEPTH_DISTINCT_OWNERS
+                                && *distinct_owners >= minimum_distinct_owners
                         })
                         .filter_map(|(price, quantity, _)| {
                             // Publish only whole privacy buckets. Observers see
