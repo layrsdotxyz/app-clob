@@ -2215,6 +2215,23 @@ fn direct_quest_operator_command(command: &OperatorCommand) -> bool {
             *amount_atomic,
             evidence_hash,
         ),
+        OperatorCommand::SignPoolWithdrawal {
+            idempotency_key,
+            authorization,
+            nonce,
+            gas_limit,
+            max_fee_per_gas_wei,
+            max_priority_fee_per_gas_wei,
+            now_millis,
+        } => direct_base_usdc_withdrawal_signing(
+            idempotency_key,
+            authorization,
+            *nonce,
+            *gas_limit,
+            max_fee_per_gas_wei,
+            max_priority_fee_per_gas_wei,
+            *now_millis,
+        ),
         OperatorCommand::ResolutionStatus { market_id }
         | OperatorCommand::ResolutionReadiness { market_id, .. } => {
             recurring_crypto_window(market_id).is_some()
@@ -2263,6 +2280,50 @@ fn direct_base_usdc_withdrawal_terminal(
         && asset == "USDC"
         && amount_atomic > 0
         && evidence_hash != &[0; 32]
+}
+
+fn direct_base_usdc_withdrawal_signing(
+    idempotency_key: &str,
+    authorization: &WithdrawalAuthorization,
+    nonce: u64,
+    gas_limit: u64,
+    max_fee_per_gas_wei: &str,
+    max_priority_fee_per_gas_wei: &str,
+    now_millis: i64,
+) -> bool {
+    let Some(withdrawal_id) = idempotency_key.strip_prefix("withdrawal-sign:") else {
+        return false;
+    };
+    let Ok(withdrawal_id) = Uuid::parse_str(withdrawal_id) else {
+        return false;
+    };
+    let intent = &authorization.intent;
+    let Ok(amount_atomic) = intent.amount_atomic.parse::<u128>() else {
+        return false;
+    };
+    let Ok(max_fee) = max_fee_per_gas_wei.parse::<u128>() else {
+        return false;
+    };
+    let Ok(priority_fee) = max_priority_fee_per_gas_wei.parse::<u128>() else {
+        return false;
+    };
+    !withdrawal_id.is_nil()
+        && withdrawal_id == intent.withdrawal_id
+        && intent.protocol_version == "layrs.withdrawal.v1"
+        && !intent.session_id.is_empty()
+        && intent.chain == "base"
+        && intent.asset == "USDC"
+        && amount_atomic > 0
+        && valid_evm_destination(&intent.destination)
+        && !intent.receipt_id.is_empty()
+        && intent.state_root != [0; 32]
+        && now_millis > 0
+        && now_millis < intent.expires_at_millis
+        && intent.expires_at_millis.saturating_sub(now_millis) <= 15 * 60_000
+        && nonce <= i64::MAX as u64
+        && (21_000..=2_000_000).contains(&gas_limit)
+        && max_fee > 0
+        && priority_fee <= max_fee
 }
 
 fn valid_evm_destination(destination: &str) -> bool {
@@ -7465,6 +7526,46 @@ mod tests {
         ] {
             assert!(direct_quest_operator_command(&command));
         }
+        let withdrawal_id = Uuid::from_u128(42);
+        let withdrawal_authorization = WithdrawalAuthorization {
+            intent: clob_service::private_core::WithdrawalIntent {
+                protocol_version: "layrs.withdrawal.v1".into(),
+                withdrawal_id,
+                session_id: "session_quest_withdrawal".into(),
+                chain: "base".into(),
+                asset: "USDC".into(),
+                amount_atomic: "2970620".into(),
+                destination: "0xE570c6cb9A7D3E46bCA321115019B9e91ad64f7c".into(),
+                receipt_id: "receipt_quest_withdrawal".into(),
+                enclave_sequence: 7,
+                state_root: [4; 32],
+                expires_at_millis: 1_000_000,
+                recovery_proof: None,
+            },
+            signature: vec![5; 64],
+        };
+        assert!(direct_quest_operator_command(
+            &OperatorCommand::SignPoolWithdrawal {
+                idempotency_key: format!("withdrawal-sign:{withdrawal_id}"),
+                authorization: withdrawal_authorization.clone(),
+                nonce: 3,
+                gas_limit: 180_000,
+                max_fee_per_gas_wei: "2".into(),
+                max_priority_fee_per_gas_wei: "1".into(),
+                now_millis: 100_000,
+            }
+        ));
+        assert!(!direct_quest_operator_command(
+            &OperatorCommand::SignPoolWithdrawal {
+                idempotency_key: format!("withdrawal-sign:{}", Uuid::from_u128(43)),
+                authorization: withdrawal_authorization,
+                nonce: 3,
+                gas_limit: 180_000,
+                max_fee_per_gas_wei: "2".into(),
+                max_priority_fee_per_gas_wei: "1".into(),
+                now_millis: 100_000,
+            }
+        ));
         for command in [
             OperatorCommand::CreditDeposit {
                 idempotency_key: "deposit:not-a-uuid".into(),
