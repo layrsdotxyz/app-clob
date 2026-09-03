@@ -2171,8 +2171,46 @@ fn direct_quest_operator_command(command: &OperatorCommand) -> bool {
             minimum_level_quantity_micros,
             ..
         } => direct_crypto_public_depth(market_id, *now_millis, *minimum_level_quantity_micros),
+        OperatorCommand::CreditDeposit {
+            idempotency_key,
+            identity_commitment,
+            asset,
+            amount_atomic,
+            evidence_hash,
+            ..
+        } => direct_base_usdc_deposit_credit(
+            idempotency_key,
+            identity_commitment,
+            asset,
+            *amount_atomic,
+            evidence_hash,
+        ),
         _ => false,
     }
+}
+
+/// Quest deposits have already been finalized on Base and reconciled to the
+/// pool before the coordinator signs this command. Permit only the normal
+/// deposit idempotency shape, non-empty account/evidence commitments and the
+/// public API's five-USDC minimum. Other funding mutations remain fenced.
+fn direct_base_usdc_deposit_credit(
+    idempotency_key: &str,
+    identity_commitment: &[u8; 32],
+    asset: &str,
+    amount_atomic: u128,
+    evidence_hash: &[u8; 32],
+) -> bool {
+    let Some(transfer_id) = idempotency_key.strip_prefix("deposit:") else {
+        return false;
+    };
+    let Ok(transfer_id) = Uuid::parse_str(transfer_id) else {
+        return false;
+    };
+    !transfer_id.is_nil()
+        && identity_commitment != &[0; 32]
+        && asset == "USDC"
+        && amount_atomic >= 5_000_000
+        && evidence_hash != &[0; 32]
 }
 
 fn direct_crypto_public_depth(
@@ -7220,7 +7258,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_quest_operator_gate_allows_only_session_setup_archive_ack_and_crypto_rollover() {
+    fn direct_quest_operator_gate_allows_only_session_setup_crypto_and_valid_deposit_credit() {
         let identity_commitment = [7u8; 32];
         assert!(direct_quest_operator_command(
             &OperatorCommand::RegisterSession {
@@ -7244,6 +7282,60 @@ mod tests {
                 identity_commitment
             }
         ));
+        assert!(direct_quest_operator_command(
+            &OperatorCommand::CreditDeposit {
+                idempotency_key: "deposit:e26d2af6-8edd-5b9c-a2f8-1065d5872063".into(),
+                identity_commitment,
+                asset: "USDC".into(),
+                amount_atomic: 5_000_000,
+                evidence_hash: [9; 32],
+                now_millis: 1,
+            }
+        ));
+        for command in [
+            OperatorCommand::CreditDeposit {
+                idempotency_key: "deposit:not-a-uuid".into(),
+                identity_commitment,
+                asset: "USDC".into(),
+                amount_atomic: 5_000_000,
+                evidence_hash: [9; 32],
+                now_millis: 1,
+            },
+            OperatorCommand::CreditDeposit {
+                idempotency_key: "deposit:c8876513-c918-5a5f-aef9-4f6a5f3aae7b".into(),
+                identity_commitment,
+                asset: "ZEN".into(),
+                amount_atomic: 5_000_000,
+                evidence_hash: [9; 32],
+                now_millis: 1,
+            },
+            OperatorCommand::CreditDeposit {
+                idempotency_key: "deposit:c8876513-c918-5a5f-aef9-4f6a5f3aae7b".into(),
+                identity_commitment: [0; 32],
+                asset: "USDC".into(),
+                amount_atomic: 5_000_000,
+                evidence_hash: [9; 32],
+                now_millis: 1,
+            },
+            OperatorCommand::CreditDeposit {
+                idempotency_key: "deposit:c8876513-c918-5a5f-aef9-4f6a5f3aae7b".into(),
+                identity_commitment,
+                asset: "USDC".into(),
+                amount_atomic: 4_999_999,
+                evidence_hash: [9; 32],
+                now_millis: 1,
+            },
+            OperatorCommand::CreditDeposit {
+                idempotency_key: "deposit:c8876513-c918-5a5f-aef9-4f6a5f3aae7b".into(),
+                identity_commitment,
+                asset: "USDC".into(),
+                amount_atomic: 5_000_000,
+                evidence_hash: [0; 32],
+                now_millis: 1,
+            },
+        ] {
+            assert!(!direct_quest_operator_command(&command));
+        }
         let opens_at_millis = 1_788_390_000_000;
         let btc_market = MarketConfig {
             market_id: "layrs:v5:BTC:USDC:1h:1788390000".into(),
