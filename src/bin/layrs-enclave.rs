@@ -2165,8 +2165,39 @@ fn direct_quest_operator_command(command: &OperatorCommand) -> bool {
             market,
             now_millis,
         } => direct_crypto_market_registration(idempotency_key, market, *now_millis),
+        OperatorCommand::AggregateDepth {
+            market_id,
+            now_millis,
+            minimum_level_quantity_micros,
+            ..
+        } => direct_crypto_public_depth(market_id, *now_millis, *minimum_level_quantity_micros),
         _ => false,
     }
+}
+
+fn direct_crypto_public_depth(
+    market_id: &str,
+    now_millis: i64,
+    minimum_level_quantity_micros: u128,
+) -> bool {
+    let Some((_, timeframe, window_start_millis)) = recurring_crypto_window(market_id) else {
+        return false;
+    };
+    let maximum_window_millis = match timeframe {
+        "5m" => 300_000,
+        "15m" => 900_000,
+        "1h" => 3_600_000,
+        "4h" => 14_400_000,
+        "1d" => 86_400_000,
+        "1w" => 604_800_000,
+        "1mo" => 2_678_400_000,
+        _ => return false,
+    };
+    // Preserve the production public-depth privacy floor even if the
+    // untrusted parent attempts to lower its configured threshold.
+    minimum_level_quantity_micros >= 5_000_000
+        && now_millis >= window_start_millis
+        && now_millis < window_start_millis.saturating_add(maximum_window_millis)
 }
 
 fn direct_crypto_market_registration(
@@ -7242,6 +7273,22 @@ mod tests {
                 idempotency_key: format!("market:{}", "ab".repeat(32)),
                 market: btc_market.clone(),
                 now_millis: opens_at_millis,
+            }
+        ));
+        assert!(direct_quest_operator_command(
+            &OperatorCommand::AggregateDepth {
+                market_id: btc_market.market_id.clone(),
+                outcome: clob_service::private_core::Outcome::Up,
+                now_millis: opens_at_millis + 1_000,
+                minimum_level_quantity_micros: 5_000_000,
+            }
+        ));
+        assert!(!direct_quest_operator_command(
+            &OperatorCommand::AggregateDepth {
+                market_id: btc_market.market_id.clone(),
+                outcome: clob_service::private_core::Outcome::Up,
+                now_millis: opens_at_millis + 1_000,
+                minimum_level_quantity_micros: 4_999_999,
             }
         ));
         let zen_market = MarketConfig {
