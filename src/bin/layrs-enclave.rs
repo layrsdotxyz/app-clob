@@ -2132,10 +2132,10 @@ fn direct_execution_request(state: &EnclaveState, request: &PlainRequest) -> boo
         return false;
     }
     match request {
-        PlainRequest::User { command, .. } => state
-            .core
-            .as_ref()
-            .is_some_and(|core| direct_btc_order_action(core, &command.action)),
+        PlainRequest::User { command, .. } => state.core.as_ref().is_some_and(|core| {
+            direct_btc_order_action(core, &command.action)
+                || direct_base_usdc_withdrawal(&command.action)
+        }),
         // Direct SubmitOrder responses reserve a bounded recovery capsule. The
         // existing signed archive proof remains mandatory, but its exact ACK
         // must not depend on Durable Command or the window would eventually
@@ -2185,7 +2185,100 @@ fn direct_quest_operator_command(command: &OperatorCommand) -> bool {
             *amount_atomic,
             evidence_hash,
         ),
+        OperatorCommand::FinalizeWithdrawal {
+            idempotency_key,
+            identity_commitment,
+            asset,
+            amount_atomic,
+            evidence_hash,
+            ..
+        } => direct_base_usdc_withdrawal_terminal(
+            "withdrawal-final:",
+            idempotency_key,
+            identity_commitment,
+            asset,
+            *amount_atomic,
+            evidence_hash,
+        ),
+        OperatorCommand::ReleaseWithdrawal {
+            idempotency_key,
+            identity_commitment,
+            asset,
+            amount_atomic,
+            evidence_hash,
+            ..
+        } => direct_base_usdc_withdrawal_terminal(
+            "withdrawal-release:",
+            idempotency_key,
+            identity_commitment,
+            asset,
+            *amount_atomic,
+            evidence_hash,
+        ),
+        OperatorCommand::ResolutionStatus { market_id }
+        | OperatorCommand::ResolutionReadiness { market_id, .. } => {
+            recurring_crypto_window(market_id).is_some()
+        }
+        OperatorCommand::SignResolutionEvidence { evidence, .. } => {
+            recurring_crypto_window(unsigned_resolution_market_id(evidence)).is_some()
+        }
+        OperatorCommand::ResolveBinanceMarket { signed, .. } => {
+            recurring_crypto_window(&signed.statement.market_id).is_some()
+        }
         _ => false,
+    }
+}
+
+fn direct_base_usdc_withdrawal(action: &UserCommandAction) -> bool {
+    let UserCommandAction::RequestWithdrawal {
+        withdrawal_id,
+        chain,
+        asset,
+        amount_atomic,
+        destination,
+    } = action
+    else {
+        return false;
+    };
+    !withdrawal_id.is_nil()
+        && chain == "base"
+        && asset == "USDC"
+        && *amount_atomic > 0
+        && valid_evm_destination(destination)
+}
+
+fn direct_base_usdc_withdrawal_terminal(
+    prefix: &str,
+    idempotency_key: &str,
+    identity_commitment: &[u8; 32],
+    asset: &str,
+    amount_atomic: u128,
+    evidence_hash: &[u8; 32],
+) -> bool {
+    let Some(withdrawal_id) = idempotency_key.strip_prefix(prefix) else {
+        return false;
+    };
+    Uuid::parse_str(withdrawal_id).is_ok_and(|value| !value.is_nil())
+        && identity_commitment != &[0; 32]
+        && asset == "USDC"
+        && amount_atomic > 0
+        && evidence_hash != &[0; 32]
+}
+
+fn valid_evm_destination(destination: &str) -> bool {
+    destination.len() == 42
+        && destination.starts_with("0x")
+        && destination[2..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn unsigned_resolution_market_id(evidence: &UnsignedResolutionEvidence) -> &str {
+    match evidence {
+        UnsignedResolutionEvidence::Pyth(statement) => &statement.market_id,
+        UnsignedResolutionEvidence::Binance(statement) => &statement.market_id,
+        UnsignedResolutionEvidence::ExactCondition(statement) => &statement.market_id,
+        UnsignedResolutionEvidence::Polymarket(statement) => &statement.market_id,
     }
 }
 
@@ -7258,6 +7351,59 @@ mod tests {
     }
 
     #[test]
+    fn direct_withdrawal_gate_accepts_only_valid_base_usdc_user_requests() {
+        let withdrawal_id = Uuid::from_u128(41);
+        assert!(direct_base_usdc_withdrawal(
+            &UserCommandAction::RequestWithdrawal {
+                withdrawal_id,
+                chain: "base".into(),
+                asset: "USDC".into(),
+                amount_atomic: 3_706_250,
+                destination: "0xE570c6cb9A7D3E46bCA321115019B9e91ad64f7c".into(),
+            }
+        ));
+        for action in [
+            UserCommandAction::RequestWithdrawal {
+                withdrawal_id: Uuid::nil(),
+                chain: "base".into(),
+                asset: "USDC".into(),
+                amount_atomic: 1,
+                destination: "0xE570c6cb9A7D3E46bCA321115019B9e91ad64f7c".into(),
+            },
+            UserCommandAction::RequestWithdrawal {
+                withdrawal_id,
+                chain: "horizen".into(),
+                asset: "USDC".into(),
+                amount_atomic: 1,
+                destination: "0xE570c6cb9A7D3E46bCA321115019B9e91ad64f7c".into(),
+            },
+            UserCommandAction::RequestWithdrawal {
+                withdrawal_id,
+                chain: "base".into(),
+                asset: "ZEN".into(),
+                amount_atomic: 1,
+                destination: "0xE570c6cb9A7D3E46bCA321115019B9e91ad64f7c".into(),
+            },
+            UserCommandAction::RequestWithdrawal {
+                withdrawal_id,
+                chain: "base".into(),
+                asset: "USDC".into(),
+                amount_atomic: 0,
+                destination: "0xE570c6cb9A7D3E46bCA321115019B9e91ad64f7c".into(),
+            },
+            UserCommandAction::RequestWithdrawal {
+                withdrawal_id,
+                chain: "base".into(),
+                asset: "USDC".into(),
+                amount_atomic: 1,
+                destination: "0xnot-an-address".into(),
+            },
+        ] {
+            assert!(!direct_base_usdc_withdrawal(&action));
+        }
+    }
+
+    #[test]
     fn direct_quest_operator_gate_allows_only_session_setup_crypto_and_valid_deposit_credit() {
         let identity_commitment = [7u8; 32];
         assert!(direct_quest_operator_command(
@@ -7292,6 +7438,33 @@ mod tests {
                 now_millis: 1,
             }
         ));
+        for command in [
+            OperatorCommand::FinalizeWithdrawal {
+                idempotency_key: "withdrawal-final:e26d2af6-8edd-5b9c-a2f8-1065d5872063".into(),
+                identity_commitment,
+                asset: "USDC".into(),
+                amount_atomic: 1,
+                evidence_hash: [9; 32],
+                now_millis: 1,
+            },
+            OperatorCommand::ReleaseWithdrawal {
+                idempotency_key: "withdrawal-release:e26d2af6-8edd-5b9c-a2f8-1065d5872063".into(),
+                identity_commitment,
+                asset: "USDC".into(),
+                amount_atomic: 1,
+                evidence_hash: [9; 32],
+                now_millis: 1,
+            },
+            OperatorCommand::ResolutionStatus {
+                market_id: "layrs:v5:BTC:USDC:1h:1788390000".into(),
+            },
+            OperatorCommand::ResolutionReadiness {
+                market_id: "layrs:v5:BTC:USDC:1h:1788390000".into(),
+                now_millis: 1_788_393_600_000,
+            },
+        ] {
+            assert!(direct_quest_operator_command(&command));
+        }
         for command in [
             OperatorCommand::CreditDeposit {
                 idempotency_key: "deposit:not-a-uuid".into(),
