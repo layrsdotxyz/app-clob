@@ -349,6 +349,18 @@ enum OperatorCommand {
         enclave_sequence: u64,
         state_root: [u8; 32],
     },
+    InspectPendingPreparation {
+        idempotency_key: String,
+    },
+    AbortSupersededPreparation {
+        idempotency_key: String,
+        preparation_id: [u8; 32],
+        pending_enclave_sequence: u64,
+        pending_state_root: [u8; 32],
+        live_enclave_sequence: u64,
+        live_state_root: [u8; 32],
+        live_journal_head: [u8; 32],
+    },
     FinalizePreparedCommand {
         preparation: DurableCommandPreparation,
         snapshot: EncryptedSnapshot,
@@ -815,11 +827,53 @@ struct DurableCommandRejection {
     signature: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SignedPendingPreparationInspection {
+    protocol_version: String,
+    environment: String,
+    enclave_measurement_sha384: Vec<u8>,
+    request_idempotency_key: String,
+    preparation_id: Option<[u8; 32]>,
+    pending_prior_enclave_sequence: Option<u64>,
+    pending_enclave_sequence: Option<u64>,
+    pending_prior_state_root: Option<[u8; 32]>,
+    pending_state_root: Option<[u8; 32]>,
+    live_enclave_sequence: u64,
+    live_state_root: [u8; 32],
+    live_journal_head: [u8; 32],
+    observed_at_millis: i64,
+    signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SignedPreparationSupersession {
+    protocol_version: String,
+    environment: String,
+    enclave_measurement_sha384: Vec<u8>,
+    request_idempotency_key: String,
+    preparation_id: [u8; 32],
+    pending_prior_enclave_sequence: u64,
+    pending_enclave_sequence: u64,
+    pending_prior_state_root: [u8; 32],
+    pending_state_root: [u8; 32],
+    live_enclave_sequence: u64,
+    live_state_root: [u8; 32],
+    live_journal_head: [u8; 32],
+    superseded_at_millis: i64,
+    signature: Vec<u8>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 enum PlainResponse {
     PreparedCommandStatus {
         state: &'static str,
+    },
+    PendingPreparationInspection {
+        inspection: SignedPendingPreparationInspection,
+    },
+    PreparedCommandSuperseded {
+        certificate: SignedPreparationSupersession,
     },
     PreparedCommandFinalized {
         preparation_id: [u8; 32],
@@ -941,6 +995,7 @@ struct EnclaveState {
     transport_nonces: TransportReplayCache,
     core: Option<PrivateTradingCore>,
     pending_preparation: Option<PendingPreparedTransition>,
+    last_preparation_supersession: Option<SignedPreparationSupersession>,
     minimum_writer_epoch: u64,
     writer_lease_id: Option<Uuid>,
     pending_provision: Option<PendingProvision>,
@@ -1150,6 +1205,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         transport_nonces: TransportReplayCache::new(MAX_TRANSPORT_REPLAY_ENTRIES),
         core: None,
         pending_preparation: None,
+        last_preparation_supersession: None,
         minimum_writer_epoch: 0,
         writer_lease_id: None,
         pending_provision: None,
@@ -1681,6 +1737,12 @@ async fn handle_encrypted(
         PlainResponse::User { response } => response.task_qualifications.clone(),
         _ => Vec::new(),
     };
+    let preparation_supersession = match &response {
+        PlainResponse::PreparedCommandSuperseded { certificate } => {
+            Some(certificate.clone())
+        }
+        _ => None,
+    };
     let encoded = match serde_json::to_vec(&response)
         .and_then(|value| pad_private_response(value).map_err(serde_json::Error::io))
     {
@@ -1920,6 +1982,29 @@ async fn handle_encrypted(
                     }
                 }
             }
+            if let Some(certificate) = preparation_supersession {
+                if !state
+                    .pending_preparation
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.preparation.preparation_id == certificate.preparation_id
+                    })
+                {
+                    return rollback_wire_error(
+                        &mut state,
+                        &mut rollback_core,
+                        &mut rollback_operator_nonce,
+                        &replay_key,
+                        "DURABLE_SUPERSESSION_PREPARATION_CHANGED",
+                    );
+                }
+                state.pending_preparation = None;
+                // Preserve exactly one signed result so a transport failure
+                // after the clear cannot turn an idempotent retry into
+                // DURABLE_PREPARATION_NOT_FOUND. The certificate is returned
+                // only when every caller-supplied anchor matches exactly.
+                state.last_preparation_supersession = Some(certificate);
+            }
             WireResponse::Encrypted {
                 nonce: response_nonce,
                 ciphertext,
@@ -2116,6 +2201,8 @@ fn durable_control_request(request: &PlainRequest) -> bool {
         PlainRequest::Operator { envelope } => matches!(
             envelope.command,
             OperatorCommand::PreparedCommandStatus { .. }
+                | OperatorCommand::InspectPendingPreparation { .. }
+                | OperatorCommand::AbortSupersededPreparation { .. }
                 | OperatorCommand::FinalizePreparedCommand { .. }
                 | OperatorCommand::DelegatedPortfolioRead { .. }
         ),
@@ -2558,6 +2645,8 @@ fn request_requires_writer_authorization(request: &PlainRequest) -> bool {
                 | OperatorCommand::ObserveBootstrapSubmission { .. }
                 | OperatorCommand::ReconcileBootstrap { .. }
                 | OperatorCommand::SignPoolWithdrawal { .. }
+                | OperatorCommand::InspectPendingPreparation { .. }
+                | OperatorCommand::AbortSupersededPreparation { .. }
                 | OperatorCommand::FinalizePreparedCommand { .. }
         ),
         PlainRequest::AggregateDepth { .. } => false,
@@ -2690,6 +2779,42 @@ fn durable_preparation_id(preparation: &DurableCommandPreparation) -> [u8; 32] {
     hash.update((encoded.len() as u32).to_be_bytes());
     hash.update(encoded);
     hash.finalize().into()
+}
+
+fn pending_preparation_is_superseded(
+    preparation: &DurableCommandPreparation,
+    live_enclave_sequence: u64,
+    live_state_root: [u8; 32],
+) -> bool {
+    // A durable decision whose candidate is still the only possible next
+    // state is irrevocable and must be finalized. Supersession is provable
+    // only after the committed core has reached the candidate sequence on a
+    // different root, or has advanced beyond it. This is the exact condition
+    // under which FINALIZE_PREPARED_COMMAND would reject the stale candidate
+    // with a head mismatch.
+    live_enclave_sequence > preparation.enclave_sequence
+        || (live_enclave_sequence == preparation.enclave_sequence
+            && live_state_root != preparation.state_root)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preparation_supersession_matches_request(
+    certificate: &SignedPreparationSupersession,
+    request_idempotency_key: &str,
+    preparation_id: [u8; 32],
+    pending_enclave_sequence: u64,
+    pending_state_root: [u8; 32],
+    live_enclave_sequence: u64,
+    live_state_root: [u8; 32],
+    live_journal_head: [u8; 32],
+) -> bool {
+    certificate.request_idempotency_key == request_idempotency_key
+        && certificate.preparation_id == preparation_id
+        && certificate.pending_enclave_sequence == pending_enclave_sequence
+        && certificate.pending_state_root == pending_state_root
+        && certificate.live_enclave_sequence == live_enclave_sequence
+        && certificate.live_state_root == live_state_root
+        && certificate.live_journal_head == live_journal_head
 }
 
 fn rebind_durable_preparation(
@@ -3355,7 +3480,9 @@ async fn dispatch(
     verified_now_millis: Option<i64>,
 ) -> PlainResponse {
     let result: Result<PlainResponse, String> = match request {
-        PlainRequest::Operator { envelope } => dispatch_operator(state, envelope).await,
+        PlainRequest::Operator { envelope } => {
+            dispatch_operator(state, envelope, verified_now_millis).await
+        }
         PlainRequest::User {
             command,
             now_millis: untrusted_client_now_millis,
@@ -3456,6 +3583,7 @@ fn ensure_market_execution_available(
 async fn dispatch_operator(
     state: &mut EnclaveState,
     envelope: OperatorEnvelope,
+    verified_now_millis: Option<i64>,
 ) -> Result<PlainResponse, String> {
     if state.operator_nonces.contains(&envelope.nonce) {
         return Err("OPERATOR_REPLAY_REJECTED".into());
@@ -3526,6 +3654,123 @@ async fn dispatch_operator(
                 "UNKNOWN"
             };
             Ok(PlainResponse::PreparedCommandStatus { state: status })
+        }
+        OperatorCommand::InspectPendingPreparation { idempotency_key } => {
+            let observed_at_millis =
+                verified_now_millis.ok_or_else(|| "TRUSTED_TIME_UNAVAILABLE".to_string())?;
+            let core = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?;
+            let pending = state.pending_preparation.as_ref();
+            let mut inspection = SignedPendingPreparationInspection {
+                protocol_version: "layrs.pending-preparation-inspection.v1".into(),
+                environment: recovery_environment().into(),
+                enclave_measurement_sha384: state.enclave_measurement_sha384.to_vec(),
+                request_idempotency_key: idempotency_key,
+                preparation_id: pending.map(|value| value.preparation.preparation_id),
+                pending_prior_enclave_sequence: pending
+                    .map(|value| value.preparation.prior_enclave_sequence),
+                pending_enclave_sequence: pending.map(|value| value.preparation.enclave_sequence),
+                pending_prior_state_root: pending.map(|value| value.preparation.prior_state_root),
+                pending_state_root: pending.map(|value| value.preparation.state_root),
+                live_enclave_sequence: core.sequence(),
+                live_state_root: core.state_root(),
+                live_journal_head: core.journal_head(),
+                observed_at_millis,
+                signature: Vec::new(),
+            };
+            let signer = state
+                .receipt_signer
+                .as_ref()
+                .ok_or_else(|| "RECEIPT_SIGNER_UNAVAILABLE".to_string())?;
+            inspection.signature = signer
+                .sign_domain_payload(b"layrs.pending-preparation-inspection.v1\0", &inspection);
+            Ok(PlainResponse::PendingPreparationInspection { inspection })
+        }
+        OperatorCommand::AbortSupersededPreparation {
+            idempotency_key,
+            preparation_id,
+            pending_enclave_sequence,
+            pending_state_root,
+            live_enclave_sequence,
+            live_state_root,
+            live_journal_head,
+        } => {
+            if let Some(previous) = state.last_preparation_supersession.as_ref() {
+                if previous.request_idempotency_key == idempotency_key {
+                    if preparation_supersession_matches_request(
+                        previous,
+                        &idempotency_key,
+                        preparation_id,
+                        pending_enclave_sequence,
+                        pending_state_root,
+                        live_enclave_sequence,
+                        live_state_root,
+                        live_journal_head,
+                    ) {
+                        return Ok(PlainResponse::PreparedCommandSuperseded {
+                            certificate: previous.clone(),
+                        });
+                    }
+                    return Err("DURABLE_SUPERSESSION_IDEMPOTENCY_CONFLICT".into());
+                }
+            }
+            let superseded_at_millis =
+                verified_now_millis.ok_or_else(|| "TRUSTED_TIME_UNAVAILABLE".to_string())?;
+            let core = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?;
+            if core.sequence() != live_enclave_sequence
+                || core.state_root() != live_state_root
+                || core.journal_head() != live_journal_head
+            {
+                return Err("DURABLE_SUPERSESSION_LIVE_HEAD_CHANGED".into());
+            }
+            let pending = state
+                .pending_preparation
+                .as_ref()
+                .ok_or_else(|| "DURABLE_PREPARATION_NOT_FOUND".to_string())?;
+            if pending.preparation.preparation_id != preparation_id
+                || pending.preparation.enclave_sequence != pending_enclave_sequence
+                || pending.preparation.state_root != pending_state_root
+            {
+                return Err("DURABLE_SUPERSESSION_PREPARATION_MISMATCH".into());
+            }
+            if !pending_preparation_is_superseded(
+                &pending.preparation,
+                live_enclave_sequence,
+                live_state_root,
+            ) {
+                return Err("DURABLE_PREPARATION_NOT_SUPERSEDED".into());
+            }
+            let mut certificate = SignedPreparationSupersession {
+                protocol_version: "layrs.preparation-supersession.v1".into(),
+                environment: recovery_environment().into(),
+                enclave_measurement_sha384: state.enclave_measurement_sha384.to_vec(),
+                request_idempotency_key: idempotency_key,
+                preparation_id,
+                pending_prior_enclave_sequence: pending.preparation.prior_enclave_sequence,
+                pending_enclave_sequence,
+                pending_prior_state_root: pending.preparation.prior_state_root,
+                pending_state_root,
+                live_enclave_sequence,
+                live_state_root,
+                live_journal_head,
+                superseded_at_millis,
+                signature: Vec::new(),
+            };
+            let signer = state
+                .receipt_signer
+                .as_ref()
+                .ok_or_else(|| "RECEIPT_SIGNER_UNAVAILABLE".to_string())?;
+            certificate.signature =
+                signer.sign_domain_payload(b"layrs.preparation-supersession.v1\0", &certificate);
+            // The pending candidate is cleared only after the encrypted
+            // certificate has been constructed successfully in
+            // `handle_encrypted`. Until then this is a read-only proof step.
+            Ok(PlainResponse::PreparedCommandSuperseded { certificate })
         }
         OperatorCommand::FinalizePreparedCommand {
             preparation,
@@ -5053,6 +5298,8 @@ async fn dispatch_operator(
                 | OperatorCommand::BeginIncidentTerminalRestore { .. }
                 | OperatorCommand::RecoverWithdrawalAuthorization { .. }
                 | OperatorCommand::PreparedCommandStatus { .. }
+                | OperatorCommand::InspectPendingPreparation { .. }
+                | OperatorCommand::AbortSupersededPreparation { .. }
                 | OperatorCommand::FinalizePreparedCommand { .. }
                 | OperatorCommand::CompleteProvision { .. }
                 | OperatorCommand::CompleteIncidentTerminalRestore { .. }
@@ -7738,6 +7985,128 @@ mod tests {
         });
         assert!(!durable_control_request(&cancellation));
         assert!(request_requires_writer_authorization(&cancellation));
+    }
+
+    fn durable_preparation_fixture() -> DurableCommandPreparation {
+        DurableCommandPreparation {
+            protocol_version: "layrs.durable-command-preparation.v1".into(),
+            environment: "test".into(),
+            enclave_measurement_sha384: vec![1; 48],
+            preparation_id: [2; 32],
+            actor_domain: "OPERATOR".into(),
+            command_binding_sha256: [3; 32],
+            command_commitment_sha256: [4; 32],
+            request_context_sha256: [5; 32],
+            request_envelope_sha256: [6; 32],
+            command_idempotency_key: "recovery:test:0001".into(),
+            writer_epoch: 7,
+            writer_lease_id: Uuid::from_u128(8),
+            prior_enclave_sequence: 40,
+            enclave_sequence: 41,
+            prior_state_root: [9; 32],
+            prior_journal_head: [10; 32],
+            state_root: [11; 32],
+            journal_record_hash: [12; 32],
+            snapshot_ciphertext_hash: [13; 32],
+            response_envelope_sha256: [14; 32],
+            response_envelope_bytes: 4_096,
+            response_status: 200,
+            response_content_type: "application/json".into(),
+            receipt_id: "receipt_test_0001".into(),
+            prepared_at_millis: 1_000,
+            expires_at_millis: 31_000,
+            signature: vec![15; 64],
+        }
+    }
+
+    #[test]
+    fn preparation_supersession_requires_a_conflicting_or_later_live_head() {
+        let preparation = durable_preparation_fixture();
+        assert!(!pending_preparation_is_superseded(
+            &preparation,
+            preparation.prior_enclave_sequence,
+            preparation.prior_state_root,
+        ));
+        assert!(!pending_preparation_is_superseded(
+            &preparation,
+            preparation.enclave_sequence,
+            preparation.state_root,
+        ));
+        assert!(pending_preparation_is_superseded(
+            &preparation,
+            preparation.enclave_sequence,
+            [16; 32],
+        ));
+        assert!(pending_preparation_is_superseded(
+            &preparation,
+            preparation.enclave_sequence + 1,
+            [17; 32],
+        ));
+    }
+
+    #[test]
+    fn preparation_supersession_replay_requires_every_exact_anchor() {
+        let certificate = SignedPreparationSupersession {
+            protocol_version: "layrs.preparation-supersession.v1".into(),
+            environment: "test".into(),
+            enclave_measurement_sha384: vec![1; 48],
+            request_idempotency_key: "abort:test:0001".into(),
+            preparation_id: [2; 32],
+            pending_prior_enclave_sequence: 40,
+            pending_enclave_sequence: 41,
+            pending_prior_state_root: [3; 32],
+            pending_state_root: [4; 32],
+            live_enclave_sequence: 45,
+            live_state_root: [5; 32],
+            live_journal_head: [6; 32],
+            superseded_at_millis: 1_000,
+            signature: vec![7; 64],
+        };
+        let matches = |request_idempotency_key: &str,
+                       preparation_id: [u8; 32],
+                       pending_enclave_sequence: u64,
+                       pending_state_root: [u8; 32],
+                       live_enclave_sequence: u64,
+                       live_state_root: [u8; 32],
+                       live_journal_head: [u8; 32]| {
+            preparation_supersession_matches_request(
+                &certificate,
+                request_idempotency_key,
+                preparation_id,
+                pending_enclave_sequence,
+                pending_state_root,
+                live_enclave_sequence,
+                live_state_root,
+                live_journal_head,
+            )
+        };
+        assert!(matches(
+            "abort:test:0001",
+            [2; 32],
+            41,
+            [4; 32],
+            45,
+            [5; 32],
+            [6; 32],
+        ));
+        assert!(!matches(
+            "abort:test:0002",
+            [2; 32],
+            41,
+            [4; 32],
+            45,
+            [5; 32],
+            [6; 32],
+        ));
+        assert!(!matches(
+            "abort:test:0001",
+            [2; 32],
+            41,
+            [4; 32],
+            46,
+            [5; 32],
+            [6; 32],
+        ));
     }
 
     #[test]

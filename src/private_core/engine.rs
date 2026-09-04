@@ -2256,6 +2256,13 @@ impl PrivateTradingCore {
         self.sequence
     }
 
+    /// Returns the committed journal head for recovery proofs. This is never
+    /// derived from a staged durable candidate: pending preparations live
+    /// outside `self`, so the value always describes the active core.
+    pub fn journal_head(&self) -> [u8; 32] {
+        self.journal.chain_head().1
+    }
+
     pub fn trading_frozen(&self) -> bool {
         self.trading_frozen
     }
