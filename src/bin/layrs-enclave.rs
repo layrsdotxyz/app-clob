@@ -1738,9 +1738,7 @@ async fn handle_encrypted(
         _ => Vec::new(),
     };
     let preparation_supersession = match &response {
-        PlainResponse::PreparedCommandSuperseded { certificate } => {
-            Some(certificate.clone())
-        }
+        PlainResponse::PreparedCommandSuperseded { certificate } => Some(certificate.clone()),
         _ => None,
     };
     let encoded = match serde_json::to_vec(&response)
@@ -1983,13 +1981,9 @@ async fn handle_encrypted(
                 }
             }
             if let Some(certificate) = preparation_supersession {
-                if !state
-                    .pending_preparation
-                    .as_ref()
-                    .is_some_and(|pending| {
-                        pending.preparation.preparation_id == certificate.preparation_id
-                    })
-                {
+                if !state.pending_preparation.as_ref().is_some_and(|pending| {
+                    pending.preparation.preparation_id == certificate.preparation_id
+                }) {
                     return rollback_wire_error(
                         &mut state,
                         &mut rollback_core,
@@ -2205,6 +2199,8 @@ fn durable_control_request(request: &PlainRequest) -> bool {
                 | OperatorCommand::AbortSupersededPreparation { .. }
                 | OperatorCommand::FinalizePreparedCommand { .. }
                 | OperatorCommand::DelegatedPortfolioRead { .. }
+                | OperatorCommand::MarketStatus { .. }
+                | OperatorCommand::ResolutionReadiness { .. }
         ),
         PlainRequest::AggregateDepth { .. } => false,
     }
@@ -8107,6 +8103,85 @@ mod tests {
             [5; 32],
             [6; 32],
         ));
+    }
+
+    #[test]
+    fn lifecycle_reads_bypass_pending_preparation_without_mutating_committed_core() {
+        let market_id = "layrs:v4:SPORTS:lifecycle-read:abababababababab";
+        let market = MarketConfig {
+            market_id: market_id.into(),
+            settlement_asset: "USDC".into(),
+            settlement_decimals: 6,
+            public_settlement_chain: Some("horizen".into()),
+            opens_at_millis: 900,
+            closes_at_millis: 2_000,
+            minimum_quantity_micros: 1,
+            maximum_quantity_micros: 10_000_000,
+            minimum_order_notional_micros: 1_000_000,
+            maximum_order_notional_micros: 10_000_000,
+            maximum_user_position_micros: 10_000_000,
+            maximum_pending_bootstrap_notional_micros: 100_000_000,
+            tick_size_micros: 1_000,
+            oracle_feed_id: 1,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
+            execution: MarketExecution::NativeClob,
+        };
+        let mut core = PrivateTradingCore::new(
+            JournalKey::from_bytes([0x64; 32]),
+            ReceiptSigner::from_seed([0x62; 32], [0x63; 48]),
+        );
+        core.register_market("sys:lifecycle-read-test".into(), market.clone(), 800)
+            .expect("register lifecycle-read market");
+        let root_before = core.state_root();
+        let sequence_before = core.sequence();
+        let pending_preparation_blocks = |request: &PlainRequest, direct_execution: bool| {
+            !durable_control_request(request) && !direct_execution
+        };
+
+        for command in [
+            OperatorCommand::MarketStatus {
+                market_id: market_id.into(),
+            },
+            OperatorCommand::ResolutionReadiness {
+                market_id: market_id.into(),
+                now_millis: 2_001,
+            },
+        ] {
+            let request = PlainRequest::Operator {
+                envelope: OperatorEnvelope {
+                    nonce: [0x65; 32],
+                    command: command.clone(),
+                    signature: Vec::new(),
+                },
+            };
+            assert!(durable_control_request(&request));
+            assert!(!request_requires_writer_authorization(&request));
+            assert!(!direct_quest_operator_command(&command));
+            assert!(!pending_preparation_blocks(&request, false));
+        }
+
+        assert_eq!(core.market_config(market_id), Some(market.clone()));
+        core.market_settlement_readiness(market_id, 2_001)
+            .expect("resolution readiness");
+        assert_eq!(core.state_root(), root_before);
+        assert_eq!(core.sequence(), sequence_before);
+        assert_eq!(core.market_config(market_id), Some(market));
+
+        let mutation = PlainRequest::Operator {
+            envelope: OperatorEnvelope {
+                nonce: [0x67; 32],
+                command: OperatorCommand::SetTradingFreeze {
+                    idempotency_key: "sys:lifecycle-read-mutation-control".into(),
+                    frozen: true,
+                    reason_commitment: [0x68; 32],
+                    now_millis: 2_001,
+                },
+                signature: Vec::new(),
+            },
+        };
+        assert!(!durable_control_request(&mutation));
+        assert!(request_requires_writer_authorization(&mutation));
+        assert!(pending_preparation_blocks(&mutation, false));
     }
 
     #[test]
