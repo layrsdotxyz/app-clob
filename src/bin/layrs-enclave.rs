@@ -40,9 +40,10 @@ use clob_service::private_core::{
     ReceiptSigner, RecoveryBridgeArtifact, ResolutionStatement, SignedAuditFillArtifact,
     SignedBinanceResolution, SignedExactConditionResolution, SignedPolymarketResolution,
     SignedResolution, SignedResolutionEvidence, SignedTaskQualificationArtifact, SystemResponse,
-    UserCommand, UserCommandAction, WithdrawalAuthorization, EXACT_LIVE_976_RELEASE_COMMIT,
-    INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX, INCIDENT_TERMINAL_JOURNAL_HEAD_HEX,
-    INCIDENT_TERMINAL_SEQUENCE, INCIDENT_TERMINAL_STATE_ROOT_HEX,
+    UserCommand, UserCommandAction, WithdrawalAuthorization, WithdrawalIntent,
+    EXACT_LIVE_976_RELEASE_COMMIT, INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX,
+    INCIDENT_TERMINAL_JOURNAL_HEAD_HEX, INCIDENT_TERMINAL_SEQUENCE,
+    INCIDENT_TERMINAL_STATE_ROOT_HEX,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use ethers_core::{
@@ -2351,7 +2352,9 @@ fn direct_deposit_operator_command(command: &OperatorCommand) -> bool {
 fn direct_withdrawal_operator_command(command: &OperatorCommand) -> bool {
     matches!(
         command,
-        OperatorCommand::DirectWithdrawal { .. } | OperatorCommand::DirectWithdrawalLookup { .. }
+        OperatorCommand::DirectWithdrawal { .. }
+            | OperatorCommand::DirectWithdrawalLookup { .. }
+            | OperatorCommand::SignPoolWithdrawal { .. }
     )
 }
 
@@ -8692,6 +8695,52 @@ mod tests {
             now,
         )
         .is_err());
+    }
+
+    #[test]
+    fn direct_withdrawal_signing_bypasses_durable_only_when_release_flag_is_embedded() {
+        if !matches!(option_env!("LAYRS_DIRECT_WITHDRAWAL_ENABLED"), Some("1")) {
+            return;
+        }
+        let operator_signer = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);
+        let receipt_signer = ReceiptSigner::from_seed([0x72; 32], [0x73; 48]);
+        let state = direct_deposit_test_state(
+            operator_signer.verifying_key(),
+            receipt_signer.verifying_key(),
+            PrivateTradingCore::new(JournalKey::from_bytes([0x74; 32]), receipt_signer),
+        );
+        let command = OperatorCommand::SignPoolWithdrawal {
+            idempotency_key: "green-direct-withdrawal-sign".into(),
+            authorization: WithdrawalAuthorization {
+                intent: WithdrawalIntent {
+                    protocol_version: "layrs.withdrawal.v1".into(),
+                    withdrawal_id: Uuid::from_u128(0x71111111_1111_4111_8111_111111111111),
+                    session_id: "green-direct-withdrawal-sign-session".into(),
+                    chain: "base".into(),
+                    asset: "USDC".into(),
+                    amount_atomic: "1".into(),
+                    destination: "0x1111111111111111111111111111111111111111".into(),
+                    receipt_id: "receipt_green_direct_withdrawal_sign".into(),
+                    enclave_sequence: 1,
+                    state_root: [0x75; 32],
+                    expires_at_millis: 1_800_000_900_000,
+                    recovery_proof: None,
+                },
+                signature: vec![0x76; 64],
+            },
+            nonce: 0,
+            gas_limit: 180_000,
+            max_fee_per_gas_wei: "2".into(),
+            max_priority_fee_per_gas_wei: "1".into(),
+            now_millis: 1_800_000_000_000,
+        };
+        let request = PlainRequest::Operator {
+            envelope: signed_operator_envelope(&operator_signer, [0x77; 32], command),
+        };
+        let direct = direct_execution_request(&state, &request);
+        assert!(direct);
+        assert!(!pending_preparation_blocks_request(true, &request, direct));
+        assert!(!requires_durable_preparation(true, direct));
     }
 
     #[test]
