@@ -44,6 +44,10 @@ use clob_service::private_core::{
     INCIDENT_TERMINAL_SEQUENCE, INCIDENT_TERMINAL_STATE_ROOT_HEX,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ethers_core::{
+    types::{transaction::eip2718::TypedTransaction, U256},
+    utils::{keccak256, rlp::Rlp},
+};
 use openssl::{
     cms::CmsContentInfo,
     md::Md,
@@ -440,6 +444,19 @@ enum OperatorCommand {
         max_priority_fee_per_gas_wei: String,
         now_millis: i64,
     },
+    ReplacePreparedPoolWithdrawal {
+        idempotency_key: String,
+        recovery_authorization: WithdrawalAuthorization,
+        original_receipt_id: String,
+        original_state_root: [u8; 32],
+        destination_commitment: [u8; 32],
+        observation: WithdrawalReplacementChainObservation,
+        replacement_nonce: u64,
+        gas_limit: u64,
+        max_fee_per_gas_wei: String,
+        max_priority_fee_per_gas_wei: String,
+        now_millis: i64,
+    },
     SignBridgeApproval {
         request: BridgeApprovalRequest,
         now_millis: i64,
@@ -686,6 +703,21 @@ enum OperatorCommand {
         evidence_hash: [u8; 32],
         now_millis: i64,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WithdrawalReplacementChainObservation {
+    protocol_version: String,
+    chain: String,
+    prepared_transaction_hash: String,
+    prepared_nonce: u64,
+    transaction_absent: bool,
+    receipt_absent: bool,
+    pending_nonce: u64,
+    block_number: u64,
+    block_hash: String,
+    observed_at_millis: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2315,6 +2347,26 @@ fn direct_quest_operator_command(command: &OperatorCommand) -> bool {
             max_priority_fee_per_gas_wei,
             *now_millis,
         ),
+        OperatorCommand::ReplacePreparedPoolWithdrawal {
+            idempotency_key,
+            recovery_authorization,
+            observation,
+            replacement_nonce,
+            gas_limit,
+            max_fee_per_gas_wei,
+            max_priority_fee_per_gas_wei,
+            now_millis,
+            ..
+        } => direct_base_usdc_withdrawal_replacement(
+            idempotency_key,
+            recovery_authorization,
+            observation,
+            *replacement_nonce,
+            *gas_limit,
+            max_fee_per_gas_wei,
+            max_priority_fee_per_gas_wei,
+            *now_millis,
+        ),
         OperatorCommand::ResolutionStatus { market_id }
         | OperatorCommand::ResolutionReadiness { market_id, .. } => {
             recurring_crypto_window(market_id).is_some()
@@ -2405,6 +2457,45 @@ fn direct_base_usdc_withdrawal_signing(
         && intent.expires_at_millis.saturating_sub(now_millis) <= 15 * 60_000
         && nonce <= i64::MAX as u64
         && (21_000..=2_000_000).contains(&gas_limit)
+        && max_fee > 0
+        && priority_fee <= max_fee
+}
+
+#[allow(clippy::too_many_arguments)]
+fn direct_base_usdc_withdrawal_replacement(
+    idempotency_key: &str,
+    authorization: &WithdrawalAuthorization,
+    observation: &WithdrawalReplacementChainObservation,
+    replacement_nonce: u64,
+    gas_limit: u64,
+    max_fee_per_gas_wei: &str,
+    max_priority_fee_per_gas_wei: &str,
+    now_millis: i64,
+) -> bool {
+    let intent = &authorization.intent;
+    let Some(proof) = intent.recovery_proof.as_ref() else {
+        return false;
+    };
+    let Ok(max_fee) = max_fee_per_gas_wei.parse::<u128>() else {
+        return false;
+    };
+    let Ok(priority_fee) = max_priority_fee_per_gas_wei.parse::<u128>() else {
+        return false;
+    };
+    idempotency_key == format!("withdrawal-replacement:{}", intent.withdrawal_id)
+        && !intent.withdrawal_id.is_nil()
+        && intent.protocol_version == "layrs.withdrawal-recovery.v1"
+        && proof.protocol_version == "layrs.withdrawal-terminal-journal-proof.v1"
+        && intent.chain == "base"
+        && intent.asset == "USDC"
+        && observation.protocol_version == "layrs.withdrawal-chain-absence.v1"
+        && observation.chain == "base"
+        && observation.transaction_absent
+        && observation.receipt_absent
+        && observation.pending_nonce == replacement_nonce
+        && now_millis > 0
+        && now_millis < intent.expires_at_millis
+        && (45_000..=250_000).contains(&gas_limit)
         && max_fee > 0
         && priority_fee <= max_fee
 }
@@ -2642,6 +2733,7 @@ fn request_requires_writer_authorization(request: &PlainRequest) -> bool {
                 | OperatorCommand::ObserveBootstrapSubmission { .. }
                 | OperatorCommand::ReconcileBootstrap { .. }
                 | OperatorCommand::SignPoolWithdrawal { .. }
+                | OperatorCommand::ReplacePreparedPoolWithdrawal { .. }
                 | OperatorCommand::InspectPendingPreparation { .. }
                 | OperatorCommand::AbortSupersededPreparation { .. }
                 | OperatorCommand::FinalizePreparedCommand { .. }
@@ -4420,6 +4512,119 @@ async fn dispatch_operator(
                 response: Some(response),
             })
         }
+        OperatorCommand::ReplacePreparedPoolWithdrawal {
+            idempotency_key,
+            recovery_authorization,
+            original_receipt_id,
+            original_state_root,
+            destination_commitment,
+            observation,
+            replacement_nonce,
+            gas_limit,
+            max_fee_per_gas_wei,
+            max_priority_fee_per_gas_wei,
+            now_millis,
+        } => {
+            verify_withdrawal_recovery_authorization(
+                &recovery_authorization,
+                state.receipt_public_key,
+            )?;
+            let withdrawal_id = recovery_authorization.intent.withdrawal_id;
+            if idempotency_key != format!("withdrawal-replacement:{withdrawal_id}")
+                || now_millis <= 0
+                || now_millis >= recovery_authorization.intent.expires_at_millis
+                || recovery_authorization
+                    .intent
+                    .expires_at_millis
+                    .saturating_sub(now_millis)
+                    > 15 * 60_000
+            {
+                return Err("INVALID_WITHDRAWAL_REPLACEMENT_AUTHORIZATION".into());
+            }
+            let core = state
+                .core
+                .as_mut()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?;
+            core.validate_withdrawal_replacement(
+                &recovery_authorization,
+                &original_receipt_id,
+                original_state_root,
+                destination_commitment,
+            )
+            .map_err(|error| error.to_string())?;
+            let (prior_commitment, prior_raw) = core
+                .prepared_withdrawal(withdrawal_id)
+                .ok_or_else(|| "PREPARED_WITHDRAWAL_NOT_FOUND".to_string())?;
+            let replacement_record = core.prepared_withdrawal_replacement(withdrawal_id);
+            let (prior_hash, prior_nonce) = if replacement_record.is_some() {
+                (
+                    observation.prepared_transaction_hash.clone(),
+                    observation.prepared_nonce,
+                )
+            } else {
+                decode_prepared_withdrawal(&prior_raw)?
+            };
+            let observation_commitment = validate_withdrawal_replacement_observation(
+                &observation,
+                &recovery_authorization.intent.chain,
+                &prior_hash,
+                prior_nonce,
+                replacement_nonce,
+                now_millis,
+            )?;
+            let signer = state
+                .chain_signer
+                .as_ref()
+                .ok_or_else(|| "CHAIN_SIGNER_NOT_PROVISIONED".to_string())?;
+            let transaction = signer
+                .sign_pool_withdrawal(
+                    &recovery_authorization.intent.chain,
+                    &recovery_authorization.intent.asset,
+                    &recovery_authorization.intent.destination,
+                    &recovery_authorization.intent.amount_atomic,
+                    replacement_nonce,
+                    gas_limit,
+                    &max_fee_per_gas_wei,
+                    &max_priority_fee_per_gas_wei,
+                )
+                .await?;
+            let raw = hex::decode(transaction.raw_transaction_hex.trim_start_matches("0x"))
+                .map_err(|_| "INVALID_SIGNED_WITHDRAWAL_TRANSACTION".to_string())?;
+            let replacement_commitment: [u8; 32] = Sha256::digest(raw).into();
+            if transaction
+                .transaction_hash
+                .eq_ignore_ascii_case(&prior_hash)
+            {
+                return Err("WITHDRAWAL_REPLACEMENT_TRANSACTION_UNCHANGED".into());
+            }
+            if let Some((_, recorded_replacement, recorded_observation)) = replacement_record {
+                if prior_commitment != recorded_replacement
+                    || prior_raw != transaction.raw_transaction_hex
+                    || observation_commitment != recorded_observation
+                {
+                    return Err("WITHDRAWAL_REPLACEMENT_ALREADY_COMMITTED".into());
+                }
+                return Ok(PlainResponse::PoolWithdrawalSigned {
+                    transaction,
+                    response: None,
+                });
+            }
+            let response = core
+                .replace_prepared_withdrawal(
+                    idempotency_key,
+                    withdrawal_id,
+                    prior_commitment,
+                    replacement_commitment,
+                    transaction.raw_transaction_hex.clone(),
+                    observation_commitment,
+                    now_millis,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(PlainResponse::PoolWithdrawalSigned {
+                transaction,
+                response: Some(response),
+            })
+        }
         OperatorCommand::SignBridgeApproval {
             request,
             now_millis,
@@ -5309,6 +5514,7 @@ async fn dispatch_operator(
                 | OperatorCommand::BeginChainSignerProvision { .. }
                 | OperatorCommand::CompleteChainSignerProvision { .. }
                 | OperatorCommand::SignPoolWithdrawal { .. }
+                | OperatorCommand::ReplacePreparedPoolWithdrawal { .. }
                 | OperatorCommand::SignBridgeApproval { .. }
                 | OperatorCommand::SignResolutionEvidence { .. }
                 | OperatorCommand::SignMarketResolution { .. }
@@ -5377,6 +5583,74 @@ fn verify_withdrawal_authorization(
         .map_err(|_| "INVALID_WITHDRAWAL_AUTHORIZATION".to_string())?
         .verify(&payload, &Signature::from_bytes(&signature))
         .map_err(|_| "INVALID_WITHDRAWAL_AUTHORIZATION".to_string())
+}
+
+fn verify_withdrawal_recovery_authorization(
+    authorization: &WithdrawalAuthorization,
+    receipt_public_key: [u8; 32],
+) -> Result<(), String> {
+    let signature: [u8; 64] = authorization
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| "INVALID_WITHDRAWAL_RECOVERY_AUTHORIZATION".to_string())?;
+    let encoded = serde_json::to_vec(&authorization.intent)
+        .map_err(|_| "INVALID_WITHDRAWAL_RECOVERY_AUTHORIZATION".to_string())?;
+    let mut payload = Vec::with_capacity(encoded.len() + 80);
+    payload.extend_from_slice(b"layrs.withdrawal-recovery-authorization.v1\0");
+    payload.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+    payload.extend_from_slice(&encoded);
+    VerifyingKey::from_bytes(&receipt_public_key)
+        .map_err(|_| "INVALID_WITHDRAWAL_RECOVERY_AUTHORIZATION".to_string())?
+        .verify(&payload, &Signature::from_bytes(&signature))
+        .map_err(|_| "INVALID_WITHDRAWAL_RECOVERY_AUTHORIZATION".to_string())
+}
+
+fn validate_withdrawal_replacement_observation(
+    observation: &WithdrawalReplacementChainObservation,
+    expected_chain: &str,
+    expected_hash: &str,
+    expected_nonce: u64,
+    replacement_nonce: u64,
+    now_millis: i64,
+) -> Result<[u8; 32], String> {
+    let hash_valid = |value: &str| {
+        value.len() == 66
+            && value.starts_with("0x")
+            && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+            && value[2..].bytes().any(|byte| byte != b'0')
+    };
+    if observation.protocol_version != "layrs.withdrawal-chain-absence.v1"
+        || observation.chain != expected_chain
+        || !observation.transaction_absent
+        || !observation.receipt_absent
+        || observation.prepared_transaction_hash.to_lowercase() != expected_hash.to_lowercase()
+        || observation.prepared_nonce != expected_nonce
+        || observation.pending_nonce != replacement_nonce
+        || observation.pending_nonce <= observation.prepared_nonce
+        || observation.block_number == 0
+        || !hash_valid(&observation.block_hash)
+        || observation.observed_at_millis > now_millis
+        || now_millis.saturating_sub(observation.observed_at_millis) > 120_000
+    {
+        return Err("INVALID_WITHDRAWAL_REPLACEMENT_CHAIN_EVIDENCE".into());
+    }
+    let encoded = serde_json::to_vec(observation)
+        .map_err(|_| "INVALID_WITHDRAWAL_REPLACEMENT_CHAIN_EVIDENCE".to_string())?;
+    Ok(Sha256::digest(encoded).into())
+}
+
+fn decode_prepared_withdrawal(raw_transaction_hex: &str) -> Result<(String, u64), String> {
+    let raw = hex::decode(raw_transaction_hex.trim_start_matches("0x"))
+        .map_err(|_| "INVALID_PREPARED_WITHDRAWAL_TRANSACTION".to_string())?;
+    let (transaction, _) = TypedTransaction::decode_signed(&Rlp::new(&raw))
+        .map_err(|_| "INVALID_PREPARED_WITHDRAWAL_TRANSACTION".to_string())?;
+    let nonce = transaction
+        .nonce()
+        .filter(|value| **value <= U256::from(u64::MAX))
+        .map(|value| value.as_u64())
+        .ok_or_else(|| "INVALID_PREPARED_WITHDRAWAL_TRANSACTION".to_string())?;
+    Ok((format!("0x{}", hex::encode(keccak256(raw))), nonce))
 }
 
 fn validate_kms_reference(kms_key_id: &str, ciphertext: Option<&[u8]>) -> Result<(), String> {
@@ -7706,6 +7980,56 @@ mod tests {
         ] {
             assert!(!direct_base_usdc_withdrawal(&action));
         }
+    }
+
+    #[test]
+    fn prepared_withdrawal_replacement_requires_fresh_exact_chain_absence() {
+        let now = 1_000_000;
+        let mut observation = WithdrawalReplacementChainObservation {
+            protocol_version: "layrs.withdrawal-chain-absence.v1".into(),
+            chain: "base".into(),
+            prepared_transaction_hash: format!("0x{}", "11".repeat(32)),
+            prepared_nonce: 44,
+            transaction_absent: true,
+            receipt_absent: true,
+            pending_nonce: 45,
+            block_number: 35_000_000,
+            block_hash: format!("0x{}", "22".repeat(32)),
+            observed_at_millis: now - 1_000,
+        };
+        assert_ne!(
+            validate_withdrawal_replacement_observation(
+                &observation,
+                "base",
+                &observation.prepared_transaction_hash,
+                44,
+                45,
+                now,
+            )
+            .unwrap(),
+            [0; 32],
+        );
+        observation.transaction_absent = false;
+        assert!(validate_withdrawal_replacement_observation(
+            &observation,
+            "base",
+            &observation.prepared_transaction_hash,
+            44,
+            45,
+            now,
+        )
+        .is_err());
+        observation.transaction_absent = true;
+        observation.observed_at_millis = now - 120_001;
+        assert!(validate_withdrawal_replacement_observation(
+            &observation,
+            "base",
+            &observation.prepared_transaction_hash,
+            44,
+            45,
+            now,
+        )
+        .is_err());
     }
 
     #[test]
