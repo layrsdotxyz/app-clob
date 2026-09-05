@@ -2427,9 +2427,10 @@ fn unsigned_resolution_market_id(evidence: &UnsignedResolutionEvidence) -> &str 
 }
 
 /// Quest deposits have already been finalized on Base and reconciled to the
-/// pool before the coordinator signs this command. Permit only the normal
-/// deposit idempotency shape, non-empty account/evidence commitments and the
-/// public API's five-USDC minimum. Other funding mutations remain fenced.
+/// pool before the coordinator signs this command. The worker enforces the
+/// five-USDC minimum over all finalized transfers in the deposit session, then
+/// credits each positive transfer against its own pool receipt. Permit only
+/// that per-transfer shape here; other funding mutations remain fenced.
 fn direct_base_usdc_deposit_credit(
     idempotency_key: &str,
     identity_commitment: &[u8; 32],
@@ -2446,7 +2447,7 @@ fn direct_base_usdc_deposit_credit(
     !transfer_id.is_nil()
         && identity_commitment != &[0; 32]
         && asset == "USDC"
-        && amount_atomic >= 5_000_000
+        && amount_atomic > 0
         && evidence_hash != &[0; 32]
 }
 
@@ -7769,6 +7770,35 @@ mod tests {
         ] {
             assert!(direct_quest_operator_command(&command));
         }
+
+        let split_session_dust = OperatorCommand::CreditDeposit {
+            idempotency_key: "deposit:c8876513-c918-5a5f-aef9-4f6a5f3aae7b".into(),
+            identity_commitment,
+            asset: "USDC".into(),
+            amount_atomic: 10_000,
+            evidence_hash: [9; 32],
+            now_millis: 1,
+        };
+        let split_session_dust_request = PlainRequest::Operator {
+            envelope: OperatorEnvelope {
+                nonce: [10; 32],
+                command: split_session_dust.clone(),
+                signature: Vec::new(),
+            },
+        };
+        assert!(direct_quest_operator_command(&split_session_dust));
+        assert!(!durable_control_request(&split_session_dust_request));
+        assert!(request_requires_writer_authorization(
+            &split_session_dust_request
+        ));
+        let pending_preparation_blocks = |request: &PlainRequest, direct_execution: bool| {
+            !durable_control_request(request) && !direct_execution
+        };
+        assert!(!pending_preparation_blocks(
+            &split_session_dust_request,
+            direct_quest_operator_command(&split_session_dust),
+        ));
+
         let withdrawal_id = Uuid::from_u128(42);
         let withdrawal_authorization = WithdrawalAuthorization {
             intent: clob_service::private_core::WithdrawalIntent {
@@ -7838,7 +7868,7 @@ mod tests {
                 idempotency_key: "deposit:c8876513-c918-5a5f-aef9-4f6a5f3aae7b".into(),
                 identity_commitment,
                 asset: "USDC".into(),
-                amount_atomic: 4_999_999,
+                amount_atomic: 0,
                 evidence_hash: [9; 32],
                 now_millis: 1,
             },
