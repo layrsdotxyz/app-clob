@@ -35,6 +35,2329 @@ const MIN_PUBLIC_DEPTH_DISTINCT_OWNERS: usize = 3;
 /// weakening the privacy floor for any other market namespace.
 const QUEST_BTC_1H_PUBLIC_DEPTH_DISTINCT_OWNERS: usize = 1;
 
+/// One request/one terminal response protocol used by the direct financial
+/// execution path. This is deliberately a value contract, not a command
+/// lifecycle: there is no admitted, pending, prepared, finalized, or expired
+/// background state represented here.
+pub const DIRECT_EXECUTION_PROTOCOL_VERSION: &str = "layrs.direct-execution.v1";
+pub const DIRECT_EXECUTION_MAX_LIFETIME_MILLIS: i64 = 5_000;
+const DIRECT_REQUEST_HASH_DOMAIN: &[u8] = b"layrs.direct-execution.request.v1\0";
+const DIRECT_FINAL_RESULT_MARKER_DOMAIN: &[u8] = b"layrs.direct-execution.final-result-marker.v1\0";
+const DIRECT_FINAL_RESULT_MARKER_PREFIX: &str = "direct-final-result:v1:";
+const DIRECT_DEPOSIT_PAYLOAD_VERSION: &str = "layrs.direct-deposit-credit.v1";
+const DIRECT_DEPOSIT_REPLAY_DOMAIN: &[u8] = b"layrs.direct-deposit-credit.replay.v1\0";
+const DIRECT_DEPOSIT_RESULT_DOMAIN: &[u8] = b"layrs.direct-deposit-credit.result.v1\0";
+const DIRECT_DEPOSIT_RESULT_SIGNATURE_DOMAIN: &[u8] =
+    b"layrs.direct-execution.terminal-result.v1\0";
+const DIRECT_DEPOSIT_RESTART_DOMAIN: &[u8] = b"layrs.direct-deposit-credit.restart.v1\0";
+const MAX_DIRECT_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+const MAX_DIRECT_SCOPE_BYTES: usize = 512;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DirectExecutionOperation {
+    RegisterSession,
+    RegisterTransferAccount,
+    CreditDeposit,
+    ReserveWithdrawal,
+    FinalizeWithdrawal,
+    ReleaseWithdrawal,
+    PlaceOrder,
+    CancelOrder,
+    ReplaceOrder,
+    CancelAllOrders,
+    RevokeMarketLadder,
+    ReplaceMarketLadder,
+    RegisterMarket,
+    ResolveMarket,
+    SettleMarket,
+}
+
+impl DirectExecutionOperation {
+    fn hash_label(self) -> &'static [u8] {
+        match self {
+            Self::RegisterSession => b"REGISTER_SESSION",
+            Self::RegisterTransferAccount => b"REGISTER_TRANSFER_ACCOUNT",
+            Self::CreditDeposit => b"CREDIT_DEPOSIT",
+            Self::ReserveWithdrawal => b"RESERVE_WITHDRAWAL",
+            Self::FinalizeWithdrawal => b"FINALIZE_WITHDRAWAL",
+            Self::ReleaseWithdrawal => b"RELEASE_WITHDRAWAL",
+            Self::PlaceOrder => b"PLACE_ORDER",
+            Self::CancelOrder => b"CANCEL_ORDER",
+            Self::ReplaceOrder => b"REPLACE_ORDER",
+            Self::CancelAllOrders => b"CANCEL_ALL_ORDERS",
+            Self::RevokeMarketLadder => b"REVOKE_MARKET_LADDER",
+            Self::ReplaceMarketLadder => b"REPLACE_MARKET_LADDER",
+            Self::RegisterMarket => b"REGISTER_MARKET",
+            Self::ResolveMarket => b"RESOLVE_MARKET",
+            Self::SettleMarket => b"SETTLE_MARKET",
+        }
+    }
+}
+
+/// Canonical payload bytes are produced by the operation-specific decoder.
+/// The envelope hashes these exact bytes; neither PostgreSQL nor the parent is
+/// allowed to reinterpret them when deciding idempotency.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DirectExecutionRequestEnvelope {
+    pub protocol_version: String,
+    pub request_id: Uuid,
+    pub request_hash: [u8; 32],
+    pub authenticated_subject_hash: [u8; 32],
+    pub account_id: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub funding_identity: Option<String>,
+    pub operation: DirectExecutionOperation,
+    #[serde(with = "serde_bytes")]
+    pub canonical_payload: Vec<u8>,
+    pub issued_at_millis: i64,
+    pub deadline_millis: i64,
+}
+
+impl DirectExecutionRequestEnvelope {
+    pub fn new(
+        request_id: Uuid,
+        authenticated_subject_hash: [u8; 32],
+        account_id: [u8; 32],
+        market_id: Option<String>,
+        funding_identity: Option<String>,
+        operation: DirectExecutionOperation,
+        canonical_payload: Vec<u8>,
+        issued_at_millis: i64,
+        deadline_millis: i64,
+    ) -> Result<Self, DirectExecutionContractError> {
+        let mut envelope = Self {
+            protocol_version: DIRECT_EXECUTION_PROTOCOL_VERSION.into(),
+            request_id,
+            request_hash: [0; 32],
+            authenticated_subject_hash,
+            account_id,
+            market_id,
+            funding_identity,
+            operation,
+            canonical_payload,
+            issued_at_millis,
+            deadline_millis,
+        };
+        envelope.request_hash = envelope.computed_request_hash();
+        envelope.validate()?;
+        Ok(envelope)
+    }
+
+    pub fn computed_request_hash(&self) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(DIRECT_REQUEST_HASH_DOMAIN);
+        hash_field(&mut hash, self.protocol_version.as_bytes());
+        hash.update(self.request_id.as_bytes());
+        hash.update(self.authenticated_subject_hash);
+        hash.update(self.account_id);
+        hash_optional_field(&mut hash, self.market_id.as_deref());
+        hash_optional_field(&mut hash, self.funding_identity.as_deref());
+        hash_field(&mut hash, self.operation.hash_label());
+        hash_field(&mut hash, &self.canonical_payload);
+        hash.update(self.issued_at_millis.to_be_bytes());
+        hash.update(self.deadline_millis.to_be_bytes());
+        hash.finalize().into()
+    }
+
+    pub fn validate(&self) -> Result<(), DirectExecutionContractError> {
+        if self.protocol_version != DIRECT_EXECUTION_PROTOCOL_VERSION {
+            return Err(DirectExecutionContractError::ProtocolVersion);
+        }
+        if self.request_id.is_nil() {
+            return Err(DirectExecutionContractError::RequestId);
+        }
+        if self.authenticated_subject_hash == [0; 32] || self.account_id == [0; 32] {
+            return Err(DirectExecutionContractError::Identity);
+        }
+        if self.market_id.is_some() && self.funding_identity.is_some() {
+            return Err(DirectExecutionContractError::AmbiguousScope);
+        }
+        for value in [self.market_id.as_deref(), self.funding_identity.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if value.is_empty() || value.len() > MAX_DIRECT_SCOPE_BYTES || value.trim() != value {
+                return Err(DirectExecutionContractError::Scope);
+            }
+        }
+        if self.canonical_payload.len() > MAX_DIRECT_PAYLOAD_BYTES {
+            return Err(DirectExecutionContractError::Payload);
+        }
+        let request_lifetime_millis = self
+            .deadline_millis
+            .checked_sub(self.issued_at_millis)
+            .ok_or(DirectExecutionContractError::Deadline)?;
+        if self.issued_at_millis < 0
+            || !(1..=DIRECT_EXECUTION_MAX_LIFETIME_MILLIS).contains(&request_lifetime_millis)
+        {
+            return Err(DirectExecutionContractError::Deadline);
+        }
+        if self.request_hash != self.computed_request_hash() {
+            return Err(DirectExecutionContractError::RequestHash);
+        }
+        Ok(())
+    }
+}
+
+fn hash_field(hash: &mut Sha256, value: &[u8]) {
+    hash.update((value.len() as u64).to_be_bytes());
+    hash.update(value);
+}
+
+fn hash_optional_field(hash: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hash.update([1]);
+            hash_field(hash, value.as_bytes());
+        }
+        None => hash.update([0]),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DirectExecutionTerminalState {
+    Applied,
+    RejectedEffectNone,
+    ExpiredEffectNone,
+    OutcomeUnknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DirectExecutionEffect {
+    Committed,
+    None,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DirectExecutionRetryPolicy {
+    ReturnOriginalResult,
+    NewRequestAllowed,
+    SameRequestOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DirectExecutionCommitEvidence {
+    pub enclave_sequence: u64,
+    pub state_root: [u8; 32],
+    pub journal_head: [u8; 32],
+    pub signed_receipt_sha256: [u8; 32],
+    pub restart_evidence_sha256: [u8; 32],
+}
+
+/// A direct response is complete in this value. It is never a handle to work
+/// that will be admitted, finalized, expired, or recovered by a background
+/// coordinator. `OUTCOME_UNKNOWN` is honest uncertainty and permits only an
+/// exact same-request replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DirectExecutionTerminalResult {
+    pub protocol_version: String,
+    pub request_id: Uuid,
+    pub request_hash: [u8; 32],
+    pub state: DirectExecutionTerminalState,
+    pub effect: DirectExecutionEffect,
+    pub retry_policy: DirectExecutionRetryPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_evidence: Option<DirectExecutionCommitEvidence>,
+    pub result_commitment_sha256: [u8; 32],
+    pub signed_at_millis: i64,
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+}
+
+/// Exact operation payload accepted by the enclave for a finalized deposit.
+/// Every field is immutable chain/account evidence. The canonical JSON bytes
+/// are also the only CREDIT_DEPOSIT projection payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DirectDepositCreditPayload {
+    pub protocol_version: String,
+    pub deposit_id: Uuid,
+    pub authenticated_subject_hash: [u8; 32],
+    pub account_id: [u8; 32],
+    pub identity_commitment: [u8; 32],
+    pub asset: String,
+    #[serde(with = "super::decimal_u128")]
+    pub amount_atomic: u128,
+    pub source_chain: String,
+    pub source_transaction_hash: [u8; 32],
+    pub source_log_index: u64,
+    pub pool_chain: String,
+    pub pool_transaction_hash: [u8; 32],
+    pub pool_log_index: u64,
+    pub pool_receipt_evidence_sha256: [u8; 32],
+    pub funding_identity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DirectDepositCreditResponse {
+    pub request: DirectExecutionRequestEnvelope,
+    pub result: DirectExecutionTerminalResult,
+    pub enclave_receipt: EnclaveReceipt,
+    pub encrypted_journal_record: EncryptedJournalRecord,
+    #[serde(with = "serde_bytes")]
+    pub projection_payload: Vec<u8>,
+    pub financial_replay_key_sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DirectDepositEffectNoneResponse {
+    pub request: DirectExecutionRequestEnvelope,
+    pub result: DirectExecutionTerminalResult,
+    pub enclave_receipt: EnclaveReceipt,
+    pub encrypted_journal_record: EncryptedJournalRecord,
+    #[serde(with = "serde_bytes")]
+    pub projection_payload: Vec<u8>,
+    pub custody_replay_key_sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "outcome",
+    content = "response",
+    rename_all = "SCREAMING_SNAKE_CASE"
+)]
+pub enum DirectDepositCreditOutcome {
+    Applied(DirectDepositCreditResponse),
+    ReturnOriginal(DirectDepositCreditResponse),
+    EffectNone(DirectDepositEffectNoneResponse),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DirectDepositCreditError {
+    #[error(transparent)]
+    Contract(#[from] DirectExecutionContractError),
+    #[error(transparent)]
+    Core(#[from] CoreError),
+    #[error("invalid direct deposit payload")]
+    InvalidPayload,
+    #[error("direct deposit replay binding mismatch")]
+    ReplayBinding,
+}
+
+impl DirectDepositCreditPayload {
+    fn decode_for(
+        request: &DirectExecutionRequestEnvelope,
+    ) -> Result<Self, DirectDepositCreditError> {
+        if request.operation != DirectExecutionOperation::CreditDeposit
+            || request.market_id.is_some()
+            || request.funding_identity.is_none()
+        {
+            return Err(DirectDepositCreditError::InvalidPayload);
+        }
+        let payload: Self = serde_json::from_slice(&request.canonical_payload)
+            .map_err(|_| DirectDepositCreditError::InvalidPayload)?;
+        let canonical =
+            serde_json::to_vec(&payload).map_err(|_| DirectDepositCreditError::InvalidPayload)?;
+        if canonical != request.canonical_payload
+            || payload.protocol_version != DIRECT_DEPOSIT_PAYLOAD_VERSION
+            || payload.deposit_id.is_nil()
+            || payload.authenticated_subject_hash != request.authenticated_subject_hash
+            || payload.account_id != request.account_id
+            || payload.identity_commitment == [0; 32]
+            || !matches!(payload.asset.as_str(), "USDC" | "ZEN")
+            || payload.amount_atomic == 0
+            || payload.source_chain.is_empty()
+            || payload.source_transaction_hash == [0; 32]
+            || payload.pool_chain.is_empty()
+            || payload.pool_transaction_hash == [0; 32]
+            || payload.pool_receipt_evidence_sha256 == [0; 32]
+            || payload.funding_identity != request.funding_identity.as_deref().unwrap_or_default()
+            || payload.pool_receipt_evidence_sha256 != payload.canonical_pool_receipt_evidence()
+        {
+            return Err(DirectDepositCreditError::InvalidPayload);
+        }
+        Ok(payload)
+    }
+
+    fn financial_replay_key(&self) -> Result<[u8; 32], DirectDepositCreditError> {
+        // Custody-event identity is global. Account/auth/session metadata is
+        // intentionally not part of this key: replaying the same pool event
+        // under another account must find the original and fail binding, not
+        // mint a second credit.
+        Ok(domain_hash(
+            DIRECT_DEPOSIT_REPLAY_DOMAIN,
+            &self.pool_receipt_evidence_sha256,
+        ))
+    }
+
+    fn canonical_pool_receipt_evidence(&self) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(b"layrs.deposit-pool-receipt.v1\0");
+        hash.update(self.pool_chain.as_bytes());
+        hash.update([0]);
+        hash.update(format!("0x{}", hex::encode(self.pool_transaction_hash)).as_bytes());
+        hash.update([0]);
+        hash.update(self.pool_log_index.to_string().as_bytes());
+        hash.update([0]);
+        hash.update(self.asset.as_bytes());
+        hash.update([0]);
+        hash.update(self.amount_atomic.to_string().as_bytes());
+        hash.finalize().into()
+    }
+}
+
+impl DirectDepositCreditResponse {
+    pub fn signed_result_wire(&self) -> Result<Vec<u8>, DirectDepositCreditError> {
+        serde_json::to_vec(self).map_err(|_| DirectDepositCreditError::ReplayBinding)
+    }
+}
+
+impl DirectDepositEffectNoneResponse {
+    pub fn signed_result_wire(&self) -> Result<Vec<u8>, DirectDepositCreditError> {
+        serde_json::to_vec(self).map_err(|_| DirectDepositCreditError::ReplayBinding)
+    }
+}
+
+impl DirectExecutionTerminalResult {
+    pub fn validate_for(
+        &self,
+        request: &DirectExecutionRequestEnvelope,
+    ) -> Result<(), DirectExecutionContractError> {
+        request.validate()?;
+        if self.protocol_version != DIRECT_EXECUTION_PROTOCOL_VERSION {
+            return Err(DirectExecutionContractError::ProtocolVersion);
+        }
+        if self.request_id != request.request_id || self.request_hash != request.request_hash {
+            return Err(DirectExecutionContractError::ResultBinding);
+        }
+        if self.signed_at_millis < request.issued_at_millis || self.signature.len() != 64 {
+            return Err(DirectExecutionContractError::Signature);
+        }
+        self.validate_terminal_shape()
+    }
+
+    fn validate_terminal_shape(&self) -> Result<(), DirectExecutionContractError> {
+        if self.signature.len() != 64 {
+            return Err(DirectExecutionContractError::Signature);
+        }
+        if self.result_commitment_sha256 == [0; 32] {
+            return Err(DirectExecutionContractError::ResultCommitment);
+        }
+        let error_valid = self
+            .error_code
+            .as_deref()
+            .map(valid_direct_error_code)
+            .unwrap_or(false);
+        match self.state {
+            DirectExecutionTerminalState::Applied
+                if self.effect == DirectExecutionEffect::Committed
+                    && self.retry_policy == DirectExecutionRetryPolicy::ReturnOriginalResult
+                    && self.error_code.is_none()
+                    && self.commit_evidence.is_some() => {}
+            DirectExecutionTerminalState::RejectedEffectNone
+                if self.effect == DirectExecutionEffect::None
+                    && self.retry_policy == DirectExecutionRetryPolicy::NewRequestAllowed
+                    && error_valid
+                    && self.commit_evidence.is_none() => {}
+            DirectExecutionTerminalState::ExpiredEffectNone
+                if self.effect == DirectExecutionEffect::None
+                    && self.retry_policy == DirectExecutionRetryPolicy::NewRequestAllowed
+                    && error_valid
+                    && self.commit_evidence.is_none() => {}
+            DirectExecutionTerminalState::OutcomeUnknown
+                if self.effect == DirectExecutionEffect::Unknown
+                    && self.retry_policy == DirectExecutionRetryPolicy::SameRequestOnly
+                    && error_valid
+                    && self.commit_evidence.is_none() => {}
+            _ => return Err(DirectExecutionContractError::ResultSemantics),
+        }
+        if let Some(evidence) = &self.commit_evidence {
+            if evidence.enclave_sequence == 0
+                || evidence.state_root == [0; 32]
+                || evidence.journal_head == [0; 32]
+                || evidence.signed_receipt_sha256 == [0; 32]
+                || evidence.restart_evidence_sha256 == [0; 32]
+            {
+                return Err(DirectExecutionContractError::CommitEvidence);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The only idempotency state retained by the direct execution kernel. It is
+/// sealed inside the enclave snapshot and never represents admitted, pending,
+/// prepared, or recoverable work. Only definitive terminal results belong in
+/// this index; an honest `OUTCOME_UNKNOWN` must be resolved by same-request
+/// recovery before it can be recorded here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+struct DirectFinalResultIndex(BTreeMap<String, StoredDirectFinalResult>);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredDirectFinalResult {
+    account_id: [u8; 32],
+    request_id: Uuid,
+    request_hash: [u8; 32],
+    result: DirectExecutionTerminalResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request: Option<DirectExecutionRequestEnvelope>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty", with = "serde_bytes")]
+    projection_payload: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enclave_receipt: Option<EnclaveReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encrypted_journal_record: Option<EncryptedJournalRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    financial_replay_key_sha256: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    marker_format_version: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectExecutionIdempotencyDecision {
+    Execute,
+    Recorded(DirectExecutionTerminalResult),
+    ReturnOriginal(DirectExecutionTerminalResult),
+}
+
+/// One bounded decision made before a direct mutation starts. Expiry is
+/// evaluated only when no definitive result already exists, so a client that
+/// lost an `APPLIED` response can still recover the byte-identical result
+/// after its original execution deadline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectExecutionAttemptDecision {
+    Execute,
+    ExpiredEffectNone,
+    ReturnOriginal(DirectExecutionTerminalResult),
+}
+
+/// Recovery after an honestly reported `OUTCOME_UNKNOWN` is a lookup against
+/// committed enclave state, followed at most by an exact same-envelope retry.
+/// Deadline expiry alone never proves no effect after dispatch. This value is
+/// not stored and does not represent pending work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectExecutionRecoveryDecision {
+    OutcomeUnknownSameRequestOnly,
+    ReturnOriginal(DirectExecutionTerminalResult),
+}
+
+impl DirectFinalResultIndex {
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn lookup(
+        &self,
+        request: &DirectExecutionRequestEnvelope,
+    ) -> Result<DirectExecutionIdempotencyDecision, DirectExecutionContractError> {
+        request.validate()?;
+        let Some(stored) = self.0.get(&direct_final_result_key(
+            &request.account_id,
+            request.request_id,
+        )) else {
+            return Ok(DirectExecutionIdempotencyDecision::Execute);
+        };
+        if stored.request_hash != request.request_hash {
+            return Err(DirectExecutionContractError::IdempotencyPayloadMismatch);
+        }
+        stored.validate()?;
+        Ok(DirectExecutionIdempotencyDecision::ReturnOriginal(
+            stored.result.clone(),
+        ))
+    }
+
+    fn decide_attempt(
+        &self,
+        request: &DirectExecutionRequestEnvelope,
+        now_millis: i64,
+    ) -> Result<DirectExecutionAttemptDecision, DirectExecutionContractError> {
+        match self.lookup(request)? {
+            DirectExecutionIdempotencyDecision::ReturnOriginal(result) => {
+                Ok(DirectExecutionAttemptDecision::ReturnOriginal(result))
+            }
+            DirectExecutionIdempotencyDecision::Execute => {
+                if now_millis >= request.deadline_millis {
+                    Ok(DirectExecutionAttemptDecision::ExpiredEffectNone)
+                } else {
+                    Ok(DirectExecutionAttemptDecision::Execute)
+                }
+            }
+            DirectExecutionIdempotencyDecision::Recorded(_) => unreachable!(),
+        }
+    }
+
+    fn recover_after_unknown(
+        &self,
+        request: &DirectExecutionRequestEnvelope,
+        unknown: &DirectExecutionTerminalResult,
+        _now_millis: i64,
+    ) -> Result<DirectExecutionRecoveryDecision, DirectExecutionContractError> {
+        unknown.validate_for(request)?;
+        if unknown.state != DirectExecutionTerminalState::OutcomeUnknown {
+            return Err(DirectExecutionContractError::RecoveryRequiresOutcomeUnknown);
+        }
+        match self.lookup(request)? {
+            DirectExecutionIdempotencyDecision::ReturnOriginal(result) => {
+                Ok(DirectExecutionRecoveryDecision::ReturnOriginal(result))
+            }
+            // Absence from the final-result index cannot by itself prove that
+            // a request which was already dispatched had no effect. Deadline
+            // expiry does not change that fact. Keep the uncertainty explicit
+            // and permit only an exact same-envelope lookup/retry; this creates
+            // no stored pending state and blocks no unrelated request.
+            DirectExecutionIdempotencyDecision::Execute => {
+                Ok(DirectExecutionRecoveryDecision::OutcomeUnknownSameRequestOnly)
+            }
+            DirectExecutionIdempotencyDecision::Recorded(_) => unreachable!(),
+        }
+    }
+
+    /// Stage a result only as part of the same enclave-local commit that makes
+    /// the underlying financial mutation durable. This helper performs no
+    /// orchestration and must not be exposed as a standalone API operation.
+    fn record_definitive(
+        &mut self,
+        request: &DirectExecutionRequestEnvelope,
+        result: DirectExecutionTerminalResult,
+    ) -> Result<DirectExecutionIdempotencyDecision, DirectExecutionContractError> {
+        request.validate()?;
+        result.validate_for(request)?;
+        if result.state == DirectExecutionTerminalState::OutcomeUnknown {
+            return Err(DirectExecutionContractError::NonFinalIdempotencyResult);
+        }
+        match self.lookup(request)? {
+            DirectExecutionIdempotencyDecision::Execute => {
+                let key = direct_final_result_key(&request.account_id, request.request_id);
+                self.0.insert(
+                    key,
+                    StoredDirectFinalResult {
+                        account_id: request.account_id,
+                        request_id: request.request_id,
+                        request_hash: request.request_hash,
+                        result: result.clone(),
+                        // Generic pre-S04 direct results retain the original
+                        // compact snapshot representation and marker digest.
+                        // Operation-specific artifacts are stored only by the
+                        // direct deposit commit path below.
+                        request: None,
+                        projection_payload: Vec::new(),
+                        enclave_receipt: None,
+                        encrypted_journal_record: None,
+                        financial_replay_key_sha256: None,
+                        marker_format_version: 0,
+                    },
+                );
+                Ok(DirectExecutionIdempotencyDecision::Recorded(result))
+            }
+            DirectExecutionIdempotencyDecision::ReturnOriginal(original) => {
+                Ok(DirectExecutionIdempotencyDecision::ReturnOriginal(original))
+            }
+            DirectExecutionIdempotencyDecision::Recorded(_) => unreachable!(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), DirectExecutionContractError> {
+        for (key, stored) in &self.0 {
+            if key != &direct_final_result_key(&stored.account_id, stored.request_id) {
+                return Err(DirectExecutionContractError::IdempotencyIndex);
+            }
+            stored.validate()?;
+        }
+        Ok(())
+    }
+
+    fn validate_rooted(
+        &self,
+        processed_hashes: &BTreeMap<String, [u8; 32]>,
+    ) -> Result<(), DirectExecutionContractError> {
+        self.validate()?;
+        for (key, stored) in &self.0 {
+            let marker_key = direct_final_result_marker_key(key);
+            let expected_digest = direct_final_result_marker_digest(stored)?;
+            if processed_hashes.get(&marker_key) != Some(&expected_digest) {
+                return Err(DirectExecutionContractError::IdempotencyIndex);
+            }
+        }
+        for (marker_key, marker_digest) in processed_hashes {
+            let Some(result_key) = marker_key.strip_prefix(DIRECT_FINAL_RESULT_MARKER_PREFIX)
+            else {
+                continue;
+            };
+            let stored = self
+                .0
+                .get(result_key)
+                .ok_or(DirectExecutionContractError::IdempotencyIndex)?;
+            if *marker_digest != direct_final_result_marker_digest(stored)? {
+                return Err(DirectExecutionContractError::IdempotencyIndex);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_direct_deposit_records(
+        &self,
+        verifying_key: [u8; 32],
+        system_keys: &BTreeSet<String>,
+        ledger: &Ledger,
+    ) -> Result<(), DirectExecutionContractError> {
+        let mut replay_keys = BTreeSet::new();
+        for stored in self.0.values().filter(|stored| {
+            stored.marker_format_version == 1
+                && stored.request.as_ref().map(|request| request.operation)
+                    == Some(DirectExecutionOperation::CreditDeposit)
+        }) {
+            if let Some(replay_key) = stored.financial_replay_key_sha256 {
+                if !replay_keys.insert(replay_key) {
+                    return Err(DirectExecutionContractError::IdempotencyIndex);
+                }
+                let response = stored_direct_deposit_response_unchecked(stored)
+                    .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?;
+                validate_direct_deposit_response_bindings(&response, Some(verifying_key))
+                    .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?;
+                let system_key = format!("direct-deposit:{}", hex::encode(replay_key));
+                let ledger_replay_key =
+                    format!("confirmed-deposit-evidence:{}", hex::encode(replay_key));
+                if !system_keys.contains(&system_key)
+                    || !ledger.offline_replay_keys().contains(&ledger_replay_key)
+                {
+                    return Err(DirectExecutionContractError::IdempotencyIndex);
+                }
+            } else {
+                validate_direct_deposit_effect_none_bindings(stored, Some(verifying_key))
+                    .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?;
+            }
+        }
+        for system_key in system_keys {
+            let Some(encoded_replay_key) = system_key.strip_prefix("direct-deposit:") else {
+                continue;
+            };
+            let replay_key: [u8; 32] = hex::decode(encoded_replay_key)
+                .ok()
+                .and_then(|value| value.try_into().ok())
+                .ok_or(DirectExecutionContractError::IdempotencyIndex)?;
+            if !replay_keys.contains(&replay_key) {
+                return Err(DirectExecutionContractError::IdempotencyIndex);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl StoredDirectFinalResult {
+    fn validate(&self) -> Result<(), DirectExecutionContractError> {
+        if self.account_id == [0; 32]
+            || self.request_id.is_nil()
+            || self.request_hash == [0; 32]
+            || self.result.request_id != self.request_id
+            || self.result.request_hash != self.request_hash
+            || self.result.protocol_version != DIRECT_EXECUTION_PROTOCOL_VERSION
+            || self.result.state == DirectExecutionTerminalState::OutcomeUnknown
+        {
+            return Err(DirectExecutionContractError::IdempotencyIndex);
+        }
+        if let Some(request) = &self.request {
+            request.validate()?;
+            if request.account_id != self.account_id
+                || request.request_id != self.request_id
+                || request.request_hash != self.request_hash
+            {
+                return Err(DirectExecutionContractError::IdempotencyIndex);
+            }
+        }
+        match self.marker_format_version {
+            0 if self.request.is_some()
+                || !self.projection_payload.is_empty()
+                || self.enclave_receipt.is_some()
+                || self.encrypted_journal_record.is_some()
+                || self.financial_replay_key_sha256.is_some() =>
+            {
+                return Err(DirectExecutionContractError::IdempotencyIndex);
+            }
+            0 => {}
+            1 => {
+                let request = self
+                    .request
+                    .as_ref()
+                    .ok_or(DirectExecutionContractError::IdempotencyIndex)?;
+                if request.operation != DirectExecutionOperation::CreditDeposit
+                    || self.projection_payload.is_empty()
+                {
+                    return Err(DirectExecutionContractError::IdempotencyIndex);
+                }
+                if self.financial_replay_key_sha256.is_some() {
+                    if self.enclave_receipt.is_none()
+                        || self.encrypted_journal_record.is_none()
+                        || self.result.state != DirectExecutionTerminalState::Applied
+                    {
+                        return Err(DirectExecutionContractError::IdempotencyIndex);
+                    }
+                    let response = stored_direct_deposit_response_unchecked(self)
+                        .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?;
+                    validate_direct_deposit_response_bindings(&response, None)
+                        .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?;
+                } else {
+                    validate_direct_deposit_effect_none_bindings(self, None)
+                        .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?;
+                }
+            }
+            _ => return Err(DirectExecutionContractError::IdempotencyIndex),
+        }
+        self.result
+            .validate_terminal_shape()
+            .map_err(|_| DirectExecutionContractError::IdempotencyIndex)
+    }
+}
+
+fn direct_final_result_key(account_id: &[u8; 32], request_id: Uuid) -> String {
+    format!("{}:{}", hex::encode(account_id), request_id.hyphenated())
+}
+
+fn direct_final_result_marker_key(result_key: &str) -> String {
+    format!("{DIRECT_FINAL_RESULT_MARKER_PREFIX}{result_key}")
+}
+
+fn direct_final_result_marker_digest(
+    stored: &StoredDirectFinalResult,
+) -> Result<[u8; 32], DirectExecutionContractError> {
+    stored.validate()?;
+    if stored.marker_format_version == 0 {
+        // Backward-compatible E02 marker. Older green snapshots serialized
+        // exactly these four fields and rooted the complete stored result.
+        #[derive(Serialize)]
+        struct LegacyStoredDirectFinalResult<'a> {
+            account_id: [u8; 32],
+            request_id: Uuid,
+            request_hash: [u8; 32],
+            result: &'a DirectExecutionTerminalResult,
+        }
+        if stored.request.is_some()
+            || !stored.projection_payload.is_empty()
+            || stored.enclave_receipt.is_some()
+            || stored.encrypted_journal_record.is_some()
+            || stored.financial_replay_key_sha256.is_some()
+        {
+            return Err(DirectExecutionContractError::IdempotencyIndex);
+        }
+        let encoded = serde_json::to_vec(&LegacyStoredDirectFinalResult {
+            account_id: stored.account_id,
+            request_id: stored.request_id,
+            request_hash: stored.request_hash,
+            result: &stored.result,
+        })
+        .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?;
+        return Ok(domain_hash(DIRECT_FINAL_RESULT_MARKER_DOMAIN, &encoded));
+    }
+    if stored.marker_format_version != 1 {
+        return Err(DirectExecutionContractError::IdempotencyIndex);
+    }
+    // Deliberately exclude commitEvidence.stateRoot and signatures: the marker
+    // is part of that state root, so including either would create an
+    // impossible self-referential hash. The rooted marker commits the request,
+    // terminal semantics, result commitment and optional financial replay key;
+    // restartEvidence then binds the resulting root and journal head.
+    direct_final_result_semantic_marker_digest(
+        stored.account_id,
+        stored.request_id,
+        stored.request_hash,
+        stored.result.state,
+        stored.result.effect,
+        stored.result.retry_policy,
+        &stored.result.error_code,
+        stored.result.result_commitment_sha256,
+        stored.financial_replay_key_sha256,
+    )
+}
+
+fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn direct_final_result_semantic_marker_digest(
+    account_id: [u8; 32],
+    request_id: Uuid,
+    request_hash: [u8; 32],
+    state: DirectExecutionTerminalState,
+    effect: DirectExecutionEffect,
+    retry_policy: DirectExecutionRetryPolicy,
+    error_code: &Option<String>,
+    result_commitment_sha256: [u8; 32],
+    financial_replay_key_sha256: Option<[u8; 32]>,
+) -> Result<[u8; 32], DirectExecutionContractError> {
+    let encoded = serde_json::to_vec(&(
+        account_id,
+        request_id,
+        request_hash,
+        state,
+        effect,
+        retry_policy,
+        error_code,
+        result_commitment_sha256,
+        financial_replay_key_sha256,
+    ))
+    .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?;
+    Ok(domain_hash(DIRECT_FINAL_RESULT_MARKER_DOMAIN, &encoded))
+}
+
+fn domain_hash(domain: &[u8], value: &[u8]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(domain);
+    hash.update((value.len() as u64).to_be_bytes());
+    hash.update(value);
+    hash.finalize().into()
+}
+
+fn stored_direct_deposit_response(
+    stored: &StoredDirectFinalResult,
+) -> Result<DirectDepositCreditResponse, DirectDepositCreditError> {
+    stored.validate()?;
+    stored_direct_deposit_response_unchecked(stored)
+}
+
+fn stored_direct_deposit_response_unchecked(
+    stored: &StoredDirectFinalResult,
+) -> Result<DirectDepositCreditResponse, DirectDepositCreditError> {
+    let request = stored
+        .request
+        .clone()
+        .ok_or(DirectDepositCreditError::ReplayBinding)?;
+    let enclave_receipt = stored
+        .enclave_receipt
+        .clone()
+        .ok_or(DirectDepositCreditError::ReplayBinding)?;
+    let encrypted_journal_record = stored
+        .encrypted_journal_record
+        .clone()
+        .ok_or(DirectDepositCreditError::ReplayBinding)?;
+    let financial_replay_key_sha256 = stored
+        .financial_replay_key_sha256
+        .ok_or(DirectDepositCreditError::ReplayBinding)?;
+    if stored.projection_payload.is_empty() {
+        return Err(DirectDepositCreditError::ReplayBinding);
+    }
+    Ok(DirectDepositCreditResponse {
+        request,
+        result: stored.result.clone(),
+        enclave_receipt,
+        encrypted_journal_record,
+        projection_payload: stored.projection_payload.clone(),
+        financial_replay_key_sha256,
+    })
+}
+
+fn validate_direct_deposit_response_bindings(
+    response: &DirectDepositCreditResponse,
+    verifying_key: Option<[u8; 32]>,
+) -> Result<(), DirectDepositCreditError> {
+    response.request.validate()?;
+    response.result.validate_for(&response.request)?;
+    let payload = DirectDepositCreditPayload::decode_for(&response.request)?;
+    let replay_key = payload.financial_replay_key()?;
+    let evidence = response
+        .result
+        .commit_evidence
+        .as_ref()
+        .ok_or(DirectDepositCreditError::ReplayBinding)?;
+    let receipt_bytes = serde_json::to_vec(&response.enclave_receipt)
+        .map_err(|_| DirectDepositCreditError::ReplayBinding)?;
+    if response.result.state != DirectExecutionTerminalState::Applied
+        || response.projection_payload != response.request.canonical_payload
+        || response.result.result_commitment_sha256
+            != domain_hash(DIRECT_DEPOSIT_RESULT_DOMAIN, &response.projection_payload)
+        || response.financial_replay_key_sha256 != replay_key
+        || evidence.state_root != response.enclave_receipt.state_root
+        || response.encrypted_journal_record.sequence != evidence.enclave_sequence
+        || response.encrypted_journal_record.state_root != evidence.state_root
+        || response.encrypted_journal_record.record_hash != evidence.journal_head
+        || evidence.journal_head != response.enclave_receipt.journal_hash
+        || evidence.enclave_sequence != response.enclave_receipt.enclave_sequence
+        || evidence.signed_receipt_sha256
+            != domain_hash(
+                b"layrs.direct-deposit-credit.enclave-receipt.v1\0",
+                &receipt_bytes,
+            )
+        || evidence.restart_evidence_sha256
+            != direct_deposit_restart_evidence(
+                &response.request,
+                replay_key,
+                evidence.enclave_sequence,
+                evidence.state_root,
+                evidence.journal_head,
+            )
+        || response.enclave_receipt.command_commitment_sha256 != Some(response.request.request_hash)
+        || response.enclave_receipt.result_commitment_sha256
+            != Some(response.result.result_commitment_sha256)
+        || response.enclave_receipt.journal_committed != Some(true)
+    {
+        return Err(DirectDepositCreditError::ReplayBinding);
+    }
+    if let Some(verifying_key) = verifying_key {
+        let mut unsigned = response.result.clone();
+        let signature = Signature::from_slice(&unsigned.signature)
+            .map_err(|_| DirectDepositCreditError::ReplayBinding)?;
+        unsigned.signature.clear();
+        let signing_payload =
+            direct_domain_signing_payload(DIRECT_DEPOSIT_RESULT_SIGNATURE_DOMAIN, &unsigned)?;
+        VerifyingKey::from_bytes(&verifying_key)
+            .map_err(|_| DirectDepositCreditError::ReplayBinding)?
+            .verify(&signing_payload, &signature)
+            .map_err(|_| DirectDepositCreditError::ReplayBinding)?;
+        verify_enclave_receipt_signature(&response.enclave_receipt, verifying_key)?;
+    }
+    Ok(())
+}
+
+fn stored_direct_deposit_effect_none_response(
+    stored: &StoredDirectFinalResult,
+) -> Result<DirectDepositEffectNoneResponse, DirectDepositCreditError> {
+    stored.validate()?;
+    let request = stored
+        .request
+        .clone()
+        .ok_or(DirectDepositCreditError::ReplayBinding)?;
+    let payload = DirectDepositCreditPayload::decode_for(&request)?;
+    Ok(DirectDepositEffectNoneResponse {
+        request,
+        result: stored.result.clone(),
+        enclave_receipt: stored
+            .enclave_receipt
+            .clone()
+            .ok_or(DirectDepositCreditError::ReplayBinding)?,
+        encrypted_journal_record: stored
+            .encrypted_journal_record
+            .clone()
+            .ok_or(DirectDepositCreditError::ReplayBinding)?,
+        projection_payload: stored.projection_payload.clone(),
+        custody_replay_key_sha256: payload.financial_replay_key()?,
+    })
+}
+
+fn validate_direct_deposit_effect_none_bindings(
+    stored: &StoredDirectFinalResult,
+    verifying_key: Option<[u8; 32]>,
+) -> Result<(), DirectDepositCreditError> {
+    let request = stored
+        .request
+        .as_ref()
+        .ok_or(DirectDepositCreditError::ReplayBinding)?;
+    request.validate()?;
+    let payload = DirectDepositCreditPayload::decode_for(request)?;
+    stored.result.validate_for(request)?;
+    let receipt = stored
+        .enclave_receipt
+        .as_ref()
+        .ok_or(DirectDepositCreditError::ReplayBinding)?;
+    let record = stored
+        .encrypted_journal_record
+        .as_ref()
+        .ok_or(DirectDepositCreditError::ReplayBinding)?;
+    if stored.marker_format_version != 1
+        || stored.account_id != request.account_id
+        || stored.request_id != request.request_id
+        || stored.request_hash != request.request_hash
+        || stored.projection_payload != request.canonical_payload
+        || stored.financial_replay_key_sha256.is_some()
+        || !matches!(
+            stored.result.state,
+            DirectExecutionTerminalState::RejectedEffectNone
+                | DirectExecutionTerminalState::ExpiredEffectNone
+        )
+        || stored.result.result_commitment_sha256
+            != domain_hash(DIRECT_DEPOSIT_RESULT_DOMAIN, &stored.projection_payload)
+        || receipt.command_commitment_sha256 != Some(request.request_hash)
+        || receipt.result_commitment_sha256 != Some(stored.result.result_commitment_sha256)
+        || receipt.publication_eligible != Some(false)
+        || receipt.journal_committed != Some(true)
+        || record.sequence != receipt.enclave_sequence
+        || record.state_root != receipt.state_root
+        || record.record_hash != receipt.journal_hash
+        || receipt.prior_state_root == receipt.state_root
+    {
+        return Err(DirectDepositCreditError::ReplayBinding);
+    }
+    if let Some(verifying_key) = verifying_key {
+        let mut unsigned = stored.result.clone();
+        let signature = Signature::from_slice(&unsigned.signature)
+            .map_err(|_| DirectDepositCreditError::ReplayBinding)?;
+        unsigned.signature.clear();
+        let signing_payload =
+            direct_domain_signing_payload(DIRECT_DEPOSIT_RESULT_SIGNATURE_DOMAIN, &unsigned)?;
+        VerifyingKey::from_bytes(&verifying_key)
+            .map_err(|_| DirectDepositCreditError::ReplayBinding)?
+            .verify(&signing_payload, &signature)
+            .map_err(|_| DirectDepositCreditError::ReplayBinding)?;
+        verify_enclave_receipt_signature(receipt, verifying_key)?;
+    }
+    if payload.financial_replay_key()? == [0; 32] {
+        return Err(DirectDepositCreditError::ReplayBinding);
+    }
+    Ok(())
+}
+
+fn verify_enclave_receipt_signature(
+    receipt: &EnclaveReceipt,
+    verifying_key: [u8; 32],
+) -> Result<(), DirectDepositCreditError> {
+    let mut unsigned = receipt.clone();
+    let signature = Signature::from_slice(&unsigned.signature)
+        .map_err(|_| DirectDepositCreditError::ReplayBinding)?;
+    unsigned.signature.clear();
+    VerifyingKey::from_bytes(&verifying_key)
+        .map_err(|_| DirectDepositCreditError::ReplayBinding)?
+        .verify(
+            &serde_json::to_vec(&unsigned).map_err(|_| DirectDepositCreditError::ReplayBinding)?,
+            &signature,
+        )
+        .map_err(|_| DirectDepositCreditError::ReplayBinding)
+}
+
+fn direct_deposit_restart_evidence(
+    request: &DirectExecutionRequestEnvelope,
+    replay_key: [u8; 32],
+    sequence: u64,
+    state_root: [u8; 32],
+    journal_head: [u8; 32],
+) -> [u8; 32] {
+    let mut bytes = Vec::with_capacity(32 * 4 + 8);
+    bytes.extend_from_slice(&request.request_hash);
+    bytes.extend_from_slice(&replay_key);
+    bytes.extend_from_slice(&sequence.to_be_bytes());
+    bytes.extend_from_slice(&state_root);
+    bytes.extend_from_slice(&journal_head);
+    domain_hash(DIRECT_DEPOSIT_RESTART_DOMAIN, &bytes)
+}
+
+fn direct_domain_signing_payload<T: Serialize>(
+    domain: &[u8],
+    value: &T,
+) -> Result<Vec<u8>, DirectDepositCreditError> {
+    let encoded = serde_json::to_vec(value).map_err(|_| DirectDepositCreditError::ReplayBinding)?;
+    let mut payload = Vec::with_capacity(domain.len() + 4 + encoded.len());
+    payload.extend_from_slice(domain);
+    payload.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+    payload.extend_from_slice(&encoded);
+    Ok(payload)
+}
+
+fn valid_direct_error_code(value: &str) -> bool {
+    (3..=96).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DirectExecutionContractError {
+    #[error("invalid direct protocol version")]
+    ProtocolVersion,
+    #[error("invalid direct request id")]
+    RequestId,
+    #[error("invalid direct identity binding")]
+    Identity,
+    #[error("direct request has ambiguous scope")]
+    AmbiguousScope,
+    #[error("invalid direct request scope")]
+    Scope,
+    #[error("invalid direct request payload")]
+    Payload,
+    #[error("invalid direct request deadline")]
+    Deadline,
+    #[error("direct request hash mismatch")]
+    RequestHash,
+    #[error("direct result is bound to a different request")]
+    ResultBinding,
+    #[error("invalid direct result signature metadata")]
+    Signature,
+    #[error("invalid direct result commitment")]
+    ResultCommitment,
+    #[error("invalid direct commit evidence")]
+    CommitEvidence,
+    #[error("incoherent direct terminal-result semantics")]
+    ResultSemantics,
+    #[error("request id was already used with a different payload")]
+    IdempotencyPayloadMismatch,
+    #[error("outcome unknown is not a definitive idempotency result")]
+    NonFinalIdempotencyResult,
+    #[error("direct recovery requires an exact bound outcome-unknown result")]
+    RecoveryRequiresOutcomeUnknown,
+    #[error("invalid direct final-result index")]
+    IdempotencyIndex,
+}
+
+#[cfg(test)]
+mod direct_execution_contract_tests {
+    use super::*;
+
+    fn legacy_command_state_fingerprint(core: &PrivateTradingCore) -> Vec<u8> {
+        let legacy_processed_hashes: BTreeMap<_, _> = processed_hashes(&core.processed)
+            .into_iter()
+            .filter(|(key, _)| !key.starts_with(DIRECT_FINAL_RESULT_MARKER_PREFIX))
+            .collect();
+        let (journal_sequence, journal_head) = core.journal.chain_head();
+
+        serde_json::to_vec(&serde_json::json!({
+            "ledger": &core.ledger,
+            "books": &core.books,
+            "markets": &core.markets,
+            "sessions": &core.sessions,
+            "legacyProcessedHashes": legacy_processed_hashes,
+            "recoveryCapsules": &core.recovery_capsules,
+            "systemKeys": &core.system_keys,
+            "positionCostBasis": &core.position_cost_basis,
+            "resolutions": &core.resolutions,
+            "oraclePublicKey": core.oracle_public_key,
+            "bootstrapExecutions": &core.bootstrap_executions,
+            "privateRewards": &core.private_rewards,
+            "tradingFrozen": core.trading_frozen,
+            "sequence": core.sequence,
+            "journalSequence": journal_sequence,
+            "journalHead": journal_head,
+        }))
+        .unwrap()
+    }
+
+    fn request() -> DirectExecutionRequestEnvelope {
+        DirectExecutionRequestEnvelope::new(
+            Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
+            [1; 32],
+            [2; 32],
+            Some("layrs:v5:BTC:USDC:1h:1800000000".into()),
+            None,
+            DirectExecutionOperation::PlaceOrder,
+            br#"{"outcome":"UP","price":"0.49","quantity":"2.1"}"#.to_vec(),
+            1_800_000_000_000,
+            1_800_000_005_000,
+        )
+        .unwrap()
+    }
+
+    fn result(state: DirectExecutionTerminalState) -> DirectExecutionTerminalResult {
+        let request = request();
+        let (effect, retry_policy, error_code, commit_evidence) = match state {
+            DirectExecutionTerminalState::Applied => (
+                DirectExecutionEffect::Committed,
+                DirectExecutionRetryPolicy::ReturnOriginalResult,
+                None,
+                Some(DirectExecutionCommitEvidence {
+                    enclave_sequence: 9,
+                    state_root: [3; 32],
+                    journal_head: [4; 32],
+                    signed_receipt_sha256: [5; 32],
+                    restart_evidence_sha256: [6; 32],
+                }),
+            ),
+            DirectExecutionTerminalState::RejectedEffectNone => (
+                DirectExecutionEffect::None,
+                DirectExecutionRetryPolicy::NewRequestAllowed,
+                Some("INSUFFICIENT_BALANCE".into()),
+                None,
+            ),
+            DirectExecutionTerminalState::ExpiredEffectNone => (
+                DirectExecutionEffect::None,
+                DirectExecutionRetryPolicy::NewRequestAllowed,
+                Some("REQUEST_DEADLINE_EXCEEDED".into()),
+                None,
+            ),
+            DirectExecutionTerminalState::OutcomeUnknown => (
+                DirectExecutionEffect::Unknown,
+                DirectExecutionRetryPolicy::SameRequestOnly,
+                Some("RESTART_EVIDENCE_UNAVAILABLE".into()),
+                None,
+            ),
+        };
+        DirectExecutionTerminalResult {
+            protocol_version: DIRECT_EXECUTION_PROTOCOL_VERSION.into(),
+            request_id: request.request_id,
+            request_hash: request.request_hash,
+            state,
+            effect,
+            retry_policy,
+            error_code,
+            commit_evidence,
+            result_commitment_sha256: [7; 32],
+            signed_at_millis: request.issued_at_millis + 10,
+            signature: vec![8; 64],
+        }
+    }
+
+    fn request_with_id(value: &str) -> DirectExecutionRequestEnvelope {
+        let mut value_request = request();
+        value_request.request_id = Uuid::parse_str(value).unwrap();
+        value_request.request_hash = value_request.computed_request_hash();
+        value_request
+    }
+
+    fn result_for(
+        request: &DirectExecutionRequestEnvelope,
+        state: DirectExecutionTerminalState,
+    ) -> DirectExecutionTerminalResult {
+        let mut value = result(state);
+        value.request_id = request.request_id;
+        value.request_hash = request.request_hash;
+        value
+    }
+
+    #[test]
+    fn request_hash_binds_every_authority_scope_payload_and_time_field() {
+        let baseline = request();
+        baseline.validate().unwrap();
+        let baseline_hash = baseline.request_hash;
+        assert_eq!(
+            hex::encode(baseline_hash),
+            "0bdc221c8c5a4be47a7a1a13447963a4bec16a85eab7a8ca09a6ecdba69c4ee0"
+        );
+
+        let mut mutations = Vec::new();
+        let mut value = baseline.clone();
+        value.authenticated_subject_hash = [9; 32];
+        mutations.push(value);
+        let mut value = baseline.clone();
+        value.account_id = [9; 32];
+        mutations.push(value);
+        let mut value = baseline.clone();
+        value.market_id = Some("layrs:v5:BTC:USDC:1h:1800003600".into());
+        mutations.push(value);
+        let mut value = baseline.clone();
+        value.operation = DirectExecutionOperation::CancelOrder;
+        mutations.push(value);
+        let mut value = baseline.clone();
+        value.canonical_payload.push(b' ');
+        mutations.push(value);
+        let mut value = baseline.clone();
+        value.issued_at_millis += 1;
+        mutations.push(value);
+        let mut value = baseline.clone();
+        value.deadline_millis -= 1;
+        mutations.push(value);
+
+        for value in mutations {
+            assert_ne!(value.computed_request_hash(), baseline_hash);
+            assert_eq!(
+                value.validate(),
+                Err(DirectExecutionContractError::RequestHash)
+            );
+        }
+    }
+
+    #[test]
+    fn request_contract_rejects_ambiguous_scope_bad_deadline_and_hash_mismatch() {
+        let mut value = request();
+        value.funding_identity = Some("base:8453:tx:0:log:1".into());
+        value.request_hash = value.computed_request_hash();
+        assert_eq!(
+            value.validate(),
+            Err(DirectExecutionContractError::AmbiguousScope)
+        );
+
+        let mut value = request();
+        value.deadline_millis = value.issued_at_millis;
+        value.request_hash = value.computed_request_hash();
+        assert_eq!(
+            value.validate(),
+            Err(DirectExecutionContractError::Deadline)
+        );
+
+        let mut value = request();
+        value.deadline_millis = value.issued_at_millis + DIRECT_EXECUTION_MAX_LIFETIME_MILLIS + 1;
+        value.request_hash = value.computed_request_hash();
+        assert_eq!(
+            value.validate(),
+            Err(DirectExecutionContractError::Deadline)
+        );
+
+        let mut value = request();
+        value.request_hash[0] ^= 1;
+        assert_eq!(
+            value.validate(),
+            Err(DirectExecutionContractError::RequestHash)
+        );
+    }
+
+    #[test]
+    fn exactly_four_terminal_classes_have_fixed_effect_and_retry_semantics() {
+        let request = request();
+        for state in [
+            DirectExecutionTerminalState::Applied,
+            DirectExecutionTerminalState::RejectedEffectNone,
+            DirectExecutionTerminalState::ExpiredEffectNone,
+            DirectExecutionTerminalState::OutcomeUnknown,
+        ] {
+            result(state).validate_for(&request).unwrap();
+        }
+
+        let mut false_failure = result(DirectExecutionTerminalState::OutcomeUnknown);
+        false_failure.effect = DirectExecutionEffect::None;
+        false_failure.retry_policy = DirectExecutionRetryPolicy::NewRequestAllowed;
+        assert_eq!(
+            false_failure.validate_for(&request),
+            Err(DirectExecutionContractError::ResultSemantics),
+        );
+
+        let mut false_success = result(DirectExecutionTerminalState::Applied);
+        false_success.commit_evidence = None;
+        assert_eq!(
+            false_success.validate_for(&request),
+            Err(DirectExecutionContractError::ResultSemantics),
+        );
+    }
+
+    #[test]
+    fn terminal_result_is_bound_to_exact_request_and_has_stable_camel_case_wire() {
+        let request = request();
+        let result = result(DirectExecutionTerminalState::Applied);
+        result.validate_for(&request).unwrap();
+
+        let mut other = request.clone();
+        other.request_id = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+        other.request_hash = other.computed_request_hash();
+        assert_eq!(
+            result.validate_for(&other),
+            Err(DirectExecutionContractError::ResultBinding),
+        );
+
+        let encoded = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            encoded["protocolVersion"],
+            DIRECT_EXECUTION_PROTOCOL_VERSION
+        );
+        assert_eq!(encoded["state"], "APPLIED");
+        assert_eq!(encoded["effect"], "COMMITTED");
+        assert_eq!(encoded["retryPolicy"], "RETURN_ORIGINAL_RESULT");
+        assert!(encoded.get("commitEvidence").is_some());
+        assert!(encoded.get("errorCode").is_none());
+    }
+
+    #[test]
+    fn definitive_result_index_returns_the_exact_original_result() {
+        let request = request();
+        let original = result(DirectExecutionTerminalState::Applied);
+        let original_bytes = serde_json::to_vec(&original).unwrap();
+        let mut index = DirectFinalResultIndex::default();
+
+        assert_eq!(
+            index.lookup(&request).unwrap(),
+            DirectExecutionIdempotencyDecision::Execute
+        );
+        assert_eq!(
+            index.record_definitive(&request, original.clone()).unwrap(),
+            DirectExecutionIdempotencyDecision::Recorded(original.clone())
+        );
+
+        let replay = index.lookup(&request).unwrap();
+        let DirectExecutionIdempotencyDecision::ReturnOriginal(replayed) = replay else {
+            panic!("exact replay did not return the original result");
+        };
+        assert_eq!(serde_json::to_vec(&replayed).unwrap(), original_bytes);
+
+        let mut replacement_attempt = original.clone();
+        replacement_attempt.result_commitment_sha256 = [9; 32];
+        assert_eq!(
+            index
+                .record_definitive(&request, replacement_attempt)
+                .unwrap(),
+            DirectExecutionIdempotencyDecision::ReturnOriginal(original)
+        );
+    }
+
+    #[test]
+    fn reused_request_id_with_changed_payload_is_rejected_without_replacement() {
+        let request = request();
+        let original = result(DirectExecutionTerminalState::Applied);
+        let mut index = DirectFinalResultIndex::default();
+        index.record_definitive(&request, original.clone()).unwrap();
+
+        let mut changed = request.clone();
+        changed.canonical_payload = br#"{"outcome":"UP","price":"0.50","quantity":"2.1"}"#.to_vec();
+        changed.request_hash = changed.computed_request_hash();
+        assert_eq!(
+            index.lookup(&changed),
+            Err(DirectExecutionContractError::IdempotencyPayloadMismatch)
+        );
+        assert_eq!(
+            index.lookup(&request).unwrap(),
+            DirectExecutionIdempotencyDecision::ReturnOriginal(original)
+        );
+    }
+
+    #[test]
+    fn outcome_unknown_cannot_be_misclassified_as_completed_idempotency() {
+        let request = request();
+        let mut index = DirectFinalResultIndex::default();
+        assert_eq!(
+            index.record_definitive(
+                &request,
+                result(DirectExecutionTerminalState::OutcomeUnknown)
+            ),
+            Err(DirectExecutionContractError::NonFinalIdempotencyResult)
+        );
+        assert_eq!(
+            index.lookup(&request).unwrap(),
+            DirectExecutionIdempotencyDecision::Execute
+        );
+    }
+
+    #[test]
+    fn deadline_expires_only_an_unstarted_request_and_never_hides_a_final_result() {
+        let request = request();
+        let mut core = PrivateTradingCore::new(
+            JournalKey::from_bytes([0x11; 32]),
+            ReceiptSigner::generate([0x12; 48]),
+        );
+
+        assert_eq!(
+            core.direct_execution_attempt(&request, request.deadline_millis - 1)
+                .unwrap(),
+            DirectExecutionAttemptDecision::Execute
+        );
+        assert_eq!(
+            core.direct_execution_attempt(&request, request.deadline_millis)
+                .unwrap(),
+            DirectExecutionAttemptDecision::ExpiredEffectNone
+        );
+
+        let original = result(DirectExecutionTerminalState::Applied);
+        let (staged, staged_processed, _) = core
+            .stage_direct_final_result(&request, original.clone())
+            .unwrap();
+        core.direct_final_results = staged;
+        core.processed = staged_processed;
+        assert_eq!(
+            core.direct_execution_attempt(&request, request.deadline_millis + 60_000)
+                .unwrap(),
+            DirectExecutionAttemptDecision::ReturnOriginal(original)
+        );
+    }
+
+    #[test]
+    fn outcome_unknown_recovery_is_stateless_and_requires_the_exact_same_request() {
+        let request = request();
+        let unknown = result(DirectExecutionTerminalState::OutcomeUnknown);
+        let core = PrivateTradingCore::new(
+            JournalKey::from_bytes([0x21; 32]),
+            ReceiptSigner::generate([0x22; 48]),
+        );
+
+        assert_eq!(
+            core.direct_recovery_after_unknown(&request, &unknown, request.deadline_millis - 1,)
+                .unwrap(),
+            DirectExecutionRecoveryDecision::OutcomeUnknownSameRequestOnly
+        );
+        assert_eq!(
+            core.direct_recovery_after_unknown(
+                &request,
+                &unknown,
+                request.deadline_millis + 86_400_000,
+            )
+            .unwrap(),
+            DirectExecutionRecoveryDecision::OutcomeUnknownSameRequestOnly
+        );
+        assert!(core.direct_final_results.is_empty());
+        assert!(core.processed.is_empty());
+
+        let changed_request = request_with_id("22222222-2222-4222-8222-222222222222");
+        assert_eq!(
+            core.direct_recovery_after_unknown(
+                &changed_request,
+                &unknown,
+                changed_request.deadline_millis - 1,
+            ),
+            Err(DirectExecutionContractError::ResultBinding)
+        );
+
+        let mut changed_payload = request.clone();
+        changed_payload.canonical_payload =
+            br#"{"outcome":"DOWN","price":"0.51","quantity":"2.1"}"#.to_vec();
+        changed_payload.request_hash = changed_payload.computed_request_hash();
+        assert_eq!(
+            core.direct_recovery_after_unknown(
+                &changed_payload,
+                &unknown,
+                changed_payload.deadline_millis - 1,
+            ),
+            Err(DirectExecutionContractError::ResultBinding)
+        );
+
+        let applied = result(DirectExecutionTerminalState::Applied);
+        assert_eq!(
+            core.direct_recovery_after_unknown(&request, &applied, request.deadline_millis - 1,),
+            Err(DirectExecutionContractError::RecoveryRequiresOutcomeUnknown)
+        );
+    }
+
+    #[test]
+    fn terminal_effect_none_does_not_block_a_new_request_before_or_after_restart() {
+        let journal_key = JournalKey::from_bytes([0x61; 32]);
+        let mut core =
+            PrivateTradingCore::new(journal_key.clone(), ReceiptSigner::generate([0x62; 48]));
+        let rejected_request = request();
+        let expired_request = request_with_id("22222222-2222-4222-8222-222222222222");
+        let next_request = request_with_id("33333333-3333-4333-8333-333333333333");
+
+        for (request, state) in [
+            (
+                &rejected_request,
+                DirectExecutionTerminalState::RejectedEffectNone,
+            ),
+            (
+                &expired_request,
+                DirectExecutionTerminalState::ExpiredEffectNone,
+            ),
+        ] {
+            let terminal = result_for(request, state);
+            let (staged, staged_processed, decision) = core
+                .stage_direct_final_result(request, terminal.clone())
+                .unwrap();
+            assert_eq!(
+                decision,
+                DirectExecutionIdempotencyDecision::Recorded(terminal)
+            );
+            core.direct_final_results = staged;
+            core.processed = staged_processed;
+        }
+
+        assert_eq!(
+            core.direct_execution_attempt(&next_request, next_request.issued_at_millis)
+                .unwrap(),
+            DirectExecutionAttemptDecision::Execute
+        );
+        let snapshot = core.export_encrypted_snapshot().unwrap();
+        let restored = PrivateTradingCore::restore_encrypted_snapshot(
+            journal_key,
+            ReceiptSigner::generate([0x63; 48]),
+            &snapshot,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            restored
+                .direct_execution_attempt(&next_request, next_request.issued_at_millis)
+                .unwrap(),
+            DirectExecutionAttemptDecision::Execute
+        );
+        assert!(matches!(
+            restored
+                .direct_idempotency_lookup(&rejected_request)
+                .unwrap(),
+            DirectExecutionIdempotencyDecision::ReturnOriginal(DirectExecutionTerminalResult {
+                state: DirectExecutionTerminalState::RejectedEffectNone,
+                ..
+            })
+        ));
+        assert!(matches!(
+            restored
+                .direct_idempotency_lookup(&expired_request)
+                .unwrap(),
+            DirectExecutionIdempotencyDecision::ReturnOriginal(DirectExecutionTerminalResult {
+                state: DirectExecutionTerminalState::ExpiredEffectNone,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn process_restart_recovers_a_lost_applied_response_from_same_id_only() {
+        let journal_key = JournalKey::from_bytes([0x71; 32]);
+        let mut core =
+            PrivateTradingCore::new(journal_key.clone(), ReceiptSigner::generate([0x72; 48]));
+        let request = request();
+        let original = result(DirectExecutionTerminalState::Applied);
+        let unknown_seen_by_caller = result(DirectExecutionTerminalState::OutcomeUnknown);
+        let original_bytes = serde_json::to_vec(&original).unwrap();
+        let (staged, staged_processed, _) =
+            core.stage_direct_final_result(&request, original).unwrap();
+        core.direct_final_results = staged;
+        core.processed = staged_processed;
+
+        // Simulate the process ending after the encrypted commit barrier but
+        // before the caller receives the signed APPLIED response.
+        let snapshot = core.export_encrypted_snapshot().unwrap();
+        drop(core);
+        let restored = PrivateTradingCore::restore_encrypted_snapshot(
+            journal_key,
+            ReceiptSigner::generate([0x73; 48]),
+            &snapshot,
+            0,
+        )
+        .unwrap();
+        let DirectExecutionRecoveryDecision::ReturnOriginal(recovered) = restored
+            .direct_recovery_after_unknown(
+                &request,
+                &unknown_seen_by_caller,
+                request.deadline_millis + 60_000,
+            )
+            .unwrap()
+        else {
+            panic!("restart recovery did not return the committed result");
+        };
+        assert_eq!(serde_json::to_vec(&recovered).unwrap(), original_bytes);
+
+        let different_request = request_with_id("44444444-4444-4444-8444-444444444444");
+        assert_eq!(
+            restored.direct_recovery_after_unknown(
+                &different_request,
+                &unknown_seen_by_caller,
+                different_request.deadline_millis + 60_000,
+            ),
+            Err(DirectExecutionContractError::ResultBinding)
+        );
+    }
+
+    #[test]
+    fn sealed_index_validation_rejects_key_record_mismatch() {
+        let request = request();
+        let mut index = DirectFinalResultIndex::default();
+        index
+            .record_definitive(
+                &request,
+                result(DirectExecutionTerminalState::RejectedEffectNone),
+            )
+            .unwrap();
+        index.validate().unwrap();
+
+        let stored = index.0.values().next().unwrap().clone();
+        index.0.clear();
+        index.0.insert("wrong-account:wrong-request".into(), stored);
+        assert_eq!(
+            index.validate(),
+            Err(DirectExecutionContractError::IdempotencyIndex)
+        );
+    }
+
+    #[test]
+    fn definitive_result_survives_encrypted_snapshot_restart() {
+        let journal_key = JournalKey::from_bytes([0x31; 32]);
+        let mut core =
+            PrivateTradingCore::new(journal_key.clone(), ReceiptSigner::generate([0x32; 48]));
+        let request = request();
+        let original = result(DirectExecutionTerminalState::Applied);
+        let original_bytes = serde_json::to_vec(&original).unwrap();
+        let prior_root = core.state_root();
+        let (staged, staged_processed, decision) = core
+            .stage_direct_final_result(&request, original.clone())
+            .unwrap();
+        assert_eq!(
+            decision,
+            DirectExecutionIdempotencyDecision::Recorded(original)
+        );
+        core.direct_final_results = staged;
+        core.processed = staged_processed;
+        assert_ne!(core.state_root(), prior_root);
+
+        let snapshot = core.export_encrypted_snapshot().unwrap();
+        let restored = PrivateTradingCore::restore_encrypted_snapshot(
+            journal_key,
+            ReceiptSigner::generate([0x33; 48]),
+            &snapshot,
+            0,
+        )
+        .unwrap();
+        let DirectExecutionIdempotencyDecision::ReturnOriginal(replayed) =
+            restored.direct_idempotency_lookup(&request).unwrap()
+        else {
+            panic!("restart did not retain the definitive direct result");
+        };
+        assert_eq!(serde_json::to_vec(&replayed).unwrap(), original_bytes);
+    }
+
+    #[test]
+    fn restore_rejects_direct_result_without_matching_root_marker() {
+        let journal_key = JournalKey::from_bytes([0x41; 32]);
+        let mut core =
+            PrivateTradingCore::new(journal_key.clone(), ReceiptSigner::generate([0x42; 48]));
+        let request = request();
+        let (staged, _staged_processed, decision) = core
+            .stage_direct_final_result(
+                &request,
+                result(DirectExecutionTerminalState::RejectedEffectNone),
+            )
+            .unwrap();
+        assert!(matches!(
+            decision,
+            DirectExecutionIdempotencyDecision::Recorded(_)
+        ));
+
+        // Simulate a corrupted snapshot assembly that persists the direct
+        // index without installing the paired marker into rooted state.
+        core.direct_final_results = staged;
+        let snapshot = core.export_encrypted_snapshot().unwrap();
+        assert!(matches!(
+            PrivateTradingCore::restore_encrypted_snapshot(
+                journal_key,
+                ReceiptSigner::generate([0x43; 48]),
+                &snapshot,
+                0,
+            ),
+            Err(CoreError::JournalChainMismatch)
+        ));
+    }
+
+    #[test]
+    fn restore_rejects_root_marker_without_matching_direct_result() {
+        let journal_key = JournalKey::from_bytes([0x51; 32]);
+        let mut core =
+            PrivateTradingCore::new(journal_key.clone(), ReceiptSigner::generate([0x52; 48]));
+        let request = request();
+        let (_staged, staged_processed, decision) = core
+            .stage_direct_final_result(
+                &request,
+                result(DirectExecutionTerminalState::RejectedEffectNone),
+            )
+            .unwrap();
+        assert!(matches!(
+            decision,
+            DirectExecutionIdempotencyDecision::Recorded(_)
+        ));
+
+        // The inverse partial commit is equally invalid: a rooted marker must
+        // never survive without the exact replay result it commits to.
+        core.processed = staged_processed;
+        let snapshot = core.export_encrypted_snapshot().unwrap();
+        assert!(matches!(
+            PrivateTradingCore::restore_encrypted_snapshot(
+                journal_key,
+                ReceiptSigner::generate([0x53; 48]),
+                &snapshot,
+                0,
+            ),
+            Err(CoreError::JournalChainMismatch)
+        ));
+    }
+
+    #[test]
+    fn direct_kernel_never_creates_or_modifies_legacy_command_lifecycle_state() {
+        let mut core = PrivateTradingCore::new(
+            JournalKey::from_bytes([0x81; 32]),
+            ReceiptSigner::generate([0x82; 48]),
+        );
+        core.processed.insert(
+            "legacy-command-sentinel".into(),
+            ProcessedCommand {
+                request_hash: [0x83; 32],
+                response: None,
+            },
+        );
+        core.system_keys.insert("legacy-system-sentinel".into());
+
+        let request = request();
+        let unknown = result(DirectExecutionTerminalState::OutcomeUnknown);
+        let baseline = legacy_command_state_fingerprint(&core);
+        let baseline_root = core.state_root();
+
+        assert_eq!(
+            core.direct_execution_attempt(&request, request.issued_at_millis)
+                .unwrap(),
+            DirectExecutionAttemptDecision::Execute
+        );
+        assert_eq!(
+            core.direct_idempotency_lookup(&request).unwrap(),
+            DirectExecutionIdempotencyDecision::Execute
+        );
+        assert_eq!(
+            core.direct_recovery_after_unknown(&request, &unknown, request.deadline_millis + 1)
+                .unwrap(),
+            DirectExecutionRecoveryDecision::OutcomeUnknownSameRequestOnly
+        );
+        assert_eq!(legacy_command_state_fingerprint(&core), baseline);
+        assert_eq!(core.state_root(), baseline_root);
+        assert!(core.direct_final_results.is_empty());
+
+        let terminal = result(DirectExecutionTerminalState::Applied);
+        let (staged_results, staged_processed, decision) = core
+            .stage_direct_final_result(&request, terminal.clone())
+            .unwrap();
+        assert_eq!(
+            decision,
+            DirectExecutionIdempotencyDecision::Recorded(terminal.clone())
+        );
+
+        // Staging is pure: it cannot admit, prepare, finalize, journal, or
+        // globally serialize work by mutating the live core.
+        assert_eq!(legacy_command_state_fingerprint(&core), baseline);
+        assert_eq!(core.state_root(), baseline_root);
+        assert!(core.direct_final_results.is_empty());
+        assert_eq!(staged_results.0.len(), 1);
+        assert_eq!(staged_processed.len(), core.processed.len() + 1);
+        assert_eq!(
+            staged_processed
+                .get("legacy-command-sentinel")
+                .map(|entry| entry.request_hash),
+            Some([0x83; 32])
+        );
+        let new_processed_keys: Vec<_> = staged_processed
+            .keys()
+            .filter(|key| !core.processed.contains_key(*key))
+            .cloned()
+            .collect();
+        assert_eq!(new_processed_keys.len(), 1);
+        assert!(new_processed_keys[0].starts_with(DIRECT_FINAL_RESULT_MARKER_PREFIX));
+        assert!(staged_processed[&new_processed_keys[0]].response.is_none());
+
+        // Installing the direct commit pair changes only the exact-result
+        // index and its rooted marker. Every legacy command/recovery surface,
+        // journal head, sequence, and financial field remains byte-identical.
+        core.direct_final_results = staged_results;
+        core.processed = staged_processed;
+        assert_eq!(legacy_command_state_fingerprint(&core), baseline);
+        assert_ne!(core.state_root(), baseline_root);
+        assert!(core.recovery_capsules.is_empty());
+        assert_eq!(core.system_keys.len(), 1);
+
+        assert_eq!(
+            core.direct_execution_attempt(&request, request.deadline_millis + 60_000)
+                .unwrap(),
+            DirectExecutionAttemptDecision::ReturnOriginal(terminal.clone())
+        );
+        assert_eq!(
+            core.direct_recovery_after_unknown(
+                &request,
+                &unknown,
+                request.deadline_millis + 60_000
+            )
+            .unwrap(),
+            DirectExecutionRecoveryDecision::ReturnOriginal(terminal)
+        );
+        assert_eq!(legacy_command_state_fingerprint(&core), baseline);
+    }
+
+    fn deposit_request(
+        request_id: &str,
+        account_id: [u8; 32],
+        identity_commitment: [u8; 32],
+        issued_at_millis: i64,
+    ) -> DirectExecutionRequestEnvelope {
+        let mut payload = DirectDepositCreditPayload {
+            protocol_version: DIRECT_DEPOSIT_PAYLOAD_VERSION.into(),
+            deposit_id: Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap(),
+            authenticated_subject_hash: [0x11; 32],
+            account_id,
+            identity_commitment,
+            asset: "USDC".into(),
+            amount_atomic: 5_000_000,
+            source_chain: "eip155:8453".into(),
+            source_transaction_hash: [0x31; 32],
+            source_log_index: 7,
+            pool_chain: "base".into(),
+            pool_transaction_hash: [0x41; 32],
+            pool_log_index: 9,
+            pool_receipt_evidence_sha256: [0; 32],
+            funding_identity: "deposit:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+        };
+        payload.pool_receipt_evidence_sha256 = payload.canonical_pool_receipt_evidence();
+        DirectExecutionRequestEnvelope::new(
+            Uuid::parse_str(request_id).unwrap(),
+            payload.authenticated_subject_hash,
+            account_id,
+            None,
+            Some(payload.funding_identity.clone()),
+            DirectExecutionOperation::CreditDeposit,
+            serde_json::to_vec(&payload).unwrap(),
+            issued_at_millis,
+            issued_at_millis + 5_000,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn direct_deposit_is_balanced_signed_and_replays_exactly_once_across_restart() {
+        let journal_key = JournalKey::from_bytes([0x91; 32]);
+        let signer = ReceiptSigner::from_seed([0x92; 32], [0x93; 48]);
+        let account_id = [0x21; 32];
+        let identity_commitment = [0x22; 32];
+        let request = deposit_request(
+            "91111111-1111-4111-8111-111111111111",
+            account_id,
+            identity_commitment,
+            1_800_000_000_000,
+        );
+        let mut core = PrivateTradingCore::new(journal_key.clone(), signer.clone());
+        let applied = match core
+            .direct_credit_deposit(request.clone(), request.issued_at_millis + 1)
+            .unwrap()
+        {
+            DirectDepositCreditOutcome::Applied(response) => response,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        let original_wire = applied.signed_result_wire().unwrap();
+        let owner = derive_private_user_id(&core.identity_key, &identity_commitment);
+        assert_eq!(
+            core.balance(&AccountKey::new(
+                owner,
+                AccountBucket::UserAvailable,
+                "USDC"
+            )),
+            5_000_000
+        );
+        assert_eq!(
+            core.balance(&AccountKey::new("layrs", AccountBucket::PoolCash, "USDC")),
+            5_000_000
+        );
+        assert_eq!(
+            applied.result.result_commitment_sha256,
+            domain_hash(DIRECT_DEPOSIT_RESULT_DOMAIN, &applied.projection_payload)
+        );
+
+        let next_request = deposit_request(
+            "92222222-2222-4222-8222-222222222222",
+            account_id,
+            identity_commitment,
+            request.deadline_millis + 60_000,
+        );
+        let replayed = match core
+            .direct_credit_deposit(next_request, request.deadline_millis + 60_001)
+            .unwrap()
+        {
+            DirectDepositCreditOutcome::ReturnOriginal(response) => response,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_eq!(replayed.signed_result_wire().unwrap(), original_wire);
+        assert_eq!(core.sequence, 1);
+
+        let snapshot = core.export_encrypted_snapshot().unwrap();
+        let mut restored =
+            PrivateTradingCore::restore_encrypted_snapshot(journal_key, signer, &snapshot, 0)
+                .unwrap();
+        let after_restart = match restored
+            .direct_credit_deposit(request.clone(), request.deadline_millis + 120_000)
+            .unwrap()
+        {
+            DirectDepositCreditOutcome::ReturnOriginal(response) => response,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_eq!(after_restart.signed_result_wire().unwrap(), original_wire);
+        assert_eq!(restored.sequence, 1);
+    }
+
+    #[test]
+    fn expired_effect_none_allows_a_fresh_request_but_global_event_binding_blocks_tampering() {
+        let journal_key = JournalKey::from_bytes([0xa3; 32]);
+        let signer = ReceiptSigner::from_seed([0xa4; 32], [0xa5; 48]);
+        let account_id = [0xa1; 32];
+        let identity_commitment = [0xa2; 32];
+        let expired = deposit_request(
+            "a1111111-1111-4111-8111-111111111111",
+            account_id,
+            identity_commitment,
+            1_800_000_000_000,
+        );
+        let mut core = PrivateTradingCore::new(journal_key.clone(), signer.clone());
+        let expired_result = match core
+            .direct_credit_deposit(expired.clone(), expired.deadline_millis)
+            .unwrap()
+        {
+            DirectDepositCreditOutcome::EffectNone(response) => response,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_eq!(
+            expired_result.result.state,
+            DirectExecutionTerminalState::ExpiredEffectNone
+        );
+        let exact_replay = match core
+            .direct_credit_deposit(expired.clone(), expired.deadline_millis + 1)
+            .unwrap()
+        {
+            DirectDepositCreditOutcome::EffectNone(response) => response,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_eq!(
+            exact_replay.signed_result_wire().unwrap(),
+            expired_result.signed_result_wire().unwrap()
+        );
+        assert_eq!(core.sequence, 1);
+        let snapshot = core.export_encrypted_snapshot().unwrap();
+        let mut core =
+            PrivateTradingCore::restore_encrypted_snapshot(journal_key, signer, &snapshot, 0)
+                .unwrap();
+        let restart_replay = match core
+            .direct_credit_deposit(expired.clone(), expired.deadline_millis + 2)
+            .unwrap()
+        {
+            DirectDepositCreditOutcome::EffectNone(response) => response,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_eq!(
+            restart_replay.signed_result_wire().unwrap(),
+            expired_result.signed_result_wire().unwrap()
+        );
+        let fresh = deposit_request(
+            "a2222222-2222-4222-8222-222222222222",
+            account_id,
+            identity_commitment,
+            expired.deadline_millis + 1,
+        );
+        assert!(matches!(
+            core.direct_credit_deposit(fresh.clone(), fresh.issued_at_millis + 1)
+                .unwrap(),
+            DirectDepositCreditOutcome::Applied(_)
+        ));
+
+        let forged_account = deposit_request(
+            "a3333333-3333-4333-8333-333333333333",
+            [0xb1; 32],
+            [0xb2; 32],
+            fresh.deadline_millis + 1,
+        );
+        assert!(matches!(
+            core.direct_credit_deposit(forged_account, fresh.deadline_millis + 2),
+            Err(DirectDepositCreditError::ReplayBinding)
+        ));
+        assert_eq!(core.sequence, 2);
+    }
+
+    #[test]
+    fn deterministic_deposit_rejection_is_signed_recorded_and_replayed_after_restart() {
+        let journal_key = JournalKey::from_bytes([0xc1; 32]);
+        let signer = ReceiptSigner::from_seed([0xc2; 32], [0xc3; 48]);
+        let mut core = PrivateTradingCore::new(journal_key.clone(), signer.clone());
+        core.apply_confirmed_deposit(
+            "overflow-seed".into(),
+            AccountKey::new("seed-user", AccountBucket::UserAvailable, "USDC"),
+            u128::MAX,
+            [0xc4; 32],
+            1_800_000_000_000,
+        )
+        .unwrap();
+        let request = deposit_request(
+            "c1111111-1111-4111-8111-111111111111",
+            [0xc5; 32],
+            [0xc6; 32],
+            1_800_000_001_000,
+        );
+        let before = serde_json::to_vec(&core.ledger).unwrap();
+        let rejected = match core
+            .direct_credit_deposit(request.clone(), request.issued_at_millis + 1)
+            .unwrap()
+        {
+            DirectDepositCreditOutcome::EffectNone(response) => response,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_eq!(
+            rejected.result.state,
+            DirectExecutionTerminalState::RejectedEffectNone
+        );
+        assert_eq!(
+            rejected.result.error_code.as_deref(),
+            Some("DEPOSIT_BALANCE_OVERFLOW")
+        );
+        assert_eq!(serde_json::to_vec(&core.ledger).unwrap(), before);
+        assert_eq!(core.sequence, 2);
+
+        let exact = match core
+            .direct_credit_deposit(request.clone(), request.issued_at_millis + 2)
+            .unwrap()
+        {
+            DirectDepositCreditOutcome::EffectNone(response) => response,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_eq!(
+            exact.signed_result_wire().unwrap(),
+            rejected.signed_result_wire().unwrap()
+        );
+
+        let snapshot = core.export_encrypted_snapshot().unwrap();
+        let mut restored =
+            PrivateTradingCore::restore_encrypted_snapshot(journal_key, signer, &snapshot, 0)
+                .unwrap();
+        let after_restart = match restored
+            .direct_credit_deposit(request.clone(), request.deadline_millis + 60_000)
+            .unwrap()
+        {
+            DirectDepositCreditOutcome::EffectNone(response) => response,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_eq!(
+            after_restart.signed_result_wire().unwrap(),
+            rejected.signed_result_wire().unwrap()
+        );
+        assert_eq!(serde_json::to_vec(&restored.ledger).unwrap(), before);
+        assert_eq!(restored.sequence, 2);
+    }
+
+    #[test]
+    fn concurrent_fresh_requests_for_one_custody_event_credit_once() {
+        use std::sync::{Arc, Barrier, Mutex};
+
+        let account_id = [0xd1; 32];
+        let identity_commitment = [0xd2; 32];
+        let first = deposit_request(
+            "d1111111-1111-4111-8111-111111111111",
+            account_id,
+            identity_commitment,
+            1_800_000_000_000,
+        );
+        let second = deposit_request(
+            "d2222222-2222-4222-8222-222222222222",
+            account_id,
+            identity_commitment,
+            1_800_000_000_000,
+        );
+        let core = Arc::new(Mutex::new(PrivateTradingCore::new(
+            JournalKey::from_bytes([0xd3; 32]),
+            ReceiptSigner::from_seed([0xd4; 32], [0xd5; 48]),
+        )));
+        let barrier = Arc::new(Barrier::new(3));
+        let mut handles = Vec::new();
+        for request in [first, second] {
+            let core = Arc::clone(&core);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                core.lock()
+                    .unwrap()
+                    .direct_credit_deposit(request.clone(), request.issued_at_millis + 1)
+                    .unwrap()
+            }));
+        }
+        barrier.wait();
+        let outcomes: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, DirectDepositCreditOutcome::Applied(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, DirectDepositCreditOutcome::ReturnOriginal(_)))
+                .count(),
+            1
+        );
+        let core = core.lock().unwrap();
+        let owner = derive_private_user_id(&core.identity_key, &identity_commitment);
+        assert_eq!(
+            core.balance(&AccountKey::new(
+                owner,
+                AccountBucket::UserAvailable,
+                "USDC"
+            )),
+            5_000_000
+        );
+        assert_eq!(
+            core.balance(&AccountKey::new("layrs", AccountBucket::PoolCash, "USDC")),
+            5_000_000
+        );
+        assert_eq!(core.sequence, 1);
+    }
+
+    #[test]
+    fn restore_rejects_forged_financial_root_even_when_non_circular_marker_is_unchanged() {
+        let journal_key = JournalKey::from_bytes([0xb3; 32]);
+        let signer = ReceiptSigner::from_seed([0xb4; 32], [0xb5; 48]);
+        let request = deposit_request(
+            "b1111111-1111-4111-8111-111111111111",
+            [0xb6; 32],
+            [0xb7; 32],
+            1_800_000_000_000,
+        );
+        let mut core = PrivateTradingCore::new(journal_key.clone(), signer.clone());
+        core.direct_credit_deposit(request.clone(), request.issued_at_millis + 1)
+            .unwrap();
+        let stored = core
+            .direct_final_results
+            .0
+            .get_mut(&direct_final_result_key(
+                &request.account_id,
+                request.request_id,
+            ))
+            .unwrap();
+        stored.result.commit_evidence.as_mut().unwrap().state_root = [0xee; 32];
+        let snapshot = core.export_encrypted_snapshot().unwrap();
+        assert!(matches!(
+            PrivateTradingCore::restore_encrypted_snapshot(journal_key, signer, &snapshot, 0),
+            Err(CoreError::JournalChainMismatch)
+        ));
+    }
+
+    #[test]
+    fn legacy_direct_marker_has_an_explicit_golden_digest() {
+        let request = request();
+        let mut index = DirectFinalResultIndex::default();
+        index
+            .record_definitive(
+                &request,
+                result(DirectExecutionTerminalState::RejectedEffectNone),
+            )
+            .unwrap();
+        let digest = direct_final_result_marker_digest(index.0.values().next().unwrap()).unwrap();
+        assert_eq!(
+            hex::encode(digest),
+            "8d60009d7310a5ae3271ac762adb1c57876585111900e8e84d00e2e784e5ac79"
+        );
+    }
+
+    #[test]
+    fn legacy_direct_record_restores_from_an_encrypted_snapshot_and_replays() {
+        let journal_key = JournalKey::from_bytes([0xe1; 32]);
+        let signer = ReceiptSigner::from_seed([0xe2; 32], [0xe3; 48]);
+        let mut core = PrivateTradingCore::new(journal_key.clone(), signer.clone());
+        let request = request();
+        let original = result(DirectExecutionTerminalState::RejectedEffectNone);
+        let (staged, staged_processed, _) = core
+            .stage_direct_final_result(&request, original.clone())
+            .unwrap();
+        core.direct_final_results = staged;
+        core.processed = staged_processed;
+        let encoded = serde_json::to_value(&core.direct_final_results).unwrap();
+        let legacy_record = encoded.as_object().unwrap().values().next().unwrap();
+        assert!(legacy_record.get("request").is_none());
+        assert!(legacy_record.get("projectionPayload").is_none());
+        assert!(legacy_record.get("enclaveReceipt").is_none());
+        assert!(legacy_record.get("financialReplayKeySha256").is_none());
+        assert!(legacy_record.get("markerFormatVersion").is_none());
+
+        let snapshot = core.export_encrypted_snapshot().unwrap();
+        let restored =
+            PrivateTradingCore::restore_encrypted_snapshot(journal_key, signer, &snapshot, 0)
+                .unwrap();
+        assert_eq!(
+            restored.direct_idempotency_lookup(&request).unwrap(),
+            DirectExecutionIdempotencyDecision::ReturnOriginal(original)
+        );
+    }
+
+    #[test]
+    fn restore_rejects_a_financial_record_downgraded_to_legacy_shape() {
+        let journal_key = JournalKey::from_bytes([0xf1; 32]);
+        let signer = ReceiptSigner::from_seed([0xf2; 32], [0xf3; 48]);
+        let request = deposit_request(
+            "f1111111-1111-4111-8111-111111111111",
+            [0xf4; 32],
+            [0xf5; 32],
+            1_800_000_000_000,
+        );
+        let mut core = PrivateTradingCore::new(journal_key.clone(), signer.clone());
+        core.direct_credit_deposit(request.clone(), request.issued_at_millis + 1)
+            .unwrap();
+        let result_key = direct_final_result_key(&request.account_id, request.request_id);
+        let marker_key = direct_final_result_marker_key(&result_key);
+        let stored = core.direct_final_results.0.get_mut(&result_key).unwrap();
+        stored.request = None;
+        stored.projection_payload.clear();
+        stored.enclave_receipt = None;
+        stored.encrypted_journal_record = None;
+        stored.financial_replay_key_sha256 = None;
+        stored.marker_format_version = 0;
+        let downgraded_digest = direct_final_result_marker_digest(stored).unwrap();
+        core.processed.get_mut(&marker_key).unwrap().request_hash = downgraded_digest;
+
+        let snapshot = core.export_encrypted_snapshot().unwrap();
+        assert!(matches!(
+            PrivateTradingCore::restore_encrypted_snapshot(journal_key, signer, &snapshot, 0),
+            Err(CoreError::JournalChainMismatch)
+        ));
+    }
+}
+
 fn minimum_public_depth_distinct_owners(market_id: &str) -> usize {
     if matches!(option_env!("LAYRS_DIRECT_BTC_EXECUTION_ENABLED"), Some("1"))
         && is_quest_btc_one_hour_market(market_id)
@@ -1069,6 +3392,13 @@ impl RecoveryCapsule {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 enum JournaledSystemCommand {
+    DirectDepositEffectNone {
+        request_id: Uuid,
+        request_hash: [u8; 32],
+        terminal_state: DirectExecutionTerminalState,
+        result_commitment_sha256: [u8; 32],
+        error_code: String,
+    },
     SetTradingFreeze {
         idempotency_key: String,
         frozen: bool,
@@ -1204,6 +3534,8 @@ struct CoreStateSnapshot {
     /// and return `PreviouslyProcessed` rather than being executed twice.
     #[serde(default)]
     recovery_capsules: BTreeMap<String, RecoveryCapsule>,
+    #[serde(default, skip_serializing_if = "DirectFinalResultIndex::is_empty")]
+    direct_final_results: DirectFinalResultIndex,
     system_keys: BTreeSet<String>,
     position_cost_basis: Vec<(PositionKey, u128)>,
     resolutions: BTreeMap<String, MarketResolution>,
@@ -1403,6 +3735,7 @@ pub struct PrivateTradingCore {
     sessions: SessionGuard,
     processed: BTreeMap<String, ProcessedCommand>,
     recovery_capsules: BTreeMap<String, RecoveryCapsule>,
+    direct_final_results: DirectFinalResultIndex,
     system_keys: BTreeSet<String>,
     journal: EncryptedJournal,
     receipt_signer: ReceiptSigner,
@@ -1427,6 +3760,7 @@ impl PrivateTradingCore {
             sessions: SessionGuard::default(),
             processed: BTreeMap::new(),
             recovery_capsules: BTreeMap::new(),
+            direct_final_results: DirectFinalResultIndex::default(),
             system_keys: BTreeSet::new(),
             journal: EncryptedJournal::new(journal_key),
             receipt_signer,
@@ -1452,6 +3786,495 @@ impl PrivateTradingCore {
         let mut core = Self::new(journal_key, receipt_signer);
         core.oracle_public_key = Some(oracle_public_key);
         Ok(core)
+    }
+
+    pub fn direct_idempotency_lookup(
+        &self,
+        request: &DirectExecutionRequestEnvelope,
+    ) -> Result<DirectExecutionIdempotencyDecision, DirectExecutionContractError> {
+        self.direct_final_results.lookup(request)
+    }
+
+    pub fn direct_execution_attempt(
+        &self,
+        request: &DirectExecutionRequestEnvelope,
+        now_millis: i64,
+    ) -> Result<DirectExecutionAttemptDecision, DirectExecutionContractError> {
+        self.direct_final_results
+            .decide_attempt(request, now_millis)
+    }
+
+    pub fn direct_recovery_after_unknown(
+        &self,
+        request: &DirectExecutionRequestEnvelope,
+        unknown: &DirectExecutionTerminalResult,
+        now_millis: i64,
+    ) -> Result<DirectExecutionRecoveryDecision, DirectExecutionContractError> {
+        self.direct_final_results
+            .recover_after_unknown(request, unknown, now_millis)
+    }
+
+    fn stage_direct_deposit_effect_none(
+        &self,
+        request: &DirectExecutionRequestEnvelope,
+        state: DirectExecutionTerminalState,
+        error_code: &str,
+        now_millis: i64,
+    ) -> Result<
+        (
+            DirectDepositEffectNoneResponse,
+            DirectFinalResultIndex,
+            BTreeMap<String, ProcessedCommand>,
+            EncryptedJournal,
+            u64,
+        ),
+        DirectDepositCreditError,
+    > {
+        if !matches!(
+            state,
+            DirectExecutionTerminalState::RejectedEffectNone
+                | DirectExecutionTerminalState::ExpiredEffectNone
+        ) {
+            return Err(DirectDepositCreditError::ReplayBinding);
+        }
+        DirectDepositCreditPayload::decode_for(request)?;
+        let mut result = DirectExecutionTerminalResult {
+            protocol_version: DIRECT_EXECUTION_PROTOCOL_VERSION.into(),
+            request_id: request.request_id,
+            request_hash: request.request_hash,
+            state,
+            effect: DirectExecutionEffect::None,
+            retry_policy: DirectExecutionRetryPolicy::NewRequestAllowed,
+            error_code: Some(error_code.into()),
+            commit_evidence: None,
+            result_commitment_sha256: domain_hash(
+                DIRECT_DEPOSIT_RESULT_DOMAIN,
+                &request.canonical_payload,
+            ),
+            signed_at_millis: now_millis,
+            signature: Vec::new(),
+        };
+        result.signature = self
+            .receipt_signer
+            .sign_domain_payload(DIRECT_DEPOSIT_RESULT_SIGNATURE_DOMAIN, &result);
+        let result_key = direct_final_result_key(&request.account_id, request.request_id);
+        let marker_key = direct_final_result_marker_key(&result_key);
+        let marker_digest = direct_final_result_semantic_marker_digest(
+            request.account_id,
+            request.request_id,
+            request.request_hash,
+            result.state,
+            result.effect,
+            result.retry_policy,
+            &result.error_code,
+            result.result_commitment_sha256,
+            None,
+        )?;
+        let mut processed = self.processed.clone();
+        if processed
+            .insert(
+                marker_key,
+                ProcessedCommand {
+                    request_hash: marker_digest,
+                    response: None,
+                },
+            )
+            .is_some()
+        {
+            return Err(DirectDepositCreditError::ReplayBinding);
+        }
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &self.ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&processed),
+            &self.system_keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let mut journal = self.journal.clone();
+        let record = journal.append(
+            next_root,
+            &JournaledSystemCommand::DirectDepositEffectNone {
+                request_id: request.request_id,
+                request_hash: request.request_hash,
+                terminal_state: result.state,
+                result_commitment_sha256: result.result_commitment_sha256,
+                error_code: error_code.into(),
+            },
+        )?;
+        let receipt = self.receipt_signer.sign(
+            "direct-credit-deposit-effect-none".into(),
+            request.request_id.hyphenated().to_string(),
+            Some(request.request_hash),
+            Some(false),
+            Some(result.result_commitment_sha256),
+            Some(true),
+            next_sequence,
+            self.state_root(),
+            next_root,
+            record.record_hash,
+            now_millis,
+        );
+        let stored = StoredDirectFinalResult {
+            account_id: request.account_id,
+            request_id: request.request_id,
+            request_hash: request.request_hash,
+            result: result.clone(),
+            request: Some(request.clone()),
+            projection_payload: request.canonical_payload.clone(),
+            enclave_receipt: Some(receipt.clone()),
+            encrypted_journal_record: Some(record.clone()),
+            financial_replay_key_sha256: None,
+            marker_format_version: 1,
+        };
+        validate_direct_deposit_effect_none_bindings(
+            &stored,
+            Some(self.receipt_signer.verifying_key()),
+        )?;
+        let mut direct_results = self.direct_final_results.clone();
+        if direct_results.0.insert(result_key, stored).is_some() {
+            return Err(DirectDepositCreditError::ReplayBinding);
+        }
+        direct_results.validate_rooted(&processed_hashes(&processed))?;
+        direct_results.validate_direct_deposit_records(
+            self.receipt_signer.verifying_key(),
+            &self.system_keys,
+            &self.ledger,
+        )?;
+        let payload = DirectDepositCreditPayload::decode_for(request)?;
+        Ok((
+            DirectDepositEffectNoneResponse {
+                request: request.clone(),
+                result,
+                enclave_receipt: receipt,
+                encrypted_journal_record: record,
+                projection_payload: request.canonical_payload.clone(),
+                custody_replay_key_sha256: payload.financial_replay_key()?,
+            },
+            direct_results,
+            processed,
+            journal,
+            next_sequence,
+        ))
+    }
+
+    /// Executes one finalized deposit directly. The immutable financial replay
+    /// key, not the short-lived transport request ID, is the exactly-once
+    /// boundary. A new request after an effect-none expiry remains live, while
+    /// a retry after commit returns the original signed response byte-for-byte.
+    pub fn direct_credit_deposit(
+        &mut self,
+        request: DirectExecutionRequestEnvelope,
+        now_millis: i64,
+    ) -> Result<DirectDepositCreditOutcome, DirectDepositCreditError> {
+        request.validate()?;
+        let payload = DirectDepositCreditPayload::decode_for(&request)?;
+        let replay_key = payload.financial_replay_key()?;
+
+        if let Some(stored) = self.direct_final_results.0.get(&direct_final_result_key(
+            &request.account_id,
+            request.request_id,
+        )) {
+            if stored.request_hash != request.request_hash {
+                return Err(DirectDepositCreditError::ReplayBinding);
+            }
+            if stored.financial_replay_key_sha256.is_none() {
+                validate_direct_deposit_effect_none_bindings(
+                    stored,
+                    Some(self.receipt_signer.verifying_key()),
+                )?;
+                return Ok(DirectDepositCreditOutcome::EffectNone(
+                    stored_direct_deposit_effect_none_response(stored)?,
+                ));
+            }
+            let original = stored_direct_deposit_response(stored)?;
+            self.validate_direct_deposit_response(&original)?;
+            return Ok(DirectDepositCreditOutcome::ReturnOriginal(original));
+        }
+        if let Some(original) = self.direct_deposit_result_by_replay_key(&replay_key)? {
+            self.validate_direct_deposit_response(&original)?;
+            if original.projection_payload != request.canonical_payload {
+                return Err(DirectDepositCreditError::ReplayBinding);
+            }
+            return Ok(DirectDepositCreditOutcome::ReturnOriginal(original));
+        }
+        if now_millis >= request.deadline_millis {
+            let (response, direct_results, processed, journal, next_sequence) = self
+                .stage_direct_deposit_effect_none(
+                    &request,
+                    DirectExecutionTerminalState::ExpiredEffectNone,
+                    "REQUEST_DEADLINE_EXCEEDED",
+                    now_millis,
+                )?;
+            self.direct_final_results = direct_results;
+            self.processed = processed;
+            self.journal = journal;
+            self.sequence = next_sequence;
+            *self.custody_totals_cache.borrow_mut() = None;
+            return Ok(DirectDepositCreditOutcome::EffectNone(response));
+        }
+
+        let owner = derive_private_user_id(&self.identity_key, &payload.identity_commitment);
+        let account = AccountKey::new(owner, AccountBucket::UserAvailable, payload.asset.clone());
+        let replay_hex = hex::encode(replay_key);
+        let system_key = format!("direct-deposit:{replay_hex}");
+        let flow = ExternalFlowTransaction {
+            idempotency_key: format!("deposit:{system_key}"),
+            evidence_hash: replay_key,
+            account,
+            amount: payload.amount_atomic,
+            direction: ExternalFlowDirection::Inflow,
+        };
+
+        let prior_root = self.state_root();
+        let mut ledger = self.ledger.clone();
+        if let Err(error) = ledger.apply_confirmed_deposit(flow.clone()) {
+            if error != CoreError::UnbalancedTransaction {
+                return Err(DirectDepositCreditError::Core(error));
+            }
+            let (response, direct_results, processed, journal, next_sequence) = self
+                .stage_direct_deposit_effect_none(
+                    &request,
+                    DirectExecutionTerminalState::RejectedEffectNone,
+                    "DEPOSIT_BALANCE_OVERFLOW",
+                    now_millis,
+                )?;
+            self.direct_final_results = direct_results;
+            self.processed = processed;
+            self.journal = journal;
+            self.sequence = next_sequence;
+            *self.custody_totals_cache.borrow_mut() = None;
+            return Ok(DirectDepositCreditOutcome::EffectNone(response));
+        }
+        let mut system_keys = self.system_keys.clone();
+        system_keys.insert(system_key.clone());
+        let next_sequence = checked_sequence(self.sequence)?;
+        let projection_payload = request.canonical_payload.clone();
+        let result_commitment = domain_hash(DIRECT_DEPOSIT_RESULT_DOMAIN, &projection_payload);
+        let result_key = direct_final_result_key(&request.account_id, request.request_id);
+        let marker_key = direct_final_result_marker_key(&result_key);
+        let marker_digest = direct_final_result_semantic_marker_digest(
+            request.account_id,
+            request.request_id,
+            request.request_hash,
+            DirectExecutionTerminalState::Applied,
+            DirectExecutionEffect::Committed,
+            DirectExecutionRetryPolicy::ReturnOriginalResult,
+            &None,
+            result_commitment,
+            Some(replay_key),
+        )?;
+        let mut processed = self.processed.clone();
+        if processed
+            .insert(
+                marker_key,
+                ProcessedCommand {
+                    request_hash: marker_digest,
+                    response: None,
+                },
+            )
+            .is_some()
+        {
+            return Err(DirectDepositCreditError::ReplayBinding);
+        }
+        let next_root = state_root(
+            &ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&processed),
+            &system_keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::ConfirmedDeposit {
+            idempotency_key: system_key,
+            flow,
+        };
+        let mut journal = self.journal.clone();
+        let record = journal.append(next_root, &entry)?;
+        let enclave_receipt = self.receipt_signer.sign(
+            "direct-credit-deposit".into(),
+            request.request_id.hyphenated().to_string(),
+            Some(request.request_hash),
+            Some(false),
+            Some(result_commitment),
+            Some(true),
+            next_sequence,
+            prior_root,
+            next_root,
+            record.record_hash,
+            now_millis,
+        );
+        let signed_receipt_sha256 = domain_hash(
+            b"layrs.direct-deposit-credit.enclave-receipt.v1\0",
+            &serde_json::to_vec(&enclave_receipt)
+                .map_err(|_| DirectDepositCreditError::ReplayBinding)?,
+        );
+        let restart_evidence_sha256 = direct_deposit_restart_evidence(
+            &request,
+            replay_key,
+            next_sequence,
+            next_root,
+            record.record_hash,
+        );
+        let mut result = DirectExecutionTerminalResult {
+            protocol_version: DIRECT_EXECUTION_PROTOCOL_VERSION.into(),
+            request_id: request.request_id,
+            request_hash: request.request_hash,
+            state: DirectExecutionTerminalState::Applied,
+            effect: DirectExecutionEffect::Committed,
+            retry_policy: DirectExecutionRetryPolicy::ReturnOriginalResult,
+            error_code: None,
+            commit_evidence: Some(DirectExecutionCommitEvidence {
+                enclave_sequence: next_sequence,
+                state_root: next_root,
+                journal_head: record.record_hash,
+                signed_receipt_sha256,
+                restart_evidence_sha256,
+            }),
+            result_commitment_sha256: result_commitment,
+            signed_at_millis: now_millis,
+            signature: Vec::new(),
+        };
+        result.signature = self
+            .receipt_signer
+            .sign_domain_payload(DIRECT_DEPOSIT_RESULT_SIGNATURE_DOMAIN, &result);
+        result.validate_for(&request)?;
+
+        let stored = StoredDirectFinalResult {
+            account_id: request.account_id,
+            request_id: request.request_id,
+            request_hash: request.request_hash,
+            result: result.clone(),
+            request: Some(request.clone()),
+            projection_payload: projection_payload.clone(),
+            enclave_receipt: Some(enclave_receipt.clone()),
+            encrypted_journal_record: Some(record.clone()),
+            financial_replay_key_sha256: Some(replay_key),
+            marker_format_version: 1,
+        };
+        stored.validate()?;
+        let mut direct_results = self.direct_final_results.clone();
+        direct_results.0.insert(result_key, stored);
+        direct_results.validate_rooted(&processed_hashes(&processed))?;
+        direct_results.validate_direct_deposit_records(
+            self.receipt_signer.verifying_key(),
+            &system_keys,
+            &ledger,
+        )?;
+
+        let response = DirectDepositCreditResponse {
+            request,
+            result,
+            enclave_receipt,
+            encrypted_journal_record: record,
+            projection_payload,
+            financial_replay_key_sha256: replay_key,
+        };
+        self.validate_direct_deposit_response(&response)?;
+        self.ledger = ledger;
+        self.system_keys = system_keys;
+        self.processed = processed;
+        self.direct_final_results = direct_results;
+        self.journal = journal;
+        self.sequence = next_sequence;
+        *self.custody_totals_cache.borrow_mut() = None;
+        Ok(DirectDepositCreditOutcome::Applied(response))
+    }
+
+    pub fn direct_deposit_credit_lookup(
+        &self,
+        account_id: [u8; 32],
+        financial_replay_key_sha256: [u8; 32],
+    ) -> Result<Option<DirectDepositCreditResponse>, DirectDepositCreditError> {
+        let response = self.direct_deposit_result_by_replay_key(&financial_replay_key_sha256)?;
+        if let Some(value) = &response {
+            self.validate_direct_deposit_response(value)?;
+            if value.request.account_id != account_id {
+                return Err(DirectDepositCreditError::ReplayBinding);
+            }
+        }
+        Ok(response)
+    }
+
+    fn direct_deposit_result_by_replay_key(
+        &self,
+        replay_key: &[u8; 32],
+    ) -> Result<Option<DirectDepositCreditResponse>, DirectDepositCreditError> {
+        self.direct_final_results
+            .0
+            .values()
+            .find(|stored| stored.financial_replay_key_sha256.as_ref() == Some(replay_key))
+            .map(stored_direct_deposit_response)
+            .transpose()
+    }
+
+    fn validate_direct_deposit_response(
+        &self,
+        response: &DirectDepositCreditResponse,
+    ) -> Result<(), DirectDepositCreditError> {
+        validate_direct_deposit_response_bindings(
+            response,
+            Some(self.receipt_signer.verifying_key()),
+        )
+    }
+
+    /// Produces the enclave-local idempotency successor for the direct commit
+    /// path. The caller must install this staged value only at the same commit
+    /// point as the financial state, journal record, and signed receipt.
+    fn stage_direct_final_result(
+        &self,
+        request: &DirectExecutionRequestEnvelope,
+        result: DirectExecutionTerminalResult,
+    ) -> Result<
+        (
+            DirectFinalResultIndex,
+            BTreeMap<String, ProcessedCommand>,
+            DirectExecutionIdempotencyDecision,
+        ),
+        DirectExecutionContractError,
+    > {
+        let mut staged = self.direct_final_results.clone();
+        let decision = staged.record_definitive(request, result)?;
+        let mut staged_processed = self.processed.clone();
+        if matches!(decision, DirectExecutionIdempotencyDecision::Recorded(_)) {
+            let result_key = direct_final_result_key(&request.account_id, request.request_id);
+            let stored = staged
+                .0
+                .get(&result_key)
+                .ok_or(DirectExecutionContractError::IdempotencyIndex)?;
+            let marker_key = direct_final_result_marker_key(&result_key);
+            let marker_digest = direct_final_result_marker_digest(stored)?;
+            if let Some(existing) = staged_processed.get(&marker_key) {
+                if existing.request_hash != marker_digest {
+                    return Err(DirectExecutionContractError::IdempotencyIndex);
+                }
+            } else {
+                staged_processed.insert(
+                    marker_key,
+                    ProcessedCommand {
+                        request_hash: marker_digest,
+                        response: None,
+                    },
+                );
+            }
+        }
+        staged.validate_rooted(&processed_hashes(&staged_processed))?;
+        Ok((staged, staged_processed, decision))
     }
 
     pub fn balance(&self, account: &AccountKey) -> u128 {
@@ -1577,6 +4400,7 @@ impl PrivateTradingCore {
                 sessions: self.sessions.clone(),
                 processed_hashes: processed_hashes(&self.processed),
                 recovery_capsules: self.recovery_capsules.clone(),
+                direct_final_results: self.direct_final_results.clone(),
                 system_keys: self.system_keys.clone(),
                 position_cost_basis: self
                     .position_cost_basis
@@ -1606,6 +4430,7 @@ impl PrivateTradingCore {
             sessions: self.sessions.clone(),
             processed_hashes: processed_hashes(&self.processed),
             recovery_capsules: self.recovery_capsules.clone(),
+            direct_final_results: self.direct_final_results.clone(),
             system_keys: self.system_keys.clone(),
             position_cost_basis: self
                 .position_cost_basis
@@ -1654,6 +4479,7 @@ impl PrivateTradingCore {
             sessions: self.sessions.clone(),
             processed_hashes: processed_hashes(&self.processed),
             recovery_capsules: self.recovery_capsules.clone(),
+            direct_final_results: self.direct_final_results.clone(),
             system_keys: self.system_keys.clone(),
             position_cost_basis: self
                 .position_cost_basis
@@ -1707,6 +4533,7 @@ impl PrivateTradingCore {
             sessions: self.sessions.clone(),
             processed_hashes: processed_hashes(&self.processed),
             recovery_capsules: self.recovery_capsules.clone(),
+            direct_final_results: self.direct_final_results.clone(),
             system_keys: self.system_keys.clone(),
             position_cost_basis: self
                 .position_cost_basis
@@ -1863,6 +4690,18 @@ impl PrivateTradingCore {
             &identity_key,
             state.sequence,
         )?;
+        state
+            .direct_final_results
+            .validate_rooted(&state.processed_hashes)
+            .map_err(|_| CoreError::JournalChainMismatch)?;
+        state
+            .direct_final_results
+            .validate_direct_deposit_records(
+                receipt_signer.verifying_key(),
+                &state.system_keys,
+                &state.ledger,
+            )
+            .map_err(|_| CoreError::JournalChainMismatch)?;
         let processed: BTreeMap<String, ProcessedCommand> = state
             .processed_hashes
             .into_iter()
@@ -1940,6 +4779,7 @@ impl PrivateTradingCore {
             sessions: state.sessions,
             processed,
             recovery_capsules: state.recovery_capsules,
+            direct_final_results: state.direct_final_results,
             system_keys: state.system_keys,
             journal,
             receipt_signer,
@@ -2145,6 +4985,18 @@ impl PrivateTradingCore {
             &self.identity_key,
             state.sequence,
         )?;
+        state
+            .direct_final_results
+            .validate_rooted(&state.processed_hashes)
+            .map_err(|_| CoreError::JournalChainMismatch)?;
+        state
+            .direct_final_results
+            .validate_direct_deposit_records(
+                self.receipt_signer.verifying_key(),
+                &state.system_keys,
+                &state.ledger,
+            )
+            .map_err(|_| CoreError::JournalChainMismatch)?;
         let processed: BTreeMap<String, ProcessedCommand> = state
             .processed_hashes
             .into_iter()
@@ -2188,6 +5040,7 @@ impl PrivateTradingCore {
             sessions: state.sessions,
             processed,
             recovery_capsules: state.recovery_capsules,
+            direct_final_results: state.direct_final_results,
             system_keys: state.system_keys,
             journal,
             receipt_signer: self.receipt_signer.clone(),
