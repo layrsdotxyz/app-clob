@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-git fetch --no-tags origin main:refs/remotes/origin/main || true
-default_base="$(git merge-base origin/main HEAD 2>/dev/null || git rev-parse HEAD^)"
+if [[ -n "${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-}" ]]; then
+  target_branch="$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+  git check-ref-format --branch "$target_branch" >/dev/null
+  base_ref="origin/$target_branch"
+  git fetch --no-tags origin "$target_branch:refs/remotes/$base_ref"
+  default_base="$(git rev-parse "${base_ref}^{commit}")"
+else
+  base_ref="origin/main"
+  git fetch --no-tags origin main:refs/remotes/origin/main || true
+  default_base="$(git merge-base "$base_ref" HEAD 2>/dev/null || git rev-parse HEAD^)"
+fi
 
 mapfile -t migration_docs < <(
-  git diff --name-only --diff-filter=ACMRTUXB "origin/main...HEAD" -- \
+  git diff --name-only --diff-filter=ACMRTUXB "$base_ref...HEAD" -- \
     'enclave/snapshot-migrations/*.md' \
     | grep -v '/README\.md$' \
     | sort
