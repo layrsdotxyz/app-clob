@@ -32,14 +32,15 @@ use clob_service::private_core::{
     exact_condition_resolution_signing_payload, polymarket_resolution_signing_payload,
     resolution_signing_payload, AccountKey, BinanceResolutionStatement, BootstrapExecutionState,
     BootstrapPreparedVenueOrder, CommandReceiptState, CommandResult, CoreResponse,
-    CustodyReconciliationSnapshot, EnclaveReceipt, EncryptedJournalRecord, EncryptedSnapshot,
-    ExactConditionResolutionStatement, ExactTerminalSnapshotRestoreReport, ExternalFlowDirection,
-    FeeProfileId, JournalKey, MarketConfig, MarketExecution, OrderStatus,
-    PolymarketResolutionStatement, PrivateTradingCore, ReceiptSigner, RecoveryBridgeArtifact,
-    ResolutionStatement, SignedAuditFillArtifact, SignedBinanceResolution,
-    SignedExactConditionResolution, SignedPolymarketResolution, SignedResolution,
-    SignedResolutionEvidence, SignedTaskQualificationArtifact, SystemResponse, UserCommand,
-    UserCommandAction, WithdrawalAuthorization, EXACT_LIVE_976_RELEASE_COMMIT,
+    CustodyReconciliationSnapshot, DirectDepositCreditOutcome, DirectDepositCreditResponse,
+    DirectExecutionRequestEnvelope, DirectWithdrawalOutcome, DirectWithdrawalResponse,
+    EnclaveReceipt, EncryptedJournalRecord, EncryptedSnapshot, ExactConditionResolutionStatement,
+    ExactTerminalSnapshotRestoreReport, ExternalFlowDirection, FeeProfileId, JournalKey,
+    MarketConfig, MarketExecution, OrderStatus, PolymarketResolutionStatement, PrivateTradingCore,
+    ReceiptSigner, RecoveryBridgeArtifact, ResolutionStatement, SignedAuditFillArtifact,
+    SignedBinanceResolution, SignedExactConditionResolution, SignedPolymarketResolution,
+    SignedResolution, SignedResolutionEvidence, SignedTaskQualificationArtifact, SystemResponse,
+    UserCommand, UserCommandAction, WithdrawalAuthorization, EXACT_LIVE_976_RELEASE_COMMIT,
     INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX, INCIDENT_TERMINAL_JOURNAL_HEAD_HEX,
     INCIDENT_TERMINAL_SEQUENCE, INCIDENT_TERMINAL_STATE_ROOT_HEX,
 };
@@ -341,6 +342,20 @@ struct OperatorEnvelope {
 // acknowledge the decode-only enum size here.
 #[allow(clippy::large_enum_variant)]
 enum OperatorCommand {
+    DirectCreditDeposit {
+        request: DirectExecutionRequestEnvelope,
+    },
+    DirectDepositCreditLookup {
+        account_id: [u8; 32],
+        financial_replay_key_sha256: [u8; 32],
+    },
+    DirectWithdrawal {
+        request: DirectExecutionRequestEnvelope,
+    },
+    DirectWithdrawalLookup {
+        account_id: [u8; 32],
+        operation_replay_key_sha256: [u8; 32],
+    },
     RecoverWithdrawalAuthorization {
         withdrawal_id: uuid::Uuid,
         session_id: String,
@@ -898,6 +913,18 @@ struct SignedPreparationSupersession {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 enum PlainResponse {
+    DirectDepositCredit {
+        outcome: DirectDepositCreditOutcome,
+    },
+    DirectDepositCreditLookup {
+        response: Option<DirectDepositCreditResponse>,
+    },
+    DirectWithdrawal {
+        outcome: DirectWithdrawalOutcome,
+    },
+    DirectWithdrawalLookup {
+        response: Option<DirectWithdrawalResponse>,
+    },
     PreparedCommandStatus {
         state: &'static str,
     },
@@ -1483,7 +1510,7 @@ async fn handle_encrypted(
             return WireResponse::Error { code };
         }
         Some(now)
-    } else if direct_execution {
+    } else if direct_execution && request_requires_trusted_execution_time(&request) {
         match trusted_nsm_now_millis(state.nsm_fd, &state.enclave_measurement_sha384) {
             Ok(value) => Some(value),
             Err(()) => {
@@ -1553,10 +1580,11 @@ async fn handle_encrypted(
             .response
             .wire_response();
     }
-    if state.pending_preparation.is_some()
-        && !durable_control_request(&request)
-        && !direct_execution
-    {
+    if pending_preparation_blocks_request(
+        state.pending_preparation.is_some(),
+        &request,
+        direct_execution,
+    ) {
         return WireResponse::Error {
             code: "DURABLE_PREPARATION_IN_PROGRESS",
         };
@@ -1598,10 +1626,7 @@ async fn handle_encrypted(
             // timestamp is obtained directly from the Nitro Secure Module for
             // every new encrypted user command. The parent cannot delay, rewrite,
             // replay, or forge this in-enclave NSM exchange.
-            let verified_now_millis = if matches!(
-                request,
-                PlainRequest::User { .. } | PlainRequest::Operator { .. }
-            ) {
+            let verified_now_millis = if request_requires_trusted_execution_time(&request) {
                 match writer_trusted_now_millis.or_else(|| {
                     trusted_nsm_now_millis(state.nsm_fd, &state.enclave_measurement_sha384).ok()
                 }) {
@@ -1716,6 +1741,14 @@ async fn handle_encrypted(
     let journal_artifacts = match &response {
         PlainResponse::User { response } => response.encrypted_record.clone().into_iter().collect(),
         PlainResponse::System { response } => vec![response.encrypted_record.clone()],
+        PlainResponse::DirectDepositCredit { .. }
+        | PlainResponse::DirectDepositCreditLookup { response: Some(_) }
+        | PlainResponse::DirectWithdrawal { .. }
+        | PlainResponse::DirectWithdrawalLookup { response: Some(_) } => {
+            direct_deposit_journal_artifact(&response)
+                .into_iter()
+                .collect()
+        }
         PlainResponse::PoolWithdrawalSigned {
             response: Some(response),
             ..
@@ -1724,6 +1757,28 @@ async fn handle_encrypted(
     };
     let snapshot_artifacts = match &response {
         PlainResponse::Snapshot { snapshot } => vec![snapshot.clone()],
+        PlainResponse::DirectDepositCredit { .. }
+        | PlainResponse::DirectDepositCreditLookup { response: Some(_) }
+        | PlainResponse::DirectWithdrawal { .. }
+        | PlainResponse::DirectWithdrawalLookup { response: Some(_) } => match state
+            .core
+            .as_ref()
+            .and_then(|core| core.export_encrypted_snapshot().ok())
+        {
+            Some(snapshot) => vec![snapshot],
+            None => {
+                if let Some(core) = rollback_core.take() {
+                    state.core = Some(core);
+                    state.transport_nonces.forget(&replay_key);
+                    if let Some(nonce) = rollback_operator_nonce.take() {
+                        state.operator_nonces.forget(&nonce);
+                    }
+                }
+                return WireResponse::Error {
+                    code: "SNAPSHOT_EXPORT_FAILED",
+                };
+            }
+        },
         _ if !journal_artifacts.is_empty() || exact_recovery => match state
             .core
             .as_ref()
@@ -1748,6 +1803,14 @@ async fn handle_encrypted(
     let receipt_artifacts = match &response {
         PlainResponse::User { response } => vec![response.receipt.clone()],
         PlainResponse::System { response } => vec![response.receipt.clone()],
+        PlainResponse::DirectDepositCredit { .. }
+        | PlainResponse::DirectDepositCreditLookup { response: Some(_) }
+        | PlainResponse::DirectWithdrawal { .. }
+        | PlainResponse::DirectWithdrawalLookup { response: Some(_) } => {
+            direct_deposit_receipt_artifact(&response)
+                .into_iter()
+                .collect()
+        }
         PlainResponse::PoolWithdrawalSigned {
             response: Some(response),
             ..
@@ -1843,7 +1906,7 @@ async fn handle_encrypted(
             }
             let mut preparation_artifacts = Vec::new();
             let mut rejection_artifacts = Vec::new();
-            if !journal_artifacts.is_empty() && !direct_execution {
+            if requires_durable_preparation(!journal_artifacts.is_empty(), direct_execution) {
                 let Some(snapshot) = snapshot_artifacts.first() else {
                     return rollback_wire_error(
                         &mut state,
@@ -2243,6 +2306,23 @@ fn durable_control_request(request: &PlainRequest) -> bool {
 /// command and the enclave's registered market definition are both checked so
 /// the untrusted parent cannot route a non-BTC mutation through this path.
 fn direct_execution_request(state: &EnclaveState, request: &PlainRequest) -> bool {
+    if matches!(
+        request,
+        PlainRequest::Operator { envelope }
+            if direct_deposit_operator_command(&envelope.command)
+    ) {
+        return matches!(
+            option_env!("LAYRS_DIRECT_DEPOSIT_CREDIT_ENABLED"),
+            Some("1")
+        );
+    }
+    if matches!(
+        request,
+        PlainRequest::Operator { envelope }
+            if direct_withdrawal_operator_command(&envelope.command)
+    ) {
+        return matches!(option_env!("LAYRS_DIRECT_WITHDRAWAL_ENABLED"), Some("1"));
+    }
     if !matches!(option_env!("LAYRS_DIRECT_BTC_EXECUTION_ENABLED"), Some("1")) {
         return false;
     }
@@ -2257,6 +2337,106 @@ fn direct_execution_request(state: &EnclaveState, request: &PlainRequest) -> boo
         // stop accepting otherwise healthy direct orders.
         PlainRequest::Operator { envelope } => direct_quest_operator_command(&envelope.command),
         PlainRequest::AggregateDepth { .. } => false,
+    }
+}
+
+fn direct_deposit_operator_command(command: &OperatorCommand) -> bool {
+    matches!(
+        command,
+        OperatorCommand::DirectCreditDeposit { .. }
+            | OperatorCommand::DirectDepositCreditLookup { .. }
+    )
+}
+
+fn direct_withdrawal_operator_command(command: &OperatorCommand) -> bool {
+    matches!(
+        command,
+        OperatorCommand::DirectWithdrawal { .. }
+            | OperatorCommand::DirectWithdrawalLookup { .. }
+            | OperatorCommand::SignPoolWithdrawal { .. }
+    )
+}
+
+/// A replay-key lookup reads an already authenticated terminal result and its
+/// original encrypted persistence evidence. It does not authorize a mutation,
+/// so an NSM clock outage must not make recovery unavailable.
+fn request_requires_trusted_execution_time(request: &PlainRequest) -> bool {
+    !matches!(
+        request,
+        PlainRequest::Operator {
+            envelope: OperatorEnvelope {
+                command: OperatorCommand::DirectDepositCreditLookup { .. }
+                    | OperatorCommand::DirectWithdrawalLookup { .. },
+                ..
+            }
+        }
+    ) && matches!(
+        request,
+        PlainRequest::User { .. } | PlainRequest::Operator { .. }
+    )
+}
+
+fn pending_preparation_blocks_request(
+    has_pending_preparation: bool,
+    request: &PlainRequest,
+    direct_execution: bool,
+) -> bool {
+    has_pending_preparation && !durable_control_request(request) && !direct_execution
+}
+
+fn requires_durable_preparation(has_journal_artifact: bool, direct_execution: bool) -> bool {
+    has_journal_artifact && !direct_execution
+}
+
+fn direct_deposit_journal_artifact(response: &PlainResponse) -> Option<EncryptedJournalRecord> {
+    match response {
+        PlainResponse::DirectDepositCredit { outcome } => Some(match outcome {
+            DirectDepositCreditOutcome::Applied(response)
+            | DirectDepositCreditOutcome::ReturnOriginal(response) => {
+                response.encrypted_journal_record.clone()
+            }
+            DirectDepositCreditOutcome::EffectNone(response) => {
+                response.encrypted_journal_record.clone()
+            }
+        }),
+        PlainResponse::DirectDepositCreditLookup {
+            response: Some(response),
+        } => Some(response.encrypted_journal_record.clone()),
+        PlainResponse::DirectWithdrawal { outcome } => Some(match outcome {
+            DirectWithdrawalOutcome::Applied(response)
+            | DirectWithdrawalOutcome::ReturnOriginal(response)
+            | DirectWithdrawalOutcome::EffectNone(response) => {
+                response.encrypted_journal_record.clone()
+            }
+        }),
+        PlainResponse::DirectWithdrawalLookup {
+            response: Some(response),
+        } => Some(response.encrypted_journal_record.clone()),
+        _ => None,
+    }
+}
+
+fn direct_deposit_receipt_artifact(response: &PlainResponse) -> Option<EnclaveReceipt> {
+    match response {
+        PlainResponse::DirectDepositCredit { outcome } => Some(match outcome {
+            DirectDepositCreditOutcome::Applied(response)
+            | DirectDepositCreditOutcome::ReturnOriginal(response) => {
+                response.enclave_receipt.clone()
+            }
+            DirectDepositCreditOutcome::EffectNone(response) => response.enclave_receipt.clone(),
+        }),
+        PlainResponse::DirectDepositCreditLookup {
+            response: Some(response),
+        } => Some(response.enclave_receipt.clone()),
+        PlainResponse::DirectWithdrawal { outcome } => Some(match outcome {
+            DirectWithdrawalOutcome::Applied(response)
+            | DirectWithdrawalOutcome::ReturnOriginal(response)
+            | DirectWithdrawalOutcome::EffectNone(response) => response.enclave_receipt.clone(),
+        }),
+        PlainResponse::DirectWithdrawalLookup {
+            response: Some(response),
+        } => Some(response.enclave_receipt.clone()),
+        _ => None,
     }
 }
 
@@ -3697,6 +3877,70 @@ async fn dispatch_operator(
     }
 
     match envelope.command {
+        OperatorCommand::DirectCreditDeposit { request } => {
+            if !matches!(
+                option_env!("LAYRS_DIRECT_DEPOSIT_CREDIT_ENABLED"),
+                Some("1")
+            ) {
+                return Err("DIRECT_DEPOSIT_CREDIT_DISABLED".into());
+            }
+            let now_millis =
+                verified_now_millis.ok_or_else(|| "TRUSTED_TIME_UNAVAILABLE".to_string())?;
+            let outcome = state
+                .core
+                .as_mut()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .direct_credit_deposit(request, now_millis)
+                .map_err(|error| error.to_string())?;
+            Ok(PlainResponse::DirectDepositCredit { outcome })
+        }
+        OperatorCommand::DirectDepositCreditLookup {
+            account_id,
+            financial_replay_key_sha256,
+        } => {
+            if !matches!(
+                option_env!("LAYRS_DIRECT_DEPOSIT_CREDIT_ENABLED"),
+                Some("1")
+            ) {
+                return Err("DIRECT_DEPOSIT_CREDIT_DISABLED".into());
+            }
+            let response = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .direct_deposit_credit_lookup(account_id, financial_replay_key_sha256)
+                .map_err(|error| error.to_string())?;
+            Ok(PlainResponse::DirectDepositCreditLookup { response })
+        }
+        OperatorCommand::DirectWithdrawal { request } => {
+            if !matches!(option_env!("LAYRS_DIRECT_WITHDRAWAL_ENABLED"), Some("1")) {
+                return Err("DIRECT_WITHDRAWAL_DISABLED".into());
+            }
+            let now_millis =
+                verified_now_millis.ok_or_else(|| "TRUSTED_TIME_UNAVAILABLE".to_string())?;
+            let outcome = state
+                .core
+                .as_mut()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .direct_withdrawal(request, now_millis)
+                .map_err(|error| error.to_string())?;
+            Ok(PlainResponse::DirectWithdrawal { outcome })
+        }
+        OperatorCommand::DirectWithdrawalLookup {
+            account_id,
+            operation_replay_key_sha256,
+        } => {
+            if !matches!(option_env!("LAYRS_DIRECT_WITHDRAWAL_ENABLED"), Some("1")) {
+                return Err("DIRECT_WITHDRAWAL_DISABLED".into());
+            }
+            let response = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .direct_withdrawal_lookup(account_id, operation_replay_key_sha256)
+                .map_err(|error| error.to_string())?;
+            Ok(PlainResponse::DirectWithdrawalLookup { response })
+        }
         OperatorCommand::RecoverWithdrawalAuthorization {
             withdrawal_id,
             session_id,
@@ -5497,6 +5741,10 @@ async fn dispatch_operator(
                         .map_err(|error| error.to_string());
                 }
                 OperatorCommand::BeginProvision { .. }
+                | OperatorCommand::DirectCreditDeposit { .. }
+                | OperatorCommand::DirectDepositCreditLookup { .. }
+                | OperatorCommand::DirectWithdrawal { .. }
+                | OperatorCommand::DirectWithdrawalLookup { .. }
                 | OperatorCommand::BeginIncidentTerminalRestore { .. }
                 | OperatorCommand::RecoverWithdrawalAuthorization { .. }
                 | OperatorCommand::PreparedCommandStatus { .. }
@@ -6263,11 +6511,150 @@ async fn write_frame(stream: &mut VsockStream, value: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use clob_service::private_core::{
+        DirectDepositCreditPayload, DirectExecutionOperation, DirectWithdrawalPayload,
         ExactTerminalCategoryCounts, ExactTerminalCategoryDigests, ExactTerminalCategoryEquality,
         FeeProfileId,
     };
     use serde_cbor::Value;
     use std::collections::BTreeMap;
+
+    fn direct_deposit_request_for_wire(
+        request_id: Uuid,
+        account_id: [u8; 32],
+        identity_commitment: [u8; 32],
+        issued_at_millis: i64,
+    ) -> DirectExecutionRequestEnvelope {
+        let amount_atomic = 5_000_000u128;
+        let pool_transaction_hash = [0x44; 32];
+        let pool_log_index = 9u64;
+        let mut evidence = Sha256::new();
+        evidence.update(b"layrs.deposit-pool-receipt.v1\0");
+        evidence.update(b"base");
+        evidence.update([0]);
+        evidence.update(format!("0x{}", hex::encode(pool_transaction_hash)).as_bytes());
+        evidence.update([0]);
+        evidence.update(pool_log_index.to_string().as_bytes());
+        evidence.update([0]);
+        evidence.update(b"USDC");
+        evidence.update([0]);
+        evidence.update(amount_atomic.to_string().as_bytes());
+        let payload = DirectDepositCreditPayload {
+            protocol_version: "layrs.direct-deposit-credit.v1".into(),
+            deposit_id: Uuid::from_u128(0xaaaaaaaa_aaaa_4aaa_8aaa_aaaaaaaaaaaa),
+            authenticated_subject_hash: [0x11; 32],
+            account_id,
+            identity_commitment,
+            asset: "USDC".into(),
+            amount_atomic,
+            source_chain: "eip155:8453".into(),
+            source_transaction_hash: [0x33; 32],
+            source_log_index: 7,
+            pool_chain: "base".into(),
+            pool_transaction_hash,
+            pool_log_index,
+            pool_receipt_evidence_sha256: evidence.finalize().into(),
+            funding_identity: "deposit:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+        };
+        DirectExecutionRequestEnvelope::new(
+            request_id,
+            payload.authenticated_subject_hash,
+            account_id,
+            None,
+            Some(payload.funding_identity.clone()),
+            DirectExecutionOperation::CreditDeposit,
+            serde_json::to_vec(&payload).expect("canonical direct deposit payload"),
+            issued_at_millis,
+            issued_at_millis + 5_000,
+        )
+        .expect("valid direct deposit request")
+    }
+
+    fn direct_withdrawal_request_for_wire(
+        request_id: Uuid,
+        withdrawal_id: Uuid,
+        account_id: [u8; 32],
+        identity_commitment: [u8; 32],
+        issued_at_millis: i64,
+    ) -> DirectExecutionRequestEnvelope {
+        let payload = DirectWithdrawalPayload {
+            protocol_version: "layrs.direct-withdrawal.v1".into(),
+            withdrawal_id,
+            authenticated_subject_hash: account_id,
+            account_id,
+            identity_commitment,
+            session_id: "green-withdrawal-wire-session".into(),
+            chain: "base".into(),
+            asset: "USDC".into(),
+            amount_atomic: 1_000_000,
+            destination: "0x1111111111111111111111111111111111111111".into(),
+            evidence_hash: None,
+            funding_identity: format!("withdrawal:{withdrawal_id}"),
+        };
+        DirectExecutionRequestEnvelope::new(
+            request_id,
+            account_id,
+            account_id,
+            None,
+            Some(payload.funding_identity.clone()),
+            DirectExecutionOperation::ReserveWithdrawal,
+            serde_json::to_vec(&payload).expect("canonical direct withdrawal payload"),
+            issued_at_millis,
+            issued_at_millis + 5_000,
+        )
+        .expect("valid direct withdrawal request")
+    }
+
+    fn signed_operator_envelope(
+        signing_key: &ed25519_dalek::SigningKey,
+        nonce: [u8; 32],
+        command: OperatorCommand,
+    ) -> OperatorEnvelope {
+        use ed25519_dalek::Signer as _;
+
+        let signature = signing_key
+            .sign(&operator_payload(nonce, &command).expect("operator payload"))
+            .to_bytes()
+            .to_vec();
+        OperatorEnvelope {
+            nonce,
+            command,
+            signature,
+        }
+    }
+
+    fn direct_deposit_test_state(
+        operator_public_key: VerifyingKey,
+        receipt_public_key: [u8; 32],
+        core: PrivateTradingCore,
+    ) -> std::mem::ManuallyDrop<EnclaveState> {
+        let transport_secret = StaticSecret::random();
+        let transport_public_key = PublicKey::from(&transport_secret).to_bytes();
+        std::mem::ManuallyDrop::new(EnclaveState {
+            nsm_fd: -1,
+            enclave_measurement_sha384: [0x52; 48],
+            transport_secret,
+            transport_public_key,
+            receipt_signer: None,
+            receipt_public_key,
+            operator_public_key,
+            operator_nonces: ReplayCache::new(32),
+            transport_nonces: TransportReplayCache::new(32),
+            core: Some(core),
+            pending_preparation: None,
+            last_preparation_supersession: None,
+            minimum_writer_epoch: 0,
+            writer_lease_id: None,
+            pending_provision: None,
+            pending_incident_terminal_restore: None,
+            incident_restore_floor: None,
+            pending_polymarket_provision: None,
+            polymarket: None,
+            pending_chain_signer_provision: None,
+            chain_signer: None,
+            pending_audit_signer_provision: None,
+            audit_signer: None,
+        })
+    }
 
     fn exact_incident_descriptor() -> IncidentSnapshotDescriptor {
         IncidentSnapshotDescriptor {
@@ -7929,6 +8316,284 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn direct_deposit_wire_bypasses_pending_slot_and_reemits_restartable_sidecars() {
+        if !matches!(
+            option_env!("LAYRS_DIRECT_DEPOSIT_CREDIT_ENABLED"),
+            Some("1")
+        ) {
+            return;
+        }
+        let operator_signer = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]);
+        let journal_key = JournalKey::from_bytes([0x52; 32]);
+        let receipt_signer = ReceiptSigner::from_seed([0x53; 32], [0x54; 48]);
+        let receipt_public_key = receipt_signer.verifying_key();
+        let core = PrivateTradingCore::new(journal_key.clone(), receipt_signer.clone());
+        let mut state =
+            direct_deposit_test_state(operator_signer.verifying_key(), receipt_public_key, core);
+        let request = direct_deposit_request_for_wire(
+            Uuid::from_u128(0x51111111_1111_4111_8111_111111111111),
+            [0x55; 32],
+            [0x56; 32],
+            1_800_000_000_000,
+        );
+        let command = OperatorCommand::DirectCreditDeposit {
+            request: request.clone(),
+        };
+        let command_json = serde_json::to_value(&command).expect("direct command wire JSON");
+        assert_eq!(command_json["type"], "DIRECT_CREDIT_DEPOSIT");
+        assert_eq!(
+            command_json["request"]["accountId"],
+            serde_json::to_value(request.account_id).unwrap()
+        );
+        let plain_request = PlainRequest::Operator {
+            envelope: signed_operator_envelope(&operator_signer, [0x57; 32], command.clone()),
+        };
+        let direct = direct_execution_request(&state, &plain_request);
+        assert!(direct);
+        assert!(!pending_preparation_blocks_request(
+            true,
+            &plain_request,
+            direct
+        ));
+        assert!(!requires_durable_preparation(true, direct));
+
+        let first = dispatch_operator(
+            &mut state,
+            signed_operator_envelope(&operator_signer, [0x58; 32], command.clone()),
+            Some(request.issued_at_millis + 1),
+        )
+        .await
+        .expect("direct credit dispatch");
+        let applied = match &first {
+            PlainResponse::DirectDepositCredit {
+                outcome: DirectDepositCreditOutcome::Applied(response),
+            } => response.clone(),
+            other => panic!("unexpected direct response: {other:?}"),
+        };
+        let response_json = serde_json::to_value(&first).expect("direct response wire JSON");
+        assert_eq!(response_json["type"], "DIRECT_DEPOSIT_CREDIT");
+        assert_eq!(response_json["outcome"]["outcome"], "APPLIED");
+        assert_eq!(
+            response_json["outcome"]["response"]["financialReplayKeySha256"],
+            serde_json::to_value(applied.financial_replay_key_sha256).unwrap()
+        );
+        let journal_artifact =
+            direct_deposit_journal_artifact(&first).expect("encrypted journal sidecar");
+        let receipt_artifact =
+            direct_deposit_receipt_artifact(&first).expect("signed receipt sidecar");
+        assert_eq!(journal_artifact, applied.encrypted_journal_record);
+        assert_eq!(receipt_artifact, applied.enclave_receipt);
+        let snapshot = state
+            .core
+            .as_ref()
+            .expect("core")
+            .export_encrypted_snapshot()
+            .expect("encrypted snapshot sidecar");
+        assert_eq!(snapshot.sequence, journal_artifact.sequence);
+        assert_eq!(snapshot.state_root, journal_artifact.state_root);
+        let encrypted_wire = WireResponse::Encrypted {
+            nonce: [0x59; 12],
+            ciphertext: vec![0x5a],
+            journal_artifacts: vec![journal_artifact.clone()],
+            snapshot_artifacts: vec![snapshot.clone()],
+            receipt_artifacts: vec![receipt_artifact.clone()],
+            audit_artifacts: Vec::new(),
+            task_artifacts: Vec::new(),
+            recovery_artifacts: Vec::new(),
+            preparation_artifacts: Vec::new(),
+            rejection_artifacts: Vec::new(),
+        };
+        let wire_json = serde_json::to_value(&encrypted_wire).expect("wire JSON");
+        assert_eq!(wire_json["type"], "ENCRYPTED");
+        assert_eq!(wire_json["journal_artifacts"].as_array().unwrap().len(), 1);
+        assert_eq!(wire_json["snapshot_artifacts"].as_array().unwrap().len(), 1);
+        assert_eq!(wire_json["receipt_artifacts"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            wire_json["preparation_artifacts"].as_array().unwrap().len(),
+            0
+        );
+
+        let exact = dispatch_operator(
+            &mut state,
+            signed_operator_envelope(&operator_signer, [0x5b; 32], command),
+            Some(request.issued_at_millis + 2),
+        )
+        .await
+        .expect("exact direct retry");
+        let replayed = match &exact {
+            PlainResponse::DirectDepositCredit {
+                outcome: DirectDepositCreditOutcome::ReturnOriginal(response),
+            } => response,
+            other => panic!("unexpected replay response: {other:?}"),
+        };
+        assert_eq!(
+            replayed.signed_result_wire().unwrap(),
+            applied.signed_result_wire().unwrap()
+        );
+        assert_eq!(
+            direct_deposit_journal_artifact(&exact),
+            Some(journal_artifact.clone())
+        );
+
+        let lookup_command = OperatorCommand::DirectDepositCreditLookup {
+            account_id: request.account_id,
+            financial_replay_key_sha256: applied.financial_replay_key_sha256,
+        };
+        let lookup_request = PlainRequest::Operator {
+            envelope: signed_operator_envelope(
+                &operator_signer,
+                [0x5c; 32],
+                lookup_command.clone(),
+            ),
+        };
+        let lookup_json = serde_json::to_value(&lookup_command).expect("lookup wire JSON");
+        assert_eq!(lookup_json["type"], "DIRECT_DEPOSIT_CREDIT_LOOKUP");
+        assert_eq!(
+            lookup_json["financial_replay_key_sha256"],
+            serde_json::to_value(applied.financial_replay_key_sha256).unwrap()
+        );
+        assert!(!request_requires_trusted_execution_time(&lookup_request));
+        let lookup = dispatch_operator(
+            &mut state,
+            signed_operator_envelope(&operator_signer, [0x5d; 32], lookup_command),
+            None,
+        )
+        .await
+        .expect("read-only lookup without trusted clock");
+        let looked_up = match lookup {
+            PlainResponse::DirectDepositCreditLookup {
+                response: Some(response),
+            } => response,
+            other => panic!("unexpected lookup response: {other:?}"),
+        };
+        assert_eq!(
+            looked_up.signed_result_wire().unwrap(),
+            applied.signed_result_wire().unwrap()
+        );
+
+        let restored = PrivateTradingCore::restore_encrypted_snapshot(
+            journal_key,
+            receipt_signer,
+            &snapshot,
+            0,
+        )
+        .expect("restore from emitted snapshot");
+        let restored_response = restored
+            .direct_deposit_credit_lookup(request.account_id, applied.financial_replay_key_sha256)
+            .expect("restored replay lookup")
+            .expect("stored result");
+        assert_eq!(
+            restored_response.signed_result_wire().unwrap(),
+            applied.signed_result_wire().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_withdrawal_reemits_restartable_sidecars() {
+        if !matches!(option_env!("LAYRS_DIRECT_WITHDRAWAL_ENABLED"), Some("1")) {
+            return;
+        }
+        let operator_signer = ed25519_dalek::SigningKey::from_bytes(&[0x61; 32]);
+        let journal_key = JournalKey::from_bytes([0x62; 32]);
+        let receipt_signer = ReceiptSigner::from_seed([0x63; 32], [0x64; 48]);
+        let receipt_public_key = receipt_signer.verifying_key();
+        let core = PrivateTradingCore::new(journal_key, receipt_signer);
+        let mut state =
+            direct_deposit_test_state(operator_signer.verifying_key(), receipt_public_key, core);
+        let account_id = [0x65; 32];
+        let identity_commitment = [0x66; 32];
+        let deposit = direct_deposit_request_for_wire(
+            Uuid::from_u128(0x61111111_1111_4111_8111_111111111111),
+            account_id,
+            identity_commitment,
+            1_800_100_000_000,
+        );
+        dispatch_operator(
+            &mut state,
+            signed_operator_envelope(
+                &operator_signer,
+                [0x67; 32],
+                OperatorCommand::DirectCreditDeposit {
+                    request: deposit.clone(),
+                },
+            ),
+            Some(deposit.issued_at_millis + 1),
+        )
+        .await
+        .expect("fund direct withdrawal fixture");
+
+        let withdrawal_id = Uuid::from_u128(0x62222222_2222_4222_8222_222222222222);
+        let reserve = direct_withdrawal_request_for_wire(
+            Uuid::from_u128(0x63333333_3333_4333_8333_333333333333),
+            withdrawal_id,
+            account_id,
+            identity_commitment,
+            deposit.deadline_millis + 1,
+        );
+        let response = dispatch_operator(
+            &mut state,
+            signed_operator_envelope(
+                &operator_signer,
+                [0x68; 32],
+                OperatorCommand::DirectWithdrawal {
+                    request: reserve.clone(),
+                },
+            ),
+            Some(reserve.issued_at_millis + 1),
+        )
+        .await
+        .expect("direct reserve dispatch");
+        let applied = match &response {
+            PlainResponse::DirectWithdrawal {
+                outcome: DirectWithdrawalOutcome::Applied(value),
+            } => value,
+            other => panic!("unexpected direct withdrawal response: {other:?}"),
+        };
+        assert_eq!(
+            direct_deposit_journal_artifact(&response),
+            Some(applied.encrypted_journal_record.clone())
+        );
+        assert_eq!(
+            direct_deposit_receipt_artifact(&response),
+            Some(applied.enclave_receipt.clone())
+        );
+        let snapshot = state
+            .core
+            .as_ref()
+            .expect("core")
+            .export_encrypted_snapshot()
+            .expect("withdrawal snapshot sidecar");
+        assert_eq!(snapshot.sequence, applied.encrypted_journal_record.sequence);
+        assert_eq!(
+            snapshot.state_root,
+            applied.encrypted_journal_record.state_root
+        );
+
+        let lookup = dispatch_operator(
+            &mut state,
+            signed_operator_envelope(
+                &operator_signer,
+                [0x69; 32],
+                OperatorCommand::DirectWithdrawalLookup {
+                    account_id,
+                    operation_replay_key_sha256: applied.operation_replay_key_sha256,
+                },
+            ),
+            None,
+        )
+        .await
+        .expect("direct withdrawal lookup");
+        assert_eq!(
+            direct_deposit_journal_artifact(&lookup),
+            Some(applied.encrypted_journal_record.clone())
+        );
+        assert_eq!(
+            direct_deposit_receipt_artifact(&lookup),
+            Some(applied.enclave_receipt.clone())
+        );
+    }
+
     #[test]
     fn direct_withdrawal_gate_accepts_only_valid_base_usdc_user_requests() {
         let withdrawal_id = Uuid::from_u128(41);
@@ -8030,6 +8695,52 @@ mod tests {
             now,
         )
         .is_err());
+    }
+
+    #[test]
+    fn direct_withdrawal_signing_bypasses_durable_only_when_release_flag_is_embedded() {
+        if !matches!(option_env!("LAYRS_DIRECT_WITHDRAWAL_ENABLED"), Some("1")) {
+            return;
+        }
+        let operator_signer = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);
+        let receipt_signer = ReceiptSigner::from_seed([0x72; 32], [0x73; 48]);
+        let state = direct_deposit_test_state(
+            operator_signer.verifying_key(),
+            receipt_signer.verifying_key(),
+            PrivateTradingCore::new(JournalKey::from_bytes([0x74; 32]), receipt_signer),
+        );
+        let command = OperatorCommand::SignPoolWithdrawal {
+            idempotency_key: "green-direct-withdrawal-sign".into(),
+            authorization: WithdrawalAuthorization {
+                intent: clob_service::private_core::WithdrawalIntent {
+                    protocol_version: "layrs.withdrawal.v1".into(),
+                    withdrawal_id: Uuid::from_u128(0x71111111_1111_4111_8111_111111111111),
+                    session_id: "green-direct-withdrawal-sign-session".into(),
+                    chain: "base".into(),
+                    asset: "USDC".into(),
+                    amount_atomic: "1".into(),
+                    destination: "0x1111111111111111111111111111111111111111".into(),
+                    receipt_id: "receipt_green_direct_withdrawal_sign".into(),
+                    enclave_sequence: 1,
+                    state_root: [0x75; 32],
+                    expires_at_millis: 1_800_000_900_000,
+                    recovery_proof: None,
+                },
+                signature: vec![0x76; 64],
+            },
+            nonce: 0,
+            gas_limit: 180_000,
+            max_fee_per_gas_wei: "2".into(),
+            max_priority_fee_per_gas_wei: "1".into(),
+            now_millis: 1_800_000_000_000,
+        };
+        let request = PlainRequest::Operator {
+            envelope: signed_operator_envelope(&operator_signer, [0x77; 32], command),
+        };
+        let direct = direct_execution_request(&state, &request);
+        assert!(direct);
+        assert!(!pending_preparation_blocks_request(true, &request, direct));
+        assert!(!requires_durable_preparation(true, direct));
     }
 
     #[test]
