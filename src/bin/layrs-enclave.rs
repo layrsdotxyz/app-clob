@@ -6642,6 +6642,7 @@ mod tests {
             transport_nonces: TransportReplayCache::new(32),
             core: Some(core),
             pending_preparation: None,
+            last_preparation_supersession: None,
             minimum_writer_epoch: 0,
             writer_lease_id: None,
             pending_provision: None,
