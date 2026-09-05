@@ -50,6 +50,10 @@ const DIRECT_DEPOSIT_RESULT_DOMAIN: &[u8] = b"layrs.direct-deposit-credit.result
 const DIRECT_DEPOSIT_RESULT_SIGNATURE_DOMAIN: &[u8] =
     b"layrs.direct-execution.terminal-result.v1\0";
 const DIRECT_DEPOSIT_RESTART_DOMAIN: &[u8] = b"layrs.direct-deposit-credit.restart.v1\0";
+const DIRECT_WITHDRAWAL_PAYLOAD_VERSION: &str = "layrs.direct-withdrawal.v1";
+const DIRECT_WITHDRAWAL_REPLAY_DOMAIN: &[u8] = b"layrs.direct-withdrawal.replay.v1\0";
+const DIRECT_WITHDRAWAL_RESULT_DOMAIN: &[u8] = b"layrs.direct-withdrawal.result.v1\0";
+const DIRECT_WITHDRAWAL_RESTART_DOMAIN: &[u8] = b"layrs.direct-withdrawal.restart.v1\0";
 const MAX_DIRECT_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DIRECT_SCOPE_BYTES: usize = 512;
 
@@ -336,6 +340,65 @@ pub enum DirectDepositCreditOutcome {
     EffectNone(DirectDepositEffectNoneResponse),
 }
 
+/// Canonical payload for all three withdrawal mutations. Reserve has no
+/// evidence hash; finalize/release require a non-zero finality/failure proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DirectWithdrawalPayload {
+    pub protocol_version: String,
+    pub withdrawal_id: Uuid,
+    pub authenticated_subject_hash: [u8; 32],
+    pub account_id: [u8; 32],
+    pub identity_commitment: [u8; 32],
+    pub session_id: String,
+    pub chain: String,
+    pub asset: String,
+    #[serde(with = "super::decimal_u128")]
+    pub amount_atomic: u128,
+    pub destination: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_hash: Option<[u8; 32]>,
+    pub funding_identity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DirectWithdrawalResponse {
+    pub request: DirectExecutionRequestEnvelope,
+    pub result: DirectExecutionTerminalResult,
+    pub enclave_receipt: EnclaveReceipt,
+    pub encrypted_journal_record: EncryptedJournalRecord,
+    #[serde(with = "serde_bytes")]
+    pub projection_payload: Vec<u8>,
+    pub operation_replay_key_sha256: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withdrawal_authorization: Option<WithdrawalAuthorization>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "outcome",
+    content = "response",
+    rename_all = "SCREAMING_SNAKE_CASE"
+)]
+pub enum DirectWithdrawalOutcome {
+    Applied(DirectWithdrawalResponse),
+    ReturnOriginal(DirectWithdrawalResponse),
+    EffectNone(DirectWithdrawalResponse),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DirectWithdrawalError {
+    #[error(transparent)]
+    Contract(#[from] DirectExecutionContractError),
+    #[error(transparent)]
+    Core(#[from] CoreError),
+    #[error("invalid direct withdrawal payload")]
+    InvalidPayload,
+    #[error("direct withdrawal replay binding mismatch")]
+    ReplayBinding,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DirectDepositCreditError {
     #[error(transparent)]
@@ -410,6 +473,88 @@ impl DirectDepositCreditPayload {
     }
 }
 
+impl DirectWithdrawalPayload {
+    fn decode_for(request: &DirectExecutionRequestEnvelope) -> Result<Self, DirectWithdrawalError> {
+        if !matches!(
+            request.operation,
+            DirectExecutionOperation::ReserveWithdrawal
+                | DirectExecutionOperation::FinalizeWithdrawal
+                | DirectExecutionOperation::ReleaseWithdrawal
+        ) || request.market_id.is_some()
+            || request.funding_identity.is_none()
+        {
+            return Err(DirectWithdrawalError::InvalidPayload);
+        }
+        let payload: Self = serde_json::from_slice(&request.canonical_payload)
+            .map_err(|_| DirectWithdrawalError::InvalidPayload)?;
+        let canonical =
+            serde_json::to_vec(&payload).map_err(|_| DirectWithdrawalError::InvalidPayload)?;
+        if canonical != request.canonical_payload
+            || payload.protocol_version != DIRECT_WITHDRAWAL_PAYLOAD_VERSION
+            || payload.withdrawal_id.is_nil()
+            || payload.authenticated_subject_hash != request.authenticated_subject_hash
+            || payload.account_id != request.account_id
+            || payload.identity_commitment == [0; 32]
+            || payload.session_id.is_empty()
+            || !matches!(payload.chain.as_str(), "base" | "horizen")
+            || !matches!(payload.asset.as_str(), "USDC" | "ZEN")
+            || payload.amount_atomic == 0
+            || payload.destination.is_empty()
+            || payload.funding_identity != request.funding_identity.as_deref().unwrap_or_default()
+            || payload.funding_identity != format!("withdrawal:{}", payload.withdrawal_id)
+        {
+            return Err(DirectWithdrawalError::InvalidPayload);
+        }
+        validate_withdrawal(
+            &payload.chain,
+            &payload.asset,
+            payload.amount_atomic,
+            &payload.destination,
+        )
+        .map_err(|_| DirectWithdrawalError::InvalidPayload)?;
+        match request.operation {
+            DirectExecutionOperation::ReserveWithdrawal if payload.evidence_hash.is_none() => {}
+            DirectExecutionOperation::FinalizeWithdrawal
+            | DirectExecutionOperation::ReleaseWithdrawal
+                if payload.evidence_hash.is_some_and(|value| value != [0; 32]) => {}
+            _ => return Err(DirectWithdrawalError::InvalidPayload),
+        }
+        Ok(payload)
+    }
+
+    fn operation_replay_key(
+        &self,
+        operation: DirectExecutionOperation,
+    ) -> Result<[u8; 32], DirectWithdrawalError> {
+        if !matches!(
+            operation,
+            DirectExecutionOperation::ReserveWithdrawal
+                | DirectExecutionOperation::FinalizeWithdrawal
+                | DirectExecutionOperation::ReleaseWithdrawal
+        ) {
+            return Err(DirectWithdrawalError::InvalidPayload);
+        }
+        Ok(direct_withdrawal_operation_replay_key(
+            operation,
+            self.withdrawal_id,
+        ))
+    }
+
+    fn immutable_fields_match(&self, reserved: &Self) -> bool {
+        self.protocol_version == reserved.protocol_version
+            && self.withdrawal_id == reserved.withdrawal_id
+            && self.authenticated_subject_hash == reserved.authenticated_subject_hash
+            && self.account_id == reserved.account_id
+            && self.identity_commitment == reserved.identity_commitment
+            && self.session_id == reserved.session_id
+            && self.chain == reserved.chain
+            && self.asset == reserved.asset
+            && self.amount_atomic == reserved.amount_atomic
+            && self.destination == reserved.destination
+            && self.funding_identity == reserved.funding_identity
+    }
+}
+
 impl DirectDepositCreditResponse {
     pub fn signed_result_wire(&self) -> Result<Vec<u8>, DirectDepositCreditError> {
         serde_json::to_vec(self).map_err(|_| DirectDepositCreditError::ReplayBinding)
@@ -419,6 +564,12 @@ impl DirectDepositCreditResponse {
 impl DirectDepositEffectNoneResponse {
     pub fn signed_result_wire(&self) -> Result<Vec<u8>, DirectDepositCreditError> {
         serde_json::to_vec(self).map_err(|_| DirectDepositCreditError::ReplayBinding)
+    }
+}
+
+impl DirectWithdrawalResponse {
+    pub fn signed_result_wire(&self) -> Result<Vec<u8>, DirectWithdrawalError> {
+        serde_json::to_vec(self).map_err(|_| DirectWithdrawalError::ReplayBinding)
     }
 }
 
@@ -515,6 +666,8 @@ struct StoredDirectFinalResult {
     encrypted_journal_record: Option<EncryptedJournalRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     financial_replay_key_sha256: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    withdrawal_authorization: Option<WithdrawalAuthorization>,
     #[serde(default, skip_serializing_if = "is_zero_u8")]
     marker_format_version: u8,
 }
@@ -650,6 +803,7 @@ impl DirectFinalResultIndex {
                         enclave_receipt: None,
                         encrypted_journal_record: None,
                         financial_replay_key_sha256: None,
+                        withdrawal_authorization: None,
                         marker_format_version: 0,
                     },
                 );
@@ -747,6 +901,51 @@ impl DirectFinalResultIndex {
         }
         Ok(())
     }
+
+    fn validate_direct_withdrawal_records(
+        &self,
+        verifying_key: [u8; 32],
+        system_keys: &BTreeSet<String>,
+    ) -> Result<(), DirectExecutionContractError> {
+        let mut replay_keys = BTreeSet::new();
+        let mut rooted_system_keys = BTreeSet::new();
+        for stored in self
+            .0
+            .values()
+            .filter(|stored| stored.marker_format_version == 2)
+        {
+            let response = stored_direct_withdrawal_response(stored)
+                .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?;
+            validate_direct_withdrawal_response_bindings(&response, Some(verifying_key))
+                .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?;
+            if response.result.state == DirectExecutionTerminalState::Applied {
+                let replay_key = stored
+                    .financial_replay_key_sha256
+                    .ok_or(DirectExecutionContractError::IdempotencyIndex)?;
+                if replay_key != response.operation_replay_key_sha256
+                    || !replay_keys.insert(replay_key)
+                {
+                    return Err(DirectExecutionContractError::IdempotencyIndex);
+                }
+                let payload = DirectWithdrawalPayload::decode_for(&response.request)
+                    .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?;
+                let system_key =
+                    direct_withdrawal_system_key(response.request.operation, payload.withdrawal_id);
+                if !system_keys.contains(&system_key) {
+                    return Err(DirectExecutionContractError::IdempotencyIndex);
+                }
+                rooted_system_keys.insert(system_key);
+            }
+        }
+        for system_key in system_keys {
+            if system_key.starts_with("direct-withdrawal:")
+                && !rooted_system_keys.contains(system_key)
+            {
+                return Err(DirectExecutionContractError::IdempotencyIndex);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl StoredDirectFinalResult {
@@ -775,7 +974,8 @@ impl StoredDirectFinalResult {
                 || !self.projection_payload.is_empty()
                 || self.enclave_receipt.is_some()
                 || self.encrypted_journal_record.is_some()
-                || self.financial_replay_key_sha256.is_some() =>
+                || self.financial_replay_key_sha256.is_some()
+                || self.withdrawal_authorization.is_some() =>
             {
                 return Err(DirectExecutionContractError::IdempotencyIndex);
             }
@@ -787,6 +987,7 @@ impl StoredDirectFinalResult {
                     .ok_or(DirectExecutionContractError::IdempotencyIndex)?;
                 if request.operation != DirectExecutionOperation::CreditDeposit
                     || self.projection_payload.is_empty()
+                    || self.withdrawal_authorization.is_some()
                 {
                     return Err(DirectExecutionContractError::IdempotencyIndex);
                 }
@@ -806,6 +1007,36 @@ impl StoredDirectFinalResult {
                         .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?;
                 }
             }
+            2 => {
+                let request = self
+                    .request
+                    .as_ref()
+                    .ok_or(DirectExecutionContractError::IdempotencyIndex)?;
+                if !matches!(
+                    request.operation,
+                    DirectExecutionOperation::ReserveWithdrawal
+                        | DirectExecutionOperation::FinalizeWithdrawal
+                        | DirectExecutionOperation::ReleaseWithdrawal
+                ) || self.projection_payload.is_empty()
+                    || self.enclave_receipt.is_none()
+                    || self.encrypted_journal_record.is_none()
+                {
+                    return Err(DirectExecutionContractError::IdempotencyIndex);
+                }
+                if self.result.state == DirectExecutionTerminalState::Applied {
+                    if self.financial_replay_key_sha256.is_none() {
+                        return Err(DirectExecutionContractError::IdempotencyIndex);
+                    }
+                } else if self.financial_replay_key_sha256.is_some()
+                    || self.withdrawal_authorization.is_some()
+                {
+                    return Err(DirectExecutionContractError::IdempotencyIndex);
+                }
+                let response = stored_direct_withdrawal_response(self)
+                    .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?;
+                validate_direct_withdrawal_response_bindings(&response, None)
+                    .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?;
+            }
             _ => return Err(DirectExecutionContractError::IdempotencyIndex),
         }
         self.result
@@ -816,6 +1047,28 @@ impl StoredDirectFinalResult {
 
 fn direct_final_result_key(account_id: &[u8; 32], request_id: Uuid) -> String {
     format!("{}:{}", hex::encode(account_id), request_id.hyphenated())
+}
+
+fn direct_withdrawal_system_key(
+    operation: DirectExecutionOperation,
+    withdrawal_id: Uuid,
+) -> String {
+    format!(
+        "direct-withdrawal:{}:{}",
+        String::from_utf8_lossy(operation.hash_label()).to_ascii_lowercase(),
+        withdrawal_id.hyphenated()
+    )
+}
+
+fn direct_withdrawal_operation_replay_key(
+    operation: DirectExecutionOperation,
+    withdrawal_id: Uuid,
+) -> [u8; 32] {
+    let mut bytes = Vec::with_capacity(32 + 16);
+    bytes.extend_from_slice(operation.hash_label());
+    bytes.push(0);
+    bytes.extend_from_slice(withdrawal_id.as_bytes());
+    domain_hash(DIRECT_WITHDRAWAL_REPLAY_DOMAIN, &bytes)
 }
 
 fn direct_final_result_marker_key(result_key: &str) -> String {
@@ -853,7 +1106,7 @@ fn direct_final_result_marker_digest(
         .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?;
         return Ok(domain_hash(DIRECT_FINAL_RESULT_MARKER_DOMAIN, &encoded));
     }
-    if stored.marker_format_version != 1 {
+    if !matches!(stored.marker_format_version, 1 | 2) {
         return Err(DirectExecutionContractError::IdempotencyIndex);
     }
     // Deliberately exclude commitEvidence.stateRoot and signatures: the marker
@@ -1131,6 +1384,177 @@ fn direct_deposit_restart_evidence(
     bytes.extend_from_slice(&state_root);
     bytes.extend_from_slice(&journal_head);
     domain_hash(DIRECT_DEPOSIT_RESTART_DOMAIN, &bytes)
+}
+
+fn stored_direct_withdrawal_response(
+    stored: &StoredDirectFinalResult,
+) -> Result<DirectWithdrawalResponse, DirectWithdrawalError> {
+    let request = stored
+        .request
+        .clone()
+        .ok_or(DirectWithdrawalError::ReplayBinding)?;
+    let payload = DirectWithdrawalPayload::decode_for(&request)?;
+    Ok(DirectWithdrawalResponse {
+        operation_replay_key_sha256: payload.operation_replay_key(request.operation)?,
+        request,
+        result: stored.result.clone(),
+        enclave_receipt: stored
+            .enclave_receipt
+            .clone()
+            .ok_or(DirectWithdrawalError::ReplayBinding)?,
+        encrypted_journal_record: stored
+            .encrypted_journal_record
+            .clone()
+            .ok_or(DirectWithdrawalError::ReplayBinding)?,
+        projection_payload: stored.projection_payload.clone(),
+        withdrawal_authorization: stored.withdrawal_authorization.clone(),
+    })
+}
+
+fn direct_withdrawal_restart_evidence(
+    request: &DirectExecutionRequestEnvelope,
+    replay_key: [u8; 32],
+    sequence: u64,
+    state_root: [u8; 32],
+    journal_head: [u8; 32],
+) -> [u8; 32] {
+    let mut bytes = Vec::with_capacity(32 * 4 + 8);
+    bytes.extend_from_slice(&request.request_hash);
+    bytes.extend_from_slice(&replay_key);
+    bytes.extend_from_slice(&sequence.to_be_bytes());
+    bytes.extend_from_slice(&state_root);
+    bytes.extend_from_slice(&journal_head);
+    domain_hash(DIRECT_WITHDRAWAL_RESTART_DOMAIN, &bytes)
+}
+
+fn validate_direct_withdrawal_response_bindings(
+    response: &DirectWithdrawalResponse,
+    verifying_key: Option<[u8; 32]>,
+) -> Result<(), DirectWithdrawalError> {
+    response.request.validate()?;
+    response.result.validate_for(&response.request)?;
+    let payload = DirectWithdrawalPayload::decode_for(&response.request)?;
+    let replay_key = payload.operation_replay_key(response.request.operation)?;
+    let receipt = &response.enclave_receipt;
+    let record = &response.encrypted_journal_record;
+    if response.projection_payload != response.request.canonical_payload
+        || response.operation_replay_key_sha256 != replay_key
+        || response.result.result_commitment_sha256
+            != domain_hash(
+                DIRECT_WITHDRAWAL_RESULT_DOMAIN,
+                &response.projection_payload,
+            )
+        || receipt.command_commitment_sha256 != Some(response.request.request_hash)
+        || receipt.result_commitment_sha256 != Some(response.result.result_commitment_sha256)
+        || receipt.publication_eligible != Some(false)
+        || receipt.journal_committed != Some(true)
+        || record.sequence != receipt.enclave_sequence
+        || record.state_root != receipt.state_root
+        || record.record_hash != receipt.journal_hash
+        || receipt.prior_state_root == receipt.state_root
+    {
+        return Err(DirectWithdrawalError::ReplayBinding);
+    }
+    match response.result.state {
+        DirectExecutionTerminalState::Applied => {
+            let evidence = response
+                .result
+                .commit_evidence
+                .as_ref()
+                .ok_or(DirectWithdrawalError::ReplayBinding)?;
+            let receipt_bytes =
+                serde_json::to_vec(receipt).map_err(|_| DirectWithdrawalError::ReplayBinding)?;
+            if evidence.state_root != receipt.state_root
+                || evidence.enclave_sequence != receipt.enclave_sequence
+                || evidence.journal_head != receipt.journal_hash
+                || evidence.signed_receipt_sha256
+                    != domain_hash(
+                        b"layrs.direct-withdrawal.enclave-receipt.v1\0",
+                        &receipt_bytes,
+                    )
+                || evidence.restart_evidence_sha256
+                    != direct_withdrawal_restart_evidence(
+                        &response.request,
+                        replay_key,
+                        evidence.enclave_sequence,
+                        evidence.state_root,
+                        evidence.journal_head,
+                    )
+            {
+                return Err(DirectWithdrawalError::ReplayBinding);
+            }
+        }
+        DirectExecutionTerminalState::RejectedEffectNone
+        | DirectExecutionTerminalState::ExpiredEffectNone => {
+            if response.result.commit_evidence.is_some() {
+                return Err(DirectWithdrawalError::ReplayBinding);
+            }
+        }
+        DirectExecutionTerminalState::OutcomeUnknown => {
+            return Err(DirectWithdrawalError::ReplayBinding)
+        }
+    }
+    match response.request.operation {
+        DirectExecutionOperation::ReserveWithdrawal
+            if response.result.state == DirectExecutionTerminalState::Applied =>
+        {
+            let authorization = response
+                .withdrawal_authorization
+                .as_ref()
+                .ok_or(DirectWithdrawalError::ReplayBinding)?;
+            let intent = &authorization.intent;
+            if intent.protocol_version != "layrs.withdrawal.v1"
+                || intent.withdrawal_id != payload.withdrawal_id
+                || intent.session_id != payload.session_id
+                || intent.chain != payload.chain
+                || intent.asset != payload.asset
+                || intent.amount_atomic != payload.amount_atomic.to_string()
+                || intent.destination != payload.destination
+                || intent.receipt_id != receipt.receipt_id
+                || intent.enclave_sequence != receipt.enclave_sequence
+                || intent.state_root != receipt.state_root
+                || intent.recovery_proof.is_some()
+            {
+                return Err(DirectWithdrawalError::ReplayBinding);
+            }
+            if let Some(key) = verifying_key {
+                let signature = Signature::from_slice(&authorization.signature)
+                    .map_err(|_| DirectWithdrawalError::ReplayBinding)?;
+                VerifyingKey::from_bytes(&key)
+                    .map_err(|_| DirectWithdrawalError::ReplayBinding)?
+                    .verify(
+                        &direct_domain_signing_payload(
+                            b"layrs.withdrawal-authorization.v1\0",
+                            intent,
+                        )
+                        .map_err(|_| DirectWithdrawalError::ReplayBinding)?,
+                        &signature,
+                    )
+                    .map_err(|_| DirectWithdrawalError::ReplayBinding)?;
+            }
+        }
+        _ if response.withdrawal_authorization.is_some() => {
+            return Err(DirectWithdrawalError::ReplayBinding)
+        }
+        _ => {}
+    }
+    if let Some(key) = verifying_key {
+        let mut unsigned = response.result.clone();
+        let signature = Signature::from_slice(&unsigned.signature)
+            .map_err(|_| DirectWithdrawalError::ReplayBinding)?;
+        unsigned.signature.clear();
+        VerifyingKey::from_bytes(&key)
+            .map_err(|_| DirectWithdrawalError::ReplayBinding)?
+            .verify(
+                &direct_domain_signing_payload(DIRECT_DEPOSIT_RESULT_SIGNATURE_DOMAIN, &unsigned)
+                    .map_err(|_| DirectWithdrawalError::ReplayBinding)?,
+                &signature,
+            )
+            .map_err(|_| DirectWithdrawalError::ReplayBinding)?;
+        verify_enclave_receipt_signature(receipt, key)
+            .map_err(|_| DirectWithdrawalError::ReplayBinding)?;
+    }
+    Ok(())
 }
 
 fn direct_domain_signing_payload<T: Serialize>(
@@ -1963,6 +2387,66 @@ mod direct_execution_contract_tests {
         .unwrap()
     }
 
+    fn withdrawal_request(
+        request_id: &str,
+        withdrawal_id: &str,
+        operation: DirectExecutionOperation,
+        account_id: [u8; 32],
+        identity_commitment: [u8; 32],
+        amount_atomic: u128,
+        issued_at_millis: i64,
+    ) -> DirectExecutionRequestEnvelope {
+        let withdrawal_id = Uuid::parse_str(withdrawal_id).unwrap();
+        let payload = DirectWithdrawalPayload {
+            protocol_version: DIRECT_WITHDRAWAL_PAYLOAD_VERSION.into(),
+            withdrawal_id,
+            authenticated_subject_hash: [0x11; 32],
+            account_id,
+            identity_commitment,
+            session_id: "green-withdrawal-session".into(),
+            chain: "base".into(),
+            asset: "USDC".into(),
+            amount_atomic,
+            destination: "0x1111111111111111111111111111111111111111".into(),
+            evidence_hash: match operation {
+                DirectExecutionOperation::FinalizeWithdrawal
+                | DirectExecutionOperation::ReleaseWithdrawal => Some([0x61; 32]),
+                _ => None,
+            },
+            funding_identity: format!("withdrawal:{withdrawal_id}"),
+        };
+        DirectExecutionRequestEnvelope::new(
+            Uuid::parse_str(request_id).unwrap(),
+            payload.authenticated_subject_hash,
+            account_id,
+            None,
+            Some(payload.funding_identity.clone()),
+            operation,
+            serde_json::to_vec(&payload).unwrap(),
+            issued_at_millis,
+            issued_at_millis + 5_000,
+        )
+        .unwrap()
+    }
+
+    fn direct_credit_fixture(
+        core: &mut PrivateTradingCore,
+        account_id: [u8; 32],
+        identity_commitment: [u8; 32],
+        now_millis: i64,
+    ) {
+        let request = deposit_request(
+            "91111111-1111-4111-8111-111111111111",
+            account_id,
+            identity_commitment,
+            now_millis,
+        );
+        assert!(matches!(
+            core.direct_credit_deposit(request, now_millis + 1).unwrap(),
+            DirectDepositCreditOutcome::Applied(_)
+        ));
+    }
+
     #[test]
     fn direct_deposit_is_balanced_signed_and_replays_exactly_once_across_restart() {
         let journal_key = JournalKey::from_bytes([0x91; 32]);
@@ -2031,6 +2515,186 @@ mod direct_execution_contract_tests {
         };
         assert_eq!(after_restart.signed_result_wire().unwrap(), original_wire);
         assert_eq!(restored.sequence, 1);
+    }
+
+    #[test]
+    fn direct_withdrawal_reserve_finalize_is_exactly_once_and_survives_restart() {
+        let journal_key = JournalKey::from_bytes([0xb1; 32]);
+        let signer = ReceiptSigner::from_seed([0xb2; 32], [0xb3; 48]);
+        let account_id = [0xb4; 32];
+        let identity_commitment = [0xb5; 32];
+        let now = 1_800_100_000_000;
+        let mut core = PrivateTradingCore::new(journal_key.clone(), signer.clone());
+        direct_credit_fixture(&mut core, account_id, identity_commitment, now);
+        let owner = derive_private_user_id(&core.identity_key, &identity_commitment);
+        let available = AccountKey::new(&owner, AccountBucket::UserAvailable, "USDC");
+        let hold = AccountKey::new(&owner, AccountBucket::UserWithdrawalHold, "USDC");
+        let reserve = withdrawal_request(
+            "b1111111-1111-4111-8111-111111111111",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            DirectExecutionOperation::ReserveWithdrawal,
+            account_id,
+            identity_commitment,
+            2_000_000,
+            now + 10,
+        );
+        let reserved = match core.direct_withdrawal(reserve.clone(), now + 11).unwrap() {
+            DirectWithdrawalOutcome::Applied(response) => response,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        let reserve_wire = reserved.signed_result_wire().unwrap();
+        assert!(reserved.withdrawal_authorization.is_some());
+        assert_eq!(core.balance(&available), 3_000_000);
+        assert_eq!(core.balance(&hold), 2_000_000);
+
+        let reserve_retry = withdrawal_request(
+            "b2222222-2222-4222-8222-222222222222",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            DirectExecutionOperation::ReserveWithdrawal,
+            account_id,
+            identity_commitment,
+            2_000_000,
+            now + 20,
+        );
+        let replayed = match core.direct_withdrawal(reserve_retry, now + 21).unwrap() {
+            DirectWithdrawalOutcome::ReturnOriginal(response) => response,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_eq!(replayed.signed_result_wire().unwrap(), reserve_wire);
+        assert_eq!(core.balance(&hold), 2_000_000);
+
+        let finalize = withdrawal_request(
+            "b3333333-3333-4333-8333-333333333333",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            DirectExecutionOperation::FinalizeWithdrawal,
+            account_id,
+            identity_commitment,
+            2_000_000,
+            now + 30,
+        );
+        let finalized = match core.direct_withdrawal(finalize.clone(), now + 31).unwrap() {
+            DirectWithdrawalOutcome::Applied(response) => response,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        let finalize_wire = finalized.signed_result_wire().unwrap();
+        assert_eq!(core.balance(&available), 3_000_000);
+        assert_eq!(core.balance(&hold), 0);
+
+        let snapshot = core.export_encrypted_snapshot().unwrap();
+        let mut restored =
+            PrivateTradingCore::restore_encrypted_snapshot(journal_key, signer, &snapshot, 0)
+                .unwrap();
+        let after_restart = match restored.direct_withdrawal(finalize, now + 40).unwrap() {
+            DirectWithdrawalOutcome::ReturnOriginal(response) => response,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_eq!(after_restart.signed_result_wire().unwrap(), finalize_wire);
+        assert_eq!(restored.balance(&available), 3_000_000);
+        assert_eq!(restored.balance(&hold), 0);
+        assert_eq!(restored.sequence, 3);
+    }
+
+    #[test]
+    fn direct_withdrawal_release_restores_funds_and_failure_does_not_block_next_request() {
+        let journal_key = JournalKey::from_bytes([0xc1; 32]);
+        let signer = ReceiptSigner::from_seed([0xc2; 32], [0xc3; 48]);
+        let account_id = [0xc4; 32];
+        let identity_commitment = [0xc5; 32];
+        let now = 1_800_200_000_000;
+        let mut core = PrivateTradingCore::new(journal_key, signer);
+        direct_credit_fixture(&mut core, account_id, identity_commitment, now);
+        let owner = derive_private_user_id(&core.identity_key, &identity_commitment);
+        let available = AccountKey::new(&owner, AccountBucket::UserAvailable, "USDC");
+        let hold = AccountKey::new(&owner, AccountBucket::UserWithdrawalHold, "USDC");
+
+        let rejected = withdrawal_request(
+            "c1111111-1111-4111-8111-111111111111",
+            "caaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            DirectExecutionOperation::ReserveWithdrawal,
+            account_id,
+            identity_commitment,
+            6_000_000,
+            now + 10,
+        );
+        let rejected = match core.direct_withdrawal(rejected, now + 11).unwrap() {
+            DirectWithdrawalOutcome::EffectNone(response) => response,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_eq!(
+            rejected.result.error_code.as_deref(),
+            Some("WITHDRAWAL_INSUFFICIENT_BALANCE")
+        );
+        assert_eq!(
+            rejected.result.retry_policy,
+            DirectExecutionRetryPolicy::NewRequestAllowed
+        );
+        assert_eq!(core.balance(&available), 5_000_000);
+
+        let reserve = withdrawal_request(
+            "c2222222-2222-4222-8222-222222222222",
+            "cbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            DirectExecutionOperation::ReserveWithdrawal,
+            account_id,
+            identity_commitment,
+            2_000_000,
+            now + 20,
+        );
+        assert!(matches!(
+            core.direct_withdrawal(reserve, now + 21).unwrap(),
+            DirectWithdrawalOutcome::Applied(_)
+        ));
+        let release = withdrawal_request(
+            "c3333333-3333-4333-8333-333333333333",
+            "cbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            DirectExecutionOperation::ReleaseWithdrawal,
+            account_id,
+            identity_commitment,
+            2_000_000,
+            now + 30,
+        );
+        assert!(matches!(
+            core.direct_withdrawal(release, now + 31).unwrap(),
+            DirectWithdrawalOutcome::Applied(_)
+        ));
+        assert_eq!(core.balance(&available), 5_000_000);
+        assert_eq!(core.balance(&hold), 0);
+    }
+
+    #[test]
+    fn direct_withdrawal_terminalization_rejects_mutated_reserve_binding() {
+        let journal_key = JournalKey::from_bytes([0xd1; 32]);
+        let signer = ReceiptSigner::from_seed([0xd2; 32], [0xd3; 48]);
+        let account_id = [0xd4; 32];
+        let identity_commitment = [0xd5; 32];
+        let now = 1_800_300_000_000;
+        let mut core = PrivateTradingCore::new(journal_key, signer);
+        direct_credit_fixture(&mut core, account_id, identity_commitment, now);
+        let reserve = withdrawal_request(
+            "d1111111-1111-4111-8111-111111111111",
+            "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            DirectExecutionOperation::ReserveWithdrawal,
+            account_id,
+            identity_commitment,
+            2_000_000,
+            now + 10,
+        );
+        assert!(matches!(
+            core.direct_withdrawal(reserve, now + 11).unwrap(),
+            DirectWithdrawalOutcome::Applied(_)
+        ));
+        let mutated = withdrawal_request(
+            "d2222222-2222-4222-8222-222222222222",
+            "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            DirectExecutionOperation::FinalizeWithdrawal,
+            account_id,
+            identity_commitment,
+            1_000_000,
+            now + 20,
+        );
+        assert!(matches!(
+            core.direct_withdrawal(mutated, now + 21),
+            Err(DirectWithdrawalError::ReplayBinding)
+        ));
     }
 
     #[test]
@@ -3399,6 +4063,24 @@ enum JournaledSystemCommand {
         result_commitment_sha256: [u8; 32],
         error_code: String,
     },
+    DirectWithdrawalEffectNone {
+        request_id: Uuid,
+        request_hash: [u8; 32],
+        operation: DirectExecutionOperation,
+        terminal_state: DirectExecutionTerminalState,
+        result_commitment_sha256: [u8; 32],
+        error_code: String,
+    },
+    DirectWithdrawalReserve {
+        idempotency_key: String,
+        withdrawal_id: Uuid,
+        identity_commitment: [u8; 32],
+        chain: String,
+        asset: String,
+        #[serde(with = "super::decimal_u128")]
+        amount_atomic: u128,
+        destination: String,
+    },
     SetTradingFreeze {
         idempotency_key: String,
         frozen: bool,
@@ -3915,16 +4597,18 @@ impl PrivateTradingCore {
             record.record_hash,
             now_millis,
         );
+        let projection_payload = request.canonical_payload.clone();
         let stored = StoredDirectFinalResult {
             account_id: request.account_id,
             request_id: request.request_id,
             request_hash: request.request_hash,
             result: result.clone(),
             request: Some(request.clone()),
-            projection_payload: request.canonical_payload.clone(),
+            projection_payload: projection_payload.clone(),
             enclave_receipt: Some(receipt.clone()),
             encrypted_journal_record: Some(record.clone()),
             financial_replay_key_sha256: None,
+            withdrawal_authorization: None,
             marker_format_version: 1,
         };
         validate_direct_deposit_effect_none_bindings(
@@ -4157,6 +4841,7 @@ impl PrivateTradingCore {
             enclave_receipt: Some(enclave_receipt.clone()),
             encrypted_journal_record: Some(record.clone()),
             financial_replay_key_sha256: Some(replay_key),
+            withdrawal_authorization: None,
             marker_format_version: 1,
         };
         stored.validate()?;
@@ -4223,6 +4908,555 @@ impl PrivateTradingCore {
             response,
             Some(self.receipt_signer.verifying_key()),
         )
+    }
+
+    /// Executes reserve/finalize/release as one direct, terminal TEE mutation.
+    /// The operation+withdrawal replay key is the business idempotency boundary;
+    /// it is independent of transport retries and creates no pending state.
+    pub fn direct_withdrawal(
+        &mut self,
+        request: DirectExecutionRequestEnvelope,
+        now_millis: i64,
+    ) -> Result<DirectWithdrawalOutcome, DirectWithdrawalError> {
+        request.validate()?;
+        let payload = DirectWithdrawalPayload::decode_for(&request)?;
+        let replay_key = payload.operation_replay_key(request.operation)?;
+        let result_key = direct_final_result_key(&request.account_id, request.request_id);
+
+        if let Some(stored) = self.direct_final_results.0.get(&result_key) {
+            if stored.request_hash != request.request_hash || stored.marker_format_version != 2 {
+                return Err(DirectWithdrawalError::ReplayBinding);
+            }
+            stored.validate()?;
+            let response = stored_direct_withdrawal_response(stored)?;
+            validate_direct_withdrawal_response_bindings(
+                &response,
+                Some(self.receipt_signer.verifying_key()),
+            )?;
+            return Ok(
+                if response.result.state == DirectExecutionTerminalState::Applied {
+                    DirectWithdrawalOutcome::ReturnOriginal(response)
+                } else {
+                    DirectWithdrawalOutcome::EffectNone(response)
+                },
+            );
+        }
+        if let Some(original) = self.direct_withdrawal_result_by_replay_key(&replay_key)? {
+            if original.projection_payload != request.canonical_payload
+                || original.request.account_id != request.account_id
+            {
+                return Err(DirectWithdrawalError::ReplayBinding);
+            }
+            return Ok(DirectWithdrawalOutcome::ReturnOriginal(original));
+        }
+        if now_millis >= request.deadline_millis {
+            return self.commit_direct_withdrawal_effect_none(
+                request,
+                DirectExecutionTerminalState::ExpiredEffectNone,
+                "REQUEST_DEADLINE_EXCEEDED",
+                now_millis,
+            );
+        }
+
+        let reserve_key = direct_withdrawal_system_key(
+            DirectExecutionOperation::ReserveWithdrawal,
+            payload.withdrawal_id,
+        );
+        let finalize_key = direct_withdrawal_system_key(
+            DirectExecutionOperation::FinalizeWithdrawal,
+            payload.withdrawal_id,
+        );
+        let release_key = direct_withdrawal_system_key(
+            DirectExecutionOperation::ReleaseWithdrawal,
+            payload.withdrawal_id,
+        );
+        if matches!(
+            request.operation,
+            DirectExecutionOperation::FinalizeWithdrawal
+                | DirectExecutionOperation::ReleaseWithdrawal
+        ) {
+            let reserve_replay_key = direct_withdrawal_operation_replay_key(
+                DirectExecutionOperation::ReserveWithdrawal,
+                payload.withdrawal_id,
+            );
+            let Some(reserved) =
+                self.direct_withdrawal_result_by_replay_key(&reserve_replay_key)?
+            else {
+                return self.commit_direct_withdrawal_effect_none(
+                    request,
+                    DirectExecutionTerminalState::RejectedEffectNone,
+                    "WITHDRAWAL_NOT_RESERVED",
+                    now_millis,
+                );
+            };
+            let reserved_payload = DirectWithdrawalPayload::decode_for(&reserved.request)?;
+            if !payload.immutable_fields_match(&reserved_payload) {
+                return Err(DirectWithdrawalError::ReplayBinding);
+            }
+        }
+        let mut ledger = self.ledger.clone();
+        let mut system_keys = self.system_keys.clone();
+        let owner = derive_private_user_id(&self.identity_key, &payload.identity_commitment);
+        let available = AccountKey::new(&owner, AccountBucket::UserAvailable, &payload.asset);
+        let hold = AccountKey::new(&owner, AccountBucket::UserWithdrawalHold, &payload.asset);
+        let journal_entry = match request.operation {
+            DirectExecutionOperation::ReserveWithdrawal => {
+                if system_keys.contains(&reserve_key) {
+                    return Err(DirectWithdrawalError::ReplayBinding);
+                }
+                if let Err(error) = ledger.apply(LedgerTransaction {
+                    idempotency_key: reserve_key.clone(),
+                    business_reference: payload.withdrawal_id.to_string(),
+                    transfers: vec![Transfer {
+                        from: available,
+                        to: hold,
+                        amount: payload.amount_atomic,
+                    }],
+                }) {
+                    let code = if error == CoreError::InsufficientBalance {
+                        "WITHDRAWAL_INSUFFICIENT_BALANCE"
+                    } else {
+                        "WITHDRAWAL_RESERVE_REJECTED"
+                    };
+                    return self.commit_direct_withdrawal_effect_none(
+                        request,
+                        DirectExecutionTerminalState::RejectedEffectNone,
+                        code,
+                        now_millis,
+                    );
+                }
+                system_keys.insert(reserve_key.clone());
+                JournaledSystemCommand::DirectWithdrawalReserve {
+                    idempotency_key: reserve_key.clone(),
+                    withdrawal_id: payload.withdrawal_id,
+                    identity_commitment: payload.identity_commitment,
+                    chain: payload.chain.clone(),
+                    asset: payload.asset.clone(),
+                    amount_atomic: payload.amount_atomic,
+                    destination: payload.destination.clone(),
+                }
+            }
+            DirectExecutionOperation::FinalizeWithdrawal => {
+                if !system_keys.contains(&reserve_key) {
+                    return self.commit_direct_withdrawal_effect_none(
+                        request,
+                        DirectExecutionTerminalState::RejectedEffectNone,
+                        "WITHDRAWAL_NOT_RESERVED",
+                        now_millis,
+                    );
+                }
+                if system_keys.contains(&release_key) {
+                    return self.commit_direct_withdrawal_effect_none(
+                        request,
+                        DirectExecutionTerminalState::RejectedEffectNone,
+                        "WITHDRAWAL_ALREADY_RELEASED",
+                        now_millis,
+                    );
+                }
+                if system_keys.contains(&finalize_key) {
+                    return Err(DirectWithdrawalError::ReplayBinding);
+                }
+                let flow = ExternalFlowTransaction {
+                    idempotency_key: finalize_key.clone(),
+                    evidence_hash: payload
+                        .evidence_hash
+                        .ok_or(DirectWithdrawalError::InvalidPayload)?,
+                    account: hold,
+                    amount: payload.amount_atomic,
+                    direction: ExternalFlowDirection::Outflow,
+                };
+                ledger.apply_confirmed_withdrawal(flow.clone())?;
+                system_keys.insert(finalize_key.clone());
+                JournaledSystemCommand::ConfirmedWithdrawal {
+                    idempotency_key: finalize_key.clone(),
+                    flow,
+                }
+            }
+            DirectExecutionOperation::ReleaseWithdrawal => {
+                if !system_keys.contains(&reserve_key) {
+                    return self.commit_direct_withdrawal_effect_none(
+                        request,
+                        DirectExecutionTerminalState::RejectedEffectNone,
+                        "WITHDRAWAL_NOT_RESERVED",
+                        now_millis,
+                    );
+                }
+                if system_keys.contains(&finalize_key) {
+                    return self.commit_direct_withdrawal_effect_none(
+                        request,
+                        DirectExecutionTerminalState::RejectedEffectNone,
+                        "WITHDRAWAL_ALREADY_FINALIZED",
+                        now_millis,
+                    );
+                }
+                if system_keys.contains(&release_key) {
+                    return Err(DirectWithdrawalError::ReplayBinding);
+                }
+                let evidence = payload
+                    .evidence_hash
+                    .ok_or(DirectWithdrawalError::InvalidPayload)?;
+                ledger.release_withdrawal(
+                    release_key.clone(),
+                    evidence,
+                    hold,
+                    available,
+                    payload.amount_atomic,
+                )?;
+                system_keys.insert(release_key.clone());
+                JournaledSystemCommand::ReleaseWithdrawal {
+                    idempotency_key: release_key.clone(),
+                    identity_commitment: payload.identity_commitment,
+                    asset: payload.asset.clone(),
+                    amount_atomic: payload.amount_atomic,
+                    evidence_hash: evidence,
+                }
+            }
+            _ => return Err(DirectWithdrawalError::InvalidPayload),
+        };
+
+        let prior_root = self.state_root();
+        let next_sequence = checked_sequence(self.sequence)?;
+        let projection_payload = request.canonical_payload.clone();
+        let result_commitment = domain_hash(DIRECT_WITHDRAWAL_RESULT_DOMAIN, &projection_payload);
+        let marker_key = direct_final_result_marker_key(&result_key);
+        let marker_digest = direct_final_result_semantic_marker_digest(
+            request.account_id,
+            request.request_id,
+            request.request_hash,
+            DirectExecutionTerminalState::Applied,
+            DirectExecutionEffect::Committed,
+            DirectExecutionRetryPolicy::ReturnOriginalResult,
+            &None,
+            result_commitment,
+            Some(replay_key),
+        )?;
+        let mut processed = self.processed.clone();
+        if processed
+            .insert(
+                marker_key,
+                ProcessedCommand {
+                    request_hash: marker_digest,
+                    response: None,
+                },
+            )
+            .is_some()
+        {
+            return Err(DirectWithdrawalError::ReplayBinding);
+        }
+        let next_root = state_root(
+            &ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&processed),
+            &system_keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let mut journal = self.journal.clone();
+        let record = journal.append(next_root, &journal_entry)?;
+        let receipt = self.receipt_signer.sign(
+            format!(
+                "direct-{}",
+                String::from_utf8_lossy(request.operation.hash_label()).to_ascii_lowercase()
+            ),
+            request.request_id.hyphenated().to_string(),
+            Some(request.request_hash),
+            Some(false),
+            Some(result_commitment),
+            Some(true),
+            next_sequence,
+            prior_root,
+            next_root,
+            record.record_hash,
+            now_millis,
+        );
+        let withdrawal_authorization =
+            if request.operation == DirectExecutionOperation::ReserveWithdrawal {
+                let intent = WithdrawalIntent {
+                    protocol_version: "layrs.withdrawal.v1".into(),
+                    withdrawal_id: payload.withdrawal_id,
+                    session_id: payload.session_id.clone(),
+                    chain: payload.chain.clone(),
+                    asset: payload.asset.clone(),
+                    amount_atomic: payload.amount_atomic.to_string(),
+                    destination: payload.destination.clone(),
+                    receipt_id: receipt.receipt_id.clone(),
+                    enclave_sequence: next_sequence,
+                    state_root: next_root,
+                    expires_at_millis: now_millis.saturating_add(15 * 60_000),
+                    recovery_proof: None,
+                };
+                Some(WithdrawalAuthorization {
+                    signature: self
+                        .receipt_signer
+                        .sign_domain_payload(b"layrs.withdrawal-authorization.v1\0", &intent),
+                    intent,
+                })
+            } else {
+                None
+            };
+        let signed_receipt_sha256 = domain_hash(
+            b"layrs.direct-withdrawal.enclave-receipt.v1\0",
+            &serde_json::to_vec(&receipt).map_err(|_| DirectWithdrawalError::ReplayBinding)?,
+        );
+        let mut result = DirectExecutionTerminalResult {
+            protocol_version: DIRECT_EXECUTION_PROTOCOL_VERSION.into(),
+            request_id: request.request_id,
+            request_hash: request.request_hash,
+            state: DirectExecutionTerminalState::Applied,
+            effect: DirectExecutionEffect::Committed,
+            retry_policy: DirectExecutionRetryPolicy::ReturnOriginalResult,
+            error_code: None,
+            commit_evidence: Some(DirectExecutionCommitEvidence {
+                enclave_sequence: next_sequence,
+                state_root: next_root,
+                journal_head: record.record_hash,
+                signed_receipt_sha256,
+                restart_evidence_sha256: direct_withdrawal_restart_evidence(
+                    &request,
+                    replay_key,
+                    next_sequence,
+                    next_root,
+                    record.record_hash,
+                ),
+            }),
+            result_commitment_sha256: result_commitment,
+            signed_at_millis: now_millis,
+            signature: Vec::new(),
+        };
+        result.signature = self
+            .receipt_signer
+            .sign_domain_payload(DIRECT_DEPOSIT_RESULT_SIGNATURE_DOMAIN, &result);
+        result.validate_for(&request)?;
+        let stored = StoredDirectFinalResult {
+            account_id: request.account_id,
+            request_id: request.request_id,
+            request_hash: request.request_hash,
+            result: result.clone(),
+            request: Some(request.clone()),
+            projection_payload: projection_payload.clone(),
+            enclave_receipt: Some(receipt.clone()),
+            encrypted_journal_record: Some(record.clone()),
+            financial_replay_key_sha256: Some(replay_key),
+            withdrawal_authorization: withdrawal_authorization.clone(),
+            marker_format_version: 2,
+        };
+        stored.validate()?;
+        let mut direct_results = self.direct_final_results.clone();
+        if direct_results.0.insert(result_key, stored).is_some() {
+            return Err(DirectWithdrawalError::ReplayBinding);
+        }
+        direct_results.validate_rooted(&processed_hashes(&processed))?;
+        direct_results.validate_direct_withdrawal_records(
+            self.receipt_signer.verifying_key(),
+            &system_keys,
+        )?;
+        let response = DirectWithdrawalResponse {
+            request,
+            result,
+            enclave_receipt: receipt,
+            encrypted_journal_record: record,
+            projection_payload,
+            operation_replay_key_sha256: replay_key,
+            withdrawal_authorization,
+        };
+        validate_direct_withdrawal_response_bindings(
+            &response,
+            Some(self.receipt_signer.verifying_key()),
+        )?;
+        self.ledger = ledger;
+        self.system_keys = system_keys;
+        self.processed = processed;
+        self.direct_final_results = direct_results;
+        self.journal = journal;
+        self.sequence = next_sequence;
+        *self.custody_totals_cache.borrow_mut() = None;
+        Ok(DirectWithdrawalOutcome::Applied(response))
+    }
+
+    pub fn direct_withdrawal_lookup(
+        &self,
+        account_id: [u8; 32],
+        operation_replay_key_sha256: [u8; 32],
+    ) -> Result<Option<DirectWithdrawalResponse>, DirectWithdrawalError> {
+        let response = self.direct_withdrawal_result_by_replay_key(&operation_replay_key_sha256)?;
+        if let Some(value) = &response {
+            if value.request.account_id != account_id {
+                return Err(DirectWithdrawalError::ReplayBinding);
+            }
+            validate_direct_withdrawal_response_bindings(
+                value,
+                Some(self.receipt_signer.verifying_key()),
+            )?;
+        }
+        Ok(response)
+    }
+
+    fn direct_withdrawal_result_by_replay_key(
+        &self,
+        replay_key: &[u8; 32],
+    ) -> Result<Option<DirectWithdrawalResponse>, DirectWithdrawalError> {
+        self.direct_final_results
+            .0
+            .values()
+            .find(|stored| {
+                stored.marker_format_version == 2
+                    && stored.financial_replay_key_sha256.as_ref() == Some(replay_key)
+            })
+            .map(stored_direct_withdrawal_response)
+            .transpose()
+    }
+
+    fn commit_direct_withdrawal_effect_none(
+        &mut self,
+        request: DirectExecutionRequestEnvelope,
+        state: DirectExecutionTerminalState,
+        error_code: &str,
+        now_millis: i64,
+    ) -> Result<DirectWithdrawalOutcome, DirectWithdrawalError> {
+        if !matches!(
+            state,
+            DirectExecutionTerminalState::RejectedEffectNone
+                | DirectExecutionTerminalState::ExpiredEffectNone
+        ) {
+            return Err(DirectWithdrawalError::ReplayBinding);
+        }
+        let payload = DirectWithdrawalPayload::decode_for(&request)?;
+        let replay_key = payload.operation_replay_key(request.operation)?;
+        let result_commitment =
+            domain_hash(DIRECT_WITHDRAWAL_RESULT_DOMAIN, &request.canonical_payload);
+        let mut result = DirectExecutionTerminalResult {
+            protocol_version: DIRECT_EXECUTION_PROTOCOL_VERSION.into(),
+            request_id: request.request_id,
+            request_hash: request.request_hash,
+            state,
+            effect: DirectExecutionEffect::None,
+            retry_policy: DirectExecutionRetryPolicy::NewRequestAllowed,
+            error_code: Some(error_code.into()),
+            commit_evidence: None,
+            result_commitment_sha256: result_commitment,
+            signed_at_millis: now_millis,
+            signature: Vec::new(),
+        };
+        result.signature = self
+            .receipt_signer
+            .sign_domain_payload(DIRECT_DEPOSIT_RESULT_SIGNATURE_DOMAIN, &result);
+        let result_key = direct_final_result_key(&request.account_id, request.request_id);
+        let marker_key = direct_final_result_marker_key(&result_key);
+        let marker_digest = direct_final_result_semantic_marker_digest(
+            request.account_id,
+            request.request_id,
+            request.request_hash,
+            result.state,
+            result.effect,
+            result.retry_policy,
+            &result.error_code,
+            result.result_commitment_sha256,
+            None,
+        )?;
+        let mut processed = self.processed.clone();
+        if processed
+            .insert(
+                marker_key,
+                ProcessedCommand {
+                    request_hash: marker_digest,
+                    response: None,
+                },
+            )
+            .is_some()
+        {
+            return Err(DirectWithdrawalError::ReplayBinding);
+        }
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &self.ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&processed),
+            &self.system_keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let mut journal = self.journal.clone();
+        let record = journal.append(
+            next_root,
+            &JournaledSystemCommand::DirectWithdrawalEffectNone {
+                request_id: request.request_id,
+                request_hash: request.request_hash,
+                operation: request.operation,
+                terminal_state: state,
+                result_commitment_sha256: result_commitment,
+                error_code: error_code.into(),
+            },
+        )?;
+        let receipt = self.receipt_signer.sign(
+            "direct-withdrawal-effect-none".into(),
+            request.request_id.hyphenated().to_string(),
+            Some(request.request_hash),
+            Some(false),
+            Some(result_commitment),
+            Some(true),
+            next_sequence,
+            self.state_root(),
+            next_root,
+            record.record_hash,
+            now_millis,
+        );
+        let projection_payload = request.canonical_payload.clone();
+        let stored = StoredDirectFinalResult {
+            account_id: request.account_id,
+            request_id: request.request_id,
+            request_hash: request.request_hash,
+            result: result.clone(),
+            request: Some(request.clone()),
+            projection_payload: projection_payload.clone(),
+            enclave_receipt: Some(receipt.clone()),
+            encrypted_journal_record: Some(record.clone()),
+            financial_replay_key_sha256: None,
+            withdrawal_authorization: None,
+            marker_format_version: 2,
+        };
+        stored.validate()?;
+        let mut direct_results = self.direct_final_results.clone();
+        if direct_results.0.insert(result_key, stored).is_some() {
+            return Err(DirectWithdrawalError::ReplayBinding);
+        }
+        direct_results.validate_rooted(&processed_hashes(&processed))?;
+        direct_results.validate_direct_withdrawal_records(
+            self.receipt_signer.verifying_key(),
+            &self.system_keys,
+        )?;
+        let response = DirectWithdrawalResponse {
+            request,
+            result,
+            enclave_receipt: receipt,
+            encrypted_journal_record: record,
+            projection_payload,
+            operation_replay_key_sha256: replay_key,
+            withdrawal_authorization: None,
+        };
+        validate_direct_withdrawal_response_bindings(
+            &response,
+            Some(self.receipt_signer.verifying_key()),
+        )?;
+        self.processed = processed;
+        self.direct_final_results = direct_results;
+        self.journal = journal;
+        self.sequence = next_sequence;
+        *self.custody_totals_cache.borrow_mut() = None;
+        Ok(DirectWithdrawalOutcome::EffectNone(response))
     }
 
     /// Produces the enclave-local idempotency successor for the direct commit
@@ -4694,6 +5928,10 @@ impl PrivateTradingCore {
                 &state.ledger,
             )
             .map_err(|_| CoreError::JournalChainMismatch)?;
+        state
+            .direct_final_results
+            .validate_direct_withdrawal_records(receipt_signer.verifying_key(), &state.system_keys)
+            .map_err(|_| CoreError::JournalChainMismatch)?;
         let processed: BTreeMap<String, ProcessedCommand> = state
             .processed_hashes
             .into_iter()
@@ -4987,6 +6225,13 @@ impl PrivateTradingCore {
                 self.receipt_signer.verifying_key(),
                 &state.system_keys,
                 &state.ledger,
+            )
+            .map_err(|_| CoreError::JournalChainMismatch)?;
+        state
+            .direct_final_results
+            .validate_direct_withdrawal_records(
+                self.receipt_signer.verifying_key(),
+                &state.system_keys,
             )
             .map_err(|_| CoreError::JournalChainMismatch)?;
         let processed: BTreeMap<String, ProcessedCommand> = state

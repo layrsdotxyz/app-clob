@@ -45,6 +45,7 @@ pub use engine::{
     CancelledOrderOutcome, CommandResult, CoreResponse, CustodyReconciliationSnapshot,
     DirectDepositCreditOutcome, DirectDepositCreditPayload, DirectDepositCreditResponse,
     DirectDepositEffectNoneResponse, DirectExecutionOperation, DirectExecutionRequestEnvelope,
+    DirectWithdrawalOutcome, DirectWithdrawalPayload, DirectWithdrawalResponse,
     ExactConditionResolutionStatement, ExactLive976CheckpointBinding, ExactLive976RestoreReport,
     ExactTerminalCategoryCounts, ExactTerminalCategoryDigests, ExactTerminalCategoryEquality,
     ExactTerminalSnapshotRestoreReport, FeeProfileId, MarketConfig, MarketExecution,
