@@ -2543,7 +2543,24 @@ mod direct_execution_contract_tests {
             other => panic!("unexpected outcome: {other:?}"),
         };
         let reserve_wire = reserved.signed_result_wire().unwrap();
-        assert!(reserved.withdrawal_authorization.is_some());
+        let authorization = reserved.withdrawal_authorization.clone().unwrap();
+        assert!(core
+            .validate_withdrawal_intent(&authorization.intent)
+            .is_ok());
+        let mut mismatched_intent = authorization.intent;
+        mismatched_intent.destination = "0x2222222222222222222222222222222222222222".into();
+        assert!(core.validate_withdrawal_intent(&mismatched_intent).is_err());
+        let reserve_snapshot = core.export_encrypted_snapshot().unwrap();
+        let restored_reserve = PrivateTradingCore::restore_encrypted_snapshot(
+            journal_key.clone(),
+            signer.clone(),
+            &reserve_snapshot,
+            0,
+        )
+        .unwrap();
+        assert!(restored_reserve
+            .validate_withdrawal_intent(&reserved.withdrawal_authorization.as_ref().unwrap().intent)
+            .is_ok());
         assert_eq!(core.balance(&available), 3_000_000);
         assert_eq!(core.balance(&hold), 2_000_000);
 
@@ -2577,6 +2594,9 @@ mod direct_execution_contract_tests {
             other => panic!("unexpected outcome: {other:?}"),
         };
         let finalize_wire = finalized.signed_result_wire().unwrap();
+        assert!(core
+            .validate_withdrawal_intent(&reserved.withdrawal_authorization.as_ref().unwrap().intent)
+            .is_err());
         assert_eq!(core.balance(&available), 3_000_000);
         assert_eq!(core.balance(&hold), 0);
 
@@ -7609,12 +7629,58 @@ impl PrivateTradingCore {
             &intent.amount_atomic,
             &intent.destination,
         )?;
-        if !self.system_keys.contains(&marker) {
-            return Err(CoreError::InvalidOrder(
-                "unknown withdrawal reservation".into(),
-            ));
+        if self.system_keys.contains(&marker) {
+            return Ok(());
         }
-        Ok(())
+        let reserve_key = direct_withdrawal_system_key(
+            DirectExecutionOperation::ReserveWithdrawal,
+            intent.withdrawal_id,
+        );
+        let reserve_replay_key = direct_withdrawal_operation_replay_key(
+            DirectExecutionOperation::ReserveWithdrawal,
+            intent.withdrawal_id,
+        );
+        let finalize_key = direct_withdrawal_system_key(
+            DirectExecutionOperation::FinalizeWithdrawal,
+            intent.withdrawal_id,
+        );
+        let release_key = direct_withdrawal_system_key(
+            DirectExecutionOperation::ReleaseWithdrawal,
+            intent.withdrawal_id,
+        );
+        let direct_reserve = self
+            .direct_withdrawal_result_by_replay_key(&reserve_replay_key)
+            .map_err(|_| CoreError::InvalidOrder("invalid direct withdrawal reservation".into()))?
+            .filter(|response| {
+                response.result.state == DirectExecutionTerminalState::Applied
+                    && response.request.operation == DirectExecutionOperation::ReserveWithdrawal
+            })
+            .and_then(|response| DirectWithdrawalPayload::decode_for(&response.request).ok())
+            .filter(|payload| {
+                payload.session_id == intent.session_id
+                    && payload.withdrawal_id == intent.withdrawal_id
+                    && payload.chain == intent.chain
+                    && payload.asset == intent.asset
+                    && payload.amount_atomic.to_string() == intent.amount_atomic
+                    && payload
+                        .destination
+                        .eq_ignore_ascii_case(&intent.destination)
+                    && self.system_keys.contains(&reserve_key)
+                    && !self.system_keys.contains(&finalize_key)
+                    && !self.system_keys.contains(&release_key)
+                    && self.ledger.balance(&AccountKey::new(
+                        derive_private_user_id(&self.identity_key, &payload.identity_commitment),
+                        AccountBucket::UserWithdrawalHold,
+                        &payload.asset,
+                    )) >= payload.amount_atomic
+            });
+        if direct_reserve.is_some() {
+            Ok(())
+        } else {
+            Err(CoreError::InvalidOrder(
+                "unknown withdrawal reservation".into(),
+            ))
+        }
     }
 
     /// Proves that a replacement authorization is a fresh, read-only recovery
