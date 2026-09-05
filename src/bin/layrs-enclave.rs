@@ -1757,6 +1757,13 @@ async fn handle_encrypted(
     };
     let snapshot_artifacts = match &response {
         PlainResponse::Snapshot { snapshot } => vec![snapshot.clone()],
+        // Exact replays and financial-key lookups return the original signed
+        // journal/receipt, but do not mutate the private core. The already
+        // archived committed snapshot is therefore the recovery artifact;
+        // exporting a freshly randomized encryption of the same head on every
+        // retry only amplifies immutable storage and churns the apparent
+        // latest copy.
+        _ if direct_execution_reuses_archived_snapshot(&response) => Vec::new(),
         PlainResponse::DirectDepositCredit { .. }
         | PlainResponse::DirectDepositCreditLookup { response: Some(_) }
         | PlainResponse::DirectWithdrawal { .. }
@@ -2386,6 +2393,19 @@ fn pending_preparation_blocks_request(
 
 fn requires_durable_preparation(has_journal_artifact: bool, direct_execution: bool) -> bool {
     has_journal_artifact && !direct_execution
+}
+
+fn direct_execution_reuses_archived_snapshot(response: &PlainResponse) -> bool {
+    matches!(
+        response,
+        PlainResponse::DirectDepositCredit {
+            outcome: DirectDepositCreditOutcome::ReturnOriginal(_),
+        } | PlainResponse::DirectDepositCreditLookup { response: Some(_) }
+            | PlainResponse::DirectWithdrawal {
+                outcome: DirectWithdrawalOutcome::ReturnOriginal(_),
+            }
+            | PlainResponse::DirectWithdrawalLookup { response: Some(_) }
+    )
 }
 
 fn direct_deposit_journal_artifact(response: &PlainResponse) -> Option<EncryptedJournalRecord> {
@@ -8317,7 +8337,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_deposit_wire_bypasses_pending_slot_and_reemits_restartable_sidecars() {
+    async fn direct_deposit_mutation_emits_snapshot_but_replay_and_lookup_reuse_it() {
         if !matches!(
             option_env!("LAYRS_DIRECT_DEPOSIT_CREDIT_ENABLED"),
             Some("1")
@@ -8435,6 +8455,7 @@ mod tests {
             direct_deposit_journal_artifact(&exact),
             Some(journal_artifact.clone())
         );
+        assert!(direct_execution_reuses_archived_snapshot(&exact));
 
         let lookup_command = OperatorCommand::DirectDepositCreditLookup {
             account_id: request.account_id,
@@ -8471,6 +8492,11 @@ mod tests {
             looked_up.signed_result_wire().unwrap(),
             applied.signed_result_wire().unwrap()
         );
+        assert!(direct_execution_reuses_archived_snapshot(
+            &PlainResponse::DirectDepositCreditLookup {
+                response: Some(looked_up.clone()),
+            }
+        ));
 
         let restored = PrivateTradingCore::restore_encrypted_snapshot(
             journal_key,
@@ -8490,7 +8516,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_withdrawal_reemits_restartable_sidecars() {
+    async fn direct_withdrawal_mutation_emits_snapshot_but_replay_and_lookup_reuse_it() {
         if !matches!(option_env!("LAYRS_DIRECT_WITHDRAWAL_ENABLED"), Some("1")) {
             return;
         }
@@ -8558,6 +8584,7 @@ mod tests {
             direct_deposit_receipt_artifact(&response),
             Some(applied.enclave_receipt.clone())
         );
+        assert!(!direct_execution_reuses_archived_snapshot(&response));
         let snapshot = state
             .core
             .as_ref()
@@ -8568,6 +8595,35 @@ mod tests {
         assert_eq!(
             snapshot.state_root,
             applied.encrypted_journal_record.state_root
+        );
+
+        let exact = dispatch_operator(
+            &mut state,
+            signed_operator_envelope(
+                &operator_signer,
+                [0x6a; 32],
+                OperatorCommand::DirectWithdrawal {
+                    request: reserve.clone(),
+                },
+            ),
+            Some(reserve.issued_at_millis + 2),
+        )
+        .await
+        .expect("direct withdrawal exact replay");
+        assert!(matches!(
+            &exact,
+            PlainResponse::DirectWithdrawal {
+                outcome: DirectWithdrawalOutcome::ReturnOriginal(_),
+            }
+        ));
+        assert!(direct_execution_reuses_archived_snapshot(&exact));
+        assert_eq!(
+            direct_deposit_journal_artifact(&exact),
+            Some(applied.encrypted_journal_record.clone())
+        );
+        assert_eq!(
+            direct_deposit_receipt_artifact(&exact),
+            Some(applied.enclave_receipt.clone())
         );
 
         let lookup = dispatch_operator(
@@ -8592,6 +8648,7 @@ mod tests {
             direct_deposit_receipt_artifact(&lookup),
             Some(applied.enclave_receipt.clone())
         );
+        assert!(direct_execution_reuses_archived_snapshot(&lookup));
     }
 
     #[test]
