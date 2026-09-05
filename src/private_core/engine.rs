@@ -1143,6 +1143,14 @@ enum JournaledSystemCommand {
         transaction_commitment: [u8; 32],
         raw_transaction_hex: String,
     },
+    ReplacePreparedWithdrawal {
+        idempotency_key: String,
+        withdrawal_id: Uuid,
+        prior_transaction_commitment: [u8; 32],
+        replacement_transaction_commitment: [u8; 32],
+        raw_transaction_hex: String,
+        chain_observation_commitment: [u8; 32],
+    },
     ResolveMarket {
         idempotency_key: String,
         resolution: MarketResolution,
@@ -3511,6 +3519,88 @@ impl PrivateTradingCore {
         Ok(())
     }
 
+    /// Proves that a replacement authorization is a fresh, read-only recovery
+    /// of the exact already-held withdrawal. It cannot authorize a new hold or
+    /// alter any of the original withdrawal invariants.
+    pub fn validate_withdrawal_replacement(
+        &self,
+        authorization: &WithdrawalAuthorization,
+        original_receipt_id: &str,
+        original_state_root: [u8; 32],
+        destination_commitment: [u8; 32],
+    ) -> CoreResult<()> {
+        let intent = &authorization.intent;
+        let proof = intent
+            .recovery_proof
+            .as_ref()
+            .ok_or_else(|| CoreError::InvalidOrder("missing withdrawal recovery proof".into()))?;
+        if intent.protocol_version != "layrs.withdrawal-recovery.v1"
+            || proof.protocol_version != "layrs.withdrawal-terminal-journal-proof.v1"
+        {
+            return Err(CoreError::InvalidOrder(
+                "invalid withdrawal recovery protocol".into(),
+            ));
+        }
+        let original = self
+            .processed
+            .get(&proof.original_idempotency_key)
+            .and_then(|processed| processed.response.as_ref())
+            .and_then(|response| response.withdrawal_authorization.as_ref())
+            .ok_or_else(|| CoreError::InvalidOrder("original withdrawal not found".into()))?;
+        if original.intent.protocol_version != "layrs.withdrawal.v1"
+            || original.intent.withdrawal_id != intent.withdrawal_id
+            || original.intent.session_id != intent.session_id
+            || original.intent.chain != intent.chain
+            || original.intent.asset != intent.asset
+            || original.intent.amount_atomic != intent.amount_atomic
+            || original.intent.destination != intent.destination
+            || original.intent.receipt_id != original_receipt_id
+            || original.intent.state_root != original_state_root
+        {
+            return Err(CoreError::InvalidOrder(
+                "withdrawal recovery binding mismatch".into(),
+            ));
+        }
+        let expected_destination_commitment: [u8; 32] = Sha256::new()
+            .chain_update(b"layrs.withdrawal-destination.v1\0")
+            .chain_update(intent.destination.to_lowercase().as_bytes())
+            .finalize()
+            .into();
+        if destination_commitment != expected_destination_commitment {
+            return Err(CoreError::InvalidOrder(
+                "withdrawal destination commitment mismatch".into(),
+            ));
+        }
+        let marker = withdrawal_reservation_marker(
+            &intent.session_id,
+            intent.withdrawal_id,
+            &intent.chain,
+            &intent.asset,
+            &intent.amount_atomic,
+            &intent.destination,
+        )?;
+        let owner = self
+            .sessions
+            .registered_owner(&intent.session_id)
+            .ok_or(CoreError::UnknownSession)?;
+        let amount = intent
+            .amount_atomic
+            .parse::<u128>()
+            .map_err(|_| CoreError::InvalidOrder("invalid withdrawal recovery amount".into()))?;
+        if !self.system_keys.contains(&marker)
+            || self.ledger.balance(&AccountKey::new(
+                owner,
+                AccountBucket::UserWithdrawalHold,
+                &intent.asset,
+            )) < amount
+        {
+            return Err(CoreError::InvalidOrder(
+                "withdrawal hold proof missing".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn prepared_withdrawal(&self, withdrawal_id: Uuid) -> Option<([u8; 32], String)> {
         let prefix = format!("prepared-withdrawal:{withdrawal_id}:");
         self.system_keys.iter().find_map(|key| {
@@ -3518,6 +3608,26 @@ impl PrivateTradingCore {
             let (commitment, raw) = value.split_once(':')?;
             let commitment: [u8; 32] = hex::decode(commitment).ok()?.try_into().ok()?;
             Some((commitment, raw.to_owned()))
+        })
+    }
+
+    pub fn prepared_withdrawal_replacement(
+        &self,
+        withdrawal_id: Uuid,
+    ) -> Option<([u8; 32], [u8; 32], [u8; 32])> {
+        let prefix = format!("replaced-withdrawal:{withdrawal_id}:");
+        self.system_keys.iter().find_map(|key| {
+            let value = key.strip_prefix(&prefix)?;
+            let mut parts = value.split(':');
+            let decode =
+                |part: &str| -> Option<[u8; 32]> { hex::decode(part).ok()?.try_into().ok() };
+            let prior = decode(parts.next()?)?;
+            let replacement = decode(parts.next()?)?;
+            let observation = decode(parts.next()?)?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some((prior, replacement, observation))
         })
     }
 
@@ -3580,6 +3690,107 @@ impl PrivateTradingCore {
         self.sequence = next_sequence;
         Ok(self.system_response(
             "prepare-withdrawal",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
+        ))
+    }
+
+    /// Atomically supersedes one exact prepared transaction. The per-
+    /// withdrawal replacement marker makes a second replacement impossible,
+    /// while exact replays return the already-recorded replacement upstream.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_prepared_withdrawal(
+        &mut self,
+        idempotency_key: String,
+        withdrawal_id: Uuid,
+        prior_transaction_commitment: [u8; 32],
+        replacement_transaction_commitment: [u8; 32],
+        raw_transaction_hex: String,
+        chain_observation_commitment: [u8; 32],
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        self.validate_new_system_key(&idempotency_key)?;
+        let (current_commitment, current_raw) = self
+            .prepared_withdrawal(withdrawal_id)
+            .ok_or_else(|| CoreError::InvalidOrder("prepared withdrawal not found".into()))?;
+        if current_commitment != prior_transaction_commitment
+            || chain_observation_commitment == [0; 32]
+            || replacement_transaction_commitment == prior_transaction_commitment
+            || !raw_transaction_hex.starts_with("0x02")
+            || raw_transaction_hex.len() < 100
+            || raw_transaction_hex.len() > 2_048
+            || !raw_transaction_hex[2..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(CoreError::InvalidOrder(
+                "invalid prepared withdrawal replacement".into(),
+            ));
+        }
+        let replacement_prefix = format!("replaced-withdrawal:{withdrawal_id}:");
+        if self
+            .system_keys
+            .iter()
+            .any(|key| key.starts_with(&replacement_prefix))
+        {
+            return Err(CoreError::InvalidOrder(
+                "withdrawal replacement already committed".into(),
+            ));
+        }
+        let prior_root = self.state_root();
+        let prior_marker = format!(
+            "prepared-withdrawal:{withdrawal_id}:{}:{current_raw}",
+            hex::encode(current_commitment),
+        );
+        let mut keys = self.system_keys.clone();
+        if !keys.remove(&prior_marker) {
+            return Err(CoreError::InvalidOrder(
+                "prepared withdrawal marker mismatch".into(),
+            ));
+        }
+        keys.insert(idempotency_key.clone());
+        keys.insert(format!(
+            "prepared-withdrawal:{withdrawal_id}:{}:{raw_transaction_hex}",
+            hex::encode(replacement_transaction_commitment),
+        ));
+        keys.insert(format!(
+            "replaced-withdrawal:{withdrawal_id}:{}:{}:{}",
+            hex::encode(prior_transaction_commitment),
+            hex::encode(replacement_transaction_commitment),
+            hex::encode(chain_observation_commitment),
+        ));
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &self.ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let entry = JournaledSystemCommand::ReplacePreparedWithdrawal {
+            idempotency_key: idempotency_key.clone(),
+            withdrawal_id,
+            prior_transaction_commitment,
+            replacement_transaction_commitment,
+            raw_transaction_hex,
+            chain_observation_commitment,
+        };
+        let record = self.journal.append(next_root, &entry)?;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            "replace-prepared-withdrawal",
             idempotency_key,
             prior_root,
             next_root,

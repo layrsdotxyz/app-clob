@@ -2743,7 +2743,7 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
         Some(([37u8; 32], raw_transaction)),
     );
     let snapshot = core.export_encrypted_snapshot().unwrap();
-    let restored = PrivateTradingCore::restore_encrypted_snapshot(
+    let mut restored = PrivateTradingCore::restore_encrypted_snapshot(
         JournalKey::from_bytes(journal_key),
         ReceiptSigner::generate([32u8; 48]),
         &snapshot,
@@ -2759,6 +2759,50 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
             .unwrap()
             .0,
         [37u8; 32]
+    );
+    let replacement_raw = format!("0x02{}", "22".repeat(80));
+    restored
+        .replace_prepared_withdrawal(
+            "withdrawal-replacement:00000000-0000-0000-0000-000000000023".into(),
+            authorization.intent.withdrawal_id,
+            [37u8; 32],
+            [38u8; 32],
+            replacement_raw.clone(),
+            [39u8; 32],
+            1_360,
+        )
+        .unwrap();
+    assert_eq!(
+        restored.prepared_withdrawal(authorization.intent.withdrawal_id),
+        Some(([38u8; 32], replacement_raw.clone())),
+    );
+    assert!(restored
+        .replace_prepared_withdrawal(
+            "withdrawal-replacement:second-attempt".into(),
+            authorization.intent.withdrawal_id,
+            [38u8; 32],
+            [40u8; 32],
+            format!("0x02{}", "33".repeat(80)),
+            [41u8; 32],
+            1_370,
+        )
+        .is_err());
+    let replaced_snapshot = restored.export_encrypted_snapshot().unwrap();
+    let restarted_after_replacement = PrivateTradingCore::restore_encrypted_snapshot(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([32u8; 48]),
+        &replaced_snapshot,
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        restarted_after_replacement.prepared_withdrawal(authorization.intent.withdrawal_id),
+        Some(([38u8; 32], replacement_raw)),
+    );
+    assert_eq!(
+        restarted_after_replacement
+            .prepared_withdrawal_replacement(authorization.intent.withdrawal_id),
+        Some(([37u8; 32], [38u8; 32], [39u8; 32])),
     );
     core.release_user_withdrawal(
         "sys:withdrawal-release:35".into(),
@@ -2920,6 +2964,7 @@ fn committed_withdrawal_authorization_recovers_exactly_after_restart_and_expiry(
     );
     let sequence = core.sequence();
     let state_root = core.state_root();
+    let original_authorization = committed.withdrawal_authorization.clone().unwrap();
     let terminal_record = committed.encrypted_record.clone().unwrap();
     let snapshot = core.export_encrypted_snapshot().unwrap();
 
@@ -2980,6 +3025,33 @@ fn committed_withdrawal_authorization_recovers_exactly_after_restart_and_expiry(
         journal_authorization.intent.protocol_version,
         "layrs.withdrawal-recovery.v1"
     );
+    let destination_commitment: [u8; 32] = Sha256::new()
+        .chain_update(b"layrs.withdrawal-destination.v1\0")
+        .chain_update(
+            journal_authorization
+                .intent
+                .destination
+                .to_lowercase()
+                .as_bytes(),
+        )
+        .finalize()
+        .into();
+    restored
+        .validate_withdrawal_replacement(
+            &journal_authorization,
+            &original_authorization.intent.receipt_id,
+            original_authorization.intent.state_root,
+            destination_commitment,
+        )
+        .unwrap();
+    assert!(restored
+        .validate_withdrawal_replacement(
+            &journal_authorization,
+            &original_authorization.intent.receipt_id,
+            original_authorization.intent.state_root,
+            [0; 32],
+        )
+        .is_err());
     let proof = journal_authorization.intent.recovery_proof.unwrap();
     assert_eq!(
         proof.original_idempotency_key,
