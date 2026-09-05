@@ -43,6 +43,8 @@ pub use engine::{
     BinanceResolutionStatement, BootstrapExecutionState, BootstrapExecutionView,
     BootstrapPreparedVenueOrder, BootstrapVenueIntent, BoundaryEvidence, CancelAllOrdersFilter,
     CancelledOrderOutcome, CommandResult, CoreResponse, CustodyReconciliationSnapshot,
+    DirectDepositCreditOutcome, DirectDepositCreditPayload, DirectDepositCreditResponse,
+    DirectDepositEffectNoneResponse, DirectExecutionOperation, DirectExecutionRequestEnvelope,
     ExactConditionResolutionStatement, ExactLive976CheckpointBinding, ExactLive976RestoreReport,
     ExactTerminalCategoryCounts, ExactTerminalCategoryDigests, ExactTerminalCategoryEquality,
     ExactTerminalSnapshotRestoreReport, FeeProfileId, MarketConfig, MarketExecution,
