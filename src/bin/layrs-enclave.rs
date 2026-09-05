@@ -40,10 +40,9 @@ use clob_service::private_core::{
     ReceiptSigner, RecoveryBridgeArtifact, ResolutionStatement, SignedAuditFillArtifact,
     SignedBinanceResolution, SignedExactConditionResolution, SignedPolymarketResolution,
     SignedResolution, SignedResolutionEvidence, SignedTaskQualificationArtifact, SystemResponse,
-    UserCommand, UserCommandAction, WithdrawalAuthorization, WithdrawalIntent,
-    EXACT_LIVE_976_RELEASE_COMMIT, INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX,
-    INCIDENT_TERMINAL_JOURNAL_HEAD_HEX, INCIDENT_TERMINAL_SEQUENCE,
-    INCIDENT_TERMINAL_STATE_ROOT_HEX,
+    UserCommand, UserCommandAction, WithdrawalAuthorization, EXACT_LIVE_976_RELEASE_COMMIT,
+    INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX, INCIDENT_TERMINAL_JOURNAL_HEAD_HEX,
+    INCIDENT_TERMINAL_SEQUENCE, INCIDENT_TERMINAL_STATE_ROOT_HEX,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use ethers_core::{
@@ -8713,7 +8712,7 @@ mod tests {
         let command = OperatorCommand::SignPoolWithdrawal {
             idempotency_key: "green-direct-withdrawal-sign".into(),
             authorization: WithdrawalAuthorization {
-                intent: WithdrawalIntent {
+                intent: clob_service::private_core::WithdrawalIntent {
                     protocol_version: "layrs.withdrawal.v1".into(),
                     withdrawal_id: Uuid::from_u128(0x71111111_1111_4111_8111_111111111111),
                     session_id: "green-direct-withdrawal-sign-session".into(),
