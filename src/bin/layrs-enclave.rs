@@ -33,14 +33,14 @@ use clob_service::private_core::{
     resolution_signing_payload, AccountKey, BinanceResolutionStatement, BootstrapExecutionState,
     BootstrapPreparedVenueOrder, CommandReceiptState, CommandResult, CoreResponse,
     CustodyReconciliationSnapshot, DirectDepositCreditOutcome, DirectDepositCreditResponse,
-    DirectExecutionRequestEnvelope, EnclaveReceipt, EncryptedJournalRecord, EncryptedSnapshot,
-    ExactConditionResolutionStatement, ExactTerminalSnapshotRestoreReport, ExternalFlowDirection,
-    FeeProfileId, JournalKey, MarketConfig, MarketExecution, OrderStatus,
-    PolymarketResolutionStatement, PrivateTradingCore, ReceiptSigner, RecoveryBridgeArtifact,
-    ResolutionStatement, SignedAuditFillArtifact, SignedBinanceResolution,
-    SignedExactConditionResolution, SignedPolymarketResolution, SignedResolution,
-    SignedResolutionEvidence, SignedTaskQualificationArtifact, SystemResponse, UserCommand,
-    UserCommandAction, WithdrawalAuthorization, EXACT_LIVE_976_RELEASE_COMMIT,
+    DirectExecutionRequestEnvelope, DirectWithdrawalOutcome, DirectWithdrawalResponse,
+    EnclaveReceipt, EncryptedJournalRecord, EncryptedSnapshot, ExactConditionResolutionStatement,
+    ExactTerminalSnapshotRestoreReport, ExternalFlowDirection, FeeProfileId, JournalKey,
+    MarketConfig, MarketExecution, OrderStatus, PolymarketResolutionStatement, PrivateTradingCore,
+    ReceiptSigner, RecoveryBridgeArtifact, ResolutionStatement, SignedAuditFillArtifact,
+    SignedBinanceResolution, SignedExactConditionResolution, SignedPolymarketResolution,
+    SignedResolution, SignedResolutionEvidence, SignedTaskQualificationArtifact, SystemResponse,
+    UserCommand, UserCommandAction, WithdrawalAuthorization, EXACT_LIVE_976_RELEASE_COMMIT,
     INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX, INCIDENT_TERMINAL_JOURNAL_HEAD_HEX,
     INCIDENT_TERMINAL_SEQUENCE, INCIDENT_TERMINAL_STATE_ROOT_HEX,
 };
@@ -348,6 +348,13 @@ enum OperatorCommand {
     DirectDepositCreditLookup {
         account_id: [u8; 32],
         financial_replay_key_sha256: [u8; 32],
+    },
+    DirectWithdrawal {
+        request: DirectExecutionRequestEnvelope,
+    },
+    DirectWithdrawalLookup {
+        account_id: [u8; 32],
+        operation_replay_key_sha256: [u8; 32],
     },
     RecoverWithdrawalAuthorization {
         withdrawal_id: uuid::Uuid,
@@ -911,6 +918,12 @@ enum PlainResponse {
     },
     DirectDepositCreditLookup {
         response: Option<DirectDepositCreditResponse>,
+    },
+    DirectWithdrawal {
+        outcome: DirectWithdrawalOutcome,
+    },
+    DirectWithdrawalLookup {
+        response: Option<DirectWithdrawalResponse>,
     },
     PreparedCommandStatus {
         state: &'static str,
@@ -2297,6 +2310,13 @@ fn direct_execution_request(state: &EnclaveState, request: &PlainRequest) -> boo
             Some("1")
         );
     }
+    if matches!(
+        request,
+        PlainRequest::Operator { envelope }
+            if direct_withdrawal_operator_command(&envelope.command)
+    ) {
+        return matches!(option_env!("LAYRS_DIRECT_WITHDRAWAL_ENABLED"), Some("1"));
+    }
     if !matches!(option_env!("LAYRS_DIRECT_BTC_EXECUTION_ENABLED"), Some("1")) {
         return false;
     }
@@ -2322,6 +2342,13 @@ fn direct_deposit_operator_command(command: &OperatorCommand) -> bool {
     )
 }
 
+fn direct_withdrawal_operator_command(command: &OperatorCommand) -> bool {
+    matches!(
+        command,
+        OperatorCommand::DirectWithdrawal { .. } | OperatorCommand::DirectWithdrawalLookup { .. }
+    )
+}
+
 /// A replay-key lookup reads an already authenticated terminal result and its
 /// original encrypted persistence evidence. It does not authorize a mutation,
 /// so an NSM clock outage must not make recovery unavailable.
@@ -2330,7 +2357,8 @@ fn request_requires_trusted_execution_time(request: &PlainRequest) -> bool {
         request,
         PlainRequest::Operator {
             envelope: OperatorEnvelope {
-                command: OperatorCommand::DirectDepositCreditLookup { .. },
+                command: OperatorCommand::DirectDepositCreditLookup { .. }
+                    | OperatorCommand::DirectWithdrawalLookup { .. },
                 ..
             }
         }
@@ -2366,6 +2394,16 @@ fn direct_deposit_journal_artifact(response: &PlainResponse) -> Option<Encrypted
         PlainResponse::DirectDepositCreditLookup {
             response: Some(response),
         } => Some(response.encrypted_journal_record.clone()),
+        PlainResponse::DirectWithdrawal { outcome } => Some(match outcome {
+            DirectWithdrawalOutcome::Applied(response)
+            | DirectWithdrawalOutcome::ReturnOriginal(response)
+            | DirectWithdrawalOutcome::EffectNone(response) => {
+                response.encrypted_journal_record.clone()
+            }
+        }),
+        PlainResponse::DirectWithdrawalLookup {
+            response: Some(response),
+        } => Some(response.encrypted_journal_record.clone()),
         _ => None,
     }
 }
@@ -2380,6 +2418,14 @@ fn direct_deposit_receipt_artifact(response: &PlainResponse) -> Option<EnclaveRe
             DirectDepositCreditOutcome::EffectNone(response) => response.enclave_receipt.clone(),
         }),
         PlainResponse::DirectDepositCreditLookup {
+            response: Some(response),
+        } => Some(response.enclave_receipt.clone()),
+        PlainResponse::DirectWithdrawal { outcome } => Some(match outcome {
+            DirectWithdrawalOutcome::Applied(response)
+            | DirectWithdrawalOutcome::ReturnOriginal(response)
+            | DirectWithdrawalOutcome::EffectNone(response) => response.enclave_receipt.clone(),
+        }),
+        PlainResponse::DirectWithdrawalLookup {
             response: Some(response),
         } => Some(response.enclave_receipt.clone()),
         _ => None,
@@ -3857,6 +3903,35 @@ async fn dispatch_operator(
                 .direct_deposit_credit_lookup(account_id, financial_replay_key_sha256)
                 .map_err(|error| error.to_string())?;
             Ok(PlainResponse::DirectDepositCreditLookup { response })
+        }
+        OperatorCommand::DirectWithdrawal { request } => {
+            if !matches!(option_env!("LAYRS_DIRECT_WITHDRAWAL_ENABLED"), Some("1")) {
+                return Err("DIRECT_WITHDRAWAL_DISABLED".into());
+            }
+            let now_millis =
+                verified_now_millis.ok_or_else(|| "TRUSTED_TIME_UNAVAILABLE".to_string())?;
+            let outcome = state
+                .core
+                .as_mut()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .direct_withdrawal(request, now_millis)
+                .map_err(|error| error.to_string())?;
+            Ok(PlainResponse::DirectWithdrawal { outcome })
+        }
+        OperatorCommand::DirectWithdrawalLookup {
+            account_id,
+            operation_replay_key_sha256,
+        } => {
+            if !matches!(option_env!("LAYRS_DIRECT_WITHDRAWAL_ENABLED"), Some("1")) {
+                return Err("DIRECT_WITHDRAWAL_DISABLED".into());
+            }
+            let response = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .direct_withdrawal_lookup(account_id, operation_replay_key_sha256)
+                .map_err(|error| error.to_string())?;
+            Ok(PlainResponse::DirectWithdrawalLookup { response })
         }
         OperatorCommand::RecoverWithdrawalAuthorization {
             withdrawal_id,
@@ -5660,6 +5735,8 @@ async fn dispatch_operator(
                 OperatorCommand::BeginProvision { .. }
                 | OperatorCommand::DirectCreditDeposit { .. }
                 | OperatorCommand::DirectDepositCreditLookup { .. }
+                | OperatorCommand::DirectWithdrawal { .. }
+                | OperatorCommand::DirectWithdrawalLookup { .. }
                 | OperatorCommand::BeginIncidentTerminalRestore { .. }
                 | OperatorCommand::RecoverWithdrawalAuthorization { .. }
                 | OperatorCommand::PreparedCommandStatus { .. }
