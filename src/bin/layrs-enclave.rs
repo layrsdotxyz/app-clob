@@ -1654,7 +1654,9 @@ async fn handle_encrypted(
         PlainResponse::User { response } => response.encrypted_record.clone().into_iter().collect(),
         PlainResponse::System { response } => vec![response.encrypted_record.clone()],
         PlainResponse::DirectDepositCredit { .. }
-        | PlainResponse::DirectDepositCreditLookup { response: Some(_) } => {
+        | PlainResponse::DirectDepositCreditLookup { response: Some(_) }
+        | PlainResponse::DirectWithdrawal { .. }
+        | PlainResponse::DirectWithdrawalLookup { response: Some(_) } => {
             direct_deposit_journal_artifact(&response)
                 .into_iter()
                 .collect()
@@ -1668,7 +1670,9 @@ async fn handle_encrypted(
     let snapshot_artifacts = match &response {
         PlainResponse::Snapshot { snapshot } => vec![snapshot.clone()],
         PlainResponse::DirectDepositCredit { .. }
-        | PlainResponse::DirectDepositCreditLookup { response: Some(_) } => match state
+        | PlainResponse::DirectDepositCreditLookup { response: Some(_) }
+        | PlainResponse::DirectWithdrawal { .. }
+        | PlainResponse::DirectWithdrawalLookup { response: Some(_) } => match state
             .core
             .as_ref()
             .and_then(|core| core.export_encrypted_snapshot().ok())
@@ -1712,7 +1716,9 @@ async fn handle_encrypted(
         PlainResponse::User { response } => vec![response.receipt.clone()],
         PlainResponse::System { response } => vec![response.receipt.clone()],
         PlainResponse::DirectDepositCredit { .. }
-        | PlainResponse::DirectDepositCreditLookup { response: Some(_) } => {
+        | PlainResponse::DirectDepositCreditLookup { response: Some(_) }
+        | PlainResponse::DirectWithdrawal { .. }
+        | PlainResponse::DirectWithdrawalLookup { response: Some(_) } => {
             direct_deposit_receipt_artifact(&response)
                 .into_iter()
                 .collect()
@@ -5796,8 +5802,9 @@ async fn write_frame(stream: &mut VsockStream, value: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use clob_service::private_core::{
-        DirectDepositCreditPayload, DirectExecutionOperation, ExactTerminalCategoryCounts,
-        ExactTerminalCategoryDigests, ExactTerminalCategoryEquality, FeeProfileId,
+        DirectDepositCreditPayload, DirectExecutionOperation, DirectWithdrawalPayload,
+        ExactTerminalCategoryCounts, ExactTerminalCategoryDigests, ExactTerminalCategoryEquality,
+        FeeProfileId,
     };
     use serde_cbor::Value;
     use std::collections::BTreeMap;
@@ -5851,6 +5858,41 @@ mod tests {
             issued_at_millis + 5_000,
         )
         .expect("valid direct deposit request")
+    }
+
+    fn direct_withdrawal_request_for_wire(
+        request_id: Uuid,
+        withdrawal_id: Uuid,
+        account_id: [u8; 32],
+        identity_commitment: [u8; 32],
+        issued_at_millis: i64,
+    ) -> DirectExecutionRequestEnvelope {
+        let payload = DirectWithdrawalPayload {
+            protocol_version: "layrs.direct-withdrawal.v1".into(),
+            withdrawal_id,
+            authenticated_subject_hash: account_id,
+            account_id,
+            identity_commitment,
+            session_id: "green-withdrawal-wire-session".into(),
+            chain: "base".into(),
+            asset: "USDC".into(),
+            amount_atomic: 1_000_000,
+            destination: "0x1111111111111111111111111111111111111111".into(),
+            evidence_hash: None,
+            funding_identity: format!("withdrawal:{withdrawal_id}"),
+        };
+        DirectExecutionRequestEnvelope::new(
+            request_id,
+            account_id,
+            account_id,
+            None,
+            Some(payload.funding_identity.clone()),
+            DirectExecutionOperation::ReserveWithdrawal,
+            serde_json::to_vec(&payload).expect("canonical direct withdrawal payload"),
+            issued_at_millis,
+            issued_at_millis + 5_000,
+        )
+        .expect("valid direct withdrawal request")
     }
 
     fn signed_operator_envelope(
@@ -7734,6 +7776,111 @@ mod tests {
         assert_eq!(
             restored_response.signed_result_wire().unwrap(),
             applied.signed_result_wire().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_withdrawal_reemits_restartable_sidecars() {
+        if !matches!(option_env!("LAYRS_DIRECT_WITHDRAWAL_ENABLED"), Some("1")) {
+            return;
+        }
+        let operator_signer = ed25519_dalek::SigningKey::from_bytes(&[0x61; 32]);
+        let journal_key = JournalKey::from_bytes([0x62; 32]);
+        let receipt_signer = ReceiptSigner::from_seed([0x63; 32], [0x64; 48]);
+        let receipt_public_key = receipt_signer.verifying_key();
+        let core = PrivateTradingCore::new(journal_key, receipt_signer);
+        let mut state =
+            direct_deposit_test_state(operator_signer.verifying_key(), receipt_public_key, core);
+        let account_id = [0x65; 32];
+        let identity_commitment = [0x66; 32];
+        let deposit = direct_deposit_request_for_wire(
+            Uuid::from_u128(0x61111111_1111_4111_8111_111111111111),
+            account_id,
+            identity_commitment,
+            1_800_100_000_000,
+        );
+        dispatch_operator(
+            &mut state,
+            signed_operator_envelope(
+                &operator_signer,
+                [0x67; 32],
+                OperatorCommand::DirectCreditDeposit {
+                    request: deposit.clone(),
+                },
+            ),
+            Some(deposit.issued_at_millis + 1),
+        )
+        .await
+        .expect("fund direct withdrawal fixture");
+
+        let withdrawal_id = Uuid::from_u128(0x62222222_2222_4222_8222_222222222222);
+        let reserve = direct_withdrawal_request_for_wire(
+            Uuid::from_u128(0x63333333_3333_4333_8333_333333333333),
+            withdrawal_id,
+            account_id,
+            identity_commitment,
+            deposit.deadline_millis + 1,
+        );
+        let response = dispatch_operator(
+            &mut state,
+            signed_operator_envelope(
+                &operator_signer,
+                [0x68; 32],
+                OperatorCommand::DirectWithdrawal {
+                    request: reserve.clone(),
+                },
+            ),
+            Some(reserve.issued_at_millis + 1),
+        )
+        .await
+        .expect("direct reserve dispatch");
+        let applied = match &response {
+            PlainResponse::DirectWithdrawal {
+                outcome: DirectWithdrawalOutcome::Applied(value),
+            } => value,
+            other => panic!("unexpected direct withdrawal response: {other:?}"),
+        };
+        assert_eq!(
+            direct_deposit_journal_artifact(&response),
+            Some(applied.encrypted_journal_record.clone())
+        );
+        assert_eq!(
+            direct_deposit_receipt_artifact(&response),
+            Some(applied.enclave_receipt.clone())
+        );
+        let snapshot = state
+            .core
+            .as_ref()
+            .expect("core")
+            .export_encrypted_snapshot()
+            .expect("withdrawal snapshot sidecar");
+        assert_eq!(snapshot.sequence, applied.encrypted_journal_record.sequence);
+        assert_eq!(
+            snapshot.state_root,
+            applied.encrypted_journal_record.state_root
+        );
+
+        let lookup = dispatch_operator(
+            &mut state,
+            signed_operator_envelope(
+                &operator_signer,
+                [0x69; 32],
+                OperatorCommand::DirectWithdrawalLookup {
+                    account_id,
+                    operation_replay_key_sha256: applied.operation_replay_key_sha256,
+                },
+            ),
+            None,
+        )
+        .await
+        .expect("direct withdrawal lookup");
+        assert_eq!(
+            direct_deposit_journal_artifact(&lookup),
+            Some(applied.encrypted_journal_record.clone())
+        );
+        assert_eq!(
+            direct_deposit_receipt_artifact(&lookup),
+            Some(applied.enclave_receipt.clone())
         );
     }
 
