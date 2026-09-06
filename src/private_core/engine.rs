@@ -20,8 +20,8 @@ use super::{
     EncryptedJournalRecord, EncryptedSnapshot, ExternalFlowDirection, ExternalFlowTransaction,
     Fill, JournalKey, Ledger, LedgerTransaction, MatchResult, MatchType, NormalFillPosting,
     OrderAction, OrderStatus, Outcome, PoolCashOpening, PriceTimeBook, PublicAssetTotal,
-    PublicBucketTotal, ReceiptSigner, ResolutionPayoutKind, SessionGuard, SignedSessionRequest,
-    TimeInForce, Transfer, VaultStrategyTransaction, VaultStrategyTransition, ReviewerEvent,
+    PublicBucketTotal, ReceiptSigner, ResolutionPayoutKind, ReviewerEvent, SessionGuard,
+    SignedSessionRequest, TimeInForce, Transfer, VaultStrategyTransaction, VaultStrategyTransition,
     PRICE_SCALE,
 };
 
@@ -8166,7 +8166,10 @@ impl PrivateTradingCore {
             idempotency_key,
             Some(command_commitment),
             Some(true),
-            Some(system_result_commitment("register-session", &record.record_hash)),
+            Some(system_result_commitment(
+                "register-session",
+                &record.record_hash,
+            )),
             Some(true),
             Some(reviewer_event("PRIVATE_SESSION_REGISTERED")),
             next_sequence,
@@ -11217,12 +11220,14 @@ impl PrivateTradingCore {
         let disclosure_nonce =
             self.receipt_signer
                 .result_disclosure_nonce(expected_hash, next_sequence, next_root);
-        // Every journaled user mutation is a reviewer-attestable v3 event. The
-        // result commitment remains encrypted/opaque, while the taxonomy below
-        // is intentionally redacted and public-safe.
-        let result_commitment = Some(
-            command_result_commitment(command_state, disclosure_nonce, &result)?
-        );
+        let reviewer_event = reviewer_event_for_user_command(&command.action, &result);
+        // Reviewer-attested state mutations retain the upstream v3 encrypted
+        // result commitment. Preview-only commands stay non-public v2.
+        let semantic_receipt = is_s08_semantic_result(&command.action, &result);
+        let v3_receipt = semantic_receipt || reviewer_event.is_some();
+        let result_commitment = v3_receipt
+            .then(|| command_result_commitment(command_state, disclosure_nonce, &result))
+            .transpose()?;
         // The leaf exposes only opaque commitments. A journal-committed FOK
         // rejection therefore remains safe to batch and can still be verified
         // after a governed receipt-key rotation.
@@ -11245,8 +11250,8 @@ impl PrivateTradingCore {
             Some(expected_hash),
             Some(publication_eligible),
             result_commitment,
-            Some(true),
-            Some(reviewer_event_for_user_command(&command.action, &result)),
+            v3_receipt.then_some(true),
+            reviewer_event,
             next_sequence,
             prior_root,
             next_root,
@@ -11510,7 +11515,10 @@ impl PrivateTradingCore {
                 &encrypted_record.record_hash,
             )),
             Some(true),
-            Some(system_result_commitment(command_id, &encrypted_record.record_hash)),
+            Some(system_result_commitment(
+                command_id,
+                &encrypted_record.record_hash,
+            )),
             Some(true),
             Some(reviewer_event),
             self.sequence,
@@ -11540,26 +11548,30 @@ fn reviewer_event(event_type: &str) -> ReviewerEvent {
 fn reviewer_event_for_user_command(
     action: &UserCommandAction,
     result: &CommandResult,
-) -> ReviewerEvent {
+) -> Option<ReviewerEvent> {
     let event_type = match action {
         UserCommandAction::SubmitOrder { .. } => match result {
             CommandResult::Order { result } if !result.fills.is_empty() => "ORDER_MATCHED",
             CommandResult::Order { .. } => "ORDER_ACCEPTED",
             _ => "ORDER_ACCEPTED",
         },
+        UserCommandAction::ReplaceOrder { .. } => "ORDER_REPLACED",
         UserCommandAction::CancelOrder { .. } => "ORDER_CANCELLED",
+        UserCommandAction::CancelAllOrders { .. } => "ORDERS_CANCELLED",
+        UserCommandAction::ClosePosition { .. } => "POSITION_CLOSED",
         UserCommandAction::CompleteSet { .. } => "COMPLETE_SET_EXECUTED",
         UserCommandAction::RequestRewardClaim { .. } => "REWARD_CLAIM_AUTHORIZED",
         UserCommandAction::CancelBootstrap { .. } => "BOOTSTRAP_CANCELLED",
         UserCommandAction::RequestWithdrawal { .. } => "WITHDRAWAL_RESERVED",
         UserCommandAction::TransferFunds { .. } => "FUNDS_TRANSFERRED",
-        // Read-only actions never receive a reviewer event because they do not
-        // change state and are not eligible for public root batching.
-        UserCommandAction::Portfolio
+        // Previews and read-only actions never receive a reviewer event because
+        // they do not perform an attestable state mutation.
+        UserCommandAction::PreviewPositionClose { .. }
+        | UserCommandAction::Portfolio
         | UserCommandAction::Rewards
-        | UserCommandAction::BootstrapStatus { .. } => "READ_ONLY",
+        | UserCommandAction::BootstrapStatus { .. } => return None,
     };
-    reviewer_event(event_type)
+    Some(reviewer_event(event_type))
 }
 
 fn reviewer_event_for_system_command(command_id: &str) -> ReviewerEvent {
