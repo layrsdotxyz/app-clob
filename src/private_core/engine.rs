@@ -21,7 +21,8 @@ use super::{
     Fill, JournalKey, Ledger, LedgerTransaction, MatchResult, MatchType, NormalFillPosting,
     OrderAction, OrderStatus, Outcome, PoolCashOpening, PriceTimeBook, PublicAssetTotal,
     PublicBucketTotal, ReceiptSigner, ResolutionPayoutKind, SessionGuard, SignedSessionRequest,
-    TimeInForce, Transfer, VaultStrategyTransaction, VaultStrategyTransition, PRICE_SCALE,
+    TimeInForce, Transfer, VaultStrategyTransaction, VaultStrategyTransition, ReviewerEvent,
+    PRICE_SCALE,
 };
 
 /// Public depth is deliberately less precise than the enclave's private book.
@@ -5399,6 +5400,7 @@ impl PrivateTradingCore {
             Some(false),
             Some(result.result_commitment_sha256),
             Some(true),
+            None,
             next_sequence,
             self.state_root(),
             next_root,
@@ -5594,9 +5596,10 @@ impl PrivateTradingCore {
             "direct-credit-deposit".into(),
             request.request_id.hyphenated().to_string(),
             Some(request.request_hash),
-            Some(false),
+            Some(true),
             Some(result_commitment),
             Some(true),
+            Some(reviewer_event("DEPOSIT_CREDITED")),
             next_sequence,
             prior_root,
             next_root,
@@ -7669,6 +7672,7 @@ impl PrivateTradingCore {
             Some(false),
             None,
             None,
+            None,
             self.sequence,
             root,
             root,
@@ -8162,8 +8166,9 @@ impl PrivateTradingCore {
             idempotency_key,
             Some(command_commitment),
             Some(true),
-            None,
-            None,
+            Some(system_result_commitment("register-session", &record.record_hash)),
+            Some(true),
+            Some(reviewer_event("PRIVATE_SESSION_REGISTERED")),
             next_sequence,
             prior_root,
             next_root,
@@ -8591,13 +8596,14 @@ impl PrivateTradingCore {
         self.sequence = next_sequence;
         // Keep the existing receipt command ID stable because the backend's
         // deterministic archive lookup uses this public protocol identifier.
-        Ok(self.system_response(
+        Ok(self.system_response_with_reviewer_event(
             "external-flow",
             idempotency_key,
             prior_root,
             next_root,
             record,
             now_millis,
+            reviewer_event("WITHDRAWAL_FINALIZED"),
         ))
     }
 
@@ -11207,10 +11213,12 @@ impl PrivateTradingCore {
         let disclosure_nonce =
             self.receipt_signer
                 .result_disclosure_nonce(expected_hash, next_sequence, next_root);
-        let semantic_receipt = is_s08_semantic_result(&command.action, &result);
-        let result_commitment = semantic_receipt
-            .then(|| command_result_commitment(command_state, disclosure_nonce, &result))
-            .transpose()?;
+        // Every journaled user mutation is a reviewer-attestable v3 event. The
+        // result commitment remains encrypted/opaque, while the taxonomy below
+        // is intentionally redacted and public-safe.
+        let result_commitment = Some(
+            command_result_commitment(command_state, disclosure_nonce, &result)?
+        );
         // The leaf exposes only opaque commitments. A journal-committed FOK
         // rejection therefore remains safe to batch and can still be verified
         // after a governed receipt-key rotation.
@@ -11233,7 +11241,8 @@ impl PrivateTradingCore {
             Some(expected_hash),
             Some(publication_eligible),
             result_commitment,
-            semantic_receipt.then_some(true),
+            Some(true),
+            Some(reviewer_event_for_user_command(&command.action, &result)),
             next_sequence,
             prior_root,
             next_root,
@@ -11390,6 +11399,7 @@ impl PrivateTradingCore {
             Some(false),
             None,
             None,
+            None,
             self.sequence,
             root,
             root,
@@ -11467,13 +11477,38 @@ impl PrivateTradingCore {
         encrypted_record: EncryptedJournalRecord,
         now_millis: i64,
     ) -> SystemResponse {
+        self.system_response_with_reviewer_event(
+            command_id,
+            idempotency_key,
+            prior_root,
+            state_root,
+            encrypted_record,
+            now_millis,
+            reviewer_event_for_system_command(command_id),
+        )
+    }
+
+    fn system_response_with_reviewer_event(
+        &self,
+        command_id: &str,
+        idempotency_key: String,
+        prior_root: [u8; 32],
+        state_root: [u8; 32],
+        encrypted_record: EncryptedJournalRecord,
+        now_millis: i64,
+        reviewer_event: ReviewerEvent,
+    ) -> SystemResponse {
         let receipt = self.receipt_signer.sign(
             command_id.into(),
             idempotency_key,
-            None,
-            None,
-            None,
-            None,
+            Some(system_receipt_commitment(
+                command_id,
+                &encrypted_record.record_hash,
+            )),
+            Some(true),
+            Some(system_result_commitment(command_id, &encrypted_record.record_hash)),
+            Some(true),
+            Some(reviewer_event),
             self.sequence,
             prior_root,
             state_root,
@@ -11489,6 +11524,75 @@ impl PrivateTradingCore {
             transfer_account: None,
         }
     }
+}
+
+fn reviewer_event(event_type: &str) -> ReviewerEvent {
+    ReviewerEvent {
+        event_type: event_type.into(),
+        status: "COMPLETED".into(),
+    }
+}
+
+fn reviewer_event_for_user_command(
+    action: &UserCommandAction,
+    result: &CommandResult,
+) -> ReviewerEvent {
+    let event_type = match action {
+        UserCommandAction::SubmitOrder { .. } => match result {
+            CommandResult::Order { result } if !result.fills.is_empty() => "ORDER_MATCHED",
+            CommandResult::Order { .. } => "ORDER_ACCEPTED",
+            _ => "ORDER_ACCEPTED",
+        },
+        UserCommandAction::CancelOrder { .. } => "ORDER_CANCELLED",
+        UserCommandAction::CompleteSet { .. } => "COMPLETE_SET_EXECUTED",
+        UserCommandAction::RequestRewardClaim { .. } => "REWARD_CLAIM_AUTHORIZED",
+        UserCommandAction::CancelBootstrap { .. } => "BOOTSTRAP_CANCELLED",
+        UserCommandAction::RequestWithdrawal { .. } => "WITHDRAWAL_RESERVED",
+        UserCommandAction::TransferFunds { .. } => "FUNDS_TRANSFERRED",
+        // Read-only actions never receive a reviewer event because they do not
+        // change state and are not eligible for public root batching.
+        UserCommandAction::Portfolio
+        | UserCommandAction::Rewards
+        | UserCommandAction::BootstrapStatus { .. } => "READ_ONLY",
+    };
+    reviewer_event(event_type)
+}
+
+fn reviewer_event_for_system_command(command_id: &str) -> ReviewerEvent {
+    let event_type = match command_id {
+        "trading-freeze" | "trading-unfreeze" => "TRADING_CONTROL_UPDATED",
+        "register-market" => "MARKET_REGISTERED",
+        "register-transfer-account" | "register-session" => "SIGNUP_REGISTERED",
+        "confirmed-deposit" => "DEPOSIT_CREDITED",
+        "external-flow" => "EXTERNAL_FLOW_RECORDED",
+        "accrue-reward" => "REWARD_ACCRUED",
+        "release-withdrawal" => "WITHDRAWAL_RELEASED",
+        "prepare-withdrawal" => "WITHDRAWAL_BROADCAST_PREPARED",
+        "resolve-market" => "MARKET_OUTCOME_RESOLVED",
+        "bootstrap-submitted" => "BOOTSTRAP_SUBMITTED",
+        "bootstrap-confirmed" => "BOOTSTRAP_CONFIRMED",
+        "bootstrap-failed" => "BOOTSTRAP_FAILED",
+        _ => "SYSTEM_MUTATION_COMPLETED",
+    };
+    reviewer_event(event_type)
+}
+
+fn system_receipt_commitment(command_id: &str, journal_hash: &[u8; 32]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.system-reviewer-receipt.v1\0");
+    hash.update((command_id.len() as u32).to_be_bytes());
+    hash.update(command_id.as_bytes());
+    hash.update(journal_hash);
+    hash.finalize().into()
+}
+
+fn system_result_commitment(command_id: &str, journal_hash: &[u8; 32]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.system-reviewer-result.v1\0");
+    hash.update((command_id.len() as u32).to_be_bytes());
+    hash.update(command_id.as_bytes());
+    hash.update(journal_hash);
+    hash.finalize().into()
 }
 
 fn system_command_commitment(command: &JournaledSystemCommand) -> CoreResult<[u8; 32]> {
