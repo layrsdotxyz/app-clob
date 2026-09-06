@@ -816,6 +816,7 @@ mod semantic_receipt_tests {
             Some(true),
             Some([6u8; 32]),
             Some(true),
+            None,
             7,
             [8u8; 32],
             [9u8; 32],
