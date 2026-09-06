@@ -962,6 +962,15 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
     assert_eq!(fill_response.receipt_state, CommandReceiptState::Filled);
     assert_eq!(fill_response.receipt.publication_eligible, Some(true));
     assert_eq!(
+        fill_response
+            .receipt
+            .reviewer_event
+            .as_ref()
+            .unwrap()
+            .event_type,
+        "ORDER_MATCHED"
+    );
+    assert_eq!(
         fill_response.receipt.command_commitment_sha256,
         Some(command_request_hash("cmd:buy", "idem:cmd:buy", &buy_action).unwrap())
     );
@@ -2692,8 +2701,12 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
         },
         1_300,
     );
-    assert_eq!(response.receipt.protocol_version, "layrs.v2");
+    assert_eq!(response.receipt.protocol_version, "layrs.v3");
     assert_eq!(response.receipt.publication_eligible, Some(true));
+    assert_eq!(
+        response.receipt.reviewer_event.as_ref().unwrap().event_type,
+        "WITHDRAWAL_RESERVED"
+    );
     assert!(response.encrypted_record.is_some());
     let public_receipt = serde_json::to_string(&response.receipt).unwrap();
     assert!(!public_receipt.contains("0x1111111111111111111111111111111111111111"));
@@ -3036,8 +3049,12 @@ fn registration_receipt_is_publication_eligible_private_and_identity_unique() {
         )
         .unwrap();
 
-    assert_eq!(first.receipt.protocol_version, "layrs.v2");
+    assert_eq!(first.receipt.protocol_version, "layrs.v3");
     assert_eq!(first.receipt.publication_eligible, Some(true));
+    assert_eq!(
+        first.receipt.reviewer_event.as_ref().unwrap().event_type,
+        "PRIVATE_SESSION_REGISTERED"
+    );
     assert!(first.receipt.command_commitment_sha256.is_some());
     let first_evidence = first.registration_evidence.unwrap();
     let second_evidence = second.registration_evidence.unwrap();
