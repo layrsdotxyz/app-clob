@@ -2303,6 +2303,7 @@ fn durable_control_request(request: &PlainRequest) -> bool {
                 | OperatorCommand::DelegatedPortfolioRead { .. }
                 | OperatorCommand::MarketStatus { .. }
                 | OperatorCommand::ResolutionReadiness { .. }
+                | OperatorCommand::TradingFreezeStatus
         ),
         PlainRequest::AggregateDepth { .. } => false,
     }
@@ -2571,6 +2572,13 @@ fn direct_quest_operator_command(command: &OperatorCommand) -> bool {
         | OperatorCommand::ResolutionReadiness { market_id, .. } => {
             recurring_crypto_window(market_id).is_some()
         }
+        OperatorCommand::TradingFreezeStatus => true,
+        OperatorCommand::SetTradingFreeze {
+            idempotency_key,
+            reason_commitment,
+            now_millis,
+            ..
+        } => direct_trading_freeze_control(idempotency_key, reason_commitment, *now_millis),
         OperatorCommand::SignResolutionEvidence { evidence, .. } => {
             recurring_crypto_window(unsigned_resolution_market_id(evidence)).is_some()
         }
@@ -2579,6 +2587,20 @@ fn direct_quest_operator_command(command: &OperatorCommand) -> bool {
         }
         _ => false,
     }
+}
+
+fn direct_trading_freeze_control(
+    idempotency_key: &str,
+    reason_commitment: &[u8; 32],
+    now_millis: i64,
+) -> bool {
+    let Some(digest) = idempotency_key.strip_prefix("trading-freeze:") else {
+        return false;
+    };
+    reason_commitment != &[0; 32]
+        && now_millis > 0
+        && digest.len() == 64
+        && digest == hex::encode(reason_commitment)
 }
 
 fn direct_base_usdc_withdrawal(action: &UserCommandAction) -> bool {
@@ -8861,6 +8883,57 @@ mod tests {
             },
         ] {
             assert!(direct_quest_operator_command(&command));
+        }
+
+        let freeze_reason = [0xabu8; 32];
+        let freeze_command = OperatorCommand::SetTradingFreeze {
+            idempotency_key: format!("trading-freeze:{}", hex::encode(freeze_reason)),
+            frozen: true,
+            reason_commitment: freeze_reason,
+            now_millis: 1,
+        };
+        assert!(direct_quest_operator_command(
+            &OperatorCommand::TradingFreezeStatus
+        ));
+        assert!(direct_quest_operator_command(&freeze_command));
+        let freeze_status_request = PlainRequest::Operator {
+            envelope: OperatorEnvelope {
+                nonce: [12; 32],
+                command: OperatorCommand::TradingFreezeStatus,
+                signature: Vec::new(),
+            },
+        };
+        assert!(durable_control_request(&freeze_status_request));
+        let freeze_request = PlainRequest::Operator {
+            envelope: OperatorEnvelope {
+                nonce: [13; 32],
+                command: freeze_command,
+                signature: Vec::new(),
+            },
+        };
+        assert!(!durable_control_request(&freeze_request));
+        assert!(request_requires_writer_authorization(&freeze_request));
+        for command in [
+            OperatorCommand::SetTradingFreeze {
+                idempotency_key: format!("trading-freeze:{}", hex::encode([0xcdu8; 32])),
+                frozen: true,
+                reason_commitment: freeze_reason,
+                now_millis: 1,
+            },
+            OperatorCommand::SetTradingFreeze {
+                idempotency_key: format!("trading-freeze:{}", hex::encode([0u8; 32])),
+                frozen: false,
+                reason_commitment: [0; 32],
+                now_millis: 1,
+            },
+            OperatorCommand::SetTradingFreeze {
+                idempotency_key: format!("trading-freeze:{}", hex::encode(freeze_reason)),
+                frozen: false,
+                reason_commitment: freeze_reason,
+                now_millis: 0,
+            },
+        ] {
+            assert!(!direct_quest_operator_command(&command));
         }
 
         let split_session_dust = OperatorCommand::CreditDeposit {
