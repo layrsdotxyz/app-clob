@@ -61,7 +61,7 @@ pub use engine::{
 };
 pub use journal::{
     command_result_commitment, CommandReceiptState, EnclaveReceipt, EncryptedJournal,
-    EncryptedJournalRecord, EncryptedSnapshot, JournalKey, ReceiptSigner,
+    EncryptedJournalRecord, EncryptedSnapshot, JournalKey, ReceiptSigner, ReviewerEvent,
 };
 #[allow(unused_imports)]
 pub use ledger::{
