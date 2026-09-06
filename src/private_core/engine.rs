@@ -5988,6 +5988,10 @@ impl PrivateTradingCore {
         now_millis: i64,
     ) -> CoreResult<SystemResponse> {
         self.validate_new_system_key(&idempotency_key)?;
+        let reviewer_command_id = match direction {
+            ExternalFlowDirection::Inflow => "deposit-credited",
+            ExternalFlowDirection::Outflow => "withdrawal-finalized",
+        };
         let prior_root = self.state_root();
         let flow = ExternalFlowTransaction {
             idempotency_key: format!("flow:{idempotency_key}"),
@@ -6025,7 +6029,7 @@ impl PrivateTradingCore {
         self.system_keys = keys;
         self.sequence = next_sequence;
         Ok(self.system_response(
-            "external-flow",
+            reviewer_command_id,
             idempotency_key,
             prior_root,
             next_root,
@@ -8854,7 +8858,8 @@ fn reviewer_event_for_system_command(command_id: &str) -> ReviewerEvent {
         "trading-freeze" | "trading-unfreeze" => "TRADING_CONTROL_UPDATED",
         "register-market" => "MARKET_REGISTERED",
         "register-transfer-account" | "register-session" => "SIGNUP_REGISTERED",
-        "confirmed-deposit" => "DEPOSIT_CREDITED",
+        "confirmed-deposit" | "deposit-credited" => "DEPOSIT_CREDITED",
+        "withdrawal-finalized" => "WITHDRAWAL_FINALIZED",
         "external-flow" => "EXTERNAL_FLOW_RECORDED",
         "accrue-reward" => "REWARD_ACCRUED",
         "release-withdrawal" => "WITHDRAWAL_RELEASED",
