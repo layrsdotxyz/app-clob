@@ -1624,6 +1624,7 @@ async fn handle_encrypted(
                 Some(false),
                 result_commitment,
                 semantic_receipt.then_some(false),
+                None,
                 core.sequence(),
                 root,
                 root,
