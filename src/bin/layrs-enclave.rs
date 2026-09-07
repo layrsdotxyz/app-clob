@@ -2522,6 +2522,33 @@ fn direct_execution_request(state: &EnclaveState, request: &PlainRequest) -> boo
         // coupled to an unrelated legacy Durable preparation.
         return true;
     }
+    #[cfg(feature = "green-pool-certification")]
+    if matches!(
+        request,
+        PlainRequest::Operator { envelope }
+            if matches!(&envelope.command,
+                OperatorCommand::RegisterSession {
+                    idempotency_key,
+                    session_id,
+                    identity_commitment,
+                    public_key,
+                    expires_at_millis,
+                    now_millis,
+                } if green_e03s05_session_renewal(
+                    idempotency_key,
+                    session_id,
+                    identity_commitment,
+                    public_key,
+                    *expires_at_millis,
+                    *now_millis,
+                )
+            )
+    ) {
+        // The exact one-shot fixture renewal must not inherit the global
+        // Durable writer fence. The Green request firewall independently
+        // checks the same closed tuple before this direct classification.
+        return true;
+    }
     if matches!(
         request,
         PlainRequest::Operator { envelope }
@@ -8708,6 +8735,14 @@ mod tests {
             &state,
             &operator_request(session_renewal())
         ));
+        let direct_session_renewal = operator_request(session_renewal());
+        assert!(direct_execution_request(&state, &direct_session_renewal));
+        assert!(!pending_preparation_blocks_request(
+            true,
+            &direct_session_renewal,
+            true
+        ));
+        assert!(!requires_durable_preparation(true, true));
         for rejected in [
             OperatorCommand::RegisterSession {
                 idempotency_key: "other-session-renew:v1".into(),
@@ -8749,11 +8784,21 @@ mod tests {
                 expires_at_millis: GREEN_E03S05_SESSION_RENEWAL_EXPIRES_AT_MILLIS - 1,
                 now_millis: GREEN_E03S05_SESSION_RENEWAL_NOW_MILLIS,
             },
+            OperatorCommand::RegisterSession {
+                idempotency_key: GREEN_E03S05_SESSION_RENEWAL_IDEMPOTENCY_KEY.into(),
+                session_id: GREEN_E03S05_SESSION_ID.into(),
+                identity_commitment: GREEN_E03S05_IDENTITY,
+                public_key: GREEN_E03S05_SESSION_PUBLIC_KEY,
+                expires_at_millis: GREEN_E03S05_SESSION_RENEWAL_EXPIRES_AT_MILLIS,
+                now_millis: GREEN_E03S05_SESSION_RENEWAL_NOW_MILLIS + 1,
+            },
         ] {
+            let rejected_request = operator_request(rejected);
             assert!(!green_pool_certification_request_allowed(
                 &state,
-                &operator_request(rejected)
+                &rejected_request
             ));
+            assert!(!direct_execution_request(&state, &rejected_request));
         }
 
         assert!(green_pool_certification_request_allowed(
