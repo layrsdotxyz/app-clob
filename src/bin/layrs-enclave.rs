@@ -1739,9 +1739,7 @@ async fn handle_encrypted(
         _ => Vec::new(),
     };
     let preparation_supersession = match &response {
-        PlainResponse::PreparedCommandSuperseded { certificate } => {
-            Some(certificate.clone())
-        }
+        PlainResponse::PreparedCommandSuperseded { certificate } => Some(certificate.clone()),
         _ => None,
     };
     let encoded = match serde_json::to_vec(&response)
@@ -1984,13 +1982,9 @@ async fn handle_encrypted(
                 }
             }
             if let Some(certificate) = preparation_supersession {
-                if !state
-                    .pending_preparation
-                    .as_ref()
-                    .is_some_and(|pending| {
-                        pending.preparation.preparation_id == certificate.preparation_id
-                    })
-                {
+                if !state.pending_preparation.as_ref().is_some_and(|pending| {
+                    pending.preparation.preparation_id == certificate.preparation_id
+                }) {
                     return rollback_wire_error(
                         &mut state,
                         &mut rollback_core,

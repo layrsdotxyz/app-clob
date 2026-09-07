@@ -6020,7 +6020,8 @@ fn reviewer_event_for_system_command(command_id: &str) -> ReviewerEvent {
     let event_type = match command_id {
         "trading-freeze" | "trading-unfreeze" => "TRADING_CONTROL_UPDATED",
         "register-market" => "MARKET_REGISTERED",
-        "register-transfer-account" | "register-session" => "SIGNUP_REGISTERED",
+        "register-transfer-account" => "SIGNUP_REGISTERED",
+        "register-session" => "PRIVATE_SESSION_REGISTERED",
         "confirmed-deposit" | "deposit-credited" => "DEPOSIT_CREDITED",
         "withdrawal-finalized" => "WITHDRAWAL_FINALIZED",
         "external-flow" => "EXTERNAL_FLOW_RECORDED",
