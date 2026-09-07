@@ -53,7 +53,7 @@ use clob_service::private_core::{
 use clob_service::private_core::{
     DirectDepositCreditPayload, DirectExecutionOperation, DirectWithdrawalPayload,
     GreenE03s05TestCapitalBinding, GreenE03s05TestCapitalOutcome, GreenE03s05TestCapitalPayload,
-    GreenNativeRefundCompletion, GreenNativeRefundTerminalTransaction,
+    GreenNativeRefundCompletion, GreenNativeRefundTerminalTransaction, GREEN_E03S05_WITHDRAWAL_ID,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use ethers_core::{
@@ -2690,6 +2690,7 @@ fn green_base_usdc_withdrawal_request(request: &DirectExecutionRequestEnvelope) 
             payload.chain == "base"
                 && payload.asset == "USDC"
                 && payload.amount_atomic == 20_000_000
+                && payload.withdrawal_id == GREEN_E03S05_WITHDRAWAL_ID
                 && payload.authenticated_subject_hash == GREEN_E03S05_ACCOUNT_AND_AUTH
                 && payload.account_id == GREEN_E03S05_ACCOUNT_AND_AUTH
                 && payload.identity_commitment == GREEN_E03S05_IDENTITY
@@ -8560,7 +8561,7 @@ mod tests {
             DirectDepositCreditOutcome::Applied(response) => response.financial_replay_key_sha256,
             other => panic!("unexpected ZEN deposit outcome: {other:?}"),
         };
-        let withdrawal_id = Uuid::from_u128(0x72222222_2222_4222_8222_222222222222);
+        let withdrawal_id = GREEN_E03S05_WITHDRAWAL_ID;
         let direct_withdrawal_payload = DirectWithdrawalPayload {
             protocol_version: "layrs.direct-withdrawal.v1".into(),
             withdrawal_id,
@@ -8660,6 +8661,30 @@ mod tests {
             &state,
             &operator_request(OperatorCommand::DirectWithdrawal {
                 request: direct_withdrawal.clone(),
+            })
+        ));
+        let mut wrong_withdrawal_id_payload: DirectWithdrawalPayload =
+            serde_json::from_slice(&direct_withdrawal.canonical_payload).unwrap();
+        wrong_withdrawal_id_payload.withdrawal_id =
+            Uuid::from_u128(0x72222222_2222_4222_8222_222222222222);
+        wrong_withdrawal_id_payload.funding_identity =
+            format!("withdrawal:{}", wrong_withdrawal_id_payload.withdrawal_id);
+        let wrong_withdrawal_id = DirectExecutionRequestEnvelope::new(
+            Uuid::from_u128(0x72333333_3333_4333_8333_333333333333),
+            GREEN_E03S05_ACCOUNT_AND_AUTH,
+            GREEN_E03S05_ACCOUNT_AND_AUTH,
+            None,
+            Some(wrong_withdrawal_id_payload.funding_identity.clone()),
+            DirectExecutionOperation::ReserveWithdrawal,
+            serde_json::to_vec(&wrong_withdrawal_id_payload).unwrap(),
+            1_800_000_000_000,
+            1_800_000_005_000,
+        )
+        .unwrap();
+        assert!(!green_pool_certification_request_allowed(
+            &state,
+            &operator_request(OperatorCommand::DirectWithdrawal {
+                request: wrong_withdrawal_id,
             })
         ));
         assert!(green_pool_certification_request_allowed(

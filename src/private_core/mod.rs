@@ -64,7 +64,7 @@ pub use engine::{
 pub use engine::{
     GreenE03s05TestCapitalBinding, GreenE03s05TestCapitalOutcome, GreenE03s05TestCapitalPayload,
     GreenE03s05TestCapitalResponse, GreenNativeRefundCompletion,
-    GreenNativeRefundTerminalTransaction,
+    GreenNativeRefundTerminalTransaction, GREEN_E03S05_WITHDRAWAL_ID,
 };
 pub use journal::{
     command_result_commitment, CommandReceiptState, EnclaveReceipt, EncryptedJournal,
