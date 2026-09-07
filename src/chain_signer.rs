@@ -87,6 +87,20 @@ pub struct GreenPoolSeedTransaction {
 }
 
 #[cfg(feature = "green-pool-certification")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GreenNativeRefundTransaction {
+    pub chain: String,
+    pub chain_id: u64,
+    pub asset: String,
+    pub signer: String,
+    pub destination: String,
+    pub amount_wei: String,
+    pub nonce: u64,
+    pub transaction_hash: String,
+    pub raw_transaction_hex: String,
+}
+
+#[cfg(feature = "green-pool-certification")]
 pub const GREEN_BASE_SIGNER: &str = "0x022b437e2324fac913d616b77ca5178ee91985a0";
 #[cfg(feature = "green-pool-certification")]
 pub const GREEN_BASE_CURRENT_POOL: &str = "0xe3f0813e8fbc707251e8446cc03812c7c60b88e7";
@@ -104,6 +118,12 @@ pub const GREEN_POOL_SEED_GAS_LIMIT: u64 = 80_000;
 pub const GREEN_POOL_SEED_MAX_FEE_PER_GAS_WEI: &str = "11000000";
 #[cfg(feature = "green-pool-certification")]
 pub const GREEN_POOL_SEED_MAX_PRIORITY_FEE_PER_GAS_WEI: &str = "1000000";
+#[cfg(feature = "green-pool-certification")]
+pub const GREEN_NATIVE_REFUND_NONCE: u64 = 1;
+#[cfg(feature = "green-pool-certification")]
+pub const GREEN_NATIVE_REFUND_GAS_LIMIT: u64 = 21_000;
+#[cfg(feature = "green-pool-certification")]
+pub const GREEN_NATIVE_REFUND_BALANCE_CEILING_WEI: &str = "2011680997104910";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketResolutionTransaction {
@@ -379,6 +399,106 @@ impl EnclaveChainSigner {
             max_priority_fee_per_gas_wei,
         )
         .await
+    }
+
+    /// Signs only a plain Base-native transfer from the one-off Green signer.
+    /// The caller-supplied Relay deposit address and amount are covered by the
+    /// independently signed operator intent; this lower layer additionally
+    /// fixes the signer, chain, nonce, calldata shape and original balance cap.
+    #[cfg(feature = "green-pool-certification")]
+    pub async fn sign_green_native_refund(
+        &self,
+        destination: &str,
+        amount_wei: &str,
+        nonce: u64,
+        gas_limit: u64,
+        max_fee_per_gas_wei: &str,
+        max_priority_fee_per_gas_wei: &str,
+    ) -> Result<GreenNativeRefundTransaction, String> {
+        self.assert_green_destination_binding()?;
+        self.sign_green_native_refund_with_policy(
+            GREEN_BASE_SIGNER,
+            GREEN_NATIVE_REFUND_BALANCE_CEILING_WEI,
+            destination,
+            amount_wei,
+            nonce,
+            gas_limit,
+            max_fee_per_gas_wei,
+            max_priority_fee_per_gas_wei,
+        )
+        .await
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    #[allow(clippy::too_many_arguments)]
+    async fn sign_green_native_refund_with_policy(
+        &self,
+        expected_signer: &str,
+        balance_ceiling_wei: &str,
+        destination: &str,
+        amount_wei: &str,
+        nonce: u64,
+        gas_limit: u64,
+        max_fee_per_gas_wei: &str,
+        max_priority_fee_per_gas_wei: &str,
+    ) -> Result<GreenNativeRefundTransaction, String> {
+        let domain = self
+            .domains
+            .get("base")
+            .ok_or_else(|| "GREEN_BASE_SIGNER_NOT_CONFIGURED".to_string())?;
+        let signer = format!("{:#x}", domain.ledger_wallet.address());
+        if signer != expected_signer {
+            return Err("GREEN_NATIVE_REFUND_SIGNER_MISMATCH".into());
+        }
+        let destination = parse_nonzero_address(destination)?;
+        if nonce != GREEN_NATIVE_REFUND_NONCE || gas_limit != GREEN_NATIVE_REFUND_GAS_LIMIT {
+            return Err("GREEN_NATIVE_REFUND_TRANSACTION_BOUNDS_INVALID".into());
+        }
+        let amount = U256::from_dec_str(amount_wei)
+            .map_err(|_| "GREEN_NATIVE_REFUND_AMOUNT_INVALID".to_string())?;
+        let max_fee = U256::from_dec_str(max_fee_per_gas_wei)
+            .map_err(|_| "GREEN_NATIVE_REFUND_FEE_INVALID".to_string())?;
+        let priority_fee = U256::from_dec_str(max_priority_fee_per_gas_wei)
+            .map_err(|_| "GREEN_NATIVE_REFUND_FEE_INVALID".to_string())?;
+        let balance_ceiling = U256::from_dec_str(balance_ceiling_wei)
+            .map_err(|_| "GREEN_NATIVE_REFUND_POLICY_INVALID".to_string())?;
+        let maximum_gas_cost = max_fee.saturating_mul(U256::from(gas_limit));
+        if amount.is_zero()
+            || max_fee.is_zero()
+            || priority_fee > max_fee
+            || amount.saturating_add(maximum_gas_cost) > balance_ceiling
+        {
+            return Err("GREEN_NATIVE_REFUND_BOUNDS_INVALID".into());
+        }
+        let transaction = TypedTransaction::Eip1559(Eip1559TransactionRequest {
+            from: Some(domain.ledger_wallet.address()),
+            to: Some(NameOrAddress::Address(destination)),
+            gas: Some(gas_limit.into()),
+            value: Some(amount),
+            data: Some(Bytes::default()),
+            nonce: Some(nonce.into()),
+            access_list: Default::default(),
+            max_priority_fee_per_gas: Some(priority_fee),
+            max_fee_per_gas: Some(max_fee),
+            chain_id: Some(8_453u64.into()),
+        });
+        let signature = domain
+            .ledger_wallet
+            .sign_transaction(&transaction)
+            .await
+            .map_err(|_| "GREEN_NATIVE_REFUND_SIGNING_FAILED".to_string())?;
+        let raw = transaction.rlp_signed(&signature);
+        Ok(GreenNativeRefundTransaction {
+            chain: "base".into(),
+            chain_id: 8_453,
+            asset: "ETH".into(),
+            signer,
+            destination: format!("{destination:#x}"),
+            amount_wei: amount_wei.into(),
+            nonce,
+            transaction_hash: format!("0x{}", hex::encode(keccak256(&raw))),
+            raw_transaction_hex: format!("0x{}", hex::encode(raw)),
+        })
     }
 
     #[cfg(feature = "green-pool-certification")]
@@ -1173,6 +1293,109 @@ mod tests {
         .expect("restart deterministic seed");
         assert_eq!(first.transaction_hash, after_restart.transaction_hash);
         assert_eq!(first.raw_transaction_hex, after_restart.raw_transaction_hex);
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    async fn green_test_native_refund(
+        signer: &EnclaveChainSigner,
+        expected_signer: &str,
+        destination: &str,
+        amount: &str,
+        nonce: u64,
+        gas: u64,
+    ) -> Result<GreenNativeRefundTransaction, String> {
+        signer
+            .sign_green_native_refund_with_policy(
+                expected_signer,
+                "2011680997104910",
+                destination,
+                amount,
+                nonce,
+                gas,
+                "5000000",
+                "1000000",
+            )
+            .await
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    #[tokio::test]
+    async fn green_native_refund_is_plain_bounded_and_restart_deterministic() {
+        let signer = test_signer();
+        let expected_signer = signer.bridge_approval_signers()["base"].clone();
+        let destination = "0x3333333333333333333333333333333333333333";
+        let amount = "1900000000000000";
+
+        let first = green_test_native_refund(
+            &signer,
+            &expected_signer,
+            destination,
+            amount,
+            GREEN_NATIVE_REFUND_NONCE,
+            GREEN_NATIVE_REFUND_GAS_LIMIT,
+        )
+        .await
+        .expect("bounded native refund");
+        assert_eq!(first.chain_id, 8_453);
+        assert_eq!(first.asset, "ETH");
+        assert_eq!(first.destination, destination);
+        assert_eq!(first.amount_wei, amount);
+        assert_eq!(first.nonce, 1);
+        assert!(first.raw_transaction_hex.starts_with("0x02"));
+
+        let restarted = test_signer();
+        let replay = green_test_native_refund(
+            &restarted,
+            &expected_signer,
+            destination,
+            amount,
+            GREEN_NATIVE_REFUND_NONCE,
+            GREEN_NATIVE_REFUND_GAS_LIMIT,
+        )
+        .await
+        .expect("restart refund");
+        assert_eq!(first.transaction_hash, replay.transaction_hash);
+        assert_eq!(first.raw_transaction_hex, replay.raw_transaction_hex);
+
+        assert_eq!(
+            green_test_native_refund(
+                &signer,
+                &expected_signer,
+                destination,
+                amount,
+                2,
+                GREEN_NATIVE_REFUND_GAS_LIMIT,
+            )
+            .await
+            .unwrap_err(),
+            "GREEN_NATIVE_REFUND_TRANSACTION_BOUNDS_INVALID"
+        );
+        assert_eq!(
+            green_test_native_refund(
+                &signer,
+                &expected_signer,
+                destination,
+                amount,
+                GREEN_NATIVE_REFUND_NONCE,
+                GREEN_NATIVE_REFUND_GAS_LIMIT + 1,
+            )
+            .await
+            .unwrap_err(),
+            "GREEN_NATIVE_REFUND_TRANSACTION_BOUNDS_INVALID"
+        );
+        assert_eq!(
+            green_test_native_refund(
+                &signer,
+                &expected_signer,
+                destination,
+                "2011680997104910",
+                GREEN_NATIVE_REFUND_NONCE,
+                GREEN_NATIVE_REFUND_GAS_LIMIT,
+            )
+            .await
+            .unwrap_err(),
+            "GREEN_NATIVE_REFUND_BOUNDS_INVALID"
+        );
     }
 
     #[test]

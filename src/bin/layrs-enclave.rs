@@ -24,8 +24,8 @@ use clob_service::chain_signer::{
 };
 #[cfg(feature = "green-pool-certification")]
 use clob_service::chain_signer::{
-    GreenPoolSeedTransaction, GREEN_BASE_CURRENT_POOL, GREEN_BASE_DESTINATION_POOL,
-    GREEN_BASE_SIGNER, GREEN_BASE_USDC, GREEN_POOL_SEED_AMOUNT_ATOMIC,
+    GreenNativeRefundTransaction, GreenPoolSeedTransaction, GREEN_BASE_CURRENT_POOL,
+    GREEN_BASE_DESTINATION_POOL, GREEN_BASE_SIGNER, GREEN_BASE_USDC, GREEN_POOL_SEED_AMOUNT_ATOMIC,
 };
 use clob_service::polymarket_enclave::{
     EnclavePolymarketClient, PolymarketSecretBundle, PreparedPolymarketOrder,
@@ -377,6 +377,31 @@ struct GreenPoolTransitionAuthorization {
 }
 
 #[cfg(feature = "green-pool-certification")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GreenNativeRefundIntent {
+    protocol_version: String,
+    operation_id: String,
+    source_signer: String,
+    relay_request_id: String,
+    relay_deposit_address: String,
+    final_recipient: String,
+    destination_chain_id: u64,
+    destination_asset: String,
+    amount_wei: String,
+    expires_at_millis: i64,
+}
+
+#[cfg(feature = "green-pool-certification")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GreenNativeRefundAuthorization {
+    #[serde(flatten)]
+    intent: GreenNativeRefundIntent,
+    signature: Vec<u8>,
+}
+
+#[cfg(feature = "green-pool-certification")]
 const GREEN_E03S05_ACCOUNT_AND_AUTH: [u8; 32] = [
     0xc2, 0x49, 0xef, 0x78, 0x7a, 0xe1, 0x9c, 0x8a, 0x93, 0x01, 0xcb, 0x6c, 0x00, 0x61, 0x09, 0xe2,
     0x40, 0xe8, 0xc2, 0x4e, 0x8b, 0xf7, 0x14, 0xed, 0x97, 0x40, 0x96, 0x6d, 0xa6, 0x3a, 0x8d, 0xb7,
@@ -498,6 +523,15 @@ enum OperatorCommand {
     #[cfg(feature = "green-pool-certification")]
     SignGreenPoolSeed {
         authorization: GreenPoolTransitionAuthorization,
+        nonce: u64,
+        gas_limit: u64,
+        max_fee_per_gas_wei: String,
+        max_priority_fee_per_gas_wei: String,
+        now_millis: i64,
+    },
+    #[cfg(feature = "green-pool-certification")]
+    SignGreenBaseNativeRefund {
+        authorization: GreenNativeRefundAuthorization,
         nonce: u64,
         gas_limit: u64,
         max_fee_per_gas_wei: String,
@@ -1056,6 +1090,15 @@ enum PlainResponse {
         operation_id: String,
         transaction: GreenPoolSeedTransaction,
     },
+    #[cfg(feature = "green-pool-certification")]
+    GreenBaseNativeRefundSigned {
+        operation_id: String,
+        relay_request_id: String,
+        final_recipient: String,
+        destination_chain_id: u64,
+        destination_asset: String,
+        transaction: GreenNativeRefundTransaction,
+    },
     BridgeApprovalSigned {
         approval: BridgeApprovalSignature,
     },
@@ -1143,6 +1186,8 @@ struct EnclaveState {
     chain_signer: Option<EnclaveChainSigner>,
     #[cfg(feature = "green-pool-certification")]
     completed_green_pool_seed: Option<CompletedGreenPoolSeed>,
+    #[cfg(feature = "green-pool-certification")]
+    completed_green_native_refund: Option<CompletedGreenNativeRefund>,
     pending_audit_signer_provision: Option<PendingAuditSignerProvision>,
     audit_signer: Option<EnclaveAuditSigner>,
 }
@@ -1315,6 +1360,14 @@ struct CompletedGreenPoolSeed {
     transaction: GreenPoolSeedTransaction,
 }
 
+#[cfg(feature = "green-pool-certification")]
+#[derive(Clone)]
+struct CompletedGreenNativeRefund {
+    operation_id: String,
+    command_commitment: [u8; 32],
+    transaction: GreenNativeRefundTransaction,
+}
+
 struct PendingAuditSignerProvision {
     recipient_private_key: PKey<Private>,
     bundle_nonce: [u8; 12],
@@ -1363,6 +1416,8 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         chain_signer: None,
         #[cfg(feature = "green-pool-certification")]
         completed_green_pool_seed: None,
+        #[cfg(feature = "green-pool-certification")]
+        completed_green_native_refund: None,
         pending_audit_signer_provision: None,
         audit_signer: None,
     }));
@@ -2423,6 +2478,7 @@ fn direct_execution_request(state: &EnclaveState, request: &PlainRequest) -> boo
         PlainRequest::Operator { envelope }
             if matches!(envelope.command,
                 OperatorCommand::SignGreenPoolSeed { .. }
+                | OperatorCommand::SignGreenBaseNativeRefund { .. }
                 | OperatorCommand::AllocateGreenE03s05TestCapital { .. }
             )
     ) {
@@ -2481,7 +2537,8 @@ fn green_pool_certification_request_allowed(state: &EnclaveState, request: &Plai
             | OperatorCommand::ChainSignerStatus
             | OperatorCommand::BeginChainSignerProvision { .. }
             | OperatorCommand::CompleteChainSignerProvision { .. }
-            | OperatorCommand::SignGreenPoolSeed { .. } => true,
+            | OperatorCommand::SignGreenPoolSeed { .. }
+            | OperatorCommand::SignGreenBaseNativeRefund { .. } => true,
             OperatorCommand::DirectCreditDeposit { request } => {
                 green_base_usdc_deposit_request(request)
             }
@@ -5134,6 +5191,73 @@ async fn dispatch_operator(
             state.completed_green_pool_seed = Some(completed);
             Ok(response)
         }
+        #[cfg(feature = "green-pool-certification")]
+        OperatorCommand::SignGreenBaseNativeRefund {
+            authorization,
+            nonce,
+            gas_limit,
+            max_fee_per_gas_wei,
+            max_priority_fee_per_gas_wei,
+            now_millis: _untrusted_now_millis,
+        } => {
+            let trusted_now_millis =
+                verified_now_millis.ok_or_else(|| "TRUSTED_TIME_UNAVAILABLE".to_string())?;
+            verify_green_native_refund_authorization(
+                &authorization,
+                &state.operator_public_key,
+                trusted_now_millis,
+            )?;
+            let commitment = green_native_refund_command_commitment(
+                &authorization.intent,
+                nonce,
+                gas_limit,
+                &max_fee_per_gas_wei,
+                &max_priority_fee_per_gas_wei,
+            )?;
+            if let Some(completed) = &state.completed_green_native_refund {
+                let transaction = replay_green_native_refund(
+                    completed,
+                    &authorization.intent.operation_id,
+                    commitment,
+                )?;
+                return Ok(PlainResponse::GreenBaseNativeRefundSigned {
+                    operation_id: completed.operation_id.clone(),
+                    relay_request_id: authorization.intent.relay_request_id,
+                    final_recipient: authorization.intent.final_recipient,
+                    destination_chain_id: authorization.intent.destination_chain_id,
+                    destination_asset: authorization.intent.destination_asset,
+                    transaction,
+                });
+            }
+            let transaction = state
+                .chain_signer
+                .as_ref()
+                .ok_or_else(|| "CHAIN_SIGNER_NOT_PROVISIONED".to_string())?
+                .sign_green_native_refund(
+                    &authorization.intent.relay_deposit_address,
+                    &authorization.intent.amount_wei,
+                    nonce,
+                    gas_limit,
+                    &max_fee_per_gas_wei,
+                    &max_priority_fee_per_gas_wei,
+                )
+                .await?;
+            let completed = CompletedGreenNativeRefund {
+                operation_id: authorization.intent.operation_id.clone(),
+                command_commitment: commitment,
+                transaction: transaction.clone(),
+            };
+            let response = PlainResponse::GreenBaseNativeRefundSigned {
+                operation_id: completed.operation_id.clone(),
+                relay_request_id: authorization.intent.relay_request_id,
+                final_recipient: authorization.intent.final_recipient,
+                destination_chain_id: authorization.intent.destination_chain_id,
+                destination_asset: authorization.intent.destination_asset,
+                transaction,
+            };
+            state.completed_green_native_refund = Some(completed);
+            Ok(response)
+        }
         OperatorCommand::SignPoolWithdrawal {
             idempotency_key,
             authorization,
@@ -6225,6 +6349,7 @@ async fn dispatch_operator(
                 | OperatorCommand::ReconcileBootstrap { .. } => unreachable!(),
                 #[cfg(feature = "green-pool-certification")]
                 OperatorCommand::SignGreenPoolSeed { .. }
+                | OperatorCommand::SignGreenBaseNativeRefund { .. }
                 | OperatorCommand::AllocateGreenE03s05TestCapital { .. } => unreachable!(),
             }
             .map_err(|error| error.to_string())?;
@@ -6431,6 +6556,110 @@ fn replay_green_pool_seed(
     if completed.operation_id != operation_id || completed.command_commitment != command_commitment
     {
         return Err("GREEN_POOL_SEED_REPLAY_MISMATCH".into());
+    }
+    Ok(completed.transaction.clone())
+}
+
+#[cfg(feature = "green-pool-certification")]
+const GREEN_NATIVE_REFUND_OPERATION_ID: &str = "green-base-native-refund-20260907-v1";
+#[cfg(feature = "green-pool-certification")]
+const GREEN_NATIVE_REFUND_FINAL_RECIPIENT: &str = "0xaf2cab23cb5461cda43d9052d675f921a8b7a1a7";
+#[cfg(feature = "green-pool-certification")]
+const GREEN_NATIVE_REFUND_DESTINATION_ASSET: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
+
+#[cfg(feature = "green-pool-certification")]
+fn green_native_refund_payload(intent: &GreenNativeRefundIntent) -> Result<Vec<u8>, String> {
+    let encoded =
+        serde_json::to_vec(intent).map_err(|_| "INVALID_GREEN_NATIVE_REFUND".to_string())?;
+    let mut payload = Vec::with_capacity(encoded.len() + 64);
+    payload.extend_from_slice(b"layrs.green-native-refund-authorization.v1\0");
+    payload.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+    payload.extend_from_slice(&encoded);
+    Ok(payload)
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn verify_green_native_refund_authorization(
+    authorization: &GreenNativeRefundAuthorization,
+    operator_public_key: &VerifyingKey,
+    now_millis: i64,
+) -> Result<(), String> {
+    let relay_request_id = authorization.intent.relay_request_id.strip_prefix("0x");
+    let valid_relay_request = relay_request_id
+        .and_then(|value| hex::decode(value).ok())
+        .is_some_and(|value| value.len() == 32);
+    if authorization.intent.protocol_version != "layrs.green-native-refund.v1"
+        || authorization.intent.operation_id != GREEN_NATIVE_REFUND_OPERATION_ID
+        || authorization.intent.source_signer != GREEN_BASE_SIGNER
+        || !valid_relay_request
+        || authorization.intent.relay_deposit_address.len() != 42
+        || !authorization.intent.relay_deposit_address.starts_with("0x")
+        || authorization.intent.final_recipient != GREEN_NATIVE_REFUND_FINAL_RECIPIENT
+        || authorization.intent.destination_chain_id != 42_161
+        || authorization.intent.destination_asset != GREEN_NATIVE_REFUND_DESTINATION_ASSET
+        || authorization.intent.amount_wei == "0"
+    {
+        return Err("GREEN_NATIVE_REFUND_POLICY_MISMATCH".into());
+    }
+    if now_millis < 0
+        || authorization.intent.expires_at_millis <= now_millis
+        || authorization.intent.expires_at_millis > now_millis.saturating_add(15 * 60 * 1_000)
+    {
+        return Err("GREEN_NATIVE_REFUND_AUTHORIZATION_EXPIRED".into());
+    }
+    let signature: [u8; 64] = authorization
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| "INVALID_GREEN_NATIVE_REFUND_AUTHORIZATION".to_string())?;
+    operator_public_key
+        .verify(
+            &green_native_refund_payload(&authorization.intent)?,
+            &Signature::from_bytes(&signature),
+        )
+        .map_err(|_| "INVALID_GREEN_NATIVE_REFUND_AUTHORIZATION".to_string())
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn green_native_refund_command_commitment(
+    intent: &GreenNativeRefundIntent,
+    nonce: u64,
+    gas_limit: u64,
+    max_fee_per_gas_wei: &str,
+    max_priority_fee_per_gas_wei: &str,
+) -> Result<[u8; 32], String> {
+    #[derive(Serialize)]
+    struct Commitment<'a> {
+        intent: &'a GreenNativeRefundIntent,
+        nonce: u64,
+        gas_limit: u64,
+        max_fee_per_gas_wei: &'a str,
+        max_priority_fee_per_gas_wei: &'a str,
+    }
+    let encoded = serde_json::to_vec(&Commitment {
+        intent,
+        nonce,
+        gas_limit,
+        max_fee_per_gas_wei,
+        max_priority_fee_per_gas_wei,
+    })
+    .map_err(|_| "INVALID_GREEN_NATIVE_REFUND_COMMAND".to_string())?;
+    let mut digest = Sha256::new();
+    digest.update(b"layrs.green-native-refund-command.v1\0");
+    digest.update((encoded.len() as u32).to_be_bytes());
+    digest.update(encoded);
+    Ok(digest.finalize().into())
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn replay_green_native_refund(
+    completed: &CompletedGreenNativeRefund,
+    operation_id: &str,
+    command_commitment: [u8; 32],
+) -> Result<GreenNativeRefundTransaction, String> {
+    if completed.operation_id != operation_id || completed.command_commitment != command_commitment
+    {
+        return Err("GREEN_NATIVE_REFUND_REPLAY_MISMATCH".into());
     }
     Ok(completed.transaction.clone())
 }
@@ -7187,6 +7416,8 @@ mod tests {
             chain_signer: None,
             #[cfg(feature = "green-pool-certification")]
             completed_green_pool_seed: None,
+            #[cfg(feature = "green-pool-certification")]
+            completed_green_native_refund: None,
             pending_audit_signer_provision: None,
             audit_signer: None,
         })
@@ -7797,8 +8028,9 @@ mod tests {
     }
     #[cfg(feature = "green-pool-certification")]
     use clob_service::chain_signer::{
-        GREEN_POOL_SEED_GAS_LIMIT, GREEN_POOL_SEED_MAX_FEE_PER_GAS_WEI,
-        GREEN_POOL_SEED_MAX_PRIORITY_FEE_PER_GAS_WEI, GREEN_POOL_SEED_NONCE,
+        GREEN_NATIVE_REFUND_GAS_LIMIT, GREEN_NATIVE_REFUND_NONCE, GREEN_POOL_SEED_GAS_LIMIT,
+        GREEN_POOL_SEED_MAX_FEE_PER_GAS_WEI, GREEN_POOL_SEED_MAX_PRIORITY_FEE_PER_GAS_WEI,
+        GREEN_POOL_SEED_NONCE,
     };
     #[cfg(feature = "green-pool-certification")]
     use ed25519_dalek::{Signer as _, SigningKey};
@@ -7884,6 +8116,11 @@ mod tests {
             serde_json::json!({
                 "type": "ALLOCATE_GREEN_E03S05_TEST_CAPITAL", "request": {}
             }),
+            serde_json::json!({
+                "type": "SIGN_GREEN_BASE_NATIVE_REFUND", "authorization": {}, "nonce": 1,
+                "gas_limit": 21_000, "max_fee_per_gas_wei": "5000000",
+                "max_priority_fee_per_gas_wei": "1000000", "now_millis": 1
+            }),
         ] {
             assert!(serde_json::from_value::<OperatorCommand>(command).is_err());
         }
@@ -7912,6 +8149,95 @@ mod tests {
             .to_bytes()
             .to_vec();
         GreenPoolTransitionAuthorization { intent, signature }
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    fn signed_green_native_refund_authorization(
+        signing_key: &SigningKey,
+        now_millis: i64,
+    ) -> GreenNativeRefundAuthorization {
+        let intent = GreenNativeRefundIntent {
+            protocol_version: "layrs.green-native-refund.v1".into(),
+            operation_id: GREEN_NATIVE_REFUND_OPERATION_ID.into(),
+            source_signer: GREEN_BASE_SIGNER.into(),
+            relay_request_id: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            relay_deposit_address: "0x3333333333333333333333333333333333333333".into(),
+            final_recipient: GREEN_NATIVE_REFUND_FINAL_RECIPIENT.into(),
+            destination_chain_id: 42_161,
+            destination_asset: GREEN_NATIVE_REFUND_DESTINATION_ASSET.into(),
+            amount_wei: "1900000000000000".into(),
+            expires_at_millis: now_millis + 60_000,
+        };
+        let signature = signing_key
+            .sign(&green_native_refund_payload(&intent).expect("payload"))
+            .to_bytes()
+            .to_vec();
+        GreenNativeRefundAuthorization { intent, signature }
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    #[test]
+    fn green_native_refund_authorization_is_exact_and_replay_bound() {
+        let signing_key = SigningKey::from_bytes(&[93u8; 32]);
+        let now = 1_800_000_000_000i64;
+        let exact = signed_green_native_refund_authorization(&signing_key, now);
+        assert!(verify_green_native_refund_authorization(
+            &exact,
+            &signing_key.verifying_key(),
+            now,
+        )
+        .is_ok());
+        let commitment = green_native_refund_command_commitment(
+            &exact.intent,
+            GREEN_NATIVE_REFUND_NONCE,
+            GREEN_NATIVE_REFUND_GAS_LIMIT,
+            "5000000",
+            "1000000",
+        )
+        .unwrap();
+        let transaction = GreenNativeRefundTransaction {
+            chain: "base".into(),
+            chain_id: 8_453,
+            asset: "ETH".into(),
+            signer: GREEN_BASE_SIGNER.into(),
+            destination: exact.intent.relay_deposit_address.clone(),
+            amount_wei: exact.intent.amount_wei.clone(),
+            nonce: GREEN_NATIVE_REFUND_NONCE,
+            transaction_hash: format!("0x{}", "11".repeat(32)),
+            raw_transaction_hex: "0x02aa".into(),
+        };
+        let completed = CompletedGreenNativeRefund {
+            operation_id: exact.intent.operation_id.clone(),
+            command_commitment: commitment,
+            transaction: transaction.clone(),
+        };
+        assert_eq!(
+            replay_green_native_refund(&completed, &exact.intent.operation_id, commitment).unwrap(),
+            transaction
+        );
+        assert_eq!(
+            replay_green_native_refund(&completed, &exact.intent.operation_id, [0u8; 32])
+                .unwrap_err(),
+            "GREEN_NATIVE_REFUND_REPLAY_MISMATCH"
+        );
+
+        let mut wrong = exact.clone();
+        wrong.intent.destination_chain_id = 8_453;
+        assert_eq!(
+            verify_green_native_refund_authorization(&wrong, &signing_key.verifying_key(), now,)
+                .unwrap_err(),
+            "GREEN_NATIVE_REFUND_POLICY_MISMATCH"
+        );
+        assert_eq!(
+            verify_green_native_refund_authorization(
+                &exact,
+                &signing_key.verifying_key(),
+                now + 60_000,
+            )
+            .unwrap_err(),
+            "GREEN_NATIVE_REFUND_AUTHORIZATION_EXPIRED"
+        );
     }
 
     #[cfg(feature = "green-pool-certification")]
@@ -8228,6 +8554,20 @@ mod tests {
                 gas_limit: GREEN_POOL_SEED_GAS_LIMIT,
                 max_fee_per_gas_wei: GREEN_POOL_SEED_MAX_FEE_PER_GAS_WEI.into(),
                 max_priority_fee_per_gas_wei: GREEN_POOL_SEED_MAX_PRIORITY_FEE_PER_GAS_WEI.into(),
+                now_millis: 1,
+            })
+        ));
+        assert!(green_pool_certification_request_allowed(
+            &state,
+            &operator_request(OperatorCommand::SignGreenBaseNativeRefund {
+                authorization: signed_green_native_refund_authorization(
+                    &SigningKey::from_bytes(&[92u8; 32]),
+                    1_800_000_000_000,
+                ),
+                nonce: GREEN_NATIVE_REFUND_NONCE,
+                gas_limit: GREEN_NATIVE_REFUND_GAS_LIMIT,
+                max_fee_per_gas_wei: "5000000".into(),
+                max_priority_fee_per_gas_wei: "1000000".into(),
                 now_millis: 1,
             })
         ));
