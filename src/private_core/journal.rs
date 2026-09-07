@@ -495,6 +495,18 @@ mod snapshot_tests {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewerEvent {
+    /// A deliberately small, public taxonomy of the completed action. It is
+    /// signed by the enclave but contains neither an account nor an order,
+    /// balance, amount, destination, or other user-identifying field.
+    pub event_type: String,
+    /// Receipts are emitted only after the state transition has committed.
+    /// Keeping this explicit lets a reviewer distinguish a completed action
+    /// from an attempted or merely queued operation.
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnclaveReceipt {
     pub protocol_version: String,
     pub receipt_id: String,
@@ -521,6 +533,11 @@ pub struct EnclaveReceipt {
     /// A signed terminal rejection is false and must preserve the prior root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal_committed: Option<bool>,
+    /// Privacy-safe reviewer metadata introduced in `layrs.v3`.  It is part
+    /// of the exact enclave-signed payload, rather than a server-side label
+    /// added after the fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_event: Option<ReviewerEvent>,
     pub enclave_sequence: u64,
     pub prior_state_root: [u8; 32],
     pub state_root: [u8; 32],
@@ -628,6 +645,7 @@ impl ReceiptSigner {
         publication_eligible: Option<bool>,
         result_commitment_sha256: Option<[u8; 32]>,
         journal_committed: Option<bool>,
+        reviewer_event: Option<ReviewerEvent>,
         enclave_sequence: u64,
         prior_state_root: [u8; 32],
         state_root: [u8; 32],
@@ -651,8 +669,23 @@ impl ReceiptSigner {
             assert_eq!(prior_state_root, state_root);
             assert_eq!(publication_eligible, Some(false));
         }
+        if reviewer_event.is_some() {
+            assert!(
+                publication_eligible == Some(true),
+                "reviewer attestations must be publication eligible"
+            );
+            assert_eq!(
+                journal_committed,
+                Some(true),
+                "reviewer attestations must bind an appended journal record"
+            );
+            assert!(
+                result_commitment_sha256.is_some(),
+                "reviewer attestations must retain the v3 result commitment"
+            );
+        }
         let mut receipt = EnclaveReceipt {
-            protocol_version: if result_commitment_sha256.is_some() {
+            protocol_version: if result_commitment_sha256.is_some() || reviewer_event.is_some() {
                 "layrs.v3".into()
             } else if command_commitment_sha256.is_some() {
                 "layrs.v2".into()
@@ -671,6 +704,7 @@ impl ReceiptSigner {
             publication_eligible,
             result_commitment_sha256,
             journal_committed,
+            reviewer_event,
             enclave_sequence,
             prior_state_root,
             state_root,
@@ -782,6 +816,7 @@ mod semantic_receipt_tests {
             Some(true),
             Some([6u8; 32]),
             Some(true),
+            None,
             7,
             [8u8; 32],
             [9u8; 32],
