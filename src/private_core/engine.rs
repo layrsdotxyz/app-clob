@@ -1755,6 +1755,18 @@ fn validate_direct_withdrawal_response_bindings(
     let replay_key = payload.operation_replay_key(response.request.operation)?;
     let receipt = &response.enclave_receipt;
     let record = &response.encrypted_journal_record;
+    // Historical direct-withdrawal receipts were private layrs.v3 artifacts.
+    // New receipts add a redacted reviewer event and become publication
+    // eligible. Accept both wire shapes so cumulative snapshots remain
+    // restorable, while requiring the new shape to carry the exact event.
+    let reviewer_shape_valid = match &receipt.reviewer_event {
+        None => receipt.publication_eligible == Some(false),
+        Some(event) => {
+            response.result.state == DirectExecutionTerminalState::Applied
+                && receipt.publication_eligible == Some(true)
+                && event == &reviewer_event_for_direct_withdrawal(response.request.operation)
+        }
+    };
     if response.projection_payload != response.request.canonical_payload
         || response.operation_replay_key_sha256 != replay_key
         || response.result.result_commitment_sha256
@@ -1764,7 +1776,7 @@ fn validate_direct_withdrawal_response_bindings(
             )
         || receipt.command_commitment_sha256 != Some(response.request.request_hash)
         || receipt.result_commitment_sha256 != Some(response.result.result_commitment_sha256)
-        || receipt.publication_eligible != Some(false)
+        || !reviewer_shape_valid
         || receipt.journal_committed != Some(true)
         || record.sequence != receipt.enclave_sequence
         || record.state_root != receipt.state_root
@@ -2860,6 +2872,11 @@ mod direct_execution_contract_tests {
             DirectWithdrawalOutcome::Applied(response) => response,
             other => panic!("unexpected outcome: {other:?}"),
         };
+        assert_eq!(reserved.enclave_receipt.publication_eligible, Some(true));
+        assert_eq!(
+            reserved.enclave_receipt.reviewer_event,
+            Some(reviewer_event("WITHDRAWAL_RESERVED"))
+        );
         let reserve_wire = reserved.signed_result_wire().unwrap();
         let authorization = reserved.withdrawal_authorization.clone().unwrap();
         assert!(core
@@ -2911,6 +2928,11 @@ mod direct_execution_contract_tests {
             DirectWithdrawalOutcome::Applied(response) => response,
             other => panic!("unexpected outcome: {other:?}"),
         };
+        assert_eq!(finalized.enclave_receipt.publication_eligible, Some(true));
+        assert_eq!(
+            finalized.enclave_receipt.reviewer_event,
+            Some(reviewer_event("WITHDRAWAL_FINALIZED"))
+        );
         let finalize_wire = finalized.signed_result_wire().unwrap();
         assert!(core
             .validate_withdrawal_intent(&reserved.withdrawal_authorization.as_ref().unwrap().intent)
@@ -2966,6 +2988,8 @@ mod direct_execution_contract_tests {
             rejected.result.retry_policy,
             DirectExecutionRetryPolicy::NewRequestAllowed
         );
+        assert_eq!(rejected.enclave_receipt.publication_eligible, Some(false));
+        assert!(rejected.enclave_receipt.reviewer_event.is_none());
         assert_eq!(core.balance(&available), 5_000_000);
 
         let reserve = withdrawal_request(
@@ -2990,10 +3014,15 @@ mod direct_execution_contract_tests {
             2_000_000,
             now + 30,
         );
-        assert!(matches!(
-            core.direct_withdrawal(release, now + 31).unwrap(),
-            DirectWithdrawalOutcome::Applied(_)
-        ));
+        let released = match core.direct_withdrawal(release, now + 31).unwrap() {
+            DirectWithdrawalOutcome::Applied(response) => response,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_eq!(released.enclave_receipt.publication_eligible, Some(true));
+        assert_eq!(
+            released.enclave_receipt.reviewer_event,
+            Some(reviewer_event("WITHDRAWAL_RELEASED"))
+        );
         assert_eq!(core.balance(&available), 5_000_000);
         assert_eq!(core.balance(&hold), 0);
     }
@@ -5835,9 +5864,10 @@ impl PrivateTradingCore {
             "allocate-green-e03s05-test-capital".into(),
             request.request_id.hyphenated().to_string(),
             Some(request.request_hash),
-            Some(false),
+            Some(true),
             Some(result_commitment),
             Some(true),
+            Some(reviewer_event("TEST_CAPITAL_ALLOCATED")),
             next_sequence,
             prior_root,
             next_root,
@@ -6290,9 +6320,10 @@ impl PrivateTradingCore {
             ),
             request.request_id.hyphenated().to_string(),
             Some(request.request_hash),
-            Some(false),
+            Some(true),
             Some(result_commitment),
             Some(true),
+            Some(reviewer_event_for_direct_withdrawal(request.operation)),
             next_sequence,
             prior_root,
             next_root,
@@ -6531,6 +6562,7 @@ impl PrivateTradingCore {
             Some(false),
             Some(result_commitment),
             Some(true),
+            None,
             next_sequence,
             self.state_root(),
             next_root,
@@ -11578,7 +11610,8 @@ fn reviewer_event_for_system_command(command_id: &str) -> ReviewerEvent {
     let event_type = match command_id {
         "trading-freeze" | "trading-unfreeze" => "TRADING_CONTROL_UPDATED",
         "register-market" => "MARKET_REGISTERED",
-        "register-transfer-account" | "register-session" => "SIGNUP_REGISTERED",
+        "register-transfer-account" => "SIGNUP_REGISTERED",
+        "register-session" => "PRIVATE_SESSION_REGISTERED",
         "confirmed-deposit" | "deposit-credited" => "DEPOSIT_CREDITED",
         "withdrawal-finalized" => "WITHDRAWAL_FINALIZED",
         "external-flow" => "EXTERNAL_FLOW_RECORDED",
@@ -11589,6 +11622,16 @@ fn reviewer_event_for_system_command(command_id: &str) -> ReviewerEvent {
         "bootstrap-submitted" => "BOOTSTRAP_SUBMITTED",
         "bootstrap-confirmed" => "BOOTSTRAP_CONFIRMED",
         "bootstrap-failed" => "BOOTSTRAP_FAILED",
+        _ => "SYSTEM_MUTATION_COMPLETED",
+    };
+    reviewer_event(event_type)
+}
+
+fn reviewer_event_for_direct_withdrawal(operation: DirectExecutionOperation) -> ReviewerEvent {
+    let event_type = match operation {
+        DirectExecutionOperation::ReserveWithdrawal => "WITHDRAWAL_RESERVED",
+        DirectExecutionOperation::FinalizeWithdrawal => "WITHDRAWAL_FINALIZED",
+        DirectExecutionOperation::ReleaseWithdrawal => "WITHDRAWAL_RELEASED",
         _ => "SYSTEM_MUTATION_COMPLETED",
     };
     reviewer_event(event_type)
