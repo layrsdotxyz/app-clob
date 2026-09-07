@@ -2420,7 +2420,7 @@ fn polymarket_bootstrap_never_credits_an_unconfirmed_fill() {
     );
 
     let execution_id = uuid::Uuid::from_u128(47);
-    let pending = execute_signed(
+    let pending_response = execute_signed_response(
         &mut core,
         &user,
         "session:bootstrap",
@@ -2441,7 +2441,24 @@ fn polymarket_bootstrap_never_credits_an_unconfirmed_fill() {
         },
         1_100,
     );
-    assert!(matches!(pending, CommandResult::BootstrapPending { .. }));
+    assert!(matches!(
+        &pending_response.result,
+        CommandResult::BootstrapPending { .. }
+    ));
+    assert_eq!(
+        pending_response.receipt_state,
+        CommandReceiptState::Accepted
+    );
+    assert_eq!(
+        pending_response
+            .receipt
+            .reviewer_attestation
+            .as_ref()
+            .expect("bootstrap reservation reviewer attestation")
+            .event_type,
+        "ORDER_FUNDS_RESERVED"
+    );
+    assert!(pending_response.task_qualifications.is_empty());
     assert_eq!(
         core.balance(&AccountKey::new(
             &private_user,
@@ -2489,13 +2506,23 @@ fn polymarket_bootstrap_never_credits_an_unconfirmed_fill() {
     let prepared = core.bootstrap_prepared_venue_order(execution_id).unwrap();
     assert_eq!(prepared.exact_request_body, exact_body);
     assert_eq!(prepared.credential_generation_sha256, [50u8; 32]);
-    core.mark_bootstrap_submitted(
-        "sys:venue-submitted:47".into(),
-        execution_id,
-        format!("0x{}", "ab".repeat(32)),
-        1_150,
-    )
-    .unwrap();
+    let submitted_response = core
+        .mark_bootstrap_submitted(
+            "sys:venue-submitted:47".into(),
+            execution_id,
+            format!("0x{}", "ab".repeat(32)),
+            1_150,
+        )
+        .unwrap();
+    assert_eq!(
+        submitted_response
+            .receipt
+            .reviewer_attestation
+            .as_ref()
+            .expect("bootstrap submission reviewer attestation")
+            .event_type,
+        "BOOTSTRAP_SUBMITTED"
+    );
     assert!(core
         .confirm_bootstrap_fill(
             "sys:bad-fill:47".into(),
@@ -2524,6 +2551,15 @@ fn polymarket_bootstrap_never_credits_an_unconfirmed_fill() {
             1_170,
         )
         .unwrap();
+    assert_eq!(
+        fill_response
+            .receipt
+            .reviewer_attestation
+            .as_ref()
+            .expect("bootstrap confirmation reviewer attestation")
+            .event_type,
+        "BOOTSTRAP_CONFIRMED"
+    );
     assert_eq!(fill_response.audit_fills[0].statement.chain, "horizen");
     assert_eq!(
         core.balance(&AccountKey::position(
@@ -2571,6 +2607,65 @@ fn polymarket_bootstrap_never_credits_an_unconfirmed_fill() {
             if execution.state == clob_service::private_core::BootstrapExecutionState::VenueConfirmed
                 && execution.confirmed_price_micros == Some(390_000)
     ));
+
+    let failed_execution_id = uuid::Uuid::from_u128(52);
+    let failed_pending = execute_signed_response(
+        &mut core,
+        &user,
+        "session:bootstrap",
+        3,
+        "cmd:bootstrap-fail",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::with_id(
+                failed_execution_id,
+                "ignored-by-enclave",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                400_000,
+                1_000_000,
+                TimeInForce::Fok,
+                None,
+            ),
+        },
+        1_300,
+    );
+    assert_eq!(
+        failed_pending
+            .receipt
+            .reviewer_attestation
+            .as_ref()
+            .expect("second bootstrap reservation reviewer attestation")
+            .event_type,
+        "ORDER_FUNDS_RESERVED"
+    );
+    assert!(failed_pending.task_qualifications.is_empty());
+    let failure_response = core
+        .fail_bootstrap_execution(
+            "sys:venue-failed:52".into(),
+            failed_execution_id,
+            "VENUE_REJECTED".into(),
+            [52u8; 32],
+            1_310,
+        )
+        .unwrap();
+    assert_eq!(
+        failure_response
+            .receipt
+            .reviewer_attestation
+            .as_ref()
+            .expect("bootstrap failure reviewer attestation")
+            .event_type,
+        "BOOTSTRAP_FAILED"
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &private_user,
+            AccountBucket::UserAvailable,
+            "USDC"
+        )),
+        609_220
+    );
 
     let resolution = PolymarketResolutionStatement {
         market_id: market_id.into(),

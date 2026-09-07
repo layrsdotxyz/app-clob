@@ -5991,6 +5991,11 @@ fn reviewer_event_for_user_command(
     receipt_state: CommandReceiptState,
 ) -> Option<ReviewerEvent> {
     let event_type = match action {
+        UserCommandAction::SubmitOrder { .. }
+            if matches!(result, CommandResult::BootstrapPending { .. }) =>
+        {
+            "ORDER_FUNDS_RESERVED"
+        }
         UserCommandAction::SubmitOrder { .. } => match receipt_state {
             CommandReceiptState::Filled => "ORDER_MATCHED",
             CommandReceiptState::Rejected => "ORDER_REJECTED",
@@ -7882,7 +7887,10 @@ fn signed_task_qualifications(
             .accepted_order
             .as_ref()
             .is_some_and(|accepted| accepted.status != OrderStatus::Rejected),
-        CommandResult::BootstrapPending { .. } => true,
+        // A Polymarket bootstrap request has only reserved funds here. The
+        // venue has not accepted or even received the order, so it must not
+        // produce the ORDER_ACCEPTED task-qualification artifact.
+        CommandResult::BootstrapPending { .. } => false,
         _ => false,
     };
     if !accepted {
@@ -9653,6 +9661,59 @@ fn remove_json_field(value: &mut serde_json::Value, field: &str) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod reviewer_event_tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_events_describe_only_the_committed_lifecycle_stage() {
+        let execution_id = Uuid::from_u128(1);
+        let action = UserCommandAction::SubmitOrder {
+            order: BookOrder::with_id(
+                execution_id,
+                "private-user",
+                "bootstrap-market",
+                Outcome::Up,
+                OrderAction::Buy,
+                500_000,
+                1_000_000,
+                TimeInForce::Fok,
+                None,
+            ),
+        };
+        let result = CommandResult::BootstrapPending {
+            execution: BootstrapExecutionView {
+                execution_id,
+                market_id: "bootstrap-market".into(),
+                outcome: Outcome::Up,
+                action: OrderAction::Buy,
+                limit_price_micros: 500_000,
+                quantity_micros: 1_000_000,
+                state: BootstrapExecutionState::FundsReserved,
+                confirmed_price_micros: None,
+                failure_code: None,
+            },
+        };
+
+        assert_eq!(
+            reviewer_event_for_user_command(&action, &result, CommandReceiptState::Accepted)
+                .expect("funds reservation is attestable")
+                .event_type,
+            "ORDER_FUNDS_RESERVED"
+        );
+        for (command_id, expected) in [
+            ("bootstrap-submitted", "BOOTSTRAP_SUBMITTED"),
+            ("bootstrap-confirmed", "BOOTSTRAP_CONFIRMED"),
+            ("bootstrap-failed", "BOOTSTRAP_FAILED"),
+        ] {
+            assert_eq!(
+                reviewer_event_for_system_command(command_id).event_type,
+                expected
+            );
+        }
     }
 }
 
