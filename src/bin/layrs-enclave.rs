@@ -414,6 +414,17 @@ const GREEN_E03S05_IDENTITY: [u8; 32] = [
 ];
 #[cfg(feature = "green-pool-certification")]
 const GREEN_E03S05_SESSION_ID: &str = "session_XuAxP8_gxcsuwg_0H6ZwrtG8Lyu4wyeD";
+#[cfg(feature = "green-pool-certification")]
+const GREEN_E03S05_SESSION_PUBLIC_KEY: [u8; 32] = [
+    0x91, 0xc5, 0xc7, 0x6b, 0x11, 0xc6, 0x94, 0x53, 0xff, 0xc4, 0xa7, 0x67, 0x41, 0x1a, 0xef, 0x68,
+    0x9a, 0xbf, 0xf3, 0xbc, 0x50, 0xb9, 0x58, 0x82, 0xa6, 0x72, 0x08, 0x42, 0xc5, 0x2e, 0x7f, 0xec,
+];
+#[cfg(feature = "green-pool-certification")]
+const GREEN_E03S05_SESSION_RENEWAL_IDEMPOTENCY_KEY: &str = "green-e03s05-session-renew:v1";
+#[cfg(feature = "green-pool-certification")]
+const GREEN_E03S05_SESSION_RENEWAL_NOW_MILLIS: i64 = 1_788_814_800_000;
+#[cfg(feature = "green-pool-certification")]
+const GREEN_E03S05_SESSION_RENEWAL_EXPIRES_AT_MILLIS: i64 = 1_788_843_600_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
@@ -2562,6 +2573,21 @@ fn green_pool_certification_request_allowed(state: &EnclaveState, request: &Plai
             | OperatorCommand::CompleteChainSignerProvision { .. }
             | OperatorCommand::SignGreenPoolSeed { .. }
             | OperatorCommand::SignGreenBaseNativeRefund { .. } => true,
+            OperatorCommand::RegisterSession {
+                idempotency_key,
+                session_id,
+                identity_commitment,
+                public_key,
+                expires_at_millis,
+                now_millis,
+            } => green_e03s05_session_renewal(
+                idempotency_key,
+                session_id,
+                identity_commitment,
+                public_key,
+                *expires_at_millis,
+                *now_millis,
+            ),
             OperatorCommand::DirectCreditDeposit { request } => {
                 green_base_usdc_deposit_request(request)
             }
@@ -2631,6 +2657,23 @@ fn green_pool_certification_request_allowed(state: &EnclaveState, request: &Plai
             _ => false,
         },
     }
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn green_e03s05_session_renewal(
+    idempotency_key: &str,
+    session_id: &str,
+    identity_commitment: &[u8; 32],
+    public_key: &[u8; 32],
+    expires_at_millis: i64,
+    now_millis: i64,
+) -> bool {
+    idempotency_key == GREEN_E03S05_SESSION_RENEWAL_IDEMPOTENCY_KEY
+        && session_id == GREEN_E03S05_SESSION_ID
+        && identity_commitment == &GREEN_E03S05_IDENTITY
+        && public_key == &GREEN_E03S05_SESSION_PUBLIC_KEY
+        && now_millis == GREEN_E03S05_SESSION_RENEWAL_NOW_MILLIS
+        && expires_at_millis == GREEN_E03S05_SESSION_RENEWAL_EXPIRES_AT_MILLIS
 }
 
 #[cfg(feature = "green-pool-certification")]
@@ -8648,6 +8691,66 @@ mod tests {
             assert!(green_pool_certification_request_allowed(
                 &state,
                 &operator_request(command)
+            ));
+        }
+
+        let session_renewal = || OperatorCommand::RegisterSession {
+            idempotency_key: GREEN_E03S05_SESSION_RENEWAL_IDEMPOTENCY_KEY.into(),
+            session_id: GREEN_E03S05_SESSION_ID.into(),
+            identity_commitment: GREEN_E03S05_IDENTITY,
+            public_key: GREEN_E03S05_SESSION_PUBLIC_KEY,
+            expires_at_millis: GREEN_E03S05_SESSION_RENEWAL_EXPIRES_AT_MILLIS,
+            now_millis: GREEN_E03S05_SESSION_RENEWAL_NOW_MILLIS,
+        };
+        assert!(green_pool_certification_request_allowed(
+            &state,
+            &operator_request(session_renewal())
+        ));
+        for rejected in [
+            OperatorCommand::RegisterSession {
+                idempotency_key: "other-session-renew:v1".into(),
+                session_id: GREEN_E03S05_SESSION_ID.into(),
+                identity_commitment: GREEN_E03S05_IDENTITY,
+                public_key: GREEN_E03S05_SESSION_PUBLIC_KEY,
+                expires_at_millis: GREEN_E03S05_SESSION_RENEWAL_EXPIRES_AT_MILLIS,
+                now_millis: GREEN_E03S05_SESSION_RENEWAL_NOW_MILLIS,
+            },
+            OperatorCommand::RegisterSession {
+                idempotency_key: GREEN_E03S05_SESSION_RENEWAL_IDEMPOTENCY_KEY.into(),
+                session_id: "session_not-the-green-fixture".into(),
+                identity_commitment: GREEN_E03S05_IDENTITY,
+                public_key: GREEN_E03S05_SESSION_PUBLIC_KEY,
+                expires_at_millis: GREEN_E03S05_SESSION_RENEWAL_EXPIRES_AT_MILLIS,
+                now_millis: GREEN_E03S05_SESSION_RENEWAL_NOW_MILLIS,
+            },
+            OperatorCommand::RegisterSession {
+                idempotency_key: GREEN_E03S05_SESSION_RENEWAL_IDEMPOTENCY_KEY.into(),
+                session_id: GREEN_E03S05_SESSION_ID.into(),
+                identity_commitment: [0x55; 32],
+                public_key: GREEN_E03S05_SESSION_PUBLIC_KEY,
+                expires_at_millis: GREEN_E03S05_SESSION_RENEWAL_EXPIRES_AT_MILLIS,
+                now_millis: GREEN_E03S05_SESSION_RENEWAL_NOW_MILLIS,
+            },
+            OperatorCommand::RegisterSession {
+                idempotency_key: GREEN_E03S05_SESSION_RENEWAL_IDEMPOTENCY_KEY.into(),
+                session_id: GREEN_E03S05_SESSION_ID.into(),
+                identity_commitment: GREEN_E03S05_IDENTITY,
+                public_key: [0x44; 32],
+                expires_at_millis: GREEN_E03S05_SESSION_RENEWAL_EXPIRES_AT_MILLIS,
+                now_millis: GREEN_E03S05_SESSION_RENEWAL_NOW_MILLIS,
+            },
+            OperatorCommand::RegisterSession {
+                idempotency_key: GREEN_E03S05_SESSION_RENEWAL_IDEMPOTENCY_KEY.into(),
+                session_id: GREEN_E03S05_SESSION_ID.into(),
+                identity_commitment: GREEN_E03S05_IDENTITY,
+                public_key: GREEN_E03S05_SESSION_PUBLIC_KEY,
+                expires_at_millis: GREEN_E03S05_SESSION_RENEWAL_EXPIRES_AT_MILLIS - 1,
+                now_millis: GREEN_E03S05_SESSION_RENEWAL_NOW_MILLIS,
+            },
+        ] {
+            assert!(!green_pool_certification_request_allowed(
+                &state,
+                &operator_request(rejected)
             ));
         }
 
