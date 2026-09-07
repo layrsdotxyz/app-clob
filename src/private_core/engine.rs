@@ -3440,6 +3440,168 @@ mod direct_execution_contract_tests {
             serde_json::to_vec(&applied).unwrap(),
             serde_json::to_vec(&replay).unwrap()
         );
+        let withdrawal_request = |request_id: u128,
+                                  withdrawal_id: u128,
+                                  operation: DirectExecutionOperation,
+                                  amount_atomic: u128,
+                                  identity_commitment: [u8; 32]| {
+            let withdrawal_id = Uuid::from_u128(withdrawal_id);
+            let payload = DirectWithdrawalPayload {
+                protocol_version: DIRECT_WITHDRAWAL_PAYLOAD_VERSION.into(),
+                withdrawal_id,
+                authenticated_subject_hash: account,
+                account_id: account,
+                identity_commitment,
+                session_id: session_id.into(),
+                chain: "base".into(),
+                asset: "USDC".into(),
+                amount_atomic,
+                destination: "0x1111111111111111111111111111111111111111".into(),
+                evidence_hash: match operation {
+                    DirectExecutionOperation::FinalizeWithdrawal => Some([0xa8; 32]),
+                    DirectExecutionOperation::ReleaseWithdrawal => Some([0xa9; 32]),
+                    _ => None,
+                },
+                funding_identity: format!("withdrawal:{withdrawal_id}"),
+            };
+            DirectExecutionRequestEnvelope::new(
+                Uuid::from_u128(request_id),
+                account,
+                account,
+                None,
+                Some(payload.funding_identity.clone()),
+                operation,
+                serde_json::to_vec(&payload).unwrap(),
+                now + 10,
+                now + 5_000,
+            )
+            .unwrap()
+        };
+        let special_custody = AccountKey::new(
+            "layrs:green-e03s05-test-capital",
+            AccountBucket::PoolCash,
+            "USDC",
+        );
+        let normal_custody = AccountKey::new("layrs", AccountBucket::PoolCash, "USDC");
+        let user = AccountKey::new(
+            derive_private_user_id(&core.identity_key, &identity),
+            AccountBucket::UserAvailable,
+            "USDC",
+        );
+        let hold = AccountKey::new(
+            derive_private_user_id(&core.identity_key, &identity),
+            AccountBucket::UserWithdrawalHold,
+            "USDC",
+        );
+
+        let released_withdrawal = 0xc8111111_1111_4111_8111_111111111111;
+        let released_reserve = withdrawal_request(
+            0xc9111111_1111_4111_8111_111111111111,
+            released_withdrawal,
+            DirectExecutionOperation::ReserveWithdrawal,
+            20_000_000,
+            identity,
+        );
+        assert!(matches!(
+            core.direct_green_e03s05_test_capital_withdrawal(released_reserve, now + 11),
+            Ok(DirectWithdrawalOutcome::Applied(_))
+        ));
+        let released = withdrawal_request(
+            0xca111111_1111_4111_8111_111111111111,
+            released_withdrawal,
+            DirectExecutionOperation::ReleaseWithdrawal,
+            20_000_000,
+            identity,
+        );
+        assert!(matches!(
+            core.direct_green_e03s05_test_capital_withdrawal(released, now + 12),
+            Ok(DirectWithdrawalOutcome::Applied(_))
+        ));
+        assert_eq!(core.balance(&special_custody), 20_000_000);
+        assert_eq!(core.balance(&normal_custody), 0);
+        assert_eq!(core.balance(&user), 20_000_000);
+        assert_eq!(core.balance(&hold), 0);
+
+        let wrong_amount = withdrawal_request(
+            0xcb111111_1111_4111_8111_111111111111,
+            0xcc111111_1111_4111_8111_111111111111,
+            DirectExecutionOperation::ReserveWithdrawal,
+            19_999_999,
+            identity,
+        );
+        assert!(matches!(
+            core.direct_green_e03s05_test_capital_withdrawal(wrong_amount, now + 13),
+            Err(DirectWithdrawalError::InvalidPayload)
+        ));
+        let wrong_identity = withdrawal_request(
+            0xcd111111_1111_4111_8111_111111111111,
+            0xce111111_1111_4111_8111_111111111111,
+            DirectExecutionOperation::ReserveWithdrawal,
+            20_000_000,
+            [0xaf; 32],
+        );
+        assert!(matches!(
+            core.direct_green_e03s05_test_capital_withdrawal(wrong_identity, now + 14),
+            Err(DirectWithdrawalError::InvalidPayload)
+        ));
+
+        let finalized_withdrawal = 0xd0111111_1111_4111_8111_111111111111;
+        let reserve = withdrawal_request(
+            0xd1111111_1111_4111_8111_111111111111,
+            finalized_withdrawal,
+            DirectExecutionOperation::ReserveWithdrawal,
+            20_000_000,
+            identity,
+        );
+        assert!(matches!(
+            core.direct_green_e03s05_test_capital_withdrawal(reserve, now + 15),
+            Ok(DirectWithdrawalOutcome::Applied(_))
+        ));
+        let finalize = withdrawal_request(
+            0xd2111111_1111_4111_8111_111111111111,
+            finalized_withdrawal,
+            DirectExecutionOperation::FinalizeWithdrawal,
+            20_000_000,
+            identity,
+        );
+        let finalized = match core
+            .direct_green_e03s05_test_capital_withdrawal(finalize.clone(), now + 16)
+            .unwrap()
+        {
+            DirectWithdrawalOutcome::Applied(response) => response,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        let finalized_wire = finalized.signed_result_wire().unwrap();
+        assert_eq!(core.balance(&special_custody), 0);
+        assert_eq!(core.balance(&normal_custody), 0);
+        assert_eq!(core.balance(&user), 0);
+        assert_eq!(core.balance(&hold), 0);
+        let replay = match core
+            .direct_green_e03s05_test_capital_withdrawal(finalize.clone(), now + 17)
+            .unwrap()
+        {
+            DirectWithdrawalOutcome::ReturnOriginal(response) => response,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_eq!(replay.signed_result_wire().unwrap(), finalized_wire);
+        let mut changed_finalize_payload = DirectWithdrawalPayload::decode_for(&finalize).unwrap();
+        changed_finalize_payload.destination = "0x2222222222222222222222222222222222222222".into();
+        let changed_finalize = DirectExecutionRequestEnvelope::new(
+            Uuid::from_u128(0xd3111111_1111_4111_8111_111111111111),
+            account,
+            account,
+            None,
+            Some(changed_finalize_payload.funding_identity.clone()),
+            DirectExecutionOperation::FinalizeWithdrawal,
+            serde_json::to_vec(&changed_finalize_payload).unwrap(),
+            now + 10,
+            now + 5_000,
+        )
+        .unwrap();
+        assert!(matches!(
+            core.direct_green_e03s05_test_capital_withdrawal(changed_finalize, now + 17),
+            Err(DirectWithdrawalError::ReplayBinding)
+        ));
         let second_request = DirectExecutionRequestEnvelope::new(
             Uuid::from_u128(0xa9111111_1111_4111_8111_111111111111),
             account,
@@ -3478,6 +3640,17 @@ mod direct_execution_contract_tests {
         assert_eq!(
             serde_json::to_vec(&applied).unwrap(),
             serde_json::to_vec(&after_restart).unwrap()
+        );
+        let finalized_after_restart = match restored
+            .direct_green_e03s05_test_capital_withdrawal(finalize, now + 4)
+            .unwrap()
+        {
+            DirectWithdrawalOutcome::ReturnOriginal(response) => response,
+            other => panic!("unexpected restart outcome: {other:?}"),
+        };
+        assert_eq!(
+            finalized_after_restart.signed_result_wire().unwrap(),
+            finalized_wire
         );
 
         let mut wrong = payload;
@@ -4649,6 +4822,11 @@ enum JournaledSystemCommand {
         flow: ExternalFlowTransaction,
     },
     #[cfg(feature = "green-pool-certification")]
+    GreenE03s05TestCapitalWithdrawal {
+        idempotency_key: String,
+        flow: ExternalFlowTransaction,
+    },
+    #[cfg(feature = "green-pool-certification")]
     GreenNativeRefundCompletion {
         idempotency_key: String,
         completion: GreenNativeRefundCompletion,
@@ -5710,6 +5888,45 @@ impl PrivateTradingCore {
         Ok(Some(response))
     }
 
+    #[cfg(feature = "green-pool-certification")]
+    fn validate_green_e03s05_test_capital_withdrawal(
+        &self,
+        withdrawal: &DirectWithdrawalPayload,
+        now_millis: i64,
+    ) -> Result<(), DirectWithdrawalError> {
+        let owner = derive_private_user_id(&self.identity_key, &withdrawal.identity_commitment);
+        if self
+            .sessions
+            .active_owner(&withdrawal.session_id, now_millis)
+            != Some(owner.as_str())
+        {
+            return Err(DirectWithdrawalError::InvalidPayload);
+        }
+        let allocation = self
+            .direct_final_results
+            .0
+            .values()
+            .find(|stored| stored.marker_format_version == 3)
+            .ok_or(DirectWithdrawalError::InvalidPayload)
+            .and_then(|stored| {
+                let response = stored_green_e03s05_test_capital_response(stored)
+                    .map_err(|_| DirectWithdrawalError::ReplayBinding)?;
+                GreenE03s05TestCapitalPayload::decode_for_unbound(&response.request)
+                    .map_err(|_| DirectWithdrawalError::ReplayBinding)
+            })?;
+        if withdrawal.authenticated_subject_hash != allocation.authenticated_subject_hash
+            || withdrawal.account_id != allocation.account_id
+            || withdrawal.identity_commitment != allocation.identity_commitment
+            || withdrawal.session_id != allocation.session_id
+            || withdrawal.chain != allocation.chain
+            || withdrawal.asset != allocation.asset
+            || withdrawal.amount_atomic != allocation.amount_atomic
+        {
+            return Err(DirectWithdrawalError::InvalidPayload);
+        }
+        Ok(())
+    }
+
     /// Executes reserve/finalize/release as one direct, terminal TEE mutation.
     /// The operation+withdrawal replay key is the business idempotency boundary;
     /// it is independent of transport retries and creates no pending state.
@@ -5718,8 +5935,38 @@ impl PrivateTradingCore {
         request: DirectExecutionRequestEnvelope,
         now_millis: i64,
     ) -> Result<DirectWithdrawalOutcome, DirectWithdrawalError> {
+        self.direct_withdrawal_with_custody(request, now_millis, false)
+    }
+
+    /// Green-only direct lifecycle for the single E03-S05 certification
+    /// allocation. The receipt-backed allocation is the authority for the
+    /// isolated custody leg; normal withdrawals always retain `layrs` pool
+    /// custody through `direct_withdrawal` above.
+    #[cfg(feature = "green-pool-certification")]
+    pub fn direct_green_e03s05_test_capital_withdrawal(
+        &mut self,
+        request: DirectExecutionRequestEnvelope,
+        now_millis: i64,
+    ) -> Result<DirectWithdrawalOutcome, DirectWithdrawalError> {
+        self.direct_withdrawal_with_custody(request, now_millis, true)
+    }
+
+    fn direct_withdrawal_with_custody(
+        &mut self,
+        request: DirectExecutionRequestEnvelope,
+        now_millis: i64,
+        green_test_capital_custody: bool,
+    ) -> Result<DirectWithdrawalOutcome, DirectWithdrawalError> {
         request.validate()?;
         let payload = DirectWithdrawalPayload::decode_for(&request)?;
+        #[cfg(feature = "green-pool-certification")]
+        if green_test_capital_custody {
+            self.validate_green_e03s05_test_capital_withdrawal(&payload, now_millis)?;
+        }
+        #[cfg(not(feature = "green-pool-certification"))]
+        if green_test_capital_custody {
+            return Err(DirectWithdrawalError::InvalidPayload);
+        }
         let replay_key = payload.operation_replay_key(request.operation)?;
         let result_key = direct_final_result_key(&request.account_id, request.request_id);
 
@@ -5865,11 +6112,30 @@ impl PrivateTradingCore {
                     amount: payload.amount_atomic,
                     direction: ExternalFlowDirection::Outflow,
                 };
-                ledger.apply_confirmed_withdrawal(flow.clone())?;
+                if green_test_capital_custody {
+                    #[cfg(feature = "green-pool-certification")]
+                    ledger.apply_green_e03s05_test_capital_withdrawal(flow.clone())?;
+                    #[cfg(not(feature = "green-pool-certification"))]
+                    return Err(DirectWithdrawalError::InvalidPayload);
+                } else {
+                    ledger.apply_confirmed_withdrawal(flow.clone())?;
+                }
                 system_keys.insert(finalize_key.clone());
-                JournaledSystemCommand::ConfirmedWithdrawal {
-                    idempotency_key: finalize_key.clone(),
-                    flow,
+                if green_test_capital_custody {
+                    #[cfg(feature = "green-pool-certification")]
+                    {
+                        JournaledSystemCommand::GreenE03s05TestCapitalWithdrawal {
+                            idempotency_key: finalize_key.clone(),
+                            flow,
+                        }
+                    }
+                    #[cfg(not(feature = "green-pool-certification"))]
+                    return Err(DirectWithdrawalError::InvalidPayload);
+                } else {
+                    JournaledSystemCommand::ConfirmedWithdrawal {
+                        idempotency_key: finalize_key.clone(),
+                        flow,
+                    }
                 }
             }
             DirectExecutionOperation::ReleaseWithdrawal => {

@@ -2685,8 +2685,17 @@ fn green_base_usdc_withdrawal_request(request: &DirectExecutionRequestEnvelope) 
         DirectExecutionOperation::ReserveWithdrawal
             | DirectExecutionOperation::FinalizeWithdrawal
             | DirectExecutionOperation::ReleaseWithdrawal
-    ) && serde_json::from_slice::<DirectWithdrawalPayload>(&request.canonical_payload)
-        .is_ok_and(|payload| payload.chain == "base" && payload.asset == "USDC")
+    ) && serde_json::from_slice::<DirectWithdrawalPayload>(&request.canonical_payload).is_ok_and(
+        |payload| {
+            payload.chain == "base"
+                && payload.asset == "USDC"
+                && payload.amount_atomic == 20_000_000
+                && payload.authenticated_subject_hash == GREEN_E03S05_ACCOUNT_AND_AUTH
+                && payload.account_id == GREEN_E03S05_ACCOUNT_AND_AUTH
+                && payload.identity_commitment == GREEN_E03S05_IDENTITY
+                && payload.session_id == GREEN_E03S05_SESSION_ID
+        },
+    )
 }
 
 fn direct_deposit_operator_command(command: &OperatorCommand) -> bool {
@@ -4368,10 +4377,16 @@ async fn dispatch_operator(
             }
             let now_millis =
                 verified_now_millis.ok_or_else(|| "TRUSTED_TIME_UNAVAILABLE".to_string())?;
-            let outcome = state
+            let core = state
                 .core
                 .as_mut()
-                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?;
+            #[cfg(feature = "green-pool-certification")]
+            let outcome = core
+                .direct_green_e03s05_test_capital_withdrawal(request, now_millis)
+                .map_err(|error| error.to_string())?;
+            #[cfg(not(feature = "green-pool-certification"))]
+            let outcome = core
                 .direct_withdrawal(request, now_millis)
                 .map_err(|error| error.to_string())?;
             Ok(PlainResponse::DirectWithdrawal { outcome })
@@ -8453,6 +8468,36 @@ mod tests {
         let receipt_signer = ReceiptSigner::from_seed([0x72; 32], [0x73; 48]);
         let receipt_public_key = receipt_signer.verifying_key();
         let mut core = PrivateTradingCore::new(JournalKey::from_bytes([0x74; 32]), receipt_signer);
+        let green_now = 1_800_000_000_000;
+        core.register_session(
+            "register-green-e03s05-firewall-session".into(),
+            GREEN_E03S05_SESSION_ID.into(),
+            GREEN_E03S05_IDENTITY,
+            SigningKey::from_bytes(&[0x7b; 32])
+                .verifying_key()
+                .to_bytes(),
+            green_now + 60_000,
+            green_now,
+        )
+        .unwrap();
+        let green_seed_hash = [0x7c; 32];
+        let green_binding = GreenE03s05TestCapitalBinding {
+            authenticated_subject_hash: GREEN_E03S05_ACCOUNT_AND_AUTH,
+            account_id: GREEN_E03S05_ACCOUNT_AND_AUTH,
+            identity_commitment: GREEN_E03S05_IDENTITY,
+            session_id: GREEN_E03S05_SESSION_ID.into(),
+            seed_transaction_hash: green_seed_hash,
+        };
+        core.allocate_green_e03s05_test_capital(
+            green_test_capital_request_for_wire(
+                Uuid::from_u128(0x72000000_0000_4000_8000_000000000000),
+                green_seed_hash,
+                green_now,
+            ),
+            &green_binding,
+            green_now + 1,
+        )
+        .unwrap();
         let direct_deposit = direct_deposit_request_for_wire(
             Uuid::from_u128(0x71111111_1111_4111_8111_111111111111),
             [0x75; 32],
@@ -8515,15 +8560,35 @@ mod tests {
             DirectDepositCreditOutcome::Applied(response) => response.financial_replay_key_sha256,
             other => panic!("unexpected ZEN deposit outcome: {other:?}"),
         };
-        let direct_withdrawal = direct_withdrawal_request_for_wire(
+        let withdrawal_id = Uuid::from_u128(0x72222222_2222_4222_8222_222222222222);
+        let direct_withdrawal_payload = DirectWithdrawalPayload {
+            protocol_version: "layrs.direct-withdrawal.v1".into(),
+            withdrawal_id,
+            authenticated_subject_hash: GREEN_E03S05_ACCOUNT_AND_AUTH,
+            account_id: GREEN_E03S05_ACCOUNT_AND_AUTH,
+            identity_commitment: GREEN_E03S05_IDENTITY,
+            session_id: GREEN_E03S05_SESSION_ID.into(),
+            chain: "base".into(),
+            asset: "USDC".into(),
+            amount_atomic: 20_000_000,
+            destination: "0x1111111111111111111111111111111111111111".into(),
+            evidence_hash: None,
+            funding_identity: format!("withdrawal:{withdrawal_id}"),
+        };
+        let direct_withdrawal = DirectExecutionRequestEnvelope::new(
             Uuid::from_u128(0x72111111_1111_4111_8111_111111111111),
-            Uuid::from_u128(0x72222222_2222_4222_8222_222222222222),
-            [0x75; 32],
-            [0x76; 32],
+            GREEN_E03S05_ACCOUNT_AND_AUTH,
+            GREEN_E03S05_ACCOUNT_AND_AUTH,
+            None,
+            Some(direct_withdrawal_payload.funding_identity.clone()),
+            DirectExecutionOperation::ReserveWithdrawal,
+            serde_json::to_vec(&direct_withdrawal_payload).unwrap(),
             1_800_000_000_000,
-        );
+            1_800_000_005_000,
+        )
+        .unwrap();
         let withdrawal_replay_key = match core
-            .direct_withdrawal(
+            .direct_green_e03s05_test_capital_withdrawal(
                 direct_withdrawal.clone(),
                 direct_withdrawal.issued_at_millis + 1,
             )
