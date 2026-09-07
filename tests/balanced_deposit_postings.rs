@@ -76,6 +76,65 @@ fn duplicate_receipt_key_cannot_credit_pool_or_user_twice() {
 }
 
 #[test]
+fn split_session_transfers_credit_exact_total_and_remain_duplicate_safe() {
+    let journal_key = [0x21; 32];
+    let commitment = [0x22; 32];
+    let owner = derived_private_user(journal_key, commitment);
+    let user = AccountKey::new(owner, AccountBucket::UserAvailable, "USDC");
+    let pool = AccountKey::new("layrs", AccountBucket::PoolCash, "USDC");
+    let mut core = PrivateTradingCore::new(
+        JournalKey::from_bytes(journal_key),
+        ReceiptSigner::generate([0x23; 48]),
+    );
+
+    core.apply_user_external_flow(
+        "deposit:split-session-main".into(),
+        commitment,
+        "USDC".into(),
+        AccountBucket::UserAvailable,
+        5_100_000,
+        ExternalFlowDirection::Inflow,
+        [0x24; 32],
+        1_800_000_000_000,
+    )
+    .unwrap();
+    core.apply_user_external_flow(
+        "deposit:split-session-dust".into(),
+        commitment,
+        "USDC".into(),
+        AccountBucket::UserAvailable,
+        10_000,
+        ExternalFlowDirection::Inflow,
+        [0x25; 32],
+        1_800_000_000_001,
+    )
+    .unwrap();
+
+    assert_eq!(core.balance(&pool), 5_110_000);
+    assert_eq!(core.balance(&user), 5_110_000);
+    assert_eq!(core.sequence(), 2);
+    let root_after_split = core.state_root();
+    assert_eq!(
+        core.apply_user_external_flow(
+            "deposit:split-session-dust".into(),
+            commitment,
+            "USDC".into(),
+            AccountBucket::UserAvailable,
+            10_000,
+            ExternalFlowDirection::Inflow,
+            [0x25; 32],
+            1_800_000_000_001,
+        )
+        .unwrap_err(),
+        CoreError::DuplicateCommand
+    );
+    assert_eq!(core.balance(&pool), 5_110_000);
+    assert_eq!(core.balance(&user), 5_110_000);
+    assert_eq!(core.sequence(), 2);
+    assert_eq!(core.state_root(), root_after_split);
+}
+
+#[test]
 fn same_finality_evidence_under_a_different_operator_key_cannot_credit_twice() {
     let mut ledger = Ledger::default();
     let user = AccountKey::new("usr_opaque_evidence", AccountBucket::UserAvailable, "USDC");

@@ -46,6 +46,13 @@ impl SessionGuard {
             .map(|session| session.private_user_id.as_str())
     }
 
+    pub(crate) fn active_owner(&self, session_id: &str, now_millis: i64) -> Option<&str> {
+        self.registered.get(session_id).and_then(|session| {
+            (!session.revoked && session.expires_at_millis > now_millis)
+                .then_some(session.private_user_id.as_str())
+        })
+    }
+
     /// Removes sessions that can no longer authorize a command. This keeps the
     /// authenticated enclave state bounded by active sessions instead of every
     /// browser session ever issued.

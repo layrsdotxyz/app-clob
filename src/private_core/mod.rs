@@ -45,6 +45,7 @@ pub use engine::{
     CancelledOrderOutcome, CommandResult, CoreResponse, CustodyReconciliationSnapshot,
     DirectDepositCreditOutcome, DirectDepositCreditPayload, DirectDepositCreditResponse,
     DirectDepositEffectNoneResponse, DirectExecutionOperation, DirectExecutionRequestEnvelope,
+    DirectWithdrawalOutcome, DirectWithdrawalPayload, DirectWithdrawalResponse,
     ExactConditionResolutionStatement, ExactLive976CheckpointBinding, ExactLive976RestoreReport,
     ExactTerminalCategoryCounts, ExactTerminalCategoryDigests, ExactTerminalCategoryEquality,
     ExactTerminalSnapshotRestoreReport, FeeProfileId, MarketConfig, MarketExecution,
@@ -58,6 +59,12 @@ pub use engine::{
     WithdrawalIntent, EXACT_LIVE_976_RELEASE_COMMIT, INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX,
     INCIDENT_TERMINAL_JOURNAL_HEAD_HEX, INCIDENT_TERMINAL_SEQUENCE,
     INCIDENT_TERMINAL_STATE_ROOT_HEX,
+};
+#[cfg(feature = "green-pool-certification")]
+pub use engine::{
+    GreenE03s05TestCapitalBinding, GreenE03s05TestCapitalOutcome, GreenE03s05TestCapitalPayload,
+    GreenE03s05TestCapitalResponse, GreenNativeRefundCompletion,
+    GreenNativeRefundTerminalTransaction, GREEN_E03S05_WITHDRAWAL_ID,
 };
 pub use journal::{
     command_result_commitment, CommandReceiptState, EnclaveReceipt, EncryptedJournal,

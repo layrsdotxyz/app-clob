@@ -7,12 +7,16 @@ ARG LAYRS_RECOVERY_ENVIRONMENT
 ARG LAYRS_ENCLAVE_TRANSITION_POLICY_SHA256
 ARG LAYRS_DIRECT_BTC_EXECUTION_ENABLED=0
 ARG LAYRS_DIRECT_DEPOSIT_CREDIT_ENABLED=0
+ARG LAYRS_DIRECT_WITHDRAWAL_ENABLED=0
+ARG LAYRS_GREEN_POOL_CERTIFICATION_ENABLED=0
 ARG SOURCE_DATE_EPOCH
 ENV LAYRS_OPERATOR_PUBLIC_KEY_HEX=${LAYRS_OPERATOR_PUBLIC_KEY_HEX}
 ENV LAYRS_RECOVERY_ENVIRONMENT=${LAYRS_RECOVERY_ENVIRONMENT}
 ENV LAYRS_ENCLAVE_TRANSITION_POLICY_SHA256=${LAYRS_ENCLAVE_TRANSITION_POLICY_SHA256}
 ENV LAYRS_DIRECT_BTC_EXECUTION_ENABLED=${LAYRS_DIRECT_BTC_EXECUTION_ENABLED}
 ENV LAYRS_DIRECT_DEPOSIT_CREDIT_ENABLED=${LAYRS_DIRECT_DEPOSIT_CREDIT_ENABLED}
+ENV LAYRS_DIRECT_WITHDRAWAL_ENABLED=${LAYRS_DIRECT_WITHDRAWAL_ENABLED}
+ENV LAYRS_GREEN_POOL_CERTIFICATION_ENABLED=${LAYRS_GREEN_POOL_CERTIFICATION_ENABLED}
 COPY enclave/runtime/Cargo.toml enclave/runtime/Cargo.lock ./enclave/runtime/
 COPY enclave/runtime/src ./enclave/runtime/src
 COPY enclave/recovery-policies ./enclave/recovery-policies
@@ -22,10 +26,17 @@ RUN test "${#LAYRS_OPERATOR_PUBLIC_KEY_HEX}" -eq 64 \
     && test "${SOURCE_DATE_EPOCH}" = "1787611129" \
     && { test "${LAYRS_DIRECT_BTC_EXECUTION_ENABLED}" = "0" -o "${LAYRS_DIRECT_BTC_EXECUTION_ENABLED}" = "1"; } \
     && { test "${LAYRS_DIRECT_DEPOSIT_CREDIT_ENABLED}" = "0" -o "${LAYRS_DIRECT_DEPOSIT_CREDIT_ENABLED}" = "1"; } \
+    && { test "${LAYRS_DIRECT_WITHDRAWAL_ENABLED}" = "0" -o "${LAYRS_DIRECT_WITHDRAWAL_ENABLED}" = "1"; } \
+    && { test "${LAYRS_GREEN_POOL_CERTIFICATION_ENABLED}" = "0" -o "${LAYRS_GREEN_POOL_CERTIFICATION_ENABLED}" = "1"; } \
     && test "${LAYRS_RECOVERY_ENVIRONMENT}" = "development" -o "${LAYRS_RECOVERY_ENVIRONMENT}" = "staging" -o "${LAYRS_RECOVERY_ENVIRONMENT}" = "production" \
     && { test -z "${LAYRS_ENCLAVE_TRANSITION_POLICY_SHA256}" \
       || echo "${LAYRS_ENCLAVE_TRANSITION_POLICY_SHA256}" | grep -Eq '^[0-9a-f]{64}$'; } \
-    && cargo build --locked --release --manifest-path enclave/runtime/Cargo.toml --bin layrs-enclave \
+    && if test "${LAYRS_GREEN_POOL_CERTIFICATION_ENABLED}" = "1"; then \
+         cargo build --locked --release --manifest-path enclave/runtime/Cargo.toml \
+           --features green-pool-certification --bin layrs-enclave; \
+       else \
+         cargo build --locked --release --manifest-path enclave/runtime/Cargo.toml --bin layrs-enclave; \
+       fi \
     && touch --date="@${SOURCE_DATE_EPOCH}" --no-dereference \
         /build/enclave/runtime/target/release/layrs-enclave
 

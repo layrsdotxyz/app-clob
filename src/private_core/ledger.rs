@@ -972,6 +972,81 @@ impl Ledger {
         })
     }
 
+    /// Records the one-time Green E03-S05 test-capital allocation.  This is
+    /// deliberately not a deposit: the custody leg is isolated from normal
+    /// PoolCash and the journal caller must use a purpose-specific replay key.
+    /// The operation remains a balanced asset/liability posting, but cannot be
+    /// mistaken for a customer chain deposit during reconciliation.
+    #[cfg(feature = "green-pool-certification")]
+    pub fn apply_green_e03s05_test_capital(
+        &mut self,
+        transaction: ExternalFlowTransaction,
+    ) -> CoreResult<AppliedLedgerTransaction> {
+        if transaction.amount == 0 || transaction.evidence_hash == [0u8; 32] {
+            return Err(CoreError::ZeroAmount);
+        }
+        if transaction.direction != ExternalFlowDirection::Inflow
+            || transaction.account.bucket != AccountBucket::UserAvailable
+            || transaction.account.owner.is_empty()
+            || transaction.account.owner == "layrs"
+            || transaction.account.market_id.is_some()
+            || transaction.account.outcome.is_some()
+        {
+            return Err(CoreError::InvalidOrder(
+                "Green test capital requires an opaque user-available liability".into(),
+            ));
+        }
+        let evidence_replay_key = format!(
+            "green-e03s05-test-capital-evidence:{}",
+            hex::encode(transaction.evidence_hash)
+        );
+        if self.applied_idempotency_keys.contains(&evidence_replay_key) {
+            return Err(CoreError::DuplicateCommand);
+        }
+        let custody = AccountKey::new(
+            "layrs:green-e03s05-test-capital",
+            AccountBucket::PoolCash,
+            &transaction.account.asset,
+        );
+        let prior_state_root = self.state_root();
+        let mut next = self.balances.clone();
+        credit(&mut next, &custody, transaction.amount)?;
+        credit(&mut next, &transaction.account, transaction.amount)?;
+        canonicalize_balances(&mut next);
+        validate_balance_model(&next)?;
+        self.balances = next;
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(CoreError::UnbalancedTransaction)?;
+        self.applied_idempotency_keys
+            .insert(evidence_replay_key.clone());
+        let state_root = self.state_root();
+        Ok(AppliedLedgerTransaction {
+            sequence: self.sequence,
+            idempotency_key: evidence_replay_key,
+            business_reference: format!(
+                "green-e03s05-test-capital:{}",
+                hex::encode(transaction.evidence_hash)
+            ),
+            prior_state_root,
+            state_root,
+            transfers: Vec::new(),
+            postings: vec![
+                LedgerPosting {
+                    account: custody,
+                    side: PostingSide::Debit,
+                    amount: transaction.amount,
+                },
+                LedgerPosting {
+                    account: transaction.account,
+                    side: PostingSide::Credit,
+                    amount: transaction.amount,
+                },
+            ],
+        })
+    }
+
     /// Records one finalized pool withdrawal as a balanced reduction of the
     /// pool asset and the corresponding user-withdrawal liability. A prepared
     /// or broadcast transaction is not sufficient: `evidence_hash` must bind
@@ -980,6 +1055,31 @@ impl Ledger {
     pub fn apply_confirmed_withdrawal(
         &mut self,
         transaction: ExternalFlowTransaction,
+    ) -> CoreResult<AppliedLedgerTransaction> {
+        self.apply_confirmed_withdrawal_from_custody(transaction, "layrs", "confirmed-withdrawal")
+    }
+
+    /// Finalizes the single Green E03-S05 certification withdrawal from the
+    /// custody bucket created by `apply_green_e03s05_test_capital`. This is
+    /// deliberately separate from normal pool custody and is only reachable
+    /// through the Green feature-gated core path.
+    #[cfg(feature = "green-pool-certification")]
+    pub fn apply_green_e03s05_test_capital_withdrawal(
+        &mut self,
+        transaction: ExternalFlowTransaction,
+    ) -> CoreResult<AppliedLedgerTransaction> {
+        self.apply_confirmed_withdrawal_from_custody(
+            transaction,
+            "layrs:green-e03s05-test-capital",
+            "green-e03s05-test-capital-withdrawal",
+        )
+    }
+
+    fn apply_confirmed_withdrawal_from_custody(
+        &mut self,
+        transaction: ExternalFlowTransaction,
+        custody_owner: &str,
+        replay_prefix: &str,
     ) -> CoreResult<AppliedLedgerTransaction> {
         if transaction.amount == 0 || transaction.evidence_hash == [0u8; 32] {
             return Err(CoreError::ZeroAmount);
@@ -996,14 +1096,18 @@ impl Ledger {
             ));
         }
         let evidence_replay_key = format!(
-            "confirmed-withdrawal-evidence:{}",
+            "{replay_prefix}-evidence:{}",
             hex::encode(transaction.evidence_hash)
         );
         if self.applied_idempotency_keys.contains(&evidence_replay_key) {
             return Err(CoreError::DuplicateCommand);
         }
 
-        let pool = AccountKey::new("layrs", AccountBucket::PoolCash, &transaction.account.asset);
+        let pool = AccountKey::new(
+            custody_owner,
+            AccountBucket::PoolCash,
+            &transaction.account.asset,
+        );
         let prior_state_root = self.state_root();
         let mut next = self.balances.clone();
         debit(&mut next, &transaction.account, transaction.amount)?;
@@ -1023,7 +1127,7 @@ impl Ledger {
             sequence: self.sequence,
             idempotency_key: evidence_replay_key,
             business_reference: format!(
-                "confirmed-withdrawal:{}",
+                "{replay_prefix}:{}",
                 hex::encode(transaction.evidence_hash)
             ),
             prior_state_root,

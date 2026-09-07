@@ -22,6 +22,11 @@ use clob_service::chain_signer::{
     BridgeApprovalRequest, BridgeApprovalSignature, ChainSignerBundle, EnclaveChainSigner,
     MarketResolutionTransaction, PoolWithdrawalTransaction,
 };
+#[cfg(feature = "green-pool-certification")]
+use clob_service::chain_signer::{
+    GreenNativeRefundTransaction, GreenPoolSeedTransaction, GREEN_BASE_CURRENT_POOL,
+    GREEN_BASE_DESTINATION_POOL, GREEN_BASE_SIGNER, GREEN_BASE_USDC, GREEN_POOL_SEED_AMOUNT_ATOMIC,
+};
 use clob_service::polymarket_enclave::{
     EnclavePolymarketClient, PolymarketSecretBundle, PreparedPolymarketOrder,
     SignedVenueRedemptionTransaction, VenueConfirmation, VenueOrderIntent, VenueOrderObservation,
@@ -33,18 +38,28 @@ use clob_service::private_core::{
     resolution_signing_payload, AccountKey, BinanceResolutionStatement, BootstrapExecutionState,
     BootstrapPreparedVenueOrder, CommandReceiptState, CommandResult, CoreResponse,
     CustodyReconciliationSnapshot, DirectDepositCreditOutcome, DirectDepositCreditResponse,
-    DirectExecutionRequestEnvelope, EnclaveReceipt, EncryptedJournalRecord, EncryptedSnapshot,
-    ExactConditionResolutionStatement, ExactTerminalSnapshotRestoreReport, ExternalFlowDirection,
-    FeeProfileId, JournalKey, MarketConfig, MarketExecution, OrderStatus,
-    PolymarketResolutionStatement, PrivateTradingCore, ReceiptSigner, RecoveryBridgeArtifact,
-    ResolutionStatement, SignedAuditFillArtifact, SignedBinanceResolution,
-    SignedExactConditionResolution, SignedPolymarketResolution, SignedResolution,
-    SignedResolutionEvidence, SignedTaskQualificationArtifact, SystemResponse, UserCommand,
-    UserCommandAction, WithdrawalAuthorization, EXACT_LIVE_976_RELEASE_COMMIT,
+    DirectExecutionRequestEnvelope, DirectWithdrawalOutcome, DirectWithdrawalResponse,
+    EnclaveReceipt, EncryptedJournalRecord, EncryptedSnapshot, ExactConditionResolutionStatement,
+    ExactTerminalSnapshotRestoreReport, ExternalFlowDirection, FeeProfileId, JournalKey,
+    MarketConfig, MarketExecution, OrderStatus, PolymarketResolutionStatement, PrivateTradingCore,
+    ReceiptSigner, RecoveryBridgeArtifact, ResolutionStatement, SignedAuditFillArtifact,
+    SignedBinanceResolution, SignedExactConditionResolution, SignedPolymarketResolution,
+    SignedResolution, SignedResolutionEvidence, SignedTaskQualificationArtifact, SystemResponse,
+    UserCommand, UserCommandAction, WithdrawalAuthorization, EXACT_LIVE_976_RELEASE_COMMIT,
     INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX, INCIDENT_TERMINAL_JOURNAL_HEAD_HEX,
     INCIDENT_TERMINAL_SEQUENCE, INCIDENT_TERMINAL_STATE_ROOT_HEX,
 };
+#[cfg(feature = "green-pool-certification")]
+use clob_service::private_core::{
+    DirectDepositCreditPayload, DirectExecutionOperation, DirectWithdrawalPayload,
+    GreenE03s05TestCapitalBinding, GreenE03s05TestCapitalOutcome, GreenE03s05TestCapitalPayload,
+    GreenNativeRefundCompletion, GreenNativeRefundTerminalTransaction, GREEN_E03S05_WITHDRAWAL_ID,
+};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ethers_core::{
+    types::{transaction::eip2718::TypedTransaction, U256},
+    utils::{keccak256, rlp::Rlp},
+};
 use openssl::{
     cms::CmsContentInfo,
     md::Md,
@@ -331,6 +346,75 @@ struct OperatorEnvelope {
     signature: Vec<u8>,
 }
 
+#[cfg(feature = "green-pool-certification")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum GreenPoolTransitionOperation {
+    SeedBasePool,
+}
+
+#[cfg(feature = "green-pool-certification")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GreenPoolTransitionIntent {
+    protocol_version: String,
+    operation_id: String,
+    operation: GreenPoolTransitionOperation,
+    source_signer: String,
+    current_pool_address: String,
+    destination_pool_address: String,
+    token_address: String,
+    amount_atomic: String,
+    expires_at_millis: i64,
+}
+
+#[cfg(feature = "green-pool-certification")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GreenPoolTransitionAuthorization {
+    #[serde(flatten)]
+    intent: GreenPoolTransitionIntent,
+    signature: Vec<u8>,
+}
+
+#[cfg(feature = "green-pool-certification")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GreenNativeRefundIntent {
+    protocol_version: String,
+    operation_id: String,
+    source_signer: String,
+    relay_request_id: String,
+    relay_deposit_address: String,
+    final_recipient: String,
+    destination_chain_id: u64,
+    destination_asset: String,
+    amount_wei: String,
+    expires_at_millis: i64,
+}
+
+#[cfg(feature = "green-pool-certification")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GreenNativeRefundAuthorization {
+    #[serde(flatten)]
+    intent: GreenNativeRefundIntent,
+    signature: Vec<u8>,
+}
+
+#[cfg(feature = "green-pool-certification")]
+const GREEN_E03S05_ACCOUNT_AND_AUTH: [u8; 32] = [
+    0xc2, 0x49, 0xef, 0x78, 0x7a, 0xe1, 0x9c, 0x8a, 0x93, 0x01, 0xcb, 0x6c, 0x00, 0x61, 0x09, 0xe2,
+    0x40, 0xe8, 0xc2, 0x4e, 0x8b, 0xf7, 0x14, 0xed, 0x97, 0x40, 0x96, 0x6d, 0xa6, 0x3a, 0x8d, 0xb7,
+];
+#[cfg(feature = "green-pool-certification")]
+const GREEN_E03S05_IDENTITY: [u8; 32] = [
+    0xfd, 0x67, 0xb4, 0x44, 0xa0, 0xde, 0x82, 0xe2, 0x8c, 0xfd, 0x90, 0x62, 0x43, 0xf0, 0x0d, 0x5e,
+    0xa3, 0xd6, 0x03, 0x68, 0x56, 0xe0, 0xc7, 0xc3, 0xf6, 0xa9, 0x5f, 0x03, 0x8a, 0x5b, 0xeb, 0x28,
+];
+#[cfg(feature = "green-pool-certification")]
+const GREEN_E03S05_SESSION_ID: &str = "session_XuAxP8_gxcsuwg_0H6ZwrtG8Lyu4wyeD";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 // The authenticated operator wire schema is release-bound. Boxing the durable
@@ -341,9 +425,20 @@ enum OperatorCommand {
     DirectCreditDeposit {
         request: DirectExecutionRequestEnvelope,
     },
+    #[cfg(feature = "green-pool-certification")]
+    AllocateGreenE03s05TestCapital {
+        request: DirectExecutionRequestEnvelope,
+    },
     DirectDepositCreditLookup {
         account_id: [u8; 32],
         financial_replay_key_sha256: [u8; 32],
+    },
+    DirectWithdrawal {
+        request: DirectExecutionRequestEnvelope,
+    },
+    DirectWithdrawalLookup {
+        account_id: [u8; 32],
+        operation_replay_key_sha256: [u8; 32],
     },
     RecoverWithdrawalAuthorization {
         withdrawal_id: uuid::Uuid,
@@ -356,6 +451,18 @@ enum OperatorCommand {
         preparation_id: [u8; 32],
         enclave_sequence: u64,
         state_root: [u8; 32],
+    },
+    InspectPendingPreparation {
+        idempotency_key: String,
+    },
+    AbortSupersededPreparation {
+        idempotency_key: String,
+        preparation_id: [u8; 32],
+        pending_enclave_sequence: u64,
+        pending_state_root: [u8; 32],
+        live_enclave_sequence: u64,
+        live_state_root: [u8; 32],
+        live_journal_head: [u8; 32],
     },
     FinalizePreparedCommand {
         preparation: DurableCommandPreparation,
@@ -414,6 +521,24 @@ enum OperatorCommand {
     CompleteChainSignerProvision {
         ciphertext_for_recipient: Vec<u8>,
     },
+    #[cfg(feature = "green-pool-certification")]
+    SignGreenPoolSeed {
+        authorization: GreenPoolTransitionAuthorization,
+        nonce: u64,
+        gas_limit: u64,
+        max_fee_per_gas_wei: String,
+        max_priority_fee_per_gas_wei: String,
+        now_millis: i64,
+    },
+    #[cfg(feature = "green-pool-certification")]
+    SignGreenBaseNativeRefund {
+        authorization: GreenNativeRefundAuthorization,
+        nonce: u64,
+        gas_limit: u64,
+        max_fee_per_gas_wei: String,
+        max_priority_fee_per_gas_wei: String,
+        now_millis: i64,
+    },
     AuditSignerStatus,
     BeginAuditSignerProvision {
         kms_key_id: String,
@@ -431,6 +556,19 @@ enum OperatorCommand {
         idempotency_key: String,
         authorization: WithdrawalAuthorization,
         nonce: u64,
+        gas_limit: u64,
+        max_fee_per_gas_wei: String,
+        max_priority_fee_per_gas_wei: String,
+        now_millis: i64,
+    },
+    ReplacePreparedPoolWithdrawal {
+        idempotency_key: String,
+        recovery_authorization: WithdrawalAuthorization,
+        original_receipt_id: String,
+        original_state_root: [u8; 32],
+        destination_commitment: [u8; 32],
+        observation: WithdrawalReplacementChainObservation,
+        replacement_nonce: u64,
         gas_limit: u64,
         max_fee_per_gas_wei: String,
         max_priority_fee_per_gas_wei: String,
@@ -684,6 +822,21 @@ enum OperatorCommand {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WithdrawalReplacementChainObservation {
+    protocol_version: String,
+    chain: String,
+    prepared_transaction_hash: String,
+    prepared_nonce: u64,
+    transaction_absent: bool,
+    receipt_absent: bool,
+    pending_nonce: u64,
+    block_number: u64,
+    block_hash: String,
+    observed_at_millis: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum DelegatedReadProjection {
@@ -823,6 +976,42 @@ struct DurableCommandRejection {
     signature: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SignedPendingPreparationInspection {
+    protocol_version: String,
+    environment: String,
+    enclave_measurement_sha384: Vec<u8>,
+    request_idempotency_key: String,
+    preparation_id: Option<[u8; 32]>,
+    pending_prior_enclave_sequence: Option<u64>,
+    pending_enclave_sequence: Option<u64>,
+    pending_prior_state_root: Option<[u8; 32]>,
+    pending_state_root: Option<[u8; 32]>,
+    live_enclave_sequence: u64,
+    live_state_root: [u8; 32],
+    live_journal_head: [u8; 32],
+    observed_at_millis: i64,
+    signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SignedPreparationSupersession {
+    protocol_version: String,
+    environment: String,
+    enclave_measurement_sha384: Vec<u8>,
+    request_idempotency_key: String,
+    preparation_id: [u8; 32],
+    pending_prior_enclave_sequence: u64,
+    pending_enclave_sequence: u64,
+    pending_prior_state_root: [u8; 32],
+    pending_state_root: [u8; 32],
+    live_enclave_sequence: u64,
+    live_state_root: [u8; 32],
+    live_journal_head: [u8; 32],
+    superseded_at_millis: i64,
+    signature: Vec<u8>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 enum PlainResponse {
@@ -832,8 +1021,24 @@ enum PlainResponse {
     DirectDepositCreditLookup {
         response: Option<DirectDepositCreditResponse>,
     },
+    #[cfg(feature = "green-pool-certification")]
+    GreenE03s05TestCapital {
+        outcome: GreenE03s05TestCapitalOutcome,
+    },
+    DirectWithdrawal {
+        outcome: DirectWithdrawalOutcome,
+    },
+    DirectWithdrawalLookup {
+        response: Option<DirectWithdrawalResponse>,
+    },
     PreparedCommandStatus {
         state: &'static str,
+    },
+    PendingPreparationInspection {
+        inspection: SignedPendingPreparationInspection,
+    },
+    PreparedCommandSuperseded {
+        certificate: SignedPreparationSupersession,
     },
     PreparedCommandFinalized {
         preparation_id: [u8; 32],
@@ -855,6 +1060,7 @@ enum PlainResponse {
         verifier_public_key: Option<[u8; 32]>,
         bridge_approval_signers: Option<std::collections::BTreeMap<String, String>>,
         reward_claim_signers: Option<std::collections::BTreeMap<String, String>>,
+        pool_addresses: Option<std::collections::BTreeMap<String, String>>,
     },
     AuditSignerStatus {
         state: &'static str,
@@ -878,6 +1084,22 @@ enum PlainResponse {
     },
     PoolWithdrawalSigned {
         transaction: PoolWithdrawalTransaction,
+        response: Option<SystemResponse>,
+    },
+    #[cfg(feature = "green-pool-certification")]
+    GreenPoolSeedSigned {
+        operation_id: String,
+        transaction: GreenPoolSeedTransaction,
+    },
+    #[cfg(feature = "green-pool-certification")]
+    GreenBaseNativeRefundSigned {
+        operation_id: String,
+        relay_request_id: String,
+        final_recipient: String,
+        destination_chain_id: u64,
+        destination_asset: String,
+        transaction: GreenNativeRefundTransaction,
+        #[serde(skip_serializing_if = "Option::is_none")]
         response: Option<SystemResponse>,
     },
     BridgeApprovalSigned {
@@ -955,6 +1177,7 @@ struct EnclaveState {
     transport_nonces: TransportReplayCache,
     core: Option<PrivateTradingCore>,
     pending_preparation: Option<PendingPreparedTransition>,
+    last_preparation_supersession: Option<SignedPreparationSupersession>,
     minimum_writer_epoch: u64,
     writer_lease_id: Option<Uuid>,
     pending_provision: Option<PendingProvision>,
@@ -964,6 +1187,8 @@ struct EnclaveState {
     polymarket: Option<EnclavePolymarketClient>,
     pending_chain_signer_provision: Option<PendingChainSignerProvision>,
     chain_signer: Option<EnclaveChainSigner>,
+    #[cfg(feature = "green-pool-certification")]
+    completed_green_pool_seed: Option<CompletedGreenPoolSeed>,
     pending_audit_signer_provision: Option<PendingAuditSignerProvision>,
     audit_signer: Option<EnclaveAuditSigner>,
 }
@@ -1128,6 +1353,14 @@ struct PendingChainSignerProvision {
     bundle_ciphertext: Vec<u8>,
 }
 
+#[cfg(feature = "green-pool-certification")]
+#[derive(Clone)]
+struct CompletedGreenPoolSeed {
+    operation_id: String,
+    command_commitment: [u8; 32],
+    transaction: GreenPoolSeedTransaction,
+}
+
 struct PendingAuditSignerProvision {
     recipient_private_key: PKey<Private>,
     bundle_nonce: [u8; 12],
@@ -1164,6 +1397,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         transport_nonces: TransportReplayCache::new(MAX_TRANSPORT_REPLAY_ENTRIES),
         core: None,
         pending_preparation: None,
+        last_preparation_supersession: None,
         minimum_writer_epoch: 0,
         writer_lease_id: None,
         pending_provision: None,
@@ -1173,6 +1407,8 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         polymarket: None,
         pending_chain_signer_provision: None,
         chain_signer: None,
+        #[cfg(feature = "green-pool-certification")]
+        completed_green_pool_seed: None,
         pending_audit_signer_provision: None,
         audit_signer: None,
     }));
@@ -1377,6 +1613,12 @@ async fn handle_encrypted(
     if validate_request_context(&request, &request_context).is_err() {
         return WireResponse::Error {
             code: "PRIVATE_COMMAND_CONTEXT_MISMATCH",
+        };
+    }
+    #[cfg(feature = "green-pool-certification")]
+    if !green_pool_certification_request_allowed(&state, &request) {
+        return WireResponse::Error {
+            code: "GREEN_POOL_CERTIFICATION_ONLY",
         };
     }
     let direct_execution = direct_execution_request(&state, &request);
@@ -1641,12 +1883,23 @@ async fn handle_encrypted(
         PlainResponse::User { response } => response.encrypted_record.clone().into_iter().collect(),
         PlainResponse::System { response } => vec![response.encrypted_record.clone()],
         PlainResponse::DirectDepositCredit { .. }
-        | PlainResponse::DirectDepositCreditLookup { response: Some(_) } => {
+        | PlainResponse::DirectDepositCreditLookup { response: Some(_) }
+        | PlainResponse::DirectWithdrawal { .. }
+        | PlainResponse::DirectWithdrawalLookup { response: Some(_) } => {
             direct_deposit_journal_artifact(&response)
                 .into_iter()
                 .collect()
         }
+        #[cfg(feature = "green-pool-certification")]
+        PlainResponse::GreenE03s05TestCapital { .. } => direct_deposit_journal_artifact(&response)
+            .into_iter()
+            .collect(),
         PlainResponse::PoolWithdrawalSigned {
+            response: Some(response),
+            ..
+        } => vec![response.encrypted_record.clone()],
+        #[cfg(feature = "green-pool-certification")]
+        PlainResponse::GreenBaseNativeRefundSigned {
             response: Some(response),
             ..
         } => vec![response.encrypted_record.clone()],
@@ -1654,8 +1907,39 @@ async fn handle_encrypted(
     };
     let snapshot_artifacts = match &response {
         PlainResponse::Snapshot { snapshot } => vec![snapshot.clone()],
+        // Exact replays and financial-key lookups return the original signed
+        // journal/receipt, but do not mutate the private core. The already
+        // archived committed snapshot is therefore the recovery artifact;
+        // exporting a freshly randomized encryption of the same head on every
+        // retry only amplifies immutable storage and churns the apparent
+        // latest copy.
+        _ if direct_execution_reuses_archived_snapshot(&response) => Vec::new(),
         PlainResponse::DirectDepositCredit { .. }
-        | PlainResponse::DirectDepositCreditLookup { response: Some(_) } => match state
+        | PlainResponse::DirectDepositCreditLookup { response: Some(_) }
+        | PlainResponse::DirectWithdrawal { .. }
+        | PlainResponse::DirectWithdrawalLookup { response: Some(_) } => match state
+            .core
+            .as_ref()
+            .and_then(|core| core.export_encrypted_snapshot().ok())
+        {
+            Some(snapshot) => vec![snapshot],
+            None => {
+                if let Some(core) = rollback_core.take() {
+                    state.core = Some(core);
+                    state.transport_nonces.forget(&replay_key);
+                    if let Some(nonce) = rollback_operator_nonce.take() {
+                        state.operator_nonces.forget(&nonce);
+                    }
+                }
+                return WireResponse::Error {
+                    code: "SNAPSHOT_EXPORT_FAILED",
+                };
+            }
+        },
+        #[cfg(feature = "green-pool-certification")]
+        PlainResponse::GreenBaseNativeRefundSigned {
+            response: Some(_), ..
+        } => match state
             .core
             .as_ref()
             .and_then(|core| core.export_encrypted_snapshot().ok())
@@ -1699,17 +1983,28 @@ async fn handle_encrypted(
         PlainResponse::User { response } => vec![response.receipt.clone()],
         PlainResponse::System { response } => vec![response.receipt.clone()],
         PlainResponse::DirectDepositCredit { .. }
-        | PlainResponse::DirectDepositCreditLookup { response: Some(_) } => {
+        | PlainResponse::DirectDepositCreditLookup { response: Some(_) }
+        | PlainResponse::DirectWithdrawal { .. }
+        | PlainResponse::DirectWithdrawalLookup { response: Some(_) } => {
             direct_deposit_receipt_artifact(&response)
                 .into_iter()
                 .collect()
         }
+        #[cfg(feature = "green-pool-certification")]
+        PlainResponse::GreenE03s05TestCapital { .. } => direct_deposit_receipt_artifact(&response)
+            .into_iter()
+            .collect(),
         PlainResponse::PoolWithdrawalSigned {
             response: Some(response),
             ..
         } => {
             vec![response.receipt.clone()]
         }
+        #[cfg(feature = "green-pool-certification")]
+        PlainResponse::GreenBaseNativeRefundSigned {
+            response: Some(response),
+            ..
+        } => vec![response.receipt.clone()],
         _ => Vec::new(),
     };
     let audit_artifacts = match &response {
@@ -1724,6 +2019,10 @@ async fn handle_encrypted(
     let task_artifacts = match &response {
         PlainResponse::User { response } => response.task_qualifications.clone(),
         _ => Vec::new(),
+    };
+    let preparation_supersession = match &response {
+        PlainResponse::PreparedCommandSuperseded { certificate } => Some(certificate.clone()),
+        _ => None,
     };
     let encoded = match serde_json::to_vec(&response)
         .and_then(|value| pad_private_response(value).map_err(serde_json::Error::io))
@@ -1964,6 +2263,25 @@ async fn handle_encrypted(
                     }
                 }
             }
+            if let Some(certificate) = preparation_supersession {
+                if !state.pending_preparation.as_ref().is_some_and(|pending| {
+                    pending.preparation.preparation_id == certificate.preparation_id
+                }) {
+                    return rollback_wire_error(
+                        &mut state,
+                        &mut rollback_core,
+                        &mut rollback_operator_nonce,
+                        &replay_key,
+                        "DURABLE_SUPERSESSION_PREPARATION_CHANGED",
+                    );
+                }
+                state.pending_preparation = None;
+                // Preserve exactly one signed result so a transport failure
+                // after the clear cannot turn an idempotent retry into
+                // DURABLE_PREPARATION_NOT_FOUND. The certificate is returned
+                // only when every caller-supplied anchor matches exactly.
+                state.last_preparation_supersession = Some(certificate);
+            }
             WireResponse::Encrypted {
                 nonce: response_nonce,
                 ciphertext,
@@ -2160,8 +2478,13 @@ fn durable_control_request(request: &PlainRequest) -> bool {
         PlainRequest::Operator { envelope } => matches!(
             envelope.command,
             OperatorCommand::PreparedCommandStatus { .. }
+                | OperatorCommand::InspectPendingPreparation { .. }
+                | OperatorCommand::AbortSupersededPreparation { .. }
                 | OperatorCommand::FinalizePreparedCommand { .. }
                 | OperatorCommand::DelegatedPortfolioRead { .. }
+                | OperatorCommand::MarketStatus { .. }
+                | OperatorCommand::ResolutionReadiness { .. }
+                | OperatorCommand::TradingFreezeStatus
         ),
         PlainRequest::AggregateDepth { .. } => false,
     }
@@ -2172,6 +2495,21 @@ fn durable_control_request(request: &PlainRequest) -> bool {
 /// command and the enclave's registered market definition are both checked so
 /// the untrusted parent cannot route a non-BTC mutation through this path.
 fn direct_execution_request(state: &EnclaveState, request: &PlainRequest) -> bool {
+    #[cfg(feature = "green-pool-certification")]
+    if matches!(
+        request,
+        PlainRequest::Operator { envelope }
+            if matches!(envelope.command,
+                OperatorCommand::SignGreenPoolSeed { .. }
+                | OperatorCommand::SignGreenBaseNativeRefund { .. }
+                | OperatorCommand::AllocateGreenE03s05TestCapital { .. }
+            )
+    ) {
+        // This one-time Green-only transaction has an independently signed,
+        // exact intent and is chain-idempotent at nonce zero. It must not be
+        // coupled to an unrelated legacy Durable preparation.
+        return true;
+    }
     if matches!(
         request,
         PlainRequest::Operator { envelope }
@@ -2182,14 +2520,21 @@ fn direct_execution_request(state: &EnclaveState, request: &PlainRequest) -> boo
             Some("1")
         );
     }
+    if matches!(
+        request,
+        PlainRequest::Operator { envelope }
+            if direct_withdrawal_operator_command(&envelope.command)
+    ) {
+        return matches!(option_env!("LAYRS_DIRECT_WITHDRAWAL_ENABLED"), Some("1"));
+    }
     if !matches!(option_env!("LAYRS_DIRECT_BTC_EXECUTION_ENABLED"), Some("1")) {
         return false;
     }
     match request {
-        PlainRequest::User { command, .. } => state
-            .core
-            .as_ref()
-            .is_some_and(|core| direct_btc_order_action(core, &command.action)),
+        PlainRequest::User { command, .. } => state.core.as_ref().is_some_and(|core| {
+            direct_btc_order_action(core, &command.action)
+                || direct_base_usdc_withdrawal(&command.action)
+        }),
         // Direct SubmitOrder responses reserve a bounded recovery capsule. The
         // existing signed archive proof remains mandatory, but its exact ACK
         // must not depend on Durable Command or the window would eventually
@@ -2199,11 +2544,175 @@ fn direct_execution_request(state: &EnclaveState, request: &PlainRequest) -> boo
     }
 }
 
+/// The one-off Green EIF is a request firewall, not a general production EIF.
+/// It exposes only the provisioning and Base-USDC funding lifecycle required
+/// to certify E03-S05. In particular, bridge, resolution, reward, market and
+/// audit signing authority remain unreachable even if their code is linked.
+#[cfg(feature = "green-pool-certification")]
+fn green_pool_certification_request_allowed(state: &EnclaveState, request: &PlainRequest) -> bool {
+    match request {
+        PlainRequest::User { command, .. } => direct_base_usdc_withdrawal(&command.action),
+        PlainRequest::AggregateDepth { .. } => false,
+        PlainRequest::Operator { envelope } => match &envelope.command {
+            OperatorCommand::ProvisionStatus
+            | OperatorCommand::BeginProvision { .. }
+            | OperatorCommand::CompleteProvision { .. }
+            | OperatorCommand::ChainSignerStatus
+            | OperatorCommand::BeginChainSignerProvision { .. }
+            | OperatorCommand::CompleteChainSignerProvision { .. }
+            | OperatorCommand::SignGreenPoolSeed { .. }
+            | OperatorCommand::SignGreenBaseNativeRefund { .. } => true,
+            OperatorCommand::DirectCreditDeposit { request } => {
+                green_base_usdc_deposit_request(request)
+            }
+            OperatorCommand::AllocateGreenE03s05TestCapital { request } => {
+                green_e03s05_test_capital_request(state, request)
+            }
+            OperatorCommand::DirectDepositCreditLookup {
+                account_id,
+                financial_replay_key_sha256,
+            } => state.core.as_ref().is_some_and(|core| {
+                match core.direct_deposit_credit_lookup(*account_id, *financial_replay_key_sha256) {
+                    Ok(Some(response)) => green_base_usdc_deposit_request(&response.request),
+                    Ok(None) => false,
+                    Err(_) => false,
+                }
+            }),
+            OperatorCommand::DirectWithdrawal { request } => {
+                green_base_usdc_withdrawal_request(request)
+            }
+            OperatorCommand::DirectWithdrawalLookup {
+                account_id,
+                operation_replay_key_sha256,
+            } => state.core.as_ref().is_some_and(|core| {
+                match core.direct_withdrawal_lookup(*account_id, *operation_replay_key_sha256) {
+                    Ok(Some(response)) => green_base_usdc_withdrawal_request(&response.request),
+                    Ok(None) => false,
+                    Err(_) => false,
+                }
+            }),
+            OperatorCommand::SignPoolWithdrawal {
+                idempotency_key,
+                authorization,
+                nonce,
+                gas_limit,
+                max_fee_per_gas_wei,
+                max_priority_fee_per_gas_wei,
+                now_millis,
+            } => direct_base_usdc_withdrawal_signing(
+                idempotency_key,
+                authorization,
+                *nonce,
+                *gas_limit,
+                max_fee_per_gas_wei,
+                max_priority_fee_per_gas_wei,
+                *now_millis,
+            ),
+            OperatorCommand::ReplacePreparedPoolWithdrawal {
+                idempotency_key,
+                recovery_authorization,
+                observation,
+                replacement_nonce,
+                gas_limit,
+                max_fee_per_gas_wei,
+                max_priority_fee_per_gas_wei,
+                now_millis,
+                ..
+            } => direct_base_usdc_withdrawal_replacement(
+                idempotency_key,
+                recovery_authorization,
+                observation,
+                *replacement_nonce,
+                *gas_limit,
+                max_fee_per_gas_wei,
+                max_priority_fee_per_gas_wei,
+                *now_millis,
+            ),
+            _ => false,
+        },
+    }
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn green_base_usdc_deposit_request(request: &DirectExecutionRequestEnvelope) -> bool {
+    request.operation == DirectExecutionOperation::CreditDeposit
+        && serde_json::from_slice::<DirectDepositCreditPayload>(&request.canonical_payload)
+            .is_ok_and(|payload| {
+                payload.asset == "USDC"
+                    && payload.source_chain == "eip155:8453"
+                    && payload.pool_chain == "base"
+            })
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn green_e03s05_test_capital_request(
+    state: &EnclaveState,
+    request: &DirectExecutionRequestEnvelope,
+) -> bool {
+    let Some(completed) = state.completed_green_pool_seed.as_ref() else {
+        // The seed-signing cache is intentionally not snapshot state.  Once a
+        // direct allocation has committed, only its exact sealed request may
+        // recover after restart; a fresh allocation remains unavailable.
+        return state.core.as_ref().is_some_and(|core| {
+            core.replay_green_e03s05_test_capital(request)
+                .is_ok_and(|response| response.is_some())
+        });
+    };
+    let Ok(seed_hash) = decode_green_transaction_hash(&completed.transaction.transaction_hash)
+    else {
+        return false;
+    };
+    let binding = GreenE03s05TestCapitalBinding {
+        authenticated_subject_hash: GREEN_E03S05_ACCOUNT_AND_AUTH,
+        account_id: GREEN_E03S05_ACCOUNT_AND_AUTH,
+        identity_commitment: GREEN_E03S05_IDENTITY,
+        session_id: GREEN_E03S05_SESSION_ID.into(),
+        seed_transaction_hash: seed_hash,
+    };
+    GreenE03s05TestCapitalPayload::decode_for(request, &binding).is_ok()
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn decode_green_transaction_hash(value: &str) -> Result<[u8; 32], ()> {
+    let bytes = hex::decode(value.strip_prefix("0x").ok_or(())?).map_err(|_| ())?;
+    bytes.try_into().map_err(|_| ())
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn green_base_usdc_withdrawal_request(request: &DirectExecutionRequestEnvelope) -> bool {
+    matches!(
+        request.operation,
+        DirectExecutionOperation::ReserveWithdrawal
+            | DirectExecutionOperation::FinalizeWithdrawal
+            | DirectExecutionOperation::ReleaseWithdrawal
+    ) && serde_json::from_slice::<DirectWithdrawalPayload>(&request.canonical_payload).is_ok_and(
+        |payload| {
+            payload.chain == "base"
+                && payload.asset == "USDC"
+                && payload.amount_atomic == 20_000_000
+                && payload.withdrawal_id == GREEN_E03S05_WITHDRAWAL_ID
+                && payload.authenticated_subject_hash == GREEN_E03S05_ACCOUNT_AND_AUTH
+                && payload.account_id == GREEN_E03S05_ACCOUNT_AND_AUTH
+                && payload.identity_commitment == GREEN_E03S05_IDENTITY
+                && payload.session_id == GREEN_E03S05_SESSION_ID
+        },
+    )
+}
+
 fn direct_deposit_operator_command(command: &OperatorCommand) -> bool {
     matches!(
         command,
         OperatorCommand::DirectCreditDeposit { .. }
             | OperatorCommand::DirectDepositCreditLookup { .. }
+    )
+}
+
+fn direct_withdrawal_operator_command(command: &OperatorCommand) -> bool {
+    matches!(
+        command,
+        OperatorCommand::DirectWithdrawal { .. }
+            | OperatorCommand::DirectWithdrawalLookup { .. }
+            | OperatorCommand::SignPoolWithdrawal { .. }
     )
 }
 
@@ -2215,7 +2724,8 @@ fn request_requires_trusted_execution_time(request: &PlainRequest) -> bool {
         request,
         PlainRequest::Operator {
             envelope: OperatorEnvelope {
-                command: OperatorCommand::DirectDepositCreditLookup { .. },
+                command: OperatorCommand::DirectDepositCreditLookup { .. }
+                    | OperatorCommand::DirectWithdrawalLookup { .. },
                 ..
             }
         }
@@ -2237,6 +2747,35 @@ fn requires_durable_preparation(has_journal_artifact: bool, direct_execution: bo
     has_journal_artifact && !direct_execution
 }
 
+fn direct_execution_reuses_archived_snapshot(response: &PlainResponse) -> bool {
+    #[cfg(feature = "green-pool-certification")]
+    if matches!(
+        response,
+        PlainResponse::GreenE03s05TestCapital {
+            outcome: GreenE03s05TestCapitalOutcome::ReturnOriginal(_),
+        }
+    ) {
+        return true;
+    }
+    #[cfg(feature = "green-pool-certification")]
+    if matches!(
+        response,
+        PlainResponse::GreenBaseNativeRefundSigned { response: None, .. }
+    ) {
+        return true;
+    }
+    matches!(
+        response,
+        PlainResponse::DirectDepositCredit {
+            outcome: DirectDepositCreditOutcome::ReturnOriginal(_),
+        } | PlainResponse::DirectDepositCreditLookup { response: Some(_) }
+            | PlainResponse::DirectWithdrawal {
+                outcome: DirectWithdrawalOutcome::ReturnOriginal(_),
+            }
+            | PlainResponse::DirectWithdrawalLookup { response: Some(_) }
+    )
+}
+
 fn direct_deposit_journal_artifact(response: &PlainResponse) -> Option<EncryptedJournalRecord> {
     match response {
         PlainResponse::DirectDepositCredit { outcome } => Some(match outcome {
@@ -2251,6 +2790,23 @@ fn direct_deposit_journal_artifact(response: &PlainResponse) -> Option<Encrypted
         PlainResponse::DirectDepositCreditLookup {
             response: Some(response),
         } => Some(response.encrypted_journal_record.clone()),
+        PlainResponse::DirectWithdrawal { outcome } => Some(match outcome {
+            DirectWithdrawalOutcome::Applied(response)
+            | DirectWithdrawalOutcome::ReturnOriginal(response)
+            | DirectWithdrawalOutcome::EffectNone(response) => {
+                response.encrypted_journal_record.clone()
+            }
+        }),
+        PlainResponse::DirectWithdrawalLookup {
+            response: Some(response),
+        } => Some(response.encrypted_journal_record.clone()),
+        #[cfg(feature = "green-pool-certification")]
+        PlainResponse::GreenE03s05TestCapital { outcome } => Some(match outcome {
+            GreenE03s05TestCapitalOutcome::Applied(response)
+            | GreenE03s05TestCapitalOutcome::ReturnOriginal(response) => {
+                response.encrypted_journal_record.clone()
+            }
+        }),
         _ => None,
     }
 }
@@ -2267,6 +2823,21 @@ fn direct_deposit_receipt_artifact(response: &PlainResponse) -> Option<EnclaveRe
         PlainResponse::DirectDepositCreditLookup {
             response: Some(response),
         } => Some(response.enclave_receipt.clone()),
+        PlainResponse::DirectWithdrawal { outcome } => Some(match outcome {
+            DirectWithdrawalOutcome::Applied(response)
+            | DirectWithdrawalOutcome::ReturnOriginal(response)
+            | DirectWithdrawalOutcome::EffectNone(response) => response.enclave_receipt.clone(),
+        }),
+        PlainResponse::DirectWithdrawalLookup {
+            response: Some(response),
+        } => Some(response.enclave_receipt.clone()),
+        #[cfg(feature = "green-pool-certification")]
+        PlainResponse::GreenE03s05TestCapital { outcome } => Some(match outcome {
+            GreenE03s05TestCapitalOutcome::Applied(response)
+            | GreenE03s05TestCapitalOutcome::ReturnOriginal(response) => {
+                response.enclave_receipt.clone()
+            }
+        }),
         _ => None,
     }
 }
@@ -2297,8 +2868,281 @@ fn direct_quest_operator_command(command: &OperatorCommand) -> bool {
             minimum_level_quantity_micros,
             ..
         } => direct_crypto_public_depth(market_id, *now_millis, *minimum_level_quantity_micros),
+        OperatorCommand::CreditDeposit {
+            idempotency_key,
+            identity_commitment,
+            asset,
+            amount_atomic,
+            evidence_hash,
+            ..
+        } => direct_base_usdc_deposit_credit(
+            idempotency_key,
+            identity_commitment,
+            asset,
+            *amount_atomic,
+            evidence_hash,
+        ),
+        OperatorCommand::FinalizeWithdrawal {
+            idempotency_key,
+            identity_commitment,
+            asset,
+            amount_atomic,
+            evidence_hash,
+            ..
+        } => direct_base_usdc_withdrawal_terminal(
+            "withdrawal-final:",
+            idempotency_key,
+            identity_commitment,
+            asset,
+            *amount_atomic,
+            evidence_hash,
+        ),
+        OperatorCommand::ReleaseWithdrawal {
+            idempotency_key,
+            identity_commitment,
+            asset,
+            amount_atomic,
+            evidence_hash,
+            ..
+        } => direct_base_usdc_withdrawal_terminal(
+            "withdrawal-release:",
+            idempotency_key,
+            identity_commitment,
+            asset,
+            *amount_atomic,
+            evidence_hash,
+        ),
+        OperatorCommand::SignPoolWithdrawal {
+            idempotency_key,
+            authorization,
+            nonce,
+            gas_limit,
+            max_fee_per_gas_wei,
+            max_priority_fee_per_gas_wei,
+            now_millis,
+        } => direct_base_usdc_withdrawal_signing(
+            idempotency_key,
+            authorization,
+            *nonce,
+            *gas_limit,
+            max_fee_per_gas_wei,
+            max_priority_fee_per_gas_wei,
+            *now_millis,
+        ),
+        OperatorCommand::ReplacePreparedPoolWithdrawal {
+            idempotency_key,
+            recovery_authorization,
+            observation,
+            replacement_nonce,
+            gas_limit,
+            max_fee_per_gas_wei,
+            max_priority_fee_per_gas_wei,
+            now_millis,
+            ..
+        } => direct_base_usdc_withdrawal_replacement(
+            idempotency_key,
+            recovery_authorization,
+            observation,
+            *replacement_nonce,
+            *gas_limit,
+            max_fee_per_gas_wei,
+            max_priority_fee_per_gas_wei,
+            *now_millis,
+        ),
+        OperatorCommand::ResolutionStatus { market_id }
+        | OperatorCommand::ResolutionReadiness { market_id, .. } => {
+            recurring_crypto_window(market_id).is_some()
+        }
+        OperatorCommand::TradingFreezeStatus => true,
+        OperatorCommand::SetTradingFreeze {
+            idempotency_key,
+            reason_commitment,
+            now_millis,
+            ..
+        } => direct_trading_freeze_control(idempotency_key, reason_commitment, *now_millis),
+        OperatorCommand::SignResolutionEvidence { evidence, .. } => {
+            recurring_crypto_window(unsigned_resolution_market_id(evidence)).is_some()
+        }
+        OperatorCommand::ResolveBinanceMarket { signed, .. } => {
+            recurring_crypto_window(&signed.statement.market_id).is_some()
+        }
         _ => false,
     }
+}
+
+fn direct_trading_freeze_control(
+    idempotency_key: &str,
+    reason_commitment: &[u8; 32],
+    now_millis: i64,
+) -> bool {
+    let Some(digest) = idempotency_key.strip_prefix("trading-freeze:") else {
+        return false;
+    };
+    reason_commitment != &[0; 32]
+        && now_millis > 0
+        && digest.len() == 64
+        && digest == hex::encode(reason_commitment)
+}
+
+fn direct_base_usdc_withdrawal(action: &UserCommandAction) -> bool {
+    let UserCommandAction::RequestWithdrawal {
+        withdrawal_id,
+        chain,
+        asset,
+        amount_atomic,
+        destination,
+    } = action
+    else {
+        return false;
+    };
+    !withdrawal_id.is_nil()
+        && chain == "base"
+        && asset == "USDC"
+        && *amount_atomic > 0
+        && valid_evm_destination(destination)
+}
+
+fn direct_base_usdc_withdrawal_terminal(
+    prefix: &str,
+    idempotency_key: &str,
+    identity_commitment: &[u8; 32],
+    asset: &str,
+    amount_atomic: u128,
+    evidence_hash: &[u8; 32],
+) -> bool {
+    let Some(withdrawal_id) = idempotency_key.strip_prefix(prefix) else {
+        return false;
+    };
+    Uuid::parse_str(withdrawal_id).is_ok_and(|value| !value.is_nil())
+        && identity_commitment != &[0; 32]
+        && asset == "USDC"
+        && amount_atomic > 0
+        && evidence_hash != &[0; 32]
+}
+
+fn direct_base_usdc_withdrawal_signing(
+    idempotency_key: &str,
+    authorization: &WithdrawalAuthorization,
+    nonce: u64,
+    gas_limit: u64,
+    max_fee_per_gas_wei: &str,
+    max_priority_fee_per_gas_wei: &str,
+    now_millis: i64,
+) -> bool {
+    let Some(withdrawal_id) = idempotency_key.strip_prefix("withdrawal-sign:") else {
+        return false;
+    };
+    let Ok(withdrawal_id) = Uuid::parse_str(withdrawal_id) else {
+        return false;
+    };
+    let intent = &authorization.intent;
+    let Ok(amount_atomic) = intent.amount_atomic.parse::<u128>() else {
+        return false;
+    };
+    let Ok(max_fee) = max_fee_per_gas_wei.parse::<u128>() else {
+        return false;
+    };
+    let Ok(priority_fee) = max_priority_fee_per_gas_wei.parse::<u128>() else {
+        return false;
+    };
+    !withdrawal_id.is_nil()
+        && withdrawal_id == intent.withdrawal_id
+        && intent.protocol_version == "layrs.withdrawal.v1"
+        && !intent.session_id.is_empty()
+        && intent.chain == "base"
+        && intent.asset == "USDC"
+        && amount_atomic > 0
+        && valid_evm_destination(&intent.destination)
+        && !intent.receipt_id.is_empty()
+        && intent.state_root != [0; 32]
+        && now_millis > 0
+        && now_millis < intent.expires_at_millis
+        && intent.expires_at_millis.saturating_sub(now_millis) <= 15 * 60_000
+        && nonce <= i64::MAX as u64
+        && (21_000..=2_000_000).contains(&gas_limit)
+        && max_fee > 0
+        && priority_fee <= max_fee
+}
+
+#[allow(clippy::too_many_arguments)]
+fn direct_base_usdc_withdrawal_replacement(
+    idempotency_key: &str,
+    authorization: &WithdrawalAuthorization,
+    observation: &WithdrawalReplacementChainObservation,
+    replacement_nonce: u64,
+    gas_limit: u64,
+    max_fee_per_gas_wei: &str,
+    max_priority_fee_per_gas_wei: &str,
+    now_millis: i64,
+) -> bool {
+    let intent = &authorization.intent;
+    let Some(proof) = intent.recovery_proof.as_ref() else {
+        return false;
+    };
+    let Ok(max_fee) = max_fee_per_gas_wei.parse::<u128>() else {
+        return false;
+    };
+    let Ok(priority_fee) = max_priority_fee_per_gas_wei.parse::<u128>() else {
+        return false;
+    };
+    idempotency_key == format!("withdrawal-replacement:{}", intent.withdrawal_id)
+        && !intent.withdrawal_id.is_nil()
+        && intent.protocol_version == "layrs.withdrawal-recovery.v1"
+        && proof.protocol_version == "layrs.withdrawal-terminal-journal-proof.v1"
+        && intent.chain == "base"
+        && intent.asset == "USDC"
+        && observation.protocol_version == "layrs.withdrawal-chain-absence.v1"
+        && observation.chain == "base"
+        && observation.transaction_absent
+        && observation.receipt_absent
+        && observation.pending_nonce == replacement_nonce
+        && now_millis > 0
+        && now_millis < intent.expires_at_millis
+        && (45_000..=250_000).contains(&gas_limit)
+        && max_fee > 0
+        && priority_fee <= max_fee
+}
+
+fn valid_evm_destination(destination: &str) -> bool {
+    destination.len() == 42
+        && destination.starts_with("0x")
+        && destination[2..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn unsigned_resolution_market_id(evidence: &UnsignedResolutionEvidence) -> &str {
+    match evidence {
+        UnsignedResolutionEvidence::Pyth(statement) => &statement.market_id,
+        UnsignedResolutionEvidence::Binance(statement) => &statement.market_id,
+        UnsignedResolutionEvidence::ExactCondition(statement) => &statement.market_id,
+        UnsignedResolutionEvidence::Polymarket(statement) => &statement.market_id,
+    }
+}
+
+/// Quest deposits have already been finalized on Base and reconciled to the
+/// pool before the coordinator signs this command. The worker enforces the
+/// five-USDC minimum over all finalized transfers in the deposit session, then
+/// credits each positive transfer against its own pool receipt. Permit only
+/// that per-transfer shape here; other funding mutations remain fenced.
+fn direct_base_usdc_deposit_credit(
+    idempotency_key: &str,
+    identity_commitment: &[u8; 32],
+    asset: &str,
+    amount_atomic: u128,
+    evidence_hash: &[u8; 32],
+) -> bool {
+    let Some(transfer_id) = idempotency_key.strip_prefix("deposit:") else {
+        return false;
+    };
+    let Ok(transfer_id) = Uuid::parse_str(transfer_id) else {
+        return false;
+    };
+    !transfer_id.is_nil()
+        && identity_commitment != &[0; 32]
+        && asset == "USDC"
+        && amount_atomic > 0
+        && evidence_hash != &[0; 32]
 }
 
 fn direct_crypto_public_depth(
@@ -2492,6 +3336,9 @@ fn request_requires_writer_authorization(request: &PlainRequest) -> bool {
                 | OperatorCommand::ObserveBootstrapSubmission { .. }
                 | OperatorCommand::ReconcileBootstrap { .. }
                 | OperatorCommand::SignPoolWithdrawal { .. }
+                | OperatorCommand::ReplacePreparedPoolWithdrawal { .. }
+                | OperatorCommand::InspectPendingPreparation { .. }
+                | OperatorCommand::AbortSupersededPreparation { .. }
                 | OperatorCommand::FinalizePreparedCommand { .. }
         ),
         PlainRequest::AggregateDepth { .. } => false,
@@ -2624,6 +3471,42 @@ fn durable_preparation_id(preparation: &DurableCommandPreparation) -> [u8; 32] {
     hash.update((encoded.len() as u32).to_be_bytes());
     hash.update(encoded);
     hash.finalize().into()
+}
+
+fn pending_preparation_is_superseded(
+    preparation: &DurableCommandPreparation,
+    live_enclave_sequence: u64,
+    live_state_root: [u8; 32],
+) -> bool {
+    // A durable decision whose candidate is still the only possible next
+    // state is irrevocable and must be finalized. Supersession is provable
+    // only after the committed core has reached the candidate sequence on a
+    // different root, or has advanced beyond it. This is the exact condition
+    // under which FINALIZE_PREPARED_COMMAND would reject the stale candidate
+    // with a head mismatch.
+    live_enclave_sequence > preparation.enclave_sequence
+        || (live_enclave_sequence == preparation.enclave_sequence
+            && live_state_root != preparation.state_root)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preparation_supersession_matches_request(
+    certificate: &SignedPreparationSupersession,
+    request_idempotency_key: &str,
+    preparation_id: [u8; 32],
+    pending_enclave_sequence: u64,
+    pending_state_root: [u8; 32],
+    live_enclave_sequence: u64,
+    live_state_root: [u8; 32],
+    live_journal_head: [u8; 32],
+) -> bool {
+    certificate.request_idempotency_key == request_idempotency_key
+        && certificate.preparation_id == preparation_id
+        && certificate.pending_enclave_sequence == pending_enclave_sequence
+        && certificate.pending_state_root == pending_state_root
+        && certificate.live_enclave_sequence == live_enclave_sequence
+        && certificate.live_state_root == live_state_root
+        && certificate.live_journal_head == live_journal_head
 }
 
 fn rebind_durable_preparation(
@@ -3434,6 +4317,43 @@ async fn dispatch_operator(
                 .map_err(|error| error.to_string())?;
             Ok(PlainResponse::DirectDepositCredit { outcome })
         }
+        #[cfg(feature = "green-pool-certification")]
+        OperatorCommand::AllocateGreenE03s05TestCapital { request } => {
+            let now_millis =
+                verified_now_millis.ok_or_else(|| "TRUSTED_TIME_UNAVAILABLE".to_string())?;
+            if let Some(response) = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .replay_green_e03s05_test_capital(&request)
+                .map_err(|error| error.to_string())?
+            {
+                return Ok(PlainResponse::GreenE03s05TestCapital {
+                    outcome: GreenE03s05TestCapitalOutcome::ReturnOriginal(response),
+                });
+            }
+            let completed = state
+                .completed_green_pool_seed
+                .as_ref()
+                .ok_or_else(|| "GREEN_POOL_SEED_EVIDENCE_REQUIRED".to_string())?;
+            let seed_transaction_hash =
+                decode_green_transaction_hash(&completed.transaction.transaction_hash)
+                    .map_err(|_| "GREEN_POOL_SEED_EVIDENCE_INVALID".to_string())?;
+            let binding = GreenE03s05TestCapitalBinding {
+                authenticated_subject_hash: GREEN_E03S05_ACCOUNT_AND_AUTH,
+                account_id: GREEN_E03S05_ACCOUNT_AND_AUTH,
+                identity_commitment: GREEN_E03S05_IDENTITY,
+                session_id: GREEN_E03S05_SESSION_ID.into(),
+                seed_transaction_hash,
+            };
+            let outcome = state
+                .core
+                .as_mut()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .allocate_green_e03s05_test_capital(request, &binding, now_millis)
+                .map_err(|error| error.to_string())?;
+            Ok(PlainResponse::GreenE03s05TestCapital { outcome })
+        }
         OperatorCommand::DirectDepositCreditLookup {
             account_id,
             financial_replay_key_sha256,
@@ -3451,6 +4371,41 @@ async fn dispatch_operator(
                 .direct_deposit_credit_lookup(account_id, financial_replay_key_sha256)
                 .map_err(|error| error.to_string())?;
             Ok(PlainResponse::DirectDepositCreditLookup { response })
+        }
+        OperatorCommand::DirectWithdrawal { request } => {
+            if !matches!(option_env!("LAYRS_DIRECT_WITHDRAWAL_ENABLED"), Some("1")) {
+                return Err("DIRECT_WITHDRAWAL_DISABLED".into());
+            }
+            let now_millis =
+                verified_now_millis.ok_or_else(|| "TRUSTED_TIME_UNAVAILABLE".to_string())?;
+            let core = state
+                .core
+                .as_mut()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?;
+            #[cfg(feature = "green-pool-certification")]
+            let outcome = core
+                .direct_green_e03s05_test_capital_withdrawal(request, now_millis)
+                .map_err(|error| error.to_string())?;
+            #[cfg(not(feature = "green-pool-certification"))]
+            let outcome = core
+                .direct_withdrawal(request, now_millis)
+                .map_err(|error| error.to_string())?;
+            Ok(PlainResponse::DirectWithdrawal { outcome })
+        }
+        OperatorCommand::DirectWithdrawalLookup {
+            account_id,
+            operation_replay_key_sha256,
+        } => {
+            if !matches!(option_env!("LAYRS_DIRECT_WITHDRAWAL_ENABLED"), Some("1")) {
+                return Err("DIRECT_WITHDRAWAL_DISABLED".into());
+            }
+            let response = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .direct_withdrawal_lookup(account_id, operation_replay_key_sha256)
+                .map_err(|error| error.to_string())?;
+            Ok(PlainResponse::DirectWithdrawalLookup { response })
         }
         OperatorCommand::RecoverWithdrawalAuthorization {
             withdrawal_id,
@@ -3498,6 +4453,123 @@ async fn dispatch_operator(
                 "UNKNOWN"
             };
             Ok(PlainResponse::PreparedCommandStatus { state: status })
+        }
+        OperatorCommand::InspectPendingPreparation { idempotency_key } => {
+            let observed_at_millis =
+                verified_now_millis.ok_or_else(|| "TRUSTED_TIME_UNAVAILABLE".to_string())?;
+            let core = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?;
+            let pending = state.pending_preparation.as_ref();
+            let mut inspection = SignedPendingPreparationInspection {
+                protocol_version: "layrs.pending-preparation-inspection.v1".into(),
+                environment: recovery_environment().into(),
+                enclave_measurement_sha384: state.enclave_measurement_sha384.to_vec(),
+                request_idempotency_key: idempotency_key,
+                preparation_id: pending.map(|value| value.preparation.preparation_id),
+                pending_prior_enclave_sequence: pending
+                    .map(|value| value.preparation.prior_enclave_sequence),
+                pending_enclave_sequence: pending.map(|value| value.preparation.enclave_sequence),
+                pending_prior_state_root: pending.map(|value| value.preparation.prior_state_root),
+                pending_state_root: pending.map(|value| value.preparation.state_root),
+                live_enclave_sequence: core.sequence(),
+                live_state_root: core.state_root(),
+                live_journal_head: core.journal_head(),
+                observed_at_millis,
+                signature: Vec::new(),
+            };
+            let signer = state
+                .receipt_signer
+                .as_ref()
+                .ok_or_else(|| "RECEIPT_SIGNER_UNAVAILABLE".to_string())?;
+            inspection.signature = signer
+                .sign_domain_payload(b"layrs.pending-preparation-inspection.v1\0", &inspection);
+            Ok(PlainResponse::PendingPreparationInspection { inspection })
+        }
+        OperatorCommand::AbortSupersededPreparation {
+            idempotency_key,
+            preparation_id,
+            pending_enclave_sequence,
+            pending_state_root,
+            live_enclave_sequence,
+            live_state_root,
+            live_journal_head,
+        } => {
+            if let Some(previous) = state.last_preparation_supersession.as_ref() {
+                if previous.request_idempotency_key == idempotency_key {
+                    if preparation_supersession_matches_request(
+                        previous,
+                        &idempotency_key,
+                        preparation_id,
+                        pending_enclave_sequence,
+                        pending_state_root,
+                        live_enclave_sequence,
+                        live_state_root,
+                        live_journal_head,
+                    ) {
+                        return Ok(PlainResponse::PreparedCommandSuperseded {
+                            certificate: previous.clone(),
+                        });
+                    }
+                    return Err("DURABLE_SUPERSESSION_IDEMPOTENCY_CONFLICT".into());
+                }
+            }
+            let superseded_at_millis =
+                verified_now_millis.ok_or_else(|| "TRUSTED_TIME_UNAVAILABLE".to_string())?;
+            let core = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?;
+            if core.sequence() != live_enclave_sequence
+                || core.state_root() != live_state_root
+                || core.journal_head() != live_journal_head
+            {
+                return Err("DURABLE_SUPERSESSION_LIVE_HEAD_CHANGED".into());
+            }
+            let pending = state
+                .pending_preparation
+                .as_ref()
+                .ok_or_else(|| "DURABLE_PREPARATION_NOT_FOUND".to_string())?;
+            if pending.preparation.preparation_id != preparation_id
+                || pending.preparation.enclave_sequence != pending_enclave_sequence
+                || pending.preparation.state_root != pending_state_root
+            {
+                return Err("DURABLE_SUPERSESSION_PREPARATION_MISMATCH".into());
+            }
+            if !pending_preparation_is_superseded(
+                &pending.preparation,
+                live_enclave_sequence,
+                live_state_root,
+            ) {
+                return Err("DURABLE_PREPARATION_NOT_SUPERSEDED".into());
+            }
+            let mut certificate = SignedPreparationSupersession {
+                protocol_version: "layrs.preparation-supersession.v1".into(),
+                environment: recovery_environment().into(),
+                enclave_measurement_sha384: state.enclave_measurement_sha384.to_vec(),
+                request_idempotency_key: idempotency_key,
+                preparation_id,
+                pending_prior_enclave_sequence: pending.preparation.prior_enclave_sequence,
+                pending_enclave_sequence,
+                pending_prior_state_root: pending.preparation.prior_state_root,
+                pending_state_root,
+                live_enclave_sequence,
+                live_state_root,
+                live_journal_head,
+                superseded_at_millis,
+                signature: Vec::new(),
+            };
+            let signer = state
+                .receipt_signer
+                .as_ref()
+                .ok_or_else(|| "RECEIPT_SIGNER_UNAVAILABLE".to_string())?;
+            certificate.signature =
+                signer.sign_domain_payload(b"layrs.preparation-supersession.v1\0", &certificate);
+            // The pending candidate is cleared only after the encrypted
+            // certificate has been constructed successfully in
+            // `handle_encrypted`. Until then this is a read-only proof step.
+            Ok(PlainResponse::PreparedCommandSuperseded { certificate })
         }
         OperatorCommand::FinalizePreparedCommand {
             preparation,
@@ -3988,6 +5060,10 @@ async fn dispatch_operator(
                 .chain_signer
                 .as_ref()
                 .map(EnclaveChainSigner::reward_claim_signers),
+            pool_addresses: state
+                .chain_signer
+                .as_ref()
+                .map(EnclaveChainSigner::pool_addresses),
         }),
         OperatorCommand::BeginChainSignerProvision {
             kms_key_id,
@@ -4070,10 +5146,16 @@ async fn dispatch_operator(
             wrapping_key.zeroize();
             let parsed = serde_json::from_slice::<ChainSignerBundle>(&plaintext);
             plaintext.zeroize();
-            state.chain_signer =
-                Some(EnclaveChainSigner::new(parsed.map_err(|_| {
-                    "INVALID_CHAIN_SIGNER_SECRET_BUNDLE".to_string()
-                })?)?);
+            let chain_signer = EnclaveChainSigner::new(
+                parsed.map_err(|_| "INVALID_CHAIN_SIGNER_SECRET_BUNDLE".to_string())?,
+            )?;
+            #[cfg(feature = "green-pool-certification")]
+            let chain_signer = {
+                let mut signer = chain_signer;
+                signer.activate_green_destination_pool()?;
+                signer
+            };
+            state.chain_signer = Some(chain_signer);
             Ok(PlainResponse::ChainSignerStatus {
                 state: "READY",
                 verifier_public_key: state
@@ -4088,7 +5170,162 @@ async fn dispatch_operator(
                     .chain_signer
                     .as_ref()
                     .map(EnclaveChainSigner::reward_claim_signers),
+                pool_addresses: state
+                    .chain_signer
+                    .as_ref()
+                    .map(EnclaveChainSigner::pool_addresses),
             })
+        }
+        #[cfg(feature = "green-pool-certification")]
+        OperatorCommand::SignGreenPoolSeed {
+            authorization,
+            nonce,
+            gas_limit,
+            max_fee_per_gas_wei,
+            max_priority_fee_per_gas_wei,
+            now_millis: _untrusted_now_millis,
+        } => {
+            let trusted_now_millis =
+                verified_now_millis.ok_or_else(|| "TRUSTED_TIME_UNAVAILABLE".to_string())?;
+            verify_green_pool_transition_authorization(
+                &authorization,
+                GreenPoolTransitionOperation::SeedBasePool,
+                &state.operator_public_key,
+                trusted_now_millis,
+            )?;
+            let commitment = green_pool_seed_command_commitment(
+                &authorization.intent,
+                nonce,
+                gas_limit,
+                &max_fee_per_gas_wei,
+                &max_priority_fee_per_gas_wei,
+            )?;
+            if let Some(completed) = &state.completed_green_pool_seed {
+                let transaction = replay_green_pool_seed(
+                    completed,
+                    &authorization.intent.operation_id,
+                    commitment,
+                )?;
+                return Ok(PlainResponse::GreenPoolSeedSigned {
+                    operation_id: completed.operation_id.clone(),
+                    transaction,
+                });
+            }
+            let transaction = state
+                .chain_signer
+                .as_ref()
+                .ok_or_else(|| "CHAIN_SIGNER_NOT_PROVISIONED".to_string())?
+                .sign_green_pool_seed(
+                    &authorization.intent.token_address,
+                    &authorization.intent.destination_pool_address,
+                    &authorization.intent.amount_atomic,
+                    nonce,
+                    gas_limit,
+                    &max_fee_per_gas_wei,
+                    &max_priority_fee_per_gas_wei,
+                )
+                .await?;
+            let completed = CompletedGreenPoolSeed {
+                operation_id: authorization.intent.operation_id,
+                command_commitment: commitment,
+                transaction: transaction.clone(),
+            };
+            let response = PlainResponse::GreenPoolSeedSigned {
+                operation_id: completed.operation_id.clone(),
+                transaction,
+            };
+            state.completed_green_pool_seed = Some(completed);
+            Ok(response)
+        }
+        #[cfg(feature = "green-pool-certification")]
+        OperatorCommand::SignGreenBaseNativeRefund {
+            authorization,
+            nonce,
+            gas_limit,
+            max_fee_per_gas_wei,
+            max_priority_fee_per_gas_wei,
+            now_millis: _untrusted_now_millis,
+        } => {
+            let trusted_now_millis =
+                verified_now_millis.ok_or_else(|| "TRUSTED_TIME_UNAVAILABLE".to_string())?;
+            verify_green_native_refund_authorization(
+                &authorization,
+                &state.operator_public_key,
+                trusted_now_millis,
+            )?;
+            let commitment = green_native_refund_command_commitment(
+                &authorization.intent,
+                nonce,
+                gas_limit,
+                &max_fee_per_gas_wei,
+                &max_priority_fee_per_gas_wei,
+            )?;
+            let prior_completion = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .green_native_refund_completion()
+                .map_err(|error| error.to_string())?;
+            if let Some(completed) = prior_completion.as_ref() {
+                let transaction = replay_green_native_refund(
+                    completed,
+                    &authorization.intent.operation_id,
+                    commitment,
+                )?;
+                return Ok(PlainResponse::GreenBaseNativeRefundSigned {
+                    operation_id: completed.operation_id.clone(),
+                    relay_request_id: authorization.intent.relay_request_id,
+                    final_recipient: authorization.intent.final_recipient,
+                    destination_chain_id: authorization.intent.destination_chain_id,
+                    destination_asset: authorization.intent.destination_asset,
+                    transaction,
+                    response: None,
+                });
+            }
+            let transaction = state
+                .chain_signer
+                .as_ref()
+                .ok_or_else(|| "CHAIN_SIGNER_NOT_PROVISIONED".to_string())?
+                .sign_green_native_refund(
+                    &authorization.intent.relay_deposit_address,
+                    &authorization.intent.amount_wei,
+                    nonce,
+                    gas_limit,
+                    &max_fee_per_gas_wei,
+                    &max_priority_fee_per_gas_wei,
+                )
+                .await?;
+            let completed = GreenNativeRefundCompletion {
+                operation_id: authorization.intent.operation_id.clone(),
+                command_commitment: commitment,
+                transaction: GreenNativeRefundTerminalTransaction {
+                    chain: transaction.chain.clone(),
+                    chain_id: transaction.chain_id,
+                    asset: transaction.asset.clone(),
+                    signer: transaction.signer.clone(),
+                    destination: transaction.destination.clone(),
+                    amount_wei: transaction.amount_wei.clone(),
+                    nonce: transaction.nonce,
+                    transaction_hash: transaction.transaction_hash.clone(),
+                    raw_transaction_hex: transaction.raw_transaction_hex.clone(),
+                },
+            };
+            let completion_response = state
+                .core
+                .as_mut()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .seal_green_native_refund_completion(completed.clone(), trusted_now_millis)
+                .map_err(|error| error.to_string())?;
+            let response = PlainResponse::GreenBaseNativeRefundSigned {
+                operation_id: completed.operation_id.clone(),
+                relay_request_id: authorization.intent.relay_request_id,
+                final_recipient: authorization.intent.final_recipient,
+                destination_chain_id: authorization.intent.destination_chain_id,
+                destination_asset: authorization.intent.destination_asset,
+                transaction,
+                response: Some(completion_response),
+            };
+            Ok(response)
         }
         OperatorCommand::SignPoolWithdrawal {
             idempotency_key,
@@ -4142,6 +5379,119 @@ async fn dispatch_operator(
                     authorization.intent.withdrawal_id,
                     commitment,
                     transaction.raw_transaction_hex.clone(),
+                    now_millis,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(PlainResponse::PoolWithdrawalSigned {
+                transaction,
+                response: Some(response),
+            })
+        }
+        OperatorCommand::ReplacePreparedPoolWithdrawal {
+            idempotency_key,
+            recovery_authorization,
+            original_receipt_id,
+            original_state_root,
+            destination_commitment,
+            observation,
+            replacement_nonce,
+            gas_limit,
+            max_fee_per_gas_wei,
+            max_priority_fee_per_gas_wei,
+            now_millis,
+        } => {
+            verify_withdrawal_recovery_authorization(
+                &recovery_authorization,
+                state.receipt_public_key,
+            )?;
+            let withdrawal_id = recovery_authorization.intent.withdrawal_id;
+            if idempotency_key != format!("withdrawal-replacement:{withdrawal_id}")
+                || now_millis <= 0
+                || now_millis >= recovery_authorization.intent.expires_at_millis
+                || recovery_authorization
+                    .intent
+                    .expires_at_millis
+                    .saturating_sub(now_millis)
+                    > 15 * 60_000
+            {
+                return Err("INVALID_WITHDRAWAL_REPLACEMENT_AUTHORIZATION".into());
+            }
+            let core = state
+                .core
+                .as_mut()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?;
+            core.validate_withdrawal_replacement(
+                &recovery_authorization,
+                &original_receipt_id,
+                original_state_root,
+                destination_commitment,
+            )
+            .map_err(|error| error.to_string())?;
+            let (prior_commitment, prior_raw) = core
+                .prepared_withdrawal(withdrawal_id)
+                .ok_or_else(|| "PREPARED_WITHDRAWAL_NOT_FOUND".to_string())?;
+            let replacement_record = core.prepared_withdrawal_replacement(withdrawal_id);
+            let (prior_hash, prior_nonce) = if replacement_record.is_some() {
+                (
+                    observation.prepared_transaction_hash.clone(),
+                    observation.prepared_nonce,
+                )
+            } else {
+                decode_prepared_withdrawal(&prior_raw)?
+            };
+            let observation_commitment = validate_withdrawal_replacement_observation(
+                &observation,
+                &recovery_authorization.intent.chain,
+                &prior_hash,
+                prior_nonce,
+                replacement_nonce,
+                now_millis,
+            )?;
+            let signer = state
+                .chain_signer
+                .as_ref()
+                .ok_or_else(|| "CHAIN_SIGNER_NOT_PROVISIONED".to_string())?;
+            let transaction = signer
+                .sign_pool_withdrawal(
+                    &recovery_authorization.intent.chain,
+                    &recovery_authorization.intent.asset,
+                    &recovery_authorization.intent.destination,
+                    &recovery_authorization.intent.amount_atomic,
+                    replacement_nonce,
+                    gas_limit,
+                    &max_fee_per_gas_wei,
+                    &max_priority_fee_per_gas_wei,
+                )
+                .await?;
+            let raw = hex::decode(transaction.raw_transaction_hex.trim_start_matches("0x"))
+                .map_err(|_| "INVALID_SIGNED_WITHDRAWAL_TRANSACTION".to_string())?;
+            let replacement_commitment: [u8; 32] = Sha256::digest(raw).into();
+            if transaction
+                .transaction_hash
+                .eq_ignore_ascii_case(&prior_hash)
+            {
+                return Err("WITHDRAWAL_REPLACEMENT_TRANSACTION_UNCHANGED".into());
+            }
+            if let Some((_, recorded_replacement, recorded_observation)) = replacement_record {
+                if prior_commitment != recorded_replacement
+                    || prior_raw != transaction.raw_transaction_hex
+                    || observation_commitment != recorded_observation
+                {
+                    return Err("WITHDRAWAL_REPLACEMENT_ALREADY_COMMITTED".into());
+                }
+                return Ok(PlainResponse::PoolWithdrawalSigned {
+                    transaction,
+                    response: None,
+                });
+            }
+            let response = core
+                .replace_prepared_withdrawal(
+                    idempotency_key,
+                    withdrawal_id,
+                    prior_commitment,
+                    replacement_commitment,
+                    transaction.raw_transaction_hex.clone(),
+                    observation_commitment,
                     now_millis,
                 )
                 .map_err(|error| error.to_string())?;
@@ -5024,9 +6374,13 @@ async fn dispatch_operator(
                 OperatorCommand::BeginProvision { .. }
                 | OperatorCommand::DirectCreditDeposit { .. }
                 | OperatorCommand::DirectDepositCreditLookup { .. }
+                | OperatorCommand::DirectWithdrawal { .. }
+                | OperatorCommand::DirectWithdrawalLookup { .. }
                 | OperatorCommand::BeginIncidentTerminalRestore { .. }
                 | OperatorCommand::RecoverWithdrawalAuthorization { .. }
                 | OperatorCommand::PreparedCommandStatus { .. }
+                | OperatorCommand::InspectPendingPreparation { .. }
+                | OperatorCommand::AbortSupersededPreparation { .. }
                 | OperatorCommand::FinalizePreparedCommand { .. }
                 | OperatorCommand::CompleteProvision { .. }
                 | OperatorCommand::CompleteIncidentTerminalRestore { .. }
@@ -5039,6 +6393,7 @@ async fn dispatch_operator(
                 | OperatorCommand::BeginChainSignerProvision { .. }
                 | OperatorCommand::CompleteChainSignerProvision { .. }
                 | OperatorCommand::SignPoolWithdrawal { .. }
+                | OperatorCommand::ReplacePreparedPoolWithdrawal { .. }
                 | OperatorCommand::SignBridgeApproval { .. }
                 | OperatorCommand::SignResolutionEvidence { .. }
                 | OperatorCommand::SignMarketResolution { .. }
@@ -5061,6 +6416,10 @@ async fn dispatch_operator(
                 | OperatorCommand::RecoveryArchiveAckStatus { .. }
                 | OperatorCommand::AggregateDepth { .. }
                 | OperatorCommand::ReconcileBootstrap { .. } => unreachable!(),
+                #[cfg(feature = "green-pool-certification")]
+                OperatorCommand::SignGreenPoolSeed { .. }
+                | OperatorCommand::SignGreenBaseNativeRefund { .. }
+                | OperatorCommand::AllocateGreenE03s05TestCapital { .. } => unreachable!(),
             }
             .map_err(|error| error.to_string())?;
             Ok(PlainResponse::System { response })
@@ -5107,6 +6466,281 @@ fn verify_withdrawal_authorization(
         .map_err(|_| "INVALID_WITHDRAWAL_AUTHORIZATION".to_string())?
         .verify(&payload, &Signature::from_bytes(&signature))
         .map_err(|_| "INVALID_WITHDRAWAL_AUTHORIZATION".to_string())
+}
+
+fn verify_withdrawal_recovery_authorization(
+    authorization: &WithdrawalAuthorization,
+    receipt_public_key: [u8; 32],
+) -> Result<(), String> {
+    let signature: [u8; 64] = authorization
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| "INVALID_WITHDRAWAL_RECOVERY_AUTHORIZATION".to_string())?;
+    let encoded = serde_json::to_vec(&authorization.intent)
+        .map_err(|_| "INVALID_WITHDRAWAL_RECOVERY_AUTHORIZATION".to_string())?;
+    let mut payload = Vec::with_capacity(encoded.len() + 80);
+    payload.extend_from_slice(b"layrs.withdrawal-recovery-authorization.v1\0");
+    payload.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+    payload.extend_from_slice(&encoded);
+    VerifyingKey::from_bytes(&receipt_public_key)
+        .map_err(|_| "INVALID_WITHDRAWAL_RECOVERY_AUTHORIZATION".to_string())?
+        .verify(&payload, &Signature::from_bytes(&signature))
+        .map_err(|_| "INVALID_WITHDRAWAL_RECOVERY_AUTHORIZATION".to_string())
+}
+
+fn validate_withdrawal_replacement_observation(
+    observation: &WithdrawalReplacementChainObservation,
+    expected_chain: &str,
+    expected_hash: &str,
+    expected_nonce: u64,
+    replacement_nonce: u64,
+    now_millis: i64,
+) -> Result<[u8; 32], String> {
+    let hash_valid = |value: &str| {
+        value.len() == 66
+            && value.starts_with("0x")
+            && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+            && value[2..].bytes().any(|byte| byte != b'0')
+    };
+    if observation.protocol_version != "layrs.withdrawal-chain-absence.v1"
+        || observation.chain != expected_chain
+        || !observation.transaction_absent
+        || !observation.receipt_absent
+        || observation.prepared_transaction_hash.to_lowercase() != expected_hash.to_lowercase()
+        || observation.prepared_nonce != expected_nonce
+        || observation.pending_nonce != replacement_nonce
+        || observation.pending_nonce <= observation.prepared_nonce
+        || observation.block_number == 0
+        || !hash_valid(&observation.block_hash)
+        || observation.observed_at_millis > now_millis
+        || now_millis.saturating_sub(observation.observed_at_millis) > 120_000
+    {
+        return Err("INVALID_WITHDRAWAL_REPLACEMENT_CHAIN_EVIDENCE".into());
+    }
+    let encoded = serde_json::to_vec(observation)
+        .map_err(|_| "INVALID_WITHDRAWAL_REPLACEMENT_CHAIN_EVIDENCE".to_string())?;
+    Ok(Sha256::digest(encoded).into())
+}
+
+fn decode_prepared_withdrawal(raw_transaction_hex: &str) -> Result<(String, u64), String> {
+    let raw = hex::decode(raw_transaction_hex.trim_start_matches("0x"))
+        .map_err(|_| "INVALID_PREPARED_WITHDRAWAL_TRANSACTION".to_string())?;
+    let (transaction, _) = TypedTransaction::decode_signed(&Rlp::new(&raw))
+        .map_err(|_| "INVALID_PREPARED_WITHDRAWAL_TRANSACTION".to_string())?;
+    let nonce = transaction
+        .nonce()
+        .filter(|value| **value <= U256::from(u64::MAX))
+        .map(|value| value.as_u64())
+        .ok_or_else(|| "INVALID_PREPARED_WITHDRAWAL_TRANSACTION".to_string())?;
+    Ok((format!("0x{}", hex::encode(keccak256(raw))), nonce))
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn green_pool_transition_payload(intent: &GreenPoolTransitionIntent) -> Result<Vec<u8>, String> {
+    let encoded =
+        serde_json::to_vec(intent).map_err(|_| "INVALID_GREEN_POOL_AUTHORIZATION".to_string())?;
+    let mut payload = Vec::with_capacity(encoded.len() + 64);
+    payload.extend_from_slice(b"layrs.green-pool-transition-authorization.v1\0");
+    payload.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+    payload.extend_from_slice(&encoded);
+    Ok(payload)
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn verify_green_pool_transition_authorization(
+    authorization: &GreenPoolTransitionAuthorization,
+    expected_operation: GreenPoolTransitionOperation,
+    operator_public_key: &VerifyingKey,
+    now_millis: i64,
+) -> Result<(), String> {
+    let expected_operation_id = "green-base-pool-seed-20260906-v1";
+    if authorization.intent.protocol_version != "layrs.green-pool-transition.v1"
+        || authorization.intent.operation != expected_operation
+        || authorization.intent.operation_id != expected_operation_id
+        || authorization.intent.source_signer != GREEN_BASE_SIGNER
+        || authorization.intent.current_pool_address != GREEN_BASE_CURRENT_POOL
+        || authorization.intent.destination_pool_address != GREEN_BASE_DESTINATION_POOL
+        || authorization.intent.token_address != GREEN_BASE_USDC
+        || authorization.intent.amount_atomic != GREEN_POOL_SEED_AMOUNT_ATOMIC
+    {
+        return Err("GREEN_POOL_TRANSITION_POLICY_MISMATCH".into());
+    }
+    if now_millis < 0
+        || authorization.intent.expires_at_millis <= now_millis
+        || authorization.intent.expires_at_millis > now_millis.saturating_add(15 * 60 * 1_000)
+    {
+        return Err("GREEN_POOL_TRANSITION_AUTHORIZATION_EXPIRED".into());
+    }
+    let signature: [u8; 64] = authorization
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| "INVALID_GREEN_POOL_AUTHORIZATION".to_string())?;
+    operator_public_key
+        .verify(
+            &green_pool_transition_payload(&authorization.intent)?,
+            &Signature::from_bytes(&signature),
+        )
+        .map_err(|_| "INVALID_GREEN_POOL_AUTHORIZATION".to_string())
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn green_pool_seed_command_commitment(
+    intent: &GreenPoolTransitionIntent,
+    nonce: u64,
+    gas_limit: u64,
+    max_fee_per_gas_wei: &str,
+    max_priority_fee_per_gas_wei: &str,
+) -> Result<[u8; 32], String> {
+    #[derive(Serialize)]
+    struct Commitment<'a> {
+        intent: &'a GreenPoolTransitionIntent,
+        nonce: u64,
+        gas_limit: u64,
+        max_fee_per_gas_wei: &'a str,
+        max_priority_fee_per_gas_wei: &'a str,
+    }
+    let encoded = serde_json::to_vec(&Commitment {
+        intent,
+        nonce,
+        gas_limit,
+        max_fee_per_gas_wei,
+        max_priority_fee_per_gas_wei,
+    })
+    .map_err(|_| "INVALID_GREEN_POOL_SEED_COMMAND".to_string())?;
+    let mut digest = Sha256::new();
+    digest.update(b"layrs.green-pool-seed-command.v1\0");
+    digest.update((encoded.len() as u32).to_be_bytes());
+    digest.update(encoded);
+    Ok(digest.finalize().into())
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn replay_green_pool_seed(
+    completed: &CompletedGreenPoolSeed,
+    operation_id: &str,
+    command_commitment: [u8; 32],
+) -> Result<GreenPoolSeedTransaction, String> {
+    if completed.operation_id != operation_id || completed.command_commitment != command_commitment
+    {
+        return Err("GREEN_POOL_SEED_REPLAY_MISMATCH".into());
+    }
+    Ok(completed.transaction.clone())
+}
+
+#[cfg(feature = "green-pool-certification")]
+const GREEN_NATIVE_REFUND_OPERATION_ID: &str = "green-base-native-refund-20260907-v1";
+#[cfg(feature = "green-pool-certification")]
+const GREEN_NATIVE_REFUND_FINAL_RECIPIENT: &str = "0xaf2cab23cb5461cda43d9052d675f921a8b7a1a7";
+#[cfg(feature = "green-pool-certification")]
+const GREEN_NATIVE_REFUND_DESTINATION_ASSET: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
+
+#[cfg(feature = "green-pool-certification")]
+fn green_native_refund_payload(intent: &GreenNativeRefundIntent) -> Result<Vec<u8>, String> {
+    let encoded =
+        serde_json::to_vec(intent).map_err(|_| "INVALID_GREEN_NATIVE_REFUND".to_string())?;
+    let mut payload = Vec::with_capacity(encoded.len() + 64);
+    payload.extend_from_slice(b"layrs.green-native-refund-authorization.v1\0");
+    payload.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+    payload.extend_from_slice(&encoded);
+    Ok(payload)
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn verify_green_native_refund_authorization(
+    authorization: &GreenNativeRefundAuthorization,
+    operator_public_key: &VerifyingKey,
+    now_millis: i64,
+) -> Result<(), String> {
+    let relay_request_id = authorization.intent.relay_request_id.strip_prefix("0x");
+    let valid_relay_request = relay_request_id
+        .and_then(|value| hex::decode(value).ok())
+        .is_some_and(|value| value.len() == 32);
+    if authorization.intent.protocol_version != "layrs.green-native-refund.v1"
+        || authorization.intent.operation_id != GREEN_NATIVE_REFUND_OPERATION_ID
+        || authorization.intent.source_signer != GREEN_BASE_SIGNER
+        || !valid_relay_request
+        || authorization.intent.relay_deposit_address.len() != 42
+        || !authorization.intent.relay_deposit_address.starts_with("0x")
+        || authorization.intent.final_recipient != GREEN_NATIVE_REFUND_FINAL_RECIPIENT
+        || authorization.intent.destination_chain_id != 42_161
+        || authorization.intent.destination_asset != GREEN_NATIVE_REFUND_DESTINATION_ASSET
+        || authorization.intent.amount_wei == "0"
+    {
+        return Err("GREEN_NATIVE_REFUND_POLICY_MISMATCH".into());
+    }
+    if now_millis < 0
+        || authorization.intent.expires_at_millis <= now_millis
+        || authorization.intent.expires_at_millis > now_millis.saturating_add(15 * 60 * 1_000)
+    {
+        return Err("GREEN_NATIVE_REFUND_AUTHORIZATION_EXPIRED".into());
+    }
+    let signature: [u8; 64] = authorization
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| "INVALID_GREEN_NATIVE_REFUND_AUTHORIZATION".to_string())?;
+    operator_public_key
+        .verify(
+            &green_native_refund_payload(&authorization.intent)?,
+            &Signature::from_bytes(&signature),
+        )
+        .map_err(|_| "INVALID_GREEN_NATIVE_REFUND_AUTHORIZATION".to_string())
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn green_native_refund_command_commitment(
+    intent: &GreenNativeRefundIntent,
+    nonce: u64,
+    gas_limit: u64,
+    max_fee_per_gas_wei: &str,
+    max_priority_fee_per_gas_wei: &str,
+) -> Result<[u8; 32], String> {
+    #[derive(Serialize)]
+    struct Commitment<'a> {
+        intent: &'a GreenNativeRefundIntent,
+        nonce: u64,
+        gas_limit: u64,
+        max_fee_per_gas_wei: &'a str,
+        max_priority_fee_per_gas_wei: &'a str,
+    }
+    let encoded = serde_json::to_vec(&Commitment {
+        intent,
+        nonce,
+        gas_limit,
+        max_fee_per_gas_wei,
+        max_priority_fee_per_gas_wei,
+    })
+    .map_err(|_| "INVALID_GREEN_NATIVE_REFUND_COMMAND".to_string())?;
+    let mut digest = Sha256::new();
+    digest.update(b"layrs.green-native-refund-command.v1\0");
+    digest.update((encoded.len() as u32).to_be_bytes());
+    digest.update(encoded);
+    Ok(digest.finalize().into())
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn replay_green_native_refund(
+    completed: &GreenNativeRefundCompletion,
+    operation_id: &str,
+    command_commitment: [u8; 32],
+) -> Result<GreenNativeRefundTransaction, String> {
+    if completed.operation_id != operation_id || completed.command_commitment != command_commitment
+    {
+        return Err("GREEN_NATIVE_REFUND_REPLAY_MISMATCH".into());
+    }
+    Ok(GreenNativeRefundTransaction {
+        chain: completed.transaction.chain.clone(),
+        chain_id: completed.transaction.chain_id,
+        asset: completed.transaction.asset.clone(),
+        signer: completed.transaction.signer.clone(),
+        destination: completed.transaction.destination.clone(),
+        amount_wei: completed.transaction.amount_wei.clone(),
+        nonce: completed.transaction.nonce,
+        transaction_hash: completed.transaction.transaction_hash.clone(),
+        raw_transaction_hex: completed.transaction.raw_transaction_hex.clone(),
+    })
 }
 
 fn validate_kms_reference(kms_key_id: &str, ciphertext: Option<&[u8]>) -> Result<(), String> {
@@ -5719,8 +7353,9 @@ async fn write_frame(stream: &mut VsockStream, value: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use clob_service::private_core::{
-        DirectDepositCreditPayload, DirectExecutionOperation, ExactTerminalCategoryCounts,
-        ExactTerminalCategoryDigests, ExactTerminalCategoryEquality, FeeProfileId,
+        DirectDepositCreditPayload, DirectExecutionOperation, DirectWithdrawalPayload,
+        ExactTerminalCategoryCounts, ExactTerminalCategoryDigests, ExactTerminalCategoryEquality,
+        FeeProfileId,
     };
     use serde_cbor::Value;
     use std::collections::BTreeMap;
@@ -5776,6 +7411,41 @@ mod tests {
         .expect("valid direct deposit request")
     }
 
+    fn direct_withdrawal_request_for_wire(
+        request_id: Uuid,
+        withdrawal_id: Uuid,
+        account_id: [u8; 32],
+        identity_commitment: [u8; 32],
+        issued_at_millis: i64,
+    ) -> DirectExecutionRequestEnvelope {
+        let payload = DirectWithdrawalPayload {
+            protocol_version: "layrs.direct-withdrawal.v1".into(),
+            withdrawal_id,
+            authenticated_subject_hash: account_id,
+            account_id,
+            identity_commitment,
+            session_id: "green-withdrawal-wire-session".into(),
+            chain: "base".into(),
+            asset: "USDC".into(),
+            amount_atomic: 1_000_000,
+            destination: "0x1111111111111111111111111111111111111111".into(),
+            evidence_hash: None,
+            funding_identity: format!("withdrawal:{withdrawal_id}"),
+        };
+        DirectExecutionRequestEnvelope::new(
+            request_id,
+            account_id,
+            account_id,
+            None,
+            Some(payload.funding_identity.clone()),
+            DirectExecutionOperation::ReserveWithdrawal,
+            serde_json::to_vec(&payload).expect("canonical direct withdrawal payload"),
+            issued_at_millis,
+            issued_at_millis + 5_000,
+        )
+        .expect("valid direct withdrawal request")
+    }
+
     fn signed_operator_envelope(
         signing_key: &ed25519_dalek::SigningKey,
         nonce: [u8; 32],
@@ -5813,6 +7483,7 @@ mod tests {
             transport_nonces: TransportReplayCache::new(32),
             core: Some(core),
             pending_preparation: None,
+            last_preparation_supersession: None,
             minimum_writer_epoch: 0,
             writer_lease_id: None,
             pending_provision: None,
@@ -5822,6 +7493,8 @@ mod tests {
             polymarket: None,
             pending_chain_signer_provision: None,
             chain_signer: None,
+            #[cfg(feature = "green-pool-certification")]
+            completed_green_pool_seed: None,
             pending_audit_signer_provision: None,
             audit_signer: None,
         })
@@ -6430,6 +8103,49 @@ mod tests {
             AccessCapability::NewOrders
         );
     }
+    #[cfg(feature = "green-pool-certification")]
+    use clob_service::chain_signer::{
+        GREEN_NATIVE_REFUND_GAS_LIMIT, GREEN_NATIVE_REFUND_NONCE, GREEN_POOL_SEED_GAS_LIMIT,
+        GREEN_POOL_SEED_MAX_FEE_PER_GAS_WEI, GREEN_POOL_SEED_MAX_PRIORITY_FEE_PER_GAS_WEI,
+        GREEN_POOL_SEED_NONCE,
+    };
+    #[cfg(feature = "green-pool-certification")]
+    use ed25519_dalek::{Signer as _, SigningKey};
+
+    #[cfg(feature = "green-pool-certification")]
+    fn green_test_capital_request_for_wire(
+        request_id: Uuid,
+        seed_transaction_hash: [u8; 32],
+        issued_at_millis: i64,
+    ) -> DirectExecutionRequestEnvelope {
+        let payload = GreenE03s05TestCapitalPayload {
+            protocol_version: "layrs.green-e03s05-test-capital.v1".into(),
+            authenticated_subject_hash: GREEN_E03S05_ACCOUNT_AND_AUTH,
+            account_id: GREEN_E03S05_ACCOUNT_AND_AUTH,
+            identity_commitment: GREEN_E03S05_IDENTITY,
+            session_id: GREEN_E03S05_SESSION_ID.into(),
+            chain: "base".into(),
+            asset: "USDC".into(),
+            amount_atomic: 20_000_000,
+            seed_transaction_hash,
+            funding_identity: format!(
+                "green-e03s05-test-capital:0x{}",
+                hex::encode(seed_transaction_hash)
+            ),
+        };
+        DirectExecutionRequestEnvelope::new(
+            request_id,
+            GREEN_E03S05_ACCOUNT_AND_AUTH,
+            GREEN_E03S05_ACCOUNT_AND_AUTH,
+            None,
+            Some(payload.funding_identity.clone()),
+            DirectExecutionOperation::AllocateGreenE03s05TestCapital,
+            serde_json::to_vec(&payload).unwrap(),
+            issued_at_millis,
+            issued_at_millis + 5_000,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn replay_cache_rejects_duplicate_keys() {
@@ -6463,6 +8179,657 @@ mod tests {
     fn replay_cache_zero_capacity_fails_closed() {
         let mut cache = ReplayCache::<2>::new(0);
         assert!(!cache.remember([1u8, 1]));
+    }
+
+    #[cfg(not(feature = "green-pool-certification"))]
+    #[test]
+    fn production_build_has_no_green_pool_commands() {
+        for command in [
+            serde_json::json!({
+                "type": "SIGN_GREEN_POOL_SEED", "authorization": {}, "nonce": 0,
+                "gas_limit": 50_000, "max_fee_per_gas_wei": "11000000",
+                "max_priority_fee_per_gas_wei": "1000000", "now_millis": 1
+            }),
+            serde_json::json!({
+                "type": "ALLOCATE_GREEN_E03S05_TEST_CAPITAL", "request": {}
+            }),
+            serde_json::json!({
+                "type": "SIGN_GREEN_BASE_NATIVE_REFUND", "authorization": {}, "nonce": 1,
+                "gas_limit": 21_000, "max_fee_per_gas_wei": "5000000",
+                "max_priority_fee_per_gas_wei": "1000000", "now_millis": 1
+            }),
+        ] {
+            assert!(serde_json::from_value::<OperatorCommand>(command).is_err());
+        }
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    fn signed_green_authorization(
+        signing_key: &SigningKey,
+        operation: GreenPoolTransitionOperation,
+        now_millis: i64,
+    ) -> GreenPoolTransitionAuthorization {
+        let operation_id = "green-base-pool-seed-20260906-v1";
+        let intent = GreenPoolTransitionIntent {
+            protocol_version: "layrs.green-pool-transition.v1".into(),
+            operation_id: operation_id.into(),
+            operation,
+            source_signer: GREEN_BASE_SIGNER.into(),
+            current_pool_address: GREEN_BASE_CURRENT_POOL.into(),
+            destination_pool_address: GREEN_BASE_DESTINATION_POOL.into(),
+            token_address: GREEN_BASE_USDC.into(),
+            amount_atomic: GREEN_POOL_SEED_AMOUNT_ATOMIC.into(),
+            expires_at_millis: now_millis + 60_000,
+        };
+        let signature = signing_key
+            .sign(&green_pool_transition_payload(&intent).expect("payload"))
+            .to_bytes()
+            .to_vec();
+        GreenPoolTransitionAuthorization { intent, signature }
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    fn signed_green_native_refund_authorization(
+        signing_key: &SigningKey,
+        now_millis: i64,
+    ) -> GreenNativeRefundAuthorization {
+        let intent = GreenNativeRefundIntent {
+            protocol_version: "layrs.green-native-refund.v1".into(),
+            operation_id: GREEN_NATIVE_REFUND_OPERATION_ID.into(),
+            source_signer: GREEN_BASE_SIGNER.into(),
+            relay_request_id: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            relay_deposit_address: "0x3333333333333333333333333333333333333333".into(),
+            final_recipient: GREEN_NATIVE_REFUND_FINAL_RECIPIENT.into(),
+            destination_chain_id: 42_161,
+            destination_asset: GREEN_NATIVE_REFUND_DESTINATION_ASSET.into(),
+            amount_wei: "1900000000000000".into(),
+            expires_at_millis: now_millis + 60_000,
+        };
+        let signature = signing_key
+            .sign(&green_native_refund_payload(&intent).expect("payload"))
+            .to_bytes()
+            .to_vec();
+        GreenNativeRefundAuthorization { intent, signature }
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    #[test]
+    fn green_native_refund_authorization_is_exact_and_replay_bound() {
+        let signing_key = SigningKey::from_bytes(&[93u8; 32]);
+        let now = 1_800_000_000_000i64;
+        let exact = signed_green_native_refund_authorization(&signing_key, now);
+        assert!(verify_green_native_refund_authorization(
+            &exact,
+            &signing_key.verifying_key(),
+            now,
+        )
+        .is_ok());
+        let commitment = green_native_refund_command_commitment(
+            &exact.intent,
+            GREEN_NATIVE_REFUND_NONCE,
+            GREEN_NATIVE_REFUND_GAS_LIMIT,
+            "5000000",
+            "1000000",
+        )
+        .unwrap();
+        let transaction = GreenNativeRefundTransaction {
+            chain: "base".into(),
+            chain_id: 8_453,
+            asset: "ETH".into(),
+            signer: GREEN_BASE_SIGNER.into(),
+            destination: exact.intent.relay_deposit_address.clone(),
+            amount_wei: exact.intent.amount_wei.clone(),
+            nonce: GREEN_NATIVE_REFUND_NONCE,
+            transaction_hash: format!("0x{}", "11".repeat(32)),
+            raw_transaction_hex: "0x02aa".into(),
+        };
+        let completed = GreenNativeRefundCompletion {
+            operation_id: exact.intent.operation_id.clone(),
+            command_commitment: commitment,
+            transaction: GreenNativeRefundTerminalTransaction {
+                chain: transaction.chain.clone(),
+                chain_id: transaction.chain_id,
+                asset: transaction.asset.clone(),
+                signer: transaction.signer.clone(),
+                destination: transaction.destination.clone(),
+                amount_wei: transaction.amount_wei.clone(),
+                nonce: transaction.nonce,
+                transaction_hash: transaction.transaction_hash.clone(),
+                raw_transaction_hex: transaction.raw_transaction_hex.clone(),
+            },
+        };
+        assert_eq!(
+            replay_green_native_refund(&completed, &exact.intent.operation_id, commitment).unwrap(),
+            transaction
+        );
+        assert_eq!(
+            replay_green_native_refund(&completed, &exact.intent.operation_id, [0u8; 32])
+                .unwrap_err(),
+            "GREEN_NATIVE_REFUND_REPLAY_MISMATCH"
+        );
+
+        let mut wrong = exact.clone();
+        wrong.intent.destination_chain_id = 8_453;
+        assert_eq!(
+            verify_green_native_refund_authorization(&wrong, &signing_key.verifying_key(), now,)
+                .unwrap_err(),
+            "GREEN_NATIVE_REFUND_POLICY_MISMATCH"
+        );
+        assert_eq!(
+            verify_green_native_refund_authorization(
+                &exact,
+                &signing_key.verifying_key(),
+                now + 60_000,
+            )
+            .unwrap_err(),
+            "GREEN_NATIVE_REFUND_AUTHORIZATION_EXPIRED"
+        );
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    #[test]
+    fn green_authorization_is_exact_signed_and_short_lived() {
+        let signing_key = SigningKey::from_bytes(&[91u8; 32]);
+        let now = 1_800_000_000_000i64;
+        let exact = signed_green_authorization(
+            &signing_key,
+            GreenPoolTransitionOperation::SeedBasePool,
+            now,
+        );
+        assert!(verify_green_pool_transition_authorization(
+            &exact,
+            GreenPoolTransitionOperation::SeedBasePool,
+            &signing_key.verifying_key(),
+            now,
+        )
+        .is_ok());
+        assert_eq!(
+            String::from_utf8(serde_json::to_vec(&exact.intent).unwrap()).unwrap(),
+            format!(
+                "{{\"protocol_version\":\"layrs.green-pool-transition.v1\",\"operation_id\":\"green-base-pool-seed-20260906-v1\",\"operation\":\"SEED_BASE_POOL\",\"source_signer\":\"{GREEN_BASE_SIGNER}\",\"current_pool_address\":\"{GREEN_BASE_CURRENT_POOL}\",\"destination_pool_address\":\"{GREEN_BASE_DESTINATION_POOL}\",\"token_address\":\"{GREEN_BASE_USDC}\",\"amount_atomic\":\"{GREEN_POOL_SEED_AMOUNT_ATOMIC}\",\"expires_at_millis\":1800000060000}}"
+            )
+        );
+
+        let mut expired = exact.clone();
+        expired.intent.expires_at_millis = now;
+        assert_eq!(
+            verify_green_pool_transition_authorization(
+                &expired,
+                GreenPoolTransitionOperation::SeedBasePool,
+                &signing_key.verifying_key(),
+                now,
+            )
+            .unwrap_err(),
+            "GREEN_POOL_TRANSITION_AUTHORIZATION_EXPIRED"
+        );
+        for (field, expected_error) in [
+            ("token", "GREEN_POOL_TRANSITION_POLICY_MISMATCH"),
+            ("recipient", "GREEN_POOL_TRANSITION_POLICY_MISMATCH"),
+            ("amount", "GREEN_POOL_TRANSITION_POLICY_MISMATCH"),
+        ] {
+            let mut changed = exact.clone();
+            match field {
+                "token" => changed.intent.token_address = GREEN_BASE_CURRENT_POOL.into(),
+                "recipient" => changed.intent.destination_pool_address = GREEN_BASE_USDC.into(),
+                "amount" => changed.intent.amount_atomic = "19999999".into(),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                verify_green_pool_transition_authorization(
+                    &changed,
+                    GreenPoolTransitionOperation::SeedBasePool,
+                    &signing_key.verifying_key(),
+                    now,
+                )
+                .unwrap_err(),
+                expected_error
+            );
+        }
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    #[test]
+    fn green_seed_commitment_is_stable_and_replay_mismatch_sensitive() {
+        let signing_key = SigningKey::from_bytes(&[92u8; 32]);
+        let authorization = signed_green_authorization(
+            &signing_key,
+            GreenPoolTransitionOperation::SeedBasePool,
+            1_800_000_000_000,
+        );
+        let exact = green_pool_seed_command_commitment(
+            &authorization.intent,
+            GREEN_POOL_SEED_NONCE,
+            GREEN_POOL_SEED_GAS_LIMIT,
+            GREEN_POOL_SEED_MAX_FEE_PER_GAS_WEI,
+            GREEN_POOL_SEED_MAX_PRIORITY_FEE_PER_GAS_WEI,
+        )
+        .unwrap();
+        assert_eq!(
+            exact,
+            green_pool_seed_command_commitment(
+                &authorization.intent,
+                GREEN_POOL_SEED_NONCE,
+                GREEN_POOL_SEED_GAS_LIMIT,
+                GREEN_POOL_SEED_MAX_FEE_PER_GAS_WEI,
+                GREEN_POOL_SEED_MAX_PRIORITY_FEE_PER_GAS_WEI,
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            exact,
+            green_pool_seed_command_commitment(
+                &authorization.intent,
+                GREEN_POOL_SEED_NONCE,
+                GREEN_POOL_SEED_GAS_LIMIT + 1,
+                GREEN_POOL_SEED_MAX_FEE_PER_GAS_WEI,
+                GREEN_POOL_SEED_MAX_PRIORITY_FEE_PER_GAS_WEI,
+            )
+            .unwrap()
+        );
+        let completed = CompletedGreenPoolSeed {
+            operation_id: authorization.intent.operation_id.clone(),
+            command_commitment: exact,
+            transaction: GreenPoolSeedTransaction {
+                chain: "base".into(),
+                chain_id: 8_453,
+                asset: "USDC".into(),
+                signer: GREEN_BASE_SIGNER.into(),
+                token_address: GREEN_BASE_USDC.into(),
+                destination_pool_address: GREEN_BASE_DESTINATION_POOL.into(),
+                amount_atomic: GREEN_POOL_SEED_AMOUNT_ATOMIC.into(),
+                nonce: 0,
+                transaction_hash: format!("0x{}", "11".repeat(32)),
+                raw_transaction_hex: "0x02aa".into(),
+            },
+        };
+        assert_eq!(
+            replay_green_pool_seed(&completed, &authorization.intent.operation_id, exact)
+                .unwrap()
+                .transaction_hash,
+            completed.transaction.transaction_hash
+        );
+        assert_eq!(
+            replay_green_pool_seed(&completed, "different-operation", exact).unwrap_err(),
+            "GREEN_POOL_SEED_REPLAY_MISMATCH"
+        );
+        assert_eq!(
+            replay_green_pool_seed(&completed, &authorization.intent.operation_id, [0u8; 32])
+                .unwrap_err(),
+            "GREEN_POOL_SEED_REPLAY_MISMATCH"
+        );
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    #[test]
+    fn green_certification_firewall_allows_only_base_funding_and_provisioning() {
+        use clob_service::private_core::{SessionRequest, SignedSessionRequest};
+
+        let operator_signer = SigningKey::from_bytes(&[0x71; 32]);
+        let receipt_signer = ReceiptSigner::from_seed([0x72; 32], [0x73; 48]);
+        let receipt_public_key = receipt_signer.verifying_key();
+        let mut core = PrivateTradingCore::new(JournalKey::from_bytes([0x74; 32]), receipt_signer);
+        let green_now = 1_800_000_000_000;
+        core.register_session(
+            "register-green-e03s05-firewall-session".into(),
+            GREEN_E03S05_SESSION_ID.into(),
+            GREEN_E03S05_IDENTITY,
+            SigningKey::from_bytes(&[0x7b; 32])
+                .verifying_key()
+                .to_bytes(),
+            green_now + 60_000,
+            green_now,
+        )
+        .unwrap();
+        let green_seed_hash = [0x7c; 32];
+        let green_binding = GreenE03s05TestCapitalBinding {
+            authenticated_subject_hash: GREEN_E03S05_ACCOUNT_AND_AUTH,
+            account_id: GREEN_E03S05_ACCOUNT_AND_AUTH,
+            identity_commitment: GREEN_E03S05_IDENTITY,
+            session_id: GREEN_E03S05_SESSION_ID.into(),
+            seed_transaction_hash: green_seed_hash,
+        };
+        core.allocate_green_e03s05_test_capital(
+            green_test_capital_request_for_wire(
+                Uuid::from_u128(0x72000000_0000_4000_8000_000000000000),
+                green_seed_hash,
+                green_now,
+            ),
+            &green_binding,
+            green_now + 1,
+        )
+        .unwrap();
+        let direct_deposit = direct_deposit_request_for_wire(
+            Uuid::from_u128(0x71111111_1111_4111_8111_111111111111),
+            [0x75; 32],
+            [0x76; 32],
+            1_800_000_000_000,
+        );
+        let deposit_replay_key = match core
+            .direct_credit_deposit(direct_deposit.clone(), direct_deposit.issued_at_millis + 1)
+            .unwrap()
+        {
+            DirectDepositCreditOutcome::Applied(response) => response.financial_replay_key_sha256,
+            other => panic!("unexpected direct deposit outcome: {other:?}"),
+        };
+        let mut zen_lookup_payload: DirectDepositCreditPayload =
+            serde_json::from_slice(&direct_deposit.canonical_payload).unwrap();
+        zen_lookup_payload.deposit_id = Uuid::from_u128(0x73111111_1111_4111_8111_111111111111);
+        zen_lookup_payload.authenticated_subject_hash = [0x77; 32];
+        zen_lookup_payload.account_id = [0x77; 32];
+        zen_lookup_payload.identity_commitment = [0x78; 32];
+        zen_lookup_payload.asset = "ZEN".into();
+        zen_lookup_payload.source_chain = "eip155:26514".into();
+        zen_lookup_payload.source_transaction_hash = [0x79; 32];
+        zen_lookup_payload.pool_chain = "horizen".into();
+        zen_lookup_payload.pool_transaction_hash = [0x7a; 32];
+        zen_lookup_payload.funding_identity = "deposit:73111111-1111-4111-8111-111111111111".into();
+        let mut zen_evidence = Sha256::new();
+        zen_evidence.update(b"layrs.deposit-pool-receipt.v1\0");
+        zen_evidence.update(zen_lookup_payload.pool_chain.as_bytes());
+        zen_evidence.update([0]);
+        zen_evidence.update(
+            format!(
+                "0x{}",
+                hex::encode(zen_lookup_payload.pool_transaction_hash)
+            )
+            .as_bytes(),
+        );
+        zen_evidence.update([0]);
+        zen_evidence.update(zen_lookup_payload.pool_log_index.to_string().as_bytes());
+        zen_evidence.update([0]);
+        zen_evidence.update(zen_lookup_payload.asset.as_bytes());
+        zen_evidence.update([0]);
+        zen_evidence.update(zen_lookup_payload.amount_atomic.to_string().as_bytes());
+        zen_lookup_payload.pool_receipt_evidence_sha256 = zen_evidence.finalize().into();
+        let zen_lookup_request = DirectExecutionRequestEnvelope::new(
+            Uuid::from_u128(0x73222222_2222_4222_8222_222222222222),
+            zen_lookup_payload.authenticated_subject_hash,
+            zen_lookup_payload.account_id,
+            None,
+            Some(zen_lookup_payload.funding_identity.clone()),
+            DirectExecutionOperation::CreditDeposit,
+            serde_json::to_vec(&zen_lookup_payload).unwrap(),
+            1_800_000_000_000,
+            1_800_000_005_000,
+        )
+        .unwrap();
+        let zen_replay_key = match core
+            .direct_credit_deposit(zen_lookup_request.clone(), 1_800_000_000_001)
+            .unwrap()
+        {
+            DirectDepositCreditOutcome::Applied(response) => response.financial_replay_key_sha256,
+            other => panic!("unexpected ZEN deposit outcome: {other:?}"),
+        };
+        let withdrawal_id = GREEN_E03S05_WITHDRAWAL_ID;
+        let direct_withdrawal_payload = DirectWithdrawalPayload {
+            protocol_version: "layrs.direct-withdrawal.v1".into(),
+            withdrawal_id,
+            authenticated_subject_hash: GREEN_E03S05_ACCOUNT_AND_AUTH,
+            account_id: GREEN_E03S05_ACCOUNT_AND_AUTH,
+            identity_commitment: GREEN_E03S05_IDENTITY,
+            session_id: GREEN_E03S05_SESSION_ID.into(),
+            chain: "base".into(),
+            asset: "USDC".into(),
+            amount_atomic: 20_000_000,
+            destination: "0x1111111111111111111111111111111111111111".into(),
+            evidence_hash: None,
+            funding_identity: format!("withdrawal:{withdrawal_id}"),
+        };
+        let direct_withdrawal = DirectExecutionRequestEnvelope::new(
+            Uuid::from_u128(0x72111111_1111_4111_8111_111111111111),
+            GREEN_E03S05_ACCOUNT_AND_AUTH,
+            GREEN_E03S05_ACCOUNT_AND_AUTH,
+            None,
+            Some(direct_withdrawal_payload.funding_identity.clone()),
+            DirectExecutionOperation::ReserveWithdrawal,
+            serde_json::to_vec(&direct_withdrawal_payload).unwrap(),
+            1_800_000_000_000,
+            1_800_000_005_000,
+        )
+        .unwrap();
+        let withdrawal_replay_key = match core
+            .direct_green_e03s05_test_capital_withdrawal(
+                direct_withdrawal.clone(),
+                direct_withdrawal.issued_at_millis + 1,
+            )
+            .unwrap()
+        {
+            DirectWithdrawalOutcome::Applied(response) => response.operation_replay_key_sha256,
+            other => panic!("unexpected direct withdrawal outcome: {other:?}"),
+        };
+        let zen_withdrawal_id = Uuid::from_u128(0x73333333_3333_4333_8333_333333333333);
+        let zen_withdrawal_payload = DirectWithdrawalPayload {
+            protocol_version: "layrs.direct-withdrawal.v1".into(),
+            withdrawal_id: zen_withdrawal_id,
+            authenticated_subject_hash: zen_lookup_payload.authenticated_subject_hash,
+            account_id: zen_lookup_payload.account_id,
+            identity_commitment: zen_lookup_payload.identity_commitment,
+            session_id: "green-cross-asset-session".into(),
+            chain: "horizen".into(),
+            asset: "ZEN".into(),
+            amount_atomic: 1,
+            destination: "0x1111111111111111111111111111111111111111".into(),
+            evidence_hash: None,
+            funding_identity: format!("withdrawal:{zen_withdrawal_id}"),
+        };
+        let zen_withdrawal_request = DirectExecutionRequestEnvelope::new(
+            Uuid::from_u128(0x73444444_4444_4444_8444_444444444444),
+            zen_withdrawal_payload.authenticated_subject_hash,
+            zen_withdrawal_payload.account_id,
+            None,
+            Some(zen_withdrawal_payload.funding_identity.clone()),
+            DirectExecutionOperation::ReserveWithdrawal,
+            serde_json::to_vec(&zen_withdrawal_payload).unwrap(),
+            1_800_000_000_000,
+            1_800_000_005_000,
+        )
+        .unwrap();
+        let zen_withdrawal_replay_key = match core
+            .direct_withdrawal(zen_withdrawal_request.clone(), 1_800_000_000_001)
+            .unwrap()
+        {
+            DirectWithdrawalOutcome::Applied(response) => response.operation_replay_key_sha256,
+            other => panic!("unexpected ZEN withdrawal outcome: {other:?}"),
+        };
+        let state =
+            direct_deposit_test_state(operator_signer.verifying_key(), receipt_public_key, core);
+        let operator_request = |command| PlainRequest::Operator {
+            envelope: OperatorEnvelope {
+                nonce: [7; 32],
+                command,
+                signature: vec![],
+            },
+        };
+        for command in [
+            OperatorCommand::ProvisionStatus,
+            OperatorCommand::ChainSignerStatus,
+        ] {
+            assert!(green_pool_certification_request_allowed(
+                &state,
+                &operator_request(command)
+            ));
+        }
+
+        assert!(green_pool_certification_request_allowed(
+            &state,
+            &operator_request(OperatorCommand::DirectCreditDeposit {
+                request: direct_deposit.clone(),
+            })
+        ));
+        assert!(green_pool_certification_request_allowed(
+            &state,
+            &operator_request(OperatorCommand::DirectWithdrawal {
+                request: direct_withdrawal.clone(),
+            })
+        ));
+        let mut wrong_withdrawal_id_payload: DirectWithdrawalPayload =
+            serde_json::from_slice(&direct_withdrawal.canonical_payload).unwrap();
+        wrong_withdrawal_id_payload.withdrawal_id =
+            Uuid::from_u128(0x72222222_2222_4222_8222_222222222222);
+        wrong_withdrawal_id_payload.funding_identity =
+            format!("withdrawal:{}", wrong_withdrawal_id_payload.withdrawal_id);
+        let wrong_withdrawal_id = DirectExecutionRequestEnvelope::new(
+            Uuid::from_u128(0x72333333_3333_4333_8333_333333333333),
+            GREEN_E03S05_ACCOUNT_AND_AUTH,
+            GREEN_E03S05_ACCOUNT_AND_AUTH,
+            None,
+            Some(wrong_withdrawal_id_payload.funding_identity.clone()),
+            DirectExecutionOperation::ReserveWithdrawal,
+            serde_json::to_vec(&wrong_withdrawal_id_payload).unwrap(),
+            1_800_000_000_000,
+            1_800_000_005_000,
+        )
+        .unwrap();
+        assert!(!green_pool_certification_request_allowed(
+            &state,
+            &operator_request(OperatorCommand::DirectWithdrawal {
+                request: wrong_withdrawal_id,
+            })
+        ));
+        assert!(green_pool_certification_request_allowed(
+            &state,
+            &operator_request(OperatorCommand::DirectDepositCreditLookup {
+                account_id: direct_deposit.account_id,
+                financial_replay_key_sha256: deposit_replay_key,
+            })
+        ));
+        assert!(green_pool_certification_request_allowed(
+            &state,
+            &operator_request(OperatorCommand::DirectWithdrawalLookup {
+                account_id: direct_withdrawal.account_id,
+                operation_replay_key_sha256: withdrawal_replay_key,
+            })
+        ));
+
+        let authorization = signed_green_authorization(
+            &SigningKey::from_bytes(&[92u8; 32]),
+            GreenPoolTransitionOperation::SeedBasePool,
+            1_800_000_000_000,
+        );
+        assert!(green_pool_certification_request_allowed(
+            &state,
+            &operator_request(OperatorCommand::SignGreenPoolSeed {
+                authorization,
+                nonce: GREEN_POOL_SEED_NONCE,
+                gas_limit: GREEN_POOL_SEED_GAS_LIMIT,
+                max_fee_per_gas_wei: GREEN_POOL_SEED_MAX_FEE_PER_GAS_WEI.into(),
+                max_priority_fee_per_gas_wei: GREEN_POOL_SEED_MAX_PRIORITY_FEE_PER_GAS_WEI.into(),
+                now_millis: 1,
+            })
+        ));
+        assert!(green_pool_certification_request_allowed(
+            &state,
+            &operator_request(OperatorCommand::SignGreenBaseNativeRefund {
+                authorization: signed_green_native_refund_authorization(
+                    &SigningKey::from_bytes(&[92u8; 32]),
+                    1_800_000_000_000,
+                ),
+                nonce: GREEN_NATIVE_REFUND_NONCE,
+                gas_limit: GREEN_NATIVE_REFUND_GAS_LIMIT,
+                max_fee_per_gas_wei: "5000000".into(),
+                max_priority_fee_per_gas_wei: "1000000".into(),
+                now_millis: 1,
+            })
+        ));
+
+        for command in [
+            OperatorCommand::PolymarketStatus,
+            OperatorCommand::AuditSignerStatus,
+            OperatorCommand::TradingFreezeStatus,
+            OperatorCommand::ExportSnapshot,
+            OperatorCommand::MarketStatus {
+                market_id: "layrs:v5:BTC:USDC:1h:1788390000".into(),
+            },
+        ] {
+            assert!(!green_pool_certification_request_allowed(
+                &state,
+                &operator_request(command)
+            ));
+        }
+
+        let mut zen_deposit_payload: DirectDepositCreditPayload =
+            serde_json::from_slice(&direct_deposit.canonical_payload).unwrap();
+        zen_deposit_payload.asset = "ZEN".into();
+        zen_deposit_payload.source_chain = "eip155:26514".into();
+        zen_deposit_payload.pool_chain = "horizen".into();
+        let mut zen_deposit = direct_deposit.clone();
+        zen_deposit.canonical_payload = serde_json::to_vec(&zen_deposit_payload).unwrap();
+        assert!(!green_pool_certification_request_allowed(
+            &state,
+            &operator_request(OperatorCommand::DirectCreditDeposit {
+                request: zen_deposit,
+            })
+        ));
+
+        for (chain, asset) in [("base", "ZEN"), ("horizen", "ZEN")] {
+            let mut payload: DirectWithdrawalPayload =
+                serde_json::from_slice(&direct_withdrawal.canonical_payload).unwrap();
+            payload.chain = chain.into();
+            payload.asset = asset.into();
+            let mut request = direct_withdrawal.clone();
+            request.canonical_payload = serde_json::to_vec(&payload).unwrap();
+            assert!(!green_pool_certification_request_allowed(
+                &state,
+                &operator_request(OperatorCommand::DirectWithdrawal { request })
+            ));
+        }
+        assert!(!green_pool_certification_request_allowed(
+            &state,
+            &operator_request(OperatorCommand::DirectDepositCreditLookup {
+                account_id: zen_lookup_request.account_id,
+                financial_replay_key_sha256: zen_replay_key,
+            })
+        ));
+        assert!(!green_pool_certification_request_allowed(
+            &state,
+            &operator_request(OperatorCommand::DirectWithdrawalLookup {
+                account_id: zen_withdrawal_request.account_id,
+                operation_replay_key_sha256: zen_withdrawal_replay_key,
+            })
+        ));
+
+        let user_request = |action| PlainRequest::User {
+            command: UserCommand {
+                command_id: "green-certification-command".into(),
+                idempotency_key: "green-certification-idempotency".into(),
+                session: SignedSessionRequest {
+                    request: SessionRequest {
+                        session_id: "green-certification-session".into(),
+                        sequence: 1,
+                        issued_at_millis: 1,
+                        expires_at_millis: 2,
+                        request_hash: [0; 32],
+                    },
+                    signature: vec![0; 64],
+                },
+                action,
+            },
+            now_millis: 1,
+        };
+        assert!(green_pool_certification_request_allowed(
+            &state,
+            &user_request(UserCommandAction::RequestWithdrawal {
+                withdrawal_id: Uuid::from_u128(2),
+                chain: "base".into(),
+                asset: "USDC".into(),
+                amount_atomic: 1,
+                destination: "0x1111111111111111111111111111111111111111".into(),
+            })
+        ));
+        assert!(!green_pool_certification_request_allowed(
+            &state,
+            &user_request(UserCommandAction::Portfolio)
+        ));
+        assert!(!green_pool_certification_request_allowed(
+            &state,
+            &PlainRequest::AggregateDepth {
+                market_id: "layrs:v5:BTC:USDC:1h:1788390000".into(),
+                outcome: clob_service::private_core::Outcome::Up,
+                now_millis: 1,
+                minimum_level_quantity_micros: 1,
+            }
+        ));
     }
 
     #[test]
@@ -7488,7 +9855,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_deposit_wire_bypasses_pending_slot_and_reemits_restartable_sidecars() {
+    async fn direct_deposit_mutation_emits_snapshot_but_replay_and_lookup_reuse_it() {
         if !matches!(
             option_env!("LAYRS_DIRECT_DEPOSIT_CREDIT_ENABLED"),
             Some("1")
@@ -7606,6 +9973,7 @@ mod tests {
             direct_deposit_journal_artifact(&exact),
             Some(journal_artifact.clone())
         );
+        assert!(direct_execution_reuses_archived_snapshot(&exact));
 
         let lookup_command = OperatorCommand::DirectDepositCreditLookup {
             account_id: request.account_id,
@@ -7642,6 +10010,11 @@ mod tests {
             looked_up.signed_result_wire().unwrap(),
             applied.signed_result_wire().unwrap()
         );
+        assert!(direct_execution_reuses_archived_snapshot(
+            &PlainResponse::DirectDepositCreditLookup {
+                response: Some(looked_up.clone()),
+            }
+        ));
 
         let restored = PrivateTradingCore::restore_encrypted_snapshot(
             journal_key,
@@ -7660,8 +10033,293 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn direct_withdrawal_mutation_emits_snapshot_but_replay_and_lookup_reuse_it() {
+        if !matches!(option_env!("LAYRS_DIRECT_WITHDRAWAL_ENABLED"), Some("1")) {
+            return;
+        }
+        let operator_signer = ed25519_dalek::SigningKey::from_bytes(&[0x61; 32]);
+        let journal_key = JournalKey::from_bytes([0x62; 32]);
+        let receipt_signer = ReceiptSigner::from_seed([0x63; 32], [0x64; 48]);
+        let receipt_public_key = receipt_signer.verifying_key();
+        let core = PrivateTradingCore::new(journal_key, receipt_signer);
+        let mut state =
+            direct_deposit_test_state(operator_signer.verifying_key(), receipt_public_key, core);
+        let account_id = [0x65; 32];
+        let identity_commitment = [0x66; 32];
+        let deposit = direct_deposit_request_for_wire(
+            Uuid::from_u128(0x61111111_1111_4111_8111_111111111111),
+            account_id,
+            identity_commitment,
+            1_800_100_000_000,
+        );
+        dispatch_operator(
+            &mut state,
+            signed_operator_envelope(
+                &operator_signer,
+                [0x67; 32],
+                OperatorCommand::DirectCreditDeposit {
+                    request: deposit.clone(),
+                },
+            ),
+            Some(deposit.issued_at_millis + 1),
+        )
+        .await
+        .expect("fund direct withdrawal fixture");
+
+        let withdrawal_id = Uuid::from_u128(0x62222222_2222_4222_8222_222222222222);
+        let reserve = direct_withdrawal_request_for_wire(
+            Uuid::from_u128(0x63333333_3333_4333_8333_333333333333),
+            withdrawal_id,
+            account_id,
+            identity_commitment,
+            deposit.deadline_millis + 1,
+        );
+        let response = dispatch_operator(
+            &mut state,
+            signed_operator_envelope(
+                &operator_signer,
+                [0x68; 32],
+                OperatorCommand::DirectWithdrawal {
+                    request: reserve.clone(),
+                },
+            ),
+            Some(reserve.issued_at_millis + 1),
+        )
+        .await
+        .expect("direct reserve dispatch");
+        let applied = match &response {
+            PlainResponse::DirectWithdrawal {
+                outcome: DirectWithdrawalOutcome::Applied(value),
+            } => value,
+            other => panic!("unexpected direct withdrawal response: {other:?}"),
+        };
+        assert_eq!(
+            direct_deposit_journal_artifact(&response),
+            Some(applied.encrypted_journal_record.clone())
+        );
+        assert_eq!(
+            direct_deposit_receipt_artifact(&response),
+            Some(applied.enclave_receipt.clone())
+        );
+        assert!(!direct_execution_reuses_archived_snapshot(&response));
+        let snapshot = state
+            .core
+            .as_ref()
+            .expect("core")
+            .export_encrypted_snapshot()
+            .expect("withdrawal snapshot sidecar");
+        assert_eq!(snapshot.sequence, applied.encrypted_journal_record.sequence);
+        assert_eq!(
+            snapshot.state_root,
+            applied.encrypted_journal_record.state_root
+        );
+
+        let exact = dispatch_operator(
+            &mut state,
+            signed_operator_envelope(
+                &operator_signer,
+                [0x6a; 32],
+                OperatorCommand::DirectWithdrawal {
+                    request: reserve.clone(),
+                },
+            ),
+            Some(reserve.issued_at_millis + 2),
+        )
+        .await
+        .expect("direct withdrawal exact replay");
+        assert!(matches!(
+            &exact,
+            PlainResponse::DirectWithdrawal {
+                outcome: DirectWithdrawalOutcome::ReturnOriginal(_),
+            }
+        ));
+        assert!(direct_execution_reuses_archived_snapshot(&exact));
+        assert_eq!(
+            direct_deposit_journal_artifact(&exact),
+            Some(applied.encrypted_journal_record.clone())
+        );
+        assert_eq!(
+            direct_deposit_receipt_artifact(&exact),
+            Some(applied.enclave_receipt.clone())
+        );
+
+        let lookup = dispatch_operator(
+            &mut state,
+            signed_operator_envelope(
+                &operator_signer,
+                [0x69; 32],
+                OperatorCommand::DirectWithdrawalLookup {
+                    account_id,
+                    operation_replay_key_sha256: applied.operation_replay_key_sha256,
+                },
+            ),
+            None,
+        )
+        .await
+        .expect("direct withdrawal lookup");
+        assert_eq!(
+            direct_deposit_journal_artifact(&lookup),
+            Some(applied.encrypted_journal_record.clone())
+        );
+        assert_eq!(
+            direct_deposit_receipt_artifact(&lookup),
+            Some(applied.enclave_receipt.clone())
+        );
+        assert!(direct_execution_reuses_archived_snapshot(&lookup));
+    }
+
     #[test]
-    fn direct_quest_operator_gate_allows_only_session_setup_archive_ack_and_crypto_rollover() {
+    fn direct_withdrawal_gate_accepts_only_valid_base_usdc_user_requests() {
+        let withdrawal_id = Uuid::from_u128(41);
+        assert!(direct_base_usdc_withdrawal(
+            &UserCommandAction::RequestWithdrawal {
+                withdrawal_id,
+                chain: "base".into(),
+                asset: "USDC".into(),
+                amount_atomic: 3_706_250,
+                destination: "0xE570c6cb9A7D3E46bCA321115019B9e91ad64f7c".into(),
+            }
+        ));
+        for action in [
+            UserCommandAction::RequestWithdrawal {
+                withdrawal_id: Uuid::nil(),
+                chain: "base".into(),
+                asset: "USDC".into(),
+                amount_atomic: 1,
+                destination: "0xE570c6cb9A7D3E46bCA321115019B9e91ad64f7c".into(),
+            },
+            UserCommandAction::RequestWithdrawal {
+                withdrawal_id,
+                chain: "horizen".into(),
+                asset: "USDC".into(),
+                amount_atomic: 1,
+                destination: "0xE570c6cb9A7D3E46bCA321115019B9e91ad64f7c".into(),
+            },
+            UserCommandAction::RequestWithdrawal {
+                withdrawal_id,
+                chain: "base".into(),
+                asset: "ZEN".into(),
+                amount_atomic: 1,
+                destination: "0xE570c6cb9A7D3E46bCA321115019B9e91ad64f7c".into(),
+            },
+            UserCommandAction::RequestWithdrawal {
+                withdrawal_id,
+                chain: "base".into(),
+                asset: "USDC".into(),
+                amount_atomic: 0,
+                destination: "0xE570c6cb9A7D3E46bCA321115019B9e91ad64f7c".into(),
+            },
+            UserCommandAction::RequestWithdrawal {
+                withdrawal_id,
+                chain: "base".into(),
+                asset: "USDC".into(),
+                amount_atomic: 1,
+                destination: "0xnot-an-address".into(),
+            },
+        ] {
+            assert!(!direct_base_usdc_withdrawal(&action));
+        }
+    }
+
+    #[test]
+    fn prepared_withdrawal_replacement_requires_fresh_exact_chain_absence() {
+        let now = 1_000_000;
+        let mut observation = WithdrawalReplacementChainObservation {
+            protocol_version: "layrs.withdrawal-chain-absence.v1".into(),
+            chain: "base".into(),
+            prepared_transaction_hash: format!("0x{}", "11".repeat(32)),
+            prepared_nonce: 44,
+            transaction_absent: true,
+            receipt_absent: true,
+            pending_nonce: 45,
+            block_number: 35_000_000,
+            block_hash: format!("0x{}", "22".repeat(32)),
+            observed_at_millis: now - 1_000,
+        };
+        assert_ne!(
+            validate_withdrawal_replacement_observation(
+                &observation,
+                "base",
+                &observation.prepared_transaction_hash,
+                44,
+                45,
+                now,
+            )
+            .unwrap(),
+            [0; 32],
+        );
+        observation.transaction_absent = false;
+        assert!(validate_withdrawal_replacement_observation(
+            &observation,
+            "base",
+            &observation.prepared_transaction_hash,
+            44,
+            45,
+            now,
+        )
+        .is_err());
+        observation.transaction_absent = true;
+        observation.observed_at_millis = now - 120_001;
+        assert!(validate_withdrawal_replacement_observation(
+            &observation,
+            "base",
+            &observation.prepared_transaction_hash,
+            44,
+            45,
+            now,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn direct_withdrawal_signing_bypasses_durable_only_when_release_flag_is_embedded() {
+        if !matches!(option_env!("LAYRS_DIRECT_WITHDRAWAL_ENABLED"), Some("1")) {
+            return;
+        }
+        let operator_signer = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);
+        let receipt_signer = ReceiptSigner::from_seed([0x72; 32], [0x73; 48]);
+        let state = direct_deposit_test_state(
+            operator_signer.verifying_key(),
+            receipt_signer.verifying_key(),
+            PrivateTradingCore::new(JournalKey::from_bytes([0x74; 32]), receipt_signer),
+        );
+        let command = OperatorCommand::SignPoolWithdrawal {
+            idempotency_key: "green-direct-withdrawal-sign".into(),
+            authorization: WithdrawalAuthorization {
+                intent: clob_service::private_core::WithdrawalIntent {
+                    protocol_version: "layrs.withdrawal.v1".into(),
+                    withdrawal_id: Uuid::from_u128(0x71111111_1111_4111_8111_111111111111),
+                    session_id: "green-direct-withdrawal-sign-session".into(),
+                    chain: "base".into(),
+                    asset: "USDC".into(),
+                    amount_atomic: "1".into(),
+                    destination: "0x1111111111111111111111111111111111111111".into(),
+                    receipt_id: "receipt_green_direct_withdrawal_sign".into(),
+                    enclave_sequence: 1,
+                    state_root: [0x75; 32],
+                    expires_at_millis: 1_800_000_900_000,
+                    recovery_proof: None,
+                },
+                signature: vec![0x76; 64],
+            },
+            nonce: 0,
+            gas_limit: 180_000,
+            max_fee_per_gas_wei: "2".into(),
+            max_priority_fee_per_gas_wei: "1".into(),
+            now_millis: 1_800_000_000_000,
+        };
+        let request = PlainRequest::Operator {
+            envelope: signed_operator_envelope(&operator_signer, [0x77; 32], command),
+        };
+        let direct = direct_execution_request(&state, &request);
+        assert!(direct);
+        assert!(!pending_preparation_blocks_request(true, &request, direct));
+        assert!(!requires_durable_preparation(true, direct));
+    }
+
+    #[test]
+    fn direct_quest_operator_gate_allows_only_session_setup_crypto_and_valid_deposit_credit() {
         let identity_commitment = [7u8; 32];
         assert!(direct_quest_operator_command(
             &OperatorCommand::RegisterSession {
@@ -7685,6 +10343,207 @@ mod tests {
                 identity_commitment
             }
         ));
+        assert!(direct_quest_operator_command(
+            &OperatorCommand::CreditDeposit {
+                idempotency_key: "deposit:e26d2af6-8edd-5b9c-a2f8-1065d5872063".into(),
+                identity_commitment,
+                asset: "USDC".into(),
+                amount_atomic: 5_000_000,
+                evidence_hash: [9; 32],
+                now_millis: 1,
+            }
+        ));
+        for command in [
+            OperatorCommand::FinalizeWithdrawal {
+                idempotency_key: "withdrawal-final:e26d2af6-8edd-5b9c-a2f8-1065d5872063".into(),
+                identity_commitment,
+                asset: "USDC".into(),
+                amount_atomic: 1,
+                evidence_hash: [9; 32],
+                now_millis: 1,
+            },
+            OperatorCommand::ReleaseWithdrawal {
+                idempotency_key: "withdrawal-release:e26d2af6-8edd-5b9c-a2f8-1065d5872063".into(),
+                identity_commitment,
+                asset: "USDC".into(),
+                amount_atomic: 1,
+                evidence_hash: [9; 32],
+                now_millis: 1,
+            },
+            OperatorCommand::ResolutionStatus {
+                market_id: "layrs:v5:BTC:USDC:1h:1788390000".into(),
+            },
+            OperatorCommand::ResolutionReadiness {
+                market_id: "layrs:v5:BTC:USDC:1h:1788390000".into(),
+                now_millis: 1_788_393_600_000,
+            },
+        ] {
+            assert!(direct_quest_operator_command(&command));
+        }
+
+        let freeze_reason = [0xabu8; 32];
+        let freeze_command = OperatorCommand::SetTradingFreeze {
+            idempotency_key: format!("trading-freeze:{}", hex::encode(freeze_reason)),
+            frozen: true,
+            reason_commitment: freeze_reason,
+            now_millis: 1,
+        };
+        assert!(direct_quest_operator_command(
+            &OperatorCommand::TradingFreezeStatus
+        ));
+        assert!(direct_quest_operator_command(&freeze_command));
+        let freeze_status_request = PlainRequest::Operator {
+            envelope: OperatorEnvelope {
+                nonce: [12; 32],
+                command: OperatorCommand::TradingFreezeStatus,
+                signature: Vec::new(),
+            },
+        };
+        assert!(durable_control_request(&freeze_status_request));
+        let freeze_request = PlainRequest::Operator {
+            envelope: OperatorEnvelope {
+                nonce: [13; 32],
+                command: freeze_command,
+                signature: Vec::new(),
+            },
+        };
+        assert!(!durable_control_request(&freeze_request));
+        assert!(request_requires_writer_authorization(&freeze_request));
+        for command in [
+            OperatorCommand::SetTradingFreeze {
+                idempotency_key: format!("trading-freeze:{}", hex::encode([0xcdu8; 32])),
+                frozen: true,
+                reason_commitment: freeze_reason,
+                now_millis: 1,
+            },
+            OperatorCommand::SetTradingFreeze {
+                idempotency_key: format!("trading-freeze:{}", hex::encode([0u8; 32])),
+                frozen: false,
+                reason_commitment: [0; 32],
+                now_millis: 1,
+            },
+            OperatorCommand::SetTradingFreeze {
+                idempotency_key: format!("trading-freeze:{}", hex::encode(freeze_reason)),
+                frozen: false,
+                reason_commitment: freeze_reason,
+                now_millis: 0,
+            },
+        ] {
+            assert!(!direct_quest_operator_command(&command));
+        }
+
+        let split_session_dust = OperatorCommand::CreditDeposit {
+            idempotency_key: "deposit:c8876513-c918-5a5f-aef9-4f6a5f3aae7b".into(),
+            identity_commitment,
+            asset: "USDC".into(),
+            amount_atomic: 10_000,
+            evidence_hash: [9; 32],
+            now_millis: 1,
+        };
+        let split_session_dust_request = PlainRequest::Operator {
+            envelope: OperatorEnvelope {
+                nonce: [10; 32],
+                command: split_session_dust.clone(),
+                signature: Vec::new(),
+            },
+        };
+        assert!(direct_quest_operator_command(&split_session_dust));
+        assert!(!durable_control_request(&split_session_dust_request));
+        assert!(request_requires_writer_authorization(
+            &split_session_dust_request
+        ));
+        let pending_preparation_blocks = |request: &PlainRequest, direct_execution: bool| {
+            !durable_control_request(request) && !direct_execution
+        };
+        assert!(!pending_preparation_blocks(
+            &split_session_dust_request,
+            direct_quest_operator_command(&split_session_dust),
+        ));
+
+        let withdrawal_id = Uuid::from_u128(42);
+        let withdrawal_authorization = WithdrawalAuthorization {
+            intent: clob_service::private_core::WithdrawalIntent {
+                protocol_version: "layrs.withdrawal.v1".into(),
+                withdrawal_id,
+                session_id: "session_quest_withdrawal".into(),
+                chain: "base".into(),
+                asset: "USDC".into(),
+                amount_atomic: "2970620".into(),
+                destination: "0xE570c6cb9A7D3E46bCA321115019B9e91ad64f7c".into(),
+                receipt_id: "receipt_quest_withdrawal".into(),
+                enclave_sequence: 7,
+                state_root: [4; 32],
+                expires_at_millis: 1_000_000,
+                recovery_proof: None,
+            },
+            signature: vec![5; 64],
+        };
+        assert!(direct_quest_operator_command(
+            &OperatorCommand::SignPoolWithdrawal {
+                idempotency_key: format!("withdrawal-sign:{withdrawal_id}"),
+                authorization: withdrawal_authorization.clone(),
+                nonce: 3,
+                gas_limit: 180_000,
+                max_fee_per_gas_wei: "2".into(),
+                max_priority_fee_per_gas_wei: "1".into(),
+                now_millis: 100_000,
+            }
+        ));
+        assert!(!direct_quest_operator_command(
+            &OperatorCommand::SignPoolWithdrawal {
+                idempotency_key: format!("withdrawal-sign:{}", Uuid::from_u128(43)),
+                authorization: withdrawal_authorization,
+                nonce: 3,
+                gas_limit: 180_000,
+                max_fee_per_gas_wei: "2".into(),
+                max_priority_fee_per_gas_wei: "1".into(),
+                now_millis: 100_000,
+            }
+        ));
+        for command in [
+            OperatorCommand::CreditDeposit {
+                idempotency_key: "deposit:not-a-uuid".into(),
+                identity_commitment,
+                asset: "USDC".into(),
+                amount_atomic: 5_000_000,
+                evidence_hash: [9; 32],
+                now_millis: 1,
+            },
+            OperatorCommand::CreditDeposit {
+                idempotency_key: "deposit:c8876513-c918-5a5f-aef9-4f6a5f3aae7b".into(),
+                identity_commitment,
+                asset: "ZEN".into(),
+                amount_atomic: 5_000_000,
+                evidence_hash: [9; 32],
+                now_millis: 1,
+            },
+            OperatorCommand::CreditDeposit {
+                idempotency_key: "deposit:c8876513-c918-5a5f-aef9-4f6a5f3aae7b".into(),
+                identity_commitment: [0; 32],
+                asset: "USDC".into(),
+                amount_atomic: 5_000_000,
+                evidence_hash: [9; 32],
+                now_millis: 1,
+            },
+            OperatorCommand::CreditDeposit {
+                idempotency_key: "deposit:c8876513-c918-5a5f-aef9-4f6a5f3aae7b".into(),
+                identity_commitment,
+                asset: "USDC".into(),
+                amount_atomic: 0,
+                evidence_hash: [9; 32],
+                now_millis: 1,
+            },
+            OperatorCommand::CreditDeposit {
+                idempotency_key: "deposit:c8876513-c918-5a5f-aef9-4f6a5f3aae7b".into(),
+                identity_commitment,
+                asset: "USDC".into(),
+                amount_atomic: 5_000_000,
+                evidence_hash: [0; 32],
+                now_millis: 1,
+            },
+        ] {
+            assert!(!direct_quest_operator_command(&command));
+        }
         let opens_at_millis = 1_788_390_000_000;
         let btc_market = MarketConfig {
             market_id: "layrs:v5:BTC:USDC:1h:1788390000".into(),
@@ -7815,6 +10674,207 @@ mod tests {
         assert!(request_requires_writer_authorization(&cancellation));
     }
 
+    fn durable_preparation_fixture() -> DurableCommandPreparation {
+        DurableCommandPreparation {
+            protocol_version: "layrs.durable-command-preparation.v1".into(),
+            environment: "test".into(),
+            enclave_measurement_sha384: vec![1; 48],
+            preparation_id: [2; 32],
+            actor_domain: "OPERATOR".into(),
+            command_binding_sha256: [3; 32],
+            command_commitment_sha256: [4; 32],
+            request_context_sha256: [5; 32],
+            request_envelope_sha256: [6; 32],
+            command_idempotency_key: "recovery:test:0001".into(),
+            writer_epoch: 7,
+            writer_lease_id: Uuid::from_u128(8),
+            prior_enclave_sequence: 40,
+            enclave_sequence: 41,
+            prior_state_root: [9; 32],
+            prior_journal_head: [10; 32],
+            state_root: [11; 32],
+            journal_record_hash: [12; 32],
+            snapshot_ciphertext_hash: [13; 32],
+            response_envelope_sha256: [14; 32],
+            response_envelope_bytes: 4_096,
+            response_status: 200,
+            response_content_type: "application/json".into(),
+            receipt_id: "receipt_test_0001".into(),
+            prepared_at_millis: 1_000,
+            expires_at_millis: 31_000,
+            signature: vec![15; 64],
+        }
+    }
+
+    #[test]
+    fn preparation_supersession_requires_a_conflicting_or_later_live_head() {
+        let preparation = durable_preparation_fixture();
+        assert!(!pending_preparation_is_superseded(
+            &preparation,
+            preparation.prior_enclave_sequence,
+            preparation.prior_state_root,
+        ));
+        assert!(!pending_preparation_is_superseded(
+            &preparation,
+            preparation.enclave_sequence,
+            preparation.state_root,
+        ));
+        assert!(pending_preparation_is_superseded(
+            &preparation,
+            preparation.enclave_sequence,
+            [16; 32],
+        ));
+        assert!(pending_preparation_is_superseded(
+            &preparation,
+            preparation.enclave_sequence + 1,
+            [17; 32],
+        ));
+    }
+
+    #[test]
+    fn preparation_supersession_replay_requires_every_exact_anchor() {
+        let certificate = SignedPreparationSupersession {
+            protocol_version: "layrs.preparation-supersession.v1".into(),
+            environment: "test".into(),
+            enclave_measurement_sha384: vec![1; 48],
+            request_idempotency_key: "abort:test:0001".into(),
+            preparation_id: [2; 32],
+            pending_prior_enclave_sequence: 40,
+            pending_enclave_sequence: 41,
+            pending_prior_state_root: [3; 32],
+            pending_state_root: [4; 32],
+            live_enclave_sequence: 45,
+            live_state_root: [5; 32],
+            live_journal_head: [6; 32],
+            superseded_at_millis: 1_000,
+            signature: vec![7; 64],
+        };
+        let matches = |request_idempotency_key: &str,
+                       preparation_id: [u8; 32],
+                       pending_enclave_sequence: u64,
+                       pending_state_root: [u8; 32],
+                       live_enclave_sequence: u64,
+                       live_state_root: [u8; 32],
+                       live_journal_head: [u8; 32]| {
+            preparation_supersession_matches_request(
+                &certificate,
+                request_idempotency_key,
+                preparation_id,
+                pending_enclave_sequence,
+                pending_state_root,
+                live_enclave_sequence,
+                live_state_root,
+                live_journal_head,
+            )
+        };
+        assert!(matches(
+            "abort:test:0001",
+            [2; 32],
+            41,
+            [4; 32],
+            45,
+            [5; 32],
+            [6; 32],
+        ));
+        assert!(!matches(
+            "abort:test:0002",
+            [2; 32],
+            41,
+            [4; 32],
+            45,
+            [5; 32],
+            [6; 32],
+        ));
+        assert!(!matches(
+            "abort:test:0001",
+            [2; 32],
+            41,
+            [4; 32],
+            46,
+            [5; 32],
+            [6; 32],
+        ));
+    }
+
+    #[test]
+    fn lifecycle_reads_bypass_pending_preparation_without_mutating_committed_core() {
+        let market_id = "layrs:v4:SPORTS:lifecycle-read:abababababababab";
+        let market = MarketConfig {
+            market_id: market_id.into(),
+            settlement_asset: "USDC".into(),
+            settlement_decimals: 6,
+            public_settlement_chain: Some("horizen".into()),
+            opens_at_millis: 900,
+            closes_at_millis: 2_000,
+            minimum_quantity_micros: 1,
+            maximum_quantity_micros: 10_000_000,
+            minimum_order_notional_micros: 1_000_000,
+            maximum_order_notional_micros: 10_000_000,
+            maximum_user_position_micros: 10_000_000,
+            maximum_pending_bootstrap_notional_micros: 100_000_000,
+            tick_size_micros: 1_000,
+            oracle_feed_id: 1,
+            fee_profile_id: FeeProfileId::LegacyProfitV1,
+            execution: MarketExecution::NativeClob,
+        };
+        let mut core = PrivateTradingCore::new(
+            JournalKey::from_bytes([0x64; 32]),
+            ReceiptSigner::from_seed([0x62; 32], [0x63; 48]),
+        );
+        core.register_market("sys:lifecycle-read-test".into(), market.clone(), 800)
+            .expect("register lifecycle-read market");
+        let root_before = core.state_root();
+        let sequence_before = core.sequence();
+        let pending_preparation_blocks = |request: &PlainRequest, direct_execution: bool| {
+            !durable_control_request(request) && !direct_execution
+        };
+
+        for command in [
+            OperatorCommand::MarketStatus {
+                market_id: market_id.into(),
+            },
+            OperatorCommand::ResolutionReadiness {
+                market_id: market_id.into(),
+                now_millis: 2_001,
+            },
+        ] {
+            let request = PlainRequest::Operator {
+                envelope: OperatorEnvelope {
+                    nonce: [0x65; 32],
+                    command: command.clone(),
+                    signature: Vec::new(),
+                },
+            };
+            assert!(durable_control_request(&request));
+            assert!(!request_requires_writer_authorization(&request));
+            assert!(!direct_quest_operator_command(&command));
+            assert!(!pending_preparation_blocks(&request, false));
+        }
+
+        assert_eq!(core.market_config(market_id), Some(market.clone()));
+        core.market_settlement_readiness(market_id, 2_001)
+            .expect("resolution readiness");
+        assert_eq!(core.state_root(), root_before);
+        assert_eq!(core.sequence(), sequence_before);
+        assert_eq!(core.market_config(market_id), Some(market));
+
+        let mutation = PlainRequest::Operator {
+            envelope: OperatorEnvelope {
+                nonce: [0x67; 32],
+                command: OperatorCommand::SetTradingFreeze {
+                    idempotency_key: "sys:lifecycle-read-mutation-control".into(),
+                    frozen: true,
+                    reason_commitment: [0x68; 32],
+                    now_millis: 2_001,
+                },
+                signature: Vec::new(),
+            },
+        };
+        assert!(!durable_control_request(&mutation));
+        assert!(request_requires_writer_authorization(&mutation));
+        assert!(pending_preparation_blocks(&mutation, false));
+    }
+
     #[test]
     fn decrypts_kms_style_cms_enveloped_data() {
         let rsa = Rsa::generate(2048).expect("rsa key");
@@ -7845,6 +10905,162 @@ mod tests {
 
         let decrypted = decrypt_kms_recipient_enveloped_data(&key_pair, &cms).expect("decrypt cms");
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    #[tokio::test]
+    async fn green_test_capital_binary_route_is_exact_and_returns_signed_terminal_receipt() {
+        let now = 1_800_000_000_000i64;
+        let operator = SigningKey::from_bytes(&[0xb1; 32]);
+        let journal_key = JournalKey::from_bytes([0xb2; 32]);
+        let receipt_signer = ReceiptSigner::from_seed([0xb3; 32], [0xb4; 48]);
+        let receipt_public_key = receipt_signer.verifying_key();
+        let mut core = PrivateTradingCore::new(journal_key, receipt_signer);
+        core.register_session(
+            "register-green-e03s05-session".into(),
+            GREEN_E03S05_SESSION_ID.into(),
+            GREEN_E03S05_IDENTITY,
+            SigningKey::from_bytes(&[0xb5; 32])
+                .verifying_key()
+                .to_bytes(),
+            now + 60_000,
+            now,
+        )
+        .unwrap();
+        let mut state =
+            direct_deposit_test_state(operator.verifying_key(), receipt_public_key, core);
+        let seed_hash = [0xb6; 32];
+        state.completed_green_pool_seed = Some(CompletedGreenPoolSeed {
+            operation_id: "green-base-pool-seed-20260906-v1".into(),
+            command_commitment: [0xb7; 32],
+            transaction: GreenPoolSeedTransaction {
+                chain: "base".into(),
+                chain_id: 8453,
+                asset: "USDC".into(),
+                signer: GREEN_BASE_SIGNER.into(),
+                token_address: GREEN_BASE_USDC.into(),
+                destination_pool_address: GREEN_BASE_DESTINATION_POOL.into(),
+                amount_atomic: GREEN_POOL_SEED_AMOUNT_ATOMIC.into(),
+                nonce: 0,
+                transaction_hash: format!("0x{}", hex::encode(seed_hash)),
+                raw_transaction_hex: "0x02aa".into(),
+            },
+        });
+        let request = green_test_capital_request_for_wire(
+            Uuid::from_u128(0xb8111111_1111_4111_8111_111111111111),
+            seed_hash,
+            now,
+        );
+        let command = OperatorCommand::AllocateGreenE03s05TestCapital {
+            request: request.clone(),
+        };
+        assert!(green_pool_certification_request_allowed(
+            &state,
+            &PlainRequest::Operator {
+                envelope: signed_operator_envelope(&operator, [0xb9; 32], command.clone()),
+            }
+        ));
+        let response = dispatch_operator(
+            &mut state,
+            signed_operator_envelope(&operator, [0xba; 32], command),
+            Some(now + 1),
+        )
+        .await
+        .unwrap();
+        let PlainResponse::GreenE03s05TestCapital {
+            outcome: GreenE03s05TestCapitalOutcome::Applied(applied),
+        } = response
+        else {
+            panic!("expected exact Green allocation")
+        };
+        assert_eq!(
+            applied.result.state,
+            clob_service::private_core::engine::DirectExecutionTerminalState::Applied
+        );
+        assert_eq!(
+            applied.enclave_receipt.command_id,
+            "allocate-green-e03s05-test-capital"
+        );
+        state.completed_green_pool_seed = None;
+        let replay_command = OperatorCommand::AllocateGreenE03s05TestCapital {
+            request: request.clone(),
+        };
+        assert!(green_pool_certification_request_allowed(
+            &state,
+            &PlainRequest::Operator {
+                envelope: signed_operator_envelope(&operator, [0xbb; 32], replay_command.clone()),
+            }
+        ));
+        assert!(matches!(
+            dispatch_operator(
+                &mut state,
+                signed_operator_envelope(&operator, [0xbc; 32], replay_command),
+                Some(now + 2),
+            )
+            .await,
+            Ok(PlainResponse::GreenE03s05TestCapital {
+                outcome: GreenE03s05TestCapitalOutcome::ReturnOriginal(_),
+            })
+        ));
+
+        let mut wrong_payload: GreenE03s05TestCapitalPayload =
+            serde_json::from_slice(&request.canonical_payload).unwrap();
+        wrong_payload.identity_commitment = [0xbb; 32];
+        let wrong_request = DirectExecutionRequestEnvelope::new(
+            Uuid::from_u128(0xbc111111_1111_4111_8111_111111111111),
+            GREEN_E03S05_ACCOUNT_AND_AUTH,
+            GREEN_E03S05_ACCOUNT_AND_AUTH,
+            None,
+            Some(wrong_payload.funding_identity.clone()),
+            DirectExecutionOperation::AllocateGreenE03s05TestCapital,
+            serde_json::to_vec(&wrong_payload).unwrap(),
+            now,
+            now + 5_000,
+        )
+        .unwrap();
+        assert!(!green_pool_certification_request_allowed(
+            &state,
+            &PlainRequest::Operator {
+                envelope: signed_operator_envelope(
+                    &operator,
+                    [0xbd; 32],
+                    OperatorCommand::AllocateGreenE03s05TestCapital {
+                        request: wrong_request
+                    }
+                ),
+            }
+        ));
+        let mut wrong_seed_payload: GreenE03s05TestCapitalPayload =
+            serde_json::from_slice(&request.canonical_payload).unwrap();
+        wrong_seed_payload.seed_transaction_hash = [0xbe; 32];
+        wrong_seed_payload.funding_identity = format!(
+            "green-e03s05-test-capital:0x{}",
+            hex::encode(wrong_seed_payload.seed_transaction_hash)
+        );
+        let wrong_seed_request = DirectExecutionRequestEnvelope::new(
+            Uuid::from_u128(0xbf111111_1111_4111_8111_111111111111),
+            GREEN_E03S05_ACCOUNT_AND_AUTH,
+            GREEN_E03S05_ACCOUNT_AND_AUTH,
+            None,
+            Some(wrong_seed_payload.funding_identity.clone()),
+            DirectExecutionOperation::AllocateGreenE03s05TestCapital,
+            serde_json::to_vec(&wrong_seed_payload).unwrap(),
+            now,
+            now + 5_000,
+        )
+        .unwrap();
+        assert!(!green_pool_certification_request_allowed(
+            &state,
+            &PlainRequest::Operator {
+                envelope: signed_operator_envelope(
+                    &operator,
+                    [0xc0; 32],
+                    OperatorCommand::AllocateGreenE03s05TestCapital {
+                        request: wrong_seed_request
+                    }
+                ),
+            }
+        ));
     }
 
     fn kms_style_cms_fixture(
