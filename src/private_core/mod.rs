@@ -57,9 +57,11 @@ pub use engine::{
     INCIDENT_TERMINAL_JOURNAL_HEAD_HEX, INCIDENT_TERMINAL_SEQUENCE,
     INCIDENT_TERMINAL_STATE_ROOT_HEX,
 };
+#[allow(unused_imports)]
 pub use journal::{
-    command_result_commitment, CommandReceiptState, EnclaveReceipt, EncryptedJournal,
-    EncryptedJournalRecord, EncryptedSnapshot, JournalKey, ReceiptSigner,
+    command_result_commitment, verify_reviewer_attestation, CommandReceiptState, EnclaveReceipt,
+    EncryptedJournal, EncryptedJournalRecord, EncryptedSnapshot, JournalKey, ReceiptSigner,
+    ReviewerAttestation, ReviewerEvent,
 };
 #[allow(unused_imports)]
 pub use ledger::{

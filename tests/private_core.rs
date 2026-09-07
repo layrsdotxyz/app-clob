@@ -1,13 +1,13 @@
 use clob_service::private_core::{
     command_request_hash, polymarket_resolution_signing_payload, resolution_signing_payload,
-    signing_payload, AccountBucket, AccountKey, BookOrder, BootstrapPreparedVenueOrder,
-    BoundaryEvidence, CancelAllOrdersFilter, CommandReceiptState, CommandResult,
-    CompleteSetDirection, CoreError, EncryptedJournal, ExternalFlowDirection, FeeProfileId,
-    JournalKey, Ledger, LedgerTransaction, MarketConfig, MarketExecution, OrderAction, OrderStatus,
-    Outcome, PolymarketResolutionStatement, PostingSide, PriceTimeBook, PrivateTradingCore,
-    ReceiptSigner, ResolutionOutcome, ResolutionStatement, SessionGuard, SessionRequest,
-    SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence, SignedSessionRequest,
-    TimeInForce, Transfer, UserCommand, UserCommandAction,
+    signing_payload, verify_reviewer_attestation, AccountBucket, AccountKey, BookOrder,
+    BootstrapPreparedVenueOrder, BoundaryEvidence, CancelAllOrdersFilter, CommandReceiptState,
+    CommandResult, CompleteSetDirection, CoreError, EncryptedJournal, ExternalFlowDirection,
+    FeeProfileId, JournalKey, Ledger, LedgerTransaction, MarketConfig, MarketExecution,
+    OrderAction, OrderStatus, Outcome, PolymarketResolutionStatement, PostingSide, PriceTimeBook,
+    PrivateTradingCore, ReceiptSigner, ResolutionOutcome, ResolutionStatement, SessionGuard,
+    SessionRequest, SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence,
+    SignedSessionRequest, TimeInForce, Transfer, UserCommand, UserCommandAction,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
@@ -961,6 +961,15 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
     assert_eq!(fill_response.receipt.journal_committed, Some(true));
     assert_eq!(fill_response.receipt_state, CommandReceiptState::Filled);
     assert_eq!(fill_response.receipt.publication_eligible, Some(true));
+    assert_eq!(
+        fill_response
+            .receipt
+            .reviewer_attestation
+            .as_ref()
+            .unwrap()
+            .event_type,
+        "ORDER_MATCHED"
+    );
     assert_eq!(
         fill_response.receipt.command_commitment_sha256,
         Some(command_request_hash("cmd:buy", "idem:cmd:buy", &buy_action).unwrap())
@@ -2389,18 +2398,29 @@ fn polymarket_bootstrap_never_credits_an_unconfirmed_fill() {
         950,
     )
     .unwrap();
-    core.apply_external_flow(
-        "sys:pool-capital".into(),
-        AccountKey::new("layrs", AccountBucket::PoolCash, "USDC"),
-        1_000_000,
-        ExternalFlowDirection::Inflow,
-        [46u8; 32],
-        950,
-    )
-    .unwrap();
+    let pool_flow = core
+        .apply_external_flow(
+            "sys:pool-capital".into(),
+            AccountKey::new("layrs", AccountBucket::PoolCash, "USDC"),
+            1_000_000,
+            ExternalFlowDirection::Inflow,
+            [46u8; 32],
+            950,
+        )
+        .unwrap();
+    assert_eq!(pool_flow.receipt.command_id, "external-flow");
+    assert_eq!(
+        pool_flow
+            .receipt
+            .reviewer_attestation
+            .as_ref()
+            .expect("generic external-flow reviewer attestation")
+            .event_type,
+        "EXTERNAL_FLOW_RECORDED"
+    );
 
     let execution_id = uuid::Uuid::from_u128(47);
-    let pending = execute_signed(
+    let pending_response = execute_signed_response(
         &mut core,
         &user,
         "session:bootstrap",
@@ -2421,7 +2441,24 @@ fn polymarket_bootstrap_never_credits_an_unconfirmed_fill() {
         },
         1_100,
     );
-    assert!(matches!(pending, CommandResult::BootstrapPending { .. }));
+    assert!(matches!(
+        &pending_response.result,
+        CommandResult::BootstrapPending { .. }
+    ));
+    assert_eq!(
+        pending_response.receipt_state,
+        CommandReceiptState::Accepted
+    );
+    assert_eq!(
+        pending_response
+            .receipt
+            .reviewer_attestation
+            .as_ref()
+            .expect("bootstrap reservation reviewer attestation")
+            .event_type,
+        "ORDER_FUNDS_RESERVED"
+    );
+    assert!(pending_response.task_qualifications.is_empty());
     assert_eq!(
         core.balance(&AccountKey::new(
             &private_user,
@@ -2469,13 +2506,23 @@ fn polymarket_bootstrap_never_credits_an_unconfirmed_fill() {
     let prepared = core.bootstrap_prepared_venue_order(execution_id).unwrap();
     assert_eq!(prepared.exact_request_body, exact_body);
     assert_eq!(prepared.credential_generation_sha256, [50u8; 32]);
-    core.mark_bootstrap_submitted(
-        "sys:venue-submitted:47".into(),
-        execution_id,
-        format!("0x{}", "ab".repeat(32)),
-        1_150,
-    )
-    .unwrap();
+    let submitted_response = core
+        .mark_bootstrap_submitted(
+            "sys:venue-submitted:47".into(),
+            execution_id,
+            format!("0x{}", "ab".repeat(32)),
+            1_150,
+        )
+        .unwrap();
+    assert_eq!(
+        submitted_response
+            .receipt
+            .reviewer_attestation
+            .as_ref()
+            .expect("bootstrap submission reviewer attestation")
+            .event_type,
+        "BOOTSTRAP_SUBMITTED"
+    );
     assert!(core
         .confirm_bootstrap_fill(
             "sys:bad-fill:47".into(),
@@ -2504,6 +2551,15 @@ fn polymarket_bootstrap_never_credits_an_unconfirmed_fill() {
             1_170,
         )
         .unwrap();
+    assert_eq!(
+        fill_response
+            .receipt
+            .reviewer_attestation
+            .as_ref()
+            .expect("bootstrap confirmation reviewer attestation")
+            .event_type,
+        "BOOTSTRAP_CONFIRMED"
+    );
     assert_eq!(fill_response.audit_fills[0].statement.chain, "horizen");
     assert_eq!(
         core.balance(&AccountKey::position(
@@ -2551,6 +2607,65 @@ fn polymarket_bootstrap_never_credits_an_unconfirmed_fill() {
             if execution.state == clob_service::private_core::BootstrapExecutionState::VenueConfirmed
                 && execution.confirmed_price_micros == Some(390_000)
     ));
+
+    let failed_execution_id = uuid::Uuid::from_u128(52);
+    let failed_pending = execute_signed_response(
+        &mut core,
+        &user,
+        "session:bootstrap",
+        3,
+        "cmd:bootstrap-fail",
+        UserCommandAction::SubmitOrder {
+            order: BookOrder::with_id(
+                failed_execution_id,
+                "ignored-by-enclave",
+                market_id,
+                Outcome::Up,
+                OrderAction::Buy,
+                400_000,
+                1_000_000,
+                TimeInForce::Fok,
+                None,
+            ),
+        },
+        1_300,
+    );
+    assert_eq!(
+        failed_pending
+            .receipt
+            .reviewer_attestation
+            .as_ref()
+            .expect("second bootstrap reservation reviewer attestation")
+            .event_type,
+        "ORDER_FUNDS_RESERVED"
+    );
+    assert!(failed_pending.task_qualifications.is_empty());
+    let failure_response = core
+        .fail_bootstrap_execution(
+            "sys:venue-failed:52".into(),
+            failed_execution_id,
+            "VENUE_REJECTED".into(),
+            [52u8; 32],
+            1_310,
+        )
+        .unwrap();
+    assert_eq!(
+        failure_response
+            .receipt
+            .reviewer_attestation
+            .as_ref()
+            .expect("bootstrap failure reviewer attestation")
+            .event_type,
+        "BOOTSTRAP_FAILED"
+    );
+    assert_eq!(
+        core.balance(&AccountKey::new(
+            &private_user,
+            AccountBucket::UserAvailable,
+            "USDC"
+        )),
+        609_220
+    );
 
     let resolution = PolymarketResolutionStatement {
         market_id: market_id.into(),
@@ -2692,8 +2807,17 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
         },
         1_300,
     );
-    assert_eq!(response.receipt.protocol_version, "layrs.v2");
+    assert_eq!(response.receipt.protocol_version, "layrs.v3");
     assert_eq!(response.receipt.publication_eligible, Some(true));
+    assert_eq!(
+        response
+            .receipt
+            .reviewer_attestation
+            .as_ref()
+            .unwrap()
+            .event_type,
+        "WITHDRAWAL_RESERVED"
+    );
     assert!(response.encrypted_record.is_some());
     let public_receipt = serde_json::to_string(&response.receipt).unwrap();
     assert!(!public_receipt.contains("0x1111111111111111111111111111111111111111"));
@@ -2823,17 +2947,29 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
         },
         1_500,
     );
-    core.apply_user_external_flow(
-        "withdrawal-final:36".into(),
-        identity_commitment,
-        "USDC".into(),
-        AccountBucket::UserWithdrawalHold,
-        10_000_000,
-        ExternalFlowDirection::Outflow,
-        [38u8; 32],
-        1_600,
-    )
-    .unwrap();
+    let confirmed = core
+        .apply_user_external_flow(
+            "withdrawal-final:36".into(),
+            identity_commitment,
+            "USDC".into(),
+            AccountBucket::UserWithdrawalHold,
+            10_000_000,
+            ExternalFlowDirection::Outflow,
+            [38u8; 32],
+            1_600,
+        )
+        .unwrap();
+    assert_eq!(confirmed.receipt.command_id, "external-flow");
+    let finalized_attestation = confirmed
+        .receipt
+        .reviewer_attestation
+        .as_ref()
+        .expect("confirmed withdrawal reviewer attestation");
+    assert_eq!(finalized_attestation.event_type, "WITHDRAWAL_FINALIZED");
+    assert!(verify_reviewer_attestation(
+        finalized_attestation,
+        &receipt_public_key
+    ));
     assert_eq!(
         core.balance(&AccountKey::new(
             &private_user,
@@ -3036,8 +3172,17 @@ fn registration_receipt_is_publication_eligible_private_and_identity_unique() {
         )
         .unwrap();
 
-    assert_eq!(first.receipt.protocol_version, "layrs.v2");
+    assert_eq!(first.receipt.protocol_version, "layrs.v3");
     assert_eq!(first.receipt.publication_eligible, Some(true));
+    assert_eq!(
+        first
+            .receipt
+            .reviewer_attestation
+            .as_ref()
+            .unwrap()
+            .event_type,
+        "PRIVATE_SESSION_REGISTERED"
+    );
     assert!(first.receipt.command_commitment_sha256.is_some());
     let first_evidence = first.registration_evidence.unwrap();
     let second_evidence = second.registration_evidence.unwrap();
@@ -4596,12 +4741,26 @@ fn api_cancel_all_filters_owner_orders_releases_holds_and_replays_once() {
         3_000_000_000_000_000_000
     );
 
+    let empty_cancel = execute_signed_response(
+        &mut core,
+        &alice_key,
+        "session:cancel-all:alice",
+        8,
+        "cmd:cancel-all:empty",
+        UserCommandAction::CancelAllOrders {
+            filter: CancelAllOrdersFilter::All,
+        },
+        1_260,
+    );
+    assert_eq!(empty_cancel.receipt_state, CommandReceiptState::Accepted);
+    assert!(empty_cancel.receipt.reviewer_attestation.is_none());
+
     let root_before_invalid_filter = core.state_root();
     let invalid = execute_signed_result(
         &mut core,
         &alice_key,
         "session:cancel-all:alice",
-        8,
+        9,
         "cmd:cancel-all:unknown-market",
         UserCommandAction::CancelAllOrders {
             filter: CancelAllOrdersFilter::Market {

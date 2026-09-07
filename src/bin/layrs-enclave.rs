@@ -1668,6 +1668,7 @@ async fn handle_encrypted(
                 Some(false),
                 result_commitment,
                 semantic_receipt.then_some(false),
+                None,
                 core.sequence(),
                 root,
                 root,
@@ -1738,9 +1739,7 @@ async fn handle_encrypted(
         _ => Vec::new(),
     };
     let preparation_supersession = match &response {
-        PlainResponse::PreparedCommandSuperseded { certificate } => {
-            Some(certificate.clone())
-        }
+        PlainResponse::PreparedCommandSuperseded { certificate } => Some(certificate.clone()),
         _ => None,
     };
     let encoded = match serde_json::to_vec(&response)
@@ -1983,13 +1982,9 @@ async fn handle_encrypted(
                 }
             }
             if let Some(certificate) = preparation_supersession {
-                if !state
-                    .pending_preparation
-                    .as_ref()
-                    .is_some_and(|pending| {
-                        pending.preparation.preparation_id == certificate.preparation_id
-                    })
-                {
+                if !state.pending_preparation.as_ref().is_some_and(|pending| {
+                    pending.preparation.preparation_id == certificate.preparation_id
+                }) {
                     return rollback_wire_error(
                         &mut state,
                         &mut rollback_core,
@@ -6391,6 +6386,7 @@ mod tests {
             publication_eligible: Some(true),
             result_commitment_sha256: None,
             journal_committed: None,
+            reviewer_attestation: None,
             enclave_sequence: 8,
             prior_state_root: [11; 32],
             state_root: [3; 32],

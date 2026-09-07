@@ -20,8 +20,9 @@ use super::{
     EncryptedJournalRecord, EncryptedSnapshot, ExternalFlowDirection, ExternalFlowTransaction,
     Fill, JournalKey, Ledger, LedgerTransaction, MatchResult, MatchType, NormalFillPosting,
     OrderAction, OrderStatus, Outcome, PoolCashOpening, PriceTimeBook, PublicAssetTotal,
-    PublicBucketTotal, ReceiptSigner, ResolutionPayoutKind, SessionGuard, SignedSessionRequest,
-    TimeInForce, Transfer, VaultStrategyTransaction, VaultStrategyTransition, PRICE_SCALE,
+    PublicBucketTotal, ReceiptSigner, ResolutionPayoutKind, ReviewerEvent, SessionGuard,
+    SignedSessionRequest, TimeInForce, Transfer, VaultStrategyTransaction, VaultStrategyTransition,
+    PRICE_SCALE,
 };
 
 /// Public depth is deliberately less precise than the enclave's private book.
@@ -2451,6 +2452,7 @@ impl PrivateTradingCore {
             Some(false),
             None,
             None,
+            None,
             self.sequence,
             root,
             root,
@@ -2856,8 +2858,12 @@ impl PrivateTradingCore {
             idempotency_key,
             Some(command_commitment),
             Some(true),
-            None,
-            None,
+            Some(system_result_commitment(
+                "register-session",
+                &record.record_hash,
+            )),
+            Some(true),
+            Some(reviewer_event("PRIVATE_SESSION_REGISTERED")),
             next_sequence,
             prior_root,
             next_root,
@@ -3285,13 +3291,14 @@ impl PrivateTradingCore {
         self.sequence = next_sequence;
         // Keep the existing receipt command ID stable because the backend's
         // deterministic archive lookup uses this public protocol identifier.
-        Ok(self.system_response(
+        Ok(self.system_response_with_reviewer_event(
             "external-flow",
             idempotency_key,
             prior_root,
             next_root,
             record,
             now_millis,
+            reviewer_event("WITHDRAWAL_FINALIZED"),
         ))
     }
 
@@ -5652,8 +5659,13 @@ impl PrivateTradingCore {
         let disclosure_nonce =
             self.receipt_signer
                 .result_disclosure_nonce(expected_hash, next_sequence, next_root);
+        let reviewer_event =
+            reviewer_event_for_user_command(&command.action, &result, command_state);
+        // Reviewer-attested state mutations retain the upstream v3 encrypted
+        // result commitment. Preview-only commands stay non-public v2.
         let semantic_receipt = is_s08_semantic_result(&command.action, &result);
-        let result_commitment = semantic_receipt
+        let v3_receipt = semantic_receipt || reviewer_event.is_some();
+        let result_commitment = v3_receipt
             .then(|| command_result_commitment(command_state, disclosure_nonce, &result))
             .transpose()?;
         // The leaf exposes only opaque commitments. A journal-committed FOK
@@ -5678,7 +5690,8 @@ impl PrivateTradingCore {
             Some(expected_hash),
             Some(publication_eligible),
             result_commitment,
-            semantic_receipt.then_some(true),
+            v3_receipt.then_some(true),
+            reviewer_event,
             next_sequence,
             prior_root,
             next_root,
@@ -5835,6 +5848,7 @@ impl PrivateTradingCore {
             Some(false),
             None,
             None,
+            None,
             self.sequence,
             root,
             root,
@@ -5912,13 +5926,41 @@ impl PrivateTradingCore {
         encrypted_record: EncryptedJournalRecord,
         now_millis: i64,
     ) -> SystemResponse {
+        self.system_response_with_reviewer_event(
+            command_id,
+            idempotency_key,
+            prior_root,
+            state_root,
+            encrypted_record,
+            now_millis,
+            reviewer_event_for_system_command(command_id),
+        )
+    }
+
+    fn system_response_with_reviewer_event(
+        &self,
+        command_id: &str,
+        idempotency_key: String,
+        prior_root: [u8; 32],
+        state_root: [u8; 32],
+        encrypted_record: EncryptedJournalRecord,
+        now_millis: i64,
+        reviewer_event: ReviewerEvent,
+    ) -> SystemResponse {
         let receipt = self.receipt_signer.sign(
             command_id.into(),
             idempotency_key,
-            None,
-            None,
-            None,
-            None,
+            Some(system_receipt_commitment(
+                command_id,
+                &encrypted_record.record_hash,
+            )),
+            Some(true),
+            Some(system_result_commitment(
+                command_id,
+                &encrypted_record.record_hash,
+            )),
+            Some(true),
+            Some(reviewer_event),
             self.sequence,
             prior_root,
             state_root,
@@ -5934,6 +5976,91 @@ impl PrivateTradingCore {
             transfer_account: None,
         }
     }
+}
+
+fn reviewer_event(event_type: &str) -> ReviewerEvent {
+    ReviewerEvent {
+        event_type: event_type.into(),
+        status: "COMPLETED".into(),
+    }
+}
+
+fn reviewer_event_for_user_command(
+    action: &UserCommandAction,
+    result: &CommandResult,
+    receipt_state: CommandReceiptState,
+) -> Option<ReviewerEvent> {
+    let event_type = match action {
+        UserCommandAction::SubmitOrder { .. }
+            if matches!(result, CommandResult::BootstrapPending { .. }) =>
+        {
+            "ORDER_FUNDS_RESERVED"
+        }
+        UserCommandAction::SubmitOrder { .. } => match receipt_state {
+            CommandReceiptState::Filled => "ORDER_MATCHED",
+            CommandReceiptState::Rejected => "ORDER_REJECTED",
+            CommandReceiptState::Cancelled => "ORDER_CANCELLED",
+            CommandReceiptState::Accepted => "ORDER_ACCEPTED",
+        },
+        UserCommandAction::ReplaceOrder { .. } => "ORDER_REPLACED",
+        UserCommandAction::CancelOrder { .. } => "ORDER_CANCELLED",
+        UserCommandAction::CancelAllOrders { .. } if matches!(result, CommandResult::OrdersCancelled { outcomes, .. } if outcomes.is_empty()) => {
+            return None
+        }
+        UserCommandAction::CancelAllOrders { .. } => "ORDERS_CANCELLED",
+        UserCommandAction::ClosePosition { .. } => "POSITION_CLOSED",
+        UserCommandAction::CompleteSet { .. } => "COMPLETE_SET_EXECUTED",
+        UserCommandAction::RequestRewardClaim { .. } => "REWARD_CLAIM_AUTHORIZED",
+        UserCommandAction::CancelBootstrap { .. } => "BOOTSTRAP_CANCELLED",
+        UserCommandAction::RequestWithdrawal { .. } => "WITHDRAWAL_RESERVED",
+        UserCommandAction::TransferFunds { .. } => "FUNDS_TRANSFERRED",
+        // Previews and read-only actions never receive a reviewer event because
+        // they do not perform an attestable state mutation.
+        UserCommandAction::PreviewPositionClose { .. }
+        | UserCommandAction::Portfolio
+        | UserCommandAction::Rewards
+        | UserCommandAction::BootstrapStatus { .. } => return None,
+    };
+    Some(reviewer_event(event_type))
+}
+
+fn reviewer_event_for_system_command(command_id: &str) -> ReviewerEvent {
+    let event_type = match command_id {
+        "trading-freeze" | "trading-unfreeze" => "TRADING_CONTROL_UPDATED",
+        "register-market" => "MARKET_REGISTERED",
+        "register-transfer-account" => "SIGNUP_REGISTERED",
+        "register-session" => "PRIVATE_SESSION_REGISTERED",
+        "confirmed-deposit" | "deposit-credited" => "DEPOSIT_CREDITED",
+        "withdrawal-finalized" => "WITHDRAWAL_FINALIZED",
+        "external-flow" => "EXTERNAL_FLOW_RECORDED",
+        "accrue-reward" => "REWARD_ACCRUED",
+        "release-withdrawal" => "WITHDRAWAL_RELEASED",
+        "prepare-withdrawal" => "WITHDRAWAL_BROADCAST_PREPARED",
+        "resolve-market" => "MARKET_OUTCOME_RESOLVED",
+        "bootstrap-submitted" => "BOOTSTRAP_SUBMITTED",
+        "bootstrap-confirmed" => "BOOTSTRAP_CONFIRMED",
+        "bootstrap-failed" => "BOOTSTRAP_FAILED",
+        _ => "SYSTEM_MUTATION_COMPLETED",
+    };
+    reviewer_event(event_type)
+}
+
+fn system_receipt_commitment(command_id: &str, journal_hash: &[u8; 32]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.system-reviewer-receipt.v1\0");
+    hash.update((command_id.len() as u32).to_be_bytes());
+    hash.update(command_id.as_bytes());
+    hash.update(journal_hash);
+    hash.finalize().into()
+}
+
+fn system_result_commitment(command_id: &str, journal_hash: &[u8; 32]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.system-reviewer-result.v1\0");
+    hash.update((command_id.len() as u32).to_be_bytes());
+    hash.update(command_id.as_bytes());
+    hash.update(journal_hash);
+    hash.finalize().into()
 }
 
 fn system_command_commitment(command: &JournaledSystemCommand) -> CoreResult<[u8; 32]> {
@@ -7760,7 +7887,10 @@ fn signed_task_qualifications(
             .accepted_order
             .as_ref()
             .is_some_and(|accepted| accepted.status != OrderStatus::Rejected),
-        CommandResult::BootstrapPending { .. } => true,
+        // A Polymarket bootstrap request has only reserved funds here. The
+        // venue has not accepted or even received the order, so it must not
+        // produce the ORDER_ACCEPTED task-qualification artifact.
+        CommandResult::BootstrapPending { .. } => false,
         _ => false,
     };
     if !accepted {
@@ -9531,6 +9661,59 @@ fn remove_json_field(value: &mut serde_json::Value, field: &str) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod reviewer_event_tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_events_describe_only_the_committed_lifecycle_stage() {
+        let execution_id = Uuid::from_u128(1);
+        let action = UserCommandAction::SubmitOrder {
+            order: BookOrder::with_id(
+                execution_id,
+                "private-user",
+                "bootstrap-market",
+                Outcome::Up,
+                OrderAction::Buy,
+                500_000,
+                1_000_000,
+                TimeInForce::Fok,
+                None,
+            ),
+        };
+        let result = CommandResult::BootstrapPending {
+            execution: BootstrapExecutionView {
+                execution_id,
+                market_id: "bootstrap-market".into(),
+                outcome: Outcome::Up,
+                action: OrderAction::Buy,
+                limit_price_micros: 500_000,
+                quantity_micros: 1_000_000,
+                state: BootstrapExecutionState::FundsReserved,
+                confirmed_price_micros: None,
+                failure_code: None,
+            },
+        };
+
+        assert_eq!(
+            reviewer_event_for_user_command(&action, &result, CommandReceiptState::Accepted)
+                .expect("funds reservation is attestable")
+                .event_type,
+            "ORDER_FUNDS_RESERVED"
+        );
+        for (command_id, expected) in [
+            ("bootstrap-submitted", "BOOTSTRAP_SUBMITTED"),
+            ("bootstrap-confirmed", "BOOTSTRAP_CONFIRMED"),
+            ("bootstrap-failed", "BOOTSTRAP_FAILED"),
+        ] {
+            assert_eq!(
+                reviewer_event_for_system_command(command_id).event_type,
+                expected
+            );
+        }
     }
 }
 
