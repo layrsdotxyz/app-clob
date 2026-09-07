@@ -22,6 +22,11 @@ use clob_service::chain_signer::{
     BridgeApprovalRequest, BridgeApprovalSignature, ChainSignerBundle, EnclaveChainSigner,
     MarketResolutionTransaction, PoolWithdrawalTransaction,
 };
+#[cfg(feature = "green-pool-certification")]
+use clob_service::chain_signer::{
+    GreenPoolSeedTransaction, GREEN_BASE_CURRENT_POOL, GREEN_BASE_DESTINATION_POOL,
+    GREEN_BASE_SIGNER, GREEN_BASE_USDC, GREEN_POOL_SEED_AMOUNT_ATOMIC,
+};
 use clob_service::polymarket_enclave::{
     EnclavePolymarketClient, PolymarketSecretBundle, PreparedPolymarketOrder,
     SignedVenueRedemptionTransaction, VenueConfirmation, VenueOrderIntent, VenueOrderObservation,
@@ -335,6 +340,37 @@ struct OperatorEnvelope {
     signature: Vec<u8>,
 }
 
+#[cfg(feature = "green-pool-certification")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum GreenPoolTransitionOperation {
+    SeedBasePool,
+}
+
+#[cfg(feature = "green-pool-certification")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GreenPoolTransitionIntent {
+    protocol_version: String,
+    operation_id: String,
+    operation: GreenPoolTransitionOperation,
+    source_signer: String,
+    current_pool_address: String,
+    destination_pool_address: String,
+    token_address: String,
+    amount_atomic: String,
+    expires_at_millis: i64,
+}
+
+#[cfg(feature = "green-pool-certification")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GreenPoolTransitionAuthorization {
+    #[serde(flatten)]
+    intent: GreenPoolTransitionIntent,
+    signature: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 // The authenticated operator wire schema is release-bound. Boxing the durable
@@ -436,6 +472,15 @@ enum OperatorCommand {
     },
     CompleteChainSignerProvision {
         ciphertext_for_recipient: Vec<u8>,
+    },
+    #[cfg(feature = "green-pool-certification")]
+    SignGreenPoolSeed {
+        authorization: GreenPoolTransitionAuthorization,
+        nonce: u64,
+        gas_limit: u64,
+        max_fee_per_gas_wei: String,
+        max_priority_fee_per_gas_wei: String,
+        now_millis: i64,
     },
     AuditSignerStatus,
     BeginAuditSignerProvision {
@@ -954,6 +999,7 @@ enum PlainResponse {
         verifier_public_key: Option<[u8; 32]>,
         bridge_approval_signers: Option<std::collections::BTreeMap<String, String>>,
         reward_claim_signers: Option<std::collections::BTreeMap<String, String>>,
+        pool_addresses: Option<std::collections::BTreeMap<String, String>>,
     },
     AuditSignerStatus {
         state: &'static str,
@@ -978,6 +1024,11 @@ enum PlainResponse {
     PoolWithdrawalSigned {
         transaction: PoolWithdrawalTransaction,
         response: Option<SystemResponse>,
+    },
+    #[cfg(feature = "green-pool-certification")]
+    GreenPoolSeedSigned {
+        operation_id: String,
+        transaction: GreenPoolSeedTransaction,
     },
     BridgeApprovalSigned {
         approval: BridgeApprovalSignature,
@@ -1064,6 +1115,8 @@ struct EnclaveState {
     polymarket: Option<EnclavePolymarketClient>,
     pending_chain_signer_provision: Option<PendingChainSignerProvision>,
     chain_signer: Option<EnclaveChainSigner>,
+    #[cfg(feature = "green-pool-certification")]
+    completed_green_pool_seed: Option<CompletedGreenPoolSeed>,
     pending_audit_signer_provision: Option<PendingAuditSignerProvision>,
     audit_signer: Option<EnclaveAuditSigner>,
 }
@@ -1228,6 +1281,14 @@ struct PendingChainSignerProvision {
     bundle_ciphertext: Vec<u8>,
 }
 
+#[cfg(feature = "green-pool-certification")]
+#[derive(Clone)]
+struct CompletedGreenPoolSeed {
+    operation_id: String,
+    command_commitment: [u8; 32],
+    transaction: GreenPoolSeedTransaction,
+}
+
 struct PendingAuditSignerProvision {
     recipient_private_key: PKey<Private>,
     bundle_nonce: [u8; 12],
@@ -1274,6 +1335,8 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         polymarket: None,
         pending_chain_signer_provision: None,
         chain_signer: None,
+        #[cfg(feature = "green-pool-certification")]
+        completed_green_pool_seed: None,
         pending_audit_signer_provision: None,
         audit_signer: None,
     }));
@@ -1478,6 +1541,12 @@ async fn handle_encrypted(
     if validate_request_context(&request, &request_context).is_err() {
         return WireResponse::Error {
             code: "PRIVATE_COMMAND_CONTEXT_MISMATCH",
+        };
+    }
+    #[cfg(feature = "green-pool-certification")]
+    if !green_pool_certification_request_allowed(&request) {
+        return WireResponse::Error {
+            code: "GREEN_POOL_CERTIFICATION_ONLY",
         };
     }
     let direct_execution = direct_execution_request(&state, &request);
@@ -2314,6 +2383,17 @@ fn durable_control_request(request: &PlainRequest) -> bool {
 /// command and the enclave's registered market definition are both checked so
 /// the untrusted parent cannot route a non-BTC mutation through this path.
 fn direct_execution_request(state: &EnclaveState, request: &PlainRequest) -> bool {
+    #[cfg(feature = "green-pool-certification")]
+    if matches!(
+        request,
+        PlainRequest::Operator { envelope }
+            if matches!(envelope.command, OperatorCommand::SignGreenPoolSeed { .. })
+    ) {
+        // This one-time Green-only transaction has an independently signed,
+        // exact intent and is chain-idempotent at nonce zero. It must not be
+        // coupled to an unrelated legacy Durable preparation.
+        return true;
+    }
     if matches!(
         request,
         PlainRequest::Operator { envelope }
@@ -2345,6 +2425,70 @@ fn direct_execution_request(state: &EnclaveState, request: &PlainRequest) -> boo
         // stop accepting otherwise healthy direct orders.
         PlainRequest::Operator { envelope } => direct_quest_operator_command(&envelope.command),
         PlainRequest::AggregateDepth { .. } => false,
+    }
+}
+
+/// The one-off Green EIF is a request firewall, not a general production EIF.
+/// It exposes only the provisioning and Base-USDC funding lifecycle required
+/// to certify E03-S05. In particular, bridge, resolution, reward, market and
+/// audit signing authority remain unreachable even if their code is linked.
+#[cfg(feature = "green-pool-certification")]
+fn green_pool_certification_request_allowed(request: &PlainRequest) -> bool {
+    match request {
+        PlainRequest::User { command, .. } => direct_base_usdc_withdrawal(&command.action),
+        PlainRequest::AggregateDepth { .. } => false,
+        PlainRequest::Operator { envelope } => match &envelope.command {
+            OperatorCommand::ProvisionStatus
+            | OperatorCommand::BeginProvision { .. }
+            | OperatorCommand::CompleteProvision { .. }
+            | OperatorCommand::ChainSignerStatus
+            | OperatorCommand::BeginChainSignerProvision { .. }
+            | OperatorCommand::CompleteChainSignerProvision { .. }
+            | OperatorCommand::SignGreenPoolSeed { .. }
+            | OperatorCommand::DirectCreditDeposit { .. }
+            | OperatorCommand::DirectDepositCreditLookup { .. }
+            | OperatorCommand::DirectWithdrawal { .. }
+            | OperatorCommand::DirectWithdrawalLookup { .. }
+            | OperatorCommand::RecoverWithdrawalAuthorization { .. } => true,
+            OperatorCommand::SignPoolWithdrawal {
+                idempotency_key,
+                authorization,
+                nonce,
+                gas_limit,
+                max_fee_per_gas_wei,
+                max_priority_fee_per_gas_wei,
+                now_millis,
+            } => direct_base_usdc_withdrawal_signing(
+                idempotency_key,
+                authorization,
+                *nonce,
+                *gas_limit,
+                max_fee_per_gas_wei,
+                max_priority_fee_per_gas_wei,
+                *now_millis,
+            ),
+            OperatorCommand::ReplacePreparedPoolWithdrawal {
+                idempotency_key,
+                recovery_authorization,
+                observation,
+                replacement_nonce,
+                gas_limit,
+                max_fee_per_gas_wei,
+                max_priority_fee_per_gas_wei,
+                now_millis,
+                ..
+            } => direct_base_usdc_withdrawal_replacement(
+                idempotency_key,
+                recovery_authorization,
+                observation,
+                *replacement_nonce,
+                *gas_limit,
+                max_fee_per_gas_wei,
+                max_priority_fee_per_gas_wei,
+                *now_millis,
+            ),
+            _ => false,
+        },
     }
 }
 
@@ -4636,6 +4780,10 @@ async fn dispatch_operator(
                 .chain_signer
                 .as_ref()
                 .map(EnclaveChainSigner::reward_claim_signers),
+            pool_addresses: state
+                .chain_signer
+                .as_ref()
+                .map(EnclaveChainSigner::pool_addresses),
         }),
         OperatorCommand::BeginChainSignerProvision {
             kms_key_id,
@@ -4718,10 +4866,16 @@ async fn dispatch_operator(
             wrapping_key.zeroize();
             let parsed = serde_json::from_slice::<ChainSignerBundle>(&plaintext);
             plaintext.zeroize();
-            state.chain_signer =
-                Some(EnclaveChainSigner::new(parsed.map_err(|_| {
-                    "INVALID_CHAIN_SIGNER_SECRET_BUNDLE".to_string()
-                })?)?);
+            let chain_signer = EnclaveChainSigner::new(
+                parsed.map_err(|_| "INVALID_CHAIN_SIGNER_SECRET_BUNDLE".to_string())?,
+            )?;
+            #[cfg(feature = "green-pool-certification")]
+            let chain_signer = {
+                let mut signer = chain_signer;
+                signer.activate_green_destination_pool()?;
+                signer
+            };
+            state.chain_signer = Some(chain_signer);
             Ok(PlainResponse::ChainSignerStatus {
                 state: "READY",
                 verifier_public_key: state
@@ -4736,7 +4890,72 @@ async fn dispatch_operator(
                     .chain_signer
                     .as_ref()
                     .map(EnclaveChainSigner::reward_claim_signers),
+                pool_addresses: state
+                    .chain_signer
+                    .as_ref()
+                    .map(EnclaveChainSigner::pool_addresses),
             })
+        }
+        #[cfg(feature = "green-pool-certification")]
+        OperatorCommand::SignGreenPoolSeed {
+            authorization,
+            nonce,
+            gas_limit,
+            max_fee_per_gas_wei,
+            max_priority_fee_per_gas_wei,
+            now_millis: _untrusted_now_millis,
+        } => {
+            let trusted_now_millis =
+                verified_now_millis.ok_or_else(|| "TRUSTED_TIME_UNAVAILABLE".to_string())?;
+            verify_green_pool_transition_authorization(
+                &authorization,
+                GreenPoolTransitionOperation::SeedBasePool,
+                &state.operator_public_key,
+                trusted_now_millis,
+            )?;
+            let commitment = green_pool_seed_command_commitment(
+                &authorization.intent,
+                nonce,
+                gas_limit,
+                &max_fee_per_gas_wei,
+                &max_priority_fee_per_gas_wei,
+            )?;
+            if let Some(completed) = &state.completed_green_pool_seed {
+                let transaction = replay_green_pool_seed(
+                    completed,
+                    &authorization.intent.operation_id,
+                    commitment,
+                )?;
+                return Ok(PlainResponse::GreenPoolSeedSigned {
+                    operation_id: completed.operation_id.clone(),
+                    transaction,
+                });
+            }
+            let transaction = state
+                .chain_signer
+                .as_ref()
+                .ok_or_else(|| "CHAIN_SIGNER_NOT_PROVISIONED".to_string())?
+                .sign_green_pool_seed(
+                    &authorization.intent.token_address,
+                    &authorization.intent.destination_pool_address,
+                    &authorization.intent.amount_atomic,
+                    nonce,
+                    gas_limit,
+                    &max_fee_per_gas_wei,
+                    &max_priority_fee_per_gas_wei,
+                )
+                .await?;
+            let completed = CompletedGreenPoolSeed {
+                operation_id: authorization.intent.operation_id,
+                command_commitment: commitment,
+                transaction: transaction.clone(),
+            };
+            let response = PlainResponse::GreenPoolSeedSigned {
+                operation_id: completed.operation_id.clone(),
+                transaction,
+            };
+            state.completed_green_pool_seed = Some(completed);
+            Ok(response)
         }
         OperatorCommand::SignPoolWithdrawal {
             idempotency_key,
@@ -5827,6 +6046,8 @@ async fn dispatch_operator(
                 | OperatorCommand::RecoveryArchiveAckStatus { .. }
                 | OperatorCommand::AggregateDepth { .. }
                 | OperatorCommand::ReconcileBootstrap { .. } => unreachable!(),
+                #[cfg(feature = "green-pool-certification")]
+                OperatorCommand::SignGreenPoolSeed { .. } => unreachable!(),
             }
             .map_err(|error| error.to_string())?;
             Ok(PlainResponse::System { response })
@@ -5941,6 +6162,99 @@ fn decode_prepared_withdrawal(raw_transaction_hex: &str) -> Result<(String, u64)
         .map(|value| value.as_u64())
         .ok_or_else(|| "INVALID_PREPARED_WITHDRAWAL_TRANSACTION".to_string())?;
     Ok((format!("0x{}", hex::encode(keccak256(raw))), nonce))
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn green_pool_transition_payload(intent: &GreenPoolTransitionIntent) -> Result<Vec<u8>, String> {
+    let encoded =
+        serde_json::to_vec(intent).map_err(|_| "INVALID_GREEN_POOL_AUTHORIZATION".to_string())?;
+    let mut payload = Vec::with_capacity(encoded.len() + 64);
+    payload.extend_from_slice(b"layrs.green-pool-transition-authorization.v1\0");
+    payload.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+    payload.extend_from_slice(&encoded);
+    Ok(payload)
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn verify_green_pool_transition_authorization(
+    authorization: &GreenPoolTransitionAuthorization,
+    expected_operation: GreenPoolTransitionOperation,
+    operator_public_key: &VerifyingKey,
+    now_millis: i64,
+) -> Result<(), String> {
+    let expected_operation_id = "green-base-pool-seed-20260906-v1";
+    if authorization.intent.protocol_version != "layrs.green-pool-transition.v1"
+        || authorization.intent.operation != expected_operation
+        || authorization.intent.operation_id != expected_operation_id
+        || authorization.intent.source_signer != GREEN_BASE_SIGNER
+        || authorization.intent.current_pool_address != GREEN_BASE_CURRENT_POOL
+        || authorization.intent.destination_pool_address != GREEN_BASE_DESTINATION_POOL
+        || authorization.intent.token_address != GREEN_BASE_USDC
+        || authorization.intent.amount_atomic != GREEN_POOL_SEED_AMOUNT_ATOMIC
+    {
+        return Err("GREEN_POOL_TRANSITION_POLICY_MISMATCH".into());
+    }
+    if now_millis < 0
+        || authorization.intent.expires_at_millis <= now_millis
+        || authorization.intent.expires_at_millis > now_millis.saturating_add(15 * 60 * 1_000)
+    {
+        return Err("GREEN_POOL_TRANSITION_AUTHORIZATION_EXPIRED".into());
+    }
+    let signature: [u8; 64] = authorization
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| "INVALID_GREEN_POOL_AUTHORIZATION".to_string())?;
+    operator_public_key
+        .verify(
+            &green_pool_transition_payload(&authorization.intent)?,
+            &Signature::from_bytes(&signature),
+        )
+        .map_err(|_| "INVALID_GREEN_POOL_AUTHORIZATION".to_string())
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn green_pool_seed_command_commitment(
+    intent: &GreenPoolTransitionIntent,
+    nonce: u64,
+    gas_limit: u64,
+    max_fee_per_gas_wei: &str,
+    max_priority_fee_per_gas_wei: &str,
+) -> Result<[u8; 32], String> {
+    #[derive(Serialize)]
+    struct Commitment<'a> {
+        intent: &'a GreenPoolTransitionIntent,
+        nonce: u64,
+        gas_limit: u64,
+        max_fee_per_gas_wei: &'a str,
+        max_priority_fee_per_gas_wei: &'a str,
+    }
+    let encoded = serde_json::to_vec(&Commitment {
+        intent,
+        nonce,
+        gas_limit,
+        max_fee_per_gas_wei,
+        max_priority_fee_per_gas_wei,
+    })
+    .map_err(|_| "INVALID_GREEN_POOL_SEED_COMMAND".to_string())?;
+    let mut digest = Sha256::new();
+    digest.update(b"layrs.green-pool-seed-command.v1\0");
+    digest.update((encoded.len() as u32).to_be_bytes());
+    digest.update(encoded);
+    Ok(digest.finalize().into())
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn replay_green_pool_seed(
+    completed: &CompletedGreenPoolSeed,
+    operation_id: &str,
+    command_commitment: [u8; 32],
+) -> Result<GreenPoolSeedTransaction, String> {
+    if completed.operation_id != operation_id || completed.command_commitment != command_commitment
+    {
+        return Err("GREEN_POOL_SEED_REPLAY_MISMATCH".into());
+    }
+    Ok(completed.transaction.clone())
 }
 
 fn validate_kms_reference(kms_key_id: &str, ciphertext: Option<&[u8]>) -> Result<(), String> {
@@ -6693,6 +7007,8 @@ mod tests {
             polymarket: None,
             pending_chain_signer_provision: None,
             chain_signer: None,
+            #[cfg(feature = "green-pool-certification")]
+            completed_green_pool_seed: None,
             pending_audit_signer_provision: None,
             audit_signer: None,
         })
@@ -7301,6 +7617,13 @@ mod tests {
             AccessCapability::NewOrders
         );
     }
+    #[cfg(feature = "green-pool-certification")]
+    use clob_service::chain_signer::{
+        GREEN_POOL_SEED_GAS_LIMIT, GREEN_POOL_SEED_MAX_FEE_PER_GAS_WEI,
+        GREEN_POOL_SEED_MAX_PRIORITY_FEE_PER_GAS_WEI, GREEN_POOL_SEED_NONCE,
+    };
+    #[cfg(feature = "green-pool-certification")]
+    use ed25519_dalek::{Signer as _, SigningKey};
 
     #[test]
     fn replay_cache_rejects_duplicate_keys() {
@@ -7334,6 +7657,284 @@ mod tests {
     fn replay_cache_zero_capacity_fails_closed() {
         let mut cache = ReplayCache::<2>::new(0);
         assert!(!cache.remember([1u8, 1]));
+    }
+
+    #[cfg(not(feature = "green-pool-certification"))]
+    #[test]
+    fn production_build_has_no_green_pool_commands() {
+        let command = serde_json::json!({
+            "type": "SIGN_GREEN_POOL_SEED",
+            "authorization": {},
+            "nonce": 0,
+            "gas_limit": 50_000,
+            "max_fee_per_gas_wei": "11000000",
+            "max_priority_fee_per_gas_wei": "1000000",
+            "now_millis": 1
+        });
+        assert!(serde_json::from_value::<OperatorCommand>(command).is_err());
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    fn signed_green_authorization(
+        signing_key: &SigningKey,
+        operation: GreenPoolTransitionOperation,
+        now_millis: i64,
+    ) -> GreenPoolTransitionAuthorization {
+        let operation_id = "green-base-pool-seed-20260906-v1";
+        let intent = GreenPoolTransitionIntent {
+            protocol_version: "layrs.green-pool-transition.v1".into(),
+            operation_id: operation_id.into(),
+            operation,
+            source_signer: GREEN_BASE_SIGNER.into(),
+            current_pool_address: GREEN_BASE_CURRENT_POOL.into(),
+            destination_pool_address: GREEN_BASE_DESTINATION_POOL.into(),
+            token_address: GREEN_BASE_USDC.into(),
+            amount_atomic: GREEN_POOL_SEED_AMOUNT_ATOMIC.into(),
+            expires_at_millis: now_millis + 60_000,
+        };
+        let signature = signing_key
+            .sign(&green_pool_transition_payload(&intent).expect("payload"))
+            .to_bytes()
+            .to_vec();
+        GreenPoolTransitionAuthorization { intent, signature }
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    #[test]
+    fn green_authorization_is_exact_signed_and_short_lived() {
+        let signing_key = SigningKey::from_bytes(&[91u8; 32]);
+        let now = 1_800_000_000_000i64;
+        let exact = signed_green_authorization(
+            &signing_key,
+            GreenPoolTransitionOperation::SeedBasePool,
+            now,
+        );
+        assert!(verify_green_pool_transition_authorization(
+            &exact,
+            GreenPoolTransitionOperation::SeedBasePool,
+            &signing_key.verifying_key(),
+            now,
+        )
+        .is_ok());
+        assert_eq!(
+            String::from_utf8(serde_json::to_vec(&exact.intent).unwrap()).unwrap(),
+            format!(
+                "{{\"protocol_version\":\"layrs.green-pool-transition.v1\",\"operation_id\":\"green-base-pool-seed-20260906-v1\",\"operation\":\"SEED_BASE_POOL\",\"source_signer\":\"{GREEN_BASE_SIGNER}\",\"current_pool_address\":\"{GREEN_BASE_CURRENT_POOL}\",\"destination_pool_address\":\"{GREEN_BASE_DESTINATION_POOL}\",\"token_address\":\"{GREEN_BASE_USDC}\",\"amount_atomic\":\"{GREEN_POOL_SEED_AMOUNT_ATOMIC}\",\"expires_at_millis\":1800000060000}}"
+            )
+        );
+
+        let mut expired = exact.clone();
+        expired.intent.expires_at_millis = now;
+        assert_eq!(
+            verify_green_pool_transition_authorization(
+                &expired,
+                GreenPoolTransitionOperation::SeedBasePool,
+                &signing_key.verifying_key(),
+                now,
+            )
+            .unwrap_err(),
+            "GREEN_POOL_TRANSITION_AUTHORIZATION_EXPIRED"
+        );
+        for (field, expected_error) in [
+            ("token", "GREEN_POOL_TRANSITION_POLICY_MISMATCH"),
+            ("recipient", "GREEN_POOL_TRANSITION_POLICY_MISMATCH"),
+            ("amount", "GREEN_POOL_TRANSITION_POLICY_MISMATCH"),
+        ] {
+            let mut changed = exact.clone();
+            match field {
+                "token" => changed.intent.token_address = GREEN_BASE_CURRENT_POOL.into(),
+                "recipient" => changed.intent.destination_pool_address = GREEN_BASE_USDC.into(),
+                "amount" => changed.intent.amount_atomic = "19999999".into(),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                verify_green_pool_transition_authorization(
+                    &changed,
+                    GreenPoolTransitionOperation::SeedBasePool,
+                    &signing_key.verifying_key(),
+                    now,
+                )
+                .unwrap_err(),
+                expected_error
+            );
+        }
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    #[test]
+    fn green_seed_commitment_is_stable_and_replay_mismatch_sensitive() {
+        let signing_key = SigningKey::from_bytes(&[92u8; 32]);
+        let authorization = signed_green_authorization(
+            &signing_key,
+            GreenPoolTransitionOperation::SeedBasePool,
+            1_800_000_000_000,
+        );
+        let exact = green_pool_seed_command_commitment(
+            &authorization.intent,
+            GREEN_POOL_SEED_NONCE,
+            GREEN_POOL_SEED_GAS_LIMIT,
+            GREEN_POOL_SEED_MAX_FEE_PER_GAS_WEI,
+            GREEN_POOL_SEED_MAX_PRIORITY_FEE_PER_GAS_WEI,
+        )
+        .unwrap();
+        assert_eq!(
+            exact,
+            green_pool_seed_command_commitment(
+                &authorization.intent,
+                GREEN_POOL_SEED_NONCE,
+                GREEN_POOL_SEED_GAS_LIMIT,
+                GREEN_POOL_SEED_MAX_FEE_PER_GAS_WEI,
+                GREEN_POOL_SEED_MAX_PRIORITY_FEE_PER_GAS_WEI,
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            exact,
+            green_pool_seed_command_commitment(
+                &authorization.intent,
+                GREEN_POOL_SEED_NONCE,
+                GREEN_POOL_SEED_GAS_LIMIT + 1,
+                GREEN_POOL_SEED_MAX_FEE_PER_GAS_WEI,
+                GREEN_POOL_SEED_MAX_PRIORITY_FEE_PER_GAS_WEI,
+            )
+            .unwrap()
+        );
+        let completed = CompletedGreenPoolSeed {
+            operation_id: authorization.intent.operation_id.clone(),
+            command_commitment: exact,
+            transaction: GreenPoolSeedTransaction {
+                chain: "base".into(),
+                chain_id: 8_453,
+                asset: "USDC".into(),
+                signer: GREEN_BASE_SIGNER.into(),
+                token_address: GREEN_BASE_USDC.into(),
+                destination_pool_address: GREEN_BASE_DESTINATION_POOL.into(),
+                amount_atomic: GREEN_POOL_SEED_AMOUNT_ATOMIC.into(),
+                nonce: 0,
+                transaction_hash: format!("0x{}", "11".repeat(32)),
+                raw_transaction_hex: "0x02aa".into(),
+            },
+        };
+        assert_eq!(
+            replay_green_pool_seed(&completed, &authorization.intent.operation_id, exact)
+                .unwrap()
+                .transaction_hash,
+            completed.transaction.transaction_hash
+        );
+        assert_eq!(
+            replay_green_pool_seed(&completed, "different-operation", exact).unwrap_err(),
+            "GREEN_POOL_SEED_REPLAY_MISMATCH"
+        );
+        assert_eq!(
+            replay_green_pool_seed(&completed, &authorization.intent.operation_id, [0u8; 32])
+                .unwrap_err(),
+            "GREEN_POOL_SEED_REPLAY_MISMATCH"
+        );
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    #[test]
+    fn green_certification_firewall_allows_only_base_funding_and_provisioning() {
+        use clob_service::private_core::{SessionRequest, SignedSessionRequest};
+
+        let operator_request = |command| PlainRequest::Operator {
+            envelope: OperatorEnvelope {
+                nonce: [7; 32],
+                command,
+                signature: vec![],
+            },
+        };
+        for command in [
+            OperatorCommand::ProvisionStatus,
+            OperatorCommand::ChainSignerStatus,
+            OperatorCommand::DirectDepositCreditLookup {
+                account_id: [1; 32],
+                financial_replay_key_sha256: [2; 32],
+            },
+            OperatorCommand::DirectWithdrawalLookup {
+                account_id: [1; 32],
+                operation_replay_key_sha256: [3; 32],
+            },
+            OperatorCommand::RecoverWithdrawalAuthorization {
+                withdrawal_id: Uuid::from_u128(1),
+                session_id: "green-certification-session".into(),
+                terminal_record: None,
+                now_millis: 1,
+            },
+        ] {
+            assert!(green_pool_certification_request_allowed(&operator_request(
+                command
+            )));
+        }
+
+        let authorization = signed_green_authorization(
+            &SigningKey::from_bytes(&[92u8; 32]),
+            GreenPoolTransitionOperation::SeedBasePool,
+            1_800_000_000_000,
+        );
+        assert!(green_pool_certification_request_allowed(&operator_request(
+            OperatorCommand::SignGreenPoolSeed {
+                authorization,
+                nonce: GREEN_POOL_SEED_NONCE,
+                gas_limit: GREEN_POOL_SEED_GAS_LIMIT,
+                max_fee_per_gas_wei: GREEN_POOL_SEED_MAX_FEE_PER_GAS_WEI.into(),
+                max_priority_fee_per_gas_wei: GREEN_POOL_SEED_MAX_PRIORITY_FEE_PER_GAS_WEI.into(),
+                now_millis: 1,
+            }
+        )));
+
+        for command in [
+            OperatorCommand::PolymarketStatus,
+            OperatorCommand::AuditSignerStatus,
+            OperatorCommand::TradingFreezeStatus,
+            OperatorCommand::ExportSnapshot,
+            OperatorCommand::MarketStatus {
+                market_id: "layrs:v5:BTC:USDC:1h:1788390000".into(),
+            },
+        ] {
+            assert!(!green_pool_certification_request_allowed(
+                &operator_request(command)
+            ));
+        }
+
+        let user_request = |action| PlainRequest::User {
+            command: UserCommand {
+                command_id: "green-certification-command".into(),
+                idempotency_key: "green-certification-idempotency".into(),
+                session: SignedSessionRequest {
+                    request: SessionRequest {
+                        session_id: "green-certification-session".into(),
+                        sequence: 1,
+                        issued_at_millis: 1,
+                        expires_at_millis: 2,
+                        request_hash: [0; 32],
+                    },
+                    signature: vec![0; 64],
+                },
+                action,
+            },
+            now_millis: 1,
+        };
+        assert!(green_pool_certification_request_allowed(&user_request(
+            UserCommandAction::RequestWithdrawal {
+                withdrawal_id: Uuid::from_u128(2),
+                chain: "base".into(),
+                asset: "USDC".into(),
+                amount_atomic: 1,
+                destination: "0x1111111111111111111111111111111111111111".into(),
+            }
+        )));
+        assert!(!green_pool_certification_request_allowed(&user_request(
+            UserCommandAction::Portfolio
+        )));
+        assert!(!green_pool_certification_request_allowed(
+            &PlainRequest::AggregateDepth {
+                market_id: "layrs:v5:BTC:USDC:1h:1788390000".into(),
+                outcome: clob_service::private_core::Outcome::Up,
+                now_millis: 1,
+                minimum_level_quantity_micros: 1,
+            }
+        ));
     }
 
     #[test]

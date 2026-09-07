@@ -23,6 +23,10 @@ path = "src/bin/layrs-enclave-parent.rs"
 [features]
 test-helpers = []
 standalone-enclave-runtime = []
+# This capability is intentionally absent from normal production enclave
+# builds. It exists only to complete the one-time, attested Green pool
+# certification transition.
+green-pool-certification = []
 
 [dependencies]
 # Async runtime

@@ -7,6 +7,7 @@ publish = false
 [features]
 default = ["standalone-enclave-runtime"]
 standalone-enclave-runtime = []
+green-pool-certification = []
 
 [lib]
 name = "clob_service"

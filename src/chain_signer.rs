@@ -71,6 +71,40 @@ pub struct PoolWithdrawalTransaction {
     pub raw_transaction_hex: String,
 }
 
+#[cfg(feature = "green-pool-certification")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GreenPoolSeedTransaction {
+    pub chain: String,
+    pub chain_id: u64,
+    pub asset: String,
+    pub signer: String,
+    pub token_address: String,
+    pub destination_pool_address: String,
+    pub amount_atomic: String,
+    pub nonce: u64,
+    pub transaction_hash: String,
+    pub raw_transaction_hex: String,
+}
+
+#[cfg(feature = "green-pool-certification")]
+pub const GREEN_BASE_SIGNER: &str = "0x022b437e2324fac913d616b77ca5178ee91985a0";
+#[cfg(feature = "green-pool-certification")]
+pub const GREEN_BASE_CURRENT_POOL: &str = "0xe3f0813e8fbc707251e8446cc03812c7c60b88e7";
+#[cfg(feature = "green-pool-certification")]
+pub const GREEN_BASE_DESTINATION_POOL: &str = "0x404cfe536acec987e834ba3be2e79344a56e9c83";
+#[cfg(feature = "green-pool-certification")]
+pub const GREEN_BASE_USDC: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+#[cfg(feature = "green-pool-certification")]
+pub const GREEN_POOL_SEED_AMOUNT_ATOMIC: &str = "20000000";
+#[cfg(feature = "green-pool-certification")]
+pub const GREEN_POOL_SEED_NONCE: u64 = 0;
+#[cfg(feature = "green-pool-certification")]
+pub const GREEN_POOL_SEED_GAS_LIMIT: u64 = 80_000;
+#[cfg(feature = "green-pool-certification")]
+pub const GREEN_POOL_SEED_MAX_FEE_PER_GAS_WEI: &str = "11000000";
+#[cfg(feature = "green-pool-certification")]
+pub const GREEN_POOL_SEED_MAX_PRIORITY_FEE_PER_GAS_WEI: &str = "1000000";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketResolutionTransaction {
     pub chain: String,
@@ -237,6 +271,214 @@ impl EnclaveChainSigner {
                 )
             })
             .collect()
+    }
+
+    /// Public contract bindings are safe to expose and let provisioning prove
+    /// that the running enclave, rather than only the database row, is bound to
+    /// the intended pool.
+    pub fn pool_addresses(&self) -> BTreeMap<String, String> {
+        self.domains
+            .iter()
+            .map(|(chain, domain)| (chain.clone(), format!("{:#x}", domain.pool)))
+            .collect()
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    fn assert_green_source_binding(&self) -> Result<(), String> {
+        let domain = self
+            .domains
+            .get("base")
+            .ok_or_else(|| "GREEN_BASE_SIGNER_NOT_CONFIGURED".to_string())?;
+        if domain.chain_id != 8_453
+            || domain.asset != "USDC"
+            || format!("{:#x}", domain.ledger_wallet.address()) != GREEN_BASE_SIGNER
+            || format!("{:#x}", domain.pool) != GREEN_BASE_CURRENT_POOL
+        {
+            return Err("GREEN_CHAIN_SIGNER_BINDING_MISMATCH".into());
+        }
+        Ok(())
+    }
+
+    /// Green certification changes one public contract binding in memory only
+    /// after proving the exact source signer, chain, asset and old pool. It
+    /// never serializes or exports private-key material, and normal builds do
+    /// not contain this method.
+    #[cfg(feature = "green-pool-certification")]
+    pub fn activate_green_destination_pool(&mut self) -> Result<(), String> {
+        self.assert_green_source_binding()?;
+        self.activate_green_destination_pool_with_policy(
+            GREEN_BASE_SIGNER,
+            GREEN_BASE_CURRENT_POOL,
+            GREEN_BASE_DESTINATION_POOL,
+        )
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    fn activate_green_destination_pool_with_policy(
+        &mut self,
+        expected_signer: &str,
+        expected_current_pool: &str,
+        destination_pool: &str,
+    ) -> Result<(), String> {
+        let destination_pool = parse_nonzero_address(destination_pool)?;
+        let domain = self
+            .domains
+            .get_mut("base")
+            .ok_or_else(|| "GREEN_BASE_SIGNER_NOT_CONFIGURED".to_string())?;
+        if domain.chain_id != 8_453
+            || domain.asset != "USDC"
+            || format!("{:#x}", domain.ledger_wallet.address()) != expected_signer
+            || format!("{:#x}", domain.pool) != expected_current_pool
+        {
+            return Err("GREEN_CHAIN_SIGNER_BINDING_MISMATCH".into());
+        }
+        domain.pool = destination_pool;
+        Ok(())
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    fn assert_green_destination_binding(&self) -> Result<(), String> {
+        let domain = self
+            .domains
+            .get("base")
+            .ok_or_else(|| "GREEN_BASE_SIGNER_NOT_CONFIGURED".to_string())?;
+        if domain.chain_id != 8_453
+            || domain.asset != "USDC"
+            || format!("{:#x}", domain.ledger_wallet.address()) != GREEN_BASE_SIGNER
+            || format!("{:#x}", domain.pool) != GREEN_BASE_DESTINATION_POOL
+        {
+            return Err("GREEN_CHAIN_SIGNER_BINDING_MISMATCH".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn sign_green_pool_seed(
+        &self,
+        token_address: &str,
+        destination_pool_address: &str,
+        amount_atomic: &str,
+        nonce: u64,
+        gas_limit: u64,
+        max_fee_per_gas_wei: &str,
+        max_priority_fee_per_gas_wei: &str,
+    ) -> Result<GreenPoolSeedTransaction, String> {
+        self.assert_green_destination_binding()?;
+        self.sign_green_pool_seed_with_policy(
+            GREEN_BASE_SIGNER,
+            GREEN_BASE_USDC,
+            GREEN_BASE_DESTINATION_POOL,
+            GREEN_POOL_SEED_AMOUNT_ATOMIC,
+            token_address,
+            destination_pool_address,
+            amount_atomic,
+            nonce,
+            gas_limit,
+            max_fee_per_gas_wei,
+            max_priority_fee_per_gas_wei,
+        )
+        .await
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    #[allow(clippy::too_many_arguments)]
+    async fn sign_green_pool_seed_with_policy(
+        &self,
+        expected_signer: &str,
+        expected_token: &str,
+        expected_pool: &str,
+        expected_amount: &str,
+        token_address: &str,
+        destination_pool_address: &str,
+        amount_atomic: &str,
+        nonce: u64,
+        gas_limit: u64,
+        max_fee_per_gas_wei: &str,
+        max_priority_fee_per_gas_wei: &str,
+    ) -> Result<GreenPoolSeedTransaction, String> {
+        let domain = self
+            .domains
+            .get("base")
+            .ok_or_else(|| "GREEN_BASE_SIGNER_NOT_CONFIGURED".to_string())?;
+        let signer = format!("{:#x}", domain.ledger_wallet.address());
+        if signer != expected_signer {
+            return Err("GREEN_POOL_SEED_SIGNER_MISMATCH".into());
+        }
+        let token = parse_nonzero_address(token_address)?;
+        let destination = parse_nonzero_address(destination_pool_address)?;
+        if format!("{token:#x}") != expected_token {
+            return Err("GREEN_POOL_SEED_TOKEN_MISMATCH".into());
+        }
+        if format!("{destination:#x}") != expected_pool {
+            return Err("GREEN_POOL_SEED_DESTINATION_MISMATCH".into());
+        }
+        if amount_atomic != expected_amount {
+            return Err("GREEN_POOL_SEED_AMOUNT_MISMATCH".into());
+        }
+        // Every signed field is fixed, not merely bounded. The Base nonce makes
+        // the transfer chain-idempotent, while the fixed fee envelope makes a
+        // restarted enclave reproduce the identical raw transaction instead
+        // of creating a replacement candidate for the same nonce.
+        if nonce != GREEN_POOL_SEED_NONCE || gas_limit != GREEN_POOL_SEED_GAS_LIMIT {
+            return Err("GREEN_POOL_SEED_TRANSACTION_BOUNDS_INVALID".into());
+        }
+        if max_fee_per_gas_wei != GREEN_POOL_SEED_MAX_FEE_PER_GAS_WEI
+            || max_priority_fee_per_gas_wei != GREEN_POOL_SEED_MAX_PRIORITY_FEE_PER_GAS_WEI
+        {
+            return Err("GREEN_POOL_SEED_FEE_INVALID".into());
+        }
+        let amount = U256::from_dec_str(amount_atomic)
+            .map_err(|_| "GREEN_POOL_SEED_AMOUNT_MISMATCH".to_string())?;
+        let max_fee = U256::from_dec_str(max_fee_per_gas_wei)
+            .map_err(|_| "GREEN_POOL_SEED_FEE_INVALID".to_string())?;
+        let priority_fee = U256::from_dec_str(max_priority_fee_per_gas_wei)
+            .map_err(|_| "GREEN_POOL_SEED_FEE_INVALID".to_string())?;
+        // Retain an independent cost ceiling even though the fee values above
+        // are exact release constants.
+        if max_fee.is_zero()
+            || priority_fee > max_fee
+            || max_fee.saturating_mul(U256::from(gas_limit)) > U256::from(1_000_000_000_000_000u64)
+        {
+            return Err("GREEN_POOL_SEED_FEE_INVALID".into());
+        }
+        let mut calldata = Vec::with_capacity(68);
+        calldata.extend_from_slice(&keccak256(b"transfer(address,uint256)")[..4]);
+        calldata.extend_from_slice(&[0u8; 12]);
+        calldata.extend_from_slice(destination.as_bytes());
+        let mut encoded_amount = [0u8; 32];
+        amount.to_big_endian(&mut encoded_amount);
+        calldata.extend_from_slice(&encoded_amount);
+        let transaction = TypedTransaction::Eip1559(Eip1559TransactionRequest {
+            from: Some(domain.ledger_wallet.address()),
+            to: Some(NameOrAddress::Address(token)),
+            gas: Some(gas_limit.into()),
+            value: Some(U256::zero()),
+            data: Some(Bytes::from(calldata)),
+            nonce: Some(nonce.into()),
+            access_list: Default::default(),
+            max_priority_fee_per_gas: Some(priority_fee),
+            max_fee_per_gas: Some(max_fee),
+            chain_id: Some(8_453u64.into()),
+        });
+        let signature = domain
+            .ledger_wallet
+            .sign_transaction(&transaction)
+            .await
+            .map_err(|_| "GREEN_POOL_SEED_SIGNING_FAILED".to_string())?;
+        let raw = transaction.rlp_signed(&signature);
+        Ok(GreenPoolSeedTransaction {
+            chain: "base".into(),
+            chain_id: 8_453,
+            asset: "USDC".into(),
+            signer,
+            token_address: format!("{token:#x}"),
+            destination_pool_address: format!("{destination:#x}"),
+            amount_atomic: amount_atomic.into(),
+            nonce,
+            transaction_hash: format!("0x{}", hex::encode(keccak256(&raw))),
+            raw_transaction_hex: format!("0x{}", hex::encode(raw)),
+        })
     }
 
     /// Returns only public EVM claim-signer addresses. Deployment automation
@@ -716,6 +958,221 @@ mod tests {
             assert_eq!(address.len(), 42);
         }
         assert_ne!(signers["base"], signers["horizen"]);
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    #[test]
+    fn green_runtime_binding_changes_only_base_pool_and_preserves_public_keys() {
+        let mut signer = test_signer();
+        let before_signers = signer.bridge_approval_signers();
+        let before_rewards = signer.reward_claim_signers();
+        let before_verifier = signer.resolution_verifying_key();
+        let before_pools = signer.pool_addresses();
+        let fixture_signer = before_signers["base"].clone();
+        let fixture_source_pool = before_pools["base"].clone();
+        let fixture_destination_pool = "0x3333333333333333333333333333333333333333";
+        signer
+            .activate_green_destination_pool_with_policy(
+                &fixture_signer,
+                &fixture_source_pool,
+                fixture_destination_pool,
+            )
+            .expect("exact runtime binding");
+
+        assert_eq!(signer.bridge_approval_signers(), before_signers);
+        assert_eq!(signer.reward_claim_signers(), before_rewards);
+        assert_eq!(signer.resolution_verifying_key(), before_verifier);
+        assert_eq!(signer.pool_addresses()["base"], fixture_destination_pool);
+        assert_eq!(signer.pool_addresses()["horizen"], before_pools["horizen"]);
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    #[test]
+    fn green_runtime_binding_rejects_non_exact_source() {
+        let signer = test_signer();
+        let expected_signer = signer.bridge_approval_signers()["base"].clone();
+        let expected_pool = signer.pool_addresses()["base"].clone();
+        let destination = "0x3333333333333333333333333333333333333333";
+        let mut wrong_signer = test_signer();
+        assert_eq!(
+            wrong_signer
+                .activate_green_destination_pool_with_policy(
+                    "0x9999999999999999999999999999999999999999",
+                    &expected_pool,
+                    destination,
+                )
+                .unwrap_err(),
+            "GREEN_CHAIN_SIGNER_BINDING_MISMATCH"
+        );
+        let mut wrong_pool = signer;
+        assert_eq!(
+            wrong_pool
+                .activate_green_destination_pool_with_policy(
+                    &expected_signer,
+                    "0x8888888888888888888888888888888888888888",
+                    destination,
+                )
+                .unwrap_err(),
+            "GREEN_CHAIN_SIGNER_BINDING_MISMATCH"
+        );
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    async fn green_test_sign(
+        signer: &EnclaveChainSigner,
+        expected_signer: &str,
+        token_address: &str,
+        destination: &str,
+        amount: &str,
+        nonce: u64,
+    ) -> Result<GreenPoolSeedTransaction, String> {
+        signer
+            .sign_green_pool_seed_with_policy(
+                expected_signer,
+                "0x7777777777777777777777777777777777777777",
+                "0x3333333333333333333333333333333333333333",
+                "20000000",
+                token_address,
+                destination,
+                amount,
+                nonce,
+                GREEN_POOL_SEED_GAS_LIMIT,
+                GREEN_POOL_SEED_MAX_FEE_PER_GAS_WEI,
+                GREEN_POOL_SEED_MAX_PRIORITY_FEE_PER_GAS_WEI,
+            )
+            .await
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    #[tokio::test]
+    async fn green_seed_signer_rejects_every_unpinned_transaction_dimension() {
+        let signer = test_signer();
+        let expected_signer = signer.bridge_approval_signers()["base"].clone();
+        let token = "0x7777777777777777777777777777777777777777";
+        let pool = "0x3333333333333333333333333333333333333333";
+
+        let signed = green_test_sign(&signer, &expected_signer, token, pool, "20000000", 0)
+            .await
+            .expect("exact seed");
+        assert_eq!(signed.chain_id, 8_453);
+        assert_eq!(signed.signer, expected_signer);
+        assert_eq!(signed.token_address, token);
+        assert_eq!(signed.destination_pool_address, pool);
+        assert_eq!(signed.amount_atomic, "20000000");
+        assert!(signed.raw_transaction_hex.starts_with("0x02"));
+
+        assert_eq!(
+            green_test_sign(
+                &signer,
+                &expected_signer,
+                "0x6666666666666666666666666666666666666666",
+                pool,
+                "20000000",
+                0
+            )
+            .await
+            .unwrap_err(),
+            "GREEN_POOL_SEED_TOKEN_MISMATCH"
+        );
+        assert_eq!(
+            green_test_sign(
+                &signer,
+                &expected_signer,
+                token,
+                "0x4444444444444444444444444444444444444444",
+                "20000000",
+                0
+            )
+            .await
+            .unwrap_err(),
+            "GREEN_POOL_SEED_DESTINATION_MISMATCH"
+        );
+        assert_eq!(
+            green_test_sign(&signer, &expected_signer, token, pool, "19999999", 0)
+                .await
+                .unwrap_err(),
+            "GREEN_POOL_SEED_AMOUNT_MISMATCH"
+        );
+        assert_eq!(
+            green_test_sign(&signer, &expected_signer, token, pool, "20000000", 1)
+                .await
+                .unwrap_err(),
+            "GREEN_POOL_SEED_TRANSACTION_BOUNDS_INVALID"
+        );
+        assert_eq!(
+            signer
+                .sign_green_pool_seed_with_policy(
+                    &expected_signer,
+                    token,
+                    pool,
+                    "20000000",
+                    token,
+                    pool,
+                    "20000000",
+                    GREEN_POOL_SEED_NONCE,
+                    GREEN_POOL_SEED_GAS_LIMIT + 1,
+                    GREEN_POOL_SEED_MAX_FEE_PER_GAS_WEI,
+                    GREEN_POOL_SEED_MAX_PRIORITY_FEE_PER_GAS_WEI,
+                )
+                .await
+                .unwrap_err(),
+            "GREEN_POOL_SEED_TRANSACTION_BOUNDS_INVALID"
+        );
+        assert_eq!(
+            signer
+                .sign_green_pool_seed_with_policy(
+                    &expected_signer,
+                    token,
+                    pool,
+                    "20000000",
+                    token,
+                    pool,
+                    "20000000",
+                    GREEN_POOL_SEED_NONCE,
+                    GREEN_POOL_SEED_GAS_LIMIT,
+                    "11000001",
+                    GREEN_POOL_SEED_MAX_PRIORITY_FEE_PER_GAS_WEI,
+                )
+                .await
+                .unwrap_err(),
+            "GREEN_POOL_SEED_FEE_INVALID"
+        );
+        assert_eq!(
+            signer
+                .sign_green_pool_seed_with_policy(
+                    &expected_signer,
+                    token,
+                    pool,
+                    "20000000",
+                    token,
+                    pool,
+                    "20000000",
+                    GREEN_POOL_SEED_NONCE,
+                    GREEN_POOL_SEED_GAS_LIMIT,
+                    GREEN_POOL_SEED_MAX_FEE_PER_GAS_WEI,
+                    "1000001",
+                )
+                .await
+                .unwrap_err(),
+            "GREEN_POOL_SEED_FEE_INVALID"
+        );
+
+        let first = green_test_sign(&signer, &expected_signer, token, pool, "20000000", 0)
+            .await
+            .expect("first deterministic seed");
+        let restarted_signer = test_signer();
+        let after_restart = green_test_sign(
+            &restarted_signer,
+            &expected_signer,
+            token,
+            pool,
+            "20000000",
+            0,
+        )
+        .await
+        .expect("restart deterministic seed");
+        assert_eq!(first.transaction_hash, after_restart.transaction_hash);
+        assert_eq!(first.raw_transaction_hex, after_restart.raw_transaction_hex);
     }
 
     #[test]
