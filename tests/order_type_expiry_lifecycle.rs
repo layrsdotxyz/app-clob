@@ -506,6 +506,15 @@ fn api_tif_commands_preserve_fees_conservation_privacy_and_snapshot_replay() {
     let rejected = core.execute(fok_command.clone(), 1_200).unwrap();
     assert_semantic_receipt(&rejected, CommandReceiptState::Rejected, true);
     assert_eq!(rejected.receipt.publication_eligible, Some(true));
+    assert_eq!(
+        rejected
+            .receipt
+            .reviewer_attestation
+            .as_ref()
+            .expect("rejected order attestation")
+            .event_type,
+        "ORDER_REJECTED"
+    );
     let CommandResult::Order { result } = &rejected.result else {
         panic!("expected FOK result");
     };

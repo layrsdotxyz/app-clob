@@ -18,10 +18,14 @@ The top-level `CoreStateSnapshot`, ledger, order book, market, session, reward,
 resolution, replay-key, sequence, state-root, and encrypted-journal envelope
 schemas are unchanged.
 
-`EnclaveReceipt` gains one optional `reviewer_event` object containing only a
-bounded public event type and the terminal status `COMPLETED`. The field uses a
-Serde default and is omitted when absent. Historical receipts therefore decode
-with `reviewer_event = None` and serialize to the same signed payload; they are
+`EnclaveReceipt` gains one optional `reviewer_attestation` object containing a
+separately signed, domain-separated disclosure: protocol version, deterministic
+receipt ID, bounded public event type, terminal status `COMPLETED`, occurrence
+time, opaque command commitment, state root, PCR0 and signature. It contains no
+command ID, idempotency key, account, order, amount, destination, or other
+user-controlled/private command field. The field uses a Serde default and is
+omitted when absent. Historical receipts therefore decode with
+`reviewer_attestation = None` and serialize to the same signed payload; they are
 not relabelled, resigned, rewritten, or backfilled.
 
 New journal-committed mutations may emit a `layrs.v3` receipt whose signature
@@ -52,7 +56,7 @@ Before any production activation:
    replay keys. No mutation is permitted during this comparison.
 3. Decode and verify every retained receipt shape present in the snapshot and
    archived terminal-result set. For historical receipts, require
-   `reviewer_event = None`, byte-identical signature payload reconstruction,
+   `reviewer_attestation = None`, byte-identical signature payload reconstruction,
    and the original signature result. Reject any receipt that changes protocol
    version, commitment, journal binding, sequence, root, hash, timestamp, or
    signature after candidate decoding.
@@ -60,11 +64,13 @@ Before any production activation:
    isolation plus no change to sequence, state root, journal head, snapshot
    hash, balances, or holds.
 5. In isolated Green, execute one allowlisted example for every reviewer event
-   class reached by the release. Verify the event is inside the exact
-   enclave-signed payload, contains no account, wallet, order, market, balance,
-   amount, price, destination, or free-form value, and is emitted only after a
-   journal-committed mutation. Preview/read-only and rejected no-effect vectors
-   must not produce a completed reviewer event.
+   class reached by the release. Verify the separate reviewer attestation's
+   domain signature, verify that the containing operational receipt also binds
+   it, and confirm that the public artifact contains no command ID, idempotency
+   key, account, wallet, order, market, balance, amount, price, destination, or
+   free-form value. Preview/read-only and empty no-op mutation vectors must not
+   produce an attestation; a journal-committed rejected order may produce only
+   the explicit terminal event `ORDER_REJECTED`.
 6. Replay each Green request with the same idempotency key, restart the enclave,
    and replay again. Require one state transition, one journal record,
    byte-identical terminal result, valid receipt signature, unchanged principal,

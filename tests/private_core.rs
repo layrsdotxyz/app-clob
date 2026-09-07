@@ -1,13 +1,13 @@
 use clob_service::private_core::{
     command_request_hash, polymarket_resolution_signing_payload, resolution_signing_payload,
-    signing_payload, AccountBucket, AccountKey, BookOrder, BootstrapPreparedVenueOrder,
-    BoundaryEvidence, CancelAllOrdersFilter, CommandReceiptState, CommandResult,
-    CompleteSetDirection, CoreError, EncryptedJournal, ExternalFlowDirection, FeeProfileId,
-    JournalKey, Ledger, LedgerTransaction, MarketConfig, MarketExecution, OrderAction, OrderStatus,
-    Outcome, PolymarketResolutionStatement, PostingSide, PriceTimeBook, PrivateTradingCore,
-    ReceiptSigner, ResolutionOutcome, ResolutionStatement, SessionGuard, SessionRequest,
-    SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence, SignedSessionRequest,
-    TimeInForce, Transfer, UserCommand, UserCommandAction,
+    signing_payload, verify_reviewer_attestation, AccountBucket, AccountKey, BookOrder,
+    BootstrapPreparedVenueOrder, BoundaryEvidence, CancelAllOrdersFilter, CommandReceiptState,
+    CommandResult, CompleteSetDirection, CoreError, EncryptedJournal, ExternalFlowDirection,
+    FeeProfileId, JournalKey, Ledger, LedgerTransaction, MarketConfig, MarketExecution,
+    OrderAction, OrderStatus, Outcome, PolymarketResolutionStatement, PostingSide, PriceTimeBook,
+    PrivateTradingCore, ReceiptSigner, ResolutionOutcome, ResolutionStatement, SessionGuard,
+    SessionRequest, SignedPolymarketResolution, SignedResolution, SignedResolutionEvidence,
+    SignedSessionRequest, TimeInForce, Transfer, UserCommand, UserCommandAction,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
@@ -964,7 +964,7 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
     assert_eq!(
         fill_response
             .receipt
-            .reviewer_event
+            .reviewer_attestation
             .as_ref()
             .unwrap()
             .event_type,
@@ -2398,15 +2398,26 @@ fn polymarket_bootstrap_never_credits_an_unconfirmed_fill() {
         950,
     )
     .unwrap();
-    core.apply_external_flow(
-        "sys:pool-capital".into(),
-        AccountKey::new("layrs", AccountBucket::PoolCash, "USDC"),
-        1_000_000,
-        ExternalFlowDirection::Inflow,
-        [46u8; 32],
-        950,
-    )
-    .unwrap();
+    let pool_flow = core
+        .apply_external_flow(
+            "sys:pool-capital".into(),
+            AccountKey::new("layrs", AccountBucket::PoolCash, "USDC"),
+            1_000_000,
+            ExternalFlowDirection::Inflow,
+            [46u8; 32],
+            950,
+        )
+        .unwrap();
+    assert_eq!(pool_flow.receipt.command_id, "external-flow");
+    assert_eq!(
+        pool_flow
+            .receipt
+            .reviewer_attestation
+            .as_ref()
+            .expect("generic external-flow reviewer attestation")
+            .event_type,
+        "EXTERNAL_FLOW_RECORDED"
+    );
 
     let execution_id = uuid::Uuid::from_u128(47);
     let pending = execute_signed(
@@ -2704,7 +2715,12 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
     assert_eq!(response.receipt.protocol_version, "layrs.v3");
     assert_eq!(response.receipt.publication_eligible, Some(true));
     assert_eq!(
-        response.receipt.reviewer_event.as_ref().unwrap().event_type,
+        response
+            .receipt
+            .reviewer_attestation
+            .as_ref()
+            .unwrap()
+            .event_type,
         "WITHDRAWAL_RESERVED"
     );
     assert!(response.encrypted_record.is_some());
@@ -2836,17 +2852,29 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
         },
         1_500,
     );
-    core.apply_user_external_flow(
-        "withdrawal-final:36".into(),
-        identity_commitment,
-        "USDC".into(),
-        AccountBucket::UserWithdrawalHold,
-        10_000_000,
-        ExternalFlowDirection::Outflow,
-        [38u8; 32],
-        1_600,
-    )
-    .unwrap();
+    let confirmed = core
+        .apply_user_external_flow(
+            "withdrawal-final:36".into(),
+            identity_commitment,
+            "USDC".into(),
+            AccountBucket::UserWithdrawalHold,
+            10_000_000,
+            ExternalFlowDirection::Outflow,
+            [38u8; 32],
+            1_600,
+        )
+        .unwrap();
+    assert_eq!(confirmed.receipt.command_id, "external-flow");
+    let finalized_attestation = confirmed
+        .receipt
+        .reviewer_attestation
+        .as_ref()
+        .expect("confirmed withdrawal reviewer attestation");
+    assert_eq!(finalized_attestation.event_type, "WITHDRAWAL_FINALIZED");
+    assert!(verify_reviewer_attestation(
+        finalized_attestation,
+        &receipt_public_key
+    ));
     assert_eq!(
         core.balance(&AccountKey::new(
             &private_user,
@@ -3052,7 +3080,12 @@ fn registration_receipt_is_publication_eligible_private_and_identity_unique() {
     assert_eq!(first.receipt.protocol_version, "layrs.v3");
     assert_eq!(first.receipt.publication_eligible, Some(true));
     assert_eq!(
-        first.receipt.reviewer_event.as_ref().unwrap().event_type,
+        first
+            .receipt
+            .reviewer_attestation
+            .as_ref()
+            .unwrap()
+            .event_type,
         "PRIVATE_SESSION_REGISTERED"
     );
     assert!(first.receipt.command_commitment_sha256.is_some());
@@ -4613,12 +4646,26 @@ fn api_cancel_all_filters_owner_orders_releases_holds_and_replays_once() {
         3_000_000_000_000_000_000
     );
 
+    let empty_cancel = execute_signed_response(
+        &mut core,
+        &alice_key,
+        "session:cancel-all:alice",
+        8,
+        "cmd:cancel-all:empty",
+        UserCommandAction::CancelAllOrders {
+            filter: CancelAllOrdersFilter::All,
+        },
+        1_260,
+    );
+    assert_eq!(empty_cancel.receipt_state, CommandReceiptState::Accepted);
+    assert!(empty_cancel.receipt.reviewer_attestation.is_none());
+
     let root_before_invalid_filter = core.state_root();
     let invalid = execute_signed_result(
         &mut core,
         &alice_key,
         "session:cancel-all:alice",
-        8,
+        9,
         "cmd:cancel-all:unknown-market",
         UserCommandAction::CancelAllOrders {
             filter: CancelAllOrdersFilter::Market {

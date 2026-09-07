@@ -2,7 +2,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -506,6 +506,23 @@ pub struct ReviewerEvent {
     pub status: String,
 }
 
+/// A deliberately redacted, independently verifiable disclosure for grant and
+/// protocol reviewers.  Unlike `EnclaveReceipt`, this payload never carries a
+/// command ID, idempotency key, account, order, amount, destination, or any
+/// other user-controlled/private command field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewerAttestation {
+    pub protocol_version: String,
+    pub receipt_id: String,
+    pub event_type: String,
+    pub status: String,
+    pub occurred_at_millis: i64,
+    pub command_commitment_sha256: [u8; 32],
+    pub state_root: [u8; 32],
+    pub enclave_measurement_sha384: Vec<u8>,
+    pub signature: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnclaveReceipt {
     pub protocol_version: String,
@@ -533,11 +550,13 @@ pub struct EnclaveReceipt {
     /// A signed terminal rejection is false and must preserve the prior root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal_committed: Option<bool>,
-    /// Privacy-safe reviewer metadata introduced in `layrs.v3`.  It is part
-    /// of the exact enclave-signed payload, rather than a server-side label
-    /// added after the fact.
+    /// Privacy-safe reviewer evidence introduced in `layrs.v3`.  The nested
+    /// artifact has its own domain-separated enclave signature and is the only
+    /// receipt payload that may be disclosed to a reviewer.  The containing
+    /// operational receipt remains private because it carries command routing
+    /// identifiers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reviewer_event: Option<ReviewerEvent>,
+    pub reviewer_attestation: Option<ReviewerAttestation>,
     pub enclave_sequence: u64,
     pub prior_state_root: [u8; 32],
     pub state_root: [u8; 32],
@@ -669,7 +688,8 @@ impl ReceiptSigner {
             assert_eq!(prior_state_root, state_root);
             assert_eq!(publication_eligible, Some(false));
         }
-        if reviewer_event.is_some() {
+        let has_reviewer_event = reviewer_event.is_some();
+        if has_reviewer_event {
             assert!(
                 publication_eligible == Some(true),
                 "reviewer attestations must be publication eligible"
@@ -684,27 +704,34 @@ impl ReceiptSigner {
                 "reviewer attestations must retain the v3 result commitment"
             );
         }
+        let receipt_id =
+            deterministic_receipt_id(&command_id, &idempotency_key, enclave_sequence, &state_root);
+        let reviewer_attestation = reviewer_event.map(|event| {
+            self.sign_reviewer_attestation(
+                receipt_id.clone(),
+                event,
+                occurred_at_millis,
+                command_commitment_sha256
+                    .expect("reviewer attestations require a command commitment"),
+                state_root,
+            )
+        });
         let mut receipt = EnclaveReceipt {
-            protocol_version: if result_commitment_sha256.is_some() || reviewer_event.is_some() {
+            protocol_version: if result_commitment_sha256.is_some() || has_reviewer_event {
                 "layrs.v3".into()
             } else if command_commitment_sha256.is_some() {
                 "layrs.v2".into()
             } else {
                 "layrs.v1".into()
             },
-            receipt_id: deterministic_receipt_id(
-                &command_id,
-                &idempotency_key,
-                enclave_sequence,
-                &state_root,
-            ),
+            receipt_id,
             command_id,
             idempotency_key,
             command_commitment_sha256,
             publication_eligible,
             result_commitment_sha256,
             journal_committed,
-            reviewer_event,
+            reviewer_attestation,
             enclave_sequence,
             prior_state_root,
             state_root,
@@ -745,6 +772,74 @@ impl ReceiptSigner {
         payload.extend_from_slice(&encoded);
         self.signing_key.sign(&payload).to_bytes().to_vec()
     }
+
+    fn sign_reviewer_attestation(
+        &self,
+        receipt_id: String,
+        event: ReviewerEvent,
+        occurred_at_millis: i64,
+        command_commitment_sha256: [u8; 32],
+        state_root: [u8; 32],
+    ) -> ReviewerAttestation {
+        assert_eq!(
+            event.status, "COMPLETED",
+            "reviewer attestations describe committed events only"
+        );
+        assert!(
+            !event.event_type.is_empty() && event.event_type.len() <= 64,
+            "reviewer attestation event type must be non-empty and bounded"
+        );
+        let mut attestation = ReviewerAttestation {
+            protocol_version: "layrs.reviewer-attestation.v1".into(),
+            receipt_id,
+            event_type: event.event_type,
+            status: event.status,
+            occurred_at_millis,
+            command_commitment_sha256,
+            state_root,
+            enclave_measurement_sha384: self.enclave_measurement_sha384.to_vec(),
+            signature: Vec::new(),
+        };
+        attestation.signature =
+            self.sign_domain_payload(b"layrs.reviewer-attestation.v1\0", &attestation);
+        attestation
+    }
+}
+
+pub fn verify_reviewer_attestation(
+    attestation: &ReviewerAttestation,
+    verifying_key: &[u8; 32],
+) -> bool {
+    if attestation.protocol_version != "layrs.reviewer-attestation.v1"
+        || attestation.status != "COMPLETED"
+        || !attestation.receipt_id.starts_with("receipt_")
+        || attestation.receipt_id.len() != "receipt_".len() + 64
+        || attestation.receipt_id["receipt_".len()..]
+            .bytes()
+            .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+        || attestation.event_type.is_empty()
+        || attestation.event_type.len() > 64
+        || attestation.enclave_measurement_sha384.len() != 48
+        || attestation.signature.len() != 64
+    {
+        return false;
+    }
+    let Ok(verifying_key) = VerifyingKey::from_bytes(verifying_key) else {
+        return false;
+    };
+    let Ok(signature) = Signature::from_slice(&attestation.signature) else {
+        return false;
+    };
+    let mut unsigned = attestation.clone();
+    unsigned.signature.clear();
+    let Ok(encoded) = serde_json::to_vec(&unsigned) else {
+        return false;
+    };
+    let mut payload = Vec::with_capacity(encoded.len() + 64);
+    payload.extend_from_slice(b"layrs.reviewer-attestation.v1\0");
+    payload.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+    payload.extend_from_slice(&encoded);
+    verifying_key.verify(&payload, &signature).is_ok()
 }
 
 fn deterministic_receipt_id(
@@ -824,6 +919,13 @@ mod semantic_receipt_tests {
             1_786_000_000_000,
         );
         assert_eq!(receipt.protocol_version, "layrs.v3");
+        assert!(receipt.reviewer_attestation.is_none());
+        let encoded_receipt = serde_json::to_vec(&receipt).unwrap();
+        let restored_receipt: EnclaveReceipt = serde_json::from_slice(&encoded_receipt).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&restored_receipt).unwrap(),
+            encoded_receipt
+        );
         let signature = Signature::from_slice(&receipt.signature).unwrap();
         let mut unsigned = receipt.clone();
         unsigned.signature.clear();
@@ -840,6 +942,92 @@ mod semantic_receipt_tests {
             .verifying_key()
             .verify(&serde_json::to_vec(&unsigned).unwrap(), &signature)
             .is_err());
+    }
+
+    #[test]
+    fn reviewer_attestation_is_redacted_domain_separated_and_tamper_evident() {
+        let signer = ReceiptSigner::from_seed([0x31; 32], [0x42; 48]);
+        let verifying_key = signer.verifying_key();
+        let receipt = signer.sign(
+            "private-command-that-must-not-be-public".into(),
+            "private:idempotency:0x1111111111111111111111111111111111111111".into(),
+            Some([0x53; 32]),
+            Some(true),
+            Some([0x64; 32]),
+            Some(true),
+            Some(ReviewerEvent {
+                event_type: "ORDER_MATCHED".into(),
+                status: "COMPLETED".into(),
+            }),
+            17,
+            [0x75; 32],
+            [0x86; 32],
+            [0x97; 32],
+            1_788_000_000_123,
+        );
+        let attestation = receipt
+            .reviewer_attestation
+            .as_ref()
+            .expect("reviewer attestation");
+        assert!(verify_reviewer_attestation(attestation, &verifying_key));
+        let attestation_signature = Signature::from_slice(&attestation.signature).unwrap();
+        let mut unsigned_attestation = attestation.clone();
+        unsigned_attestation.signature.clear();
+        assert!(signer
+            .signing_key
+            .verifying_key()
+            .verify(
+                &serde_json::to_vec(&unsigned_attestation).unwrap(),
+                &attestation_signature
+            )
+            .is_err());
+        let public_json = serde_json::to_string(attestation).unwrap();
+        for private_value in [
+            "private-command-that-must-not-be-public",
+            "private:idempotency",
+            "0x1111111111111111111111111111111111111111",
+        ] {
+            assert!(!public_json.contains(private_value));
+        }
+        assert_eq!(
+            hex::encode(&attestation.signature),
+            "22a719c60b00c86bb7bb57464c18af175052e252d3e15befd66faa6e33cf58b1bc1ff4790f305d9e62df48e1b4398c23ff7d4917b135797624a9160f4a793a00"
+        );
+
+        let mut tampered_event = attestation.clone();
+        tampered_event.event_type = "ORDER_ACCEPTED".into();
+        assert!(!verify_reviewer_attestation(
+            &tampered_event,
+            &verifying_key
+        ));
+        let receipt_signature = Signature::from_slice(&receipt.signature).unwrap();
+        let mut tampered_receipt = receipt.clone();
+        tampered_receipt.signature.clear();
+        tampered_receipt
+            .reviewer_attestation
+            .as_mut()
+            .unwrap()
+            .event_type = "ORDER_ACCEPTED".into();
+        assert!(signer
+            .signing_key
+            .verifying_key()
+            .verify(
+                &serde_json::to_vec(&tampered_receipt).unwrap(),
+                &receipt_signature
+            )
+            .is_err());
+        let mut tampered_time = attestation.clone();
+        tampered_time.occurred_at_millis += 1;
+        assert!(!verify_reviewer_attestation(&tampered_time, &verifying_key));
+        let mut tampered_commitment = attestation.clone();
+        tampered_commitment.command_commitment_sha256[0] ^= 1;
+        assert!(!verify_reviewer_attestation(
+            &tampered_commitment,
+            &verifying_key
+        ));
+        let mut tampered_root = attestation.clone();
+        tampered_root.state_root[0] ^= 1;
+        assert!(!verify_reviewer_attestation(&tampered_root, &verifying_key));
     }
 }
 

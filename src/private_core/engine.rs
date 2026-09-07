@@ -3143,10 +3143,6 @@ impl PrivateTradingCore {
         now_millis: i64,
     ) -> CoreResult<SystemResponse> {
         self.validate_new_system_key(&idempotency_key)?;
-        let reviewer_command_id = match direction {
-            ExternalFlowDirection::Inflow => "deposit-credited",
-            ExternalFlowDirection::Outflow => "withdrawal-finalized",
-        };
         let prior_root = self.state_root();
         let flow = ExternalFlowTransaction {
             idempotency_key: format!("flow:{idempotency_key}"),
@@ -3184,7 +3180,7 @@ impl PrivateTradingCore {
         self.system_keys = keys;
         self.sequence = next_sequence;
         Ok(self.system_response(
-            reviewer_command_id,
+            "external-flow",
             idempotency_key,
             prior_root,
             next_root,
@@ -3295,13 +3291,14 @@ impl PrivateTradingCore {
         self.sequence = next_sequence;
         // Keep the existing receipt command ID stable because the backend's
         // deterministic archive lookup uses this public protocol identifier.
-        Ok(self.system_response(
+        Ok(self.system_response_with_reviewer_event(
             "external-flow",
             idempotency_key,
             prior_root,
             next_root,
             record,
             now_millis,
+            reviewer_event("WITHDRAWAL_FINALIZED"),
         ))
     }
 
@@ -5662,7 +5659,8 @@ impl PrivateTradingCore {
         let disclosure_nonce =
             self.receipt_signer
                 .result_disclosure_nonce(expected_hash, next_sequence, next_root);
-        let reviewer_event = reviewer_event_for_user_command(&command.action, &result);
+        let reviewer_event =
+            reviewer_event_for_user_command(&command.action, &result, command_state);
         // Reviewer-attested state mutations retain the upstream v3 encrypted
         // result commitment. Preview-only commands stay non-public v2.
         let semantic_receipt = is_s08_semantic_result(&command.action, &result);
@@ -5990,15 +5988,20 @@ fn reviewer_event(event_type: &str) -> ReviewerEvent {
 fn reviewer_event_for_user_command(
     action: &UserCommandAction,
     result: &CommandResult,
+    receipt_state: CommandReceiptState,
 ) -> Option<ReviewerEvent> {
     let event_type = match action {
-        UserCommandAction::SubmitOrder { .. } => match result {
-            CommandResult::Order { result } if !result.fills.is_empty() => "ORDER_MATCHED",
-            CommandResult::Order { .. } => "ORDER_ACCEPTED",
-            _ => "ORDER_ACCEPTED",
+        UserCommandAction::SubmitOrder { .. } => match receipt_state {
+            CommandReceiptState::Filled => "ORDER_MATCHED",
+            CommandReceiptState::Rejected => "ORDER_REJECTED",
+            CommandReceiptState::Cancelled => "ORDER_CANCELLED",
+            CommandReceiptState::Accepted => "ORDER_ACCEPTED",
         },
         UserCommandAction::ReplaceOrder { .. } => "ORDER_REPLACED",
         UserCommandAction::CancelOrder { .. } => "ORDER_CANCELLED",
+        UserCommandAction::CancelAllOrders { .. } if matches!(result, CommandResult::OrdersCancelled { outcomes, .. } if outcomes.is_empty()) => {
+            return None
+        }
         UserCommandAction::CancelAllOrders { .. } => "ORDERS_CANCELLED",
         UserCommandAction::ClosePosition { .. } => "POSITION_CLOSED",
         UserCommandAction::CompleteSet { .. } => "COMPLETE_SET_EXECUTED",

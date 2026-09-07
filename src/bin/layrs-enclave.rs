@@ -6386,7 +6386,7 @@ mod tests {
             publication_eligible: Some(true),
             result_commitment_sha256: None,
             journal_committed: None,
-            reviewer_event: None,
+            reviewer_attestation: None,
             enclave_sequence: 8,
             prior_state_root: [11; 32],
             state_root: [3; 32],
