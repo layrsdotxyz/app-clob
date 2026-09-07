@@ -1368,7 +1368,7 @@ fn direct_final_result_marker_digest(
         .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?;
         return Ok(domain_hash(DIRECT_FINAL_RESULT_MARKER_DOMAIN, &encoded));
     }
-    if !matches!(stored.marker_format_version, 1 | 2 | 3) {
+    if !matches!(stored.marker_format_version, 1..=3) {
         return Err(DirectExecutionContractError::IdempotencyIndex);
     }
     // Deliberately exclude commitEvidence.stateRoot and signatures: the marker
