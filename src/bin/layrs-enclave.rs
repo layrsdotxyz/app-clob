@@ -52,6 +52,7 @@ use clob_service::private_core::{
 #[cfg(feature = "green-pool-certification")]
 use clob_service::private_core::{
     DirectDepositCreditPayload, DirectExecutionOperation, DirectWithdrawalPayload,
+    GreenE03s05TestCapitalBinding, GreenE03s05TestCapitalOutcome, GreenE03s05TestCapitalPayload,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use ethers_core::{
@@ -375,6 +376,19 @@ struct GreenPoolTransitionAuthorization {
     signature: Vec<u8>,
 }
 
+#[cfg(feature = "green-pool-certification")]
+const GREEN_E03S05_ACCOUNT_AND_AUTH: [u8; 32] = [
+    0xc2, 0x49, 0xef, 0x78, 0x7a, 0xe1, 0x9c, 0x8a, 0x93, 0x01, 0xcb, 0x6c, 0x00, 0x61, 0x09, 0xe2,
+    0x40, 0xe8, 0xc2, 0x4e, 0x8b, 0xf7, 0x14, 0xed, 0x97, 0x40, 0x96, 0x6d, 0xa6, 0x3a, 0x8d, 0xb7,
+];
+#[cfg(feature = "green-pool-certification")]
+const GREEN_E03S05_IDENTITY: [u8; 32] = [
+    0xfd, 0x67, 0xb4, 0x44, 0xa0, 0xde, 0x82, 0xe2, 0x8c, 0xfd, 0x90, 0x62, 0x43, 0xf0, 0x0d, 0x5e,
+    0xa3, 0xd6, 0x03, 0x68, 0x56, 0xe0, 0xc7, 0xc3, 0xf6, 0xa9, 0x5f, 0x03, 0x8a, 0x5b, 0xeb, 0x28,
+];
+#[cfg(feature = "green-pool-certification")]
+const GREEN_E03S05_SESSION_ID: &str = "session_XuAxP8_gxcsuwg_0H6ZwrtG8Lyu4wyeD";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 // The authenticated operator wire schema is release-bound. Boxing the durable
@@ -383,6 +397,10 @@ struct GreenPoolTransitionAuthorization {
 #[allow(clippy::large_enum_variant)]
 enum OperatorCommand {
     DirectCreditDeposit {
+        request: DirectExecutionRequestEnvelope,
+    },
+    #[cfg(feature = "green-pool-certification")]
+    AllocateGreenE03s05TestCapital {
         request: DirectExecutionRequestEnvelope,
     },
     DirectDepositCreditLookup {
@@ -967,6 +985,10 @@ enum PlainResponse {
     },
     DirectDepositCreditLookup {
         response: Option<DirectDepositCreditResponse>,
+    },
+    #[cfg(feature = "green-pool-certification")]
+    GreenE03s05TestCapital {
+        outcome: GreenE03s05TestCapitalOutcome,
     },
     DirectWithdrawal {
         outcome: DirectWithdrawalOutcome,
@@ -1822,6 +1844,10 @@ async fn handle_encrypted(
                 .into_iter()
                 .collect()
         }
+        #[cfg(feature = "green-pool-certification")]
+        PlainResponse::GreenE03s05TestCapital { .. } => direct_deposit_journal_artifact(&response)
+            .into_iter()
+            .collect(),
         PlainResponse::PoolWithdrawalSigned {
             response: Some(response),
             ..
@@ -1891,6 +1917,10 @@ async fn handle_encrypted(
                 .into_iter()
                 .collect()
         }
+        #[cfg(feature = "green-pool-certification")]
+        PlainResponse::GreenE03s05TestCapital { .. } => direct_deposit_receipt_artifact(&response)
+            .into_iter()
+            .collect(),
         PlainResponse::PoolWithdrawalSigned {
             response: Some(response),
             ..
@@ -2391,7 +2421,10 @@ fn direct_execution_request(state: &EnclaveState, request: &PlainRequest) -> boo
     if matches!(
         request,
         PlainRequest::Operator { envelope }
-            if matches!(envelope.command, OperatorCommand::SignGreenPoolSeed { .. })
+            if matches!(envelope.command,
+                OperatorCommand::SignGreenPoolSeed { .. }
+                | OperatorCommand::AllocateGreenE03s05TestCapital { .. }
+            )
     ) {
         // This one-time Green-only transaction has an independently signed,
         // exact intent and is chain-idempotent at nonce zero. It must not be
@@ -2451,6 +2484,9 @@ fn green_pool_certification_request_allowed(state: &EnclaveState, request: &Plai
             | OperatorCommand::SignGreenPoolSeed { .. } => true,
             OperatorCommand::DirectCreditDeposit { request } => {
                 green_base_usdc_deposit_request(request)
+            }
+            OperatorCommand::AllocateGreenE03s05TestCapital { request } => {
+                green_e03s05_test_capital_request(state, request)
             }
             OperatorCommand::DirectDepositCreditLookup {
                 account_id,
@@ -2529,6 +2565,40 @@ fn green_base_usdc_deposit_request(request: &DirectExecutionRequestEnvelope) -> 
 }
 
 #[cfg(feature = "green-pool-certification")]
+fn green_e03s05_test_capital_request(
+    state: &EnclaveState,
+    request: &DirectExecutionRequestEnvelope,
+) -> bool {
+    let Some(completed) = state.completed_green_pool_seed.as_ref() else {
+        // The seed-signing cache is intentionally not snapshot state.  Once a
+        // direct allocation has committed, only its exact sealed request may
+        // recover after restart; a fresh allocation remains unavailable.
+        return state.core.as_ref().is_some_and(|core| {
+            core.replay_green_e03s05_test_capital(request)
+                .is_ok_and(|response| response.is_some())
+        });
+    };
+    let Ok(seed_hash) = decode_green_transaction_hash(&completed.transaction.transaction_hash)
+    else {
+        return false;
+    };
+    let binding = GreenE03s05TestCapitalBinding {
+        authenticated_subject_hash: GREEN_E03S05_ACCOUNT_AND_AUTH,
+        account_id: GREEN_E03S05_ACCOUNT_AND_AUTH,
+        identity_commitment: GREEN_E03S05_IDENTITY,
+        session_id: GREEN_E03S05_SESSION_ID.into(),
+        seed_transaction_hash: seed_hash,
+    };
+    GreenE03s05TestCapitalPayload::decode_for(request, &binding).is_ok()
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn decode_green_transaction_hash(value: &str) -> Result<[u8; 32], ()> {
+    let bytes = hex::decode(value.strip_prefix("0x").ok_or(())?).map_err(|_| ())?;
+    bytes.try_into().map_err(|_| ())
+}
+
+#[cfg(feature = "green-pool-certification")]
 fn green_base_usdc_withdrawal_request(request: &DirectExecutionRequestEnvelope) -> bool {
     matches!(
         request.operation,
@@ -2588,6 +2658,15 @@ fn requires_durable_preparation(has_journal_artifact: bool, direct_execution: bo
 }
 
 fn direct_execution_reuses_archived_snapshot(response: &PlainResponse) -> bool {
+    #[cfg(feature = "green-pool-certification")]
+    if matches!(
+        response,
+        PlainResponse::GreenE03s05TestCapital {
+            outcome: GreenE03s05TestCapitalOutcome::ReturnOriginal(_),
+        }
+    ) {
+        return true;
+    }
     matches!(
         response,
         PlainResponse::DirectDepositCredit {
@@ -2624,6 +2703,13 @@ fn direct_deposit_journal_artifact(response: &PlainResponse) -> Option<Encrypted
         PlainResponse::DirectWithdrawalLookup {
             response: Some(response),
         } => Some(response.encrypted_journal_record.clone()),
+        #[cfg(feature = "green-pool-certification")]
+        PlainResponse::GreenE03s05TestCapital { outcome } => Some(match outcome {
+            GreenE03s05TestCapitalOutcome::Applied(response)
+            | GreenE03s05TestCapitalOutcome::ReturnOriginal(response) => {
+                response.encrypted_journal_record.clone()
+            }
+        }),
         _ => None,
     }
 }
@@ -2648,6 +2734,13 @@ fn direct_deposit_receipt_artifact(response: &PlainResponse) -> Option<EnclaveRe
         PlainResponse::DirectWithdrawalLookup {
             response: Some(response),
         } => Some(response.enclave_receipt.clone()),
+        #[cfg(feature = "green-pool-certification")]
+        PlainResponse::GreenE03s05TestCapital { outcome } => Some(match outcome {
+            GreenE03s05TestCapitalOutcome::Applied(response)
+            | GreenE03s05TestCapitalOutcome::ReturnOriginal(response) => {
+                response.enclave_receipt.clone()
+            }
+        }),
         _ => None,
     }
 }
@@ -4126,6 +4219,43 @@ async fn dispatch_operator(
                 .direct_credit_deposit(request, now_millis)
                 .map_err(|error| error.to_string())?;
             Ok(PlainResponse::DirectDepositCredit { outcome })
+        }
+        #[cfg(feature = "green-pool-certification")]
+        OperatorCommand::AllocateGreenE03s05TestCapital { request } => {
+            let now_millis =
+                verified_now_millis.ok_or_else(|| "TRUSTED_TIME_UNAVAILABLE".to_string())?;
+            if let Some(response) = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .replay_green_e03s05_test_capital(&request)
+                .map_err(|error| error.to_string())?
+            {
+                return Ok(PlainResponse::GreenE03s05TestCapital {
+                    outcome: GreenE03s05TestCapitalOutcome::ReturnOriginal(response),
+                });
+            }
+            let completed = state
+                .completed_green_pool_seed
+                .as_ref()
+                .ok_or_else(|| "GREEN_POOL_SEED_EVIDENCE_REQUIRED".to_string())?;
+            let seed_transaction_hash =
+                decode_green_transaction_hash(&completed.transaction.transaction_hash)
+                    .map_err(|_| "GREEN_POOL_SEED_EVIDENCE_INVALID".to_string())?;
+            let binding = GreenE03s05TestCapitalBinding {
+                authenticated_subject_hash: GREEN_E03S05_ACCOUNT_AND_AUTH,
+                account_id: GREEN_E03S05_ACCOUNT_AND_AUTH,
+                identity_commitment: GREEN_E03S05_IDENTITY,
+                session_id: GREEN_E03S05_SESSION_ID.into(),
+                seed_transaction_hash,
+            };
+            let outcome = state
+                .core
+                .as_mut()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .allocate_green_e03s05_test_capital(request, &binding, now_millis)
+                .map_err(|error| error.to_string())?;
+            Ok(PlainResponse::GreenE03s05TestCapital { outcome })
         }
         OperatorCommand::DirectDepositCreditLookup {
             account_id,
@@ -6094,7 +6224,8 @@ async fn dispatch_operator(
                 | OperatorCommand::AggregateDepth { .. }
                 | OperatorCommand::ReconcileBootstrap { .. } => unreachable!(),
                 #[cfg(feature = "green-pool-certification")]
-                OperatorCommand::SignGreenPoolSeed { .. } => unreachable!(),
+                OperatorCommand::SignGreenPoolSeed { .. }
+                | OperatorCommand::AllocateGreenE03s05TestCapital { .. } => unreachable!(),
             }
             .map_err(|error| error.to_string())?;
             Ok(PlainResponse::System { response })
@@ -7672,6 +7803,41 @@ mod tests {
     #[cfg(feature = "green-pool-certification")]
     use ed25519_dalek::{Signer as _, SigningKey};
 
+    #[cfg(feature = "green-pool-certification")]
+    fn green_test_capital_request_for_wire(
+        request_id: Uuid,
+        seed_transaction_hash: [u8; 32],
+        issued_at_millis: i64,
+    ) -> DirectExecutionRequestEnvelope {
+        let payload = GreenE03s05TestCapitalPayload {
+            protocol_version: "layrs.green-e03s05-test-capital.v1".into(),
+            authenticated_subject_hash: GREEN_E03S05_ACCOUNT_AND_AUTH,
+            account_id: GREEN_E03S05_ACCOUNT_AND_AUTH,
+            identity_commitment: GREEN_E03S05_IDENTITY,
+            session_id: GREEN_E03S05_SESSION_ID.into(),
+            chain: "base".into(),
+            asset: "USDC".into(),
+            amount_atomic: 20_000_000,
+            seed_transaction_hash,
+            funding_identity: format!(
+                "green-e03s05-test-capital:0x{}",
+                hex::encode(seed_transaction_hash)
+            ),
+        };
+        DirectExecutionRequestEnvelope::new(
+            request_id,
+            GREEN_E03S05_ACCOUNT_AND_AUTH,
+            GREEN_E03S05_ACCOUNT_AND_AUTH,
+            None,
+            Some(payload.funding_identity.clone()),
+            DirectExecutionOperation::AllocateGreenE03s05TestCapital,
+            serde_json::to_vec(&payload).unwrap(),
+            issued_at_millis,
+            issued_at_millis + 5_000,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn replay_cache_rejects_duplicate_keys() {
         let mut cache = ReplayCache::<4>::new(8);
@@ -7709,16 +7875,18 @@ mod tests {
     #[cfg(not(feature = "green-pool-certification"))]
     #[test]
     fn production_build_has_no_green_pool_commands() {
-        let command = serde_json::json!({
-            "type": "SIGN_GREEN_POOL_SEED",
-            "authorization": {},
-            "nonce": 0,
-            "gas_limit": 50_000,
-            "max_fee_per_gas_wei": "11000000",
-            "max_priority_fee_per_gas_wei": "1000000",
-            "now_millis": 1
-        });
-        assert!(serde_json::from_value::<OperatorCommand>(command).is_err());
+        for command in [
+            serde_json::json!({
+                "type": "SIGN_GREEN_POOL_SEED", "authorization": {}, "nonce": 0,
+                "gas_limit": 50_000, "max_fee_per_gas_wei": "11000000",
+                "max_priority_fee_per_gas_wei": "1000000", "now_millis": 1
+            }),
+            serde_json::json!({
+                "type": "ALLOCATE_GREEN_E03S05_TEST_CAPITAL", "request": {}
+            }),
+        ] {
+            assert!(serde_json::from_value::<OperatorCommand>(command).is_err());
+        }
     }
 
     #[cfg(feature = "green-pool-certification")]
@@ -10236,6 +10404,162 @@ mod tests {
 
         let decrypted = decrypt_kms_recipient_enveloped_data(&key_pair, &cms).expect("decrypt cms");
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    #[tokio::test]
+    async fn green_test_capital_binary_route_is_exact_and_returns_signed_terminal_receipt() {
+        let now = 1_800_000_000_000i64;
+        let operator = SigningKey::from_bytes(&[0xb1; 32]);
+        let journal_key = JournalKey::from_bytes([0xb2; 32]);
+        let receipt_signer = ReceiptSigner::from_seed([0xb3; 32], [0xb4; 48]);
+        let receipt_public_key = receipt_signer.verifying_key();
+        let mut core = PrivateTradingCore::new(journal_key, receipt_signer);
+        core.register_session(
+            "register-green-e03s05-session".into(),
+            GREEN_E03S05_SESSION_ID.into(),
+            GREEN_E03S05_IDENTITY,
+            SigningKey::from_bytes(&[0xb5; 32])
+                .verifying_key()
+                .to_bytes(),
+            now + 60_000,
+            now,
+        )
+        .unwrap();
+        let mut state =
+            direct_deposit_test_state(operator.verifying_key(), receipt_public_key, core);
+        let seed_hash = [0xb6; 32];
+        state.completed_green_pool_seed = Some(CompletedGreenPoolSeed {
+            operation_id: "green-base-pool-seed-20260906-v1".into(),
+            command_commitment: [0xb7; 32],
+            transaction: GreenPoolSeedTransaction {
+                chain: "base".into(),
+                chain_id: 8453,
+                asset: "USDC".into(),
+                signer: GREEN_BASE_SIGNER.into(),
+                token_address: GREEN_BASE_USDC.into(),
+                destination_pool_address: GREEN_BASE_DESTINATION_POOL.into(),
+                amount_atomic: GREEN_POOL_SEED_AMOUNT_ATOMIC.into(),
+                nonce: 0,
+                transaction_hash: format!("0x{}", hex::encode(seed_hash)),
+                raw_transaction_hex: "0x02aa".into(),
+            },
+        });
+        let request = green_test_capital_request_for_wire(
+            Uuid::from_u128(0xb8111111_1111_4111_8111_111111111111),
+            seed_hash,
+            now,
+        );
+        let command = OperatorCommand::AllocateGreenE03s05TestCapital {
+            request: request.clone(),
+        };
+        assert!(green_pool_certification_request_allowed(
+            &state,
+            &PlainRequest::Operator {
+                envelope: signed_operator_envelope(&operator, [0xb9; 32], command.clone()),
+            }
+        ));
+        let response = dispatch_operator(
+            &mut state,
+            signed_operator_envelope(&operator, [0xba; 32], command),
+            Some(now + 1),
+        )
+        .await
+        .unwrap();
+        let PlainResponse::GreenE03s05TestCapital {
+            outcome: GreenE03s05TestCapitalOutcome::Applied(applied),
+        } = response
+        else {
+            panic!("expected exact Green allocation")
+        };
+        assert_eq!(
+            applied.result.state,
+            clob_service::private_core::engine::DirectExecutionTerminalState::Applied
+        );
+        assert_eq!(
+            applied.enclave_receipt.command_id,
+            "allocate-green-e03s05-test-capital"
+        );
+        state.completed_green_pool_seed = None;
+        let replay_command = OperatorCommand::AllocateGreenE03s05TestCapital {
+            request: request.clone(),
+        };
+        assert!(green_pool_certification_request_allowed(
+            &state,
+            &PlainRequest::Operator {
+                envelope: signed_operator_envelope(&operator, [0xbb; 32], replay_command.clone()),
+            }
+        ));
+        assert!(matches!(
+            dispatch_operator(
+                &mut state,
+                signed_operator_envelope(&operator, [0xbc; 32], replay_command),
+                Some(now + 2),
+            )
+            .await,
+            Ok(PlainResponse::GreenE03s05TestCapital {
+                outcome: GreenE03s05TestCapitalOutcome::ReturnOriginal(_),
+            })
+        ));
+
+        let mut wrong_payload: GreenE03s05TestCapitalPayload =
+            serde_json::from_slice(&request.canonical_payload).unwrap();
+        wrong_payload.identity_commitment = [0xbb; 32];
+        let wrong_request = DirectExecutionRequestEnvelope::new(
+            Uuid::from_u128(0xbc111111_1111_4111_8111_111111111111),
+            GREEN_E03S05_ACCOUNT_AND_AUTH,
+            GREEN_E03S05_ACCOUNT_AND_AUTH,
+            None,
+            Some(wrong_payload.funding_identity.clone()),
+            DirectExecutionOperation::AllocateGreenE03s05TestCapital,
+            serde_json::to_vec(&wrong_payload).unwrap(),
+            now,
+            now + 5_000,
+        )
+        .unwrap();
+        assert!(!green_pool_certification_request_allowed(
+            &state,
+            &PlainRequest::Operator {
+                envelope: signed_operator_envelope(
+                    &operator,
+                    [0xbd; 32],
+                    OperatorCommand::AllocateGreenE03s05TestCapital {
+                        request: wrong_request
+                    }
+                ),
+            }
+        ));
+        let mut wrong_seed_payload: GreenE03s05TestCapitalPayload =
+            serde_json::from_slice(&request.canonical_payload).unwrap();
+        wrong_seed_payload.seed_transaction_hash = [0xbe; 32];
+        wrong_seed_payload.funding_identity = format!(
+            "green-e03s05-test-capital:0x{}",
+            hex::encode(wrong_seed_payload.seed_transaction_hash)
+        );
+        let wrong_seed_request = DirectExecutionRequestEnvelope::new(
+            Uuid::from_u128(0xbf111111_1111_4111_8111_111111111111),
+            GREEN_E03S05_ACCOUNT_AND_AUTH,
+            GREEN_E03S05_ACCOUNT_AND_AUTH,
+            None,
+            Some(wrong_seed_payload.funding_identity.clone()),
+            DirectExecutionOperation::AllocateGreenE03s05TestCapital,
+            serde_json::to_vec(&wrong_seed_payload).unwrap(),
+            now,
+            now + 5_000,
+        )
+        .unwrap();
+        assert!(!green_pool_certification_request_allowed(
+            &state,
+            &PlainRequest::Operator {
+                envelope: signed_operator_envelope(
+                    &operator,
+                    [0xc0; 32],
+                    OperatorCommand::AllocateGreenE03s05TestCapital {
+                        request: wrong_seed_request
+                    }
+                ),
+            }
+        ));
     }
 
     fn kms_style_cms_fixture(

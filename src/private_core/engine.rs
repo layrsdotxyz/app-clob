@@ -54,6 +54,17 @@ const DIRECT_WITHDRAWAL_PAYLOAD_VERSION: &str = "layrs.direct-withdrawal.v1";
 const DIRECT_WITHDRAWAL_REPLAY_DOMAIN: &[u8] = b"layrs.direct-withdrawal.replay.v1\0";
 const DIRECT_WITHDRAWAL_RESULT_DOMAIN: &[u8] = b"layrs.direct-withdrawal.result.v1\0";
 const DIRECT_WITHDRAWAL_RESTART_DOMAIN: &[u8] = b"layrs.direct-withdrawal.restart.v1\0";
+#[cfg(feature = "green-pool-certification")]
+const GREEN_TEST_CAPITAL_PAYLOAD_VERSION: &str = "layrs.green-e03s05-test-capital.v1";
+#[cfg(feature = "green-pool-certification")]
+const GREEN_TEST_CAPITAL_REPLAY_DOMAIN: &[u8] = b"layrs.green-e03s05-test-capital.replay.v1\0";
+#[cfg(feature = "green-pool-certification")]
+const GREEN_TEST_CAPITAL_RESULT_DOMAIN: &[u8] = b"layrs.green-e03s05-test-capital.result.v1\0";
+#[cfg(feature = "green-pool-certification")]
+const GREEN_TEST_CAPITAL_RESULT_SIGNATURE_DOMAIN: &[u8] =
+    b"layrs.green-e03s05-test-capital.terminal-result.v1\0";
+#[cfg(feature = "green-pool-certification")]
+const GREEN_TEST_CAPITAL_RESTART_DOMAIN: &[u8] = b"layrs.green-e03s05-test-capital.restart.v1\0";
 const MAX_DIRECT_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DIRECT_SCOPE_BYTES: usize = 512;
 
@@ -63,6 +74,8 @@ pub enum DirectExecutionOperation {
     RegisterSession,
     RegisterTransferAccount,
     CreditDeposit,
+    #[cfg(feature = "green-pool-certification")]
+    AllocateGreenE03s05TestCapital,
     ReserveWithdrawal,
     FinalizeWithdrawal,
     ReleaseWithdrawal,
@@ -83,6 +96,8 @@ impl DirectExecutionOperation {
             Self::RegisterSession => b"REGISTER_SESSION",
             Self::RegisterTransferAccount => b"REGISTER_TRANSFER_ACCOUNT",
             Self::CreditDeposit => b"CREDIT_DEPOSIT",
+            #[cfg(feature = "green-pool-certification")]
+            Self::AllocateGreenE03s05TestCapital => b"ALLOCATE_GREEN_E03S05_TEST_CAPITAL",
             Self::ReserveWithdrawal => b"RESERVE_WITHDRAWAL",
             Self::FinalizeWithdrawal => b"FINALIZE_WITHDRAWAL",
             Self::ReleaseWithdrawal => b"RELEASE_WITHDRAWAL",
@@ -304,6 +319,60 @@ pub struct DirectDepositCreditPayload {
     pub funding_identity: String,
 }
 
+/// One explicitly labelled certification allocation. It is tied to the exact
+/// Green seed transaction and is never a customer deposit or a generic mint.
+#[cfg(feature = "green-pool-certification")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GreenE03s05TestCapitalPayload {
+    pub protocol_version: String,
+    pub authenticated_subject_hash: [u8; 32],
+    pub account_id: [u8; 32],
+    pub identity_commitment: [u8; 32],
+    pub session_id: String,
+    pub chain: String,
+    pub asset: String,
+    #[serde(with = "super::decimal_u128")]
+    pub amount_atomic: u128,
+    pub seed_transaction_hash: [u8; 32],
+    pub funding_identity: String,
+}
+
+#[cfg(feature = "green-pool-certification")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GreenE03s05TestCapitalBinding {
+    pub authenticated_subject_hash: [u8; 32],
+    pub account_id: [u8; 32],
+    pub identity_commitment: [u8; 32],
+    pub session_id: String,
+    pub seed_transaction_hash: [u8; 32],
+}
+
+#[cfg(feature = "green-pool-certification")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GreenE03s05TestCapitalResponse {
+    pub request: DirectExecutionRequestEnvelope,
+    pub result: DirectExecutionTerminalResult,
+    pub enclave_receipt: EnclaveReceipt,
+    pub encrypted_journal_record: EncryptedJournalRecord,
+    #[serde(with = "serde_bytes")]
+    pub projection_payload: Vec<u8>,
+    pub financial_replay_key_sha256: [u8; 32],
+}
+
+#[cfg(feature = "green-pool-certification")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "outcome",
+    content = "response",
+    rename_all = "SCREAMING_SNAKE_CASE"
+)]
+pub enum GreenE03s05TestCapitalOutcome {
+    Applied(GreenE03s05TestCapitalResponse),
+    ReturnOriginal(GreenE03s05TestCapitalResponse),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DirectDepositCreditResponse {
@@ -411,6 +480,19 @@ pub enum DirectDepositCreditError {
     ReplayBinding,
 }
 
+#[cfg(feature = "green-pool-certification")]
+#[derive(Debug, thiserror::Error)]
+pub enum GreenE03s05TestCapitalError {
+    #[error(transparent)]
+    Contract(#[from] DirectExecutionContractError),
+    #[error(transparent)]
+    Core(#[from] CoreError),
+    #[error("invalid Green test-capital payload")]
+    InvalidPayload,
+    #[error("Green test-capital replay binding mismatch")]
+    ReplayBinding,
+}
+
 impl DirectDepositCreditPayload {
     fn decode_for(
         request: &DirectExecutionRequestEnvelope,
@@ -470,6 +552,90 @@ impl DirectDepositCreditPayload {
         hash.update([0]);
         hash.update(self.amount_atomic.to_string().as_bytes());
         hash.finalize().into()
+    }
+}
+
+#[cfg(feature = "green-pool-certification")]
+impl GreenE03s05TestCapitalPayload {
+    pub fn decode_for(
+        request: &DirectExecutionRequestEnvelope,
+        binding: &GreenE03s05TestCapitalBinding,
+    ) -> Result<Self, GreenE03s05TestCapitalError> {
+        if request.operation != DirectExecutionOperation::AllocateGreenE03s05TestCapital
+            || request.market_id.is_some()
+            || request.funding_identity.is_none()
+        {
+            return Err(GreenE03s05TestCapitalError::InvalidPayload);
+        }
+        let payload: Self = serde_json::from_slice(&request.canonical_payload)
+            .map_err(|_| GreenE03s05TestCapitalError::InvalidPayload)?;
+        let canonical = serde_json::to_vec(&payload)
+            .map_err(|_| GreenE03s05TestCapitalError::InvalidPayload)?;
+        if canonical != request.canonical_payload
+            || payload.protocol_version != GREEN_TEST_CAPITAL_PAYLOAD_VERSION
+            || payload.authenticated_subject_hash != request.authenticated_subject_hash
+            || payload.account_id != request.account_id
+            || payload.authenticated_subject_hash != binding.authenticated_subject_hash
+            || payload.account_id != binding.account_id
+            || payload.identity_commitment != binding.identity_commitment
+            || payload.session_id != binding.session_id
+            || payload.chain != "base"
+            || payload.asset != "USDC"
+            || payload.amount_atomic != 20_000_000
+            || payload.seed_transaction_hash == [0; 32]
+            || payload.seed_transaction_hash != binding.seed_transaction_hash
+            || payload.funding_identity != request.funding_identity.as_deref().unwrap_or_default()
+            || payload.funding_identity
+                != format!(
+                    "green-e03s05-test-capital:0x{}",
+                    hex::encode(payload.seed_transaction_hash)
+                )
+        {
+            return Err(GreenE03s05TestCapitalError::InvalidPayload);
+        }
+        Ok(payload)
+    }
+
+    fn financial_replay_key(&self) -> [u8; 32] {
+        domain_hash(
+            GREEN_TEST_CAPITAL_REPLAY_DOMAIN,
+            &self.seed_transaction_hash,
+        )
+    }
+
+    fn decode_for_unbound(
+        request: &DirectExecutionRequestEnvelope,
+    ) -> Result<Self, GreenE03s05TestCapitalError> {
+        if request.operation != DirectExecutionOperation::AllocateGreenE03s05TestCapital
+            || request.market_id.is_some()
+            || request.funding_identity.is_none()
+        {
+            return Err(GreenE03s05TestCapitalError::InvalidPayload);
+        }
+        let payload: Self = serde_json::from_slice(&request.canonical_payload)
+            .map_err(|_| GreenE03s05TestCapitalError::InvalidPayload)?;
+        let canonical = serde_json::to_vec(&payload)
+            .map_err(|_| GreenE03s05TestCapitalError::InvalidPayload)?;
+        if canonical != request.canonical_payload
+            || payload.protocol_version != GREEN_TEST_CAPITAL_PAYLOAD_VERSION
+            || payload.authenticated_subject_hash != request.authenticated_subject_hash
+            || payload.account_id != request.account_id
+            || payload.identity_commitment == [0; 32]
+            || payload.session_id.is_empty()
+            || payload.chain != "base"
+            || payload.asset != "USDC"
+            || payload.amount_atomic != 20_000_000
+            || payload.seed_transaction_hash == [0; 32]
+            || payload.funding_identity != request.funding_identity.as_deref().unwrap_or_default()
+            || payload.funding_identity
+                != format!(
+                    "green-e03s05-test-capital:0x{}",
+                    hex::encode(payload.seed_transaction_hash)
+                )
+        {
+            return Err(GreenE03s05TestCapitalError::InvalidPayload);
+        }
+        Ok(payload)
     }
 }
 
@@ -899,6 +1065,83 @@ impl DirectFinalResultIndex {
                 return Err(DirectExecutionContractError::IdempotencyIndex);
             }
         }
+        #[cfg(feature = "green-pool-certification")]
+        {
+            let mut green_replay_keys = BTreeSet::new();
+            for stored in self
+                .0
+                .values()
+                .filter(|stored| stored.marker_format_version == 3)
+            {
+                let response = stored_green_e03s05_test_capital_response(stored)
+                    .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?;
+                let replay_key = response.financial_replay_key_sha256;
+                let evidence = response
+                    .result
+                    .commit_evidence
+                    .as_ref()
+                    .ok_or(DirectExecutionContractError::IdempotencyIndex)?;
+                let mut unsigned = response.result.clone();
+                let signature = Signature::from_slice(&unsigned.signature)
+                    .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?;
+                unsigned.signature.clear();
+                let signature_payload = direct_domain_signing_payload(
+                    GREEN_TEST_CAPITAL_RESULT_SIGNATURE_DOMAIN,
+                    &unsigned,
+                )
+                .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?;
+                VerifyingKey::from_bytes(&verifying_key)
+                    .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?
+                    .verify(&signature_payload, &signature)
+                    .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?;
+                verify_enclave_receipt_signature(&response.enclave_receipt, verifying_key)
+                    .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?;
+                if response.result.result_commitment_sha256
+                    != domain_hash(
+                        GREEN_TEST_CAPITAL_RESULT_DOMAIN,
+                        &response.projection_payload,
+                    )
+                    || evidence.enclave_sequence != response.enclave_receipt.enclave_sequence
+                    || evidence.state_root != response.enclave_receipt.state_root
+                    || evidence.journal_head != response.enclave_receipt.journal_hash
+                    || evidence.restart_evidence_sha256
+                        != green_e03s05_test_capital_restart_evidence(
+                            &response.request,
+                            replay_key,
+                            evidence.enclave_sequence,
+                            evidence.state_root,
+                            evidence.journal_head,
+                        )
+                {
+                    return Err(DirectExecutionContractError::IdempotencyIndex);
+                }
+                if !green_replay_keys.insert(replay_key) {
+                    return Err(DirectExecutionContractError::IdempotencyIndex);
+                }
+                let system_key = format!("green-e03s05-test-capital:{}", hex::encode(replay_key));
+                let ledger_replay_key = format!(
+                    "green-e03s05-test-capital-evidence:{}",
+                    hex::encode(replay_key)
+                );
+                if !system_keys.contains(&system_key)
+                    || !ledger.offline_replay_keys().contains(&ledger_replay_key)
+                {
+                    return Err(DirectExecutionContractError::IdempotencyIndex);
+                }
+            }
+            for system_key in system_keys {
+                let Some(encoded) = system_key.strip_prefix("green-e03s05-test-capital:") else {
+                    continue;
+                };
+                let replay_key: [u8; 32] = hex::decode(encoded)
+                    .ok()
+                    .and_then(|value| value.try_into().ok())
+                    .ok_or(DirectExecutionContractError::IdempotencyIndex)?;
+                if !green_replay_keys.contains(&replay_key) {
+                    return Err(DirectExecutionContractError::IdempotencyIndex);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1037,6 +1280,25 @@ impl StoredDirectFinalResult {
                 validate_direct_withdrawal_response_bindings(&response, None)
                     .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?;
             }
+            #[cfg(feature = "green-pool-certification")]
+            3 => {
+                let request = self
+                    .request
+                    .as_ref()
+                    .ok_or(DirectExecutionContractError::IdempotencyIndex)?;
+                let payload = GreenE03s05TestCapitalPayload::decode_for_unbound(request)
+                    .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?;
+                if self.projection_payload != request.canonical_payload
+                    || self.enclave_receipt.is_none()
+                    || self.encrypted_journal_record.is_none()
+                    || self.financial_replay_key_sha256 != Some(payload.financial_replay_key())
+                    || self.withdrawal_authorization.is_some()
+                    || self.result.state != DirectExecutionTerminalState::Applied
+                    || self.result.effect != DirectExecutionEffect::Committed
+                {
+                    return Err(DirectExecutionContractError::IdempotencyIndex);
+                }
+            }
             _ => return Err(DirectExecutionContractError::IdempotencyIndex),
         }
         self.result
@@ -1106,7 +1368,7 @@ fn direct_final_result_marker_digest(
         .map_err(|_| DirectExecutionContractError::IdempotencyIndex)?;
         return Ok(domain_hash(DIRECT_FINAL_RESULT_MARKER_DOMAIN, &encoded));
     }
-    if !matches!(stored.marker_format_version, 1 | 2) {
+    if !matches!(stored.marker_format_version, 1 | 2 | 3) {
         return Err(DirectExecutionContractError::IdempotencyIndex);
     }
     // Deliberately exclude commitEvidence.stateRoot and signatures: the marker
@@ -1384,6 +1646,58 @@ fn direct_deposit_restart_evidence(
     bytes.extend_from_slice(&state_root);
     bytes.extend_from_slice(&journal_head);
     domain_hash(DIRECT_DEPOSIT_RESTART_DOMAIN, &bytes)
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn green_e03s05_test_capital_restart_evidence(
+    request: &DirectExecutionRequestEnvelope,
+    replay_key: [u8; 32],
+    sequence: u64,
+    state_root: [u8; 32],
+    journal_head: [u8; 32],
+) -> [u8; 32] {
+    let mut bytes = Vec::with_capacity(32 * 4 + 8);
+    bytes.extend_from_slice(&request.request_hash);
+    bytes.extend_from_slice(&replay_key);
+    bytes.extend_from_slice(&sequence.to_be_bytes());
+    bytes.extend_from_slice(&state_root);
+    bytes.extend_from_slice(&journal_head);
+    domain_hash(GREEN_TEST_CAPITAL_RESTART_DOMAIN, &bytes)
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn stored_green_e03s05_test_capital_response(
+    stored: &StoredDirectFinalResult,
+) -> Result<GreenE03s05TestCapitalResponse, GreenE03s05TestCapitalError> {
+    stored.validate()?;
+    let request = stored
+        .request
+        .clone()
+        .ok_or(GreenE03s05TestCapitalError::ReplayBinding)?;
+    GreenE03s05TestCapitalPayload::decode_for_unbound(&request)?;
+    if stored.marker_format_version != 3
+        || stored.result.state != DirectExecutionTerminalState::Applied
+        || stored.result.effect != DirectExecutionEffect::Committed
+        || stored.projection_payload != request.canonical_payload
+    {
+        return Err(GreenE03s05TestCapitalError::ReplayBinding);
+    }
+    Ok(GreenE03s05TestCapitalResponse {
+        request,
+        result: stored.result.clone(),
+        enclave_receipt: stored
+            .enclave_receipt
+            .clone()
+            .ok_or(GreenE03s05TestCapitalError::ReplayBinding)?,
+        encrypted_journal_record: stored
+            .encrypted_journal_record
+            .clone()
+            .ok_or(GreenE03s05TestCapitalError::ReplayBinding)?,
+        projection_payload: stored.projection_payload.clone(),
+        financial_replay_key_sha256: stored
+            .financial_replay_key_sha256
+            .ok_or(GreenE03s05TestCapitalError::ReplayBinding)?,
+    })
 }
 
 fn stored_direct_withdrawal_response(
@@ -3040,6 +3354,151 @@ mod direct_execution_contract_tests {
             Err(CoreError::JournalChainMismatch)
         ));
     }
+
+    #[cfg(feature = "green-pool-certification")]
+    #[test]
+    fn green_test_capital_is_exactly_once_policy_bound_and_restart_safe() {
+        use ed25519_dalek::SigningKey;
+
+        let now = 1_800_000_000_000i64;
+        let journal_key = JournalKey::from_bytes([0xa1; 32]);
+        let signer = ReceiptSigner::from_seed([0xa2; 32], [0xa3; 48]);
+        let identity = [0xa4; 32];
+        let account = [0xa5; 32];
+        let seed_hash = [0xa6; 32];
+        let session_id = "green-e03s05-test-session";
+        let binding = GreenE03s05TestCapitalBinding {
+            authenticated_subject_hash: account,
+            account_id: account,
+            identity_commitment: identity,
+            session_id: session_id.into(),
+            seed_transaction_hash: seed_hash,
+        };
+        let payload = GreenE03s05TestCapitalPayload {
+            protocol_version: GREEN_TEST_CAPITAL_PAYLOAD_VERSION.into(),
+            authenticated_subject_hash: account,
+            account_id: account,
+            identity_commitment: identity,
+            session_id: session_id.into(),
+            chain: "base".into(),
+            asset: "USDC".into(),
+            amount_atomic: 20_000_000,
+            seed_transaction_hash: seed_hash,
+            funding_identity: format!("green-e03s05-test-capital:0x{}", hex::encode(seed_hash)),
+        };
+        let request = DirectExecutionRequestEnvelope::new(
+            Uuid::from_u128(0xa7111111_1111_4111_8111_111111111111),
+            account,
+            account,
+            None,
+            Some(payload.funding_identity.clone()),
+            DirectExecutionOperation::AllocateGreenE03s05TestCapital,
+            serde_json::to_vec(&payload).unwrap(),
+            now,
+            now + 5_000,
+        )
+        .unwrap();
+        let mut no_session_core = PrivateTradingCore::new(
+            JournalKey::from_bytes([0xaf; 32]),
+            ReceiptSigner::from_seed([0xb0; 32], [0xb1; 48]),
+        );
+        assert!(matches!(
+            no_session_core.allocate_green_e03s05_test_capital(request.clone(), &binding, now + 1),
+            Err(GreenE03s05TestCapitalError::InvalidPayload)
+        ));
+        let mut core = PrivateTradingCore::new(journal_key.clone(), signer.clone());
+        core.register_session(
+            "register-green-e03s05-test-session".into(),
+            session_id.into(),
+            identity,
+            SigningKey::from_bytes(&[0xa7; 32])
+                .verifying_key()
+                .to_bytes(),
+            now + 60_000,
+            now,
+        )
+        .unwrap();
+        let applied = core
+            .allocate_green_e03s05_test_capital(request.clone(), &binding, now + 1)
+            .unwrap();
+        let GreenE03s05TestCapitalOutcome::Applied(applied) = applied else {
+            panic!("expected allocation")
+        };
+        assert_eq!(applied.result.state, DirectExecutionTerminalState::Applied);
+        assert_eq!(
+            core.ledger
+                .total_for_owner_asset("layrs:green-e03s05-test-capital", "USDC"),
+            20_000_000
+        );
+        let replay = core
+            .allocate_green_e03s05_test_capital(request.clone(), &binding, now + 2)
+            .unwrap();
+        let GreenE03s05TestCapitalOutcome::ReturnOriginal(replay) = replay else {
+            panic!("expected replay")
+        };
+        assert_eq!(
+            serde_json::to_vec(&applied).unwrap(),
+            serde_json::to_vec(&replay).unwrap()
+        );
+        let second_request = DirectExecutionRequestEnvelope::new(
+            Uuid::from_u128(0xa9111111_1111_4111_8111_111111111111),
+            account,
+            account,
+            None,
+            Some(payload.funding_identity.clone()),
+            DirectExecutionOperation::AllocateGreenE03s05TestCapital,
+            serde_json::to_vec(&payload).unwrap(),
+            now,
+            now + 5_000,
+        )
+        .unwrap();
+        assert!(matches!(
+            core.allocate_green_e03s05_test_capital(second_request, &binding, now + 2),
+            Ok(GreenE03s05TestCapitalOutcome::ReturnOriginal(_))
+        ));
+
+        let snapshot = core.export_encrypted_snapshot().unwrap();
+        let mut restored =
+            PrivateTradingCore::restore_encrypted_snapshot(journal_key, signer, &snapshot, 0)
+                .unwrap();
+        let recovered = restored
+            .replay_green_e03s05_test_capital(&request)
+            .unwrap()
+            .expect("sealed terminal allocation");
+        assert_eq!(
+            serde_json::to_vec(&applied).unwrap(),
+            serde_json::to_vec(&recovered).unwrap()
+        );
+        let after_restart = restored
+            .allocate_green_e03s05_test_capital(request.clone(), &binding, now + 3)
+            .unwrap();
+        let GreenE03s05TestCapitalOutcome::ReturnOriginal(after_restart) = after_restart else {
+            panic!("expected restart replay")
+        };
+        assert_eq!(
+            serde_json::to_vec(&applied).unwrap(),
+            serde_json::to_vec(&after_restart).unwrap()
+        );
+
+        let mut wrong = payload;
+        wrong.amount_atomic = 19_999_999;
+        let wrong_request = DirectExecutionRequestEnvelope::new(
+            Uuid::from_u128(0xa8111111_1111_4111_8111_111111111111),
+            account,
+            account,
+            None,
+            Some(wrong.funding_identity.clone()),
+            DirectExecutionOperation::AllocateGreenE03s05TestCapital,
+            serde_json::to_vec(&wrong).unwrap(),
+            now,
+            now + 5_000,
+        )
+        .unwrap();
+        assert!(matches!(
+            restored.allocate_green_e03s05_test_capital(wrong_request, &binding, now + 4),
+            Err(GreenE03s05TestCapitalError::InvalidPayload)
+        ));
+    }
 }
 
 fn minimum_public_depth_distinct_owners(market_id: &str) -> usize {
@@ -4130,6 +4589,11 @@ enum JournaledSystemCommand {
         idempotency_key: String,
         flow: ExternalFlowTransaction,
     },
+    #[cfg(feature = "green-pool-certification")]
+    GreenE03s05TestCapitalAllocation {
+        idempotency_key: String,
+        flow: ExternalFlowTransaction,
+    },
     ConfirmedWithdrawal {
         idempotency_key: String,
         flow: ExternalFlowTransaction,
@@ -4936,6 +5400,224 @@ impl PrivateTradingCore {
             response,
             Some(self.receipt_signer.verifying_key()),
         )
+    }
+
+    /// Executes the single Green E03-S05 test-capital allocation. This is
+    /// feature-gated and policy-bound by the enclave caller; no deposit or
+    /// generic capital-mint operation shares this path.
+    #[cfg(feature = "green-pool-certification")]
+    pub fn allocate_green_e03s05_test_capital(
+        &mut self,
+        request: DirectExecutionRequestEnvelope,
+        binding: &GreenE03s05TestCapitalBinding,
+        now_millis: i64,
+    ) -> Result<GreenE03s05TestCapitalOutcome, GreenE03s05TestCapitalError> {
+        request.validate()?;
+        let payload = GreenE03s05TestCapitalPayload::decode_for(&request, binding)?;
+        let expected_owner =
+            derive_private_user_id(&self.identity_key, &payload.identity_commitment);
+        if self.sessions.active_owner(&payload.session_id, now_millis)
+            != Some(expected_owner.as_str())
+        {
+            return Err(GreenE03s05TestCapitalError::InvalidPayload);
+        }
+        let replay_key = payload.financial_replay_key();
+        let result_key = direct_final_result_key(&request.account_id, request.request_id);
+        if let Some(stored) = self.direct_final_results.0.get(&result_key) {
+            if stored.request_hash != request.request_hash || stored.marker_format_version != 3 {
+                return Err(GreenE03s05TestCapitalError::ReplayBinding);
+            }
+            return Ok(GreenE03s05TestCapitalOutcome::ReturnOriginal(
+                stored_green_e03s05_test_capital_response(stored)?,
+            ));
+        }
+        if let Some(stored) = self.direct_final_results.0.values().find(|stored| {
+            stored.marker_format_version == 3
+                && stored.financial_replay_key_sha256 == Some(replay_key)
+        }) {
+            let original = stored_green_e03s05_test_capital_response(stored)?;
+            if original.projection_payload != request.canonical_payload {
+                return Err(GreenE03s05TestCapitalError::ReplayBinding);
+            }
+            return Ok(GreenE03s05TestCapitalOutcome::ReturnOriginal(original));
+        }
+        if now_millis >= request.deadline_millis {
+            return Err(GreenE03s05TestCapitalError::InvalidPayload);
+        }
+
+        let account = AccountKey::new(expected_owner, AccountBucket::UserAvailable, "USDC");
+        let system_key = format!("green-e03s05-test-capital:{}", hex::encode(replay_key));
+        let flow = ExternalFlowTransaction {
+            idempotency_key: system_key.clone(),
+            evidence_hash: replay_key,
+            account,
+            amount: payload.amount_atomic,
+            direction: ExternalFlowDirection::Inflow,
+        };
+        let prior_root = self.state_root();
+        let mut ledger = self.ledger.clone();
+        ledger.apply_green_e03s05_test_capital(flow.clone())?;
+        let mut system_keys = self.system_keys.clone();
+        if !system_keys.insert(system_key.clone()) {
+            return Err(GreenE03s05TestCapitalError::ReplayBinding);
+        }
+        let next_sequence = checked_sequence(self.sequence)?;
+        let projection_payload = request.canonical_payload.clone();
+        let result_commitment = domain_hash(GREEN_TEST_CAPITAL_RESULT_DOMAIN, &projection_payload);
+        let marker_key = direct_final_result_marker_key(&result_key);
+        let marker_digest = direct_final_result_semantic_marker_digest(
+            request.account_id,
+            request.request_id,
+            request.request_hash,
+            DirectExecutionTerminalState::Applied,
+            DirectExecutionEffect::Committed,
+            DirectExecutionRetryPolicy::ReturnOriginalResult,
+            &None,
+            result_commitment,
+            Some(replay_key),
+        )?;
+        let mut processed = self.processed.clone();
+        if processed
+            .insert(
+                marker_key,
+                ProcessedCommand {
+                    request_hash: marker_digest,
+                    response: None,
+                },
+            )
+            .is_some()
+        {
+            return Err(GreenE03s05TestCapitalError::ReplayBinding);
+        }
+        let next_root = state_root(
+            &ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&processed),
+            &system_keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let mut journal = self.journal.clone();
+        let record = journal.append(
+            next_root,
+            &JournaledSystemCommand::GreenE03s05TestCapitalAllocation {
+                idempotency_key: system_key,
+                flow,
+            },
+        )?;
+        let receipt = self.receipt_signer.sign(
+            "allocate-green-e03s05-test-capital".into(),
+            request.request_id.hyphenated().to_string(),
+            Some(request.request_hash),
+            Some(false),
+            Some(result_commitment),
+            Some(true),
+            next_sequence,
+            prior_root,
+            next_root,
+            record.record_hash,
+            now_millis,
+        );
+        let signed_receipt_sha256 = domain_hash(
+            b"layrs.green-e03s05-test-capital.enclave-receipt.v1\0",
+            &serde_json::to_vec(&receipt)
+                .map_err(|_| GreenE03s05TestCapitalError::ReplayBinding)?,
+        );
+        let restart_evidence_sha256 = green_e03s05_test_capital_restart_evidence(
+            &request,
+            replay_key,
+            next_sequence,
+            next_root,
+            record.record_hash,
+        );
+        let mut result = DirectExecutionTerminalResult {
+            protocol_version: DIRECT_EXECUTION_PROTOCOL_VERSION.into(),
+            request_id: request.request_id,
+            request_hash: request.request_hash,
+            state: DirectExecutionTerminalState::Applied,
+            effect: DirectExecutionEffect::Committed,
+            retry_policy: DirectExecutionRetryPolicy::ReturnOriginalResult,
+            error_code: None,
+            commit_evidence: Some(DirectExecutionCommitEvidence {
+                enclave_sequence: next_sequence,
+                state_root: next_root,
+                journal_head: record.record_hash,
+                signed_receipt_sha256,
+                restart_evidence_sha256,
+            }),
+            result_commitment_sha256: result_commitment,
+            signed_at_millis: now_millis,
+            signature: Vec::new(),
+        };
+        result.signature = self
+            .receipt_signer
+            .sign_domain_payload(GREEN_TEST_CAPITAL_RESULT_SIGNATURE_DOMAIN, &result);
+        result.validate_for(&request)?;
+        let stored = StoredDirectFinalResult {
+            account_id: request.account_id,
+            request_id: request.request_id,
+            request_hash: request.request_hash,
+            result: result.clone(),
+            request: Some(request.clone()),
+            projection_payload: projection_payload.clone(),
+            enclave_receipt: Some(receipt.clone()),
+            encrypted_journal_record: Some(record.clone()),
+            financial_replay_key_sha256: Some(replay_key),
+            withdrawal_authorization: None,
+            marker_format_version: 3,
+        };
+        stored.validate()?;
+        let mut direct_results = self.direct_final_results.clone();
+        if direct_results.0.insert(result_key, stored).is_some() {
+            return Err(GreenE03s05TestCapitalError::ReplayBinding);
+        }
+        direct_results.validate_rooted(&processed_hashes(&processed))?;
+        self.ledger = ledger;
+        self.system_keys = system_keys;
+        self.processed = processed;
+        self.direct_final_results = direct_results;
+        self.journal = journal;
+        self.sequence = next_sequence;
+        *self.custody_totals_cache.borrow_mut() = None;
+        Ok(GreenE03s05TestCapitalOutcome::Applied(
+            GreenE03s05TestCapitalResponse {
+                request,
+                result,
+                enclave_receipt: receipt,
+                encrypted_journal_record: record,
+                projection_payload,
+                financial_replay_key_sha256: replay_key,
+            },
+        ))
+    }
+
+    /// Recovery-only lookup for a sealed terminal allocation. It cannot
+    /// create a result and deliberately does not accept a replacement seed.
+    #[cfg(feature = "green-pool-certification")]
+    pub fn replay_green_e03s05_test_capital(
+        &self,
+        request: &DirectExecutionRequestEnvelope,
+    ) -> Result<Option<GreenE03s05TestCapitalResponse>, GreenE03s05TestCapitalError> {
+        request.validate()?;
+        let result_key = direct_final_result_key(&request.account_id, request.request_id);
+        let Some(stored) = self.direct_final_results.0.get(&result_key) else {
+            return Ok(None);
+        };
+        if stored.marker_format_version != 3 || stored.request_hash != request.request_hash {
+            return Err(GreenE03s05TestCapitalError::ReplayBinding);
+        }
+        let response = stored_green_e03s05_test_capital_response(stored)?;
+        if response.request != *request {
+            return Err(GreenE03s05TestCapitalError::ReplayBinding);
+        }
+        Ok(Some(response))
     }
 
     /// Executes reserve/finalize/release as one direct, terminal TEE mutation.

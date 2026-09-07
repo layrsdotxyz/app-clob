@@ -60,6 +60,11 @@ pub use engine::{
     INCIDENT_TERMINAL_JOURNAL_HEAD_HEX, INCIDENT_TERMINAL_SEQUENCE,
     INCIDENT_TERMINAL_STATE_ROOT_HEX,
 };
+#[cfg(feature = "green-pool-certification")]
+pub use engine::{
+    GreenE03s05TestCapitalBinding, GreenE03s05TestCapitalOutcome, GreenE03s05TestCapitalPayload,
+    GreenE03s05TestCapitalResponse,
+};
 pub use journal::{
     command_result_commitment, CommandReceiptState, EnclaveReceipt, EncryptedJournal,
     EncryptedJournalRecord, EncryptedSnapshot, JournalKey, ReceiptSigner,
