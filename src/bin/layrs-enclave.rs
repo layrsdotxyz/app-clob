@@ -49,6 +49,10 @@ use clob_service::private_core::{
     INCIDENT_TERMINAL_CIPHERTEXT_SHA256_HEX, INCIDENT_TERMINAL_JOURNAL_HEAD_HEX,
     INCIDENT_TERMINAL_SEQUENCE, INCIDENT_TERMINAL_STATE_ROOT_HEX,
 };
+#[cfg(feature = "green-pool-certification")]
+use clob_service::private_core::{
+    DirectDepositCreditPayload, DirectExecutionOperation, DirectWithdrawalPayload,
+};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use ethers_core::{
     types::{transaction::eip2718::TypedTransaction, U256},
@@ -1544,7 +1548,7 @@ async fn handle_encrypted(
         };
     }
     #[cfg(feature = "green-pool-certification")]
-    if !green_pool_certification_request_allowed(&request) {
+    if !green_pool_certification_request_allowed(&state, &request) {
         return WireResponse::Error {
             code: "GREEN_POOL_CERTIFICATION_ONLY",
         };
@@ -2433,7 +2437,7 @@ fn direct_execution_request(state: &EnclaveState, request: &PlainRequest) -> boo
 /// to certify E03-S05. In particular, bridge, resolution, reward, market and
 /// audit signing authority remain unreachable even if their code is linked.
 #[cfg(feature = "green-pool-certification")]
-fn green_pool_certification_request_allowed(request: &PlainRequest) -> bool {
+fn green_pool_certification_request_allowed(state: &EnclaveState, request: &PlainRequest) -> bool {
     match request {
         PlainRequest::User { command, .. } => direct_base_usdc_withdrawal(&command.action),
         PlainRequest::AggregateDepth { .. } => false,
@@ -2444,12 +2448,33 @@ fn green_pool_certification_request_allowed(request: &PlainRequest) -> bool {
             | OperatorCommand::ChainSignerStatus
             | OperatorCommand::BeginChainSignerProvision { .. }
             | OperatorCommand::CompleteChainSignerProvision { .. }
-            | OperatorCommand::SignGreenPoolSeed { .. }
-            | OperatorCommand::DirectCreditDeposit { .. }
-            | OperatorCommand::DirectDepositCreditLookup { .. }
-            | OperatorCommand::DirectWithdrawal { .. }
-            | OperatorCommand::DirectWithdrawalLookup { .. }
-            | OperatorCommand::RecoverWithdrawalAuthorization { .. } => true,
+            | OperatorCommand::SignGreenPoolSeed { .. } => true,
+            OperatorCommand::DirectCreditDeposit { request } => {
+                green_base_usdc_deposit_request(request)
+            }
+            OperatorCommand::DirectDepositCreditLookup {
+                account_id,
+                financial_replay_key_sha256,
+            } => state.core.as_ref().is_some_and(|core| {
+                match core.direct_deposit_credit_lookup(*account_id, *financial_replay_key_sha256) {
+                    Ok(Some(response)) => green_base_usdc_deposit_request(&response.request),
+                    Ok(None) => false,
+                    Err(_) => false,
+                }
+            }),
+            OperatorCommand::DirectWithdrawal { request } => {
+                green_base_usdc_withdrawal_request(request)
+            }
+            OperatorCommand::DirectWithdrawalLookup {
+                account_id,
+                operation_replay_key_sha256,
+            } => state.core.as_ref().is_some_and(|core| {
+                match core.direct_withdrawal_lookup(*account_id, *operation_replay_key_sha256) {
+                    Ok(Some(response)) => green_base_usdc_withdrawal_request(&response.request),
+                    Ok(None) => false,
+                    Err(_) => false,
+                }
+            }),
             OperatorCommand::SignPoolWithdrawal {
                 idempotency_key,
                 authorization,
@@ -2490,6 +2515,28 @@ fn green_pool_certification_request_allowed(request: &PlainRequest) -> bool {
             _ => false,
         },
     }
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn green_base_usdc_deposit_request(request: &DirectExecutionRequestEnvelope) -> bool {
+    request.operation == DirectExecutionOperation::CreditDeposit
+        && serde_json::from_slice::<DirectDepositCreditPayload>(&request.canonical_payload)
+            .is_ok_and(|payload| {
+                payload.asset == "USDC"
+                    && payload.source_chain == "eip155:8453"
+                    && payload.pool_chain == "base"
+            })
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn green_base_usdc_withdrawal_request(request: &DirectExecutionRequestEnvelope) -> bool {
+    matches!(
+        request.operation,
+        DirectExecutionOperation::ReserveWithdrawal
+            | DirectExecutionOperation::FinalizeWithdrawal
+            | DirectExecutionOperation::ReleaseWithdrawal
+    ) && serde_json::from_slice::<DirectWithdrawalPayload>(&request.canonical_payload)
+        .is_ok_and(|payload| payload.chain == "base" && payload.asset == "USDC")
 }
 
 fn direct_deposit_operator_command(command: &OperatorCommand) -> bool {
@@ -7837,6 +7884,125 @@ mod tests {
     fn green_certification_firewall_allows_only_base_funding_and_provisioning() {
         use clob_service::private_core::{SessionRequest, SignedSessionRequest};
 
+        let operator_signer = SigningKey::from_bytes(&[0x71; 32]);
+        let receipt_signer = ReceiptSigner::from_seed([0x72; 32], [0x73; 48]);
+        let receipt_public_key = receipt_signer.verifying_key();
+        let mut core = PrivateTradingCore::new(JournalKey::from_bytes([0x74; 32]), receipt_signer);
+        let direct_deposit = direct_deposit_request_for_wire(
+            Uuid::from_u128(0x71111111_1111_4111_8111_111111111111),
+            [0x75; 32],
+            [0x76; 32],
+            1_800_000_000_000,
+        );
+        let deposit_replay_key = match core
+            .direct_credit_deposit(direct_deposit.clone(), direct_deposit.issued_at_millis + 1)
+            .unwrap()
+        {
+            DirectDepositCreditOutcome::Applied(response) => response.financial_replay_key_sha256,
+            other => panic!("unexpected direct deposit outcome: {other:?}"),
+        };
+        let mut zen_lookup_payload: DirectDepositCreditPayload =
+            serde_json::from_slice(&direct_deposit.canonical_payload).unwrap();
+        zen_lookup_payload.deposit_id = Uuid::from_u128(0x73111111_1111_4111_8111_111111111111);
+        zen_lookup_payload.authenticated_subject_hash = [0x77; 32];
+        zen_lookup_payload.account_id = [0x77; 32];
+        zen_lookup_payload.identity_commitment = [0x78; 32];
+        zen_lookup_payload.asset = "ZEN".into();
+        zen_lookup_payload.source_chain = "eip155:26514".into();
+        zen_lookup_payload.source_transaction_hash = [0x79; 32];
+        zen_lookup_payload.pool_chain = "horizen".into();
+        zen_lookup_payload.pool_transaction_hash = [0x7a; 32];
+        zen_lookup_payload.funding_identity = "deposit:73111111-1111-4111-8111-111111111111".into();
+        let mut zen_evidence = Sha256::new();
+        zen_evidence.update(b"layrs.deposit-pool-receipt.v1\0");
+        zen_evidence.update(zen_lookup_payload.pool_chain.as_bytes());
+        zen_evidence.update([0]);
+        zen_evidence.update(
+            format!(
+                "0x{}",
+                hex::encode(zen_lookup_payload.pool_transaction_hash)
+            )
+            .as_bytes(),
+        );
+        zen_evidence.update([0]);
+        zen_evidence.update(zen_lookup_payload.pool_log_index.to_string().as_bytes());
+        zen_evidence.update([0]);
+        zen_evidence.update(zen_lookup_payload.asset.as_bytes());
+        zen_evidence.update([0]);
+        zen_evidence.update(zen_lookup_payload.amount_atomic.to_string().as_bytes());
+        zen_lookup_payload.pool_receipt_evidence_sha256 = zen_evidence.finalize().into();
+        let zen_lookup_request = DirectExecutionRequestEnvelope::new(
+            Uuid::from_u128(0x73222222_2222_4222_8222_222222222222),
+            zen_lookup_payload.authenticated_subject_hash,
+            zen_lookup_payload.account_id,
+            None,
+            Some(zen_lookup_payload.funding_identity.clone()),
+            DirectExecutionOperation::CreditDeposit,
+            serde_json::to_vec(&zen_lookup_payload).unwrap(),
+            1_800_000_000_000,
+            1_800_000_005_000,
+        )
+        .unwrap();
+        let zen_replay_key = match core
+            .direct_credit_deposit(zen_lookup_request.clone(), 1_800_000_000_001)
+            .unwrap()
+        {
+            DirectDepositCreditOutcome::Applied(response) => response.financial_replay_key_sha256,
+            other => panic!("unexpected ZEN deposit outcome: {other:?}"),
+        };
+        let direct_withdrawal = direct_withdrawal_request_for_wire(
+            Uuid::from_u128(0x72111111_1111_4111_8111_111111111111),
+            Uuid::from_u128(0x72222222_2222_4222_8222_222222222222),
+            [0x75; 32],
+            [0x76; 32],
+            1_800_000_000_000,
+        );
+        let withdrawal_replay_key = match core
+            .direct_withdrawal(
+                direct_withdrawal.clone(),
+                direct_withdrawal.issued_at_millis + 1,
+            )
+            .unwrap()
+        {
+            DirectWithdrawalOutcome::Applied(response) => response.operation_replay_key_sha256,
+            other => panic!("unexpected direct withdrawal outcome: {other:?}"),
+        };
+        let zen_withdrawal_id = Uuid::from_u128(0x73333333_3333_4333_8333_333333333333);
+        let zen_withdrawal_payload = DirectWithdrawalPayload {
+            protocol_version: "layrs.direct-withdrawal.v1".into(),
+            withdrawal_id: zen_withdrawal_id,
+            authenticated_subject_hash: zen_lookup_payload.authenticated_subject_hash,
+            account_id: zen_lookup_payload.account_id,
+            identity_commitment: zen_lookup_payload.identity_commitment,
+            session_id: "green-cross-asset-session".into(),
+            chain: "horizen".into(),
+            asset: "ZEN".into(),
+            amount_atomic: 1,
+            destination: "0x1111111111111111111111111111111111111111".into(),
+            evidence_hash: None,
+            funding_identity: format!("withdrawal:{zen_withdrawal_id}"),
+        };
+        let zen_withdrawal_request = DirectExecutionRequestEnvelope::new(
+            Uuid::from_u128(0x73444444_4444_4444_8444_444444444444),
+            zen_withdrawal_payload.authenticated_subject_hash,
+            zen_withdrawal_payload.account_id,
+            None,
+            Some(zen_withdrawal_payload.funding_identity.clone()),
+            DirectExecutionOperation::ReserveWithdrawal,
+            serde_json::to_vec(&zen_withdrawal_payload).unwrap(),
+            1_800_000_000_000,
+            1_800_000_005_000,
+        )
+        .unwrap();
+        let zen_withdrawal_replay_key = match core
+            .direct_withdrawal(zen_withdrawal_request.clone(), 1_800_000_000_001)
+            .unwrap()
+        {
+            DirectWithdrawalOutcome::Applied(response) => response.operation_replay_key_sha256,
+            other => panic!("unexpected ZEN withdrawal outcome: {other:?}"),
+        };
+        let state =
+            direct_deposit_test_state(operator_signer.verifying_key(), receipt_public_key, core);
         let operator_request = |command| PlainRequest::Operator {
             envelope: OperatorEnvelope {
                 nonce: [7; 32],
@@ -7847,41 +8013,56 @@ mod tests {
         for command in [
             OperatorCommand::ProvisionStatus,
             OperatorCommand::ChainSignerStatus,
-            OperatorCommand::DirectDepositCreditLookup {
-                account_id: [1; 32],
-                financial_replay_key_sha256: [2; 32],
-            },
-            OperatorCommand::DirectWithdrawalLookup {
-                account_id: [1; 32],
-                operation_replay_key_sha256: [3; 32],
-            },
-            OperatorCommand::RecoverWithdrawalAuthorization {
-                withdrawal_id: Uuid::from_u128(1),
-                session_id: "green-certification-session".into(),
-                terminal_record: None,
-                now_millis: 1,
-            },
         ] {
-            assert!(green_pool_certification_request_allowed(&operator_request(
-                command
-            )));
+            assert!(green_pool_certification_request_allowed(
+                &state,
+                &operator_request(command)
+            ));
         }
+
+        assert!(green_pool_certification_request_allowed(
+            &state,
+            &operator_request(OperatorCommand::DirectCreditDeposit {
+                request: direct_deposit.clone(),
+            })
+        ));
+        assert!(green_pool_certification_request_allowed(
+            &state,
+            &operator_request(OperatorCommand::DirectWithdrawal {
+                request: direct_withdrawal.clone(),
+            })
+        ));
+        assert!(green_pool_certification_request_allowed(
+            &state,
+            &operator_request(OperatorCommand::DirectDepositCreditLookup {
+                account_id: direct_deposit.account_id,
+                financial_replay_key_sha256: deposit_replay_key,
+            })
+        ));
+        assert!(green_pool_certification_request_allowed(
+            &state,
+            &operator_request(OperatorCommand::DirectWithdrawalLookup {
+                account_id: direct_withdrawal.account_id,
+                operation_replay_key_sha256: withdrawal_replay_key,
+            })
+        ));
 
         let authorization = signed_green_authorization(
             &SigningKey::from_bytes(&[92u8; 32]),
             GreenPoolTransitionOperation::SeedBasePool,
             1_800_000_000_000,
         );
-        assert!(green_pool_certification_request_allowed(&operator_request(
-            OperatorCommand::SignGreenPoolSeed {
+        assert!(green_pool_certification_request_allowed(
+            &state,
+            &operator_request(OperatorCommand::SignGreenPoolSeed {
                 authorization,
                 nonce: GREEN_POOL_SEED_NONCE,
                 gas_limit: GREEN_POOL_SEED_GAS_LIMIT,
                 max_fee_per_gas_wei: GREEN_POOL_SEED_MAX_FEE_PER_GAS_WEI.into(),
                 max_priority_fee_per_gas_wei: GREEN_POOL_SEED_MAX_PRIORITY_FEE_PER_GAS_WEI.into(),
                 now_millis: 1,
-            }
-        )));
+            })
+        ));
 
         for command in [
             OperatorCommand::PolymarketStatus,
@@ -7893,9 +8074,51 @@ mod tests {
             },
         ] {
             assert!(!green_pool_certification_request_allowed(
+                &state,
                 &operator_request(command)
             ));
         }
+
+        let mut zen_deposit_payload: DirectDepositCreditPayload =
+            serde_json::from_slice(&direct_deposit.canonical_payload).unwrap();
+        zen_deposit_payload.asset = "ZEN".into();
+        zen_deposit_payload.source_chain = "eip155:26514".into();
+        zen_deposit_payload.pool_chain = "horizen".into();
+        let mut zen_deposit = direct_deposit.clone();
+        zen_deposit.canonical_payload = serde_json::to_vec(&zen_deposit_payload).unwrap();
+        assert!(!green_pool_certification_request_allowed(
+            &state,
+            &operator_request(OperatorCommand::DirectCreditDeposit {
+                request: zen_deposit,
+            })
+        ));
+
+        for (chain, asset) in [("base", "ZEN"), ("horizen", "ZEN")] {
+            let mut payload: DirectWithdrawalPayload =
+                serde_json::from_slice(&direct_withdrawal.canonical_payload).unwrap();
+            payload.chain = chain.into();
+            payload.asset = asset.into();
+            let mut request = direct_withdrawal.clone();
+            request.canonical_payload = serde_json::to_vec(&payload).unwrap();
+            assert!(!green_pool_certification_request_allowed(
+                &state,
+                &operator_request(OperatorCommand::DirectWithdrawal { request })
+            ));
+        }
+        assert!(!green_pool_certification_request_allowed(
+            &state,
+            &operator_request(OperatorCommand::DirectDepositCreditLookup {
+                account_id: zen_lookup_request.account_id,
+                financial_replay_key_sha256: zen_replay_key,
+            })
+        ));
+        assert!(!green_pool_certification_request_allowed(
+            &state,
+            &operator_request(OperatorCommand::DirectWithdrawalLookup {
+                account_id: zen_withdrawal_request.account_id,
+                operation_replay_key_sha256: zen_withdrawal_replay_key,
+            })
+        ));
 
         let user_request = |action| PlainRequest::User {
             command: UserCommand {
@@ -7915,19 +8138,22 @@ mod tests {
             },
             now_millis: 1,
         };
-        assert!(green_pool_certification_request_allowed(&user_request(
-            UserCommandAction::RequestWithdrawal {
+        assert!(green_pool_certification_request_allowed(
+            &state,
+            &user_request(UserCommandAction::RequestWithdrawal {
                 withdrawal_id: Uuid::from_u128(2),
                 chain: "base".into(),
                 asset: "USDC".into(),
                 amount_atomic: 1,
                 destination: "0x1111111111111111111111111111111111111111".into(),
-            }
-        )));
-        assert!(!green_pool_certification_request_allowed(&user_request(
-            UserCommandAction::Portfolio
-        )));
+            })
+        ));
         assert!(!green_pool_certification_request_allowed(
+            &state,
+            &user_request(UserCommandAction::Portfolio)
+        ));
+        assert!(!green_pool_certification_request_allowed(
+            &state,
             &PlainRequest::AggregateDepth {
                 market_id: "layrs:v5:BTC:USDC:1h:1788390000".into(),
                 outcome: clob_service::private_core::Outcome::Up,
