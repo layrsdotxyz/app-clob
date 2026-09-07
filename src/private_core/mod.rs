@@ -63,7 +63,8 @@ pub use engine::{
 #[cfg(feature = "green-pool-certification")]
 pub use engine::{
     GreenE03s05TestCapitalBinding, GreenE03s05TestCapitalOutcome, GreenE03s05TestCapitalPayload,
-    GreenE03s05TestCapitalResponse,
+    GreenE03s05TestCapitalResponse, GreenNativeRefundCompletion,
+    GreenNativeRefundTerminalTransaction,
 };
 pub use journal::{
     command_result_commitment, CommandReceiptState, EnclaveReceipt, EncryptedJournal,

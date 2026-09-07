@@ -53,6 +53,7 @@ use clob_service::private_core::{
 use clob_service::private_core::{
     DirectDepositCreditPayload, DirectExecutionOperation, DirectWithdrawalPayload,
     GreenE03s05TestCapitalBinding, GreenE03s05TestCapitalOutcome, GreenE03s05TestCapitalPayload,
+    GreenNativeRefundCompletion, GreenNativeRefundTerminalTransaction,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use ethers_core::{
@@ -1098,6 +1099,8 @@ enum PlainResponse {
         destination_chain_id: u64,
         destination_asset: String,
         transaction: GreenNativeRefundTransaction,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        response: Option<SystemResponse>,
     },
     BridgeApprovalSigned {
         approval: BridgeApprovalSignature,
@@ -1186,8 +1189,6 @@ struct EnclaveState {
     chain_signer: Option<EnclaveChainSigner>,
     #[cfg(feature = "green-pool-certification")]
     completed_green_pool_seed: Option<CompletedGreenPoolSeed>,
-    #[cfg(feature = "green-pool-certification")]
-    completed_green_native_refund: Option<CompletedGreenNativeRefund>,
     pending_audit_signer_provision: Option<PendingAuditSignerProvision>,
     audit_signer: Option<EnclaveAuditSigner>,
 }
@@ -1360,14 +1361,6 @@ struct CompletedGreenPoolSeed {
     transaction: GreenPoolSeedTransaction,
 }
 
-#[cfg(feature = "green-pool-certification")]
-#[derive(Clone)]
-struct CompletedGreenNativeRefund {
-    operation_id: String,
-    command_commitment: [u8; 32],
-    transaction: GreenNativeRefundTransaction,
-}
-
 struct PendingAuditSignerProvision {
     recipient_private_key: PKey<Private>,
     bundle_nonce: [u8; 12],
@@ -1416,8 +1409,6 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         chain_signer: None,
         #[cfg(feature = "green-pool-certification")]
         completed_green_pool_seed: None,
-        #[cfg(feature = "green-pool-certification")]
-        completed_green_native_refund: None,
         pending_audit_signer_provision: None,
         audit_signer: None,
     }));
@@ -1907,6 +1898,11 @@ async fn handle_encrypted(
             response: Some(response),
             ..
         } => vec![response.encrypted_record.clone()],
+        #[cfg(feature = "green-pool-certification")]
+        PlainResponse::GreenBaseNativeRefundSigned {
+            response: Some(response),
+            ..
+        } => vec![response.encrypted_record.clone()],
         _ => Vec::new(),
     };
     let snapshot_artifacts = match &response {
@@ -1922,6 +1918,28 @@ async fn handle_encrypted(
         | PlainResponse::DirectDepositCreditLookup { response: Some(_) }
         | PlainResponse::DirectWithdrawal { .. }
         | PlainResponse::DirectWithdrawalLookup { response: Some(_) } => match state
+            .core
+            .as_ref()
+            .and_then(|core| core.export_encrypted_snapshot().ok())
+        {
+            Some(snapshot) => vec![snapshot],
+            None => {
+                if let Some(core) = rollback_core.take() {
+                    state.core = Some(core);
+                    state.transport_nonces.forget(&replay_key);
+                    if let Some(nonce) = rollback_operator_nonce.take() {
+                        state.operator_nonces.forget(&nonce);
+                    }
+                }
+                return WireResponse::Error {
+                    code: "SNAPSHOT_EXPORT_FAILED",
+                };
+            }
+        },
+        #[cfg(feature = "green-pool-certification")]
+        PlainResponse::GreenBaseNativeRefundSigned {
+            response: Some(_), ..
+        } => match state
             .core
             .as_ref()
             .and_then(|core| core.export_encrypted_snapshot().ok())
@@ -1982,6 +2000,11 @@ async fn handle_encrypted(
         } => {
             vec![response.receipt.clone()]
         }
+        #[cfg(feature = "green-pool-certification")]
+        PlainResponse::GreenBaseNativeRefundSigned {
+            response: Some(response),
+            ..
+        } => vec![response.receipt.clone()],
         _ => Vec::new(),
     };
     let audit_artifacts = match &response {
@@ -2721,6 +2744,13 @@ fn direct_execution_reuses_archived_snapshot(response: &PlainResponse) -> bool {
         PlainResponse::GreenE03s05TestCapital {
             outcome: GreenE03s05TestCapitalOutcome::ReturnOriginal(_),
         }
+    ) {
+        return true;
+    }
+    #[cfg(feature = "green-pool-certification")]
+    if matches!(
+        response,
+        PlainResponse::GreenBaseNativeRefundSigned { response: None, .. }
     ) {
         return true;
     }
@@ -5214,7 +5244,13 @@ async fn dispatch_operator(
                 &max_fee_per_gas_wei,
                 &max_priority_fee_per_gas_wei,
             )?;
-            if let Some(completed) = &state.completed_green_native_refund {
+            let prior_completion = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .green_native_refund_completion()
+                .map_err(|error| error.to_string())?;
+            if let Some(completed) = prior_completion.as_ref() {
                 let transaction = replay_green_native_refund(
                     completed,
                     &authorization.intent.operation_id,
@@ -5227,6 +5263,7 @@ async fn dispatch_operator(
                     destination_chain_id: authorization.intent.destination_chain_id,
                     destination_asset: authorization.intent.destination_asset,
                     transaction,
+                    response: None,
                 });
             }
             let transaction = state
@@ -5242,11 +5279,27 @@ async fn dispatch_operator(
                     &max_priority_fee_per_gas_wei,
                 )
                 .await?;
-            let completed = CompletedGreenNativeRefund {
+            let completed = GreenNativeRefundCompletion {
                 operation_id: authorization.intent.operation_id.clone(),
                 command_commitment: commitment,
-                transaction: transaction.clone(),
+                transaction: GreenNativeRefundTerminalTransaction {
+                    chain: transaction.chain.clone(),
+                    chain_id: transaction.chain_id,
+                    asset: transaction.asset.clone(),
+                    signer: transaction.signer.clone(),
+                    destination: transaction.destination.clone(),
+                    amount_wei: transaction.amount_wei.clone(),
+                    nonce: transaction.nonce,
+                    transaction_hash: transaction.transaction_hash.clone(),
+                    raw_transaction_hex: transaction.raw_transaction_hex.clone(),
+                },
             };
+            let completion_response = state
+                .core
+                .as_mut()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .seal_green_native_refund_completion(completed.clone(), trusted_now_millis)
+                .map_err(|error| error.to_string())?;
             let response = PlainResponse::GreenBaseNativeRefundSigned {
                 operation_id: completed.operation_id.clone(),
                 relay_request_id: authorization.intent.relay_request_id,
@@ -5254,8 +5307,8 @@ async fn dispatch_operator(
                 destination_chain_id: authorization.intent.destination_chain_id,
                 destination_asset: authorization.intent.destination_asset,
                 transaction,
+                response: Some(completion_response),
             };
-            state.completed_green_native_refund = Some(completed);
             Ok(response)
         }
         OperatorCommand::SignPoolWithdrawal {
@@ -6653,7 +6706,7 @@ fn green_native_refund_command_commitment(
 
 #[cfg(feature = "green-pool-certification")]
 fn replay_green_native_refund(
-    completed: &CompletedGreenNativeRefund,
+    completed: &GreenNativeRefundCompletion,
     operation_id: &str,
     command_commitment: [u8; 32],
 ) -> Result<GreenNativeRefundTransaction, String> {
@@ -6661,7 +6714,17 @@ fn replay_green_native_refund(
     {
         return Err("GREEN_NATIVE_REFUND_REPLAY_MISMATCH".into());
     }
-    Ok(completed.transaction.clone())
+    Ok(GreenNativeRefundTransaction {
+        chain: completed.transaction.chain.clone(),
+        chain_id: completed.transaction.chain_id,
+        asset: completed.transaction.asset.clone(),
+        signer: completed.transaction.signer.clone(),
+        destination: completed.transaction.destination.clone(),
+        amount_wei: completed.transaction.amount_wei.clone(),
+        nonce: completed.transaction.nonce,
+        transaction_hash: completed.transaction.transaction_hash.clone(),
+        raw_transaction_hex: completed.transaction.raw_transaction_hex.clone(),
+    })
 }
 
 fn validate_kms_reference(kms_key_id: &str, ciphertext: Option<&[u8]>) -> Result<(), String> {
@@ -7416,8 +7479,6 @@ mod tests {
             chain_signer: None,
             #[cfg(feature = "green-pool-certification")]
             completed_green_pool_seed: None,
-            #[cfg(feature = "green-pool-certification")]
-            completed_green_native_refund: None,
             pending_audit_signer_provision: None,
             audit_signer: None,
         })
@@ -8207,10 +8268,20 @@ mod tests {
             transaction_hash: format!("0x{}", "11".repeat(32)),
             raw_transaction_hex: "0x02aa".into(),
         };
-        let completed = CompletedGreenNativeRefund {
+        let completed = GreenNativeRefundCompletion {
             operation_id: exact.intent.operation_id.clone(),
             command_commitment: commitment,
-            transaction: transaction.clone(),
+            transaction: GreenNativeRefundTerminalTransaction {
+                chain: transaction.chain.clone(),
+                chain_id: transaction.chain_id,
+                asset: transaction.asset.clone(),
+                signer: transaction.signer.clone(),
+                destination: transaction.destination.clone(),
+                amount_wei: transaction.amount_wei.clone(),
+                nonce: transaction.nonce,
+                transaction_hash: transaction.transaction_hash.clone(),
+                raw_transaction_hex: transaction.raw_transaction_hex.clone(),
+            },
         };
         assert_eq!(
             replay_green_native_refund(&completed, &exact.intent.operation_id, commitment).unwrap(),

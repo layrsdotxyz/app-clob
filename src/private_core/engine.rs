@@ -3499,6 +3499,60 @@ mod direct_execution_contract_tests {
             Err(GreenE03s05TestCapitalError::InvalidPayload)
         ));
     }
+
+    #[cfg(feature = "green-pool-certification")]
+    #[test]
+    fn green_native_refund_completion_is_rooted_and_restart_safe() {
+        let now = 1_800_000_000_000i64;
+        let journal_key = JournalKey::from_bytes([0xc1; 32]);
+        let signer = ReceiptSigner::from_seed([0xc2; 32], [0xc3; 48]);
+        let completion = GreenNativeRefundCompletion {
+            operation_id: "green-base-native-refund-20260907-v1".into(),
+            command_commitment: [0xc4; 32],
+            transaction: GreenNativeRefundTerminalTransaction {
+                chain: "base".into(),
+                chain_id: 8_453,
+                asset: "ETH".into(),
+                signer: "0x022b437e2324fac913d616b77ca5178ee91985a0".into(),
+                destination: "0x1111111111111111111111111111111111111111".into(),
+                amount_wei: "1900000000000000".into(),
+                nonce: 1,
+                transaction_hash: format!("0x{}", "c5".repeat(32)),
+                raw_transaction_hex: "0x02c6".into(),
+            },
+        };
+        let mut core = PrivateTradingCore::new(journal_key.clone(), signer.clone());
+        assert!(core.green_native_refund_completion().unwrap().is_none());
+        let response = core
+            .seal_green_native_refund_completion(completion.clone(), now)
+            .unwrap();
+        assert_eq!(
+            response.receipt.command_id,
+            "green-base-native-refund-completion"
+        );
+        assert_eq!(
+            core.green_native_refund_completion().unwrap(),
+            Some(completion.clone())
+        );
+        assert!(matches!(
+            core.seal_green_native_refund_completion(completion.clone(), now + 1),
+            Err(CoreError::DuplicateCommand)
+        ));
+
+        let snapshot = core.export_encrypted_snapshot().unwrap();
+        let restored =
+            PrivateTradingCore::restore_encrypted_snapshot(journal_key, signer, &snapshot, 0)
+                .unwrap();
+        assert_eq!(
+            restored.green_native_refund_completion().unwrap(),
+            Some(completion)
+        );
+        assert_eq!(restored.state_root(), snapshot.state_root);
+        assert_eq!(
+            restored.journal.chain_head(),
+            (snapshot.sequence, snapshot.journal_head)
+        );
+    }
 }
 
 fn minimum_public_depth_distinct_owners(market_id: &str) -> usize {
@@ -4594,6 +4648,11 @@ enum JournaledSystemCommand {
         idempotency_key: String,
         flow: ExternalFlowTransaction,
     },
+    #[cfg(feature = "green-pool-certification")]
+    GreenNativeRefundCompletion {
+        idempotency_key: String,
+        completion: GreenNativeRefundCompletion,
+    },
     ConfirmedWithdrawal {
         idempotency_key: String,
         flow: ExternalFlowTransaction,
@@ -4685,6 +4744,37 @@ enum JournaledSystemCommand {
         result_digest: [u8; 32],
         archive_row_commitment: [u8; 32],
     },
+}
+
+#[cfg(feature = "green-pool-certification")]
+const GREEN_NATIVE_REFUND_COMPLETION_PREFIX: &str = "green-native-refund-completion:v1:";
+
+/// Exact one-shot Green refund result sealed inside the private-core snapshot.
+/// The rooted system-key copy prevents a restart from authorizing a different
+/// nonce-1 candidate, while the encrypted journal retains the same terminal
+/// result as independently replayable evidence.
+#[cfg(feature = "green-pool-certification")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GreenNativeRefundCompletion {
+    pub operation_id: String,
+    pub command_commitment: [u8; 32],
+    pub transaction: GreenNativeRefundTerminalTransaction,
+}
+
+#[cfg(feature = "green-pool-certification")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GreenNativeRefundTerminalTransaction {
+    pub chain: String,
+    pub chain_id: u64,
+    pub asset: String,
+    pub signer: String,
+    pub destination: String,
+    pub amount_wei: String,
+    pub nonce: u64,
+    pub transaction_hash: String,
+    pub raw_transaction_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7413,6 +7503,94 @@ impl PrivateTradingCore {
             command_idempotency_key,
             result_digest,
             archive_row_commitment,
+        ))
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    pub fn green_native_refund_completion(
+        &self,
+    ) -> CoreResult<Option<GreenNativeRefundCompletion>> {
+        let mut matches = self
+            .system_keys
+            .iter()
+            .filter(|key| key.starts_with(GREEN_NATIVE_REFUND_COMPLETION_PREFIX));
+        let Some(encoded) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        let payload = hex::decode(
+            encoded
+                .strip_prefix(GREEN_NATIVE_REFUND_COMPLETION_PREFIX)
+                .ok_or(CoreError::JournalChainMismatch)?,
+        )
+        .map_err(|_| CoreError::JournalChainMismatch)?;
+        let completion: GreenNativeRefundCompletion =
+            serde_json::from_slice(&payload).map_err(|_| CoreError::JournalChainMismatch)?;
+        if green_native_refund_completion_key(&completion)? != *encoded {
+            return Err(CoreError::JournalChainMismatch);
+        }
+        Ok(Some(completion))
+    }
+
+    #[cfg(feature = "green-pool-certification")]
+    pub fn seal_green_native_refund_completion(
+        &mut self,
+        completion: GreenNativeRefundCompletion,
+        now_millis: i64,
+    ) -> CoreResult<SystemResponse> {
+        if completion.operation_id.is_empty()
+            || completion.command_commitment == [0; 32]
+            || completion.transaction.transaction_hash.is_empty()
+            || completion.transaction.raw_transaction_hex.is_empty()
+        {
+            return Err(CoreError::InvalidOrder(
+                "green native refund completion is incomplete".into(),
+            ));
+        }
+        if self.green_native_refund_completion()?.is_some() {
+            return Err(CoreError::DuplicateCommand);
+        }
+        let rooted_completion = green_native_refund_completion_key(&completion)?;
+        let prior_root = self.state_root();
+        let mut keys = self.system_keys.clone();
+        if !keys.insert(rooted_completion) {
+            return Err(CoreError::DuplicateCommand);
+        }
+        let next_sequence = checked_sequence(self.sequence)?;
+        let next_root = state_root(
+            &self.ledger,
+            &self.books,
+            &self.markets,
+            &self.sessions,
+            &processed_hashes(&self.processed),
+            &keys,
+            &self.position_cost_basis,
+            &self.resolutions,
+            &self.oracle_public_key,
+            &self.bootstrap_executions,
+            &self.private_rewards,
+            self.trading_frozen,
+            next_sequence,
+        );
+        let idempotency_key = completion.operation_id.clone();
+        let record = self.journal.append(
+            next_root,
+            &JournaledSystemCommand::GreenNativeRefundCompletion {
+                idempotency_key: idempotency_key.clone(),
+                completion,
+            },
+        )?;
+        self.system_keys = keys;
+        self.sequence = next_sequence;
+        Ok(self.system_response(
+            "green-base-native-refund-completion",
+            idempotency_key,
+            prior_root,
+            next_root,
+            record,
+            now_millis,
         ))
     }
 
@@ -13830,6 +14008,17 @@ fn processed_hashes(processed: &BTreeMap<String, ProcessedCommand>) -> BTreeMap<
         .iter()
         .map(|(key, value)| (key.clone(), value.request_hash))
         .collect()
+}
+
+#[cfg(feature = "green-pool-certification")]
+fn green_native_refund_completion_key(
+    completion: &GreenNativeRefundCompletion,
+) -> CoreResult<String> {
+    let encoded = serde_json::to_vec(completion).map_err(|_| CoreError::JournalCrypto)?;
+    Ok(format!(
+        "{GREEN_NATIVE_REFUND_COMPLETION_PREFIX}{}",
+        hex::encode(encoded)
+    ))
 }
 
 fn recovery_result_marker(idempotency_key: &str, digest: [u8; 32]) -> String {
