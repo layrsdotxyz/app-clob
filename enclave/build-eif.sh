@@ -42,6 +42,18 @@ case "${LAYRS_GREEN_POOL_CERTIFICATION_ENABLED:-0}" in
   *) echo "LAYRS_GREEN_POOL_CERTIFICATION_ENABLED must be 0 or 1" >&2; exit 1 ;;
 esac
 
+if [[ ${LAYRS_GREEN_POOL_CERTIFICATION_ENABLED:-0} == 1 ]]; then
+  if [[ ${LAYRS_RECOVERY_ENVIRONMENT} == production
+        || ! ${LAYRS_GREEN_E03S05_RENEWAL_START_MILLIS:-} =~ ^[1-9][0-9]{0,15}$ ]]; then
+    echo 'Green certification requires a non-production, explicit renewal release window' >&2
+    exit 1
+  fi
+  if (( LAYRS_GREEN_E03S05_RENEWAL_START_MILLIS > 8639999971200000 )); then
+    echo 'Green renewal release window overflows supported timestamps' >&2
+    exit 1
+  fi
+fi
+
 image_tag=${LAYRS_ENCLAVE_IMAGE_TAG:-layrsv2-clob-enclave:local}
 output_eif=${LAYRS_EIF_OUTPUT:-build/layrsv2-clob.eif}
 measurement_file=${LAYRS_MEASUREMENT_OUTPUT:-build/layrsv2-clob-measurements.json}
@@ -70,6 +82,7 @@ docker build \
   --build-arg "LAYRS_DIRECT_DEPOSIT_CREDIT_ENABLED=${LAYRS_DIRECT_DEPOSIT_CREDIT_ENABLED:-0}" \
   --build-arg "LAYRS_DIRECT_WITHDRAWAL_ENABLED=${LAYRS_DIRECT_WITHDRAWAL_ENABLED:-0}" \
   --build-arg "LAYRS_GREEN_POOL_CERTIFICATION_ENABLED=${LAYRS_GREEN_POOL_CERTIFICATION_ENABLED:-0}" \
+  --build-arg "LAYRS_GREEN_E03S05_RENEWAL_START_MILLIS=${LAYRS_GREEN_E03S05_RENEWAL_START_MILLIS:-}" \
   --build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}" \
   --tag "${image_tag}" \
   .
