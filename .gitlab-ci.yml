@@ -52,6 +52,20 @@ clob-fast:
       -A clippy::wrong-self-convention
       -A clippy::enum-variant-names
 
+green-enclave-regression:
+  stage: full
+  timeout: 90m
+  needs: [clob-fast]
+  variables:
+    LAYRS_DIRECT_DEPOSIT_CREDIT_ENABLED: "1"
+    LAYRS_DIRECT_WITHDRAWAL_ENABLED: "1"
+    # Deliberately historical test vector, never a release build default.
+    LAYRS_GREEN_E03S05_RENEWAL_START_MILLIS: "1788814800000"
+  script:
+    - cargo test --locked --features green-pool-certification --bin layrs-enclave -- --test-threads=1
+    - cargo test --locked --manifest-path enclave/runtime/Cargo.toml --features green-pool-certification --bin layrs-enclave -- --test-threads=1
+    - cargo test --locked --bin layrs-enclave -- --test-threads=1
+
 clob-full:
   stage: full
   timeout: 2h
@@ -72,7 +86,7 @@ deploy-zk-proof-worker:
   stage: deploy
   tags: [layrs, deploy, x86]
   interruptible: false
-  needs: [clob-full]
+  needs: [clob-full, green-enclave-regression]
   resource_group: production-zk-proof-worker
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'

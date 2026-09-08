@@ -420,11 +420,41 @@ const GREEN_E03S05_SESSION_PUBLIC_KEY: [u8; 32] = [
     0x9a, 0xbf, 0xf3, 0xbc, 0x50, 0xb9, 0x58, 0x82, 0xa6, 0x72, 0x08, 0x42, 0xc5, 0x2e, 0x7f, 0xec,
 ];
 #[cfg(feature = "green-pool-certification")]
-const GREEN_E03S05_SESSION_RENEWAL_IDEMPOTENCY_KEY: &str = "green-e03s05-session-renew:v1";
+struct GreenSessionWindow {
+    now_millis: i64,
+    expires_at_millis: i64,
+    idempotency_key: String,
+}
+
+// The timestamp is an immutable EIF build input, NOT parent runtime input.
+// Missing/malformed configuration disables renewal; never fall back to a
+// historic date or independently sample a clock on either side of the wire.
 #[cfg(feature = "green-pool-certification")]
-const GREEN_E03S05_SESSION_RENEWAL_NOW_MILLIS: i64 = 1_788_814_800_000;
+fn parse_green_session_window(value: Option<&str>) -> Option<GreenSessionWindow> {
+    let value = value?;
+    if value.is_empty()
+        || value.len() > 16
+        || value.starts_with('0')
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let now_millis: i64 = value.parse().ok()?;
+    let expires_at_millis = now_millis.checked_add(8 * 60 * 60_000)?;
+    if expires_at_millis > 8_640_000_000_000_000 {
+        return None;
+    }
+    Some(GreenSessionWindow {
+        now_millis,
+        expires_at_millis,
+        idempotency_key: format!("green-e03s05-session-renew:v2:{value}"),
+    })
+}
+
 #[cfg(feature = "green-pool-certification")]
-const GREEN_E03S05_SESSION_RENEWAL_EXPIRES_AT_MILLIS: i64 = 1_788_843_600_000;
+fn green_session_window() -> Option<GreenSessionWindow> {
+    parse_green_session_window(option_env!("LAYRS_GREEN_E03S05_RENEWAL_START_MILLIS"))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
@@ -2544,9 +2574,9 @@ fn direct_execution_request(state: &EnclaveState, request: &PlainRequest) -> boo
                 )
             )
     ) {
-        // The exact one-shot fixture renewal must not inherit the global
-        // Durable writer fence. The Green request firewall independently
-        // checks the same closed tuple before this direct classification.
+        // The firewall independently checks the same closed release tuple.
+        // Direct admission does not permit mutation over a pending successor:
+        // pending_preparation_blocks_request still protects committed state.
         return true;
     }
     if matches!(
@@ -2696,12 +2726,15 @@ fn green_e03s05_session_renewal(
     expires_at_millis: i64,
     now_millis: i64,
 ) -> bool {
-    idempotency_key == GREEN_E03S05_SESSION_RENEWAL_IDEMPOTENCY_KEY
+    let Some(window) = green_session_window() else {
+        return false;
+    };
+    idempotency_key == window.idempotency_key
         && session_id == GREEN_E03S05_SESSION_ID
         && identity_commitment == &GREEN_E03S05_IDENTITY
         && public_key == &GREEN_E03S05_SESSION_PUBLIC_KEY
-        && now_millis == GREEN_E03S05_SESSION_RENEWAL_NOW_MILLIS
-        && expires_at_millis == GREEN_E03S05_SESSION_RENEWAL_EXPIRES_AT_MILLIS
+        && now_millis == window.now_millis
+        && expires_at_millis == window.expires_at_millis
 }
 
 #[cfg(feature = "green-pool-certification")]
@@ -2811,7 +2844,46 @@ fn pending_preparation_blocks_request(
     request: &PlainRequest,
     direct_execution: bool,
 ) -> bool {
-    has_pending_preparation && !durable_control_request(request) && !direct_execution
+    has_pending_preparation
+        && !durable_control_request(request)
+        && (!direct_execution || direct_execution_mutates_committed_core(request))
+}
+
+/// Direct execution removes the database admission/prepare round trip; it does
+/// not grant a second writer permission to advance committed core state while
+/// a durable successor is awaiting finalize/abort.  Read-only direct commands
+/// may continue to observe the last committed core.  Exact direct deposit and
+/// withdrawal envelopes are listed here because their outer enum variants are
+/// intentionally not part of the legacy writer-authorization allowlist even
+/// though their successful outcomes append a journal record.
+fn direct_execution_mutates_committed_core(request: &PlainRequest) -> bool {
+    if request_requires_writer_authorization(request)
+        || matches!(
+            request,
+            PlainRequest::Operator {
+                envelope: OperatorEnvelope {
+                    command: OperatorCommand::DirectCreditDeposit { .. }
+                        | OperatorCommand::DirectWithdrawal { .. },
+                    ..
+                }
+            }
+        )
+    {
+        return true;
+    }
+    #[cfg(feature = "green-pool-certification")]
+    if matches!(
+        request,
+        PlainRequest::Operator {
+            envelope: OperatorEnvelope {
+                command: OperatorCommand::AllocateGreenE03s05TestCapital { .. },
+                ..
+            }
+        }
+    ) {
+        return true;
+    }
+    false
 }
 
 fn requires_durable_preparation(has_journal_artifact: bool, direct_execution: bool) -> bool {
@@ -3025,12 +3097,6 @@ fn direct_quest_operator_command(command: &OperatorCommand) -> bool {
             recurring_crypto_window(market_id).is_some()
         }
         OperatorCommand::TradingFreezeStatus => true,
-        OperatorCommand::SetTradingFreeze {
-            idempotency_key,
-            reason_commitment,
-            now_millis,
-            ..
-        } => direct_trading_freeze_control(idempotency_key, reason_commitment, *now_millis),
         OperatorCommand::SignResolutionEvidence { evidence, .. } => {
             recurring_crypto_window(unsigned_resolution_market_id(evidence)).is_some()
         }
@@ -3039,20 +3105,6 @@ fn direct_quest_operator_command(command: &OperatorCommand) -> bool {
         }
         _ => false,
     }
-}
-
-fn direct_trading_freeze_control(
-    idempotency_key: &str,
-    reason_commitment: &[u8; 32],
-    now_millis: i64,
-) -> bool {
-    let Some(digest) = idempotency_key.strip_prefix("trading-freeze:") else {
-        return false;
-    };
-    reason_commitment != &[0; 32]
-        && now_millis > 0
-        && digest.len() == 64
-        && digest == hex::encode(reason_commitment)
 }
 
 fn direct_base_usdc_withdrawal(action: &UserCommandAction) -> bool {
@@ -7422,6 +7474,45 @@ async fn write_frame(stream: &mut VsockStream, value: &[u8]) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "green-pool-certification")]
+    #[test]
+    fn green_renewal_release_window_is_canonical_bounded_and_versioned() {
+        assert!(super::parse_green_session_window(None).is_none());
+        for invalid in [
+            "",
+            "0",
+            "-1",
+            "01",
+            " 1788814800000",
+            "1788814800000 ",
+            "1e12",
+            "1.5",
+            "NaN",
+            "Infinity",
+            "9007199254740991",
+            "8640000000000000",
+            "99999999999999999",
+        ] {
+            assert!(super::parse_green_session_window(Some(invalid)).is_none());
+        }
+        for value in ["1788814800000", "1800000000000", "2000000000000"] {
+            let window = super::parse_green_session_window(Some(value)).unwrap();
+            assert_eq!(window.now_millis, value.parse::<i64>().unwrap());
+            assert_eq!(window.expires_at_millis - window.now_millis, 28_800_000);
+            assert_eq!(
+                window.idempotency_key,
+                format!("green-e03s05-session-renew:v2:{value}")
+            );
+        }
+        assert_ne!(
+            super::parse_green_session_window(Some("1800000000000"))
+                .unwrap()
+                .idempotency_key,
+            super::parse_green_session_window(Some("1800000000001"))
+                .unwrap()
+                .idempotency_key
+        );
+    }
     use super::*;
     use clob_service::private_core::{
         DirectDepositCreditPayload, DirectExecutionOperation, DirectWithdrawalPayload,
@@ -8723,13 +8814,15 @@ mod tests {
             ));
         }
 
+        let window =
+            green_session_window().expect("Green tests require the pinned renewal build input");
         let session_renewal = || OperatorCommand::RegisterSession {
-            idempotency_key: GREEN_E03S05_SESSION_RENEWAL_IDEMPOTENCY_KEY.into(),
+            idempotency_key: window.idempotency_key.clone(),
             session_id: GREEN_E03S05_SESSION_ID.into(),
             identity_commitment: GREEN_E03S05_IDENTITY,
             public_key: GREEN_E03S05_SESSION_PUBLIC_KEY,
-            expires_at_millis: GREEN_E03S05_SESSION_RENEWAL_EXPIRES_AT_MILLIS,
-            now_millis: GREEN_E03S05_SESSION_RENEWAL_NOW_MILLIS,
+            expires_at_millis: window.expires_at_millis,
+            now_millis: window.now_millis,
         };
         assert!(green_pool_certification_request_allowed(
             &state,
@@ -8737,8 +8830,13 @@ mod tests {
         ));
         let direct_session_renewal = operator_request(session_renewal());
         assert!(direct_execution_request(&state, &direct_session_renewal));
-        assert!(!pending_preparation_blocks_request(
+        assert!(pending_preparation_blocks_request(
             true,
+            &direct_session_renewal,
+            true
+        ));
+        assert!(!pending_preparation_blocks_request(
+            false,
             &direct_session_renewal,
             true
         ));
@@ -8749,48 +8847,48 @@ mod tests {
                 session_id: GREEN_E03S05_SESSION_ID.into(),
                 identity_commitment: GREEN_E03S05_IDENTITY,
                 public_key: GREEN_E03S05_SESSION_PUBLIC_KEY,
-                expires_at_millis: GREEN_E03S05_SESSION_RENEWAL_EXPIRES_AT_MILLIS,
-                now_millis: GREEN_E03S05_SESSION_RENEWAL_NOW_MILLIS,
+                expires_at_millis: window.expires_at_millis,
+                now_millis: window.now_millis,
             },
             OperatorCommand::RegisterSession {
-                idempotency_key: GREEN_E03S05_SESSION_RENEWAL_IDEMPOTENCY_KEY.into(),
+                idempotency_key: window.idempotency_key.clone(),
                 session_id: "session_not-the-green-fixture".into(),
                 identity_commitment: GREEN_E03S05_IDENTITY,
                 public_key: GREEN_E03S05_SESSION_PUBLIC_KEY,
-                expires_at_millis: GREEN_E03S05_SESSION_RENEWAL_EXPIRES_AT_MILLIS,
-                now_millis: GREEN_E03S05_SESSION_RENEWAL_NOW_MILLIS,
+                expires_at_millis: window.expires_at_millis,
+                now_millis: window.now_millis,
             },
             OperatorCommand::RegisterSession {
-                idempotency_key: GREEN_E03S05_SESSION_RENEWAL_IDEMPOTENCY_KEY.into(),
+                idempotency_key: window.idempotency_key.clone(),
                 session_id: GREEN_E03S05_SESSION_ID.into(),
                 identity_commitment: [0x55; 32],
                 public_key: GREEN_E03S05_SESSION_PUBLIC_KEY,
-                expires_at_millis: GREEN_E03S05_SESSION_RENEWAL_EXPIRES_AT_MILLIS,
-                now_millis: GREEN_E03S05_SESSION_RENEWAL_NOW_MILLIS,
+                expires_at_millis: window.expires_at_millis,
+                now_millis: window.now_millis,
             },
             OperatorCommand::RegisterSession {
-                idempotency_key: GREEN_E03S05_SESSION_RENEWAL_IDEMPOTENCY_KEY.into(),
+                idempotency_key: window.idempotency_key.clone(),
                 session_id: GREEN_E03S05_SESSION_ID.into(),
                 identity_commitment: GREEN_E03S05_IDENTITY,
                 public_key: [0x44; 32],
-                expires_at_millis: GREEN_E03S05_SESSION_RENEWAL_EXPIRES_AT_MILLIS,
-                now_millis: GREEN_E03S05_SESSION_RENEWAL_NOW_MILLIS,
+                expires_at_millis: window.expires_at_millis,
+                now_millis: window.now_millis,
             },
             OperatorCommand::RegisterSession {
-                idempotency_key: GREEN_E03S05_SESSION_RENEWAL_IDEMPOTENCY_KEY.into(),
+                idempotency_key: window.idempotency_key.clone(),
                 session_id: GREEN_E03S05_SESSION_ID.into(),
                 identity_commitment: GREEN_E03S05_IDENTITY,
                 public_key: GREEN_E03S05_SESSION_PUBLIC_KEY,
-                expires_at_millis: GREEN_E03S05_SESSION_RENEWAL_EXPIRES_AT_MILLIS - 1,
-                now_millis: GREEN_E03S05_SESSION_RENEWAL_NOW_MILLIS,
+                expires_at_millis: window.expires_at_millis - 1,
+                now_millis: window.now_millis,
             },
             OperatorCommand::RegisterSession {
-                idempotency_key: GREEN_E03S05_SESSION_RENEWAL_IDEMPOTENCY_KEY.into(),
+                idempotency_key: window.idempotency_key.clone(),
                 session_id: GREEN_E03S05_SESSION_ID.into(),
                 identity_commitment: GREEN_E03S05_IDENTITY,
                 public_key: GREEN_E03S05_SESSION_PUBLIC_KEY,
-                expires_at_millis: GREEN_E03S05_SESSION_RENEWAL_EXPIRES_AT_MILLIS,
-                now_millis: GREEN_E03S05_SESSION_RENEWAL_NOW_MILLIS + 1,
+                expires_at_millis: window.expires_at_millis,
+                now_millis: window.now_millis + 1,
             },
         ] {
             let rejected_request = operator_request(rejected);
@@ -10039,7 +10137,7 @@ mod tests {
         };
         let direct = direct_execution_request(&state, &plain_request);
         assert!(direct);
-        assert!(!pending_preparation_blocks_request(
+        assert!(pending_preparation_blocks_request(
             true,
             &plain_request,
             direct
@@ -10143,6 +10241,12 @@ mod tests {
             serde_json::to_value(applied.financial_replay_key_sha256).unwrap()
         );
         assert!(!request_requires_trusted_execution_time(&lookup_request));
+        assert!(!direct_execution_mutates_committed_core(&lookup_request));
+        assert!(!pending_preparation_blocks_request(
+            true,
+            &lookup_request,
+            direct_execution_request(&state, &lookup_request),
+        ));
         let lookup = dispatch_operator(
             &mut state,
             signed_operator_envelope(&operator_signer, [0x5d; 32], lookup_command),
@@ -10183,6 +10287,42 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "green-pool-certification")]
+    #[tokio::test]
+    async fn green_dispatch_rejects_generic_withdrawal_without_mutating_core() {
+        let operator_signer = ed25519_dalek::SigningKey::from_bytes(&[0x61; 32]);
+        let receipt_signer = ReceiptSigner::from_seed([0x63; 32], [0x64; 48]);
+        let receipt_public_key = receipt_signer.verifying_key();
+        let core = PrivateTradingCore::new(JournalKey::from_bytes([0x62; 32]), receipt_signer);
+        let mut state =
+            direct_deposit_test_state(operator_signer.verifying_key(), receipt_public_key, core);
+        let request = direct_withdrawal_request_for_wire(
+            Uuid::from_u128(0x63333333_3333_4333_8333_333333333333),
+            Uuid::from_u128(0x62222222_2222_4222_8222_222222222222),
+            [0x65; 32],
+            [0x66; 32],
+            1_800_100_000_000,
+        );
+        let root = state.core.as_ref().unwrap().state_root();
+        let sequence = state.core.as_ref().unwrap().sequence();
+        let result = dispatch_operator(
+            &mut state,
+            signed_operator_envelope(
+                &operator_signer,
+                [0x68; 32],
+                OperatorCommand::DirectWithdrawal {
+                    request: request.clone(),
+                },
+            ),
+            Some(request.issued_at_millis + 1),
+        )
+        .await;
+        assert!(matches!(result, Err(error) if error == "invalid direct withdrawal payload"));
+        assert_eq!(state.core.as_ref().unwrap().state_root(), root);
+        assert_eq!(state.core.as_ref().unwrap().sequence(), sequence);
+    }
+
+    #[cfg(not(feature = "green-pool-certification"))]
     #[tokio::test]
     async fn direct_withdrawal_mutation_emits_snapshot_but_replay_and_lookup_reuse_it() {
         if !matches!(option_env!("LAYRS_DIRECT_WITHDRAWAL_ENABLED"), Some("1")) {
@@ -10464,7 +10604,7 @@ mod tests {
         };
         let direct = direct_execution_request(&state, &request);
         assert!(direct);
-        assert!(!pending_preparation_blocks_request(true, &request, direct));
+        assert!(pending_preparation_blocks_request(true, &request, direct));
         assert!(!requires_durable_preparation(true, direct));
     }
 
@@ -10541,7 +10681,7 @@ mod tests {
         assert!(direct_quest_operator_command(
             &OperatorCommand::TradingFreezeStatus
         ));
-        assert!(direct_quest_operator_command(&freeze_command));
+        assert!(!direct_quest_operator_command(&freeze_command));
         let freeze_status_request = PlainRequest::Operator {
             envelope: OperatorEnvelope {
                 nonce: [12; 32],
@@ -10602,10 +10742,8 @@ mod tests {
         assert!(request_requires_writer_authorization(
             &split_session_dust_request
         ));
-        let pending_preparation_blocks = |request: &PlainRequest, direct_execution: bool| {
-            !durable_control_request(request) && !direct_execution
-        };
-        assert!(!pending_preparation_blocks(
+        assert!(pending_preparation_blocks_request(
+            true,
             &split_session_dust_request,
             direct_quest_operator_command(&split_session_dust),
         ));
@@ -10724,6 +10862,42 @@ mod tests {
                 market: btc_market.clone(),
                 now_millis: opens_at_millis,
             }
+        ));
+        let direct_market_read = PlainRequest::Operator {
+            envelope: OperatorEnvelope {
+                nonce: [0x31; 32],
+                command: OperatorCommand::MarketStatus {
+                    market_id: btc_market.market_id.clone(),
+                },
+                signature: Vec::new(),
+            },
+        };
+        assert!(!direct_execution_mutates_committed_core(
+            &direct_market_read
+        ));
+        assert!(!pending_preparation_blocks_request(
+            true,
+            &direct_market_read,
+            true,
+        ));
+        let direct_market_registration = PlainRequest::Operator {
+            envelope: OperatorEnvelope {
+                nonce: [0x32; 32],
+                command: OperatorCommand::RegisterMarket {
+                    idempotency_key: format!("market:{}", "ab".repeat(32)),
+                    market: btc_market.clone(),
+                    now_millis: opens_at_millis,
+                },
+                signature: Vec::new(),
+            },
+        };
+        assert!(direct_execution_mutates_committed_core(
+            &direct_market_registration
+        ));
+        assert!(pending_preparation_blocks_request(
+            true,
+            &direct_market_registration,
+            true,
         ));
         assert!(direct_quest_operator_command(
             &OperatorCommand::AggregateDepth {
@@ -10975,10 +11149,6 @@ mod tests {
             .expect("register lifecycle-read market");
         let root_before = core.state_root();
         let sequence_before = core.sequence();
-        let pending_preparation_blocks = |request: &PlainRequest, direct_execution: bool| {
-            !durable_control_request(request) && !direct_execution
-        };
-
         for command in [
             OperatorCommand::MarketStatus {
                 market_id: market_id.into(),
@@ -10998,7 +11168,7 @@ mod tests {
             assert!(durable_control_request(&request));
             assert!(!request_requires_writer_authorization(&request));
             assert!(!direct_quest_operator_command(&command));
-            assert!(!pending_preparation_blocks(&request, false));
+            assert!(!pending_preparation_blocks_request(true, &request, false));
         }
 
         assert_eq!(core.market_config(market_id), Some(market.clone()));
@@ -11022,7 +11192,7 @@ mod tests {
         };
         assert!(!durable_control_request(&mutation));
         assert!(request_requires_writer_authorization(&mutation));
-        assert!(pending_preparation_blocks(&mutation, false));
+        assert!(pending_preparation_blocks_request(true, &mutation, false));
     }
 
     #[test]
