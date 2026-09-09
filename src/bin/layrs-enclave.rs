@@ -733,6 +733,12 @@ enum OperatorCommand {
         expires_at_millis: i64,
         now_millis: i64,
     },
+    SessionRegistrationStatus {
+        session_id: String,
+        identity_commitment: [u8; 32],
+        public_key: [u8; 32],
+        expires_at_millis: i64,
+    },
     RegisterTransferAccount {
         idempotency_key: String,
         identity_commitment: [u8; 32],
@@ -1119,6 +1125,10 @@ enum PlainResponse {
     TransferAccountStatus {
         transfer_account: String,
         registered: bool,
+    },
+    SessionRegistrationStatus {
+        registered: bool,
+        exact_match: bool,
     },
     DelegatedPortfolioRead {
         envelope: EncryptedDelegatedRead,
@@ -2993,6 +3003,7 @@ fn direct_quest_operator_command(command: &OperatorCommand) -> bool {
     match command {
         OperatorCommand::AcknowledgeRecoveryArchive { .. }
         | OperatorCommand::RegisterSession { .. }
+        | OperatorCommand::SessionRegistrationStatus { .. }
         | OperatorCommand::RegisterTransferAccount { .. }
         | OperatorCommand::TransferAccountStatus { .. } => true,
         // Crypto rollover must not inherit a protocol-wide Durable preparation.
@@ -6065,6 +6076,27 @@ async fn dispatch_operator(
                 registered: status.registered,
             })
         }
+        OperatorCommand::SessionRegistrationStatus {
+            session_id,
+            identity_commitment,
+            public_key,
+            expires_at_millis,
+        } => {
+            let (registered, exact_match) = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .session_registration_status(
+                    &session_id,
+                    identity_commitment,
+                    public_key,
+                    expires_at_millis,
+                );
+            Ok(PlainResponse::SessionRegistrationStatus {
+                registered,
+                exact_match,
+            })
+        }
         OperatorCommand::DelegatedPortfolioRead {
             request_id,
             identity_commitment,
@@ -6534,6 +6566,7 @@ async fn dispatch_operator(
                 | OperatorCommand::ResolutionReadiness { .. }
                 | OperatorCommand::CustodyReconciliationSnapshot { .. }
                 | OperatorCommand::TransferAccountStatus { .. }
+                | OperatorCommand::SessionRegistrationStatus { .. }
                 | OperatorCommand::DelegatedPortfolioRead { .. }
                 | OperatorCommand::TradingFreezeStatus
                 | OperatorCommand::RecoveryArchiveAckStatus { .. }
@@ -10317,7 +10350,10 @@ mod tests {
             Some(request.issued_at_millis + 1),
         )
         .await;
-        assert!(matches!(result, Err(error) if error == "invalid direct withdrawal payload"));
+        assert!(
+            matches!(&result, Err(error) if error == "invalid direct withdrawal payload"),
+            "unexpected generic-withdrawal result: {result:?}"
+        );
         assert_eq!(state.core.as_ref().unwrap().state_root(), root);
         assert_eq!(state.core.as_ref().unwrap().sequence(), sequence);
     }
@@ -10619,6 +10655,14 @@ mod tests {
                 public_key: [8u8; 32],
                 expires_at_millis: 10_000,
                 now_millis: 1,
+            }
+        ));
+        assert!(direct_quest_operator_command(
+            &OperatorCommand::SessionRegistrationStatus {
+                session_id: "session_test".into(),
+                identity_commitment,
+                public_key: [8u8; 32],
+                expires_at_millis: 10_000,
             }
         ));
         assert!(direct_quest_operator_command(
