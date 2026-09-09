@@ -18,7 +18,8 @@ const JOURNAL_KEY: [u8; 32] = [11u8; 32];
 const USER_COMMITMENT: [u8; 32] = [12u8; 32];
 const USER_KEY: [u8; 32] = [13u8; 32];
 const ORACLE_KEY: [u8; 32] = [14u8; 32];
-const RECEIPT_KEY: [u8; 48] = [15u8; 48];
+const RECEIPT_SIGNING_SEED: [u8; 32] = [15u8; 32];
+const RECEIPT_MEASUREMENT: [u8; 48] = [15u8; 48];
 
 #[test]
 fn gtc_gtd_fak_and_fok_have_deterministic_orderbook_semantics() {
@@ -452,7 +453,7 @@ fn api_tif_commands_preserve_fees_conservation_privacy_and_snapshot_replay() {
     let fak_snapshot = core.export_encrypted_snapshot().unwrap();
     let mut core = PrivateTradingCore::restore_encrypted_snapshot(
         JournalKey::from_bytes(JOURNAL_KEY),
-        ReceiptSigner::generate(RECEIPT_KEY),
+        ReceiptSigner::from_seed(RECEIPT_SIGNING_SEED, RECEIPT_MEASUREMENT),
         &fak_snapshot,
         fak_snapshot.sequence,
     )
@@ -533,7 +534,7 @@ fn api_tif_commands_preserve_fees_conservation_privacy_and_snapshot_replay() {
     let snapshot = core.export_encrypted_snapshot().unwrap();
     let mut restored = PrivateTradingCore::restore_encrypted_snapshot(
         JournalKey::from_bytes(JOURNAL_KEY),
-        ReceiptSigner::generate(RECEIPT_KEY),
+        ReceiptSigner::from_seed(RECEIPT_SIGNING_SEED, RECEIPT_MEASUREMENT),
         &snapshot,
         snapshot.sequence,
     )
@@ -862,14 +863,14 @@ fn resolution_cancels_all_order_holds_and_is_deterministic_after_snapshot() {
     let snapshot = core.export_encrypted_snapshot().unwrap();
     let mut first = PrivateTradingCore::restore_encrypted_snapshot(
         JournalKey::from_bytes(JOURNAL_KEY),
-        ReceiptSigner::generate(RECEIPT_KEY),
+        ReceiptSigner::from_seed(RECEIPT_SIGNING_SEED, RECEIPT_MEASUREMENT),
         &snapshot,
         snapshot.sequence,
     )
     .unwrap();
     let mut second = PrivateTradingCore::restore_encrypted_snapshot(
         JournalKey::from_bytes(JOURNAL_KEY),
-        ReceiptSigner::generate(RECEIPT_KEY),
+        ReceiptSigner::from_seed(RECEIPT_SIGNING_SEED, RECEIPT_MEASUREMENT),
         &snapshot,
         snapshot.sequence,
     )
@@ -963,7 +964,7 @@ fn configured_core(markets: &[(&str, i64, i64, u128)]) -> (PrivateTradingCore, S
     let owner = derived_private_user(JOURNAL_KEY, USER_COMMITMENT);
     let mut core = PrivateTradingCore::new_with_oracle(
         JournalKey::from_bytes(JOURNAL_KEY),
-        ReceiptSigner::generate(RECEIPT_KEY),
+        ReceiptSigner::from_seed(RECEIPT_SIGNING_SEED, RECEIPT_MEASUREMENT),
         oracle.verifying_key().to_bytes(),
     )
     .unwrap();
