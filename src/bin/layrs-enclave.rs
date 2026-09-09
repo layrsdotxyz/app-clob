@@ -3707,7 +3707,7 @@ fn verify_durable_preparation(
         .map_err(|_| "DURABLE_PREPARATION_INVALID".to_string())
 }
 
-fn enclave_transition_policy_hash(source: &[u8], target: &[u8], schema: &str) -> [u8; 32] {
+fn legacy_enclave_transition_policy_hash(source: &[u8], target: &[u8], schema: &str) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"layrs.enclave-generation-transition.v1\0");
     hash.update((source.len() as u32).to_be_bytes());
@@ -3719,10 +3719,38 @@ fn enclave_transition_policy_hash(source: &[u8], target: &[u8], schema: &str) ->
     hash.finalize().into()
 }
 
+fn enclave_transition_policy_hash(
+    source: &[u8],
+    target_release_commit: &str,
+    schema: &str,
+) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.enclave-generation-transition.v2\0");
+    hash.update((source.len() as u32).to_be_bytes());
+    hash.update(source);
+    hash.update((target_release_commit.len() as u32).to_be_bytes());
+    hash.update(target_release_commit.as_bytes());
+    hash.update((schema.len() as u32).to_be_bytes());
+    hash.update(schema.as_bytes());
+    hash.finalize().into()
+}
+
 fn configured_transition_policy_hash() -> Option<[u8; 32]> {
     option_env!("LAYRS_ENCLAVE_TRANSITION_POLICY_SHA256")
         .and_then(|value| hex::decode(value).ok())
         .and_then(|value| value.try_into().ok())
+}
+
+fn valid_release_commit(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn configured_transition_target_release_commit() -> Option<&'static str> {
+    option_env!("LAYRS_ENCLAVE_TRANSITION_TARGET_RELEASE_COMMIT")
+        .filter(|value| valid_release_commit(value))
 }
 
 fn decode_exact_hex<const N: usize>(value: &str) -> Result<[u8; N], String> {
@@ -3855,20 +3883,55 @@ fn verify_enclave_generation_transition(
     schema: &str,
     supplied_policy: [u8; 32],
 ) -> Result<(), String> {
+    verify_enclave_generation_transition_with_policy(
+        source,
+        target,
+        current,
+        schema,
+        supplied_policy,
+        configured_transition_policy_hash(),
+        configured_transition_target_release_commit(),
+    )
+}
+
+fn verify_enclave_generation_transition_with_policy(
+    source: &[u8],
+    target: &[u8],
+    current: &[u8; 48],
+    schema: &str,
+    supplied_policy: [u8; 32],
+    configured_policy: Option<[u8; 32]>,
+    target_release_commit: Option<&str>,
+) -> Result<(), String> {
     if source.len() != 48
         || target != current.as_slice()
         || schema != "layrs.private-core-snapshot.s07.v1"
     {
         return Err("DURABLE_ENCLAVE_TRANSITION_INVALID".into());
     }
-    let expected = enclave_transition_policy_hash(source, target, schema);
+    if source == target {
+        let expected = legacy_enclave_transition_policy_hash(source, target, schema);
+        return if supplied_policy == expected {
+            Ok(())
+        } else {
+            Err("DURABLE_ENCLAVE_TRANSITION_INVALID".into())
+        };
+    }
+
+    // Target PCR0 cannot be part of a value compiled into that same target
+    // image: embedding the value changes PCR0 and creates an unsatisfiable
+    // fixed point. Bind cross-PCR authority to the immutable source PCR,
+    // target release commit and snapshot schema instead. The target PCR is
+    // independently bound above to the enclave's measured `current` value and
+    // by the signed release manifest plus the KMS attestation allowlist.
+    let target_release_commit = target_release_commit
+        .filter(|value| valid_release_commit(value))
+        .ok_or_else(|| "DURABLE_ENCLAVE_TRANSITION_NOT_AUTHORIZED".to_string())?;
+    let expected = enclave_transition_policy_hash(source, target_release_commit, schema);
     if supplied_policy != expected {
         return Err("DURABLE_ENCLAVE_TRANSITION_INVALID".into());
     }
-    if source != target && configured_transition_policy_hash() != Some(expected) {
-        // Cross-PCR roll-forward is disabled unless the target EIF embeds the
-        // exact reviewed source/target/schema policy commitment. Same-PCR
-        // recovery remains available without a transition policy.
+    if configured_policy != Some(expected) {
         return Err("DURABLE_ENCLAVE_TRANSITION_NOT_AUTHORIZED".into());
     }
     Ok(())
@@ -8208,23 +8271,61 @@ mod tests {
         let source = [0x31; 48];
         let target = [0x32; 48];
         let schema = "layrs.private-core-snapshot.s07.v1";
-        let same = enclave_transition_policy_hash(&target, &target, schema);
+        let target_release_commit = "37ed1f204e653626fdd3bdab3f425db813e8a25f";
+        let same = legacy_enclave_transition_policy_hash(&target, &target, schema);
         assert!(
             verify_enclave_generation_transition(&target, &target, &target, schema, same).is_ok()
         );
 
-        let cross = enclave_transition_policy_hash(&source, &target, schema);
+        let cross = enclave_transition_policy_hash(&source, target_release_commit, schema);
         assert_eq!(
-            verify_enclave_generation_transition(&source, &target, &target, schema, cross)
-                .unwrap_err(),
+            hex::encode(cross),
+            "c01f64acf9ccb88654c6ab92bf2948db72c3a97b5eb9f6cf01ec9a1d3c01e532"
+        );
+        assert_eq!(
+            verify_enclave_generation_transition_with_policy(
+                &source, &target, &target, schema, cross, None, None,
+            )
+            .unwrap_err(),
             "DURABLE_ENCLAVE_TRANSITION_NOT_AUTHORIZED"
         );
+        assert!(verify_enclave_generation_transition_with_policy(
+            &source,
+            &target,
+            &target,
+            schema,
+            cross,
+            Some(cross),
+            Some(target_release_commit),
+        )
+        .is_ok());
         let mut forged = cross;
         forged[0] ^= 1;
         assert_eq!(
-            verify_enclave_generation_transition(&source, &target, &target, schema, forged)
-                .unwrap_err(),
+            verify_enclave_generation_transition_with_policy(
+                &source,
+                &target,
+                &target,
+                schema,
+                forged,
+                Some(cross),
+                Some(target_release_commit),
+            )
+            .unwrap_err(),
             "DURABLE_ENCLAVE_TRANSITION_INVALID"
+        );
+        assert_eq!(
+            verify_enclave_generation_transition_with_policy(
+                &source,
+                &target,
+                &target,
+                schema,
+                cross,
+                Some([0x44; 32]),
+                Some(target_release_commit),
+            )
+            .unwrap_err(),
+            "DURABLE_ENCLAVE_TRANSITION_NOT_AUTHORIZED"
         );
     }
 
