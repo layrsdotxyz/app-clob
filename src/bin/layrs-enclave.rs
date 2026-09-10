@@ -1673,47 +1673,47 @@ async fn handle_encrypted(
         };
     }
     let direct_execution = direct_execution_request(&state, &request);
-    let writer_trusted_now_millis = if request_requires_writer_authorization(&request)
-        && !direct_execution
-    {
-        let Some(authorization) = writer_authorization.as_ref() else {
-            return WireResponse::Error {
-                code: "DURABLE_WRITER_AUTHORIZATION_REQUIRED",
+    let writer_trusted_now_millis =
+        if should_verify_writer_authorization(&request, direct_execution) {
+            let Some(authorization) = writer_authorization.as_ref() else {
+                return WireResponse::Error {
+                    code: "DURABLE_WRITER_AUTHORIZATION_REQUIRED",
+                };
             };
-        };
-        let now = match trusted_nsm_now_millis(state.nsm_fd, &state.enclave_measurement_sha384) {
-            Ok(value) => value,
-            Err(()) => {
-                return WireResponse::Error {
-                    code: "TRUSTED_TIME_UNAVAILABLE",
+            let now = match trusted_nsm_now_millis(state.nsm_fd, &state.enclave_measurement_sha384)
+            {
+                Ok(value) => value,
+                Err(()) => {
+                    return WireResponse::Error {
+                        code: "TRUSTED_TIME_UNAVAILABLE",
+                    }
+                }
+            };
+            if let Err(code) = verify_writer_authorization(
+                &mut state,
+                authorization,
+                &actor_domain,
+                &command_idempotency_key,
+                durable_command_commitment,
+                request_context_sha256,
+                request_envelope_sha256,
+                now,
+            ) {
+                return WireResponse::Error { code };
+            }
+            Some(now)
+        } else if direct_execution && request_requires_trusted_execution_time(&request) {
+            match trusted_nsm_now_millis(state.nsm_fd, &state.enclave_measurement_sha384) {
+                Ok(value) => Some(value),
+                Err(()) => {
+                    return WireResponse::Error {
+                        code: "TRUSTED_TIME_UNAVAILABLE",
+                    }
                 }
             }
+        } else {
+            None
         };
-        if let Err(code) = verify_writer_authorization(
-            &mut state,
-            authorization,
-            &actor_domain,
-            &command_idempotency_key,
-            durable_command_commitment,
-            request_context_sha256,
-            request_envelope_sha256,
-            now,
-        ) {
-            return WireResponse::Error { code };
-        }
-        Some(now)
-    } else if direct_execution && request_requires_trusted_execution_time(&request) {
-        match trusted_nsm_now_millis(state.nsm_fd, &state.enclave_measurement_sha384) {
-            Ok(value) => Some(value),
-            Err(()) => {
-                return WireResponse::Error {
-                    code: "TRUSTED_TIME_UNAVAILABLE",
-                }
-            }
-        }
-    } else {
-        None
-    };
     if transport_replay == TransportReplayDecision::ExactRetry
         && state
             .pending_preparation
@@ -3108,6 +3108,11 @@ fn direct_quest_operator_command(command: &OperatorCommand) -> bool {
             recurring_crypto_window(market_id).is_some()
         }
         OperatorCommand::TradingFreezeStatus => true,
+        OperatorCommand::SetTradingFreeze {
+            idempotency_key,
+            reason_commitment,
+            ..
+        } => direct_trading_freeze(idempotency_key, reason_commitment),
         OperatorCommand::SignResolutionEvidence { evidence, .. } => {
             recurring_crypto_window(unsigned_resolution_market_id(evidence)).is_some()
         }
@@ -3116,6 +3121,33 @@ fn direct_quest_operator_command(command: &OperatorCommand) -> bool {
         }
         _ => false,
     }
+}
+
+/// A Green reconciliation freeze is direct only when its idempotency key is
+/// exactly bound to the committed reason. The operator signature authenticates
+/// the command and the separately signed writer authorization still proves the
+/// current database lease inside the enclave.
+fn direct_trading_freeze(idempotency_key: &str, reason_commitment: &[u8; 32]) -> bool {
+    idempotency_key
+        .strip_prefix("trading-freeze:")
+        .is_some_and(|value| value == hex::encode(reason_commitment))
+}
+
+fn direct_execution_requires_writer_authorization(request: &PlainRequest) -> bool {
+    matches!(
+        request,
+        PlainRequest::Operator {
+            envelope: OperatorEnvelope {
+                command: OperatorCommand::SetTradingFreeze { .. },
+                ..
+            }
+        }
+    )
+}
+
+fn should_verify_writer_authorization(request: &PlainRequest, direct_execution: bool) -> bool {
+    request_requires_writer_authorization(request)
+        && (!direct_execution || direct_execution_requires_writer_authorization(request))
 }
 
 fn direct_base_usdc_withdrawal(action: &UserCommandAction) -> bool {
@@ -10826,7 +10858,7 @@ mod tests {
         assert!(direct_quest_operator_command(
             &OperatorCommand::TradingFreezeStatus
         ));
-        assert!(!direct_quest_operator_command(&freeze_command));
+        assert!(direct_quest_operator_command(&freeze_command));
         let freeze_status_request = PlainRequest::Operator {
             envelope: OperatorEnvelope {
                 nonce: [12; 32],
@@ -10844,13 +10876,25 @@ mod tests {
         };
         assert!(!durable_control_request(&freeze_request));
         assert!(request_requires_writer_authorization(&freeze_request));
-        for command in [
-            OperatorCommand::SetTradingFreeze {
+        assert!(direct_execution_requires_writer_authorization(
+            &freeze_request
+        ));
+        assert!(should_verify_writer_authorization(&freeze_request, true));
+        assert!(should_verify_writer_authorization(&freeze_request, false));
+        assert!(pending_preparation_blocks_request(
+            true,
+            &freeze_request,
+            true,
+        ));
+        assert!(!direct_quest_operator_command(
+            &OperatorCommand::SetTradingFreeze {
                 idempotency_key: format!("trading-freeze:{}", hex::encode([0xcdu8; 32])),
                 frozen: true,
                 reason_commitment: freeze_reason,
                 now_millis: 1,
-            },
+            }
+        ));
+        for command in [
             OperatorCommand::SetTradingFreeze {
                 idempotency_key: format!("trading-freeze:{}", hex::encode([0u8; 32])),
                 frozen: false,
@@ -10864,7 +10908,7 @@ mod tests {
                 now_millis: 0,
             },
         ] {
-            assert!(!direct_quest_operator_command(&command));
+            assert!(direct_quest_operator_command(&command));
         }
 
         let split_session_dust = OperatorCommand::CreditDeposit {
