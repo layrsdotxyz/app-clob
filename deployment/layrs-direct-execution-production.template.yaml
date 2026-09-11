@@ -1,0 +1,82 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Dormant Layrs direct-execution Nitro parent. It intentionally creates no writer route or running capacity.
+Parameters:
+  VpcId: { Type: AWS::EC2::VPC::Id }
+  PrivateSubnetId: { Type: AWS::EC2::Subnet::Id }
+  BffSecurityGroupId: { Type: AWS::EC2::SecurityGroup::Id }
+  CandidateAmiId: { Type: AWS::EC2::Image::Id, Default: ami-0a26d307d4920f05b }
+  ArchiveBucketArn: { Type: String }
+  ArchiveKmsKeyArn: { Type: String }
+  AlertTopicArn: { Type: String }
+Resources:
+  RuntimeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /layrs/direct-execution/runtime, RetentionInDays: 365 }
+  RuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: 'sts:AssumeRole' }]
+      Policies:
+        - PolicyName: direct-runtime-dormant-archive-only
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket, s3:GetBucketObjectLockConfiguration, s3:GetObjectRetention, s3:PutObjectRetention]
+                Resource: [!Ref ArchiveBucketArn, !Sub '${ArchiveBucketArn}/*']
+              - Effect: Allow
+                Action: [kms:Encrypt, kms:Decrypt, kms:GenerateDataKey, kms:DescribeKey]
+                Resource: !Ref ArchiveKmsKeyArn
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt RuntimeLogGroup.Arn
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore]
+  RuntimeProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: { Roles: [!Ref RuntimeRole] }
+  RuntimeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Direct runtime accepts only BFF health and command traffic
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8443, ToPort: 8443, SourceSecurityGroupId: !Ref BffSecurityGroupId }
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0 }
+  DormantLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref CandidateAmiId
+        InstanceType: m6i.xlarge
+        IamInstanceProfile: { Arn: !GetAtt RuntimeProfile.Arn }
+        SecurityGroupIds: [!Ref RuntimeSecurityGroup]
+        EnclaveOptions: { Enabled: true }
+        MetadataOptions: { HttpTokens: required, HttpEndpoint: enabled }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{ Key: Project, Value: Layrs }, { Key: Environment, Value: production-dormant }, { Key: WriterEnabled, Value: 'false' }]
+  DormantAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: [!Ref PrivateSubnetId]
+      LaunchTemplate: { LaunchTemplateId: !Ref DormantLaunchTemplate, Version: !GetAtt DormantLaunchTemplate.LatestVersionNumber }
+      MinSize: '0'
+      MaxSize: '1'
+      DesiredCapacity: '0'
+      Tags: [{ Key: WriterEnabled, Value: 'false', PropagateAtLaunch: true }]
+  RuntimeHealthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: layrs-production-direct-runtime-health-missing
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlertTopicArn]

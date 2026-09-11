@@ -14,17 +14,17 @@ customer asset.
 | opening state | `84835da82210671d87321a21246317d898afd35381c57be8522df1a516dc3590` |
 | opening evidence | `70e579f630c759258728d91cb957fa84e200674aeebd3eae5997430a62203957` |
 | transaction model | `layrs.direct-execution.v1` |
-| EIF | `138d35cb576bd07f2dcf37652d436fa4d2acdc5aa3431c6c4934a0ff8cbc1548` |
-| enclave binary | `fcbba5e7a469aa54de63ddb836b1c8ae95fb43282a626f753cfb9b95f00f46b5` |
-| parent binary | `697823b3de72c82432c715df12103d6811443f6c5f9733c6db8d41a66a135ad7` |
-| PCR0 | `d2a9db65dbcdc682f02b3023321aa9b1c9272a52cbe4ec8d36c112eadc48a351cfc0b11ca0af4dd744290836e31dba13` |
+| AMI | `ami-0a26d307d4920f05b` |
+| EIF | `a71f54ccc2b420b8771d16a1607582e72c7394171d7d3217a86cc7c772eafa74` |
+| enclave binary | `cf693b97b1ce8e0906bbb6b572811c36b608b0c1d9c731681427a88c208629b8` |
+| parent binary | `29b374bcbaeb1cf8cb80478c46a262cf625e2f3ee402c812a9b362f097616b32` |
+| PCR0 | `28b343ca5357abc638a1536d097e03c47daf264920d998ee3ad4b180238b0ee88a4630750ff1535c998970fbe8ed46bb` |
 | PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
-| PCR2 | `08f5b0adbcb270fd159b3f73630676415a6f30df3c8b7aeeb0ac34a1597f668f845f302463557cab8c9483feda2213bf` |
+| PCR2 | `85bb69be9eea43dbd96d100dc8dd44600b24a4d7f5e6f18a69c43011fa56ee4ab3ce296813583d8369e21d246b8788eb` |
 
-The original candidate AMI, `ami-00b5f08fce6be9018`, did not return from
-`DescribeImages` during this precheck.  It must not be replaced silently.  A
-fresh artifact requires an isolated rebuild, matching EIF/PCR verification,
-and a new governed approval before this runbook can be used.
+The earlier unregistered candidate has been superseded by the independently
+verified final candidate above.  The new candidate remains writer-disabled and
+requires a new governed approval; no prior approval transfers to it.
 
 ## Pre-activation gates — all must pass in order
 
@@ -66,9 +66,9 @@ and a new governed approval before this runbook can be used.
 9. The governance/key-release control must bind the exact AMI, EIF and PCR
    values above before releasing runtime keys.  The in-runtime `WriterGrant`
    independently verifies `activationId`, epoch, model, opening hash,
-   old-writer-fence hash, expiry and signature; it does **not** itself carry
-   AMI/EIF/PCR fields.  Do not claim those commitments are cryptographically
-   enforced until the external attestation/key-release policy is verified.
+   old-writer-fence hash, expiry, AMI, EIF, PCRs, source commit and binary
+   hashes.  Do not claim an external approval until a matching signature and
+   independent attestation/key-release verification both exist.
 10. After gates 1–9 pass, approvers may sign the canonical WriterGrant below.
     Persist the signed grant and fence in the projection, read both back, and
     then set the fence target writer flag once.  Never fabricate a signature.
