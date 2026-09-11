@@ -99,6 +99,7 @@ struct EmbeddedWallet {
 #[derive(Debug, Clone)]
 pub struct SealedEpoch {
     identities: BTreeMap<String, BTreeMap<(String, String), u128>>,
+    identity_subjects: BTreeMap<String, String>,
     subject_identities: BTreeMap<String, BTreeSet<String>>,
     subject_wallets: BTreeMap<String, BTreeSet<String>>,
 }
@@ -123,14 +124,19 @@ impl SealedEpoch {
             return Err(RuntimeError::EpochSchema);
         }
         let mut subject_identities: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut identity_subjects = BTreeMap::new();
         let identities = raw
             .identities
             .into_iter()
             .map(|identity| {
                 subject_identities
-                    .entry(identity.auth_subject_hash)
+                    .entry(identity.auth_subject_hash.clone())
                     .or_default()
                     .insert(identity.identity_commitment.clone());
+                identity_subjects.insert(
+                    identity.identity_commitment.clone(),
+                    identity.auth_subject_hash.clone(),
+                );
                 let balances = identity
                     .balances
                     .into_iter()
@@ -165,6 +171,7 @@ impl SealedEpoch {
         }
         Ok(Self {
             identities,
+            identity_subjects,
             subject_identities,
             subject_wallets,
         })
@@ -182,6 +189,57 @@ impl SealedEpoch {
     pub fn identity_count(&self) -> usize {
         self.identities.len()
     }
+    /// Read-only opening data for the external accounting projection. It is
+    /// never accepted as a source of enclave state.
+    pub fn projection_rows(&self) -> Vec<ProjectionBalanceRow> {
+        self.identities
+            .iter()
+            .flat_map(|(identity, balances)| {
+                let subject = self
+                    .identity_subjects
+                    .get(identity)
+                    .cloned()
+                    .unwrap_or_default();
+                balances
+                    .iter()
+                    .map(move |((asset, bucket), amount)| ProjectionBalanceRow {
+                        auth_subject_hash: subject.clone(),
+                        identity_commitment: identity.clone(),
+                        asset: asset.clone(),
+                        bucket: bucket.clone(),
+                        amount_atomic: amount.to_string(),
+                    })
+            })
+            .collect()
+    }
+    pub fn projection_wallet_rows(&self) -> Vec<ProjectionWalletRow> {
+        self.subject_wallets
+            .iter()
+            .flat_map(|(subject, wallets)| {
+                wallets.iter().map(move |wallet| ProjectionWalletRow {
+                    auth_subject_hash: subject.clone(),
+                    wallet_address: wallet.clone(),
+                })
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionBalanceRow {
+    pub auth_subject_hash: String,
+    pub identity_commitment: String,
+    pub asset: String,
+    pub bucket: String,
+    pub amount_atomic: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionWalletRow {
+    pub auth_subject_hash: String,
+    pub wallet_address: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,6 +314,24 @@ pub enum DirectAction {
         amount_atomic: String,
     },
 }
+
+/// Custody evidence is deliberately terminal-only at the direct execution
+/// boundary. Observed and confirmed events may be projected for operations,
+/// but cannot credit a customer or settle a withdrawal.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CustodyFinality {
+    Observed,
+    Confirmed,
+    Final,
+    Failed,
+}
+
+impl CustodyFinality {
+    pub fn permits_settlement(self) -> bool {
+        matches!(self, Self::Final)
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TerminalStatus {
@@ -272,6 +348,7 @@ pub struct DirectReceipt {
     pub request_hash: String,
     pub status: TerminalStatus,
     pub effect: String,
+    pub amount_atomic: Option<String>,
     pub custody_reference: Option<String>,
     pub genesis_ordinal: u64,
     pub signature: String,
@@ -335,112 +412,123 @@ impl DirectRuntime {
         if !self.owns(&request.account_id, &request.identity_commitment) {
             return Err(RuntimeError::IdentityDenied);
         }
-        let (effect, custody_reference): (String, Option<String>) = match &request.action {
-            DirectAction::CreditDeposit {
-                amount_atomic,
-                custody_reference,
-            } => {
-                let value = amount(amount_atomic)?;
-                if custody_reference.is_empty() {
-                    return Err(RuntimeError::InvalidRequest);
+        let (effect, amount_atomic, custody_reference): (String, Option<String>, Option<String>) =
+            match &request.action {
+                DirectAction::CreditDeposit {
+                    amount_atomic,
+                    custody_reference,
+                } => {
+                    let value = amount(amount_atomic)?;
+                    if custody_reference.is_empty() {
+                        return Err(RuntimeError::InvalidRequest);
+                    }
+                    self.add(&request.identity_commitment, "USER_AVAILABLE", value)?;
+                    (
+                        "DEPOSIT_CREDITED".into(),
+                        Some(amount_atomic.clone()),
+                        Some(custody_reference.clone()),
+                    )
                 }
-                self.add(&request.identity_commitment, "USER_AVAILABLE", value)?;
-                ("DEPOSIT_CREDITED".into(), Some(custody_reference.clone()))
-            }
-            DirectAction::PlaceOrder {
-                order_id,
-                market_id,
-                reserve_atomic,
-            } => {
-                let value = amount(reserve_atomic)?;
-                if order_id.is_empty() || market_id.is_empty() || self.orders.contains_key(order_id)
-                {
-                    return Err(RuntimeError::InvalidRequest);
+                DirectAction::PlaceOrder {
+                    order_id,
+                    market_id,
+                    reserve_atomic,
+                } => {
+                    let value = amount(reserve_atomic)?;
+                    if order_id.is_empty()
+                        || market_id.is_empty()
+                        || self.orders.contains_key(order_id)
+                    {
+                        return Err(RuntimeError::InvalidRequest);
+                    }
+                    self.move_bucket(
+                        &request.identity_commitment,
+                        "USER_AVAILABLE",
+                        "USER_ORDER_HOLD",
+                        value,
+                    )?;
+                    self.orders.insert(
+                        order_id.clone(),
+                        (request.identity_commitment.clone(), value),
+                    );
+                    ("ORDER_PLACED".into(), Some(reserve_atomic.clone()), None)
                 }
-                self.move_bucket(
-                    &request.identity_commitment,
-                    "USER_AVAILABLE",
-                    "USER_ORDER_HOLD",
-                    value,
-                )?;
-                self.orders.insert(
-                    order_id.clone(),
-                    (request.identity_commitment.clone(), value),
-                );
-                ("ORDER_PLACED".into(), None)
-            }
-            DirectAction::CancelOrder { order_id } => {
-                let (owner, value) = self
-                    .orders
-                    .remove(order_id)
-                    .ok_or(RuntimeError::UnknownOrder)?;
-                if owner != request.identity_commitment {
-                    self.orders.insert(order_id.clone(), (owner, value));
-                    return Err(RuntimeError::IdentityDenied);
+                DirectAction::CancelOrder { order_id } => {
+                    let (owner, value) = self
+                        .orders
+                        .remove(order_id)
+                        .ok_or(RuntimeError::UnknownOrder)?;
+                    if owner != request.identity_commitment {
+                        self.orders.insert(order_id.clone(), (owner, value));
+                        return Err(RuntimeError::IdentityDenied);
+                    }
+                    self.move_bucket(
+                        &request.identity_commitment,
+                        "USER_ORDER_HOLD",
+                        "USER_AVAILABLE",
+                        value,
+                    )?;
+                    ("ORDER_CANCELLED".into(), Some(value.to_string()), None)
                 }
-                self.move_bucket(
-                    &request.identity_commitment,
-                    "USER_ORDER_HOLD",
-                    "USER_AVAILABLE",
-                    value,
-                )?;
-                ("ORDER_CANCELLED".into(), None)
-            }
-            DirectAction::ReserveWithdrawal {
-                destination,
-                amount_atomic,
-                custody_reference,
-            } => {
-                let value = amount(amount_atomic)?;
-                let destination = destination.to_ascii_lowercase();
-                if custody_reference.is_empty()
-                    || !self
-                        .subject_wallets
-                        .get(&request.account_id)
-                        .is_some_and(|wallets| wallets.contains(&destination))
-                {
-                    return Err(RuntimeError::DestinationDenied);
+                DirectAction::ReserveWithdrawal {
+                    destination,
+                    amount_atomic,
+                    custody_reference,
+                } => {
+                    let value = amount(amount_atomic)?;
+                    let destination = destination.to_ascii_lowercase();
+                    if custody_reference.is_empty()
+                        || !self
+                            .subject_wallets
+                            .get(&request.account_id)
+                            .is_some_and(|wallets| wallets.contains(&destination))
+                    {
+                        return Err(RuntimeError::DestinationDenied);
+                    }
+                    self.move_bucket(
+                        &request.identity_commitment,
+                        "USER_AVAILABLE",
+                        "USER_WITHDRAWAL_HOLD",
+                        value,
+                    )?;
+                    self.move_bucket(
+                        &request.identity_commitment,
+                        "USER_WITHDRAWAL_HOLD",
+                        "USER_SETTLED",
+                        value,
+                    )?;
+                    (
+                        "WITHDRAWAL_SETTLED".into(),
+                        Some(amount_atomic.clone()),
+                        Some(custody_reference.clone()),
+                    )
                 }
-                self.move_bucket(
-                    &request.identity_commitment,
-                    "USER_AVAILABLE",
-                    "USER_WITHDRAWAL_HOLD",
-                    value,
-                )?;
-                self.move_bucket(
-                    &request.identity_commitment,
-                    "USER_WITHDRAWAL_HOLD",
-                    "USER_SETTLED",
-                    value,
-                )?;
-                ("WITHDRAWAL_SETTLED".into(), Some(custody_reference.clone()))
-            }
-            DirectAction::Transfer {
-                recipient_identity_commitment,
-                amount_atomic,
-            } => {
-                let value = amount(amount_atomic)?;
-                if recipient_identity_commitment == &request.identity_commitment
-                    || !self.balances.contains_key(recipient_identity_commitment)
-                {
-                    return Err(RuntimeError::InvalidRequest);
+                DirectAction::Transfer {
+                    recipient_identity_commitment,
+                    amount_atomic,
+                } => {
+                    let value = amount(amount_atomic)?;
+                    if recipient_identity_commitment == &request.identity_commitment
+                        || !self.balances.contains_key(recipient_identity_commitment)
+                    {
+                        return Err(RuntimeError::InvalidRequest);
+                    }
+                    self.move_bucket(
+                        &request.identity_commitment,
+                        "USER_AVAILABLE",
+                        "USER_TRANSFER_HOLD",
+                        value,
+                    )?;
+                    self.move_bucket(
+                        &request.identity_commitment,
+                        "USER_TRANSFER_HOLD",
+                        "USER_SETTLED",
+                        value,
+                    )?;
+                    self.add(recipient_identity_commitment, "USER_AVAILABLE", value)?;
+                    ("TRANSFER_SETTLED".into(), Some(amount_atomic.clone()), None)
                 }
-                self.move_bucket(
-                    &request.identity_commitment,
-                    "USER_AVAILABLE",
-                    "USER_TRANSFER_HOLD",
-                    value,
-                )?;
-                self.move_bucket(
-                    &request.identity_commitment,
-                    "USER_TRANSFER_HOLD",
-                    "USER_SETTLED",
-                    value,
-                )?;
-                self.add(recipient_identity_commitment, "USER_AVAILABLE", value)?;
-                ("TRANSFER_SETTLED".into(), None)
-            }
-        };
+            };
         let mut receipt = DirectReceipt {
             receipt_id: sha256(
                 format!("{}:{}:{}", EPOCH_ID, request.account_id, request.request_id).as_bytes(),
@@ -451,6 +539,7 @@ impl DirectRuntime {
             request_hash: request.request_hash.clone(),
             status: TerminalStatus::Applied,
             effect: effect.clone(),
+            amount_atomic,
             custody_reference,
             genesis_ordinal: 0,
             signature: String::new(),
@@ -808,5 +897,13 @@ mod tests {
         assert!(!grant.verify(&key, 200));
         grant.old_writer_fence_evidence_sha256 = "b".repeat(64);
         assert!(!grant.verify(&key, 100));
+    }
+
+    #[test]
+    fn only_final_custody_evidence_permits_settlement() {
+        assert!(!CustodyFinality::Observed.permits_settlement());
+        assert!(!CustodyFinality::Confirmed.permits_settlement());
+        assert!(!CustodyFinality::Failed.permits_settlement());
+        assert!(CustodyFinality::Final.permits_settlement());
     }
 }
