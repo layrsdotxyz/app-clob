@@ -473,12 +473,21 @@ struct DirectState {
 /// existing immutable-object archive; tests use this exact write-once contract.
 pub trait DirectStateStore {
     fn put_if_absent(&mut self, artifact: &DirectStateArtifact) -> Result<(), RuntimeError>;
-    fn artifacts(&self) -> Vec<DirectStateArtifact>;
+    fn artifacts(&self) -> Result<Vec<DirectStateArtifact>, RuntimeError>;
 }
 
 #[derive(Default)]
 pub struct InMemoryDirectStateStore {
     artifacts: BTreeMap<String, DirectStateArtifact>,
+}
+impl InMemoryDirectStateStore {
+    pub fn from_artifacts(artifacts: Vec<DirectStateArtifact>) -> Result<Self, RuntimeError> {
+        let mut store = Self::default();
+        for artifact in artifacts {
+            store.put_if_absent(&artifact)?;
+        }
+        Ok(store)
+    }
 }
 impl DirectStateStore for InMemoryDirectStateStore {
     fn put_if_absent(&mut self, artifact: &DirectStateArtifact) -> Result<(), RuntimeError> {
@@ -492,8 +501,8 @@ impl DirectStateStore for InMemoryDirectStateStore {
             }
         }
     }
-    fn artifacts(&self) -> Vec<DirectStateArtifact> {
-        self.artifacts.values().cloned().collect()
+    fn artifacts(&self) -> Result<Vec<DirectStateArtifact>, RuntimeError> {
+        Ok(self.artifacts.values().cloned().collect())
     }
 }
 
@@ -505,12 +514,77 @@ impl DirectStateStore for InMemoryDirectStateStore {
 pub struct FilesystemImmutableArtifactStore {
     root: PathBuf,
 }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ArtifactRecoveryHead {
+    epoch_id: String,
+    sequence: u64,
+    state_hash: String,
+    artifact_hash: String,
+}
 impl FilesystemImmutableArtifactStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
     fn path_for(&self, artifact: &DirectStateArtifact) -> PathBuf {
-        self.root.join(format!("{}.cbor", artifact.request_hash))
+        self.root
+            .join(format!("{}.artifact.cbor", artifact.request_hash))
+    }
+    fn head_path(&self) -> PathBuf {
+        self.root.join("committed-head.cbor")
+    }
+    fn read_head(&self) -> Result<Option<ArtifactRecoveryHead>, RuntimeError> {
+        let path = self.head_path();
+        match fs::read(path) {
+            Ok(bytes) => serde_cbor::from_slice(&bytes)
+                .map(Some)
+                .map_err(|_| RuntimeError::StatePersistence),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(RuntimeError::StatePersistence),
+        }
+    }
+    fn persist_head(&self, head: &ArtifactRecoveryHead) -> Result<(), RuntimeError> {
+        let tmp = self
+            .root
+            .join(format!(".committed-head-{}.tmp", std::process::id()));
+        let bytes = serde_cbor::to_vec(head).map_err(|_| RuntimeError::StatePersistence)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|_| RuntimeError::StatePersistence)?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| RuntimeError::StatePersistence)?;
+        fs::rename(&tmp, self.head_path()).map_err(|_| RuntimeError::StatePersistence)?;
+        fs::File::open(&self.root)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|_| RuntimeError::StatePersistence)
+    }
+    fn advance_head(&self, artifact: &DirectStateArtifact) -> Result<(), RuntimeError> {
+        let artifact_hash = artifact_hash(artifact);
+        match self.read_head()? {
+            Some(head)
+                if head.epoch_id == artifact.epoch_id
+                    && head.sequence == artifact.sequence
+                    && head.state_hash == artifact.state_hash
+                    && head.artifact_hash == artifact_hash =>
+            {
+                return Ok(())
+            }
+            Some(head)
+                if artifact.sequence == head.sequence + 1
+                    && artifact.prior_state_hash == head.state_hash => {}
+            Some(_) => return Err(RuntimeError::StatePersistence),
+            None if artifact.sequence == 1 => {}
+            None => return Err(RuntimeError::StatePersistence),
+        }
+        self.persist_head(&ArtifactRecoveryHead {
+            epoch_id: artifact.epoch_id.clone(),
+            sequence: artifact.sequence,
+            state_hash: artifact.state_hash.clone(),
+            artifact_hash,
+        })
     }
     pub fn persist_readback(
         &self,
@@ -538,7 +612,49 @@ impl FilesystemImmutableArtifactStore {
         if &restored != artifact || artifact_hash(&restored) != artifact_hash(artifact) {
             return Err(RuntimeError::StatePersistence);
         }
+        // The head is not state authority; it is a durable recovery floor.  It
+        // prevents a deleted latest object from being mistaken for genesis.
+        self.advance_head(&restored)?;
         Ok(restored)
+    }
+    /// Return the only recovery set acceptable to the enclave.  A corrupt,
+    /// missing, forked, or untracked object is an error; callers must not fall
+    /// back to opening state after this error.
+    pub fn load_committed(&self) -> Result<Vec<DirectStateArtifact>, RuntimeError> {
+        let head = self.read_head()?;
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && head.is_none() => {
+                return Ok(Vec::new())
+            }
+            Err(_) => return Err(RuntimeError::StatePersistence),
+        };
+        let mut artifacts: Vec<DirectStateArtifact> = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|_| RuntimeError::StatePersistence)?;
+            let name = entry.file_name();
+            if !name.to_string_lossy().ends_with(".artifact.cbor") {
+                continue;
+            }
+            let bytes = fs::read(entry.path()).map_err(|_| RuntimeError::StatePersistence)?;
+            artifacts
+                .push(serde_cbor::from_slice(&bytes).map_err(|_| RuntimeError::StatePersistence)?);
+        }
+        artifacts.sort_by_key(|artifact| artifact.sequence);
+        match (head, artifacts.last()) {
+            (None, None) => Ok(artifacts),
+            (None, Some(_)) => Err(RuntimeError::StatePersistence),
+            (Some(_), None) => Err(RuntimeError::StatePersistence),
+            (Some(head), Some(last))
+                if head.epoch_id == last.epoch_id
+                    && head.sequence == last.sequence
+                    && head.state_hash == last.state_hash
+                    && head.artifact_hash == artifact_hash(last) =>
+            {
+                Ok(artifacts)
+            }
+            _ => Err(RuntimeError::StatePersistence),
+        }
     }
     pub fn root(&self) -> &Path {
         &self.root
@@ -548,15 +664,8 @@ impl DirectStateStore for FilesystemImmutableArtifactStore {
     fn put_if_absent(&mut self, artifact: &DirectStateArtifact) -> Result<(), RuntimeError> {
         self.persist_readback(artifact).map(|_| ())
     }
-    fn artifacts(&self) -> Vec<DirectStateArtifact> {
-        let Ok(entries) = fs::read_dir(&self.root) else {
-            return Vec::new();
-        };
-        entries
-            .filter_map(Result::ok)
-            .filter_map(|entry| fs::read(entry.path()).ok())
-            .filter_map(|bytes| serde_cbor::from_slice(&bytes).ok())
-            .collect()
+    fn artifacts(&self) -> Result<Vec<DirectStateArtifact>, RuntimeError> {
+        self.load_committed()
     }
 }
 impl DirectRuntime {
@@ -850,16 +959,22 @@ impl DirectRuntime {
     ) -> Result<Self, RuntimeError> {
         let mut runtime = Self::new(epoch, mode, receipt_key)?;
         let mut prior = runtime.state_hash();
-        let mut artifacts = store.artifacts();
+        let mut artifacts = store.artifacts()?;
         artifacts.sort_by_key(|a| a.sequence);
+        let mut expected_sequence = 1u64;
         for artifact in artifacts {
-            if artifact.prior_state_hash != prior
+            if artifact.sequence != expected_sequence
+                || artifact.prior_state_hash != prior
                 || !runtime.verify_artifact(&artifact, state_key)?
             {
                 return Err(RuntimeError::StateArtifact);
             }
             runtime.apply_artifact(&artifact, state_key)?;
+            if runtime.state_hash() != artifact.state_hash {
+                return Err(RuntimeError::StateArtifact);
+            }
             prior = runtime.state_hash();
+            expected_sequence += 1;
         }
         Ok(runtime)
     }
@@ -973,6 +1088,12 @@ impl DirectRuntime {
     pub fn writer_enabled(&self) -> bool {
         self.mode != RuntimeMode::Dormant
     }
+    pub fn committed_state_hash(&self) -> String {
+        self.state_hash()
+    }
+    pub fn committed_sequence(&self) -> u64 {
+        self.requests.len() as u64
+    }
 }
 fn amount(input: &str) -> Result<u128, RuntimeError> {
     let value = input
@@ -1001,6 +1122,12 @@ pub enum RuntimeRequest {
     DurabilityAck {
         ack: DurabilityAck,
     },
+    /// Startup-only handoff of immutable encrypted artifacts from the parent.
+    /// The enclave reconstructs and verifies private state itself; PostgreSQL
+    /// is never part of this input.
+    RecoverCommitted {
+        artifacts: Vec<DirectStateArtifact>,
+    },
     Balance {
         account_id: String,
         identity_commitment: String,
@@ -1022,6 +1149,10 @@ pub enum RuntimeResponse {
     },
     CommitCandidate {
         artifact: DirectStateArtifact,
+    },
+    RecoveryComplete {
+        recovered_sequence: u64,
+        recovered_state_hash: String,
     },
     Balance {
         amount_atomic: String,
@@ -1330,6 +1461,6 @@ mod tests {
                 .receipt,
             receipt
         );
-        assert_eq!(store.artifacts().len(), 1);
+        assert_eq!(store.artifacts().unwrap().len(), 1);
     }
 }

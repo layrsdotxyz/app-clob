@@ -155,6 +155,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter(|value| value.len() == 32)
             .unwrap_or_default(),
     };
+    // The HTTP parent never accepts a financial command until it has supplied
+    // the immutable archive's complete, head-verified recovery set and the
+    // enclave has independently reconstructed it.  PostgreSQL is excluded.
+    recover_enclave(&state).await?;
     let port = env::var("PORT").unwrap_or_else(|_| "8443".into()).parse()?;
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -567,6 +571,55 @@ async fn exchange(state: &AppState, request: RuntimeRequest) -> io::Result<Runti
     })
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "enclave timeout"))?
+}
+
+async fn recover_enclave(state: &AppState) -> io::Result<()> {
+    let store = state.artifact_store.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "DIRECT_ARTIFACT_STORE_NOT_CONFIGURED",
+        )
+    })?;
+    let artifacts = store.load_committed().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("DIRECT_STATE_RECOVERY_FAILED:{error}"),
+        )
+    })?;
+    let expected = artifacts.last().map(|artifact| {
+        (
+            artifact.sequence,
+            artifact.state_hash.clone(),
+            artifact.epoch_id.clone(),
+        )
+    });
+    match exchange(state, RuntimeRequest::RecoverCommitted { artifacts }).await? {
+        RuntimeResponse::RecoveryComplete {
+            recovered_sequence,
+            recovered_state_hash,
+        } => match expected {
+            Some((sequence, state_hash, epoch_id))
+                if epoch_id == EPOCH_ID
+                    && sequence == recovered_sequence
+                    && state_hash == recovered_state_hash =>
+            {
+                Ok(())
+            }
+            None if recovered_sequence == 0 => Ok(()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DIRECT_STATE_RECOVERY_MISMATCH",
+            )),
+        },
+        RuntimeResponse::Error { code } => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("DIRECT_STATE_RECOVERY_FAILED:{code}"),
+        )),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DIRECT_STATE_RECOVERY_UNEXPECTED_RESPONSE",
+        )),
+    }
 }
 
 /// One bounded direct request.  The first response is deliberately not a

@@ -9,8 +9,8 @@ use aws_nitro_enclaves_nsm_api::{
     driver::{nsm_exit, nsm_init, nsm_process_request},
 };
 use layrs_direct_execution_v1::{
-    runtime_binding, DirectRuntime, RuntimeMode, RuntimeRequest, RuntimeResponse, SealedEpoch,
-    WriterGrant,
+    runtime_binding, DirectRuntime, InMemoryDirectStateStore, RuntimeMode, RuntimeRequest,
+    RuntimeResponse, SealedEpoch, WriterGrant,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -24,9 +24,13 @@ const MAX_FRAME_BYTES: usize = 1024 * 1024;
 struct EnclaveState {
     nsm_fd: i32,
     runtime: DirectRuntime,
+    epoch: SealedEpoch,
+    mode: RuntimeMode,
+    receipt_key: Vec<u8>,
     identity_count: usize,
     state_key: Vec<u8>,
     commit_ack_key: Vec<u8>,
+    recovery_complete: bool,
 }
 
 impl Drop for EnclaveState {
@@ -66,10 +70,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let commit_ack_key = protected_key("LAYRS_DIRECT_COMMIT_ACK_KEY_HEX", mode)?;
     let state = Arc::new(Mutex::new(EnclaveState {
         nsm_fd,
-        runtime: DirectRuntime::new(epoch, mode, receipt_key)?,
+        runtime: DirectRuntime::new(epoch.clone(), mode, receipt_key.clone())?,
+        epoch,
+        mode,
+        receipt_key,
         identity_count,
         state_key,
         commit_ack_key,
+        recovery_complete: false,
     }));
     let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, PORT))?;
     loop {
@@ -122,7 +130,10 @@ where
         RuntimeRequest::Status => {
             let state = state.lock().await;
             RuntimeResponse::Status {
-                status: runtime_binding(state.identity_count, state.runtime.writer_enabled()),
+                status: runtime_binding(
+                    state.identity_count,
+                    state.recovery_complete && state.runtime.writer_enabled(),
+                ),
             }
         }
         RuntimeRequest::Execute { request } => {
@@ -131,13 +142,18 @@ where
         RuntimeRequest::DurabilityAck { .. } => RuntimeResponse::Error {
             code: "UNEXPECTED_DURABILITY_ACK".into(),
         },
+        RuntimeRequest::RecoverCommitted { artifacts } => recover_committed(state, artifacts).await,
         RuntimeRequest::Balance {
             account_id,
             identity_commitment,
             bucket,
         } => {
             let state = state.lock().await;
-            if !state.runtime.owns(&account_id, &identity_commitment) {
+            if !state.recovery_complete {
+                RuntimeResponse::Error {
+                    code: "DIRECT_STATE_RECOVERY_REQUIRED".into(),
+                }
+            } else if !state.runtime.owns(&account_id, &identity_commitment) {
                 RuntimeResponse::Error {
                     code: "IDENTITY_DENIED".into(),
                 }
@@ -158,6 +174,47 @@ where
     .await
 }
 
+async fn recover_committed(
+    state: Arc<Mutex<EnclaveState>>,
+    artifacts: Vec<layrs_direct_execution_v1::DirectStateArtifact>,
+) -> RuntimeResponse {
+    let mut state = state.lock().await;
+    if state.recovery_complete {
+        return RuntimeResponse::Error {
+            code: "DIRECT_STATE_RECOVERY_ALREADY_COMPLETE".into(),
+        };
+    }
+    let store = match InMemoryDirectStateStore::from_artifacts(artifacts) {
+        Ok(store) => store,
+        Err(error) => {
+            return RuntimeResponse::Error {
+                code: format!("DIRECT_STATE_RECOVERY_FAILED:{error}"),
+            }
+        }
+    };
+    let runtime = match DirectRuntime::restore_committed(
+        state.epoch.clone(),
+        state.mode,
+        state.receipt_key.clone(),
+        &state.state_key,
+        &store,
+    ) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return RuntimeResponse::Error {
+                code: format!("DIRECT_STATE_RECOVERY_FAILED:{error}"),
+            }
+        }
+    };
+    let response = RuntimeResponse::RecoveryComplete {
+        recovered_sequence: runtime.committed_sequence(),
+        recovered_state_hash: runtime.committed_state_hash(),
+    };
+    state.runtime = runtime;
+    state.recovery_complete = true;
+    response
+}
+
 /// This is the only persistence callback in direct execution.  The mutex is
 /// deliberately held across the bounded request/ACK exchange so two commands
 /// cannot derive competing successors from one committed root.  The candidate
@@ -171,6 +228,15 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut state = state.lock().await;
+    if !state.recovery_complete {
+        return write_response(
+            stream,
+            RuntimeResponse::Error {
+                code: "DIRECT_STATE_RECOVERY_REQUIRED".into(),
+            },
+        )
+        .await;
+    }
     if let Some(result) = state.runtime.existing_result(&request).map_err(invalid)? {
         return write_response(stream, RuntimeResponse::Execute { result }).await;
     }
@@ -329,18 +395,36 @@ mod tests {
         request
     }
     fn state() -> Arc<Mutex<EnclaveState>> {
+        let epoch = SealedEpoch::load(epoch_path()).unwrap();
+        let mode = RuntimeMode::IsolatedTest;
+        let receipt_key = vec![7; 32];
         Arc::new(Mutex::new(EnclaveState {
             nsm_fd: -1,
-            runtime: DirectRuntime::new(
-                SealedEpoch::load(epoch_path()).unwrap(),
-                RuntimeMode::IsolatedTest,
-                vec![7; 32],
-            )
-            .unwrap(),
+            runtime: DirectRuntime::new(epoch.clone(), mode, receipt_key.clone()).unwrap(),
+            epoch,
+            mode,
+            receipt_key,
             identity_count: 438,
             state_key: vec![8; 32],
             commit_ack_key: vec![9; 32],
+            recovery_complete: false,
         }))
+    }
+    async fn recover(
+        state: Arc<Mutex<EnclaveState>>,
+        artifacts: Vec<layrs_direct_execution_v1::DirectStateArtifact>,
+    ) -> RuntimeResponse {
+        let (mut parent, enclave) = tokio::io::duplex(MAX_FRAME_BYTES * 2);
+        let server = tokio::spawn(serve(enclave, state));
+        write_frame(
+            &mut parent,
+            &serde_cbor::to_vec(&RuntimeRequest::RecoverCommitted { artifacts }).unwrap(),
+        )
+        .await
+        .unwrap();
+        let response = serde_cbor::from_slice(&read_frame(&mut parent).await.unwrap()).unwrap();
+        server.await.unwrap().unwrap();
+        response
     }
     async fn begin(
         state: Arc<Mutex<EnclaveState>>,
@@ -371,14 +455,64 @@ mod tests {
     }
     fn artifact_dir() -> PathBuf {
         std::env::temp_dir().join(format!(
-            "layrs-vsock-commit-{}",
-            NEXT_TEST_DIR.fetch_add(1, Ordering::SeqCst)
+            "layrs-vsock-commit-{}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            NEXT_TEST_DIR.fetch_add(1, Ordering::SeqCst),
         ))
+    }
+    async fn commit_through_parent_callback(
+        state: Arc<Mutex<EnclaveState>>,
+        request: DirectRequest,
+        store: &FilesystemImmutableArtifactStore,
+    ) -> RuntimeResponse {
+        let (mut parent, server) = begin(state, request).await;
+        let artifact = candidate(&mut parent).await;
+        let restored = store.persist_readback(&artifact).unwrap();
+        let ack = DurabilityAck::issue(&restored, &[9; 32]);
+        write_frame(
+            &mut parent,
+            &serde_cbor::to_vec(&RuntimeRequest::DurabilityAck { ack }).unwrap(),
+        )
+        .await
+        .unwrap();
+        let terminal = serde_cbor::from_slice(&read_frame(&mut parent).await.unwrap()).unwrap();
+        server.await.unwrap().unwrap();
+        terminal
+    }
+    async fn execute_without_ack(
+        state: Arc<Mutex<EnclaveState>>,
+        request: DirectRequest,
+    ) -> layrs_direct_execution_v1::DirectStateArtifact {
+        let (mut parent, server) = begin(state, request).await;
+        let artifact = candidate(&mut parent).await;
+        drop(parent);
+        assert!(server.await.unwrap().is_err());
+        artifact
+    }
+    async fn execute_response(
+        state: Arc<Mutex<EnclaveState>>,
+        request: DirectRequest,
+    ) -> RuntimeResponse {
+        let (mut parent, server) = begin(state, request).await;
+        let response = serde_cbor::from_slice(&read_frame(&mut parent).await.unwrap()).unwrap();
+        server.await.unwrap().unwrap();
+        response
     }
 
     #[tokio::test]
     async fn vsock_callback_persists_readbacks_binds_ack_then_adopts() {
         let state = state();
+        assert!(matches!(
+            recover(Arc::clone(&state), Vec::new()).await,
+            RuntimeResponse::RecoveryComplete {
+                recovered_sequence: 0,
+                ..
+            }
+        ));
         let (mut parent, server) = begin(Arc::clone(&state), request("vsock-success")).await;
         let artifact = candidate(&mut parent).await;
         // The handler holds the committed-state mutex while it waits; no
@@ -414,6 +548,13 @@ mod tests {
     #[tokio::test]
     async fn vsock_callback_rejects_missing_or_invalid_ack_without_adoption() {
         let state = state();
+        assert!(matches!(
+            recover(Arc::clone(&state), Vec::new()).await,
+            RuntimeResponse::RecoveryComplete {
+                recovered_sequence: 0,
+                ..
+            }
+        ));
         let (mut parent, server) = begin(Arc::clone(&state), request("vsock-invalid-ack")).await;
         let artifact = candidate(&mut parent).await;
         let mut ack = DurabilityAck::issue(&artifact, &[9; 32]);
@@ -441,6 +582,13 @@ mod tests {
     #[tokio::test]
     async fn vsock_callback_persistence_failure_cannot_adopt_candidate() {
         let state = state();
+        assert!(matches!(
+            recover(Arc::clone(&state), Vec::new()).await,
+            RuntimeResponse::RecoveryComplete {
+                recovered_sequence: 0,
+                ..
+            }
+        ));
         let (mut parent, server) = begin(Arc::clone(&state), request("vsock-no-ack")).await;
         let artifact = candidate(&mut parent).await;
         // This is the same create-if-absent/readback adapter the parent uses;
@@ -455,5 +603,222 @@ mod tests {
             5_000_000
         );
         assert_eq!(state.runtime.balance(IDENTITY, "USDC", "USER_SETTLED"), 0);
+    }
+
+    #[tokio::test]
+    async fn parent_enclave_restart_recovers_committed_state_and_replays_once() {
+        let store = FilesystemImmutableArtifactStore::new(artifact_dir());
+        let first = state();
+        assert!(matches!(
+            recover(Arc::clone(&first), Vec::new()).await,
+            RuntimeResponse::RecoveryComplete {
+                recovered_sequence: 0,
+                ..
+            }
+        ));
+        let command = request("restart-replay");
+        assert!(matches!(
+            commit_through_parent_callback(Arc::clone(&first), command.clone(), &store).await,
+            RuntimeResponse::Execute { .. }
+        ));
+        assert_eq!(
+            first
+                .lock()
+                .await
+                .runtime
+                .balance(IDENTITY, "USDC", "USER_AVAILABLE"),
+            4_000_000
+        );
+        assert_eq!(store.load_committed().unwrap().len(), 1);
+
+        // Fresh parent/enclave runtime: parent supplies only the immutable
+        // archive set; enclave verifies and restores it before command input.
+        let restarted = state();
+        let artifacts = store.load_committed().unwrap();
+        assert!(matches!(
+            recover(Arc::clone(&restarted), artifacts).await,
+            RuntimeResponse::RecoveryComplete {
+                recovered_sequence: 1,
+                ..
+            }
+        ));
+        assert_eq!(
+            restarted
+                .lock()
+                .await
+                .runtime
+                .balance(IDENTITY, "USDC", "USER_AVAILABLE"),
+            4_000_000
+        );
+        let replay = execute_response(Arc::clone(&restarted), command).await;
+        assert!(matches!(replay, RuntimeResponse::Execute { .. }));
+        assert_eq!(
+            restarted
+                .lock()
+                .await
+                .runtime
+                .balance(IDENTITY, "USDC", "USER_AVAILABLE"),
+            4_000_000
+        );
+        assert_eq!(
+            restarted
+                .lock()
+                .await
+                .runtime
+                .balance(IDENTITY, "USDC", "USER_SETTLED"),
+            1_000_000
+        );
+        assert_eq!(store.load_committed().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn restart_before_ack_does_not_recover_candidate() {
+        let store = FilesystemImmutableArtifactStore::new(artifact_dir());
+        let first = state();
+        assert!(matches!(
+            recover(Arc::clone(&first), Vec::new()).await,
+            RuntimeResponse::RecoveryComplete {
+                recovered_sequence: 0,
+                ..
+            }
+        ));
+        let artifact = execute_without_ack(Arc::clone(&first), request("restart-before-ack")).await;
+        assert_eq!(artifact.sequence, 1);
+        assert!(store.load_committed().unwrap().is_empty());
+
+        let restarted = state();
+        assert!(matches!(
+            recover(Arc::clone(&restarted), store.load_committed().unwrap()).await,
+            RuntimeResponse::RecoveryComplete {
+                recovered_sequence: 0,
+                ..
+            }
+        ));
+        assert_eq!(
+            restarted
+                .lock()
+                .await
+                .runtime
+                .balance(IDENTITY, "USDC", "USER_AVAILABLE"),
+            5_000_000
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_after_ack_before_terminal_response_recovers_committed_state() {
+        let store = FilesystemImmutableArtifactStore::new(artifact_dir());
+        let first = state();
+        assert!(matches!(
+            recover(Arc::clone(&first), Vec::new()).await,
+            RuntimeResponse::RecoveryComplete {
+                recovered_sequence: 0,
+                ..
+            }
+        ));
+        let (mut parent, server) = begin(Arc::clone(&first), request("restart-after-ack")).await;
+        let artifact = candidate(&mut parent).await;
+        let restored = store.persist_readback(&artifact).unwrap();
+        write_frame(
+            &mut parent,
+            &serde_cbor::to_vec(&RuntimeRequest::DurabilityAck {
+                ack: DurabilityAck::issue(&restored, &[9; 32]),
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        // The ACK has been accepted, but the parent loses its connection
+        // before it can consume the terminal receipt.
+        drop(parent);
+        let _ = server.await.unwrap();
+
+        let restarted = state();
+        assert!(matches!(
+            recover(Arc::clone(&restarted), store.load_committed().unwrap()).await,
+            RuntimeResponse::RecoveryComplete {
+                recovered_sequence: 1,
+                ..
+            }
+        ));
+        assert_eq!(
+            restarted
+                .lock()
+                .await
+                .runtime
+                .balance(IDENTITY, "USDC", "USER_AVAILABLE"),
+            4_000_000
+        );
+        assert_eq!(
+            restarted
+                .lock()
+                .await
+                .runtime
+                .balance(IDENTITY, "USDC", "USER_SETTLED"),
+            1_000_000
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_or_corrupt_latest_artifact_fails_closed_before_command() {
+        for corrupt in [false, true] {
+            let store = FilesystemImmutableArtifactStore::new(artifact_dir());
+            let first = state();
+            assert!(matches!(
+                recover(Arc::clone(&first), Vec::new()).await,
+                RuntimeResponse::RecoveryComplete {
+                    recovered_sequence: 0,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                commit_through_parent_callback(
+                    Arc::clone(&first),
+                    request(if corrupt {
+                        "corrupt-latest"
+                    } else {
+                        "missing-latest"
+                    }),
+                    &store
+                )
+                .await,
+                RuntimeResponse::Execute { .. }
+            ));
+            let artifact_path = std::fs::read_dir(store.root())
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .find(|path| path.to_string_lossy().ends_with(".artifact.cbor"))
+                .unwrap();
+            if corrupt {
+                std::fs::write(&artifact_path, [0u8, 1, 2]).unwrap();
+            } else {
+                std::fs::remove_file(&artifact_path).unwrap();
+            }
+            // The parent-side archive loader refuses to hand a partial chain to
+            // a new enclave.  Without a successful RecoverCommitted exchange,
+            // the runtime rejects an otherwise valid financial command.
+            assert!(store.load_committed().is_err());
+            let restarted = state();
+            let response = execute_response(
+                Arc::clone(&restarted),
+                request(if corrupt {
+                    "corrupt-command"
+                } else {
+                    "missing-command"
+                }),
+            )
+            .await;
+            assert!(
+                matches!(response, RuntimeResponse::Error { ref code } if code == "DIRECT_STATE_RECOVERY_REQUIRED")
+            );
+            assert_eq!(
+                restarted
+                    .lock()
+                    .await
+                    .runtime
+                    .balance(IDENTITY, "USDC", "USER_AVAILABLE"),
+                5_000_000
+            );
+        }
     }
 }
