@@ -360,7 +360,7 @@ impl Projection {
         let wallets = epoch.projection_wallet_rows();
         for row in &balances {
             self.client.execute(
-                "INSERT INTO direct_execution_epoch_balances (epoch_id, auth_subject_hash, identity_commitment, asset, bucket, amount_atomic) VALUES ($1,$2,$3,$4,$5,$6::numeric) ON CONFLICT (epoch_id, identity_commitment, asset, bucket) DO NOTHING",
+                "INSERT INTO direct_execution_epoch_balances (epoch_id, auth_subject_hash, identity_commitment, asset, bucket, amount_atomic) VALUES ($1,$2,$3,$4,$5,$6::text::numeric) ON CONFLICT (epoch_id, identity_commitment, asset, bucket) DO NOTHING",
                 &[&EPOCH_ID, &row.auth_subject_hash, &row.identity_commitment, &row.asset, &row.bucket, &row.amount_atomic],
             ).await.map_err(|_| ProjectionError::Database)?;
         }
@@ -429,7 +429,7 @@ impl Projection {
     async fn record_result(&self, result: &DirectResult) -> Result<(), ProjectionError> {
         let receipt = &result.receipt;
         self.client.execute(
-            "INSERT INTO direct_execution_receipts (receipt_id, epoch_id, auth_subject_hash, identity_commitment, request_id, request_hash, terminal_status, effect, custody_reference, receipt_json) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb) ON CONFLICT (receipt_id) DO NOTHING",
+            "INSERT INTO direct_execution_receipts (receipt_id, epoch_id, auth_subject_hash, identity_commitment, request_id, request_hash, terminal_status, effect, custody_reference, receipt_json) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::text::jsonb) ON CONFLICT (receipt_id) DO NOTHING",
             &[&receipt.receipt_id, &EPOCH_ID, &receipt.account_id, &receipt.identity_commitment, &receipt.request_id, &receipt.request_hash, &format!("{:?}", receipt.status).to_uppercase(), &receipt.effect, &receipt.custody_reference, &serde_json::to_string(receipt).map_err(|_| ProjectionError::Database)?],
         ).await.map_err(|_| ProjectionError::Database)?;
         let accounting_amount = receipt.amount_atomic.clone();
@@ -438,12 +438,12 @@ impl Projection {
             (&receipt.custody_reference, direction, amount)
         {
             self.client.execute(
-                "INSERT INTO direct_execution_custody_events (epoch_id, custody_reference, direction, state, chain_id, tx_hash, auth_subject_hash, identity_commitment, amount_atomic) VALUES ($1,$2,$3,'FINAL',8453,$4,$5,$6,$7::numeric) ON CONFLICT DO NOTHING",
+                "INSERT INTO direct_execution_custody_events (epoch_id, custody_reference, direction, state, chain_id, tx_hash, auth_subject_hash, identity_commitment, amount_atomic) VALUES ($1,$2,$3,'FINAL',8453,$4,$5,$6,$7::text::numeric) ON CONFLICT DO NOTHING",
                 &[&EPOCH_ID, reference, &direction, reference, &receipt.account_id, &receipt.identity_commitment, &amount],
             ).await.map_err(|_| ProjectionError::Database)?;
         }
         self.client.execute(
-            "INSERT INTO direct_execution_accounting_events (receipt_id, epoch_id, auth_subject_hash, identity_commitment, effect, amount_atomic) VALUES ($1,$2,$3,$4,$5,$6::numeric) ON CONFLICT DO NOTHING",
+            "INSERT INTO direct_execution_accounting_events (receipt_id, epoch_id, auth_subject_hash, identity_commitment, effect, amount_atomic) VALUES ($1,$2,$3,$4,$5,$6::text::numeric) ON CONFLICT DO NOTHING",
             &[&receipt.receipt_id, &EPOCH_ID, &receipt.account_id, &receipt.identity_commitment, &receipt.effect, &accounting_amount],
         ).await.map_err(|_| ProjectionError::Database)?;
         Ok(())
