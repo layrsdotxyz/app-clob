@@ -10,6 +10,9 @@ Environment=PORT=8443
 Environment=LAYRS_ENCLAVE_CID=16
 Environment=LAYRS_OPENING_EPOCH_PATH=/opt/layrs-opening/OPENING_EPOCH_STATE_20260911.json
 Environment=LAYRS_OPENING_EVIDENCE_PATH=/opt/layrs-opening/OPENING_EPOCH_EVIDENCE_MANIFEST_20260911.json
+# Isolated, write-once encrypted successor-artifact mount.  The protected ACK
+# key is injected only at isolated-test/activation time through EnvironmentFile.
+Environment=LAYRS_DIRECT_ARTIFACT_DIR=/var/lib/layrs-opening-artifacts
 # The root-owned BFF session key is intentionally absent from the AMI.
 EnvironmentFile=-/etc/layrs-opening/direct-runtime.env
 ExecStart=/opt/layrs-opening/layrs-direct-parent
@@ -19,6 +22,7 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
 CapabilityBoundingSet=
+StateDirectory=layrs-opening-artifacts
 
 [Install]
 WantedBy=multi-user.target

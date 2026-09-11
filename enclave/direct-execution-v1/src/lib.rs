@@ -6,8 +6,9 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
-    path::Path,
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
 };
 
 use chacha20poly1305::{
@@ -396,6 +397,65 @@ pub struct DirectStateArtifact {
     pub ciphertext_hash: String,
     pub receipt: DirectReceipt,
 }
+
+/// A parent may acknowledge a candidate only after the immutable artifact has
+/// been read back byte-for-byte.  The acknowledgement is HMAC-bound to every
+/// field that identifies the successor; it cannot be replayed for another
+/// candidate, root, request, or epoch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DurabilityAck {
+    pub epoch_id: String,
+    pub sequence: u64,
+    pub prior_state_hash: String,
+    pub state_hash: String,
+    pub request_hash: String,
+    pub artifact_hash: String,
+    pub signature: String,
+}
+impl DurabilityAck {
+    pub fn issue(artifact: &DirectStateArtifact, key: &[u8]) -> Self {
+        let mut ack = Self {
+            epoch_id: artifact.epoch_id.clone(),
+            sequence: artifact.sequence,
+            prior_state_hash: artifact.prior_state_hash.clone(),
+            state_hash: artifact.state_hash.clone(),
+            request_hash: artifact.request_hash.clone(),
+            artifact_hash: artifact_hash(artifact),
+            signature: String::new(),
+        };
+        ack.signature = sign(
+            key,
+            &serde_cbor::to_vec(&ack.unsigned()).expect("ack serializes"),
+        );
+        ack
+    }
+    pub fn verify_for(&self, artifact: &DirectStateArtifact, key: &[u8]) -> bool {
+        key.len() >= 32
+            && self.epoch_id == artifact.epoch_id
+            && self.sequence == artifact.sequence
+            && self.prior_state_hash == artifact.prior_state_hash
+            && self.state_hash == artifact.state_hash
+            && self.request_hash == artifact.request_hash
+            && self.artifact_hash == artifact_hash(artifact)
+            && constant_time_eq(
+                &self.signature,
+                &sign(
+                    key,
+                    &serde_cbor::to_vec(&self.unsigned()).expect("ack serializes"),
+                ),
+            )
+    }
+    fn unsigned(&self) -> Self {
+        let mut unsigned = self.clone();
+        unsigned.signature.clear();
+        unsigned
+    }
+}
+
+pub fn artifact_hash(artifact: &DirectStateArtifact) -> String {
+    sha256(&serde_cbor::to_vec(artifact).expect("artifact serializes"))
+}
 pub struct DirectCandidate {
     runtime: DirectRuntime,
     pub artifact: DirectStateArtifact,
@@ -434,6 +494,69 @@ impl DirectStateStore for InMemoryDirectStateStore {
     }
     fn artifacts(&self) -> Vec<DirectStateArtifact> {
         self.artifacts.values().cloned().collect()
+    }
+}
+
+/// The isolated implementation of the existing write-once encrypted artifact
+/// boundary.  It deliberately stores opaque CBOR ciphertext and never derives
+/// ledger state.  A production archive adapter must provide the same
+/// create-if-absent plus readback contract.
+#[derive(Debug, Clone)]
+pub struct FilesystemImmutableArtifactStore {
+    root: PathBuf,
+}
+impl FilesystemImmutableArtifactStore {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+    fn path_for(&self, artifact: &DirectStateArtifact) -> PathBuf {
+        self.root.join(format!("{}.cbor", artifact.request_hash))
+    }
+    pub fn persist_readback(
+        &self,
+        artifact: &DirectStateArtifact,
+    ) -> Result<DirectStateArtifact, RuntimeError> {
+        fs::create_dir_all(&self.root).map_err(|_| RuntimeError::StatePersistence)?;
+        let path = self.path_for(artifact);
+        let expected = serde_cbor::to_vec(artifact).map_err(|_| RuntimeError::StatePersistence)?;
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(&expected)
+                    .map_err(|_| RuntimeError::StatePersistence)?;
+                file.sync_all()
+                    .map_err(|_| RuntimeError::StatePersistence)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(RuntimeError::StatePersistence),
+        }
+        let actual = fs::read(&path).map_err(|_| RuntimeError::StatePersistence)?;
+        if actual != expected {
+            return Err(RuntimeError::StatePersistence);
+        }
+        let restored: DirectStateArtifact =
+            serde_cbor::from_slice(&actual).map_err(|_| RuntimeError::StatePersistence)?;
+        if &restored != artifact || artifact_hash(&restored) != artifact_hash(artifact) {
+            return Err(RuntimeError::StatePersistence);
+        }
+        Ok(restored)
+    }
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+}
+impl DirectStateStore for FilesystemImmutableArtifactStore {
+    fn put_if_absent(&mut self, artifact: &DirectStateArtifact) -> Result<(), RuntimeError> {
+        self.persist_readback(artifact).map(|_| ())
+    }
+    fn artifacts(&self) -> Vec<DirectStateArtifact> {
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| fs::read(entry.path()).ok())
+            .filter_map(|bytes| serde_cbor::from_slice(&bytes).ok())
+            .collect()
     }
 }
 impl DirectRuntime {
@@ -619,6 +742,22 @@ impl DirectRuntime {
         self.requests
             .insert(key, (request.request_hash, result.clone()));
         Ok(result)
+    }
+    /// Returns an already-terminal result without creating a successor.  The
+    /// VSOCK handler uses this before candidate creation so exact replay never
+    /// creates another artifact.
+    pub fn existing_result(
+        &self,
+        request: &DirectRequest,
+    ) -> Result<Option<DirectResult>, RuntimeError> {
+        let key = (request.account_id.clone(), request.request_id.clone());
+        match self.requests.get(&key) {
+            Some((prior_hash, result)) if prior_hash == &request.request_hash => {
+                Ok(Some(result.clone()))
+            }
+            Some(_) => Err(RuntimeError::RequestReuse),
+            None => Ok(None),
+        }
     }
     /// Execute against a clone, durably publish its encrypted successor, then
     /// adopt it.  A failed write leaves `self` unchanged and returns no result.
@@ -856,6 +995,12 @@ pub enum RuntimeRequest {
     Execute {
         request: DirectRequest,
     },
+    /// The second, bounded frame of one direct request.  It is never stored as
+    /// a workflow record: it merely proves that the parent read back the exact
+    /// immutable candidate sent in the preceding frame.
+    DurabilityAck {
+        ack: DurabilityAck,
+    },
     Balance {
         account_id: String,
         identity_commitment: String,
@@ -874,6 +1019,9 @@ pub enum RuntimeResponse {
     },
     Execute {
         result: DirectResult,
+    },
+    CommitCandidate {
+        artifact: DirectStateArtifact,
     },
     Balance {
         amount_atomic: String,

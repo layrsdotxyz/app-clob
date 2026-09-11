@@ -14,14 +14,15 @@ use chacha20poly1305::{
 };
 use layrs_direct_execution_v1::{
     request_hash, sha256, sign, DirectAction, DirectReceipt, DirectRequest, DirectResult,
-    ProjectionBalanceRow, ProjectionWalletRow, RuntimeRequest, RuntimeResponse, SealedEpoch,
-    WriterGrant, EPOCH_ID, POSTGRES_PROJECTION_DDL,
+    DurabilityAck, FilesystemImmutableArtifactStore, ProjectionBalanceRow, ProjectionWalletRow,
+    RuntimeRequest, RuntimeResponse, SealedEpoch, WriterGrant, EPOCH_ID, POSTGRES_PROJECTION_DDL,
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     env, io,
     net::Ipv4Addr,
+    path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -42,6 +43,8 @@ struct AppState {
     isolated_test: bool,
     projection: Option<Projection>,
     local_used_sessions: Arc<Mutex<HashSet<(String, String)>>>,
+    artifact_store: Option<FilesystemImmutableArtifactStore>,
+    commit_ack_key: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -141,6 +144,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         isolated_test,
         projection,
         local_used_sessions: Arc::new(Mutex::new(HashSet::new())),
+        artifact_store: env::var("LAYRS_DIRECT_ARTIFACT_DIR")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .map(FilesystemImmutableArtifactStore::new),
+        commit_ack_key: env::var("LAYRS_DIRECT_COMMIT_ACK_KEY_HEX")
+            .ok()
+            .and_then(|value| hex::decode(value).ok())
+            .filter(|value| value.len() == 32)
+            .unwrap_or_default(),
     };
     let port = env::var("PORT").unwrap_or_else(|_| "8443".into()).parse()?;
     let app = Router::new()
@@ -249,7 +262,7 @@ async fn command(
             return (StatusCode::CONFLICT, "SESSION_REPLAY_REJECTED").into_response();
         }
     }
-    match exchange(&state, RuntimeRequest::Execute { request }).await {
+    match exchange_direct(&state, request).await {
         Ok(RuntimeResponse::Execute { result }) => {
             if let Some(projection) = &state.projection {
                 if projection.record_result(&result).await.is_err() {
@@ -555,6 +568,62 @@ async fn exchange(state: &AppState, request: RuntimeRequest) -> io::Result<Runti
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "enclave timeout"))?
 }
+
+/// One bounded direct request.  The first response is deliberately not a
+/// customer result: it is an opaque encrypted successor that must be stored
+/// immutably and read back before this parent can issue an acknowledgement.
+async fn exchange_direct(state: &AppState, request: DirectRequest) -> io::Result<RuntimeResponse> {
+    let store = state.artifact_store.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "DIRECT_ARTIFACT_STORE_NOT_CONFIGURED",
+        )
+    })?;
+    if state.commit_ack_key.len() != 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "DIRECT_COMMIT_ACK_KEY_NOT_CONFIGURED",
+        ));
+    }
+    timeout(Duration::from_secs(10), async {
+        let mut stream =
+            VsockStream::connect(VsockAddr::new(state.enclave_cid, ENCLOSURE_PORT)).await?;
+        write_frame(
+            &mut stream,
+            &serde_cbor::to_vec(&RuntimeRequest::Execute { request }).map_err(invalid)?,
+        )
+        .await?;
+        let first: RuntimeResponse =
+            serde_cbor::from_slice(&read_frame(&mut stream).await?).map_err(invalid)?;
+        let RuntimeResponse::CommitCandidate { artifact } = first else {
+            return Ok(first);
+        };
+        // `persist_readback` uses create_new, fsyncs the write, rereads the
+        // opaque bytes, decodes them, and compares the complete artifact plus
+        // its CBOR hash before this acknowledgement exists.
+        let restored = store.persist_readback(&artifact).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("IMMUTABLE_PERSISTENCE_FAILED:{error}"),
+            )
+        })?;
+        if restored != artifact {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ARTIFACT_READBACK_MISMATCH",
+            ));
+        }
+        let ack = DurabilityAck::issue(&restored, &state.commit_ack_key);
+        write_frame(
+            &mut stream,
+            &serde_cbor::to_vec(&RuntimeRequest::DurabilityAck { ack }).map_err(invalid)?,
+        )
+        .await?;
+        serde_cbor::from_slice(&read_frame(&mut stream).await?).map_err(invalid)
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "enclave timeout"))?
+}
 fn invalid(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
@@ -607,6 +676,8 @@ mod tests {
             isolated_test: true,
             projection: None,
             local_used_sessions: Arc::new(Mutex::new(HashSet::new())),
+            artifact_store: None,
+            commit_ack_key: Vec::new(),
         };
         assert!(authenticated(&headers, &state).is_ok());
         headers.insert("authorization", "Bearer bad".parse().unwrap());
