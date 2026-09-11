@@ -10,6 +10,10 @@ use std::{
     path::Path,
 };
 
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    ChaCha20Poly1305, Key, Nonce,
+};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -47,6 +51,10 @@ pub enum RuntimeError {
     InsufficientAvailable,
     #[error("unknown order")]
     UnknownOrder,
+    #[error("authoritative state artifact is invalid")]
+    StateArtifact,
+    #[error("authoritative state persistence failed")]
+    StatePersistence,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -362,6 +370,7 @@ pub struct DirectResult {
     pub receipt: DirectReceipt,
 }
 
+#[derive(Clone)]
 pub struct DirectRuntime {
     balances: BTreeMap<String, BTreeMap<(String, String), u128>>,
     subject_identities: BTreeMap<String, BTreeSet<String>>,
@@ -370,6 +379,57 @@ pub struct DirectRuntime {
     requests: BTreeMap<(String, String), (String, DirectResult)>,
     receipt_key: Vec<u8>,
     mode: RuntimeMode,
+}
+
+/// The encrypted, write-once successor of the opening epoch.  It is the
+/// authoritative recovery input; PostgreSQL is not included or consulted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectStateArtifact {
+    pub epoch_id: String,
+    pub sequence: u64,
+    pub prior_state_hash: String,
+    pub state_hash: String,
+    pub request_hash: String,
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+    pub ciphertext_hash: String,
+    pub receipt: DirectReceipt,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct DirectState {
+    balances: BTreeMap<String, BTreeMap<(String, String), u128>>,
+    orders: BTreeMap<String, (String, u128)>,
+    requests: BTreeMap<(String, String), (String, DirectResult)>,
+}
+
+/// Minimal immutable artifact boundary.  Production implements this with the
+/// existing immutable-object archive; tests use this exact write-once contract.
+pub trait DirectStateStore {
+    fn put_if_absent(&mut self, artifact: &DirectStateArtifact) -> Result<(), RuntimeError>;
+    fn artifacts(&self) -> Vec<DirectStateArtifact>;
+}
+
+#[derive(Default)]
+pub struct InMemoryDirectStateStore {
+    artifacts: BTreeMap<String, DirectStateArtifact>,
+}
+impl DirectStateStore for InMemoryDirectStateStore {
+    fn put_if_absent(&mut self, artifact: &DirectStateArtifact) -> Result<(), RuntimeError> {
+        match self.artifacts.get(&artifact.request_hash) {
+            Some(existing) if existing == artifact => Ok(()),
+            Some(_) => Err(RuntimeError::StatePersistence),
+            None => {
+                self.artifacts
+                    .insert(artifact.request_hash.clone(), artifact.clone());
+                Ok(())
+            }
+        }
+    }
+    fn artifacts(&self) -> Vec<DirectStateArtifact> {
+        self.artifacts.values().cloned().collect()
+    }
 }
 impl DirectRuntime {
     pub fn new(
@@ -555,6 +615,128 @@ impl DirectRuntime {
             .insert(key, (request.request_hash, result.clone()));
         Ok(result)
     }
+    /// Execute against a clone, durably publish its encrypted successor, then
+    /// adopt it.  A failed write leaves `self` unchanged and returns no result.
+    pub fn execute_committed<S: DirectStateStore>(
+        &mut self,
+        request: DirectRequest,
+        state_key: &[u8],
+        store: &mut S,
+    ) -> Result<DirectResult, RuntimeError> {
+        let key = (request.account_id.clone(), request.request_id.clone());
+        if let Some((hash, result)) = self.requests.get(&key) {
+            return if hash == &request.request_hash {
+                Ok(result.clone())
+            } else {
+                Err(RuntimeError::RequestReuse)
+            };
+        }
+        let prior = self.state_hash();
+        let mut candidate = self.clone();
+        let result = candidate.execute(request.clone())?;
+        let artifact = candidate.seal_artifact(
+            &prior,
+            &request.request_hash,
+            state_key,
+            result.receipt.clone(),
+        )?;
+        store.put_if_absent(&artifact)?;
+        if !candidate.verify_artifact(&artifact, state_key)? {
+            return Err(RuntimeError::StateArtifact);
+        }
+        *self = candidate;
+        Ok(result)
+    }
+    pub fn restore_committed<S: DirectStateStore>(
+        epoch: SealedEpoch,
+        mode: RuntimeMode,
+        receipt_key: Vec<u8>,
+        state_key: &[u8],
+        store: &S,
+    ) -> Result<Self, RuntimeError> {
+        let mut runtime = Self::new(epoch, mode, receipt_key)?;
+        let mut prior = runtime.state_hash();
+        let mut artifacts = store.artifacts();
+        artifacts.sort_by_key(|a| a.sequence);
+        for artifact in artifacts {
+            if artifact.prior_state_hash != prior
+                || !runtime.verify_artifact(&artifact, state_key)?
+            {
+                return Err(RuntimeError::StateArtifact);
+            }
+            runtime.apply_artifact(&artifact, state_key)?;
+            prior = runtime.state_hash();
+        }
+        Ok(runtime)
+    }
+    fn snapshot(&self) -> DirectState {
+        DirectState {
+            balances: self.balances.clone(),
+            orders: self.orders.clone(),
+            requests: self.requests.clone(),
+        }
+    }
+    fn state_hash(&self) -> String {
+        sha256(&serde_cbor::to_vec(&self.snapshot()).expect("state serializes"))
+    }
+    fn seal_artifact(
+        &self,
+        prior: &str,
+        request_hash: &str,
+        key: &[u8],
+        receipt: DirectReceipt,
+    ) -> Result<DirectStateArtifact, RuntimeError> {
+        if key.len() != 32 {
+            return Err(RuntimeError::StateArtifact);
+        }
+        let sequence = self.requests.len() as u64;
+        let state_hash = self.state_hash();
+        let seed = sha256(format!("{sequence}:{request_hash}:{state_hash}").as_bytes());
+        let nonce = hex::decode(&seed[..24]).map_err(|_| RuntimeError::StateArtifact)?;
+        let ciphertext = ChaCha20Poly1305::new(Key::from_slice(key))
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                serde_cbor::to_vec(&self.snapshot())
+                    .map_err(|_| RuntimeError::StateArtifact)?
+                    .as_ref(),
+            )
+            .map_err(|_| RuntimeError::StateArtifact)?;
+        Ok(DirectStateArtifact {
+            epoch_id: EPOCH_ID.into(),
+            sequence,
+            prior_state_hash: prior.into(),
+            state_hash,
+            request_hash: request_hash.into(),
+            nonce,
+            ciphertext_hash: sha256(&ciphertext),
+            ciphertext,
+            receipt,
+        })
+    }
+    fn verify_artifact(&self, a: &DirectStateArtifact, key: &[u8]) -> Result<bool, RuntimeError> {
+        if a.epoch_id != EPOCH_ID
+            || a.nonce.len() != 12
+            || a.ciphertext_hash != sha256(&a.ciphertext)
+            || key.len() != 32
+        {
+            return Ok(false);
+        }
+        let plain = ChaCha20Poly1305::new(Key::from_slice(key))
+            .decrypt(Nonce::from_slice(&a.nonce), a.ciphertext.as_ref())
+            .map_err(|_| RuntimeError::StateArtifact)?;
+        Ok(sha256(&plain) == a.state_hash && verify_receipt(&self.receipt_key, &a.receipt))
+    }
+    fn apply_artifact(&mut self, a: &DirectStateArtifact, key: &[u8]) -> Result<(), RuntimeError> {
+        let plain = ChaCha20Poly1305::new(Key::from_slice(key))
+            .decrypt(Nonce::from_slice(&a.nonce), a.ciphertext.as_ref())
+            .map_err(|_| RuntimeError::StateArtifact)?;
+        let state: DirectState =
+            serde_cbor::from_slice(&plain).map_err(|_| RuntimeError::StateArtifact)?;
+        self.balances = state.balances;
+        self.orders = state.orders;
+        self.requests = state.requests;
+        Ok(())
+    }
     fn add(&mut self, identity: &str, bucket: &str, value: u128) -> Result<(), RuntimeError> {
         let account = self
             .balances
@@ -696,7 +878,8 @@ pub fn verify_receipt(key: &[u8], receipt: &DirectReceipt) -> bool {
     constant_time_eq(&receipt_signature(key, receipt), &receipt.signature)
 }
 pub fn sign(key: &[u8], bytes: &[u8]) -> String {
-    let mut mac = HmacSha256::new_from_slice(key).expect("hmac accepts arbitrary key length");
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(key).expect("hmac accepts arbitrary key length");
     mac.update(bytes);
     hex::encode(mac.finalize().into_bytes())
 }
@@ -905,5 +1088,45 @@ mod tests {
         assert!(!CustodyFinality::Confirmed.permits_settlement());
         assert!(!CustodyFinality::Failed.permits_settlement());
         assert!(CustodyFinality::Final.permits_settlement());
+    }
+    #[test]
+    fn committed_direct_execution_survives_restart_and_replays_once() {
+        let identity = "0bafc03d08d4951d769d58284db85c7ac2ee3c79de87ec680f58edc03017c418";
+        let state_key = vec![9; 32];
+        let mut store = InMemoryDirectStateStore::default();
+        let mut live = runtime(RuntimeMode::IsolatedTest);
+        let command = request(
+            "restart-safe-withdrawal",
+            DirectAction::ReserveWithdrawal {
+                destination: "0xccb96357deb4cbf0808208d55916774f0b51a908".into(),
+                amount_atomic: "1000000".into(),
+                custody_reference: "mock-finality-commit".into(),
+            },
+        );
+        let receipt = live
+            .execute_committed(command.clone(), &state_key, &mut store)
+            .unwrap()
+            .receipt;
+        assert_eq!(live.balance(identity, "USDC", "USER_AVAILABLE"), 4000000);
+        let mut restarted = DirectRuntime::restore_committed(
+            SealedEpoch::load(epoch_path()).unwrap(),
+            RuntimeMode::IsolatedTest,
+            vec![7; 32],
+            &state_key,
+            &store,
+        )
+        .unwrap();
+        assert_eq!(
+            restarted.balance(identity, "USDC", "USER_AVAILABLE"),
+            4000000
+        );
+        assert_eq!(
+            restarted
+                .execute_committed(command, &state_key, &mut store)
+                .unwrap()
+                .receipt,
+            receipt
+        );
+        assert_eq!(store.artifacts().len(), 1);
     }
 }
