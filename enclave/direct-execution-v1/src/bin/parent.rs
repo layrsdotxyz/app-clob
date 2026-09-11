@@ -131,9 +131,21 @@ impl S3ImmutableArtifactStore {
         let listing = self.client.list_objects_v2().bucket(&self.bucket).prefix(format!("{}/artifacts/", self.prefix)).send().await.map_err(|_| "archive listing failed")?;
         if listing.is_truncated.unwrap_or(false) { return Err("archive listing exceeds bounded recovery set".into()); }
         let mut artifacts = Vec::new();
+        let mut object_hashes = HashSet::new();
+        let mut sequences = HashSet::new();
         for object in listing.contents() {
             let key = object.key().ok_or("archive object key missing")?;
-            artifacts.push(serde_cbor::from_slice(&self.read(key).await?).map_err(|_| "artifact decode failed")?);
+            let artifact: DirectStateArtifact = serde_cbor::from_slice(&self.read(key).await?).map_err(|_| "artifact decode failed")?;
+            // The object name is part of the immutable commitment.  Accepting
+            // a second spelling for the same encrypted artifact could hide a
+            // duplicate or a conflicting archive object from recovery.
+            if key != self.artifact_key(&artifact)
+                || !object_hashes.insert(artifact_hash(&artifact))
+                || !sequences.insert(artifact.sequence)
+            {
+                return Err("duplicate or conflicting archive artifact".into());
+            }
+            artifacts.push(artifact);
         }
         artifacts.sort_by_key(|artifact: &DirectStateArtifact| artifact.sequence);
         for artifact in &artifacts { let head = self.read(&self.head_key(artifact)).await?; if head != serde_cbor::to_vec(artifact).map_err(|_| "head encoding failed")? { return Err("archive head mismatch".into()); } }
@@ -328,6 +340,19 @@ async fn command(
                 )
                     .into_response();
             }
+            // A direct withdrawal is deliberately not a general-purpose
+            // transfer instruction.  The Privy-verifying BFF has bound this
+            // short-lived assertion to one embedded EVM wallet, and the
+            // parent must enforce that binding before a candidate exists.
+            // Comparing canonical EVM spellings is case-insensitive only;
+            // no alternate destination can be authorized by this route.
+            if !withdrawal_destination_matches(&destination, &claims.wallet_address) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    "DIRECT_DESTINATION_BINDING_DENIED",
+                )
+                    .into_response();
+            }
             DirectAction::ReserveWithdrawal {
                 destination,
                 amount_atomic,
@@ -382,6 +407,14 @@ async fn command(
         }
         _ => (StatusCode::BAD_GATEWAY, "ENCLOSURE_UNAVAILABLE").into_response(),
     }
+}
+
+fn withdrawal_destination_matches(destination: &str, verified_wallet: &str) -> bool {
+    destination.len() == 42
+        && verified_wallet.len() == 42
+        && destination.starts_with("0x")
+        && verified_wallet.starts_with("0x")
+        && destination.eq_ignore_ascii_case(verified_wallet)
 }
 async fn balance(
     State(state): State<AppState>,
@@ -911,6 +944,18 @@ mod tests {
         assert!(matches!(
             command.action,
             CustomerAction::ReserveWithdrawal { amount_atomic, .. } if amount_atomic == "1000000"
+        ));
+    }
+
+    #[test]
+    fn withdrawal_destination_must_equal_session_bound_privy_wallet() {
+        assert!(withdrawal_destination_matches(
+            "0xCCB96357dEB4cbF0808208d55916774f0B51a908",
+            "0xccb96357deb4cbf0808208d55916774f0b51a908"
+        ));
+        assert!(!withdrawal_destination_matches(
+            "0xCCB96357dEB4cbF0808208d55916774f0B51a908",
+            "0x1cBE2DDB7C7AC4C67BC692CB463f759D0D7b4dED"
         ));
     }
 }
