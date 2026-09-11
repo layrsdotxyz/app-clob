@@ -94,6 +94,9 @@ struct SessionClaims {
     subject_hash: String,
     privy_user_id_hash: String,
     audience: String,
+    epoch_id: String,
+    epoch_state_sha256: String,
+    wallet_address: String,
     expires_at_unix: u64,
     response_key: String,
     signature: String,
@@ -340,6 +343,10 @@ fn authenticated(
     let bytes = serde_json::to_vec(&unsigned)
         .map_err(|_| (StatusCode::UNAUTHORIZED, "INVALID_SESSION").into_response())?;
     if claims.audience != SESSION_AUDIENCE
+        || claims.epoch_id != EPOCH_ID
+        || claims.epoch_state_sha256 != layrs_direct_execution_v1::EPOCH_STATE_SHA256
+        || !claims.wallet_address.starts_with("0x")
+        || claims.wallet_address.len() != 42
         || claims.session_id.len() < 16
         || claims.subject_hash.len() != 64
         || claims.privy_user_id_hash.len() != 64
@@ -768,6 +775,9 @@ mod tests {
             subject_hash: "a".repeat(64),
             privy_user_id_hash: "b".repeat(64),
             audience: SESSION_AUDIENCE.into(),
+            epoch_id: EPOCH_ID.into(),
+            epoch_state_sha256: layrs_direct_execution_v1::EPOCH_STATE_SHA256.into(),
+            wallet_address: "0x1111111111111111111111111111111111111111".into(),
             expires_at_unix: now_unix() + 60,
             response_key: URL_SAFE_NO_PAD.encode([3u8; 32]),
             signature: String::new(),
