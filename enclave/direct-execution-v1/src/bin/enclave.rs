@@ -242,11 +242,6 @@ async fn recover_committed(
     artifacts: Vec<layrs_direct_execution_v1::DirectStateArtifact>,
 ) -> RuntimeResponse {
     let mut state = state.lock().await;
-    if state.recovery_complete {
-        return RuntimeResponse::Error {
-            code: "DIRECT_STATE_RECOVERY_ALREADY_COMPLETE".into(),
-        };
-    }
     let store = match InMemoryDirectStateStore::from_artifacts(artifacts) {
         Ok(store) => store,
         Err(error) => {
@@ -273,6 +268,21 @@ async fn recover_committed(
         recovered_sequence: runtime.committed_sequence(),
         recovered_state_hash: runtime.committed_state_hash(),
     };
+    // Parent restart is a transport event, not a ledger event.  It must be
+    // able to submit the immutable archive again and prove it describes the
+    // already authoritative in-enclave state.  A different, missing, or
+    // corrupt archive fails closed; it can never replace an adopted state.
+    if state.recovery_complete {
+        return if runtime.committed_sequence() == state.runtime.committed_sequence()
+            && runtime.committed_state_hash() == state.runtime.committed_state_hash()
+        {
+            response
+        } else {
+            RuntimeResponse::Error {
+                code: "DIRECT_STATE_RECOVERY_MISMATCH".into(),
+            }
+        };
+    }
     state.runtime = runtime;
     state.recovery_complete = true;
     response
@@ -760,6 +770,39 @@ mod tests {
             1_000_000
         );
         assert_eq!(store.load_committed().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn parent_reconnect_reverifies_same_committed_archive_without_state_transition() {
+        let store = FilesystemImmutableArtifactStore::new(artifact_dir());
+        let running = state();
+        assert!(matches!(
+            recover(Arc::clone(&running), Vec::new()).await,
+            RuntimeResponse::RecoveryComplete { recovered_sequence: 0, .. }
+        ));
+        assert!(matches!(
+            commit_through_parent_callback(
+                Arc::clone(&running),
+                request("parent-reconnect"),
+                &store
+            )
+            .await,
+            RuntimeResponse::Execute { .. }
+        ));
+        assert!(matches!(
+            recover(Arc::clone(&running), store.load_committed().unwrap()).await,
+            RuntimeResponse::RecoveryComplete { recovered_sequence: 1, .. }
+        ));
+        assert_eq!(
+            running.lock().await.runtime.balance(IDENTITY, "USDC", "USER_AVAILABLE"),
+            4_000_000
+        );
+        // A parent that cannot present the committed head must not regain a
+        // serving connection by silently falling back to the opening state.
+        assert!(matches!(
+            recover(running, Vec::new()).await,
+            RuntimeResponse::Error { ref code } if code == "DIRECT_STATE_RECOVERY_MISMATCH"
+        ));
     }
 
     #[tokio::test]
