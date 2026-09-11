@@ -64,7 +64,7 @@ build {
       "sudo install -m 0600 /tmp/OPENING_EPOCH_EVIDENCE_MANIFEST_20260911.json /tmp/opening-image/OPENING_EPOCH_EVIDENCE_MANIFEST_20260911.json",
       "sudo install -m 0644 /tmp/Dockerfile /tmp/opening-image/Dockerfile",
       "sudo docker build -t layrs-opening-epoch:local /tmp/opening-image",
-      "sudo NITRO_CLI_BLOBS=/usr/share/nitro_enclaves/blobs nitro-cli build-enclave --docker-uri layrs-opening-epoch:local --output-file /tmp/layrs-direct-execution.eif",
+      "sudo NITRO_CLI_BLOBS=/usr/share/nitro_enclaves/blobs NITRO_CLI_ARTIFACTS=/usr/share/nitro_enclaves/blobs nitro-cli build-enclave --docker-uri layrs-opening-epoch:local --output-file /tmp/layrs-direct-execution.eif",
       "sudo install -m 0600 /tmp/layrs-direct-execution.eif /opt/layrs-opening/layrs-direct-execution.eif",
       "sudo install -m 0600 /tmp/OPENING_EPOCH_STATE_20260911.json /opt/layrs-opening/OPENING_EPOCH_STATE_20260911.json",
       "sudo install -m 0600 /tmp/OPENING_EPOCH_EVIDENCE_MANIFEST_20260911.json /opt/layrs-opening/OPENING_EPOCH_EVIDENCE_MANIFEST_20260911.json",
