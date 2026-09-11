@@ -55,7 +55,8 @@ build {
   }
   provisioner "shell" {
     inline = [
-      "sudo dnf install -y aws-nitro-enclaves-cli aws-nitro-enclaves-cli-devel docker",
+      "sudo dnf install -y amazon-ssm-agent aws-nitro-enclaves-cli aws-nitro-enclaves-cli-devel docker",
+      "sudo systemctl enable amazon-ssm-agent && sudo systemctl start amazon-ssm-agent",
       "sudo systemctl enable docker && sudo systemctl start docker",
       "sudo install -d -m 0755 /opt/layrs-opening /tmp/opening-image",
       "sudo install -d -m 0755 /etc/layrs-opening",
