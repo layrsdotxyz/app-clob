@@ -69,6 +69,8 @@ build {
       "sudo install -m 0600 /tmp/OPENING_EPOCH_STATE_20260911.json /opt/layrs-opening/OPENING_EPOCH_STATE_20260911.json",
       "sudo install -m 0600 /tmp/OPENING_EPOCH_EVIDENCE_MANIFEST_20260911.json /opt/layrs-opening/OPENING_EPOCH_EVIDENCE_MANIFEST_20260911.json",
       "sudo useradd --system --home-dir /nonexistent --shell /sbin/nologin layrsopening || true",
+      "sudo chown root:layrsopening /opt/layrs-opening/OPENING_EPOCH_STATE_20260911.json /opt/layrs-opening/OPENING_EPOCH_EVIDENCE_MANIFEST_20260911.json",
+      "sudo chmod 0640 /opt/layrs-opening/OPENING_EPOCH_STATE_20260911.json /opt/layrs-opening/OPENING_EPOCH_EVIDENCE_MANIFEST_20260911.json",
       "sudo install -m 0644 /tmp/layrs-opening-enclave.service /etc/systemd/system/layrs-opening-enclave.service",
       "sudo install -m 0644 /tmp/layrs-opening-parent.service /etc/systemd/system/layrs-opening-parent.service",
       "sudo install -d -m 0755 /etc/nitro_enclaves",
