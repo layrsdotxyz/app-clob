@@ -263,6 +263,32 @@ pub enum RuntimeMode {
 /// terminal execution.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct RuntimeMeasurementBinding {
+    pub ami_id: String,
+    pub eif_sha256: String,
+    pub pcr0: String,
+    pub pcr1: String,
+    pub pcr2: String,
+    pub source_commit: String,
+    pub enclave_sha256: String,
+    pub parent_sha256: String,
+}
+
+impl RuntimeMeasurementBinding {
+    pub fn valid(&self) -> bool {
+        self.ami_id.starts_with("ami-")
+            && self.source_commit.len() >= 7
+            && [&self.eif_sha256, &self.enclave_sha256, &self.parent_sha256]
+                .iter()
+                .all(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            && [&self.pcr0, &self.pcr1, &self.pcr2]
+                .iter()
+                .all(|value| value.len() == 96 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct WriterGrant {
     pub activation_id: String,
     pub epoch_id: String,
@@ -271,17 +297,22 @@ pub struct WriterGrant {
     pub runtime: String,
     /// Binds activation to the sealed opening epoch, not merely its label.
     pub opening_epoch_sha256: String,
+    pub opening_evidence_manifest_sha256: String,
+    pub runtime_measurement: RuntimeMeasurementBinding,
     pub old_writer_fence_evidence_sha256: String,
     pub expires_at_unix: u64,
     pub signature: String,
 }
 
 impl WriterGrant {
-    pub fn verify(&self, governance_key: &[u8], now_unix: u64) -> bool {
+    pub fn verify(&self, governance_key: &[u8], now_unix: u64, binding: &RuntimeMeasurementBinding) -> bool {
         if self.activation_id.is_empty()
             || self.epoch_id != EPOCH_ID
             || self.runtime != TRANSACTION_MODEL
             || self.opening_epoch_sha256 != EPOCH_STATE_SHA256
+            || self.opening_evidence_manifest_sha256 != EVIDENCE_MANIFEST_SHA256
+            || !binding.valid()
+            || &self.runtime_measurement != binding
             || self.old_writer_fence_evidence_sha256.len() != 64
             || self.expires_at_unix <= now_unix
         {
@@ -1421,32 +1452,43 @@ mod tests {
     #[test]
     fn writer_grant_requires_matching_epoch_fence_signature_and_expiry() {
         let key = vec![1; 32];
+        let binding = RuntimeMeasurementBinding {
+            ami_id: "ami-0123456789abcdef0".into(),
+            eif_sha256: "b".repeat(64),
+            pcr0: "c".repeat(96), pcr1: "d".repeat(96), pcr2: "e".repeat(96),
+            source_commit: "92e9918".into(), enclave_sha256: "f".repeat(64), parent_sha256: "a".repeat(64),
+        };
         let mut grant = WriterGrant {
             activation_id: "step6-review-id".into(),
             epoch_id: EPOCH_ID.into(),
             runtime: TRANSACTION_MODEL.into(),
             opening_epoch_sha256: EPOCH_STATE_SHA256.into(),
+            opening_evidence_manifest_sha256: EVIDENCE_MANIFEST_SHA256.into(),
+            runtime_measurement: binding.clone(),
             old_writer_fence_evidence_sha256: "a".repeat(64),
             expires_at_unix: 200,
             signature: String::new(),
         };
         grant.signature = sign(&key, &serde_json::to_vec(&grant).unwrap());
-        assert!(grant.verify(&key, 100));
+        assert!(grant.verify(&key, 100, &binding));
         let mut forged = grant.clone();
         forged.signature = "0".repeat(64);
-        assert!(!forged.verify(&key, 100));
-        assert!(!grant.verify(&key, 200));
+        assert!(!forged.verify(&key, 100, &binding));
+        assert!(!grant.verify(&key, 200, &binding));
         grant.old_writer_fence_evidence_sha256 = "b".repeat(64);
-        assert!(!grant.verify(&key, 100));
+        assert!(!grant.verify(&key, 100, &binding));
         grant.old_writer_fence_evidence_sha256 = "a".repeat(64);
         grant.runtime = "legacy.durable-command.v1".into();
-        assert!(!grant.verify(&key, 100));
+        assert!(!grant.verify(&key, 100, &binding));
         grant.runtime = TRANSACTION_MODEL.into();
         grant.opening_epoch_sha256 = "b".repeat(64);
-        assert!(!grant.verify(&key, 100));
+        assert!(!grant.verify(&key, 100, &binding));
         grant.opening_epoch_sha256 = EPOCH_STATE_SHA256.into();
         grant.epoch_id = "wrong-lineage".into();
-        assert!(!grant.verify(&key, 100));
+        assert!(!grant.verify(&key, 100, &binding));
+        grant.epoch_id = EPOCH_ID.into();
+        grant.runtime_measurement.pcr0 = "0".repeat(96);
+        assert!(!grant.verify(&key, 100, &binding));
     }
 
     #[test]

@@ -1,0 +1,24 @@
+{
+  "schema": "layrs.legacy-writer-fence.v1",
+  "sealedStep5EvidenceSha256": "872b41e03ca2a892dafdbc8c8b7b2c8a68a67535a3c9c27ce2cb448bde70588d",
+  "scope": "production-legacy-financial-writers",
+  "mechanism": "ECS desired-count-zero plus target-group deregistration; task definitions retained for audit and no successor writer enabled",
+  "services": [
+    {"name":"layrs-production-public-api","preFenceDesired":2,"postFenceDesired":0,"postFenceRunning":0,"capability":"legacy customer financial command ingress"},
+    {"name":"layrs-production-green-core-coordinator","preFenceDesired":1,"postFenceDesired":0,"postFenceRunning":0,"capability":"legacy private-ledger coordinator"},
+    {"name":"layrs-production-deposit-withdrawal","preFenceDesired":2,"postFenceDesired":0,"postFenceRunning":0,"capability":"legacy custody signing and payout worker"},
+    {"name":"layrs-production-control-scheduler","preFenceDesired":1,"postFenceDesired":0,"postFenceRunning":0,"capability":"legacy funding and settlement scheduling"},
+    {"name":"layrs-production-resolution","preFenceDesired":1,"postFenceDesired":0,"postFenceRunning":0,"capability":"legacy resolution and settlement worker"},
+    {"name":"layrs-production-vault-accounting","preFenceDesired":1,"postFenceDesired":0,"postFenceRunning":0,"capability":"legacy vault accounting worker"}
+  ],
+  "routing": {
+    "publicApiTargetGroup": "EMPTY",
+    "greenCoreTargetGroup": "EMPTY"
+  },
+  "legacyDatabaseLease": {
+    "status": "NOT_USED_AS_FENCE",
+    "reason": "legacy private-command writer leases expire after at most 180 seconds and therefore cannot provide a persistent financial freeze"
+  },
+  "newWriter": {"enabled": false, "deployed": false},
+  "prohibitionsObserved": ["no customer balance mutation", "no custody transaction", "no production database mutation", "no 75594 action", "no Green writer restart"]
+}

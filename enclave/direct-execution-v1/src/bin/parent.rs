@@ -8,13 +8,15 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use aws_sdk_s3::{primitives::ByteStream, types::{ObjectLockMode, ServerSideEncryption}, Client as S3Client};
+use aws_smithy_types::DateTime;
 use chacha20poly1305::{
     aead::{Aead, KeyInit},
     ChaCha20Poly1305, Key, Nonce,
 };
 use layrs_direct_execution_v1::{
     request_hash, sha256, sign, DirectAction, DirectReceipt, DirectRequest, DirectResult,
-    DurabilityAck, FilesystemImmutableArtifactStore, ProjectionBalanceRow, ProjectionWalletRow,
+    artifact_hash, DirectStateArtifact, DurabilityAck, FilesystemImmutableArtifactStore, ProjectionBalanceRow, ProjectionWalletRow,
     RuntimeRequest, RuntimeResponse, SealedEpoch, WriterGrant, EPOCH_ID, POSTGRES_PROJECTION_DDL,
 };
 use serde::{Deserialize, Serialize};
@@ -43,8 +45,100 @@ struct AppState {
     isolated_test: bool,
     projection: Option<Projection>,
     local_used_sessions: Arc<Mutex<HashSet<(String, String)>>>,
-    artifact_store: Option<FilesystemImmutableArtifactStore>,
+    artifact_store: Option<ArchiveStore>,
     commit_ack_key: Vec<u8>,
+}
+
+#[derive(Clone)]
+enum ArchiveStore {
+    Filesystem(FilesystemImmutableArtifactStore),
+    S3(S3ImmutableArtifactStore),
+}
+
+#[derive(Clone)]
+struct S3ImmutableArtifactStore {
+    client: S3Client,
+    bucket: String,
+    prefix: String,
+    kms_key_id: String,
+    retention_seconds: i64,
+}
+
+impl ArchiveStore {
+    async fn from_environment(isolated_test: bool) -> Result<Option<Self>, Box<dyn std::error::Error>> {
+        match env::var("LAYRS_DIRECT_ARCHIVE_BACKEND").as_deref() {
+            Ok("s3-object-lock") => Ok(Some(Self::S3(S3ImmutableArtifactStore::from_environment().await?))),
+            Ok("filesystem") if isolated_test => Ok(env::var("LAYRS_DIRECT_ARTIFACT_DIR").ok()
+                .filter(|value| !value.is_empty()).map(PathBuf::from)
+                .map(FilesystemImmutableArtifactStore::new).map(Self::Filesystem)),
+            Ok("filesystem") => Err("filesystem archive is prohibited outside isolated test".into()),
+            Ok(_) => Err("invalid direct archive backend".into()),
+            Err(_) if isolated_test => Ok(env::var("LAYRS_DIRECT_ARTIFACT_DIR").ok()
+                .filter(|value| !value.is_empty()).map(PathBuf::from)
+                .map(FilesystemImmutableArtifactStore::new).map(Self::Filesystem)),
+            Err(_) => Err("production direct archive backend is required".into()),
+        }
+    }
+    async fn persist_readback(&self, artifact: &DirectStateArtifact) -> Result<DirectStateArtifact, String> {
+        match self {
+            Self::Filesystem(store) => store.persist_readback(artifact).map_err(|error| error.to_string()),
+            Self::S3(store) => store.persist_readback(artifact).await,
+        }
+    }
+    async fn load_committed(&self) -> Result<Vec<DirectStateArtifact>, String> {
+        match self {
+            Self::Filesystem(store) => store.load_committed().map_err(|error| error.to_string()),
+            Self::S3(store) => store.load_committed().await,
+        }
+    }
+}
+
+impl S3ImmutableArtifactStore {
+    async fn from_environment() -> Result<Self, Box<dyn std::error::Error>> {
+        let bucket = env::var("LAYRS_DIRECT_ARCHIVE_BUCKET")?;
+        let prefix = env::var("LAYRS_DIRECT_ARCHIVE_PREFIX")?;
+        let kms_key_id = env::var("LAYRS_DIRECT_ARCHIVE_KMS_KEY_ID")?;
+        let retention_seconds = env::var("LAYRS_DIRECT_ARCHIVE_RETENTION_SECONDS")?.parse::<i64>()?;
+        if bucket.is_empty() || prefix.is_empty() || kms_key_id.is_empty() || retention_seconds < 86_400 { return Err("invalid immutable archive configuration".into()); }
+        let client = S3Client::new(&aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await);
+        client.get_object_lock_configuration().bucket(&bucket).send().await?;
+        Ok(Self { client, bucket, prefix: prefix.trim_end_matches('/').into(), kms_key_id, retention_seconds })
+    }
+    fn artifact_key(&self, artifact: &DirectStateArtifact) -> String { format!("{}/artifacts/{:020}-{}.cbor", self.prefix, artifact.sequence, artifact_hash(artifact)) }
+    fn head_key(&self, artifact: &DirectStateArtifact) -> String { format!("{}/heads/{:020}-{}.cbor", self.prefix, artifact.sequence, artifact_hash(artifact)) }
+    async fn read(&self, key: &str) -> Result<Vec<u8>, String> {
+        Ok(self.client.get_object().bucket(&self.bucket).key(key).send().await.map_err(|_| "archive read failed")?
+            .body.collect().await.map_err(|_| "archive read body failed")?.into_bytes().to_vec())
+    }
+    async fn write_once(&self, key: &str, bytes: Vec<u8>) -> Result<(), String> {
+        let until = DateTime::from_secs(SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| "clock invalid")?.as_secs() as i64 + self.retention_seconds);
+        let put = self.client.put_object().bucket(&self.bucket).key(key).body(ByteStream::from(bytes.clone()))
+            .if_none_match("*").server_side_encryption(ServerSideEncryption::AwsKms).ssekms_key_id(&self.kms_key_id)
+            .object_lock_mode(ObjectLockMode::Compliance).object_lock_retain_until_date(until).send().await;
+        if put.is_err() && self.read(key).await? != bytes { return Err("archive immutable write failed".into()); }
+        if self.read(key).await? != bytes { return Err("archive readback mismatch".into()); }
+        Ok(())
+    }
+    async fn persist_readback(&self, artifact: &DirectStateArtifact) -> Result<DirectStateArtifact, String> {
+        let bytes = serde_cbor::to_vec(artifact).map_err(|_| "artifact encoding failed")?;
+        self.write_once(&self.artifact_key(artifact), bytes.clone()).await?;
+        self.write_once(&self.head_key(artifact), bytes).await?;
+        let restored: DirectStateArtifact = serde_cbor::from_slice(&self.read(&self.artifact_key(artifact)).await?).map_err(|_| "artifact decode failed")?;
+        if restored != *artifact || artifact_hash(&restored) != artifact_hash(artifact) { return Err("artifact integrity mismatch".into()); }
+        Ok(restored)
+    }
+    async fn load_committed(&self) -> Result<Vec<DirectStateArtifact>, String> {
+        let listing = self.client.list_objects_v2().bucket(&self.bucket).prefix(format!("{}/artifacts/", self.prefix)).send().await.map_err(|_| "archive listing failed")?;
+        if listing.is_truncated.unwrap_or(false) { return Err("archive listing exceeds bounded recovery set".into()); }
+        let mut artifacts = Vec::new();
+        for object in listing.contents() {
+            let key = object.key().ok_or("archive object key missing")?;
+            artifacts.push(serde_cbor::from_slice(&self.read(key).await?).map_err(|_| "artifact decode failed")?);
+        }
+        artifacts.sort_by_key(|artifact: &DirectStateArtifact| artifact.sequence);
+        for artifact in &artifacts { let head = self.read(&self.head_key(artifact)).await?; if head != serde_cbor::to_vec(artifact).map_err(|_| "head encoding failed")? { return Err("archive head mismatch".into()); } }
+        Ok(artifacts)
+    }
 }
 
 #[derive(Clone)]
@@ -151,11 +245,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         isolated_test,
         projection,
         local_used_sessions: Arc::new(Mutex::new(HashSet::new())),
-        artifact_store: env::var("LAYRS_DIRECT_ARTIFACT_DIR")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .map(FilesystemImmutableArtifactStore::new),
+        artifact_store: ArchiveStore::from_environment(isolated_test).await?,
         commit_ack_key: env::var("LAYRS_DIRECT_COMMIT_ACK_KEY_HEX")
             .ok()
             .and_then(|value| hex::decode(value).ok())
@@ -595,7 +685,7 @@ async fn recover_enclave(state: &AppState) -> io::Result<()> {
             "DIRECT_ARTIFACT_STORE_NOT_CONFIGURED",
         )
     })?;
-    let artifacts = store.load_committed().map_err(|error| {
+    let artifacts = store.load_committed().await.map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("DIRECT_STATE_RECOVERY_FAILED:{error}"),
@@ -721,7 +811,7 @@ async fn exchange_direct(state: &AppState, request: DirectRequest) -> io::Result
         // `persist_readback` uses create_new, fsyncs the write, rereads the
         // opaque bytes, decodes them, and compares the complete artifact plus
         // its CBOR hash before this acknowledgement exists.
-        let restored = store.persist_readback(&artifact).map_err(|error| {
+        let restored = store.persist_readback(&artifact).await.map_err(|error| {
             io::Error::new(
                 io::ErrorKind::Other,
                 format!("IMMUTABLE_PERSISTENCE_FAILED:{error}"),

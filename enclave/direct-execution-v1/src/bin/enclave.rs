@@ -9,8 +9,8 @@ use aws_nitro_enclaves_nsm_api::{
     driver::{nsm_exit, nsm_init, nsm_process_request},
 };
 use layrs_direct_execution_v1::{
-    runtime_binding, DirectRuntime, InMemoryDirectStateStore, RuntimeMode, RuntimeRequest,
-    RuntimeResponse, SealedEpoch, WriterGrant,
+    runtime_binding, DirectRuntime, InMemoryDirectStateStore, RuntimeMeasurementBinding,
+    RuntimeMode, RuntimeRequest, RuntimeResponse, SealedEpoch, WriterGrant,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -112,11 +112,14 @@ fn verified_writer_grant() -> bool {
         .ok()
         .and_then(|value| hex::decode(value).ok())
         .filter(|value| value.len() >= 32);
+    let binding = env::var("LAYRS_DIRECT_APPROVED_RUNTIME_BINDING_JSON")
+        .ok()
+        .and_then(|value| serde_json::from_str::<RuntimeMeasurementBinding>(&value).ok());
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_secs())
         .unwrap_or(0);
-    matches!((grant, key), (Some(grant), Some(key)) if grant.verify(&key, now))
+    matches!((grant, key, binding), (Some(grant), Some(key), Some(binding)) if grant.verify(&key, now, &binding))
 }
 
 async fn serve<S>(mut stream: S, state: Arc<Mutex<EnclaveState>>) -> io::Result<()>
