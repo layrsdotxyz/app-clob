@@ -195,6 +195,23 @@ async fn bootstrap_isolated(
         };
     }
     let mut state = state.lock().await;
+    // The parent can restart while the enclave keeps running.  Replaying the
+    // isolated bootstrap with exactly the same keys is therefore an
+    // idempotent transport setup operation, not a ledger transition.  A
+    // different key set is always rejected: it must never replace keys after
+    // recovery or enable a different parent to take over this runtime.
+    if state.mode == RuntimeMode::IsolatedTest {
+        return if state.receipt_key == receipt_key
+            && state.state_key == state_key
+            && state.commit_ack_key == commit_ack_key
+        {
+            RuntimeResponse::BootstrapComplete
+        } else {
+            RuntimeResponse::Error {
+                code: "ISOLATED_BOOTSTRAP_REJECTED".into(),
+            }
+        };
+    }
     if state.mode != RuntimeMode::Dormant || state.recovery_complete {
         return RuntimeResponse::Error {
             code: "ISOLATED_BOOTSTRAP_REJECTED".into(),
@@ -547,6 +564,34 @@ mod tests {
         let response = serde_cbor::from_slice(&read_frame(&mut parent).await.unwrap()).unwrap();
         server.await.unwrap().unwrap();
         response
+    }
+
+    #[tokio::test]
+    async fn isolated_bootstrap_is_idempotent_only_for_the_same_keys() {
+        let epoch = SealedEpoch::load(epoch_path()).unwrap();
+        let state = Arc::new(Mutex::new(EnclaveState {
+            nsm_fd: -1,
+            runtime: DirectRuntime::new(epoch.clone(), RuntimeMode::Dormant, vec![0; 32]).unwrap(),
+            epoch,
+            mode: RuntimeMode::Dormant,
+            receipt_key: vec![0; 32],
+            identity_count: 438,
+            state_key: Vec::new(),
+            commit_ack_key: Vec::new(),
+            recovery_complete: false,
+        }));
+        assert!(matches!(
+            bootstrap_isolated(Arc::clone(&state), vec![7; 32], vec![8; 32], vec![9; 32]).await,
+            RuntimeResponse::BootstrapComplete
+        ));
+        assert!(matches!(
+            bootstrap_isolated(Arc::clone(&state), vec![7; 32], vec![8; 32], vec![9; 32]).await,
+            RuntimeResponse::BootstrapComplete
+        ));
+        assert!(matches!(
+            bootstrap_isolated(state, vec![7; 32], vec![8; 32], vec![1; 32]).await,
+            RuntimeResponse::Error { ref code } if code == "ISOLATED_BOOTSTRAP_REJECTED"
+        ));
     }
 
     #[tokio::test]
