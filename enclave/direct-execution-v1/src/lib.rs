@@ -7,6 +7,8 @@ use thiserror::Error;
 pub const EPOCH_ID: &str = "layrs-opening-epoch-20260911-941107537728c98b";
 pub const EPOCH_STATE_SHA256: &str =
     "84835da82210671d87321a21246317d898afd35381c57be8522df1a516dc3590";
+pub const EVIDENCE_MANIFEST_SHA256: &str =
+    "70e579f630c759258728d91cb957fa84e200674aeebd3eae5997430a62203957";
 pub const TRANSACTION_MODEL: &str = "layrs.direct-execution.v1";
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -104,6 +106,17 @@ impl SealedEpoch {
             })
             .collect::<Result<BTreeMap<_, _>, RuntimeError>>()?;
         Ok(Self { identities })
+    }
+
+    pub fn load_with_evidence(
+        epoch_path: impl AsRef<Path>,
+        evidence_manifest_path: impl AsRef<Path>,
+    ) -> Result<Self, RuntimeError> {
+        let evidence = fs::read(evidence_manifest_path).map_err(|_| RuntimeError::Read)?;
+        if sha256(&evidence) != EVIDENCE_MANIFEST_SHA256 {
+            return Err(RuntimeError::EpochHash);
+        }
+        Self::load(epoch_path)
     }
 
     pub fn identity_count(&self) -> usize {
@@ -232,6 +245,58 @@ impl DirectRuntime {
 
 pub struct DirectParent {
     runtime: DirectRuntime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RuntimeRequest {
+    Attestation { nonce: Vec<u8> },
+    Status,
+    DirectTest { request: DirectRequest },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RuntimeResponse {
+    Attestation {
+        document: Vec<u8>,
+        binding: RuntimeBinding,
+    },
+    Status {
+        status: RuntimeStatus,
+    },
+    DirectTest {
+        result: DirectResult,
+    },
+    Error {
+        code: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeBinding {
+    pub runtime: String,
+    pub transaction_model: String,
+    pub epoch_state_sha256: String,
+    pub evidence_manifest_sha256: String,
+    pub genesis_ordinal: u64,
+    pub writer_enabled: bool,
+    pub identity_count: usize,
+}
+
+pub type RuntimeStatus = RuntimeBinding;
+
+pub fn runtime_binding(identity_count: usize) -> RuntimeBinding {
+    RuntimeBinding {
+        runtime: "layrs.direct-execution.nitro.v1".into(),
+        transaction_model: TRANSACTION_MODEL.into(),
+        epoch_state_sha256: EPOCH_STATE_SHA256.into(),
+        evidence_manifest_sha256: EVIDENCE_MANIFEST_SHA256.into(),
+        genesis_ordinal: 0,
+        writer_enabled: false,
+        identity_count,
+    }
 }
 
 impl DirectParent {

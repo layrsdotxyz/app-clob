@@ -1,0 +1,22 @@
+[Unit]
+Description=Layrs opening epoch direct-execution parent
+After=layrs-opening-enclave.service
+Requires=layrs-opening-enclave.service
+
+[Service]
+Type=simple
+User=layrsopening
+Environment=PORT=8443
+Environment=LAYRS_ENCLAVE_CID=16
+Environment=LAYRS_OPENING_EPOCH_PATH=/opt/layrs-opening/OPENING_EPOCH_STATE_20260911.json
+Environment=LAYRS_OPENING_EVIDENCE_PATH=/opt/layrs-opening/OPENING_EPOCH_EVIDENCE_MANIFEST_20260911.json
+ExecStart=/opt/layrs-opening/layrs-direct-parent
+Restart=on-failure
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
