@@ -396,6 +396,11 @@ pub struct DirectStateArtifact {
     pub ciphertext_hash: String,
     pub receipt: DirectReceipt,
 }
+pub struct DirectCandidate {
+    runtime: DirectRuntime,
+    pub artifact: DirectStateArtifact,
+    pub result: DirectResult,
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct DirectState {
@@ -631,21 +636,71 @@ impl DirectRuntime {
                 Err(RuntimeError::RequestReuse)
             };
         }
+        let candidate = self.prepare_candidate(request, state_key)?;
+        store.put_if_absent(&candidate.artifact)?;
+        if !candidate
+            .runtime
+            .verify_artifact(&candidate.artifact, state_key)?
+        {
+            return Err(RuntimeError::StateArtifact);
+        }
+        let result = candidate.result.clone();
+        self.adopt_candidate(candidate, state_key)?;
+        Ok(result)
+    }
+    pub fn prepare_candidate(
+        &self,
+        request: DirectRequest,
+        state_key: &[u8],
+    ) -> Result<DirectCandidate, RuntimeError> {
+        let key = (request.account_id.clone(), request.request_id.clone());
+        if let Some((hash, result)) = self.requests.get(&key) {
+            return if hash == &request.request_hash {
+                Ok(DirectCandidate {
+                    runtime: self.clone(),
+                    artifact: self.seal_artifact(
+                        &self.state_hash(),
+                        &request.request_hash,
+                        state_key,
+                        result.receipt.clone(),
+                    )?,
+                    result: result.clone(),
+                })
+            } else {
+                Err(RuntimeError::RequestReuse)
+            };
+        }
         let prior = self.state_hash();
-        let mut candidate = self.clone();
-        let result = candidate.execute(request.clone())?;
-        let artifact = candidate.seal_artifact(
+        let mut runtime = self.clone();
+        let result = runtime.execute(request.clone())?;
+        let artifact = runtime.seal_artifact(
             &prior,
             &request.request_hash,
             state_key,
             result.receipt.clone(),
         )?;
-        store.put_if_absent(&artifact)?;
-        if !candidate.verify_artifact(&artifact, state_key)? {
+        if !runtime.verify_artifact(&artifact, state_key)? {
             return Err(RuntimeError::StateArtifact);
         }
-        *self = candidate;
-        Ok(result)
+        Ok(DirectCandidate {
+            runtime,
+            artifact,
+            result,
+        })
+    }
+    pub fn adopt_candidate(
+        &mut self,
+        candidate: DirectCandidate,
+        state_key: &[u8],
+    ) -> Result<(), RuntimeError> {
+        if !candidate
+            .runtime
+            .verify_artifact(&candidate.artifact, state_key)?
+        {
+            return Err(RuntimeError::StateArtifact);
+        }
+        *self = candidate.runtime;
+        Ok(())
     }
     pub fn restore_committed<S: DirectStateStore>(
         epoch: SealedEpoch,
