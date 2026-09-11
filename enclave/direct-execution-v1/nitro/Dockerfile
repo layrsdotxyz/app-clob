@@ -4,6 +4,4 @@ COPY OPENING_EPOCH_STATE_20260911.json /opt/layrs-opening/OPENING_EPOCH_STATE_20
 COPY OPENING_EPOCH_EVIDENCE_MANIFEST_20260911.json /opt/layrs-opening/OPENING_EPOCH_EVIDENCE_MANIFEST_20260911.json
 ENV LAYRS_OPENING_EPOCH_PATH=/opt/layrs-opening/OPENING_EPOCH_STATE_20260911.json
 ENV LAYRS_OPENING_EVIDENCE_PATH=/opt/layrs-opening/OPENING_EPOCH_EVIDENCE_MANIFEST_20260911.json
-# `nitro-cli build-enclave` derives the EIF cmdline from Docker Config.Cmd;
-# Config.Entrypoint alone leaves the generated cmdline blob absent (E19).
-CMD ["/opt/layrs-opening/layrs-direct-enclave"]
+ENTRYPOINT ["/opt/layrs-opening/layrs-direct-enclave"]
