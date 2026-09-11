@@ -58,6 +58,7 @@ build {
       "sudo dnf install -y aws-nitro-enclaves-cli aws-nitro-enclaves-cli-devel docker",
       "sudo systemctl enable docker && sudo systemctl start docker",
       "sudo install -d -m 0755 /opt/layrs-opening /tmp/opening-image",
+      "sudo install -d -m 0755 /etc/layrs-opening",
       "sudo install -m 0755 /tmp/layrs-direct-enclave /tmp/opening-image/layrs-direct-enclave",
       "sudo install -m 0755 /tmp/layrs-direct-parent /opt/layrs-opening/layrs-direct-parent",
       "sudo install -m 0600 /tmp/OPENING_EPOCH_STATE_20260911.json /tmp/opening-image/OPENING_EPOCH_STATE_20260911.json",
