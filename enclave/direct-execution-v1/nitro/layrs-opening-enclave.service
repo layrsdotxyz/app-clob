@@ -7,6 +7,10 @@ Before=layrs-opening-parent.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# The enclave needs the same isolated protected-key release as the parent.
+# The image contains no keys; this root-owned optional file is supplied only
+# by isolated verification or a later governed activation.
+EnvironmentFile=-/etc/layrs-opening/direct-runtime.env
 ExecStart=/usr/bin/nitro-cli run-enclave --cpu-count 2 --memory 1024 --eif-path /opt/layrs-opening/layrs-direct-execution.eif --enclave-cid 16
 ExecStop=/usr/bin/nitro-cli terminate-enclave --all
 TimeoutStartSec=120
