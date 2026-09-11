@@ -55,7 +55,7 @@ build {
   }
   provisioner "shell" {
     inline = [
-      "sudo dnf install -y aws-nitro-enclaves-cli docker",
+      "sudo dnf install -y aws-nitro-enclaves-cli aws-nitro-enclaves-cli-devel docker",
       "sudo systemctl enable docker && sudo systemctl start docker",
       "sudo install -d -m 0755 /opt/layrs-opening /tmp/opening-image",
       "sudo install -m 0755 /tmp/layrs-direct-enclave /tmp/opening-image/layrs-direct-enclave",
