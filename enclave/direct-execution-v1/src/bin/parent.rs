@@ -349,10 +349,9 @@ impl Projection {
             .client
             .batch_execute(POSTGRES_PROJECTION_DDL)
             .await?;
-        projection
-            .import_opening(epoch)
-            .await
-            .map_err(|_| "opening projection mismatch")?;
+        if let Err(error) = projection.import_opening(epoch).await {
+            return Err(format!("opening projection import failed: {error:?}").into());
+        }
         Ok(projection)
     }
 

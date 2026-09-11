@@ -738,10 +738,10 @@ mod tests {
     }
     #[test]
     fn loads_exact_sealed_epoch() {
-        assert_eq!(
-            SealedEpoch::load(epoch_path()).unwrap().identity_count(),
-            438
-        );
+        let epoch = SealedEpoch::load(epoch_path()).unwrap();
+        assert_eq!(epoch.identity_count(), 438);
+        assert_eq!(epoch.projection_rows().len(), 322);
+        assert_eq!(epoch.projection_wallet_rows().len(), 414);
     }
     #[test]
     fn immediate_withdrawal_is_idempotent_and_bound_to_embedded_wallet() {
