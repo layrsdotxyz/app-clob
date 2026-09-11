@@ -1,0 +1,23 @@
+[package]
+name = "layrs-direct-execution-v1"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "layrs-direct-enclave"
+path = "src/bin/enclave.rs"
+
+[[bin]]
+name = "layrs-direct-parent"
+path = "src/bin/parent.rs"
+
+[dependencies]
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "1.0"
