@@ -1432,6 +1432,9 @@ mod tests {
         };
         grant.signature = sign(&key, &serde_json::to_vec(&grant).unwrap());
         assert!(grant.verify(&key, 100));
+        let mut forged = grant.clone();
+        forged.signature = "0".repeat(64);
+        assert!(!forged.verify(&key, 100));
         assert!(!grant.verify(&key, 200));
         grant.old_writer_fence_evidence_sha256 = "b".repeat(64);
         assert!(!grant.verify(&key, 100));
@@ -1440,6 +1443,9 @@ mod tests {
         assert!(!grant.verify(&key, 100));
         grant.runtime = TRANSACTION_MODEL.into();
         grant.opening_epoch_sha256 = "b".repeat(64);
+        assert!(!grant.verify(&key, 100));
+        grant.opening_epoch_sha256 = EPOCH_STATE_SHA256.into();
+        grant.epoch_id = "wrong-lineage".into();
         assert!(!grant.verify(&key, 100));
     }
 
