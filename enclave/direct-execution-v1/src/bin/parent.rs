@@ -66,7 +66,11 @@ struct CustomerCommand {
     action: CustomerAction,
 }
 #[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(
+    tag = "type",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    rename_all_fields = "camelCase"
+)]
 enum CustomerAction {
     PlaceOrder {
         order_id: String,
@@ -791,5 +795,22 @@ mod tests {
         assert!(authenticated(&headers, &state).is_ok());
         headers.insert("authorization", "Bearer bad".parse().unwrap());
         assert!(authenticated(&headers, &state).is_err());
+    }
+
+    #[test]
+    fn customer_command_accepts_documented_camel_case_fields() {
+        let command: CustomerCommand = serde_json::from_value(serde_json::json!({
+            "identityCommitment": "identity",
+            "action": {
+                "type": "RESERVE_WITHDRAWAL",
+                "destination": "0xCCB96357dEB4cbF0808208d55916774f0B51a908",
+                "amountAtomic": "1000000"
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            command.action,
+            CustomerAction::ReserveWithdrawal { amount_atomic, .. } if amount_atomic == "1000000"
+        ));
     }
 }
