@@ -72,7 +72,7 @@ build {
       "sudo install -m 0644 /tmp/layrs-opening-enclave.service /etc/systemd/system/layrs-opening-enclave.service",
       "sudo install -m 0644 /tmp/layrs-opening-parent.service /etc/systemd/system/layrs-opening-parent.service",
       "sudo install -d -m 0755 /etc/nitro_enclaves",
-      "printf 'memory_mib: 1024\\ncpu_count: 2\\n' | sudo tee /etc/nitro_enclaves/allocator.yaml >/dev/null",
+      "printf '%s\\n' '---' 'memory_mib: 1024' 'cpu_count: 2' | sudo tee /etc/nitro_enclaves/allocator.yaml >/dev/null",
       "sudo systemctl enable nitro-enclaves-allocator.service layrs-opening-enclave.service layrs-opening-parent.service",
       "sudo dnf clean all"
     ]
