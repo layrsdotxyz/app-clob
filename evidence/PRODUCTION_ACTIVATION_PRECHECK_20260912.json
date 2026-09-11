@@ -1,0 +1,78 @@
+{
+  "schema": "layrs.production-activation-precheck.v1",
+  "generatedAt": "2026-09-12T03:26:46+05:30",
+  "status": "WAITING_FOR_EXTERNAL_AUTHORIZATION",
+  "sealedStep5Evidence": {
+    "sha256": "872b41e03ca2a892dafdbc8c8b7b2c8a68a67535a3c9c27ce2cb448bde70588d",
+    "epochId": "layrs-opening-epoch-20260911-941107537728c98b",
+    "openingEpochStateSha256": "84835da82210671d87321a21246317d898afd35381c57be8522df1a516dc3590",
+    "openingEvidenceManifestSha256": "70e579f630c759258728d91cb957fa84e200674aeebd3eae5997430a62203957"
+  },
+  "approvedCandidate": {
+    "sourceCommit": "92e9918",
+    "ami": "ami-00b5f08fce6be9018",
+    "amiAvailability": "NOT_REGISTERED_AT_READ_ONLY_CHECK",
+    "eifSha256": "138d35cb576bd07f2dcf37652d436fa4d2acdc5aa3431c6c4934a0ff8cbc1548",
+    "enclaveSha256": "fcbba5e7a469aa54de63ddb836b1c8ae95fb43282a626f753cfb9b95f00f46b5",
+    "parentSha256": "697823b3de72c82432c715df12103d6811443f6c5f9733c6db8d41a66a135ad7",
+    "pcr0": "d2a9db65dbcdc682f02b3023321aa9b1c9272a52cbe4ec8d36c112eadc48a351cfc0b11ca0af4dd744290836e31dba13",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "08f5b0adbcb270fd159b3f73630676415a6f30df3c8b7aeeb0ac34a1597f668f845f302463557cab8c9483feda2213bf"
+  },
+  "readOnlyProductionFindings": {
+    "account": "082223548516",
+    "region": "us-east-1",
+    "directExecutionProductionTaskDefinition": "ABSENT",
+    "directExecutionProductionRoute": "ABSENT",
+    "legacyPublicApi": {
+      "service": "layrs-production-public-api",
+      "taskDefinition": "layrs-production-public-api:80",
+      "image": "layrs-green-backend-20260906@sha256:51113f62a8df6b5c0c2be87351487f53d179f6f6ac6a12c0a8ad63d05daba873",
+      "targetHealth": "2_HEALTHY"
+    },
+    "legacyDepositWithdrawal": {
+      "service": "layrs-production-deposit-withdrawal",
+      "taskDefinition": "layrs-production-deposit-withdrawal:36",
+      "image": "layrs-green-backend-20260906@sha256:96ba3a7cc22bce9584828f1211f70142aaff1c525a29fed8bc34b875627df31c",
+      "desiredRunning": "2_2"
+    },
+    "legacyGreenCore": {
+      "service": "layrs-production-green-core-coordinator",
+      "taskDefinition": "layrs-production-green-core-coordinator:7",
+      "desiredRunning": "1_1",
+      "targetHealth": "HEALTHY"
+    },
+    "baseRpcCredentialMetadata": {
+      "secretName": "layrs/production/providers/rpc",
+      "kmsKey": "alias/layrs/production/operational-identity",
+      "valueRead": false,
+      "credentialValidatedForDirectAdapter": false
+    },
+    "operationalAlertTopic": {
+      "name": "layrs-production-operational-alerts",
+      "confirmedSubscriptions": 0,
+      "layrsAlarmsInAlarm": 16
+    }
+  },
+  "failClosedChecks": {
+    "oldWriterFenceApplied": false,
+    "targetWriterEnabled": false,
+    "signedWriterGrantPresent": false,
+    "productionAttestationKeyReleasePolicyVerified": false,
+    "productionImmutableArchiveAdapterPresent": false,
+    "productionCustodyAdapterEnabled": false,
+    "fundedCanaryAuthorized": false,
+    "customerFundsMoved": false,
+    "productionDatabaseMutated": false,
+    "productionWriterActivated": false
+  },
+  "requiredExternalPrerequisites": [
+    "Governed authorization and evidence to fence every legacy financial writer, including the currently running layrs-production-green-core-coordinator and deposit-withdrawal path, before any target writer is enabled.",
+    "A newly available, independently approved and attested launch artifact. The sealed AMI ami-00b5f08fce6be9018 is not registered at this check; a replacement requires rebuild, PCR comparison, and new approval rather than substitution.",
+    "A production immutable encrypted archive adapter with create-if-absent and verified-readback semantics. The current binary only instantiates the filesystem test adapter and explicitly requires a production archive adapter.",
+    "A governed key-release/attestation policy that cryptographically binds the approved AMI/EIF/PCR commitments. The current WriterGrant code binds epoch, runtime, opening hash, fence hash, expiry and signature, but not AMI, EIF, or PCR fields itself.",
+    "Approved production custody adapter configuration: authenticated Base RPC finality source, finality threshold, custody signer authority, and a read-only finality preflight. Existing secret metadata was inspected without reading a value and belongs to the legacy workload, not a direct-execution deployment.",
+    "An activation-specific direct-execution route, health checks, alert delivery, and monitoring. No direct task definition or route exists; the operational alert topic has zero confirmed subscriptions and sixteen relevant alarms are already ALARM.",
+    "A signed, unexpired WriterGrant only after the fence, attestation policy, archive, custody and route checks succeed, plus separately approved funded-canary parameters and execution authority."
+  ]
+}
