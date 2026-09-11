@@ -136,6 +136,11 @@ where
                 ),
             }
         }
+        RuntimeRequest::BootstrapIsolated {
+            receipt_key,
+            state_key,
+            commit_ack_key,
+        } => bootstrap_isolated(state, receipt_key, state_key, commit_ack_key).await,
         RuntimeRequest::Execute { request } => {
             return execute_direct(&mut stream, state, request).await
         }
@@ -172,6 +177,47 @@ where
         &serde_cbor::to_vec(&response).map_err(invalid)?,
     )
     .await
+}
+
+/// The parent environment is outside an EIF.  For an explicitly isolated
+/// test, pass the three ephemeral keys across the existing VSOCK channel once,
+/// before any recovery or financial request.  The bootstrap never changes a
+/// ledger state and cannot enable a production writer.
+async fn bootstrap_isolated(
+    state: Arc<Mutex<EnclaveState>>,
+    receipt_key: Vec<u8>,
+    state_key: Vec<u8>,
+    commit_ack_key: Vec<u8>,
+) -> RuntimeResponse {
+    if receipt_key.len() != 32 || state_key.len() != 32 || commit_ack_key.len() != 32 {
+        return RuntimeResponse::Error {
+            code: "INVALID_ISOLATED_BOOTSTRAP".into(),
+        };
+    }
+    let mut state = state.lock().await;
+    if state.mode != RuntimeMode::Dormant || state.recovery_complete {
+        return RuntimeResponse::Error {
+            code: "ISOLATED_BOOTSTRAP_REJECTED".into(),
+        };
+    }
+    let runtime = match DirectRuntime::new(
+        state.epoch.clone(),
+        RuntimeMode::IsolatedTest,
+        receipt_key.clone(),
+    ) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return RuntimeResponse::Error {
+                code: error.to_string(),
+            }
+        }
+    };
+    state.runtime = runtime;
+    state.mode = RuntimeMode::IsolatedTest;
+    state.receipt_key = receipt_key;
+    state.state_key = state_key;
+    state.commit_ack_key = commit_ack_key;
+    RuntimeResponse::BootstrapComplete
 }
 
 async fn recover_committed(

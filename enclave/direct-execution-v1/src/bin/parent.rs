@@ -155,6 +155,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter(|value| value.len() == 32)
             .unwrap_or_default(),
     };
+    // A Nitro EIF does not inherit the parent's systemd environment.  The
+    // isolated test key material therefore crosses the existing VSOCK channel
+    // once, before recovery; production never uses this bootstrap.
+    bootstrap_isolated_enclave(&state).await?;
     // The HTTP parent never accepts a financial command until it has supplied
     // the immutable archive's complete, head-verified recovery set and the
     // enclave has independently reconstructed it.  PostgreSQL is excluded.
@@ -618,6 +622,58 @@ async fn recover_enclave(state: &AppState) -> io::Result<()> {
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "DIRECT_STATE_RECOVERY_UNEXPECTED_RESPONSE",
+        )),
+    }
+}
+
+async fn bootstrap_isolated_enclave(state: &AppState) -> io::Result<()> {
+    if !state.isolated_test {
+        return Ok(());
+    }
+    let receipt_key = env::var("LAYRS_DIRECT_RECEIPT_KEY_HEX")
+        .ok()
+        .and_then(|value| hex::decode(value).ok())
+        .filter(|value| value.len() == 32)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "DIRECT_RECEIPT_KEY_NOT_CONFIGURED",
+            )
+        })?;
+    let state_key = env::var("LAYRS_DIRECT_STATE_KEY_HEX")
+        .ok()
+        .and_then(|value| hex::decode(value).ok())
+        .filter(|value| value.len() == 32)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "DIRECT_STATE_KEY_NOT_CONFIGURED",
+            )
+        })?;
+    if state.commit_ack_key.len() != 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "DIRECT_COMMIT_ACK_KEY_NOT_CONFIGURED",
+        ));
+    }
+    match exchange(
+        state,
+        RuntimeRequest::BootstrapIsolated {
+            receipt_key,
+            state_key,
+            commit_ack_key: state.commit_ack_key.clone(),
+        },
+    )
+    .await?
+    {
+        RuntimeResponse::BootstrapComplete => Ok(()),
+        RuntimeResponse::Error { code } => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("ISOLATED_BOOTSTRAP_FAILED:{code}"),
+        )),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ISOLATED_BOOTSTRAP_UNEXPECTED_RESPONSE",
         )),
     }
 }

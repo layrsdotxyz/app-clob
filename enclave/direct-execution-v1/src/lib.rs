@@ -1113,6 +1113,17 @@ pub enum RuntimeRequest {
         nonce: Vec<u8>,
     },
     Status,
+    /// Startup-only protected-key handoff for an explicitly isolated test
+    /// runtime.  Nitro does not propagate the parent's systemd environment
+    /// into an EIF, so test keys must cross the already-authenticated VSOCK
+    /// boundary before recovery.  This is deliberately unavailable to a
+    /// production-enabled runtime; production key release remains attestation
+    /// governed and is not represented by this message.
+    BootstrapIsolated {
+        receipt_key: Vec<u8>,
+        state_key: Vec<u8>,
+        commit_ack_key: Vec<u8>,
+    },
     Execute {
         request: DirectRequest,
     },
@@ -1144,6 +1155,7 @@ pub enum RuntimeResponse {
     Status {
         status: RuntimeStatus,
     },
+    BootstrapComplete,
     Execute {
         result: DirectResult,
     },
