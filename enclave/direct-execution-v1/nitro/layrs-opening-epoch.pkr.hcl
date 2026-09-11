@@ -6,14 +6,16 @@ packer {
 variable "aws_region" { type = string }
 variable "release_id" { type = string }
 source "amazon-ebs" "opening_epoch" {
-  region          = var.aws_region
-  instance_type   = "m6i.xlarge"
-  ssh_username    = "ec2-user"
-  ami_name        = "layrs-opening-epoch-${var.release_id}"
-  ami_description = "Isolated dormant Layrs opening epoch direct-execution Nitro runtime"
-  encrypt_boot    = true
-  ena_support     = true
-  imds_support    = "v2.0"
+  region               = var.aws_region
+  instance_type        = "m6i.xlarge"
+  ssh_username         = "ec2-user"
+  ssh_interface        = "session_manager"
+  iam_instance_profile = "layrs-opening-epoch-packer-ssm"
+  ami_name             = "layrs-opening-epoch-${var.release_id}"
+  ami_description      = "Isolated dormant Layrs opening epoch direct-execution Nitro runtime"
+  encrypt_boot         = true
+  ena_support          = true
+  imds_support         = "v2.0"
   source_ami_filter {
     filters     = { name = "al2023-ami-2023.*-x86_64", root-device-type = "ebs", virtualization-type = "hvm" }
     owners      = ["137112412989"]
