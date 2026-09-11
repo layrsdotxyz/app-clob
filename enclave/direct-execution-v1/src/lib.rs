@@ -266,6 +266,11 @@ pub enum RuntimeMode {
 pub struct WriterGrant {
     pub activation_id: String,
     pub epoch_id: String,
+    /// Binds a grant to direct execution rather than any legacy command
+    /// runtime.
+    pub runtime: String,
+    /// Binds activation to the sealed opening epoch, not merely its label.
+    pub opening_epoch_sha256: String,
     pub old_writer_fence_evidence_sha256: String,
     pub expires_at_unix: u64,
     pub signature: String,
@@ -275,6 +280,8 @@ impl WriterGrant {
     pub fn verify(&self, governance_key: &[u8], now_unix: u64) -> bool {
         if self.activation_id.is_empty()
             || self.epoch_id != EPOCH_ID
+            || self.runtime != TRANSACTION_MODEL
+            || self.opening_epoch_sha256 != EPOCH_STATE_SHA256
             || self.old_writer_fence_evidence_sha256.len() != 64
             || self.expires_at_unix <= now_unix
         {
@@ -1417,6 +1424,8 @@ mod tests {
         let mut grant = WriterGrant {
             activation_id: "step6-review-id".into(),
             epoch_id: EPOCH_ID.into(),
+            runtime: TRANSACTION_MODEL.into(),
+            opening_epoch_sha256: EPOCH_STATE_SHA256.into(),
             old_writer_fence_evidence_sha256: "a".repeat(64),
             expires_at_unix: 200,
             signature: String::new(),
@@ -1425,6 +1434,12 @@ mod tests {
         assert!(grant.verify(&key, 100));
         assert!(!grant.verify(&key, 200));
         grant.old_writer_fence_evidence_sha256 = "b".repeat(64);
+        assert!(!grant.verify(&key, 100));
+        grant.old_writer_fence_evidence_sha256 = "a".repeat(64);
+        grant.runtime = "legacy.durable-command.v1".into();
+        assert!(!grant.verify(&key, 100));
+        grant.runtime = TRANSACTION_MODEL.into();
+        grant.opening_epoch_sha256 = "b".repeat(64);
         assert!(!grant.verify(&key, 100));
     }
 
