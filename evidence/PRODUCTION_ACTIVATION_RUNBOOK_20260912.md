@@ -14,17 +14,17 @@ customer asset.
 | opening state | `84835da82210671d87321a21246317d898afd35381c57be8522df1a516dc3590` |
 | opening evidence | `70e579f630c759258728d91cb957fa84e200674aeebd3eae5997430a62203957` |
 | transaction model | `layrs.direct-execution.v1` |
-| AMI | `ami-0a26d307d4920f05b` |
-| EIF | `a71f54ccc2b420b8771d16a1607582e72c7394171d7d3217a86cc7c772eafa74` |
-| enclave binary | `cf693b97b1ce8e0906bbb6b572811c36b608b0c1d9c731681427a88c208629b8` |
-| parent binary | `29b374bcbaeb1cf8cb80478c46a262cf625e2f3ee402c812a9b362f097616b32` |
-| PCR0 | `28b343ca5357abc638a1536d097e03c47daf264920d998ee3ad4b180238b0ee88a4630750ff1535c998970fbe8ed46bb` |
+| AMI | `ami-0781a67a374dc8a70` |
+| EIF | `6f1cc6cd61492e7b2d3c34d75256412542de640fefbf3b6f4aad7021cc742542` |
+| enclave binary | `f0375fa4bbc88f4a5fa93123e7f0c1ac789064887cc714a178c2b590ba7609ba` |
+| parent binary | `96941a1d8018f296e5caf0f185760d0d1601e5fe95d2475f9bbe5464b213f425` |
+| PCR0 | `b965c2a0c3da8011f87933c69fca75d76bd9e215e2fea48def8a2fca0dd1ae6497b167140619901b3210cd4b7b82681f` |
 | PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
-| PCR2 | `85bb69be9eea43dbd96d100dc8dd44600b24a4d7f5e6f18a69c43011fa56ee4ab3ce296813583d8369e21d246b8788eb` |
+| PCR2 | `3d16f1c847e9edc8d28b23d0c64dd99867cbe355447ceb6cb501bcd6aa110c725a64d321a3e1b515ac86bd5267b7a193` |
 
-The earlier unregistered candidate has been superseded by the independently
-verified final candidate above.  The new candidate remains writer-disabled and
-requires a new governed approval; no prior approval transfers to it.
+The independently verified final candidate above is deployed only in
+private, dormant, writer-disabled form.  It requires a new governed approval;
+no prior approval transfers to it.
 
 ## Pre-activation gates — all must pass in order
 
