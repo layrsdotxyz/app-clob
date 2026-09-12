@@ -25,3 +25,7 @@ at a five-minute period with two evaluation periods and missing data breaching.
 The alert action remains the existing production SNS topic.  The alarm must be
 rebound to the final candidate instance during governed promotion; no state was
 forced or suppressed while waiting for normal metric evaluation.
+
+Normal CloudWatch evaluation subsequently observed two zero-valued health
+datapoints and transitioned this activation-critical alarm to `OK`; no manual
+state override was used.
