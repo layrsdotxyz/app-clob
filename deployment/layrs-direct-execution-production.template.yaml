@@ -120,7 +120,7 @@ Resources:
             values = {
                 "LAYRS_DIRECT_EXECUTION_MODE": "dormant",
                 "LAYRS_DIRECT_CUSTODY_PROVIDER": "privy-base-existing-pool-ledger",
-                "LAYRS_DIRECT_ARCHIVE_BACKEND": "s3",
+                "LAYRS_DIRECT_ARCHIVE_BACKEND": "s3-object-lock",
                 "LAYRS_DIRECT_ARCHIVE_BUCKET": "${ArchiveBucketName}",
                 "LAYRS_DIRECT_ARCHIVE_PREFIX": "${ArchivePrefix}",
                 "LAYRS_DIRECT_ARCHIVE_KMS_KEY_ID": "${ArchiveKmsKeyArn}",
