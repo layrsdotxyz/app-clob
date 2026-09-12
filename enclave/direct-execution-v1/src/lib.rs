@@ -15,7 +15,12 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
     ChaCha20Poly1305, Key, Nonce,
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
 use hmac::{Hmac, Mac};
+use p256::{
+    ecdsa::{signature::Verifier, Signature, VerifyingKey},
+    pkcs8::DecodePublicKey,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -34,6 +39,14 @@ pub const EVIDENCE_MANIFEST_SHA256: &str =
     "70e579f630c759258728d91cb957fa84e200674aeebd3eae5997430a62203957";
 pub const TRANSACTION_MODEL: &str = "layrs.direct-execution.v1";
 pub const PROJECTION_SCHEMA_VERSION: u32 = 1;
+/// Existing production recovery-evidence KMS signer.  This public key is
+/// deliberately compiled into the measured enclave so the untrusted parent
+/// cannot substitute governance verification material at activation time.
+pub const GOVERNANCE_KEY_ID: &str =
+    "alias/layrs/production/recovery-evidence-signing";
+pub const GOVERNANCE_SIGNING_ALGORITHM: &str = "ECDSA_SHA_256";
+const GOVERNANCE_PUBLIC_KEY_DER_BASE64: &str =
+    "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEj+YWePc+NPoCGDc7OF6yw4rVY2VYN0Ty3K2Y/tndvv9YSEp3scEn24l8KwAlexmygo+jlBofIkiSr12Wk99iuQ==";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -310,16 +323,36 @@ pub struct WriterGrant {
     pub runtime_measurement: RuntimeMeasurementBinding,
     pub old_writer_fence_evidence_sha256: String,
     pub expires_at_unix: u64,
+    /// KMS key alias and algorithm are signed fields, not deployment inputs.
+    pub governance_key_id: String,
+    pub signing_algorithm: String,
+    /// Standard-base64 DER ECDSA P-256 signature returned by AWS KMS.
     pub signature: String,
 }
 
 impl WriterGrant {
     pub fn verify(
         &self,
-        governance_key: &[u8],
         now_unix: u64,
         binding: &RuntimeMeasurementBinding,
     ) -> bool {
+        let Some(bytes) = self.unsigned_bytes(now_unix, binding) else {
+            return false;
+        };
+        let Ok(public_key_der) = STANDARD.decode(GOVERNANCE_PUBLIC_KEY_DER_BASE64) else {
+            return false;
+        };
+        let Ok(verifying_key) = VerifyingKey::from_public_key_der(&public_key_der) else {
+            return false;
+        };
+        self.verify_with_key(&verifying_key, &bytes)
+    }
+
+    fn unsigned_bytes(
+        &self,
+        now_unix: u64,
+        binding: &RuntimeMeasurementBinding,
+    ) -> Option<Vec<u8>> {
         if self.activation_id.is_empty()
             || self.epoch_id != EPOCH_ID
             || self.runtime != TRANSACTION_MODEL
@@ -329,15 +362,35 @@ impl WriterGrant {
             || &self.runtime_measurement != binding
             || self.old_writer_fence_evidence_sha256.len() != 64
             || self.expires_at_unix <= now_unix
+            || self.governance_key_id != GOVERNANCE_KEY_ID
+            || self.signing_algorithm != GOVERNANCE_SIGNING_ALGORITHM
         {
-            return false;
+            return None;
         }
         let mut unsigned = self.clone();
         unsigned.signature.clear();
-        let Ok(bytes) = serde_json::to_vec(&unsigned) else {
+        serde_json::to_vec(&unsigned).ok()
+    }
+
+    fn verify_with_key(&self, verifying_key: &VerifyingKey, bytes: &[u8]) -> bool {
+        let Ok(signature_der) = STANDARD.decode(&self.signature) else {
             return false;
         };
-        constant_time_eq(&sign(governance_key, &bytes), &self.signature)
+        let Ok(signature) = Signature::from_der(&signature_der) else {
+            return false;
+        };
+        verifying_key.verify(&bytes, &signature).is_ok()
+    }
+
+    #[cfg(test)]
+    fn verify_with_test_key(
+        &self,
+        now_unix: u64,
+        binding: &RuntimeMeasurementBinding,
+        verifying_key: &VerifyingKey,
+    ) -> bool {
+        self.unsigned_bytes(now_unix, binding)
+            .is_some_and(|bytes| self.verify_with_key(verifying_key, &bytes))
     }
 }
 
@@ -1568,7 +1621,9 @@ mod tests {
 
     #[test]
     fn writer_grant_requires_matching_epoch_fence_signature_and_expiry() {
-        let key = vec![1; 32];
+        use p256::ecdsa::{signature::Signer, SigningKey};
+        let signing_key = SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
+        let verifying_key = VerifyingKey::from(&signing_key);
         let binding = RuntimeMeasurementBinding {
             ami_id: "ami-0123456789abcdef0".into(),
             eif_sha256: "b".repeat(64),
@@ -1588,28 +1643,31 @@ mod tests {
             runtime_measurement: binding.clone(),
             old_writer_fence_evidence_sha256: "a".repeat(64),
             expires_at_unix: 200,
+            governance_key_id: GOVERNANCE_KEY_ID.into(),
+            signing_algorithm: GOVERNANCE_SIGNING_ALGORITHM.into(),
             signature: String::new(),
         };
-        grant.signature = sign(&key, &serde_json::to_vec(&grant).unwrap());
-        assert!(grant.verify(&key, 100, &binding));
+        let signature: Signature = signing_key.sign(&serde_json::to_vec(&grant).unwrap());
+        grant.signature = STANDARD.encode(signature.to_der().as_bytes());
+        assert!(grant.verify_with_test_key(100, &binding, &verifying_key));
         let mut forged = grant.clone();
-        forged.signature = "0".repeat(64);
-        assert!(!forged.verify(&key, 100, &binding));
-        assert!(!grant.verify(&key, 200, &binding));
+        forged.signature = STANDARD.encode([0u8; 8]);
+        assert!(!forged.verify_with_test_key(100, &binding, &verifying_key));
+        assert!(!grant.verify_with_test_key(200, &binding, &verifying_key));
         grant.old_writer_fence_evidence_sha256 = "b".repeat(64);
-        assert!(!grant.verify(&key, 100, &binding));
+        assert!(!grant.verify_with_test_key(100, &binding, &verifying_key));
         grant.old_writer_fence_evidence_sha256 = "a".repeat(64);
         grant.runtime = "legacy.durable-command.v1".into();
-        assert!(!grant.verify(&key, 100, &binding));
+        assert!(!grant.verify_with_test_key(100, &binding, &verifying_key));
         grant.runtime = TRANSACTION_MODEL.into();
         grant.opening_epoch_sha256 = "b".repeat(64);
-        assert!(!grant.verify(&key, 100, &binding));
+        assert!(!grant.verify_with_test_key(100, &binding, &verifying_key));
         grant.opening_epoch_sha256 = EPOCH_STATE_SHA256.into();
         grant.epoch_id = "wrong-lineage".into();
-        assert!(!grant.verify(&key, 100, &binding));
+        assert!(!grant.verify_with_test_key(100, &binding, &verifying_key));
         grant.epoch_id = EPOCH_ID.into();
         grant.runtime_measurement.pcr0 = "0".repeat(96);
-        assert!(!grant.verify(&key, 100, &binding));
+        assert!(!grant.verify_with_test_key(100, &binding, &verifying_key));
     }
 
     #[test]

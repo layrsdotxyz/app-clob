@@ -26,7 +26,8 @@ use layrs_direct_execution_v1::{
     DirectRequest, DirectResult, DirectStateArtifact, DurabilityAck, ExternalEffectIntent,
     ExternalEffectRecovery, FilesystemImmutableArtifactStore, FilesystemImmutableIntentStore,
     ImmutableExternalEffectIntentStore, ProjectionBalanceRow, ProjectionWalletRow, RuntimeRequest,
-    RuntimeResponse, SealedEpoch, WriterGrant, EPOCH_ID, POSTGRES_PROJECTION_DDL,
+    RuntimeMeasurementBinding, RuntimeResponse, SealedEpoch, WriterGrant, EPOCH_ID,
+    POSTGRES_PROJECTION_DDL,
 };
 use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
@@ -991,6 +992,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok()
             .and_then(|value| serde_json::from_str(&value).ok())
             .ok_or("production writer grant is required")?;
+        let binding: RuntimeMeasurementBinding = env::var("LAYRS_DIRECT_APPROVED_RUNTIME_BINDING_JSON")
+            .ok()
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .ok_or("approved runtime binding is required")?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_secs())
+            .unwrap_or(0);
+        if !grant.verify(now, &binding) {
+            return Err("production writer grant signature is invalid".into());
+        }
         projection
             .as_ref()
             .ok_or("production projection is required")?

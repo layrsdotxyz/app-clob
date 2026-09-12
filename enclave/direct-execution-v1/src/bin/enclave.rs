@@ -108,10 +108,6 @@ fn verified_writer_grant() -> bool {
     let grant = env::var("LAYRS_DIRECT_WRITER_GRANT_JSON")
         .ok()
         .and_then(|value| serde_json::from_str::<WriterGrant>(&value).ok());
-    let key = env::var("LAYRS_DIRECT_GOVERNANCE_KEY_HEX")
-        .ok()
-        .and_then(|value| hex::decode(value).ok())
-        .filter(|value| value.len() >= 32);
     let binding = env::var("LAYRS_DIRECT_APPROVED_RUNTIME_BINDING_JSON")
         .ok()
         .and_then(|value| serde_json::from_str::<RuntimeMeasurementBinding>(&value).ok());
@@ -119,7 +115,7 @@ fn verified_writer_grant() -> bool {
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_secs())
         .unwrap_or(0);
-    matches!((grant, key, binding), (Some(grant), Some(key), Some(binding)) if grant.verify(&key, now, &binding))
+    matches!((grant, binding), (Some(grant), Some(binding)) if grant.verify(now, &binding))
 }
 
 async fn serve<S>(mut stream: S, state: Arc<Mutex<EnclaveState>>) -> io::Result<()>
