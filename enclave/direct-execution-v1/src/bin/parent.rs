@@ -996,6 +996,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let projection = match env::var("LAYRS_DIRECT_PROJECTION_DATABASE_URL") {
         Ok(url) => Some(Projection::connect(&url, &epoch).await?),
+        // This is restricted to a named isolated-package fixture.  It permits
+        // the parent/enclave/artifact restart test to run without inventing a
+        // second database fixture; production always requires its projection.
+        Err(_) if isolated_test
+            && env::var("LAYRS_DIRECT_ISOLATED_NO_PROJECTION").as_deref() == Ok("true") => None,
         Err(_) if isolated_test => {
             return Err("isolated direct execution requires an isolated projection database".into())
         }
