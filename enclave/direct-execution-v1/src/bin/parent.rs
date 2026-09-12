@@ -71,6 +71,10 @@ const DIRECT_SESSION_KEY_DERIVATION_DOMAIN: &[u8] = b"layrs.direct-session.v1\0"
 const BASE_USDC_ADDRESS: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
 const ERC20_TRANSFER_TOPIC: &str =
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const POOL_WITHDRAW_TOPIC: &str =
+    "0xcbcdbdf10631a43cc99c80acace8232649421c3f4f73919f16013d47c83a687a";
+const USER_OPERATION_EVENT_TOPIC: &str =
+    "0x49628fd1471006c1482da88028e9ce4dbb080b815c9b0344d39e5a8e6ec1419f";
 #[derive(Clone)]
 struct AppState {
     enclave_cid: u32,
@@ -285,6 +289,12 @@ impl PrivyBaseCustodyAdapter {
             .and_then(Value::as_str)
             .filter(|value| valid_transaction_hash(value))
             .map(str::to_owned);
+        let sponsored = record.get("sponsored").and_then(Value::as_bool) == Some(true);
+        let user_operation_hash = record
+            .get("user_operation_hash")
+            .and_then(Value::as_str)
+            .filter(|value| valid_transaction_hash(value))
+            .map(str::to_owned);
         match status {
             "pending" | "broadcasted" => Ok(
                 layrs_direct_execution_v1::ExternalEffectObservation::Pending {
@@ -293,8 +303,14 @@ impl PrivyBaseCustodyAdapter {
             ),
             "confirmed" | "finalized" => match transaction_hash {
                 Some(transaction_hash) => {
-                    self.authoritative_finality(intent, id, transaction_hash)
-                        .await
+                    self.authoritative_finality(
+                        intent,
+                        id,
+                        transaction_hash,
+                        sponsored,
+                        user_operation_hash,
+                    )
+                    .await
                 }
                 None => Ok(
                     layrs_direct_execution_v1::ExternalEffectObservation::Pending {
@@ -304,8 +320,14 @@ impl PrivyBaseCustodyAdapter {
             },
             "execution_reverted" => match transaction_hash {
                 Some(transaction_hash) => {
-                    self.authoritative_finality(intent, id, transaction_hash)
-                        .await
+                    self.authoritative_finality(
+                        intent,
+                        id,
+                        transaction_hash,
+                        sponsored,
+                        user_operation_hash,
+                    )
+                    .await
                 }
                 None => Ok(layrs_direct_execution_v1::ExternalEffectObservation::Conflict),
             },
@@ -417,6 +439,8 @@ impl PrivyBaseCustodyAdapter {
         intent: &ExternalEffectIntent,
         provider_transaction_id: String,
         transaction_hash: String,
+        sponsored: bool,
+        user_operation_hash: Option<String>,
     ) -> Result<layrs_direct_execution_v1::ExternalEffectObservation, String> {
         let transaction = self
             .rpc("eth_getTransactionByHash", json!([transaction_hash]))
@@ -428,26 +452,28 @@ impl PrivyBaseCustodyAdapter {
                 },
             );
         }
-        let expected_data = pool_withdraw_calldata(&intent.destination, &intent.amount_atomic)?;
-        if transaction
-            .get("from")
-            .and_then(Value::as_str)
-            .and_then(|value| canonical_evm_address(value).ok())
-            .as_deref()
-            != Some(self.wallet_address.as_str())
-            || transaction
-                .get("to")
+        if !sponsored {
+            let expected_data = pool_withdraw_calldata(&intent.destination, &intent.amount_atomic)?;
+            if transaction
+                .get("from")
                 .and_then(Value::as_str)
                 .and_then(|value| canonical_evm_address(value).ok())
                 .as_deref()
-                != Some(self.pool_address.as_str())
-            || transaction
-                .get("input")
-                .and_then(Value::as_str)
-                .map(|value| value.eq_ignore_ascii_case(&expected_data))
-                != Some(true)
-        {
-            return Ok(layrs_direct_execution_v1::ExternalEffectObservation::Conflict);
+                != Some(self.wallet_address.as_str())
+                || transaction
+                    .get("to")
+                    .and_then(Value::as_str)
+                    .and_then(|value| canonical_evm_address(value).ok())
+                    .as_deref()
+                    != Some(self.pool_address.as_str())
+                || transaction
+                    .get("input")
+                    .and_then(Value::as_str)
+                    .map(|value| value.eq_ignore_ascii_case(&expected_data))
+                    != Some(true)
+            {
+                return Ok(layrs_direct_execution_v1::ExternalEffectObservation::Conflict);
+            }
         }
         let receipt = self
             .rpc("eth_getTransactionReceipt", json!([transaction_hash]))
@@ -497,12 +523,23 @@ impl PrivyBaseCustodyAdapter {
             return Ok(layrs_direct_execution_v1::ExternalEffectObservation::Conflict);
         }
         match status {
-            "0x1" => Ok(
-                layrs_direct_execution_v1::ExternalEffectObservation::Finalized {
-                    provider_transaction_id,
-                    transaction_hash,
-                },
-            ),
+            "0x1"
+                if !sponsored
+                    || sponsored_withdrawal_receipt_matches(
+                        intent,
+                        &self.wallet_address,
+                        &self.pool_address,
+                        user_operation_hash.as_deref(),
+                        &receipt,
+                    ) =>
+            {
+                Ok(
+                    layrs_direct_execution_v1::ExternalEffectObservation::Finalized {
+                        provider_transaction_id,
+                        transaction_hash,
+                    },
+                )
+            }
             "0x0" => Ok(
                 layrs_direct_execution_v1::ExternalEffectObservation::Reverted {
                     provider_transaction_id,
@@ -686,6 +723,77 @@ fn erc20_transfer_calldata(destination: &str, amount: u128) -> Result<String, St
 
 fn address_topic(address: &str) -> String {
     format!("0x{:0>64}", &address[2..].to_ascii_lowercase())
+}
+
+/// Privy gas sponsorship wraps the authorized pool call in an ERC-4337
+/// transaction, so the outer transaction is sent by the bundler to the Entry
+/// Point rather than directly by the operational wallet to the pool.  Bind
+/// finality to the provider-owned user-operation hash and to the exact
+/// successful inner financial effect instead of weakening the direct-call
+/// checks above.
+fn sponsored_withdrawal_receipt_matches(
+    intent: &ExternalEffectIntent,
+    operational_wallet: &str,
+    pool_address: &str,
+    user_operation_hash: Option<&str>,
+    receipt: &Value,
+) -> bool {
+    let Some(user_operation_hash) = user_operation_hash else {
+        return false;
+    };
+    let Some(logs) = receipt.get("logs").and_then(Value::as_array) else {
+        return false;
+    };
+    let Ok(amount) = intent.amount_atomic.parse::<u128>() else {
+        return false;
+    };
+    let wallet_topic = address_topic(operational_wallet);
+    let pool_topic = address_topic(pool_address);
+    let destination_topic = address_topic(&intent.destination);
+    let mut matching_user_operations = 0usize;
+    let mut matching_transfers = 0usize;
+    let mut matching_withdrawals = 0usize;
+    for log in logs {
+        let address = log
+            .get("address")
+            .and_then(Value::as_str)
+            .and_then(|value| canonical_evm_address(value).ok());
+        let topics = log.get("topics").and_then(Value::as_array);
+        let data = log.get("data").and_then(Value::as_str);
+        let topic = |index: usize| {
+            topics
+                .and_then(|values| values.get(index))
+                .and_then(Value::as_str)
+        };
+        if topic(0).is_some_and(|value| value.eq_ignore_ascii_case(USER_OPERATION_EVENT_TOPIC))
+            && topic(1).is_some_and(|value| value.eq_ignore_ascii_case(user_operation_hash))
+            && topic(2).is_some_and(|value| value.eq_ignore_ascii_case(&wallet_topic))
+            && data
+                .and_then(|value| value.strip_prefix("0x"))
+                .filter(|value| value.len() >= 128)
+                .and_then(|value| u128::from_str_radix(&value[64..128], 16).ok())
+                == Some(1)
+        {
+            matching_user_operations += 1;
+        }
+        if address.as_deref() == Some(BASE_USDC_ADDRESS)
+            && topic(0).is_some_and(|value| value.eq_ignore_ascii_case(ERC20_TRANSFER_TOPIC))
+            && topic(1).is_some_and(|value| value.eq_ignore_ascii_case(&pool_topic))
+            && topic(2).is_some_and(|value| value.eq_ignore_ascii_case(&destination_topic))
+            && data.and_then(parse_quantity) == Some(amount)
+        {
+            matching_transfers += 1;
+        }
+        if address.as_deref() == Some(pool_address)
+            && topic(0).is_some_and(|value| value.eq_ignore_ascii_case(POOL_WITHDRAW_TOPIC))
+            && topic(1).is_some_and(|value| value.eq_ignore_ascii_case(&destination_topic))
+            && topic(2).is_some_and(|value| value.eq_ignore_ascii_case(&wallet_topic))
+            && data.and_then(parse_quantity) == Some(amount)
+        {
+            matching_withdrawals += 1;
+        }
+    }
+    matching_user_operations == 1 && matching_transfers == 1 && matching_withdrawals == 1
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3164,6 +3272,76 @@ mod tests {
             .unwrap(),
             DepositFinality::Reverted
         );
+    }
+
+    #[test]
+    fn sponsored_withdrawal_binds_user_operation_and_exact_financial_logs() {
+        let wallet = "0x2aeba31935ea5f8993cac56af2ac4dee74cfe13d";
+        let pool = "0xb07627b0d646f5c82c8e30975a37650dc272a35f";
+        let destination = "0xb69ac21b8a96234a09ba6c7644f1c2b106fd4a01";
+        let user_operation_hash = format!("0x{}", "11".repeat(32));
+        let amount = 5_000_000u128;
+        let intent = ExternalEffectIntent::create(
+            "a".repeat(64),
+            "sponsored-withdrawal".into(),
+            "b".repeat(64),
+            "c".repeat(64),
+            "identity".into(),
+            "base".into(),
+            "USDC".into(),
+            destination.into(),
+            amount.to_string(),
+            "existing-wallet".into(),
+            pool.into(),
+            "1".into(),
+            "180000".into(),
+            "11000000".into(),
+            "1000000".into(),
+            now_unix(),
+        )
+        .unwrap();
+        let receipt = json!({
+            "logs": [
+                {
+                    "address": "0x0000000071727de22e5e9d8baf0edac6f37da032",
+                    "topics": [USER_OPERATION_EVENT_TOPIC, user_operation_hash, address_topic(wallet)],
+                    "data": format!("0x{:064x}{:064x}{:064x}{:064x}", 7, 1, 0, 129_564),
+                },
+                {
+                    "address": BASE_USDC_ADDRESS,
+                    "topics": [ERC20_TRANSFER_TOPIC, address_topic(pool), address_topic(destination)],
+                    "data": quantity(amount),
+                },
+                {
+                    "address": pool,
+                    "topics": [POOL_WITHDRAW_TOPIC, address_topic(destination), address_topic(wallet)],
+                    "data": quantity(amount),
+                }
+            ]
+        });
+        assert!(sponsored_withdrawal_receipt_matches(
+            &intent,
+            wallet,
+            pool,
+            Some(&user_operation_hash),
+            &receipt,
+        ));
+        assert!(!sponsored_withdrawal_receipt_matches(
+            &intent,
+            wallet,
+            pool,
+            Some(&format!("0x{}", "22".repeat(32))),
+            &receipt,
+        ));
+        let mut wrong_amount = receipt;
+        wrong_amount["logs"][1]["data"] = json!(quantity(amount - 1));
+        assert!(!sponsored_withdrawal_receipt_matches(
+            &intent,
+            wallet,
+            pool,
+            Some(&user_operation_hash),
+            &wrong_amount,
+        ));
     }
 
     #[test]
