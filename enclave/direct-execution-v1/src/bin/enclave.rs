@@ -781,7 +781,10 @@ mod tests {
         let running = state();
         assert!(matches!(
             recover(Arc::clone(&running), Vec::new()).await,
-            RuntimeResponse::RecoveryComplete { recovered_sequence: 0, .. }
+            RuntimeResponse::RecoveryComplete {
+                recovered_sequence: 0,
+                ..
+            }
         ));
         assert!(matches!(
             commit_through_parent_callback(
@@ -794,10 +797,17 @@ mod tests {
         ));
         assert!(matches!(
             recover(Arc::clone(&running), store.load_committed().unwrap()).await,
-            RuntimeResponse::RecoveryComplete { recovered_sequence: 1, .. }
+            RuntimeResponse::RecoveryComplete {
+                recovered_sequence: 1,
+                ..
+            }
         ));
         assert_eq!(
-            running.lock().await.runtime.balance(IDENTITY, "USDC", "USER_AVAILABLE"),
+            running
+                .lock()
+                .await
+                .runtime
+                .balance(IDENTITY, "USDC", "USER_AVAILABLE"),
             4_000_000
         );
         // A parent that cannot present the committed head must not regain a

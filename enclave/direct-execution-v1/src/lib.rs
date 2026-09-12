@@ -20,6 +20,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+mod external_effect;
+pub use external_effect::{
+    reference_for, ExternalEffectIntent, ExternalEffectObservation, ExternalEffectRecovery,
+    FilesystemImmutableIntentStore, ImmutableExternalEffectIntentStore,
+    EXTERNAL_EFFECT_INTENT_PROTOCOL_VERSION, MAX_PROVIDER_IDEMPOTENCY_WINDOW_SECONDS,
+};
+
 pub const EPOCH_ID: &str = "layrs-opening-epoch-20260911-941107537728c98b";
 pub const EPOCH_STATE_SHA256: &str =
     "84835da82210671d87321a21246317d898afd35381c57be8522df1a516dc3590";
@@ -280,10 +287,12 @@ impl RuntimeMeasurementBinding {
             && self.source_commit.len() >= 7
             && [&self.eif_sha256, &self.enclave_sha256, &self.parent_sha256]
                 .iter()
-                .all(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
-            && [&self.pcr0, &self.pcr1, &self.pcr2]
-                .iter()
-                .all(|value| value.len() == 96 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .all(|value| {
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            && [&self.pcr0, &self.pcr1, &self.pcr2].iter().all(|value| {
+                value.len() == 96 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
     }
 }
 
@@ -305,7 +314,12 @@ pub struct WriterGrant {
 }
 
 impl WriterGrant {
-    pub fn verify(&self, governance_key: &[u8], now_unix: u64, binding: &RuntimeMeasurementBinding) -> bool {
+    pub fn verify(
+        &self,
+        governance_key: &[u8],
+        now_unix: u64,
+        binding: &RuntimeMeasurementBinding,
+    ) -> bool {
         if self.activation_id.is_empty()
             || self.epoch_id != EPOCH_ID
             || self.runtime != TRANSACTION_MODEL
@@ -352,6 +366,13 @@ pub enum DirectAction {
         order_id: String,
     },
     ReserveWithdrawal {
+        destination: String,
+        amount_atomic: String,
+        custody_reference: String,
+    },
+    /// A terminal external revert is recorded once in the same immutable
+    /// lineage, with no balance movement.  It is not a retriable custody job.
+    RecordWithdrawalReverted {
         destination: String,
         amount_atomic: String,
         custody_reference: String,
@@ -812,7 +833,7 @@ impl DirectRuntime {
                 } => {
                     let value = amount(amount_atomic)?;
                     let destination = destination.to_ascii_lowercase();
-                    if custody_reference.is_empty()
+                    if !valid_withdrawal_custody_reference(custody_reference, self.mode)
                         || !self
                             .subject_wallets
                             .get(&request.account_id)
@@ -834,6 +855,27 @@ impl DirectRuntime {
                     )?;
                     (
                         "WITHDRAWAL_SETTLED".into(),
+                        Some(amount_atomic.clone()),
+                        Some(custody_reference.clone()),
+                    )
+                }
+                DirectAction::RecordWithdrawalReverted {
+                    destination,
+                    amount_atomic,
+                    custody_reference,
+                } => {
+                    let _ = amount(amount_atomic)?;
+                    let destination = destination.to_ascii_lowercase();
+                    if !valid_withdrawal_custody_reference(custody_reference, self.mode)
+                        || !self
+                            .subject_wallets
+                            .get(&request.account_id)
+                            .is_some_and(|wallets| wallets.contains(&destination))
+                    {
+                        return Err(RuntimeError::DestinationDenied);
+                    }
+                    (
+                        "WITHDRAWAL_REVERTED".into(),
                         Some(amount_atomic.clone()),
                         Some(custody_reference.clone()),
                     )
@@ -864,6 +906,11 @@ impl DirectRuntime {
                     ("TRANSFER_SETTLED".into(), Some(amount_atomic.clone()), None)
                 }
             };
+        let terminal_status = if effect == "WITHDRAWAL_REVERTED" {
+            TerminalStatus::RejectedEffectNone
+        } else {
+            TerminalStatus::Applied
+        };
         let mut receipt = DirectReceipt {
             receipt_id: sha256(
                 format!("{}:{}:{}", EPOCH_ID, request.account_id, request.request_id).as_bytes(),
@@ -872,7 +919,7 @@ impl DirectRuntime {
             identity_commitment: request.identity_commitment.clone(),
             request_id: request.request_id.clone(),
             request_hash: request.request_hash.clone(),
-            status: TerminalStatus::Applied,
+            status: terminal_status.clone(),
             effect: effect.clone(),
             amount_atomic,
             custody_reference,
@@ -881,7 +928,7 @@ impl DirectRuntime {
         };
         receipt.signature = receipt_signature(&self.receipt_key, &receipt);
         let result = DirectResult {
-            status: TerminalStatus::Applied,
+            status: terminal_status,
             effect,
             genesis_ordinal: 0,
             receipt,
@@ -1237,15 +1284,85 @@ pub fn runtime_binding(identity_count: usize, writer_enabled: bool) -> RuntimeBi
     }
 }
 pub fn request_hash(request: &DirectRequest) -> String {
-    sha256(
-        &serde_json::to_vec(&(
-            request.account_id.as_str(),
-            request.identity_commitment.as_str(),
-            request.request_id.as_str(),
-            &request.action,
-        ))
-        .expect("serializable direct request"),
-    )
+    // A final transaction hash is an externally observed result, not customer
+    // intent.  For an immutable external-effect intent the request binds the
+    // stable provider reference, while the receipt/artifact still records the
+    // exact resulting hash.  This makes startup recovery able to rebuild the
+    // same direct request without mutating or extending the intent artifact.
+    match &request.action {
+        DirectAction::ReserveWithdrawal {
+            destination,
+            amount_atomic,
+            custody_reference,
+        } if custody_reference.starts_with("lei-") => {
+            let reference = custody_reference
+                .split_once(':')
+                .map(|(reference, _)| reference)
+                .unwrap_or(custody_reference);
+            sha256(
+                &serde_json::to_vec(&(
+                    request.account_id.as_str(),
+                    request.identity_commitment.as_str(),
+                    request.request_id.as_str(),
+                    "RESERVE_WITHDRAWAL",
+                    destination.to_ascii_lowercase(),
+                    amount_atomic,
+                    reference,
+                ))
+                .expect("serializable direct withdrawal request"),
+            )
+        }
+        DirectAction::RecordWithdrawalReverted {
+            destination,
+            amount_atomic,
+            custody_reference,
+        } if custody_reference.starts_with("lei-") => {
+            let reference = custody_reference
+                .split_once(':')
+                .map(|(reference, _)| reference)
+                .unwrap_or(custody_reference);
+            sha256(
+                &serde_json::to_vec(&(
+                    request.account_id.as_str(),
+                    request.identity_commitment.as_str(),
+                    request.request_id.as_str(),
+                    "RESERVE_WITHDRAWAL",
+                    destination.to_ascii_lowercase(),
+                    amount_atomic,
+                    reference,
+                ))
+                .expect("serializable reverted direct withdrawal request"),
+            )
+        }
+        _ => sha256(
+            &serde_json::to_vec(&(
+                request.account_id.as_str(),
+                request.identity_commitment.as_str(),
+                request.request_id.as_str(),
+                &request.action,
+            ))
+            .expect("serializable direct request"),
+        ),
+    }
+}
+
+fn valid_withdrawal_custody_reference(reference: &str, mode: RuntimeMode) -> bool {
+    if mode == RuntimeMode::IsolatedTest
+        && (reference.starts_with("mock-") || reference.starts_with("isolated-"))
+    {
+        return true;
+    }
+    let Some((intent, transaction_hash)) = reference.split_once(':') else {
+        return false;
+    };
+    intent.len() == 64
+        && intent.starts_with("lei-")
+        && intent[4..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        && transaction_hash.len() == 66
+        && transaction_hash.starts_with("0x")
+        && transaction_hash[2..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
 }
 pub fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
@@ -1455,8 +1572,12 @@ mod tests {
         let binding = RuntimeMeasurementBinding {
             ami_id: "ami-0123456789abcdef0".into(),
             eif_sha256: "b".repeat(64),
-            pcr0: "c".repeat(96), pcr1: "d".repeat(96), pcr2: "e".repeat(96),
-            source_commit: "92e9918".into(), enclave_sha256: "f".repeat(64), parent_sha256: "a".repeat(64),
+            pcr0: "c".repeat(96),
+            pcr1: "d".repeat(96),
+            pcr2: "e".repeat(96),
+            source_commit: "92e9918".into(),
+            enclave_sha256: "f".repeat(64),
+            parent_sha256: "a".repeat(64),
         };
         let mut grant = WriterGrant {
             activation_id: "step6-review-id".into(),
