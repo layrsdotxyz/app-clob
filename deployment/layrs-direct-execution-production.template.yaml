@@ -19,6 +19,7 @@ Parameters:
   # CloudFormation, EC2 user data, instance tags, or logs.
   RuntimeSecretArn: { Type: String }
   DatabaseSecretArn: { Type: String }
+  DatabaseSecretKmsKeyArn: { Type: String }
   DatabaseCaSecretArn: { Type: String }
   DatabaseHost: { Type: String }
   DatabaseName: { Type: String, Default: layrsv2 }
@@ -51,6 +52,9 @@ Resources:
               - Effect: Allow
                 Action: [kms:Encrypt, kms:Decrypt, kms:GenerateDataKey, kms:DescribeKey]
                 Resource: !Ref ArchiveKmsKeyArn
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:DescribeKey]
+                Resource: !Ref DatabaseSecretKmsKeyArn
               # The read-only runtime may retrieve only its existing Privy
               # application configuration.  It cannot list,
               # create, update, rotate, or delete Secrets Manager objects.
