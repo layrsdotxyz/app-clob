@@ -84,6 +84,16 @@ Resources:
                     kms:EncryptionContext:layrs-runtime: layrs.direct-execution.v1
                     kms:EncryptionContext:layrs-epoch: layrs-opening-epoch-20260911-941107537728c98b
                     kms:EncryptionContext:layrs-writer-grant: !Ref WriterGrantCommitment
+              # A measured-runtime upgrade may rewrap the exact prior root-key
+              # ciphertext under the newly signed grant context. KMS performs
+              # this entirely inside the service; the parent cannot receive
+              # plaintext, change keys, or re-encrypt to another CMK.
+              - Effect: Allow
+                Action: [kms:ReEncryptFrom, kms:ReEncryptTo]
+                Resource: !Ref OperationalIdentityKmsKeyArn
+                Condition:
+                  Bool:
+                    kms:ReEncryptOnSameKey: 'true'
               - Effect: Allow
                 Action: [kms:DescribeKey]
                 Resource: !Ref OperationalIdentityKmsKeyArn

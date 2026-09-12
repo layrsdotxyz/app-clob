@@ -877,6 +877,7 @@ mod tests {
             runtime_measurement: binding.clone(),
             old_writer_fence_evidence_sha256: "1".repeat(64),
             key_release_kms_key_id: "arn:aws:kms:us-east-1:111122223333:key/direct-runtime".into(),
+            key_release_predecessor: None,
             expires_at_unix: 2_000,
             governance_key_id: layrs_direct_execution_v1::GOVERNANCE_KEY_ID.into(),
             signing_algorithm: layrs_direct_execution_v1::GOVERNANCE_SIGNING_ALGORITHM.into(),

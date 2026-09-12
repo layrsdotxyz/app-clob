@@ -346,6 +346,26 @@ impl RuntimeMeasurementBinding {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct KeyReleasePredecessor {
+    pub activation_id: String,
+    pub artifact_sha256: String,
+    pub writer_grant_commitment: String,
+}
+
+impl KeyReleasePredecessor {
+    fn valid(&self, current_activation_id: &str) -> bool {
+        !self.activation_id.is_empty()
+            && self.activation_id != current_activation_id
+            && [&self.artifact_sha256, &self.writer_grant_commitment]
+                .iter()
+                .all(|value| {
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct WriterGrant {
     pub activation_id: String,
     /// Signed deployment scope. A production grant cannot be replayed into an
@@ -366,6 +386,12 @@ pub struct WriterGrant {
     /// Existing KMS CMK that may release the enclave-only runtime root key.
     /// This is a reference, never key material.
     pub key_release_kms_key_id: String,
+    /// A signed, exact pointer to the immutable prior key-release artifact.
+    /// When present, KMS re-encrypts that same root key under this grant's
+    /// context without exposing plaintext to the parent. This is runtime-key
+    /// continuity, not a financial command or ledger state transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_release_predecessor: Option<KeyReleasePredecessor>,
     pub expires_at_unix: u64,
     /// KMS key alias and algorithm are signed fields, not deployment inputs.
     pub governance_key_id: String,
@@ -408,6 +434,10 @@ impl WriterGrant {
             || self.old_writer_fence_evidence_sha256.len() != 64
             || self.key_release_kms_key_id.is_empty()
             || self.key_release_kms_key_id.len() > 2_048
+            || self
+                .key_release_predecessor
+                .as_ref()
+                .is_some_and(|predecessor| !predecessor.valid(&self.activation_id))
             || self.expires_at_unix <= now_unix
             || self.governance_key_id != GOVERNANCE_KEY_ID
             || self.signing_algorithm != GOVERNANCE_SIGNING_ALGORITHM
@@ -496,6 +526,37 @@ impl GovernedKeyReleaseArtifact {
 
     pub fn artifact_hash(&self) -> String {
         sha256(&serde_cbor::to_vec(self).unwrap_or_default())
+    }
+
+    pub fn verify_as_predecessor(
+        &self,
+        predecessor: &KeyReleasePredecessor,
+        kms_key_id: &str,
+    ) -> bool {
+        predecessor.valid("")
+            && self.protocol == "layrs.direct-execution.key-release.v1"
+            && self.activation_id == predecessor.activation_id
+            && self.writer_grant_commitment == predecessor.writer_grant_commitment
+            && self.artifact_hash() == predecessor.artifact_sha256
+            && self.runtime_measurement.valid()
+            && self.kms_key_id == kms_key_id
+            && !self.ciphertext_blob.is_empty()
+            && self.ciphertext_blob.len() <= 65_536
+            && self
+                .encryption_context
+                .get("layrs-runtime")
+                .map(String::as_str)
+                == Some(TRANSACTION_MODEL)
+            && self
+                .encryption_context
+                .get("layrs-epoch")
+                .map(String::as_str)
+                == Some(EPOCH_ID)
+            && self
+                .encryption_context
+                .get("layrs-writer-grant")
+                .map(String::as_str)
+                == Some(predecessor.writer_grant_commitment.as_str())
     }
 }
 
@@ -3253,6 +3314,7 @@ mod tests {
             runtime_measurement: binding.clone(),
             old_writer_fence_evidence_sha256: "a".repeat(64),
             key_release_kms_key_id: "arn:aws:kms:us-east-1:111122223333:key/example".into(),
+            key_release_predecessor: None,
             expires_at_unix: 200,
             governance_key_id: GOVERNANCE_KEY_ID.into(),
             signing_algorithm: GOVERNANCE_SIGNING_ALGORITHM.into(),
@@ -3309,6 +3371,7 @@ mod tests {
             runtime_measurement: binding.clone(),
             old_writer_fence_evidence_sha256: "1".repeat(64),
             key_release_kms_key_id: "arn:aws:kms:us-east-1:1:key/test".into(),
+            key_release_predecessor: None,
             expires_at_unix: 200,
             governance_key_id: GOVERNANCE_KEY_ID.into(),
             signing_algorithm: GOVERNANCE_SIGNING_ALGORITHM.into(),
@@ -3330,6 +3393,15 @@ mod tests {
             ciphertext_blob: vec![7; 64],
         };
         assert!(artifact.verify_for(&grant, &binding, &grant.key_release_kms_key_id));
+        let predecessor = KeyReleasePredecessor {
+            activation_id: artifact.activation_id.clone(),
+            artifact_sha256: artifact.artifact_hash(),
+            writer_grant_commitment: artifact.writer_grant_commitment.clone(),
+        };
+        assert!(artifact.verify_as_predecessor(&predecessor, &grant.key_release_kms_key_id));
+        let mut wrong_predecessor = predecessor;
+        wrong_predecessor.artifact_sha256 = "0".repeat(64);
+        assert!(!artifact.verify_as_predecessor(&wrong_predecessor, &grant.key_release_kms_key_id));
         let mut conflict = artifact.clone();
         conflict.runtime_measurement.pcr0 = "9".repeat(96);
         assert!(!conflict.verify_for(&grant, &binding, &grant.key_release_kms_key_id));

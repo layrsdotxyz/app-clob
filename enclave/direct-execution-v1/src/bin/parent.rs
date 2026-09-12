@@ -2775,28 +2775,85 @@ async fn bootstrap_governed_enclave(state: &AppState) -> io::Result<()> {
             (artifact, ciphertext)
         }
         None => {
-            let output = kms
-                .generate_data_key()
-                .key_id(&config.kms_key_id)
-                .key_spec(DataKeySpec::Aes256)
-                .set_encryption_context(Some(encryption_context_map.clone()))
-                .recipient(recipient)
-                .send()
-                .await
-                .map_err(|_| invalid("KMS_ATTESTED_DATA_KEY_FAILED"))?;
-            if output.plaintext().is_some() {
-                return Err(invalid("KMS_RETURNED_PARENT_PLAINTEXT"));
-            }
-            let ciphertext_blob = output
-                .ciphertext_blob()
-                .ok_or_else(|| invalid("KMS_CIPHERTEXT_BLOB_MISSING"))?
-                .as_ref()
-                .to_vec();
-            let ciphertext_for_recipient = output
-                .ciphertext_for_recipient()
-                .ok_or_else(|| invalid("KMS_RECIPIENT_CIPHERTEXT_MISSING"))?
-                .as_ref()
-                .to_vec();
+            let (ciphertext_blob, ciphertext_for_recipient) = if let Some(predecessor) =
+                &config.grant.key_release_predecessor
+            {
+                let predecessor_artifact = store
+                    .load_key_release(&predecessor.activation_id)
+                    .await
+                    .map_err(invalid)?
+                    .ok_or_else(|| invalid("KEY_RELEASE_PREDECESSOR_MISSING"))?;
+                if !predecessor_artifact.verify_as_predecessor(predecessor, &config.kms_key_id) {
+                    return Err(invalid("KEY_RELEASE_PREDECESSOR_INVALID"));
+                }
+                let source_context: std::collections::HashMap<String, String> =
+                    predecessor_artifact
+                        .encryption_context
+                        .clone()
+                        .into_iter()
+                        .collect();
+                // KMS changes only the authenticated encryption context of
+                // the same enclave root key. The parent receives no
+                // plaintext and the signed grant binds the exact immutable
+                // predecessor artifact and commitment.
+                let reencrypted = kms
+                    .re_encrypt()
+                    .ciphertext_blob(KmsBlob::new(predecessor_artifact.ciphertext_blob.clone()))
+                    .source_key_id(&config.kms_key_id)
+                    .destination_key_id(&config.kms_key_id)
+                    .set_source_encryption_context(Some(source_context))
+                    .set_destination_encryption_context(Some(encryption_context_map.clone()))
+                    .send()
+                    .await
+                    .map_err(|_| invalid("KMS_KEY_CONTINUITY_REENCRYPT_FAILED"))?;
+                let ciphertext_blob = reencrypted
+                    .ciphertext_blob()
+                    .ok_or_else(|| invalid("KMS_REENCRYPTED_BLOB_MISSING"))?
+                    .as_ref()
+                    .to_vec();
+                let released = kms
+                    .decrypt()
+                    .key_id(&config.kms_key_id)
+                    .ciphertext_blob(KmsBlob::new(ciphertext_blob.clone()))
+                    .set_encryption_context(Some(encryption_context_map.clone()))
+                    .recipient(recipient)
+                    .send()
+                    .await
+                    .map_err(|_| invalid("KMS_ATTESTED_KEY_RELEASE_FAILED"))?;
+                if released.plaintext().is_some() {
+                    return Err(invalid("KMS_RETURNED_PARENT_PLAINTEXT"));
+                }
+                let ciphertext_for_recipient = released
+                    .ciphertext_for_recipient()
+                    .ok_or_else(|| invalid("KMS_RECIPIENT_CIPHERTEXT_MISSING"))?
+                    .as_ref()
+                    .to_vec();
+                (ciphertext_blob, ciphertext_for_recipient)
+            } else {
+                let output = kms
+                    .generate_data_key()
+                    .key_id(&config.kms_key_id)
+                    .key_spec(DataKeySpec::Aes256)
+                    .set_encryption_context(Some(encryption_context_map.clone()))
+                    .recipient(recipient)
+                    .send()
+                    .await
+                    .map_err(|_| invalid("KMS_ATTESTED_DATA_KEY_FAILED"))?;
+                if output.plaintext().is_some() {
+                    return Err(invalid("KMS_RETURNED_PARENT_PLAINTEXT"));
+                }
+                let ciphertext_blob = output
+                    .ciphertext_blob()
+                    .ok_or_else(|| invalid("KMS_CIPHERTEXT_BLOB_MISSING"))?
+                    .as_ref()
+                    .to_vec();
+                let ciphertext_for_recipient = output
+                    .ciphertext_for_recipient()
+                    .ok_or_else(|| invalid("KMS_RECIPIENT_CIPHERTEXT_MISSING"))?
+                    .as_ref()
+                    .to_vec();
+                (ciphertext_blob, ciphertext_for_recipient)
+            };
             let artifact = GovernedKeyReleaseArtifact {
                 protocol: "layrs.direct-execution.key-release.v1".into(),
                 activation_id: config.grant.activation_id.clone(),
