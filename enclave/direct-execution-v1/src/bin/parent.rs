@@ -21,6 +21,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
     ChaCha20Poly1305, Key, Nonce,
 };
+use hmac::{Hmac, Mac};
 use layrs_direct_execution_v1::{
     artifact_hash, reference_for, request_hash, sha256, sign, DirectAction, DirectReceipt,
     DirectRequest, DirectResult, DirectStateArtifact, DurabilityAck, ExternalEffectIntent,
@@ -37,6 +38,7 @@ use reqwest::header::{HeaderMap as ReqwestHeaderMap, HeaderValue, ACCEPT};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha3::{Digest as KeccakDigest, Keccak256};
+use sha2::Sha256;
 use std::{
     collections::{BTreeMap, HashSet},
     env, io,
@@ -55,6 +57,7 @@ use tokio_vsock::{VsockAddr, VsockStream};
 const ENCLOSURE_PORT: u32 = 5_003;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const SESSION_AUDIENCE: &str = "layrs.direct-execution.v1";
+const DIRECT_SESSION_KEY_DERIVATION_DOMAIN: &[u8] = b"layrs.direct-session.v1\0";
 #[derive(Clone)]
 struct AppState {
     enclave_cid: u32,
@@ -971,6 +974,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|value| hex::decode(value).ok())
         .filter(|key| key.len() >= 32)
+        .or_else(|| {
+            // The direct BFF and parent already require the existing Privy app
+            // secret.  A domain-separated derivation avoids minting or
+            // repurposing another operational key, and binds assertions to
+            // this runtime's fixed opening epoch.  The parent never receives
+            // raw Privy JWTs.
+            env::var("LAYRSV2_PRIVY_APP_SECRET")
+                .ok()
+                .filter(|secret| secret.len() >= 32)
+                .map(|secret| derive_direct_session_key(secret.as_bytes()))
+        })
         // A dormant image can answer health, status, and attestation without a
         // session secret. Customer routes fail closed until an isolated test or
         // later governed activation injects the BFF verification key.
@@ -1053,6 +1067,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn derive_direct_session_key(privy_app_secret: &[u8]) -> Vec<u8> {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(privy_app_secret)
+        .expect("HMAC accepts arbitrary key material");
+    mac.update(DIRECT_SESSION_KEY_DERIVATION_DOMAIN);
+    mac.update(EPOCH_ID.as_bytes());
+    mac.update(&[0]);
+    mac.update(layrs_direct_execution_v1::EPOCH_STATE_SHA256.as_bytes());
+    mac.finalize().into_bytes().to_vec()
 }
 async fn attestation(
     State(state): State<AppState>,
@@ -1981,6 +2005,19 @@ async fn write_frame(stream: &mut VsockStream, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn privy_session_derivation_is_epoch_bound_and_deterministic() {
+        let secret = b"p".repeat(32);
+        let first = derive_direct_session_key(&secret);
+        let second = derive_direct_session_key(&secret);
+        assert_eq!(first, second);
+        assert_eq!(
+            hex::encode(&first),
+            "4fe34632da8b4234bc67e743148300263046ab646abc3cd1e49a3c8c6ad6abd9"
+        );
+        assert_eq!(first.len(), 32);
+        assert_ne!(first, secret);
+    }
     #[test]
     fn signed_session_rejects_tampering() {
         let key = vec![9; 32];
