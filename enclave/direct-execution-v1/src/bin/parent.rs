@@ -35,6 +35,7 @@ use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
     pkcs8::DecodePrivateKey,
 };
+use postgres_native_tls::MakeTlsConnector;
 use reqwest::header::{HeaderMap as ReqwestHeaderMap, HeaderValue, ACCEPT};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1008,7 +1009,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dormant = matches!(execution_mode.as_deref(), None | Some("dormant"));
     let financial_enabled = execution_mode.as_deref() == Some("production-enabled");
     let projection = match env::var("LAYRS_DIRECT_PROJECTION_DATABASE_URL") {
-        Ok(url) => Some(Projection::connect(&url, &epoch).await?),
+        Ok(url) => Some(Projection::connect(&url, &epoch, isolated_test).await?),
         // This is restricted to a named isolated-package fixture.  It permits
         // the parent/enclave/artifact restart test to run without inventing a
         // second database fixture; production always requires its projection.
@@ -1696,11 +1697,31 @@ enum ProjectionError {
 }
 
 impl Projection {
-    async fn connect(url: &str, epoch: &SealedEpoch) -> Result<Self, Box<dyn std::error::Error>> {
-        let (client, connection) = tokio_postgres::connect(url, NoTls).await?;
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
+    async fn connect(
+        url: &str,
+        epoch: &SealedEpoch,
+        isolated_test: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let client = if isolated_test {
+            let (client, connection) = tokio_postgres::connect(url, NoTls).await?;
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+        } else {
+            let ca_pem = env::var("LAYRS_DIRECT_PROJECTION_DATABASE_CA_PEM")
+                .map_err(|_| "production projection CA is required")?;
+            let certificate = native_tls::Certificate::from_pem(ca_pem.as_bytes())?;
+            let connector = native_tls::TlsConnector::builder()
+                .add_root_certificate(certificate)
+                .build()?;
+            let connector = MakeTlsConnector::new(connector);
+            let (client, connection) = tokio_postgres::connect(url, connector).await?;
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+        };
         let projection = Self {
             client: Arc::new(client),
         };

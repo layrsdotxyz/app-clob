@@ -3395,7 +3395,9 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "layrs-clob-service",
+ "native-tls",
  "p256",
+ "postgres-native-tls",
  "reqwest 0.12.28",
  "serde",
  "serde_cbor",
@@ -4255,6 +4257,18 @@ dependencies = [
  "cpufeatures 0.2.17",
  "opaque-debug",
  "universal-hash",
+]
+
+[[package]]
+name = "postgres-native-tls"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fef4de47bb81477e0c3deaf153a1b10ae176484713ff1640969f4cb96b653ebc"
+dependencies = [
+ "native-tls",
+ "tokio",
+ "tokio-native-tls",
+ "tokio-postgres",
 ]
 
 [[package]]
