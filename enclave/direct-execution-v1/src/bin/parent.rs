@@ -1729,14 +1729,58 @@ impl Projection {
         let projection = Self {
             client: Arc::new(client),
         };
-        projection
-            .client
-            .batch_execute(POSTGRES_PROJECTION_DDL)
-            .await?;
+        if isolated_test {
+            projection
+                .client
+                .batch_execute(POSTGRES_PROJECTION_DDL)
+                .await?;
+        } else {
+            // Production schema changes are applied once through the existing
+            // migration principal. The long-running runtime receives only the
+            // established projection-writer duty and fails closed if that
+            // migration or its least-privilege grants are absent.
+            if let Err(error) = projection.verify_schema_and_privileges().await {
+                return Err(format!("projection schema verification failed: {error:?}").into());
+            }
+        }
         if let Err(error) = projection.import_opening(epoch).await {
             return Err(format!("opening projection import failed: {error:?}").into());
         }
         Ok(projection)
+    }
+
+    async fn verify_schema_and_privileges(&self) -> Result<(), ProjectionError> {
+        let tables = [
+            ("direct_execution_receipts", "SELECT,INSERT"),
+            ("direct_execution_epoch_balances", "SELECT,INSERT,UPDATE"),
+            ("direct_execution_identities", "SELECT,INSERT"),
+            ("direct_execution_privy_wallets", "SELECT,INSERT"),
+            ("direct_execution_identity_admissions", "SELECT,INSERT"),
+            ("direct_execution_sessions", "SELECT,INSERT"),
+            ("direct_execution_custody_events", "SELECT,INSERT"),
+            ("direct_execution_accounting_events", "SELECT,INSERT"),
+            ("direct_execution_order_events", "SELECT,INSERT"),
+            ("direct_execution_trade_events", "SELECT,INSERT"),
+            ("direct_execution_writer_fence", "SELECT"),
+            ("direct_execution_writer_grants", "SELECT"),
+        ];
+        for (table, privileges) in tables {
+            let qualified = format!("layrsv2.{table}");
+            let row = self
+                .client
+                .query_one(
+                    "SELECT to_regclass($1)::text, has_table_privilege(current_user,$1,$2)",
+                    &[&qualified, &privileges],
+                )
+                .await
+                .map_err(|_| ProjectionError::Database)?;
+            let relation: Option<String> = row.get(0);
+            let allowed: bool = row.get(1);
+            if relation.is_none() || !allowed {
+                return Err(ProjectionError::OpeningMismatch);
+            }
+        }
+        Ok(())
     }
 
     async fn import_opening(&self, epoch: &SealedEpoch) -> Result<(), ProjectionError> {

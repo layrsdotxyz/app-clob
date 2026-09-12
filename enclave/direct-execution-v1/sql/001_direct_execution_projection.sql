@@ -1,6 +1,7 @@
 -- Auditable projection for the clean runtime. Balance rows contain the latest
 -- signed receipt-derived read model but are never used to restore private state.
 BEGIN;
+SET LOCAL search_path TO layrsv2, pg_catalog;
 
 CREATE TABLE IF NOT EXISTS direct_execution_receipts (
     receipt_id TEXT PRIMARY KEY,
@@ -148,5 +149,39 @@ CREATE TABLE IF NOT EXISTS direct_execution_writer_grants (
     applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (epoch_id, old_writer_fence_evidence_sha256)
 );
+
+-- Reuse the established database duties. The direct runtime uses the fenced
+-- worker principal only to publish signed projection rows; the API and audit
+-- principals remain read-only. None of these grants make PostgreSQL private
+-- financial-state authority.
+GRANT SELECT, INSERT ON
+    direct_execution_receipts,
+    direct_execution_identities,
+    direct_execution_privy_wallets,
+    direct_execution_identity_admissions,
+    direct_execution_sessions,
+    direct_execution_custody_events,
+    direct_execution_accounting_events,
+    direct_execution_order_events,
+    direct_execution_trade_events
+TO layrsv2_worker_role;
+GRANT SELECT, INSERT, UPDATE ON direct_execution_epoch_balances
+TO layrsv2_worker_role;
+GRANT SELECT ON
+    direct_execution_receipts,
+    direct_execution_epoch_balances,
+    direct_execution_identities,
+    direct_execution_privy_wallets,
+    direct_execution_identity_admissions,
+    direct_execution_sessions,
+    direct_execution_custody_events,
+    direct_execution_accounting_events,
+    direct_execution_order_events,
+    direct_execution_trade_events,
+    direct_execution_writer_fence,
+    direct_execution_writer_grants
+TO layrsv2_api_role, layrsv2_auditor_role, layrsv2_operator;
+GRANT SELECT ON direct_execution_writer_fence, direct_execution_writer_grants
+TO layrsv2_worker_role;
 
 COMMIT;
