@@ -19,7 +19,11 @@ use tokio::{
 use tokio_vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
 
 const PORT: u32 = 5_003;
-const MAX_FRAME_BYTES: usize = 1024 * 1024;
+// Startup recovery carries the verified immutable lineage in one parent-only
+// VSOCK frame. The opening epoch plus several encrypted successors already
+// exceeds 1 MiB; keep a finite 64 MiB ceiling so valid recovery remains
+// possible without turning bootstrap transport into a persisted workflow.
+const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 struct EnclaveState {
     nsm_fd: i32,
@@ -27,7 +31,6 @@ struct EnclaveState {
     epoch: SealedEpoch,
     mode: RuntimeMode,
     receipt_key: Vec<u8>,
-    identity_count: usize,
     state_key: Vec<u8>,
     commit_ack_key: Vec<u8>,
     recovery_complete: bool,
@@ -47,7 +50,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::var("LAYRS_OPENING_EPOCH_PATH")?,
         env::var("LAYRS_OPENING_EVIDENCE_PATH")?,
     )?;
-    let identity_count = epoch.identity_count();
     let nsm_fd = nsm_init();
     if nsm_fd < 0 {
         return Err("Nitro Secure Module is unavailable".into());
@@ -57,6 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             RuntimeMode::IsolatedTest
         }
         Ok("dormant") | Err(_) => RuntimeMode::Dormant,
+        Ok("admission-enabled") if verified_writer_grant() => RuntimeMode::AdmissionOnly,
         Ok("production-enabled") if verified_writer_grant() => RuntimeMode::ProductionEnabled,
         // An arbitrary deployment flag cannot create a writer. Step 6 requires
         // a separately signed and unexpired old-writer-fence grant.
@@ -74,7 +77,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         epoch,
         mode,
         receipt_key,
-        identity_count,
         state_key,
         commit_ack_key,
         recovery_complete: false,
@@ -130,8 +132,9 @@ where
             let state = state.lock().await;
             RuntimeResponse::Status {
                 status: runtime_binding(
-                    state.identity_count,
+                    state.runtime.identity_count(),
                     state.recovery_complete && state.runtime.writer_enabled(),
+                    state.recovery_complete && state.runtime.admission_enabled(),
                 ),
             }
         }
@@ -379,7 +382,11 @@ async fn attest(state: &Arc<Mutex<EnclaveState>>, nonce: Vec<u8>) -> RuntimeResp
         };
     }
     let state = state.lock().await;
-    let binding = runtime_binding(state.identity_count, state.runtime.writer_enabled());
+    let binding = runtime_binding(
+        state.runtime.identity_count(),
+        state.runtime.writer_enabled(),
+        state.runtime.admission_enabled(),
+    );
     let user_data = match serde_json::to_vec(&binding) {
         Ok(value) => value,
         Err(_) => {
@@ -436,8 +443,10 @@ where
 mod tests {
     use super::*;
     use layrs_direct_execution_v1::{
-        artifact_hash, request_hash, DirectAction, DirectRequest, DurabilityAck,
-        FilesystemImmutableArtifactStore,
+        artifact_hash, identity_commitment_for, request_hash, DirectAction, DirectRequest,
+        DurabilityAck, FeeProfileId, FilesystemImmutableArtifactStore, GovernedMarketRegistration,
+        MarketConfig, MarketExecution, OrderAction, Outcome, TimeInForce, EPOCH_ID,
+        TRANSACTION_MODEL,
     };
     use std::{
         path::PathBuf,
@@ -452,19 +461,69 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../../.codex-review-bundles/unified-direct-execution-20260905/new-epoch-20260911/OPENING_EPOCH_STATE_20260911.json")
     }
     fn request(id: &str) -> DirectRequest {
-        let mut request = DirectRequest {
-            account_id: SUBJECT.into(),
-            identity_commitment: IDENTITY.into(),
-            request_id: id.into(),
-            request_hash: String::new(),
-            action: DirectAction::ReserveWithdrawal {
+        request_for(
+            SUBJECT,
+            IDENTITY,
+            id,
+            DirectAction::ReserveWithdrawal {
                 destination: "0xCCB96357dEB4cbF0808208d55916774f0B51a908".into(),
                 amount_atomic: "1000000".into(),
                 custody_reference: "isolated-vsock-custody-finality".into(),
             },
+        )
+    }
+    fn request_for(
+        account_id: &str,
+        identity_commitment: &str,
+        id: &str,
+        action: DirectAction,
+    ) -> DirectRequest {
+        let mut request = DirectRequest {
+            account_id: account_id.into(),
+            identity_commitment: identity_commitment.into(),
+            request_id: id.into(),
+            request_hash: String::new(),
+            action,
         };
         request.request_hash = request_hash(&request);
         request
+    }
+    fn market_registration(id: &str, market_id: &str) -> DirectRequest {
+        request_for(
+            "governance",
+            "governance",
+            id,
+            DirectAction::RegisterMarket {
+                registration: GovernedMarketRegistration {
+                    registration_id: id.into(),
+                    epoch_id: EPOCH_ID.into(),
+                    runtime: TRANSACTION_MODEL.into(),
+                    market: MarketConfig {
+                        market_id: market_id.into(),
+                        settlement_asset: "USDC".into(),
+                        settlement_decimals: 6,
+                        public_settlement_chain: Some("horizen".into()),
+                        opens_at_millis: 1,
+                        closes_at_millis: 10_000_000,
+                        minimum_quantity_micros: 1,
+                        maximum_quantity_micros: 10_000_000,
+                        minimum_order_notional_micros: 1,
+                        maximum_order_notional_micros: 10_000_000,
+                        maximum_user_position_micros: 20_000_000,
+                        maximum_pending_bootstrap_notional_micros: 10_000_000,
+                        tick_size_micros: 100,
+                        oracle_feed_id: 9002,
+                        fee_profile_id: FeeProfileId::LayrsCryptoV2,
+                        execution: MarketExecution::NativeClob,
+                    },
+                    expires_at_unix: 9_000,
+                    governance_key_id: "isolated".into(),
+                    signing_algorithm: "isolated".into(),
+                    signature: "isolated-market-release".into(),
+                },
+                now_unix: 1,
+            },
+        )
     }
     fn state() -> Arc<Mutex<EnclaveState>> {
         let epoch = SealedEpoch::load(epoch_path()).unwrap();
@@ -476,7 +535,6 @@ mod tests {
             epoch,
             mode,
             receipt_key,
-            identity_count: 438,
             state_key: vec![8; 32],
             commit_ack_key: vec![9; 32],
             recovery_complete: false,
@@ -584,7 +642,6 @@ mod tests {
             epoch,
             mode: RuntimeMode::Dormant,
             receipt_key: vec![0; 32],
-            identity_count: 438,
             state_key: Vec::new(),
             commit_ack_key: Vec::new(),
             recovery_complete: false,
@@ -769,6 +826,100 @@ mod tests {
             1_000_000
         );
         assert_eq!(store.load_committed().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn vsock_admission_and_native_clob_trade_survive_restart_and_replay_once() {
+        const MARKET: &str = "layrs:v5:BTC:USDC:15m:vsock-fixture";
+        const NEW_SUBJECT: &str =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const NEW_WALLET: &str = "0x2222222222222222222222222222222222222222";
+        let new_identity = identity_commitment_for(NEW_SUBJECT, NEW_WALLET);
+        let store = FilesystemImmutableArtifactStore::new(artifact_dir());
+        let first = state();
+        assert!(matches!(
+            recover(Arc::clone(&first), Vec::new()).await,
+            RuntimeResponse::RecoveryComplete {
+                recovered_sequence: 0,
+                ..
+            }
+        ));
+        for command in [
+            request_for(
+                NEW_SUBJECT,
+                &new_identity,
+                "vsock-admit",
+                DirectAction::AdmitIdentity {
+                    wallet_address: NEW_WALLET.into(),
+                },
+            ),
+            request_for(
+                NEW_SUBJECT,
+                &new_identity,
+                "vsock-credit",
+                DirectAction::CreditDeposit {
+                    amount_atomic: "5000000".into(),
+                    custody_reference: "isolated-vsock-final-deposit".into(),
+                },
+            ),
+            market_registration("vsock-market", MARKET),
+            request_for(
+                SUBJECT,
+                IDENTITY,
+                "vsock-maker",
+                DirectAction::PlaceOrder {
+                    order_id: "55555555-6666-4777-8888-999999999999".into(),
+                    market_id: MARKET.into(),
+                    outcome: Outcome::Up,
+                    action: OrderAction::Buy,
+                    price_micros: 400_000,
+                    quantity_micros: "1000000".into(),
+                    time_in_force: TimeInForce::Gtc,
+                    expires_at_millis: None,
+                    now_millis: 1_000,
+                },
+            ),
+        ] {
+            assert!(matches!(
+                commit_through_parent_callback(Arc::clone(&first), command, &store).await,
+                RuntimeResponse::Execute { .. }
+            ));
+        }
+        let trade = request_for(
+            NEW_SUBJECT,
+            &new_identity,
+            "vsock-trade",
+            DirectAction::PlaceOrder {
+                order_id: "66666666-7777-4888-9999-aaaaaaaaaaaa".into(),
+                market_id: MARKET.into(),
+                outcome: Outcome::Down,
+                action: OrderAction::Buy,
+                price_micros: 600_000,
+                quantity_micros: "1000000".into(),
+                time_in_force: TimeInForce::Gtc,
+                expires_at_millis: None,
+                now_millis: 2_000,
+            },
+        );
+        let terminal =
+            commit_through_parent_callback(Arc::clone(&first), trade.clone(), &store).await;
+        let RuntimeResponse::Execute { result: expected } = terminal else {
+            panic!("expected terminal trade result");
+        };
+        assert_eq!(expected.receipt.execution.as_ref().unwrap().trades.len(), 1);
+        assert_eq!(store.load_committed().unwrap().len(), 5);
+
+        let restarted = state();
+        assert!(matches!(
+            recover(Arc::clone(&restarted), store.load_committed().unwrap()).await,
+            RuntimeResponse::RecoveryComplete {
+                recovered_sequence: 5,
+                ..
+            }
+        ));
+        let replay = execute_response(Arc::clone(&restarted), trade).await;
+        assert_eq!(replay, RuntimeResponse::Execute { result: expected });
+        assert_eq!(store.load_committed().unwrap().len(), 5);
     }
 
     #[tokio::test]

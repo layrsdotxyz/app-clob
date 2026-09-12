@@ -23,12 +23,13 @@ use chacha20poly1305::{
 };
 use hmac::{Hmac, Mac};
 use layrs_direct_execution_v1::{
-    artifact_hash, reference_for, request_hash, sha256, sign, DirectAction, DirectReceipt,
-    DirectRequest, DirectResult, DirectStateArtifact, DurabilityAck, ExternalEffectIntent,
-    ExternalEffectRecovery, FilesystemImmutableArtifactStore, FilesystemImmutableIntentStore,
-    ImmutableExternalEffectIntentStore, ProjectionBalanceRow, ProjectionWalletRow, RuntimeRequest,
-    RuntimeMeasurementBinding, RuntimeResponse, SealedEpoch, WriterGrant, EPOCH_ID,
-    POSTGRES_PROJECTION_DDL,
+    artifact_hash, identity_commitment_for, reference_for, request_hash, sha256, sign,
+    DirectAction, DirectReceipt, DirectRequest, DirectResult, DirectStateArtifact, DurabilityAck,
+    ExternalEffectIntent, ExternalEffectRecovery, FilesystemImmutableArtifactStore,
+    FilesystemImmutableIntentStore, GovernedMarketRegistration, ImmutableExternalEffectIntentStore,
+    OrderAction, Outcome, ProjectionBalanceRow, ProjectionIdentityRow, ProjectionWalletRow,
+    RuntimeMeasurementBinding, RuntimeRequest, RuntimeResponse, SealedEpoch, TimeInForce,
+    WriterGrant, EPOCH_ID, POSTGRES_PROJECTION_DDL,
 };
 use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
@@ -37,8 +38,8 @@ use p256::{
 use reqwest::header::{HeaderMap as ReqwestHeaderMap, HeaderValue, ACCEPT};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha3::{Digest as KeccakDigest, Keccak256};
 use sha2::Sha256;
+use sha3::{Digest as KeccakDigest, Keccak256};
 use std::{
     collections::{BTreeMap, HashSet},
     env, io,
@@ -55,7 +56,8 @@ use tokio::{
 use tokio_postgres::{Client, NoTls};
 use tokio_vsock::{VsockAddr, VsockStream};
 const ENCLOSURE_PORT: u32 = 5_003;
-const MAX_FRAME_BYTES: usize = 1024 * 1024;
+// Must match the enclave's finite parent-only VSOCK recovery ceiling.
+const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const SESSION_AUDIENCE: &str = "layrs.direct-execution.v1";
 const DIRECT_SESSION_KEY_DERIVATION_DOMAIN: &[u8] = b"layrs.direct-session.v1\0";
 #[derive(Clone)]
@@ -921,6 +923,11 @@ struct CustomerCommand {
     action: CustomerAction,
 }
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MarketRegistrationCommand {
+    registration: GovernedMarketRegistration,
+}
+#[derive(Deserialize)]
 #[serde(
     tag = "type",
     rename_all = "SCREAMING_SNAKE_CASE",
@@ -930,7 +937,13 @@ enum CustomerAction {
     PlaceOrder {
         order_id: String,
         market_id: String,
-        reserve_atomic: String,
+        outcome: Outcome,
+        action: OrderAction,
+        price_micros: u64,
+        quantity_micros: String,
+        time_in_force: TimeInForce,
+        expires_at_millis: Option<i64>,
+        now_millis: i64,
     },
     CancelOrder {
         order_id: String,
@@ -952,6 +965,7 @@ struct SessionClaims {
     epoch_id: String,
     epoch_state_sha256: String,
     wallet_address: String,
+    identity_commitment: String,
     expires_at_unix: u64,
     response_key: String,
     signature: String,
@@ -990,31 +1004,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // later governed activation injects the BFF verification key.
         .unwrap_or_default();
     let isolated_test = env::var("LAYRS_DIRECT_ISOLATED_TEST").as_deref() == Ok("true");
-    let dormant = matches!(
-        env::var("LAYRS_DIRECT_EXECUTION_MODE").as_deref(),
-        Err(_) | Ok("dormant")
-    );
+    let execution_mode = env::var("LAYRS_DIRECT_EXECUTION_MODE").ok();
+    let dormant = matches!(execution_mode.as_deref(), None | Some("dormant"));
+    let financial_enabled = execution_mode.as_deref() == Some("production-enabled");
     let projection = match env::var("LAYRS_DIRECT_PROJECTION_DATABASE_URL") {
         Ok(url) => Some(Projection::connect(&url, &epoch).await?),
         // This is restricted to a named isolated-package fixture.  It permits
         // the parent/enclave/artifact restart test to run without inventing a
         // second database fixture; production always requires its projection.
-        Err(_) if isolated_test
-            && env::var("LAYRS_DIRECT_ISOLATED_NO_PROJECTION").as_deref() == Ok("true") => None,
+        Err(_)
+            if isolated_test
+                && env::var("LAYRS_DIRECT_ISOLATED_NO_PROJECTION").as_deref() == Ok("true") =>
+        {
+            None
+        }
         Err(_) if isolated_test => {
             return Err("isolated direct execution requires an isolated projection database".into())
         }
         Err(_) => None,
     };
-    if env::var("LAYRS_DIRECT_EXECUTION_MODE").as_deref() == Ok("production-enabled") {
+    if matches!(
+        execution_mode.as_deref(),
+        Some("admission-enabled" | "production-enabled")
+    ) {
         let grant: WriterGrant = env::var("LAYRS_DIRECT_WRITER_GRANT_JSON")
             .ok()
             .and_then(|value| serde_json::from_str(&value).ok())
             .ok_or("production writer grant is required")?;
-        let binding: RuntimeMeasurementBinding = env::var("LAYRS_DIRECT_APPROVED_RUNTIME_BINDING_JSON")
-            .ok()
-            .and_then(|value| serde_json::from_str(&value).ok())
-            .ok_or("approved runtime binding is required")?;
+        let binding: RuntimeMeasurementBinding =
+            env::var("LAYRS_DIRECT_APPROVED_RUNTIME_BINDING_JSON")
+                .ok()
+                .and_then(|value| serde_json::from_str(&value).ok())
+                .ok_or("approved runtime binding is required")?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|value| value.as_secs())
@@ -1025,9 +1046,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         projection
             .as_ref()
             .ok_or("production projection is required")?
-            .verify_active_writer_grant(&grant)
+            .verify_governed_runtime_mode(&grant, financial_enabled)
             .await
-            .map_err(|_| "writer fence verification failed")?;
+            .map_err(|_| "runtime authorization and writer fence verification failed")?;
     }
     let state = AppState {
         enclave_cid: env::var("LAYRS_ENCLAVE_CID")
@@ -1049,11 +1070,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // A read-only runtime must not construct a custody adapter at all.
         // This removes both execution capability and any reason to load an
         // operational payout signer before the separately governed canary.
-        custody: if dormant {
-            None
-        } else {
+        custody: if financial_enabled {
             PrivyBaseCustodyAdapter::from_environment()
                 .map_err(|error| format!("direct custody configuration invalid: {error}"))?
+        } else {
+            None
         },
         financial_gate: Arc::new(Mutex::new(())),
         committed_state_root: Arc::new(Mutex::new(None)),
@@ -1073,6 +1094,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(|| async { "ok" }))
         .route("/v1/attestation", get(attestation))
         .route("/v1/runtime/status", get(status))
+        .route("/v1/operator/markets", post(register_market))
+        .route("/v1/direct/admissions", post(admit_identity))
         .route("/v1/direct/commands", post(command))
         .route("/v1/direct/balances/:identity", get(balance))
         .with_state(state);
@@ -1114,7 +1137,10 @@ fn runtime_bind_address(
     // artifact can be created.  Any writable listener still requires the
     // WriterGrant-gated production-enabled mode.
     let read_only_listener = mode == Some("dormant") && read_only_vpc_bind;
-    if !address.is_loopback() && mode != Some("production-enabled") && !read_only_listener {
+    if !address.is_loopback()
+        && !matches!(mode, Some("admission-enabled" | "production-enabled"))
+        && !read_only_listener
+    {
         return Err("non-loopback direct runtime listener requires production-enabled mode");
     }
     Ok(address)
@@ -1159,17 +1185,32 @@ async fn command(
         Some(value) => value.to_string(),
         None => return (StatusCode::BAD_REQUEST, "IDEMPOTENCY_KEY_REQUIRED").into_response(),
     };
+    if body.identity_commitment != claims.identity_commitment {
+        return (StatusCode::FORBIDDEN, "DIRECT_IDENTITY_BINDING_DENIED").into_response();
+    }
     let _financial_guard = state.financial_gate.lock().await;
     let external_effect_pending = !state.unresolved_external_effects.lock().await.is_empty();
     let action = match body.action {
         CustomerAction::PlaceOrder {
             order_id,
             market_id,
-            reserve_atomic,
+            outcome,
+            action,
+            price_micros,
+            quantity_micros,
+            time_in_force,
+            expires_at_millis,
+            now_millis,
         } if !external_effect_pending => DirectAction::PlaceOrder {
             order_id,
             market_id,
-            reserve_atomic,
+            outcome,
+            action,
+            price_micros,
+            quantity_micros,
+            time_in_force,
+            expires_at_millis,
+            now_millis,
         },
         CustomerAction::CancelOrder { order_id } if !external_effect_pending => {
             DirectAction::CancelOrder { order_id }
@@ -1255,6 +1296,124 @@ async fn command(
                 }
             }
             encrypted(&claims, &result)
+        }
+        Ok(RuntimeResponse::Error { code }) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, code).into_response()
+        }
+        _ => (StatusCode::BAD_GATEWAY, "ENCLOSURE_UNAVAILABLE").into_response(),
+    }
+}
+
+async fn admit_identity(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let claims = match authenticated(&headers, &state) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if !matches!(
+        env::var("LAYRS_DIRECT_EXECUTION_MODE").as_deref(),
+        Ok("admission-enabled" | "production-enabled")
+    ) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "ADMISSION_DISABLED").into_response();
+    }
+    if claims.identity_commitment
+        != identity_commitment_for(&claims.subject_hash, &claims.wallet_address)
+    {
+        return (StatusCode::FORBIDDEN, "DIRECT_IDENTITY_BINDING_DENIED").into_response();
+    }
+    let request_id = match headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.len() <= 200)
+    {
+        Some(value) => value.to_string(),
+        None => return (StatusCode::BAD_REQUEST, "IDEMPOTENCY_KEY_REQUIRED").into_response(),
+    };
+    let _guard = state.financial_gate.lock().await;
+    let mut request = DirectRequest {
+        account_id: claims.subject_hash.clone(),
+        identity_commitment: claims.identity_commitment.clone(),
+        request_id,
+        request_hash: String::new(),
+        action: DirectAction::AdmitIdentity {
+            wallet_address: claims.wallet_address.clone(),
+        },
+    };
+    request.request_hash = request_hash(&request);
+    match exchange_direct(&state, request).await {
+        Ok(RuntimeResponse::Execute { result }) => {
+            let Some(projection) = &state.projection else {
+                return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_NOT_CONFIGURED")
+                    .into_response();
+            };
+            if projection
+                .consume_session(&claims, &result.receipt.request_hash)
+                .await
+                .is_err()
+                || projection.record_result(&result).await.is_err()
+                || projection
+                    .record_identity_admission(
+                        &claims.subject_hash,
+                        &claims.identity_commitment,
+                        &claims.wallet_address,
+                        &result.receipt.receipt_id,
+                    )
+                    .await
+                    .is_err()
+            {
+                return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE").into_response();
+            }
+            encrypted(&claims, &result)
+        }
+        Ok(RuntimeResponse::Error { code }) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, code).into_response()
+        }
+        _ => (StatusCode::BAD_GATEWAY, "ENCLOSURE_UNAVAILABLE").into_response(),
+    }
+}
+
+async fn register_market(
+    State(state): State<AppState>,
+    Json(body): Json<MarketRegistrationCommand>,
+) -> impl IntoResponse {
+    if !matches!(
+        env::var("LAYRS_DIRECT_EXECUTION_MODE").as_deref(),
+        Ok("admission-enabled" | "production-enabled")
+    ) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "MARKET_REGISTRATION_DISABLED",
+        )
+            .into_response();
+    }
+    let now = now_unix();
+    if !body.registration.verify(now) {
+        return (
+            StatusCode::FORBIDDEN,
+            "MARKET_REGISTRATION_SIGNATURE_INVALID",
+        )
+            .into_response();
+    }
+    let mut request = DirectRequest {
+        account_id: "governance".into(),
+        identity_commitment: "governance".into(),
+        request_id: body.registration.registration_id.clone(),
+        request_hash: String::new(),
+        action: DirectAction::RegisterMarket {
+            registration: body.registration,
+            now_unix: now,
+        },
+    };
+    request.request_hash = request_hash(&request);
+    let _guard = state.financial_gate.lock().await;
+    match exchange_direct(&state, request).await {
+        Ok(RuntimeResponse::Execute { result }) => {
+            if let Some(projection) = &state.projection {
+                if projection.record_result(&result).await.is_err() {
+                    return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE")
+                        .into_response();
+                }
+            }
+            Json(result).into_response()
         }
         Ok(RuntimeResponse::Error { code }) => {
             (StatusCode::UNPROCESSABLE_ENTITY, code).into_response()
@@ -1510,6 +1669,11 @@ fn authenticated(
         || claims.epoch_state_sha256 != layrs_direct_execution_v1::EPOCH_STATE_SHA256
         || !claims.wallet_address.starts_with("0x")
         || claims.wallet_address.len() != 42
+        || claims.identity_commitment.len() != 64
+        || !claims
+            .identity_commitment
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
         || claims.session_id.len() < 16
         || claims.subject_hash.len() != 64
         || claims.privy_user_id_hash.len() != 64
@@ -1552,7 +1716,14 @@ impl Projection {
 
     async fn import_opening(&self, epoch: &SealedEpoch) -> Result<(), ProjectionError> {
         let balances = epoch.projection_rows();
+        let identities = epoch.projection_identity_rows();
         let wallets = epoch.projection_wallet_rows();
+        for row in &identities {
+            self.client.execute(
+                "INSERT INTO direct_execution_identities (epoch_id, auth_subject_hash, identity_commitment, admitted_post_genesis) VALUES ($1,$2,$3,false) ON CONFLICT (epoch_id, identity_commitment) DO NOTHING",
+                &[&EPOCH_ID, &row.auth_subject_hash, &row.identity_commitment],
+            ).await.map_err(|_| ProjectionError::Database)?;
+        }
         for row in &balances {
             self.client.execute(
                 "INSERT INTO direct_execution_epoch_balances (epoch_id, auth_subject_hash, identity_commitment, asset, bucket, amount_atomic) VALUES ($1,$2,$3,$4,$5,$6::text::numeric) ON CONFLICT (epoch_id, identity_commitment, asset, bucket) DO NOTHING",
@@ -1565,14 +1736,26 @@ impl Projection {
                 &[&EPOCH_ID, &row.auth_subject_hash, &row.wallet_address],
             ).await.map_err(|_| ProjectionError::Database)?;
         }
-        self.verify_opening(&balances, &wallets).await
+        self.verify_opening(&identities, &balances, &wallets).await
     }
 
     async fn verify_opening(
         &self,
+        identities: &[ProjectionIdentityRow],
         balances: &[ProjectionBalanceRow],
         wallets: &[ProjectionWalletRow],
     ) -> Result<(), ProjectionError> {
+        for row in identities {
+            let actual = self.client.query_opt(
+                "SELECT auth_subject_hash, admitted_post_genesis FROM direct_execution_identities WHERE epoch_id=$1 AND identity_commitment=$2",
+                &[&EPOCH_ID, &row.identity_commitment],
+            ).await.map_err(|_| ProjectionError::Database)?.ok_or(ProjectionError::OpeningMismatch)?;
+            let subject: String = actual.get(0);
+            let admitted: bool = actual.get(1);
+            if subject != row.auth_subject_hash || admitted {
+                return Err(ProjectionError::OpeningMismatch);
+            }
+        }
         for row in balances {
             let actual = self.client.query_opt(
                 "SELECT amount_atomic::text, auth_subject_hash FROM direct_execution_epoch_balances WHERE epoch_id=$1 AND identity_commitment=$2 AND asset=$3 AND bucket=$4",
@@ -1627,6 +1810,12 @@ impl Projection {
             "INSERT INTO direct_execution_receipts (receipt_id, epoch_id, auth_subject_hash, identity_commitment, request_id, request_hash, terminal_status, effect, custody_reference, receipt_json) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::text::jsonb) ON CONFLICT (receipt_id) DO NOTHING",
             &[&receipt.receipt_id, &EPOCH_ID, &receipt.account_id, &receipt.identity_commitment, &receipt.request_id, &receipt.request_hash, &format!("{:?}", receipt.status).to_uppercase(), &receipt.effect, &receipt.custody_reference, &serde_json::to_string(receipt).map_err(|_| ProjectionError::Database)?],
         ).await.map_err(|_| ProjectionError::Database)?;
+        for update in &receipt.projection_balance_updates {
+            self.client.execute(
+                "INSERT INTO direct_execution_epoch_balances (epoch_id, auth_subject_hash, identity_commitment, asset, bucket, amount_atomic) VALUES ($1,$2,$3,$4,$5,$6::text::numeric) ON CONFLICT (epoch_id, identity_commitment, asset, bucket) DO UPDATE SET auth_subject_hash=EXCLUDED.auth_subject_hash, amount_atomic=EXCLUDED.amount_atomic, updated_at=now()",
+                &[&EPOCH_ID, &update.auth_subject_hash, &update.identity_commitment, &update.asset, &update.bucket, &update.amount_atomic],
+            ).await.map_err(|_| ProjectionError::Database)?;
+        }
         let accounting_amount = receipt.amount_atomic.clone();
         let (direction, amount) = receipt_custody(receipt);
         if let (Some(reference), Some(direction), Some(amount)) =
@@ -1641,10 +1830,71 @@ impl Projection {
             "INSERT INTO direct_execution_accounting_events (receipt_id, epoch_id, auth_subject_hash, identity_commitment, effect, amount_atomic) VALUES ($1,$2,$3,$4,$5,$6::text::numeric) ON CONFLICT DO NOTHING",
             &[&receipt.receipt_id, &EPOCH_ID, &receipt.account_id, &receipt.identity_commitment, &receipt.effect, &accounting_amount],
         ).await.map_err(|_| ProjectionError::Database)?;
+        if let Some(execution) = &receipt.execution {
+            let status = enum_name(&execution.status)?;
+            let outcome = enum_name(&execution.outcome)?;
+            let action = enum_name(&execution.action)?;
+            self.client.execute(
+                "INSERT INTO direct_execution_order_events (receipt_id, epoch_id, order_id, auth_subject_hash, identity_commitment, market_id, outcome, action, status, limit_price_micros, quantity_micros, executed_quantity_micros, remaining_quantity_micros, fee_atomic, resulting_position_micros, resulting_available_atomic) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::text::numeric,$12::text::numeric,$13::text::numeric,$14::text::numeric,$15::text::numeric,$16::text::numeric) ON CONFLICT DO NOTHING",
+                &[&receipt.receipt_id, &EPOCH_ID, &execution.order_id, &receipt.account_id, &receipt.identity_commitment, &execution.market_id, &outcome, &action, &status, &(execution.limit_price_micros as i64), &execution.quantity_micros, &execution.executed_quantity_micros, &execution.remaining_quantity_micros, &execution.total_fee_atomic, &execution.resulting_position_micros, &execution.resulting_available_atomic],
+            ).await.map_err(|_| ProjectionError::Database)?;
+            for trade in &execution.trades {
+                let trade_outcome = enum_name(&trade.outcome)?;
+                let match_type = enum_name(&trade.match_type)?;
+                self.client.execute(
+                    "INSERT INTO direct_execution_trade_events (trade_id, receipt_id, epoch_id, market_id, maker_order_id, taker_order_id, outcome, match_type, executed_quantity_micros, execution_price_micros, fee_atomic) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::text::numeric,$10,$11::text::numeric) ON CONFLICT DO NOTHING",
+                    &[&trade.trade_id, &receipt.receipt_id, &EPOCH_ID, &trade.market_id, &trade.maker_order_id, &trade.taker_order_id, &trade_outcome, &match_type, &trade.executed_quantity_micros, &(trade.execution_price_micros as i64), &trade.fee_atomic],
+                ).await.map_err(|_| ProjectionError::Database)?;
+            }
+        }
         Ok(())
     }
 
-    async fn verify_active_writer_grant(&self, grant: &WriterGrant) -> Result<(), ProjectionError> {
+    async fn record_identity_admission(
+        &self,
+        auth_subject_hash: &str,
+        identity_commitment: &str,
+        wallet_address: &str,
+        receipt_id: &str,
+    ) -> Result<(), ProjectionError> {
+        self.client.execute(
+            "INSERT INTO direct_execution_identities (epoch_id, auth_subject_hash, identity_commitment, admitted_post_genesis) VALUES ($1,$2,$3,true) ON CONFLICT (epoch_id, identity_commitment) DO NOTHING",
+            &[&EPOCH_ID, &auth_subject_hash, &identity_commitment],
+        ).await.map_err(|_| ProjectionError::Database)?;
+        self.client.execute(
+            "INSERT INTO direct_execution_epoch_balances (epoch_id, auth_subject_hash, identity_commitment, asset, bucket, amount_atomic) VALUES ($1,$2,$3,'USDC','USER_AVAILABLE',0) ON CONFLICT (epoch_id, identity_commitment, asset, bucket) DO NOTHING",
+            &[&EPOCH_ID, &auth_subject_hash, &identity_commitment],
+        ).await.map_err(|_| ProjectionError::Database)?;
+        self.client.execute(
+            "INSERT INTO direct_execution_privy_wallets (epoch_id, auth_subject_hash, wallet_address) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
+            &[&EPOCH_ID, &auth_subject_hash, &wallet_address],
+        ).await.map_err(|_| ProjectionError::Database)?;
+        self.client.execute(
+            "INSERT INTO direct_execution_identity_admissions (receipt_id, epoch_id, auth_subject_hash, identity_commitment, wallet_address) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
+            &[&receipt_id, &EPOCH_ID, &auth_subject_hash, &identity_commitment, &wallet_address],
+        ).await.map_err(|_| ProjectionError::Database)?;
+        let row = self.client.query_opt(
+            "SELECT identity.auth_subject_hash, wallet.wallet_address, admission.receipt_id FROM direct_execution_identities identity JOIN direct_execution_epoch_balances balance ON balance.epoch_id=identity.epoch_id AND balance.identity_commitment=identity.identity_commitment JOIN direct_execution_privy_wallets wallet ON wallet.epoch_id=identity.epoch_id AND wallet.auth_subject_hash=identity.auth_subject_hash JOIN direct_execution_identity_admissions admission ON admission.epoch_id=identity.epoch_id AND admission.identity_commitment=identity.identity_commitment WHERE identity.epoch_id=$1 AND identity.identity_commitment=$2 AND identity.admitted_post_genesis=true AND balance.asset='USDC' AND balance.bucket='USER_AVAILABLE' AND balance.amount_atomic=0",
+            &[&EPOCH_ID, &identity_commitment],
+        ).await.map_err(|_| ProjectionError::Database)?.ok_or(ProjectionError::OpeningMismatch)?;
+        let actual_subject: String = row.get(0);
+        let actual_wallet: String = row.get(1);
+        let actual_receipt: String = row.get(2);
+        if actual_subject == auth_subject_hash
+            && actual_wallet.eq_ignore_ascii_case(wallet_address)
+            && actual_receipt == receipt_id
+        {
+            Ok(())
+        } else {
+            Err(ProjectionError::OpeningMismatch)
+        }
+    }
+
+    async fn verify_governed_runtime_mode(
+        &self,
+        grant: &WriterGrant,
+        financial_writer_enabled: bool,
+    ) -> Result<(), ProjectionError> {
         let row = self.client.query_opt(
             "SELECT old_writer_fence_evidence_sha256, old_writer_authorized, target_writer_enabled, activation_id FROM direct_execution_writer_fence WHERE epoch_id=$1",
             &[&EPOCH_ID],
@@ -1654,7 +1904,7 @@ impl Projection {
         let target_enabled: bool = row.get(2);
         let activation: Option<String> = row.get(3);
         if old_authorized
-            || !target_enabled
+            || target_enabled != financial_writer_enabled
             || fence_hash != grant.old_writer_fence_evidence_sha256
             || activation.as_deref() != Some(&grant.activation_id)
         {
@@ -1670,6 +1920,12 @@ impl Projection {
             Err(ProjectionError::OpeningMismatch)
         }
     }
+}
+
+fn enum_name<T: Serialize>(value: &T) -> Result<String, ProjectionError> {
+    serde_json::to_string(value)
+        .map(|value| value.trim_matches('"').to_string())
+        .map_err(|_| ProjectionError::Database)
 }
 
 fn receipt_custody(receipt: &DirectReceipt) -> (Option<&'static str>, Option<String>) {
@@ -2092,6 +2348,7 @@ mod tests {
             epoch_id: EPOCH_ID.into(),
             epoch_state_sha256: layrs_direct_execution_v1::EPOCH_STATE_SHA256.into(),
             wallet_address: "0x1111111111111111111111111111111111111111".into(),
+            identity_commitment: "c".repeat(64),
             expires_at_unix: now_unix() + 60,
             response_key: URL_SAFE_NO_PAD.encode([3u8; 32]),
             signature: String::new(),
