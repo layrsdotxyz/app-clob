@@ -32,6 +32,7 @@ use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
     pkcs8::DecodePrivateKey,
 };
+use reqwest::header::{HeaderMap as ReqwestHeaderMap, HeaderValue, ACCEPT};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha3::{Digest as KeccakDigest, Keccak256};
@@ -122,9 +123,16 @@ impl PrivyBaseCustodyAdapter {
                 if confirmations == 0 {
                     return Err("invalid Base confirmation count".into());
                 }
+                let mut default_headers = ReqwestHeaderMap::new();
+                // Match the existing operational Privy client exactly.  This
+                // is a provider routing contract, not a new credential or a
+                // weaker authorization scheme.
+                default_headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
                 Ok(Some(Self {
                     client: reqwest::Client::builder()
                         .https_only(true)
+                        .user_agent("layrsv2-public-api/1.0")
+                        .default_headers(default_headers)
                         .build()
                         .map_err(|_| "custody HTTP client unavailable")?,
                     app_id: required("LAYRSV2_PRIVY_APP_ID")?,
