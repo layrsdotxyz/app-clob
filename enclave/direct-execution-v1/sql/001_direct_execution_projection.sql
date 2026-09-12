@@ -1,7 +1,10 @@
 -- Auditable projection for the clean runtime. Balance rows contain the latest
 -- signed receipt-derived read model but are never used to restore private state.
+-- A dedicated schema prevents collision with retained legacy direct-execution
+-- projection tables, whose receipt wire format is intentionally preserved.
 BEGIN;
-SET LOCAL search_path TO layrsv2, pg_catalog;
+CREATE SCHEMA IF NOT EXISTS layrs_direct_v1;
+SET LOCAL search_path TO layrs_direct_v1, pg_catalog;
 
 CREATE TABLE IF NOT EXISTS direct_execution_receipts (
     receipt_id TEXT PRIMARY KEY,
@@ -154,6 +157,8 @@ CREATE TABLE IF NOT EXISTS direct_execution_writer_grants (
 -- worker principal only to publish signed projection rows; the API and audit
 -- principals remain read-only. None of these grants make PostgreSQL private
 -- financial-state authority.
+GRANT USAGE ON SCHEMA layrs_direct_v1
+TO layrsv2_worker_role, layrsv2_api_role, layrsv2_auditor_role, layrsv2_operator;
 GRANT SELECT, INSERT ON
     direct_execution_receipts,
     direct_execution_identities,

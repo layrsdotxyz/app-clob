@@ -1743,6 +1743,10 @@ impl Projection {
                 return Err(format!("projection schema verification failed: {error:?}").into());
             }
         }
+        projection
+            .client
+            .batch_execute("SET search_path TO layrs_direct_v1, pg_catalog")
+            .await?;
         if let Err(error) = projection.import_opening(epoch).await {
             return Err(format!("opening projection import failed: {error:?}").into());
         }
@@ -1765,7 +1769,7 @@ impl Projection {
             ("direct_execution_writer_grants", "SELECT"),
         ];
         for (table, privileges) in tables {
-            let qualified = format!("layrsv2.{table}");
+            let qualified = format!("layrs_direct_v1.{table}");
             let row = self
                 .client
                 .query_one(
