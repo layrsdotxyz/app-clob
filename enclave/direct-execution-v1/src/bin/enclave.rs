@@ -8,15 +8,24 @@ use aws_nitro_enclaves_nsm_api::{
     api::{Request as NsmRequest, Response as NsmResponse},
     driver::{nsm_exit, nsm_init, nsm_process_request},
 };
+use hmac::{Hmac, Mac};
 use layrs_direct_execution_v1::{
     runtime_binding, DirectRuntime, InMemoryDirectStateStore, RuntimeMeasurementBinding,
-    RuntimeMode, RuntimeRequest, RuntimeResponse, SealedEpoch, WriterGrant,
+    RuntimeMode, RuntimeRequest, RuntimeResponse, SealedEpoch, WriterGrant, EPOCH_ID,
+    TRANSACTION_MODEL,
 };
+use openssl::{
+    cms::CmsContentInfo,
+    pkey::{PKey, Private},
+    rsa::Rsa,
+};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::Mutex,
 };
 use tokio_vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
+use zeroize::Zeroize;
 
 const PORT: u32 = 5_003;
 // Startup recovery carries the verified immutable lineage in one parent-only
@@ -34,6 +43,19 @@ struct EnclaveState {
     state_key: Vec<u8>,
     commit_ack_key: Vec<u8>,
     recovery_complete: bool,
+    pending_governed_bootstrap: Option<PendingGovernedBootstrap>,
+    writer_grant_commitment: Option<String>,
+    writer_grant_expires_at_unix: Option<u64>,
+    key_release_artifact_hash: Option<String>,
+}
+
+struct PendingGovernedBootstrap {
+    recipient_private_key: PKey<Private>,
+    grant: WriterGrant,
+    binding: RuntimeMeasurementBinding,
+    requested_mode: RuntimeMode,
+    kms_key_id: String,
+    encryption_context: std::collections::BTreeMap<String, String>,
 }
 
 impl Drop for EnclaveState {
@@ -54,23 +76,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if nsm_fd < 0 {
         return Err("Nitro Secure Module is unavailable".into());
     }
-    let mode = match env::var("LAYRS_DIRECT_EXECUTION_MODE").as_deref() {
-        Ok("isolated-test") if env::var("LAYRS_DIRECT_ISOLATED_TEST").as_deref() == Ok("true") => {
-            RuntimeMode::IsolatedTest
-        }
-        Ok("dormant") | Err(_) => RuntimeMode::Dormant,
-        Ok("admission-enabled") if verified_writer_grant() => RuntimeMode::AdmissionOnly,
-        Ok("production-enabled") if verified_writer_grant() => RuntimeMode::ProductionEnabled,
-        // An arbitrary deployment flag cannot create a writer. Step 6 requires
-        // a separately signed and unexpired old-writer-fence grant.
-        _ => return Err("invalid or unauthorized direct-execution mode".into()),
-    };
-    let receipt_key = env::var("LAYRS_DIRECT_RECEIPT_KEY_HEX")
-        .ok()
-        .and_then(|value| hex::decode(value).ok())
-        .unwrap_or_else(|| vec![0u8; 32]);
-    let state_key = protected_key("LAYRS_DIRECT_STATE_KEY_HEX", mode)?;
-    let commit_ack_key = protected_key("LAYRS_DIRECT_COMMIT_ACK_KEY_HEX", mode)?;
+    // An EIF never inherits the parent's process environment. It always
+    // starts dormant and can become authorized only through the governed,
+    // attestation-bound VSOCK bootstrap below. Isolated tests retain their
+    // explicitly named bootstrap request.
+    let mode = RuntimeMode::Dormant;
+    let receipt_key = vec![0u8; 32];
+    let state_key = vec![0u8; 32];
+    let commit_ack_key = vec![0u8; 32];
     let state = Arc::new(Mutex::new(EnclaveState {
         nsm_fd,
         runtime: DirectRuntime::new(epoch.clone(), mode, receipt_key.clone())?,
@@ -80,6 +93,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state_key,
         commit_ack_key,
         recovery_complete: false,
+        pending_governed_bootstrap: None,
+        writer_grant_commitment: None,
+        writer_grant_expires_at_unix: None,
+        key_release_artifact_hash: None,
     }));
     let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, PORT))?;
     loop {
@@ -89,35 +106,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = serve(stream, state).await;
         });
     }
-}
-
-fn protected_key(name: &str, mode: RuntimeMode) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    match env::var(name)
-        .ok()
-        .and_then(|value| hex::decode(value).ok())
-    {
-        Some(value) if value.len() == 32 => Ok(value),
-        // A dormant runtime cannot perform a financial command.  It remains
-        // usable for status/attestation before the protected key-release path
-        // is configured, while an enabled isolated/production writer fails
-        // closed at boot without the key.
-        None if mode == RuntimeMode::Dormant => Ok(vec![0u8; 32]),
-        _ => Err(format!("{name} must be exactly 32 bytes").into()),
-    }
-}
-
-fn verified_writer_grant() -> bool {
-    let grant = env::var("LAYRS_DIRECT_WRITER_GRANT_JSON")
-        .ok()
-        .and_then(|value| serde_json::from_str::<WriterGrant>(&value).ok());
-    let binding = env::var("LAYRS_DIRECT_APPROVED_RUNTIME_BINDING_JSON")
-        .ok()
-        .and_then(|value| serde_json::from_str::<RuntimeMeasurementBinding>(&value).ok());
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_secs())
-        .unwrap_or(0);
-    matches!((grant, binding), (Some(grant), Some(binding)) if grant.verify(now, &binding))
 }
 
 async fn serve<S>(mut stream: S, state: Arc<Mutex<EnclaveState>>) -> io::Result<()>
@@ -135,8 +123,32 @@ where
                     state.runtime.identity_count(),
                     state.recovery_complete && state.runtime.writer_enabled(),
                     state.recovery_complete && state.runtime.admission_enabled(),
+                    state.writer_grant_commitment.clone(),
+                    state.writer_grant_expires_at_unix,
+                    state.key_release_artifact_hash.clone(),
                 ),
             }
+        }
+        RuntimeRequest::BeginGovernedBootstrap {
+            grant,
+            binding,
+            kms_key_id,
+            requested_mode,
+        } => begin_governed_bootstrap(state, grant, binding, kms_key_id, requested_mode).await,
+        RuntimeRequest::CompleteGovernedBootstrap {
+            writer_grant_commitment,
+            key_release_artifact_hash,
+            ciphertext_for_recipient,
+            commit_ack_key,
+        } => {
+            complete_governed_bootstrap(
+                state,
+                writer_grant_commitment,
+                key_release_artifact_hash,
+                ciphertext_for_recipient,
+                commit_ack_key,
+            )
+            .await
         }
         RuntimeRequest::BootstrapIsolated {
             receipt_key,
@@ -179,6 +191,274 @@ where
         &serde_cbor::to_vec(&response).map_err(invalid)?,
     )
     .await
+}
+
+async fn begin_governed_bootstrap(
+    state: Arc<Mutex<EnclaveState>>,
+    grant: WriterGrant,
+    binding: RuntimeMeasurementBinding,
+    kms_key_id: String,
+    requested_mode: String,
+) -> RuntimeResponse {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    let signature_valid = grant.verify(now, &binding);
+    begin_governed_bootstrap_with_attestor(
+        state,
+        grant,
+        binding,
+        kms_key_id,
+        requested_mode,
+        now,
+        signature_valid,
+        |nsm_fd, user_data, recipient_public_key| match nsm_process_request(
+            nsm_fd,
+            NsmRequest::Attestation {
+                user_data: Some(user_data.into()),
+                nonce: None,
+                public_key: Some(recipient_public_key.into()),
+            },
+        ) {
+            NsmResponse::Attestation { document } => Ok(document),
+            _ => Err("KEY_RELEASE_ATTESTATION_FAILED".into()),
+        },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn begin_governed_bootstrap_with_attestor<F>(
+    state: Arc<Mutex<EnclaveState>>,
+    grant: WriterGrant,
+    binding: RuntimeMeasurementBinding,
+    kms_key_id: String,
+    requested_mode: String,
+    now: u64,
+    signature_valid: bool,
+    attestor: F,
+) -> RuntimeResponse
+where
+    F: FnOnce(i32, Vec<u8>, Vec<u8>) -> Result<Vec<u8>, String>,
+{
+    let mode = match requested_mode.as_str() {
+        "admission-enabled" => RuntimeMode::AdmissionOnly,
+        "production-enabled" => RuntimeMode::ProductionEnabled,
+        _ => {
+            return RuntimeResponse::Error {
+                code: "WRITER_GRANT_SCOPE_INVALID".into(),
+            }
+        }
+    };
+    if !signature_valid
+        || grant.environment != "production"
+        || grant.runtime != TRANSACTION_MODEL
+        || grant.authorization_scope != requested_mode
+        || grant.epoch_id != EPOCH_ID
+        || grant.opening_epoch_sha256 != layrs_direct_execution_v1::EPOCH_STATE_SHA256
+        || grant.opening_evidence_manifest_sha256
+            != layrs_direct_execution_v1::EVIDENCE_MANIFEST_SHA256
+        || grant.expires_at_unix <= now
+        || !binding.valid()
+        || grant.runtime_measurement != binding
+        || grant.key_release_kms_key_id != kms_key_id
+    {
+        return RuntimeResponse::Error {
+            code: "WRITER_GRANT_INVALID".into(),
+        };
+    }
+    let grant_commitment = grant.commitment();
+    let mut state = state.lock().await;
+    if state.writer_grant_commitment.is_some() {
+        return RuntimeResponse::Error {
+            code: "WRITER_GRANT_REPLAY".into(),
+        };
+    }
+    if state.mode != RuntimeMode::Dormant
+        || state.recovery_complete
+        || state.pending_governed_bootstrap.is_some()
+    {
+        return RuntimeResponse::Error {
+            code: "GOVERNED_BOOTSTRAP_UNAVAILABLE".into(),
+        };
+    }
+    let (recipient_private_key, recipient_public_key) = match generate_recipient_key() {
+        Ok(value) => value,
+        Err(code) => return RuntimeResponse::Error { code },
+    };
+    let mut encryption_context = std::collections::BTreeMap::new();
+    encryption_context.insert("layrs-runtime".into(), TRANSACTION_MODEL.into());
+    encryption_context.insert("layrs-epoch".into(), EPOCH_ID.into());
+    encryption_context.insert("layrs-writer-grant".into(), grant_commitment.clone());
+    let user_data = match serde_json::to_vec(&serde_json::json!({
+        "protocol": "layrs.direct-execution.key-release.v1",
+        "writerGrantCommitment": grant_commitment,
+        "requestedMode": requested_mode,
+        "kmsKeyIdSha256": hex::encode(Sha256::digest(kms_key_id.as_bytes())),
+        "runtimeMeasurementSha256": hex::encode(Sha256::digest(serde_json::to_vec(&binding).unwrap_or_default())),
+    })) {
+        Ok(value) => value,
+        Err(_) => {
+            return RuntimeResponse::Error {
+                code: "GOVERNED_BOOTSTRAP_BINDING_FAILED".into(),
+            }
+        }
+    };
+    let attestation_document = match attestor(state.nsm_fd, user_data, recipient_public_key) {
+        Ok(document) if !document.is_empty() => document,
+        _ => {
+            return RuntimeResponse::Error {
+                code: "KEY_RELEASE_ATTESTATION_FAILED".into(),
+            }
+        }
+    };
+    state.pending_governed_bootstrap = Some(PendingGovernedBootstrap {
+        recipient_private_key,
+        grant,
+        binding,
+        requested_mode: mode,
+        kms_key_id: kms_key_id.clone(),
+        encryption_context: encryption_context.clone(),
+    });
+    RuntimeResponse::GovernedKeyRecipient {
+        attestation_document,
+        writer_grant_commitment: grant_commitment,
+        kms_key_id,
+        encryption_context,
+    }
+}
+
+async fn complete_governed_bootstrap(
+    state: Arc<Mutex<EnclaveState>>,
+    writer_grant_commitment: String,
+    key_release_artifact_hash: String,
+    ciphertext_for_recipient: Vec<u8>,
+    commit_ack_key: Vec<u8>,
+) -> RuntimeResponse {
+    complete_governed_bootstrap_with_decryptor(
+        state,
+        writer_grant_commitment,
+        key_release_artifact_hash,
+        ciphertext_for_recipient,
+        commit_ack_key,
+        decrypt_recipient_key,
+    )
+    .await
+}
+
+async fn complete_governed_bootstrap_with_decryptor<F>(
+    state: Arc<Mutex<EnclaveState>>,
+    writer_grant_commitment: String,
+    key_release_artifact_hash: String,
+    ciphertext_for_recipient: Vec<u8>,
+    commit_ack_key: Vec<u8>,
+    decryptor: F,
+) -> RuntimeResponse
+where
+    F: FnOnce(PKey<Private>, &[u8]) -> Result<Vec<u8>, String>,
+{
+    if writer_grant_commitment.len() != 64
+        || key_release_artifact_hash.len() != 64
+        || !writer_grant_commitment
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || !key_release_artifact_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || ciphertext_for_recipient.is_empty()
+        || ciphertext_for_recipient.len() > 65_536
+        || commit_ack_key.len() != 32
+    {
+        return RuntimeResponse::Error {
+            code: "KEY_RELEASE_RESPONSE_INVALID".into(),
+        };
+    }
+    let mut state = state.lock().await;
+    let Some(pending) = state.pending_governed_bootstrap.take() else {
+        return RuntimeResponse::Error {
+            code: "NO_PENDING_GOVERNED_BOOTSTRAP".into(),
+        };
+    };
+    if pending.grant.commitment() != writer_grant_commitment
+        || pending.grant.key_release_kms_key_id != pending.kms_key_id
+        || pending.binding != pending.grant.runtime_measurement
+        || pending
+            .encryption_context
+            .get("layrs-writer-grant")
+            .map(String::as_str)
+            != Some(writer_grant_commitment.as_str())
+    {
+        return RuntimeResponse::Error {
+            code: "KEY_RELEASE_BINDING_MISMATCH".into(),
+        };
+    }
+    let mut root_key = match decryptor(pending.recipient_private_key, &ciphertext_for_recipient) {
+        Ok(value) if value.len() == 32 => value,
+        Ok(mut value) => {
+            value.zeroize();
+            return RuntimeResponse::Error {
+                code: "KEY_RELEASE_MATERIAL_INVALID".into(),
+            };
+        }
+        Err(code) => return RuntimeResponse::Error { code },
+    };
+    let receipt_key = derive_runtime_key(&root_key, b"receipt-v1");
+    let state_key = derive_runtime_key(&root_key, b"state-v1");
+    root_key.zeroize();
+    let runtime = match DirectRuntime::new(
+        state.epoch.clone(),
+        pending.requested_mode,
+        receipt_key.clone(),
+    ) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return RuntimeResponse::Error {
+                code: error.to_string(),
+            }
+        }
+    };
+    state.runtime = runtime;
+    state.mode = pending.requested_mode;
+    state.receipt_key = receipt_key;
+    state.state_key = state_key;
+    state.commit_ack_key = commit_ack_key;
+    state.writer_grant_expires_at_unix = Some(pending.grant.expires_at_unix);
+    state.writer_grant_commitment = Some(writer_grant_commitment.clone());
+    state.key_release_artifact_hash = Some(key_release_artifact_hash);
+    RuntimeResponse::GovernedBootstrapComplete {
+        writer_grant_commitment,
+    }
+}
+
+fn derive_runtime_key(root_key: &[u8], purpose: &[u8]) -> Vec<u8> {
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(root_key).expect("HMAC accepts a 32-byte root key");
+    mac.update(b"layrs.direct-execution.runtime-key.v1\0");
+    mac.update(EPOCH_ID.as_bytes());
+    mac.update(&[0]);
+    mac.update(purpose);
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn generate_recipient_key() -> Result<(PKey<Private>, Vec<u8>), String> {
+    let rsa = Rsa::generate(2048).map_err(|_| "RECIPIENT_KEY_GENERATION_FAILED".to_string())?;
+    let private_key =
+        PKey::from_rsa(rsa).map_err(|_| "RECIPIENT_KEY_GENERATION_FAILED".to_string())?;
+    let public_key = private_key
+        .public_key_to_der()
+        .map_err(|_| "RECIPIENT_KEY_ENCODING_FAILED".to_string())?;
+    Ok((private_key, public_key))
+}
+
+fn decrypt_recipient_key(
+    private_key: PKey<Private>,
+    ciphertext_for_recipient: &[u8],
+) -> Result<Vec<u8>, String> {
+    let cms = CmsContentInfo::from_der(ciphertext_for_recipient)
+        .map_err(|_| "KMS_RECIPIENT_DECRYPT_FAILED".to_string())?;
+    cms.decrypt_without_cert_check(&private_key)
+        .map_err(|_| "KMS_RECIPIENT_DECRYPT_FAILED".to_string())
 }
 
 /// The parent environment is outside an EIF.  For an explicitly isolated
@@ -386,6 +666,9 @@ async fn attest(state: &Arc<Mutex<EnclaveState>>, nonce: Vec<u8>) -> RuntimeResp
         state.runtime.identity_count(),
         state.runtime.writer_enabled(),
         state.runtime.admission_enabled(),
+        state.writer_grant_commitment.clone(),
+        state.writer_grant_expires_at_unix,
+        state.key_release_artifact_hash.clone(),
     );
     let user_data = match serde_json::to_vec(&binding) {
         Ok(value) => value,
@@ -447,6 +730,14 @@ mod tests {
         DurabilityAck, FeeProfileId, FilesystemImmutableArtifactStore, GovernedMarketRegistration,
         MarketConfig, MarketExecution, OrderAction, Outcome, TimeInForce, EPOCH_ID,
         TRANSACTION_MODEL,
+    };
+    use openssl::{
+        asn1::Asn1Time,
+        cms::CMSOptions,
+        hash::MessageDigest,
+        stack::Stack,
+        symm::Cipher,
+        x509::{X509NameBuilder, X509},
     };
     use std::{
         path::PathBuf,
@@ -538,7 +829,104 @@ mod tests {
             state_key: vec![8; 32],
             commit_ack_key: vec![9; 32],
             recovery_complete: false,
+            pending_governed_bootstrap: None,
+            writer_grant_commitment: None,
+            writer_grant_expires_at_unix: None,
+            key_release_artifact_hash: None,
         }))
+    }
+    fn dormant_state() -> Arc<Mutex<EnclaveState>> {
+        let epoch = SealedEpoch::load(epoch_path()).unwrap();
+        Arc::new(Mutex::new(EnclaveState {
+            nsm_fd: -1,
+            runtime: DirectRuntime::new(epoch.clone(), RuntimeMode::Dormant, vec![0; 32]).unwrap(),
+            epoch,
+            mode: RuntimeMode::Dormant,
+            receipt_key: vec![0; 32],
+            state_key: vec![0; 32],
+            commit_ack_key: vec![0; 32],
+            recovery_complete: false,
+            pending_governed_bootstrap: None,
+            writer_grant_commitment: None,
+            writer_grant_expires_at_unix: None,
+            key_release_artifact_hash: None,
+        }))
+    }
+    fn measurement_binding() -> RuntimeMeasurementBinding {
+        RuntimeMeasurementBinding {
+            ami_id: "ami-0123456789abcdef0".into(),
+            eif_sha256: "a".repeat(64),
+            pcr0: "b".repeat(96),
+            pcr1: "c".repeat(96),
+            pcr2: "d".repeat(96),
+            source_commit: "writer-grant-bootstrap-test".into(),
+            enclave_sha256: "e".repeat(64),
+            parent_sha256: "f".repeat(64),
+        }
+    }
+    fn writer_grant(binding: &RuntimeMeasurementBinding) -> WriterGrant {
+        WriterGrant {
+            activation_id: "production-bootstrap-test-1".into(),
+            environment: "production".into(),
+            authorization_scope: "production-enabled".into(),
+            epoch_id: EPOCH_ID.into(),
+            runtime: TRANSACTION_MODEL.into(),
+            opening_epoch_sha256: layrs_direct_execution_v1::EPOCH_STATE_SHA256.into(),
+            opening_evidence_manifest_sha256: layrs_direct_execution_v1::EVIDENCE_MANIFEST_SHA256
+                .into(),
+            runtime_measurement: binding.clone(),
+            old_writer_fence_evidence_sha256: "1".repeat(64),
+            key_release_kms_key_id: "arn:aws:kms:us-east-1:111122223333:key/direct-runtime".into(),
+            expires_at_unix: 2_000,
+            governance_key_id: layrs_direct_execution_v1::GOVERNANCE_KEY_ID.into(),
+            signing_algorithm: layrs_direct_execution_v1::GOVERNANCE_SIGNING_ALGORITHM.into(),
+            signature: "deterministic-test-signature".into(),
+        }
+    }
+    async fn begin_test_bootstrap(
+        state: Arc<Mutex<EnclaveState>>,
+        grant: WriterGrant,
+        binding: RuntimeMeasurementBinding,
+        now: u64,
+        signature_valid: bool,
+    ) -> RuntimeResponse {
+        let kms_key_id = grant.key_release_kms_key_id.clone();
+        begin_governed_bootstrap_with_attestor(
+            state,
+            grant,
+            binding,
+            kms_key_id,
+            "production-enabled".into(),
+            now,
+            signature_valid,
+            |_, user_data, public_key| {
+                assert!(!user_data.is_empty());
+                assert!(!public_key.is_empty());
+                Ok(vec![0xa5; 128])
+            },
+        )
+        .await
+    }
+    async fn complete_test_bootstrap(
+        state: Arc<Mutex<EnclaveState>>,
+        grant: &WriterGrant,
+        decrypts: bool,
+    ) -> RuntimeResponse {
+        complete_governed_bootstrap_with_decryptor(
+            state,
+            grant.commitment(),
+            "2".repeat(64),
+            vec![0x42; 128],
+            vec![0x33; 32],
+            move |_, _| {
+                if decrypts {
+                    Ok(vec![0x44; 32])
+                } else {
+                    Err("KMS_RECIPIENT_DECRYPT_FAILED".into())
+                }
+            },
+        )
+        .await
     }
     async fn recover(
         state: Arc<Mutex<EnclaveState>>,
@@ -645,6 +1033,10 @@ mod tests {
             state_key: Vec::new(),
             commit_ack_key: Vec::new(),
             recovery_complete: false,
+            pending_governed_bootstrap: None,
+            writer_grant_commitment: None,
+            writer_grant_expires_at_unix: None,
+            key_release_artifact_hash: None,
         }));
         assert!(matches!(
             bootstrap_isolated(Arc::clone(&state), vec![7; 32], vec![8; 32], vec![9; 32]).await,
@@ -658,6 +1050,199 @@ mod tests {
             bootstrap_isolated(state, vec![7; 32], vec![8; 32], vec![1; 32]).await,
             RuntimeResponse::Error { ref code } if code == "ISOLATED_BOOTSTRAP_REJECTED"
         ));
+    }
+
+    #[tokio::test]
+    async fn governed_bootstrap_a_valid_grant_accepts_then_l_releases_only_after_checks() {
+        let binding = measurement_binding();
+        let grant = writer_grant(&binding);
+        let state = dormant_state();
+        assert!(matches!(
+            begin_test_bootstrap(Arc::clone(&state), grant.clone(), binding, 1_000, true).await,
+            RuntimeResponse::GovernedKeyRecipient { .. }
+        ));
+        {
+            let state = state.lock().await;
+            assert_eq!(state.mode, RuntimeMode::Dormant);
+            assert_eq!(state.state_key, vec![0; 32]);
+            assert!(state.writer_grant_commitment.is_none());
+        }
+        assert!(matches!(
+            complete_test_bootstrap(Arc::clone(&state), &grant, true).await,
+            RuntimeResponse::GovernedBootstrapComplete { .. }
+        ));
+        let state = state.lock().await;
+        assert_eq!(state.mode, RuntimeMode::ProductionEnabled);
+        assert!(state.runtime.writer_enabled());
+        assert_ne!(state.state_key, vec![0; 32]);
+        assert_eq!(state.commit_ack_key, vec![0x33; 32]);
+        assert_eq!(
+            state.writer_grant_commitment.as_deref(),
+            Some(grant.commitment().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn governed_bootstrap_b_through_e_rejects_mismatched_expired_and_tampered_grants() {
+        let binding = measurement_binding();
+        let grant = writer_grant(&binding);
+
+        let mut wrong_pcr = binding.clone();
+        wrong_pcr.pcr0 = "9".repeat(96);
+        assert!(matches!(
+            begin_test_bootstrap(
+                dormant_state(),
+                grant.clone(),
+                wrong_pcr,
+                1_000,
+                true
+            )
+            .await,
+            RuntimeResponse::Error { ref code } if code == "WRITER_GRANT_INVALID"
+        ));
+
+        let mut wrong_epoch = grant.clone();
+        wrong_epoch.epoch_id = "wrong-epoch".into();
+        assert!(matches!(
+            begin_test_bootstrap(
+                dormant_state(),
+                wrong_epoch,
+                binding.clone(),
+                1_000,
+                true
+            )
+            .await,
+            RuntimeResponse::Error { ref code } if code == "WRITER_GRANT_INVALID"
+        ));
+
+        assert!(matches!(
+            begin_test_bootstrap(
+                dormant_state(),
+                grant.clone(),
+                binding.clone(),
+                grant.expires_at_unix,
+                true
+            )
+            .await,
+            RuntimeResponse::Error { ref code } if code == "WRITER_GRANT_INVALID"
+        ));
+
+        assert!(matches!(
+            begin_test_bootstrap(dormant_state(), grant, binding, 1_000, false).await,
+            RuntimeResponse::Error { ref code } if code == "WRITER_GRANT_INVALID"
+        ));
+    }
+
+    #[tokio::test]
+    async fn governed_bootstrap_f_through_l_is_replay_safe_restart_safe_and_fail_closed() {
+        let binding = measurement_binding();
+        let grant = writer_grant(&binding);
+        let state = dormant_state();
+
+        // G/K: without a grant, no release request exists and the writer is
+        // independently dormant.
+        assert!(!state.lock().await.runtime.writer_enabled());
+        assert!(state.lock().await.pending_governed_bootstrap.is_none());
+
+        assert!(matches!(
+            begin_test_bootstrap(
+                Arc::clone(&state),
+                grant.clone(),
+                binding.clone(),
+                1_000,
+                true
+            )
+            .await,
+            RuntimeResponse::GovernedKeyRecipient { .. }
+        ));
+        // H: a failed recipient decrypt consumes the ephemeral attempt but
+        // never changes mode or installs keys.
+        assert!(matches!(
+            complete_test_bootstrap(Arc::clone(&state), &grant, false).await,
+            RuntimeResponse::Error { ref code } if code == "KMS_RECIPIENT_DECRYPT_FAILED"
+        ));
+        assert_eq!(state.lock().await.mode, RuntimeMode::Dormant);
+        assert!(state.lock().await.writer_grant_commitment.is_none());
+
+        // A fresh enclave retry can complete, representing enclave restart.
+        let restarted = dormant_state();
+        assert!(matches!(
+            begin_test_bootstrap(
+                Arc::clone(&restarted),
+                grant.clone(),
+                binding.clone(),
+                1_000,
+                true
+            )
+            .await,
+            RuntimeResponse::GovernedKeyRecipient { .. }
+        ));
+        assert!(matches!(
+            complete_test_bootstrap(Arc::clone(&restarted), &grant, true).await,
+            RuntimeResponse::GovernedBootstrapComplete { .. }
+        ));
+
+        // F/J: replay into the live enclave is rejected. A restarted parent
+        // can query the exact commitment and recognize the already-authorized
+        // enclave without replacing keys or state.
+        assert!(matches!(
+            begin_test_bootstrap(
+                Arc::clone(&restarted),
+                grant.clone(),
+                binding,
+                1_000,
+                true
+            )
+            .await,
+            RuntimeResponse::Error { ref code } if code == "WRITER_GRANT_REPLAY"
+        ));
+        let restarted = restarted.lock().await;
+        assert_eq!(
+            restarted.writer_grant_commitment.as_deref(),
+            Some(grant.commitment().as_str())
+        );
+        assert!(restarted.runtime.writer_enabled());
+    }
+
+    #[test]
+    fn kms_recipient_cms_unwraps_only_with_enclave_private_key() {
+        let (private_key, _) = generate_recipient_key().unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", "layrs-direct-test")
+            .unwrap();
+        let name = name.build();
+        let mut certificate = X509::builder().unwrap();
+        certificate.set_version(2).unwrap();
+        certificate.set_subject_name(&name).unwrap();
+        certificate.set_issuer_name(&name).unwrap();
+        certificate.set_pubkey(&private_key).unwrap();
+        certificate
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        certificate
+            .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        certificate
+            .sign(&private_key, MessageDigest::sha256())
+            .unwrap();
+        let certificate = certificate.build();
+        let mut recipients = Stack::new().unwrap();
+        recipients.push(certificate).unwrap();
+        let expected = [0x77u8; 32];
+        let cms = CmsContentInfo::encrypt(
+            &recipients,
+            &expected,
+            Cipher::aes_256_cbc(),
+            CMSOptions::BINARY,
+        )
+        .unwrap()
+        .to_der()
+        .unwrap();
+        let actual = decrypt_recipient_key(private_key, &cms).unwrap();
+        assert_eq!(actual, expected);
+
+        let (wrong_private_key, _) = generate_recipient_key().unwrap();
+        assert!(decrypt_recipient_key(wrong_private_key, &cms).is_err());
     }
 
     #[tokio::test]

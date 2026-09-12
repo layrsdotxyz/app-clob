@@ -418,6 +418,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-kms"
+version = "1.118.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c243864bc3754be9f0001414e0162fdf1370fa62c70b0cfbe1da6a6221d553c7"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-s3"
 version = "1.146.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3387,6 +3413,7 @@ version = "0.1.0"
 dependencies = [
  "aws-config",
  "aws-nitro-enclaves-nsm-api",
+ "aws-sdk-kms",
  "aws-sdk-s3",
  "aws-smithy-types",
  "axum",
@@ -3396,6 +3423,7 @@ dependencies = [
  "hmac 0.12.1",
  "layrs-clob-service",
  "native-tls",
+ "openssl",
  "p256",
  "postgres-native-tls",
  "reqwest 0.12.28",
@@ -3409,6 +3437,7 @@ dependencies = [
  "tokio-postgres",
  "tokio-vsock",
  "uuid 1.26.1",
+ "zeroize",
 ]
 
 [[package]]

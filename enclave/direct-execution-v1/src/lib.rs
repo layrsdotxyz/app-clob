@@ -346,6 +346,12 @@ impl RuntimeMeasurementBinding {
 #[serde(rename_all = "camelCase")]
 pub struct WriterGrant {
     pub activation_id: String,
+    /// Signed deployment scope. A production grant cannot be replayed into an
+    /// isolated or non-production runtime.
+    pub environment: String,
+    /// Exact capability released at startup. It is intentionally not a set of
+    /// command permissions or a renewable lease.
+    pub authorization_scope: String,
     pub epoch_id: String,
     /// Binds a grant to direct execution rather than any legacy command
     /// runtime.
@@ -355,6 +361,9 @@ pub struct WriterGrant {
     pub opening_evidence_manifest_sha256: String,
     pub runtime_measurement: RuntimeMeasurementBinding,
     pub old_writer_fence_evidence_sha256: String,
+    /// Existing KMS CMK that may release the enclave-only runtime root key.
+    /// This is a reference, never key material.
+    pub key_release_kms_key_id: String,
     pub expires_at_unix: u64,
     /// KMS key alias and algorithm are signed fields, not deployment inputs.
     pub governance_key_id: String,
@@ -383,6 +392,11 @@ impl WriterGrant {
         binding: &RuntimeMeasurementBinding,
     ) -> Option<Vec<u8>> {
         if self.activation_id.is_empty()
+            || self.environment != "production"
+            || !matches!(
+                self.authorization_scope.as_str(),
+                "admission-enabled" | "production-enabled"
+            )
             || self.epoch_id != EPOCH_ID
             || self.runtime != TRANSACTION_MODEL
             || self.opening_epoch_sha256 != EPOCH_STATE_SHA256
@@ -390,6 +404,8 @@ impl WriterGrant {
             || !binding.valid()
             || &self.runtime_measurement != binding
             || self.old_writer_fence_evidence_sha256.len() != 64
+            || self.key_release_kms_key_id.is_empty()
+            || self.key_release_kms_key_id.len() > 2_048
             || self.expires_at_unix <= now_unix
             || self.governance_key_id != GOVERNANCE_KEY_ID
             || self.signing_algorithm != GOVERNANCE_SIGNING_ALGORITHM
@@ -399,6 +415,13 @@ impl WriterGrant {
         let mut unsigned = self.clone();
         unsigned.signature.clear();
         serde_json::to_vec(&unsigned).ok()
+    }
+
+    /// Stable commitment used by the enclave bootstrap, KMS encryption
+    /// context, and immutable key-release record. It includes the signature,
+    /// so a different authorization can never reuse a prior release.
+    pub fn commitment(&self) -> String {
+        sha256(&serde_json::to_vec(self).unwrap_or_default())
     }
 
     fn verify_with_key(&self, verifying_key: &VerifyingKey, bytes: &[u8]) -> bool {
@@ -420,6 +443,57 @@ impl WriterGrant {
     ) -> bool {
         self.unsigned_bytes(now_unix, binding)
             .is_some_and(|bytes| self.verify_with_key(verifying_key, &bytes))
+    }
+}
+
+/// Public, immutable metadata for the KMS-wrapped direct-runtime root key.
+/// The plaintext key is returned only as KMS CiphertextForRecipient to the
+/// attested enclave and is never present in this record or the parent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GovernedKeyReleaseArtifact {
+    pub protocol: String,
+    pub activation_id: String,
+    pub writer_grant_commitment: String,
+    pub runtime_measurement: RuntimeMeasurementBinding,
+    pub kms_key_id: String,
+    pub encryption_context: BTreeMap<String, String>,
+    pub ciphertext_blob: Vec<u8>,
+}
+
+impl GovernedKeyReleaseArtifact {
+    pub fn verify_for(
+        &self,
+        grant: &WriterGrant,
+        binding: &RuntimeMeasurementBinding,
+        kms_key_id: &str,
+    ) -> bool {
+        self.protocol == "layrs.direct-execution.key-release.v1"
+            && self.activation_id == grant.activation_id
+            && self.writer_grant_commitment == grant.commitment()
+            && &self.runtime_measurement == binding
+            && self.kms_key_id == kms_key_id
+            && !self.ciphertext_blob.is_empty()
+            && self.ciphertext_blob.len() <= 65_536
+            && self
+                .encryption_context
+                .get("layrs-runtime")
+                .map(String::as_str)
+                == Some(TRANSACTION_MODEL)
+            && self
+                .encryption_context
+                .get("layrs-epoch")
+                .map(String::as_str)
+                == Some(EPOCH_ID)
+            && self
+                .encryption_context
+                .get("layrs-writer-grant")
+                .map(String::as_str)
+                == Some(self.writer_grant_commitment.as_str())
+    }
+
+    pub fn artifact_hash(&self) -> String {
+        sha256(&serde_cbor::to_vec(self).unwrap_or_default())
     }
 }
 
@@ -2239,6 +2313,26 @@ pub enum RuntimeRequest {
         nonce: Vec<u8>,
     },
     Status,
+    /// First half of the production startup authorization. The enclave
+    /// verifies the governed grant before creating an NSM-attested ephemeral
+    /// recipient key. No writer state or key material is installed yet.
+    BeginGovernedBootstrap {
+        grant: WriterGrant,
+        binding: RuntimeMeasurementBinding,
+        kms_key_id: String,
+        requested_mode: String,
+    },
+    /// Completes the same bounded startup exchange with KMS
+    /// CiphertextForRecipient. Only the enclave can unwrap it. This is an
+    /// authorization bootstrap, not a financial command lifecycle.
+    CompleteGovernedBootstrap {
+        writer_grant_commitment: String,
+        key_release_artifact_hash: String,
+        ciphertext_for_recipient: Vec<u8>,
+        /// Existing parent durability-ACK credential. It is not a custody or
+        /// ledger decryption key and is delivered only after grant validation.
+        commit_ack_key: Vec<u8>,
+    },
     /// Startup-only protected-key handoff for an explicitly isolated test
     /// runtime.  Nitro does not propagate the parent's systemd environment
     /// into an EIF, so test keys must cross the already-authenticated VSOCK
@@ -2281,6 +2375,15 @@ pub enum RuntimeResponse {
     Status {
         status: RuntimeStatus,
     },
+    GovernedKeyRecipient {
+        attestation_document: Vec<u8>,
+        writer_grant_commitment: String,
+        kms_key_id: String,
+        encryption_context: BTreeMap<String, String>,
+    },
+    GovernedBootstrapComplete {
+        writer_grant_commitment: String,
+    },
     BootstrapComplete,
     Execute {
         result: DirectResult,
@@ -2311,12 +2414,21 @@ pub struct RuntimeBinding {
     pub admission_enabled: bool,
     pub identity_count: usize,
     pub projection_schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_grant_commitment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_grant_expires_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_release_artifact_hash: Option<String>,
 }
 pub type RuntimeStatus = RuntimeBinding;
 pub fn runtime_binding(
     identity_count: usize,
     writer_enabled: bool,
     admission_enabled: bool,
+    writer_grant_commitment: Option<String>,
+    writer_grant_expires_at_unix: Option<u64>,
+    key_release_artifact_hash: Option<String>,
 ) -> RuntimeBinding {
     RuntimeBinding {
         runtime: "layrs.direct-execution.nitro.v1".into(),
@@ -2328,6 +2440,9 @@ pub fn runtime_binding(
         admission_enabled,
         identity_count,
         projection_schema_version: PROJECTION_SCHEMA_VERSION,
+        writer_grant_commitment,
+        writer_grant_expires_at_unix,
+        key_release_artifact_hash,
     }
 }
 pub fn request_hash(request: &DirectRequest) -> String {
@@ -3044,12 +3159,15 @@ mod tests {
         };
         let mut grant = WriterGrant {
             activation_id: "step6-review-id".into(),
+            environment: "production".into(),
+            authorization_scope: "production-enabled".into(),
             epoch_id: EPOCH_ID.into(),
             runtime: TRANSACTION_MODEL.into(),
             opening_epoch_sha256: EPOCH_STATE_SHA256.into(),
             opening_evidence_manifest_sha256: EVIDENCE_MANIFEST_SHA256.into(),
             runtime_measurement: binding.clone(),
             old_writer_fence_evidence_sha256: "a".repeat(64),
+            key_release_kms_key_id: "arn:aws:kms:us-east-1:111122223333:key/example".into(),
             expires_at_unix: 200,
             governance_key_id: GOVERNANCE_KEY_ID.into(),
             signing_algorithm: GOVERNANCE_SIGNING_ALGORITHM.into(),
@@ -3068,6 +3186,9 @@ mod tests {
         grant.runtime = "legacy.durable-command.v1".into();
         assert!(!grant.verify_with_test_key(100, &binding, &verifying_key));
         grant.runtime = TRANSACTION_MODEL.into();
+        grant.environment = "isolated".into();
+        assert!(!grant.verify_with_test_key(100, &binding, &verifying_key));
+        grant.environment = "production".into();
         grant.opening_epoch_sha256 = "b".repeat(64);
         assert!(!grant.verify_with_test_key(100, &binding, &verifying_key));
         grant.opening_epoch_sha256 = EPOCH_STATE_SHA256.into();
@@ -3076,6 +3197,62 @@ mod tests {
         grant.epoch_id = EPOCH_ID.into();
         grant.runtime_measurement.pcr0 = "0".repeat(96);
         assert!(!grant.verify_with_test_key(100, &binding, &verifying_key));
+    }
+
+    #[test]
+    fn governed_key_release_artifact_is_exactly_grant_and_measurement_bound() {
+        use p256::ecdsa::{signature::Signer, SigningKey};
+        let signing_key = SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
+        let binding = RuntimeMeasurementBinding {
+            ami_id: "ami-0123456789abcdef0".into(),
+            eif_sha256: "b".repeat(64),
+            pcr0: "c".repeat(96),
+            pcr1: "d".repeat(96),
+            pcr2: "e".repeat(96),
+            source_commit: "key-release-test".into(),
+            enclave_sha256: "f".repeat(64),
+            parent_sha256: "a".repeat(64),
+        };
+        let mut grant = WriterGrant {
+            activation_id: "key-release-test".into(),
+            environment: "production".into(),
+            authorization_scope: "production-enabled".into(),
+            epoch_id: EPOCH_ID.into(),
+            runtime: TRANSACTION_MODEL.into(),
+            opening_epoch_sha256: EPOCH_STATE_SHA256.into(),
+            opening_evidence_manifest_sha256: EVIDENCE_MANIFEST_SHA256.into(),
+            runtime_measurement: binding.clone(),
+            old_writer_fence_evidence_sha256: "1".repeat(64),
+            key_release_kms_key_id: "arn:aws:kms:us-east-1:1:key/test".into(),
+            expires_at_unix: 200,
+            governance_key_id: GOVERNANCE_KEY_ID.into(),
+            signing_algorithm: GOVERNANCE_SIGNING_ALGORITHM.into(),
+            signature: String::new(),
+        };
+        let signature: Signature = signing_key.sign(&serde_json::to_vec(&grant).unwrap());
+        grant.signature = STANDARD.encode(signature.to_der().as_bytes());
+        let artifact = GovernedKeyReleaseArtifact {
+            protocol: "layrs.direct-execution.key-release.v1".into(),
+            activation_id: grant.activation_id.clone(),
+            writer_grant_commitment: grant.commitment(),
+            runtime_measurement: binding.clone(),
+            kms_key_id: grant.key_release_kms_key_id.clone(),
+            encryption_context: BTreeMap::from([
+                ("layrs-runtime".into(), TRANSACTION_MODEL.into()),
+                ("layrs-epoch".into(), EPOCH_ID.into()),
+                ("layrs-writer-grant".into(), grant.commitment()),
+            ]),
+            ciphertext_blob: vec![7; 64],
+        };
+        assert!(artifact.verify_for(&grant, &binding, &grant.key_release_kms_key_id));
+        let mut conflict = artifact.clone();
+        conflict.runtime_measurement.pcr0 = "9".repeat(96);
+        assert!(!conflict.verify_for(&grant, &binding, &grant.key_release_kms_key_id));
+        let mut conflict = artifact;
+        conflict
+            .encryption_context
+            .insert("layrs-writer-grant".into(), "0".repeat(64));
+        assert!(!conflict.verify_for(&grant, &binding, &grant.key_release_kms_key_id));
     }
 
     #[test]

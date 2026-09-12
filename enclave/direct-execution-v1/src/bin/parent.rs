@@ -1,5 +1,10 @@
 //! Parent boundary for the clean direct runtime.  A Privy-verified BFF mints
 //! short-lived signed sessions; the browser never supplies an auth subject or enclave frame.
+use aws_sdk_kms::{
+    primitives::Blob as KmsBlob,
+    types::{DataKeySpec, KeyEncryptionMechanism, RecipientInfo},
+    Client as KmsClient,
+};
 use aws_sdk_s3::{
     primitives::ByteStream,
     types::{ObjectLockMode, ServerSideEncryption},
@@ -26,10 +31,10 @@ use layrs_direct_execution_v1::{
     artifact_hash, identity_commitment_for, reference_for, request_hash, sha256, sign,
     DirectAction, DirectReceipt, DirectRequest, DirectResult, DirectStateArtifact, DurabilityAck,
     ExternalEffectIntent, ExternalEffectRecovery, FilesystemImmutableArtifactStore,
-    FilesystemImmutableIntentStore, GovernedMarketRegistration, ImmutableExternalEffectIntentStore,
-    OrderAction, Outcome, ProjectionBalanceRow, ProjectionIdentityRow, ProjectionWalletRow,
-    RuntimeMeasurementBinding, RuntimeRequest, RuntimeResponse, SealedEpoch, TimeInForce,
-    WriterGrant, EPOCH_ID, POSTGRES_PROJECTION_DDL,
+    FilesystemImmutableIntentStore, GovernedKeyReleaseArtifact, GovernedMarketRegistration,
+    ImmutableExternalEffectIntentStore, OrderAction, Outcome, ProjectionBalanceRow,
+    ProjectionIdentityRow, ProjectionWalletRow, RuntimeMeasurementBinding, RuntimeRequest,
+    RuntimeResponse, SealedEpoch, TimeInForce, WriterGrant, EPOCH_ID, POSTGRES_PROJECTION_DDL,
 };
 use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
@@ -43,7 +48,9 @@ use sha2::Sha256;
 use sha3::{Digest as KeccakDigest, Keccak256};
 use std::{
     collections::{BTreeMap, HashSet},
-    env, io,
+    env,
+    fs::{self, OpenOptions},
+    io,
     net::IpAddr,
     path::PathBuf,
     sync::Arc,
@@ -76,6 +83,15 @@ struct AppState {
     financial_gate: Arc<Mutex<()>>,
     committed_state_root: Arc<Mutex<Option<String>>>,
     unresolved_external_effects: Arc<Mutex<BTreeMap<String, ExternalEffectIntent>>>,
+    governed_bootstrap: Option<GovernedBootstrapConfig>,
+}
+
+#[derive(Clone)]
+struct GovernedBootstrapConfig {
+    grant: WriterGrant,
+    binding: RuntimeMeasurementBinding,
+    kms_key_id: String,
+    requested_mode: String,
 }
 
 #[derive(Clone)]
@@ -701,6 +717,59 @@ impl ArchiveStore {
             Self::S3(store) => store.load_intents().await,
         }
     }
+    async fn load_key_release(
+        &self,
+        activation_id: &str,
+    ) -> Result<Option<GovernedKeyReleaseArtifact>, String> {
+        match self {
+            Self::Filesystem(store) => {
+                let path = store
+                    .root()
+                    .join("authorization")
+                    .join(format!("{activation_id}.cbor"));
+                match fs::read(path) {
+                    Ok(bytes) => serde_cbor::from_slice(&bytes)
+                        .map(Some)
+                        .map_err(|_| "key-release artifact decode failed".into()),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                    Err(_) => Err("key-release artifact read failed".into()),
+                }
+            }
+            Self::S3(store) => store.load_key_release(activation_id).await,
+        }
+    }
+    async fn persist_key_release(
+        &self,
+        artifact: &GovernedKeyReleaseArtifact,
+    ) -> Result<GovernedKeyReleaseArtifact, String> {
+        match self {
+            Self::Filesystem(store) => {
+                let directory = store.root().join("authorization");
+                fs::create_dir_all(&directory).map_err(|_| "key-release directory unavailable")?;
+                let path = directory.join(format!("{}.cbor", artifact.activation_id));
+                let bytes = serde_cbor::to_vec(artifact)
+                    .map_err(|_| "key-release artifact encoding failed")?;
+                match OpenOptions::new().create_new(true).write(true).open(&path) {
+                    Ok(mut file) => {
+                        std::io::Write::write_all(&mut file, &bytes)
+                            .and_then(|_| file.sync_all())
+                            .map_err(|_| "key-release artifact write failed")?;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(_) => return Err("key-release artifact immutable write failed".into()),
+                }
+                let restored: GovernedKeyReleaseArtifact = serde_cbor::from_slice(
+                    &fs::read(path).map_err(|_| "key-release artifact readback failed")?,
+                )
+                .map_err(|_| "key-release artifact decode failed")?;
+                if restored != *artifact {
+                    return Err("key-release artifact conflict".into());
+                }
+                Ok(restored)
+            }
+            Self::S3(store) => store.persist_key_release(artifact).await,
+        }
+    }
 }
 
 impl S3ImmutableArtifactStore {
@@ -753,6 +822,9 @@ impl S3ImmutableArtifactStore {
             "{}/external-effect-intents/{}.cbor",
             self.prefix, intent.intent_hash
         )
+    }
+    fn key_release_key(&self, activation_id: &str) -> String {
+        format!("{}/authorization/{}.cbor", self.prefix, activation_id)
     }
     async fn read(&self, key: &str) -> Result<Vec<u8>, String> {
         Ok(self
@@ -903,6 +975,49 @@ impl S3ImmutableArtifactStore {
         }
         Ok(intents.into_values().collect())
     }
+    async fn load_key_release(
+        &self,
+        activation_id: &str,
+    ) -> Result<Option<GovernedKeyReleaseArtifact>, String> {
+        let key = self.key_release_key(activation_id);
+        let listing = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(&key)
+            .send()
+            .await
+            .map_err(|_| "key-release artifact listing failed")?;
+        let matching: Vec<_> = listing
+            .contents()
+            .iter()
+            .filter(|object| object.key() == Some(key.as_str()))
+            .collect();
+        if matching.is_empty() {
+            return Ok(None);
+        }
+        if matching.len() != 1 {
+            return Err("duplicate key-release artifacts".into());
+        }
+        serde_cbor::from_slice(&self.read(&key).await?)
+            .map(Some)
+            .map_err(|_| "key-release artifact decode failed".into())
+    }
+    async fn persist_key_release(
+        &self,
+        artifact: &GovernedKeyReleaseArtifact,
+    ) -> Result<GovernedKeyReleaseArtifact, String> {
+        let key = self.key_release_key(&artifact.activation_id);
+        let bytes =
+            serde_cbor::to_vec(artifact).map_err(|_| "key-release artifact encoding failed")?;
+        self.write_once(&key, bytes).await?;
+        let restored: GovernedKeyReleaseArtifact = serde_cbor::from_slice(&self.read(&key).await?)
+            .map_err(|_| "key-release artifact decode failed")?;
+        if restored != *artifact || restored.artifact_hash() != artifact.artifact_hash() {
+            return Err("key-release artifact readback mismatch".into());
+        }
+        Ok(restored)
+    }
 }
 
 #[derive(Clone)]
@@ -1024,7 +1139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(_) => None,
     };
-    if matches!(
+    let governed_bootstrap = if matches!(
         execution_mode.as_deref(),
         Some("admission-enabled" | "production-enabled")
     ) {
@@ -1044,13 +1159,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !grant.verify(now, &binding) {
             return Err("production writer grant signature is invalid".into());
         }
+        let kms_key_id = env::var("LAYRS_DIRECT_KEY_RELEASE_KMS_KEY_ID")
+            .map_err(|_| "production key-release KMS reference is required")?;
+        if kms_key_id != grant.key_release_kms_key_id {
+            return Err("production key-release KMS reference mismatch".into());
+        }
         projection
             .as_ref()
             .ok_or("production projection is required")?
             .verify_governed_runtime_mode(&grant, financial_enabled)
             .await
             .map_err(|_| "runtime authorization and writer fence verification failed")?;
-    }
+        Some(GovernedBootstrapConfig {
+            grant,
+            binding,
+            kms_key_id,
+            requested_mode: execution_mode.clone().unwrap_or_default(),
+        })
+    } else {
+        None
+    };
     let state = AppState {
         enclave_cid: env::var("LAYRS_ENCLAVE_CID")
             .unwrap_or_else(|_| "16".into())
@@ -1080,11 +1208,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         financial_gate: Arc::new(Mutex::new(())),
         committed_state_root: Arc::new(Mutex::new(None)),
         unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
+        governed_bootstrap,
     };
     // A Nitro EIF does not inherit the parent's systemd environment.  The
     // isolated test key material therefore crosses the existing VSOCK channel
     // once, before recovery; production never uses this bootstrap.
     bootstrap_isolated_enclave(&state).await?;
+    bootstrap_governed_enclave(&state).await?;
     // The HTTP parent never accepts a financial command until it has supplied
     // the immutable archive's complete, head-verified recovery set and the
     // enclave has independently reconstructed it.  PostgreSQL is excluded.
@@ -2298,6 +2428,178 @@ async fn bootstrap_isolated_enclave(state: &AppState) -> io::Result<()> {
     }
 }
 
+async fn bootstrap_governed_enclave(state: &AppState) -> io::Result<()> {
+    let Some(config) = &state.governed_bootstrap else {
+        return Ok(());
+    };
+    if state.commit_ack_key.len() != 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "DIRECT_COMMIT_ACK_KEY_NOT_CONFIGURED",
+        ));
+    }
+    let expected_commitment = config.grant.commitment();
+    let begin = exchange(
+        state,
+        RuntimeRequest::BeginGovernedBootstrap {
+            grant: config.grant.clone(),
+            binding: config.binding.clone(),
+            kms_key_id: config.kms_key_id.clone(),
+            requested_mode: config.requested_mode.clone(),
+        },
+    )
+    .await?;
+    if matches!(begin, RuntimeResponse::Error { ref code } if code == "WRITER_GRANT_REPLAY") {
+        return match exchange(state, RuntimeRequest::Status).await? {
+            RuntimeResponse::Status { status }
+                if status.writer_grant_commitment.as_deref()
+                    == Some(expected_commitment.as_str())
+                    && ((config.requested_mode == "production-enabled"
+                        && status.writer_enabled)
+                        || (config.requested_mode == "admission-enabled"
+                            && status.admission_enabled
+                            && !status.writer_enabled)) =>
+            {
+                Ok(())
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "GOVERNED_BOOTSTRAP_REPLAY_MISMATCH",
+            )),
+        };
+    }
+    let RuntimeResponse::GovernedKeyRecipient {
+        attestation_document,
+        writer_grant_commitment,
+        kms_key_id,
+        encryption_context,
+    } = begin
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "GOVERNED_BOOTSTRAP_BEGIN_FAILED",
+        ));
+    };
+    if writer_grant_commitment != expected_commitment
+        || kms_key_id != config.kms_key_id
+        || attestation_document.is_empty()
+        || encryption_context
+            .get("layrs-writer-grant")
+            .map(String::as_str)
+            != Some(expected_commitment.as_str())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "GOVERNED_BOOTSTRAP_RECIPIENT_MISMATCH",
+        ));
+    }
+    let store = state.artifact_store.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "DIRECT_ARTIFACT_STORE_NOT_CONFIGURED",
+        )
+    })?;
+    let aws = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    let kms = KmsClient::new(&aws);
+    let recipient = RecipientInfo::builder()
+        .key_encryption_algorithm(KeyEncryptionMechanism::RsaesOaepSha256)
+        .attestation_document(KmsBlob::new(attestation_document))
+        .build();
+    let encryption_context_map: std::collections::HashMap<String, String> =
+        encryption_context.clone().into_iter().collect();
+    let (artifact, ciphertext_for_recipient) = match store
+        .load_key_release(&config.grant.activation_id)
+        .await
+        .map_err(invalid)?
+    {
+        Some(artifact) => {
+            if !artifact.verify_for(&config.grant, &config.binding, &config.kms_key_id) {
+                return Err(invalid("KEY_RELEASE_ARTIFACT_INVALID"));
+            }
+            let output = kms
+                .decrypt()
+                .key_id(&config.kms_key_id)
+                .ciphertext_blob(KmsBlob::new(artifact.ciphertext_blob.clone()))
+                .set_encryption_context(Some(encryption_context_map.clone()))
+                .recipient(recipient)
+                .send()
+                .await
+                .map_err(|_| invalid("KMS_ATTESTED_KEY_RELEASE_FAILED"))?;
+            if output.plaintext().is_some() {
+                return Err(invalid("KMS_RETURNED_PARENT_PLAINTEXT"));
+            }
+            let ciphertext = output
+                .ciphertext_for_recipient()
+                .ok_or_else(|| invalid("KMS_RECIPIENT_CIPHERTEXT_MISSING"))?
+                .as_ref()
+                .to_vec();
+            (artifact, ciphertext)
+        }
+        None => {
+            let output = kms
+                .generate_data_key()
+                .key_id(&config.kms_key_id)
+                .key_spec(DataKeySpec::Aes256)
+                .set_encryption_context(Some(encryption_context_map.clone()))
+                .recipient(recipient)
+                .send()
+                .await
+                .map_err(|_| invalid("KMS_ATTESTED_DATA_KEY_FAILED"))?;
+            if output.plaintext().is_some() {
+                return Err(invalid("KMS_RETURNED_PARENT_PLAINTEXT"));
+            }
+            let ciphertext_blob = output
+                .ciphertext_blob()
+                .ok_or_else(|| invalid("KMS_CIPHERTEXT_BLOB_MISSING"))?
+                .as_ref()
+                .to_vec();
+            let ciphertext_for_recipient = output
+                .ciphertext_for_recipient()
+                .ok_or_else(|| invalid("KMS_RECIPIENT_CIPHERTEXT_MISSING"))?
+                .as_ref()
+                .to_vec();
+            let artifact = GovernedKeyReleaseArtifact {
+                protocol: "layrs.direct-execution.key-release.v1".into(),
+                activation_id: config.grant.activation_id.clone(),
+                writer_grant_commitment: expected_commitment.clone(),
+                runtime_measurement: config.binding.clone(),
+                kms_key_id: config.kms_key_id.clone(),
+                encryption_context: encryption_context.clone(),
+                ciphertext_blob,
+            };
+            if !artifact.verify_for(&config.grant, &config.binding, &config.kms_key_id) {
+                return Err(invalid("KEY_RELEASE_ARTIFACT_INVALID"));
+            }
+            let artifact = store
+                .persist_key_release(&artifact)
+                .await
+                .map_err(invalid)?;
+            (artifact, ciphertext_for_recipient)
+        }
+    };
+    let artifact_hash = artifact.artifact_hash();
+    match exchange(
+        state,
+        RuntimeRequest::CompleteGovernedBootstrap {
+            writer_grant_commitment: expected_commitment.clone(),
+            key_release_artifact_hash: artifact_hash,
+            ciphertext_for_recipient,
+            commit_ack_key: state.commit_ack_key.clone(),
+        },
+    )
+    .await?
+    {
+        RuntimeResponse::GovernedBootstrapComplete {
+            writer_grant_commitment,
+        } if writer_grant_commitment == expected_commitment => Ok(()),
+        RuntimeResponse::Error { code } => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("GOVERNED_BOOTSTRAP_FAILED:{code}"),
+        )),
+        _ => Err(invalid("GOVERNED_BOOTSTRAP_UNEXPECTED_RESPONSE")),
+    }
+}
+
 /// One bounded direct request.  The first response is deliberately not a
 /// customer result: it is an opaque encrypted successor that must be stored
 /// immutably and read back before this parent can issue an acknowledgement.
@@ -2449,6 +2751,7 @@ mod tests {
             financial_gate: Arc::new(Mutex::new(())),
             committed_state_root: Arc::new(Mutex::new(None)),
             unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
+            governed_bootstrap: None,
         };
         assert!(authenticated(&headers, &state).is_ok());
         headers.insert("authorization", "Bearer bad".parse().unwrap());

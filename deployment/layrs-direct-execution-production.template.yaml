@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Dormant Layrs direct-execution Nitro parent. It intentionally creates no writer route or running capacity.
+Description: Governed Layrs direct-execution Nitro runtime. Defaults dormant and writer-disabled.
 Parameters:
   VpcId: { Type: AWS::EC2::VPC::Id }
   PrivateSubnetId: { Type: AWS::EC2::Subnet::Id }
@@ -26,6 +26,22 @@ Parameters:
   DatabasePort: { Type: Number, Default: 5432 }
   RpcSecretArn: { Type: String }
   OperationalIdentityKmsKeyArn: { Type: String }
+  ExecutionMode:
+    Type: String
+    Default: dormant
+    AllowedValues: [dormant, admission-enabled, production-enabled]
+  WriterGrantBase64:
+    Type: String
+    Default: ''
+    NoEcho: true
+  ApprovedRuntimeBindingBase64:
+    Type: String
+    Default: ''
+    NoEcho: true
+  WriterGrantCommitment: { Type: String, Default: '' }
+  ApprovedPcr0: { Type: String, Default: '' }
+  ApprovedPcr1: { Type: String, Default: '' }
+  ApprovedPcr2: { Type: String, Default: '' }
   BasePoolAddress: { Type: String, AllowedPattern: '^0x[0-9a-fA-F]{40}$' }
   BaseConfirmations: { Type: Number, MinValue: 1 }
   # A dormant verifier may run to support attestation and health checks, but
@@ -55,12 +71,26 @@ Resources:
               - Effect: Allow
                 Action: [kms:Decrypt, kms:DescribeKey]
                 Resource: !Ref DatabaseSecretKmsKeyArn
+              - Effect: Allow
+                Action: [kms:GenerateDataKey, kms:Decrypt]
+                Resource: !Ref OperationalIdentityKmsKeyArn
+                Condition:
+                  StringEquals:
+                    kms:RecipientAttestation:PCR0: !Ref ApprovedPcr0
+                    kms:RecipientAttestation:PCR1: !Ref ApprovedPcr1
+                    kms:RecipientAttestation:PCR2: !Ref ApprovedPcr2
+                    kms:EncryptionContext:layrs-runtime: layrs.direct-execution.v1
+                    kms:EncryptionContext:layrs-epoch: layrs-opening-epoch-20260911-941107537728c98b
+                    kms:EncryptionContext:layrs-writer-grant: !Ref WriterGrantCommitment
+              - Effect: Allow
+                Action: [kms:DescribeKey]
+                Resource: !Ref OperationalIdentityKmsKeyArn
               # The read-only runtime may retrieve only its existing Privy
               # application configuration.  It cannot list,
               # create, update, rotate, or delete Secrets Manager objects.
               - Effect: Allow
                 Action: [secretsmanager:GetSecretValue]
-                Resource: [!Ref RuntimeSecretArn, !Ref DatabaseSecretArn, !Ref DatabaseCaSecretArn]
+                Resource: [!Ref RuntimeSecretArn, !Ref DatabaseSecretArn, !Ref DatabaseCaSecretArn, !Ref RpcSecretArn]
               - Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
                 Resource: !GetAtt RuntimeLogGroup.Arn
@@ -116,6 +146,8 @@ Resources:
             install -d -m 0700 /etc/layrs-opening
             /usr/bin/python3 - <<'PY'
             import json
+            import base64
+            import hashlib
             import os
             import subprocess
             import tempfile
@@ -142,6 +174,7 @@ Resources:
             runtime = secret("${RuntimeSecretArn}")
             database = secret("${DatabaseSecretArn}")
             database_ca = secret("${DatabaseCaSecretArn}")
+            rpc = secret("${RpcSecretArn}")
             database_url = "postgresql://{}:{}@{}:{}/{}?sslmode=require".format(
                 quote(required(database, "username"), safe=""),
                 quote(required(database, "password"), safe=""),
@@ -150,7 +183,7 @@ Resources:
                 quote("${DatabaseName}", safe=""),
             )
             values = {
-                "LAYRS_DIRECT_EXECUTION_MODE": "dormant",
+                "LAYRS_DIRECT_EXECUTION_MODE": "${ExecutionMode}",
                 # This guarded VPC listener serves only signed, encrypted
                 # balance reads from the dedicated BFF.  The enclave remains
                 # dormant and the parent rejects every financial command.
@@ -165,7 +198,31 @@ Resources:
                 "LAYRSV2_PRIVY_APP_SECRET": required(runtime, "privyAppSecret"),
                 "LAYRS_DIRECT_PROJECTION_DATABASE_URL": database_url,
                 "LAYRS_DIRECT_PROJECTION_DATABASE_CA_PEM": required(database_ca, "databaseCaPem"),
+                "LAYRS_DIRECT_KEY_RELEASE_KMS_KEY_ID": "${OperationalIdentityKmsKeyArn}",
+                "LAYRS_DIRECT_COMMIT_ACK_KEY_HEX": hashlib.sha256(
+                    b"layrs.direct-execution.durability-ack.v1\\0" +
+                    required(runtime, "receiptShareHmacSecret").encode("utf-8")
+                ).hexdigest(),
             }
+            if "${ExecutionMode}" in ("admission-enabled", "production-enabled"):
+                writer_grant = base64.b64decode("${WriterGrantBase64}", validate=True).decode("utf-8")
+                runtime_binding = base64.b64decode("${ApprovedRuntimeBindingBase64}", validate=True).decode("utf-8")
+                json.loads(writer_grant)
+                json.loads(runtime_binding)
+                values.update({
+                    "LAYRS_DIRECT_WRITER_GRANT_JSON": writer_grant,
+                    "LAYRS_DIRECT_APPROVED_RUNTIME_BINDING_JSON": runtime_binding,
+                })
+            if "${ExecutionMode}" == "production-enabled":
+                values.update({
+                    "LAYRS_DIRECT_CUSTODY_PROVIDER": "privy-base-existing-pool-ledger",
+                    "LAYRSV2_BASE_POOL_LEDGER_PRIVY_ADDRESS": required(runtime, "basePoolLedgerPrivyAddress"),
+                    "LAYRSV2_BASE_POOL_LEDGER_PRIVY_WALLET_ID": required(runtime, "basePoolLedgerPrivyWalletId"),
+                    "LAYRSV2_BASE_POOL_LEDGER_PRIVY_AUTH_PRIVATE_KEY_PEM": required(runtime, "basePoolLedgerPrivyAuthPrivateKeyPem"),
+                    "LAYRSV2_BASE_POOL_ADDRESS": "${BasePoolAddress}",
+                    "LAYRSV2_BASE_RPC_URL": required(rpc, "baseRpcUrl"),
+                    "LAYRSV2_BASE_CONFIRMATIONS": "${BaseConfirmations}",
+                })
             def quote(value):
                 return '"' + value.replace('\\\\', '\\\\\\\\').replace('"', '\\\\"').replace('\n', '\\n') + '"'
             fd, temporary = tempfile.mkstemp(prefix="direct-runtime.", dir="/etc/layrs-opening")
