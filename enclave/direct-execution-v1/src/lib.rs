@@ -76,6 +76,8 @@ pub enum RuntimeError {
     IdentityAlreadyAdmitted,
     #[error("withdrawal destination is not the caller's verified embedded wallet")]
     DestinationDenied,
+    #[error("custody reference has already been committed")]
+    CustodyReferenceReuse,
     #[error("insufficient available balance")]
     InsufficientAvailable,
     #[error("unknown order")]
@@ -715,6 +717,11 @@ pub struct DirectRuntime {
     position_cost_basis: BTreeMap<(String, String, Outcome), u128>,
     market_collateral: BTreeMap<String, u128>,
     fee_revenue_atomic: u128,
+    /// Finalized external inflows are consumed exactly once across every
+    /// account and request id. The reference is derived from the Base
+    /// transaction hash after the parent has independently verified the
+    /// transfer and finality.
+    credited_custody_references: BTreeSet<String>,
     requests: BTreeMap<(String, String), (String, DirectResult)>,
     receipt_key: Vec<u8>,
     mode: RuntimeMode,
@@ -813,6 +820,8 @@ struct DirectState {
     position_cost_basis: BTreeMap<(String, String, Outcome), u128>,
     market_collateral: BTreeMap<String, u128>,
     fee_revenue_atomic: u128,
+    #[serde(default)]
+    credited_custody_references: BTreeSet<String>,
     requests: BTreeMap<(String, String), (String, DirectResult)>,
 }
 
@@ -1036,6 +1045,7 @@ impl DirectRuntime {
             position_cost_basis: BTreeMap::new(),
             market_collateral: BTreeMap::new(),
             fee_revenue_atomic: 0,
+            credited_custody_references: BTreeSet::new(),
             requests: BTreeMap::new(),
             receipt_key,
             mode,
@@ -1138,8 +1148,17 @@ impl DirectRuntime {
                     custody_reference,
                 } => {
                     let value = amount(amount_atomic)?;
-                    if custody_reference.is_empty() {
+                    if custody_reference.is_empty()
+                        || (self.mode == RuntimeMode::ProductionEnabled
+                            && !valid_deposit_custody_reference(custody_reference))
+                    {
                         return Err(RuntimeError::InvalidRequest);
+                    }
+                    if !self
+                        .credited_custody_references
+                        .insert(custody_reference.to_ascii_lowercase())
+                    {
+                        return Err(RuntimeError::CustodyReferenceReuse);
                     }
                     self.add(&request.identity_commitment, "USER_AVAILABLE", value)?;
                     (
@@ -1471,6 +1490,7 @@ impl DirectRuntime {
             position_cost_basis: self.position_cost_basis.clone(),
             market_collateral: self.market_collateral.clone(),
             fee_revenue_atomic: self.fee_revenue_atomic,
+            credited_custody_references: self.credited_custody_references.clone(),
             requests: self.requests.clone(),
         }
     }
@@ -1541,6 +1561,7 @@ impl DirectRuntime {
         self.position_cost_basis = state.position_cost_basis;
         self.market_collateral = state.market_collateral;
         self.fee_revenue_atomic = state.fee_revenue_atomic;
+        self.credited_custody_references = state.credited_custody_references;
         self.requests = state.requests;
         Ok(())
     }
@@ -2526,6 +2547,17 @@ fn valid_withdrawal_custody_reference(reference: &str, mode: RuntimeMode) -> boo
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
 }
+
+fn valid_deposit_custody_reference(reference: &str) -> bool {
+    let Some(transaction_hash) = reference.strip_prefix("base-deposit:") else {
+        return false;
+    };
+    transaction_hash.len() == 66
+        && transaction_hash.starts_with("0x")
+        && transaction_hash[2..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+}
 pub fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -2675,6 +2707,59 @@ mod tests {
             ),
             1000000
         );
+    }
+    #[test]
+    fn finalized_deposit_reference_is_global_exactly_once_and_survives_restart() {
+        let identity = "0bafc03d08d4951d769d58284db85c7ac2ee3c79de87ec680f58edc03017c418";
+        let reference = format!("base-deposit:0x{}", "11".repeat(32));
+        let state_key = [9u8; 32];
+        let mut store = InMemoryDirectStateStore::default();
+        let mut live = runtime(RuntimeMode::IsolatedTest);
+        let first = request(
+            "base-deposit:first",
+            DirectAction::CreditDeposit {
+                amount_atomic: "5000000".into(),
+                custody_reference: reference.clone(),
+            },
+        );
+        live.execute_committed(first.clone(), &state_key, &mut store)
+            .unwrap();
+        let after = live.balance(identity, "USDC", "USER_AVAILABLE");
+        assert_eq!(after, 10_000_000);
+        assert_eq!(
+            live.execute_committed(
+                request(
+                    "base-deposit:different-request",
+                    DirectAction::CreditDeposit {
+                        amount_atomic: "5000000".into(),
+                        custody_reference: reference,
+                    },
+                ),
+                &state_key,
+                &mut store,
+            )
+            .unwrap_err(),
+            RuntimeError::CustodyReferenceReuse
+        );
+        assert_eq!(live.balance(identity, "USDC", "USER_AVAILABLE"), after);
+        let mut restored = DirectRuntime::restore_committed(
+            SealedEpoch::load(epoch_path()).unwrap(),
+            RuntimeMode::IsolatedTest,
+            vec![7; 32],
+            &state_key,
+            &store,
+        )
+        .unwrap();
+        assert_eq!(restored.balance(identity, "USDC", "USER_AVAILABLE"), after);
+        assert_eq!(
+            restored
+                .execute_committed(first, &state_key, &mut store)
+                .unwrap()
+                .receipt
+                .effect,
+            "DEPOSIT_CREDITED"
+        );
+        assert_eq!(store.artifacts().unwrap().len(), 1);
     }
     #[test]
     fn rejects_cross_account_and_wrong_destination_without_effect() {

@@ -68,6 +68,9 @@ const ENCLOSURE_PORT: u32 = 5_003;
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const SESSION_AUDIENCE: &str = "layrs.direct-execution.v1";
 const DIRECT_SESSION_KEY_DERIVATION_DOMAIN: &[u8] = b"layrs.direct-session.v1\0";
+const BASE_USDC_ADDRESS: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+const ERC20_TRANSFER_TOPIC: &str =
+    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 #[derive(Clone)]
 struct AppState {
     enclave_cid: u32,
@@ -124,6 +127,14 @@ struct PrivyBaseCustodyAdapter {
     pool_address: String,
     confirmations: u64,
     api_base_url: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DepositFinality {
+    Pending,
+    Finalized,
+    Reverted,
+    Conflict,
 }
 
 impl PrivyBaseCustodyAdapter {
@@ -502,6 +513,55 @@ impl PrivyBaseCustodyAdapter {
         }
     }
 
+    /// Verify one inbound Base USDC transfer from the authenticated embedded
+    /// wallet into the existing pool custody address. This is a synchronous
+    /// chain observation only: it creates no job, queue, lease, or database
+    /// command state. The enclave consumes the transaction hash exactly once.
+    async fn deposit_finality(
+        &self,
+        source_wallet: &str,
+        transaction_hash: &str,
+        amount_atomic: &str,
+    ) -> Result<DepositFinality, String> {
+        let source_wallet = canonical_evm_address(source_wallet)?;
+        if !valid_transaction_hash(transaction_hash) {
+            return Err("deposit transaction hash invalid".into());
+        }
+        let amount = amount_atomic
+            .parse::<u128>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or("deposit amount invalid")?;
+        let transaction = self
+            .rpc("eth_getTransactionByHash", json!([transaction_hash]))
+            .await?;
+        if transaction.is_null() {
+            return Ok(DepositFinality::Pending);
+        }
+        let receipt = self
+            .rpc("eth_getTransactionReceipt", json!([transaction_hash]))
+            .await?;
+        if receipt.is_null() {
+            return Ok(DepositFinality::Pending);
+        }
+        let head = self
+            .rpc("eth_blockNumber", json!([]))
+            .await?
+            .as_str()
+            .and_then(parse_quantity)
+            .ok_or("Base RPC head malformed")?;
+        classify_base_deposit(
+            &source_wallet,
+            &self.pool_address,
+            transaction_hash,
+            amount,
+            self.confirmations,
+            &transaction,
+            &receipt,
+            head,
+        )
+    }
+
     async fn rpc(&self, method: &str, params: Value) -> Result<Value, String> {
         let response = self
             .client
@@ -614,6 +674,118 @@ fn pool_withdraw_calldata(destination: &str, amount_atomic: &str) -> Result<Stri
         &destination[2..],
         format!("{amount:x}")
     ))
+}
+
+fn erc20_transfer_calldata(destination: &str, amount: u128) -> Result<String, String> {
+    let destination = canonical_evm_address(destination)?;
+    Ok(format!(
+        "0xa9059cbb{:0>64}{amount:0>64x}",
+        &destination[2..]
+    ))
+}
+
+fn address_topic(address: &str) -> String {
+    format!("0x{:0>64}", &address[2..].to_ascii_lowercase())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_base_deposit(
+    source_wallet: &str,
+    pool_address: &str,
+    transaction_hash: &str,
+    amount: u128,
+    confirmations: u64,
+    transaction: &Value,
+    receipt: &Value,
+    head: u128,
+) -> Result<DepositFinality, String> {
+    let expected_input = erc20_transfer_calldata(pool_address, amount)?;
+    if transaction
+        .get("from")
+        .and_then(Value::as_str)
+        .and_then(|value| canonical_evm_address(value).ok())
+        .as_deref()
+        != Some(source_wallet)
+        || transaction
+            .get("to")
+            .and_then(Value::as_str)
+            .and_then(|value| canonical_evm_address(value).ok())
+            .as_deref()
+            != Some(BASE_USDC_ADDRESS)
+        || transaction
+            .get("input")
+            .and_then(Value::as_str)
+            .map(|value| value.eq_ignore_ascii_case(&expected_input))
+            != Some(true)
+        || transaction
+            .get("value")
+            .and_then(Value::as_str)
+            .and_then(parse_quantity)
+            != Some(0)
+        || receipt
+            .get("transactionHash")
+            .and_then(Value::as_str)
+            .map(|value| value.eq_ignore_ascii_case(transaction_hash))
+            != Some(true)
+        || receipt.get("blockHash").and_then(Value::as_str)
+            != transaction.get("blockHash").and_then(Value::as_str)
+    {
+        return Ok(DepositFinality::Conflict);
+    }
+    match receipt.get("status").and_then(Value::as_str) {
+        Some("0x0") => return Ok(DepositFinality::Reverted),
+        Some("0x1") => {}
+        _ => return Ok(DepositFinality::Conflict),
+    }
+    let expected_from_topic = address_topic(source_wallet);
+    let expected_to_topic = address_topic(pool_address);
+    let exact_transfer = receipt
+        .get("logs")
+        .and_then(Value::as_array)
+        .is_some_and(|logs| {
+            logs.iter().any(|log| {
+                log.get("address")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.eq_ignore_ascii_case(BASE_USDC_ADDRESS))
+                    && log
+                        .get("topics")
+                        .and_then(Value::as_array)
+                        .is_some_and(|topics| {
+                            topics.len() >= 3
+                                && topics[0].as_str().is_some_and(|value| {
+                                    value.eq_ignore_ascii_case(ERC20_TRANSFER_TOPIC)
+                                })
+                                && topics[1].as_str().is_some_and(|value| {
+                                    value.eq_ignore_ascii_case(&expected_from_topic)
+                                })
+                                && topics[2].as_str().is_some_and(|value| {
+                                    value.eq_ignore_ascii_case(&expected_to_topic)
+                                })
+                        })
+                    && log
+                        .get("data")
+                        .and_then(Value::as_str)
+                        .and_then(parse_quantity)
+                        == Some(amount)
+            })
+        });
+    if !exact_transfer {
+        return Ok(DepositFinality::Conflict);
+    }
+    let block_number = receipt
+        .get("blockNumber")
+        .and_then(Value::as_str)
+        .and_then(parse_quantity)
+        .ok_or("Base deposit receipt block number malformed")?;
+    if head
+        .checked_sub(block_number)
+        .and_then(|value| value.checked_add(1))
+        .unwrap_or(0)
+        < u128::from(confirmations)
+    {
+        return Ok(DepositFinality::Pending);
+    }
+    Ok(DepositFinality::Finalized)
 }
 fn canonical_json(value: &Value) -> String {
     match value {
@@ -1050,6 +1222,10 @@ struct MarketRegistrationCommand {
     rename_all_fields = "camelCase"
 )]
 enum CustomerAction {
+    CreditDeposit {
+        transaction_hash: String,
+        amount_atomic: String,
+    },
     PlaceOrder {
         order_id: String,
         market_id: String,
@@ -1322,6 +1498,62 @@ async fn command(
     let _financial_guard = state.financial_gate.lock().await;
     let external_effect_pending = !state.unresolved_external_effects.lock().await.is_empty();
     let action = match body.action {
+        CustomerAction::CreditDeposit {
+            transaction_hash,
+            amount_atomic,
+        } if !external_effect_pending => {
+            let canonical_hash = transaction_hash.to_ascii_lowercase();
+            let required_request_id = format!("base-deposit:{canonical_hash}");
+            if request_id != required_request_id {
+                return (StatusCode::BAD_REQUEST, "DEPOSIT_IDEMPOTENCY_KEY_MISMATCH")
+                    .into_response();
+            }
+            let Some(custody) = &state.custody else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "CUSTODY_ADAPTER_NOT_ENABLED",
+                )
+                    .into_response();
+            };
+            match custody
+                .deposit_finality(&claims.wallet_address, &canonical_hash, &amount_atomic)
+                .await
+            {
+                Ok(DepositFinality::Finalized) => DirectAction::CreditDeposit {
+                    amount_atomic,
+                    custody_reference: required_request_id,
+                },
+                Ok(DepositFinality::Pending) => {
+                    return (StatusCode::SERVICE_UNAVAILABLE, "DEPOSIT_FINALITY_PENDING")
+                        .into_response()
+                }
+                Ok(DepositFinality::Reverted) => {
+                    return (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "DEPOSIT_TRANSACTION_REVERTED",
+                    )
+                        .into_response()
+                }
+                Ok(DepositFinality::Conflict) => {
+                    return (StatusCode::CONFLICT, "DEPOSIT_TRANSACTION_BINDING_CONFLICT")
+                        .into_response()
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "DEPOSIT_FINALITY_UNAVAILABLE",
+                    )
+                        .into_response()
+                }
+            }
+        }
+        CustomerAction::CreditDeposit { .. } => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "EXTERNAL_EFFECT_FINALITY_PENDING",
+            )
+                .into_response()
+        }
         CustomerAction::PlaceOrder {
             order_id,
             market_id,
@@ -2773,6 +3005,92 @@ mod tests {
             command.action,
             CustomerAction::ReserveWithdrawal { amount_atomic, .. } if amount_atomic == "1000000"
         ));
+    }
+
+    #[test]
+    fn customer_deposit_requires_transaction_hash_and_exact_amount() {
+        let command: CustomerCommand = serde_json::from_value(serde_json::json!({
+            "identityCommitment": "identity",
+            "action": {
+                "type": "CREDIT_DEPOSIT",
+                "transactionHash": format!("0x{}", "11".repeat(32)),
+                "amountAtomic": "5000000"
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            command.action,
+            CustomerAction::CreditDeposit { amount_atomic, .. } if amount_atomic == "5000000"
+        ));
+    }
+
+    #[test]
+    fn finalized_deposit_is_bound_to_wallet_pool_token_amount_and_confirmations() {
+        let source = "0xd5d8f363b2122c1fcedaff313990b049fbd11e61";
+        let pool = "0xb07627b0d646f5c82c8e30975a37650dc272a35f";
+        let hash = format!("0x{}", "11".repeat(32));
+        let block_hash = format!("0x{}", "22".repeat(32));
+        let amount = 5_000_000u128;
+        let transaction = json!({
+            "from": source,
+            "to": BASE_USDC_ADDRESS,
+            "input": erc20_transfer_calldata(pool, amount).unwrap(),
+            "value": "0x0",
+            "blockHash": block_hash,
+        });
+        let receipt = json!({
+            "transactionHash": hash,
+            "blockHash": block_hash,
+            "blockNumber": "0x64",
+            "status": "0x1",
+            "logs": [{
+                "address": BASE_USDC_ADDRESS,
+                "topics": [ERC20_TRANSFER_TOPIC, address_topic(source), address_topic(pool)],
+                "data": quantity(amount),
+            }],
+        });
+        assert_eq!(
+            classify_base_deposit(source, pool, &hash, amount, 20, &transaction, &receipt, 118)
+                .unwrap(),
+            DepositFinality::Pending
+        );
+        assert_eq!(
+            classify_base_deposit(source, pool, &hash, amount, 20, &transaction, &receipt, 119)
+                .unwrap(),
+            DepositFinality::Finalized
+        );
+        let mut wrong_amount = receipt.clone();
+        wrong_amount["logs"][0]["data"] = json!(quantity(amount - 1));
+        assert_eq!(
+            classify_base_deposit(
+                source,
+                pool,
+                &hash,
+                amount,
+                20,
+                &transaction,
+                &wrong_amount,
+                119
+            )
+            .unwrap(),
+            DepositFinality::Conflict
+        );
+        let mut reverted = receipt;
+        reverted["status"] = json!("0x0");
+        assert_eq!(
+            classify_base_deposit(
+                source,
+                pool,
+                &hash,
+                amount,
+                20,
+                &transaction,
+                &reverted,
+                119
+            )
+            .unwrap(),
+            DepositFinality::Reverted
+        );
     }
 
     #[test]
