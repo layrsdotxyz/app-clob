@@ -42,7 +42,7 @@ use sha2::Sha256;
 use std::{
     collections::{BTreeMap, HashSet},
     env, io,
-    net::{IpAddr, Ipv4Addr},
+    net::IpAddr,
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -2038,11 +2038,14 @@ mod tests {
     }
     #[test]
     fn bff_listener_is_loopback_until_governed_production_mode() {
-        assert_eq!(runtime_bind_address(None, Some("dormant")).unwrap(), Ipv4Addr::LOCALHOST);
+        assert_eq!(
+            runtime_bind_address(None, Some("dormant")).unwrap(),
+            std::net::Ipv4Addr::LOCALHOST,
+        );
         assert!(runtime_bind_address(Some("0.0.0.0"), Some("dormant")).is_err());
         assert_eq!(
             runtime_bind_address(Some("0.0.0.0"), Some("production-enabled")).unwrap(),
-            Ipv4Addr::UNSPECIFIED,
+            std::net::Ipv4Addr::UNSPECIFIED,
         );
     }
     #[test]
