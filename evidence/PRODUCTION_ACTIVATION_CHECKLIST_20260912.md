@@ -1,7 +1,7 @@
 # Final production activation checklist — prepared, not executed
 
-Candidate: `ami-0a26d307d4920f05b`; EIF:
-`a71f54ccc2b420b8771d16a1607582e72c7394171d7d3217a86cc7c772eafa74`.
+Candidate: `ami-0781a67a374dc8a70`; EIF:
+`6f1cc6cd61492e7b2d3c34d75256412542de640fefbf3b6f4aad7021cc742542`.
 The measured commitments and isolated canary evidence are in
 `STEP_5_FINAL_ISOLATED_ARCHIVE_EVIDENCE_20260912.md`.
 
@@ -20,11 +20,12 @@ The measured commitments and isolated canary evidence are in
    definition: Nitro enclaves require an EC2 Nitro parent.  Validate its private
    subnet, BFF-only security-group ingress, IMDSv2, archive/KMS least privilege,
    CloudWatch log group, disabled writer tag, and no route before any capacity.
-3. An authorized custody owner injects the direct-runtime-only credential and
-   fixed Base finality configuration.  Run a read-only query of a named historic
-   transaction and retain only its transaction hash, observed state, block/finality
-   threshold, adapter version, and timestamp.  It must distinguish pending,
-   finalized, and reverted; it must not send a transaction or expose a secret.
+3. The final dormant runtime has completed the authorized read-only custody/RPC
+   preflight using existing secret references: it resolved the existing signer
+   configuration and Base pool-ledger wallet, reached the authenticated Base RPC,
+   and retained the 20-confirmation policy without submitting or signing a
+   transaction.  A funded canary remains required to observe a new intent-bound
+   payout; no historical transaction may be substituted for that evidence.
 4. A named alert owner creates and confirms a subscription on
    `layrs-production-operational-alerts`; test delivery with a non-financial
    alert.  No endpoint is assumed in this package.
@@ -37,11 +38,32 @@ The measured commitments and isolated canary evidence are in
 
 ## Current alarm audit
 
-| Alarm(s) | condition and impact | required remediation / acceptance |
+All entries below were independently read from CloudWatch at 2026-09-12 IST.
+Every action points at the existing `layrs-production-operational-alerts` topic,
+which has zero subscriptions.  No alarm was disabled, altered, or suppressed.
+
+| Alarm | observed root condition | disposition required before activation |
 |---|---|---|
-| `active-market-publication-pending`; `horizen-market-registrar-batch-funding-shortfall`; `milestone-adoption-report-stale`; `rolling-market-current-inventory-missing` | Missing telemetry is treated as breaching; operational state cannot be trusted as current. | Restore the specific publisher/reporter, verify fresh datapoints, or obtain time-bounded owner acceptance with an alternative monitored signal. |
-| `audit-dlq-not-empty`; `chain-indexer-dlq-not-empty`; `control-scheduler-dlq-not-empty`; `deposit-withdrawal-dlq-not-empty`; `market-data-dlq-not-empty`; `outbox-dispatcher-dlq-not-empty`; `reconciliation-dlq-not-empty`; `resolution-dlq-not-empty`; `vault-accounting-dlq-not-empty` | All point to the same legacy DLQ, currently 916 visible messages. The alarm history is stale, but the queue condition is current and unresolved. | Preserve and classify every message, reconcile any financial impact, then drain/replay only under an approved procedure; otherwise record explicit owners and a bounded exception. |
-| `horizen-admin-treasury-low-eth`; `horizen-oracle-resolver-low-eth`; `horizen-pool-ledger-signer-low-eth`; `horizen-settlement-audit-signer-low-eth`; `horizen-zen-bridge-sweeper-low-eth`; `horizen-zen-market-maker-low-eth` | Last observed values were below the 0.003 ETH threshold; observations are stale but could block required operational actions. | Independently read current balances, fund only with treasury authorization if still low, or record owner acceptance if each role is retired. |
+| `active-market-publication-pending` | 10 missing periods treated as breaching; refreshed 2026-09-12. | Restore/retire its publisher and prove a fresh metric, or named owner accepts a bounded exception. |
+| `audit-dlq-not-empty` | 2 messages, last breach 2026-08-24. | Preserve, classify, and reconcile the messages under an approved DLQ procedure; name owner/expiry if retained. |
+| `chain-indexer-dlq-not-empty` | 6 messages, last breach 2026-08-26. | Preserve, classify, and reconcile under an approved DLQ procedure; name owner/expiry if retained. |
+| `control-scheduler-dlq-not-empty` | 6 messages, last breach 2026-08-26. | Preserve, classify, and reconcile under an approved DLQ procedure; name owner/expiry if retained. |
+| `deposit-withdrawal-dlq-not-empty` | 6 messages, last breach 2026-08-26. | Preserve and classify; do not redrive the fenced legacy financial writer. Name owner/expiry if retained. |
+| `direct-runtime-health-missing` | 2 missing periods treated as breaching; refreshed 2026-09-12. | Wire the dormant runtime health metric, validate a fresh datapoint, and preserve fail-closed alerting. |
+| `horizen-admin-treasury-low-eth` | Last observed 0.000999573 ETH, below 0.003 threshold. | Read current balance; treasury owner funds only if separately authorized, or explicitly retires/accepts with expiry. |
+| `horizen-market-registrar-batch-funding-shortfall` | One missing period treated as breaching; refreshed 2026-09-12. | Restore/retire the reporter and prove a fresh metric, or named owner accepts a bounded exception. |
+| `horizen-oracle-resolver-low-eth` | Last observed 0.001997341 ETH, below 0.003 threshold. | Read current balance; treasury owner funds only if separately authorized, or explicitly retires/accepts with expiry. |
+| `horizen-pool-ledger-signer-low-eth` | Last observed 0.001997731 ETH, below 0.003 threshold. | Read current balance; treasury owner funds only if separately authorized, or explicitly retires/accepts with expiry. |
+| `horizen-settlement-audit-signer-low-eth` | Last observed 0.001374823 ETH, below 0.003 threshold. | Read current balance; treasury owner funds only if separately authorized, or explicitly retires/accepts with expiry. |
+| `horizen-zen-bridge-sweeper-low-eth` | Last observed 0.001377778 ETH, below 0.003 threshold. | Read current balance; treasury owner funds only if separately authorized, or explicitly retires/accepts with expiry. |
+| `horizen-zen-market-maker-low-eth` | Last observed 0.001999078 ETH, below 0.003 threshold. | Read current balance; treasury owner funds only if separately authorized, or explicitly retires/accepts with expiry. |
+| `market-data-dlq-not-empty` | 6 messages, last breach 2026-08-26. | Preserve, classify, and reconcile under an approved DLQ procedure; name owner/expiry if retained. |
+| `milestone-adoption-report-stale` | One missing period treated as breaching; refreshed 2026-09-12. | Restore/retire its reporter and prove a fresh metric, or named owner accepts a bounded exception. |
+| `outbox-dispatcher-dlq-not-empty` | 6 messages, last breach 2026-08-26. | Preserve, classify, and reconcile under an approved DLQ procedure; name owner/expiry if retained. |
+| `reconciliation-dlq-not-empty` | 6 messages, last breach 2026-08-26. | Preserve, classify, and reconcile under an approved DLQ procedure; name owner/expiry if retained. |
+| `resolution-dlq-not-empty` | 6 messages, last breach 2026-08-26. | Preserve, classify, and reconcile under an approved DLQ procedure; name owner/expiry if retained. |
+| `rolling-market-current-inventory-missing` | 3 missing periods treated as breaching; refreshed 2026-09-08. | Restore/retire its reporter and prove a fresh metric, or named owner accepts a bounded exception. |
+| `vault-accounting-dlq-not-empty` | 6 messages, last breach 2026-08-26. | Preserve, classify, and reconcile under an approved DLQ procedure; name owner/expiry if retained. |
 
 ## Funded-canary approval record — intentionally incomplete
 
@@ -71,8 +93,8 @@ only a projection and must never reconstruct private financial state.
 - The old public API, deposit/withdrawal service, and Green core coordinator are
   each steady at desired/running `0/0`; no legacy writer is restored.
 - The alert topic has zero confirmed subscriptions.
-- No direct-runtime-specific production custody credential was identified
-  without reading secret values.  The available `layrs/production/providers/rpc`
-  is legacy-provider metadata only and is not approved for this path.
+- The direct runtime has a completed read-only preflight against existing
+  production references.  It remains dormant and no custody request, signature,
+  intent, or archive write was created.
 - Neither this checklist nor the dormant deployment fixture activates a writer,
   route, capacity, funded canary, or customer balance change.
