@@ -140,7 +140,7 @@ Resources:
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as out:
                     for key, value in values.items():
-                        out.write(key + "=" + quote(value) + "\\n")
+                    out.write(key + "=" + quote(value) + "\n")
                     out.flush()
                     os.fsync(out.fileno())
                 os.chmod(temporary, 0o600)
