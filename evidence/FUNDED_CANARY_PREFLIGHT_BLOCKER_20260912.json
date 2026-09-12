@@ -1,0 +1,75 @@
+{
+  "schema": "layrs.funded-canary-preflight-blocker.v1",
+  "createdAt": "2026-09-12T17:58:00Z",
+  "status": "BLOCKED_BEFORE_FINANCIAL_MUTATION",
+  "authorization": {
+    "fundedCanaryAuthorized": true,
+    "sourceAccount": "layrs-mm-02@predifi.com",
+    "canaryAccount": "layrs-mm-20@predifi.com",
+    "depositAsset": "USDC",
+    "depositChain": "Base",
+    "depositAmountAtomic": "5000000"
+  },
+  "canaryIdentity": {
+    "email": "layrs-mm-20@predifi.com",
+    "privySubject": "did:privy:cmtyoo2ok00wg0cl8z68ajqvd",
+    "embeddedEvmWallet": "0xd5d8f363b2122C1fcedAFF313990b049Fbd11E61",
+    "embeddedSolanaWallet": "QtDeEdzq6VwwxqLM2NsuSz2QYUaYkMXrvWMM4B8aCS3",
+    "authSubjectHash": "eda99ba0207ebc263c7d9da3d53772ca2118b4ce1f902257500609cc84e8ef8d",
+    "identityCommitment": "5cf9ad268d5f9a9dace8b69be450a59e4585c3497fc6c6c02fc6542d4811a943",
+    "normalPrivyOtpOnboardingComplete": true,
+    "directRuntimeAdmissionComplete": false,
+    "privateLedgerBalanceAtomic": "0",
+    "projectionBalanceAtomic": "0",
+    "baseUsdcBalanceAtomic": "0",
+    "baseNativeBalanceWei": "0"
+  },
+  "sourcePreflight": {
+    "account": "layrs-mm-02@predifi.com",
+    "certifiedPrivateUsdcBalanceAtomic": "9404611",
+    "embeddedEvmWallet": "0xB69ac21b8a96234A09Ba6c7644F1c2b106FD4A01",
+    "baseUsdcBalanceAtomic": "0",
+    "baseNativeBalanceWei": "0",
+    "requiredFundingPath": "governed direct withdrawal to MM-02 bound wallet, followed by exact 5 USDC transfer into MM-20 normal deposit route"
+  },
+  "candidate": {
+    "sourceCommit": "40ca230d40799f0d45a488cf220d863699c0051a",
+    "ami": "ami-0a0c4d0e2608aa701",
+    "eifSha256": "28c4f8ad242ebb5b0525961cc5994b6b6426c98dd48a39ae133e7cac476912c2",
+    "writerGrantActivationId": "layrs-direct-40ca230-20260912",
+    "writerGrantSignedAndVerified": true,
+    "parentMode": "dormant",
+    "enclaveMode": "dormant",
+    "writerEnabled": false,
+    "admissionEnabled": false
+  },
+  "blocker": {
+    "code": "ATTESTED_ENCLAVE_ACTIVATION_KEY_RELEASE_NOT_IMPLEMENTED",
+    "finding": "The parent can load the signed WriterGrant, but Nitro does not propagate the parent systemd environment into the EIF. The enclave reads its mode, WriterGrant, runtime binding, receipt key, state key, and durability-ACK key only from EIF-local environment variables. The built EIF contains only the sealed opening paths and therefore boots dormant.",
+    "unsafeWorkaroundsRejected": [
+      "enable only the parent while the enclave remains dormant",
+      "bake the WriterGrant into the EIF after signing because that changes the PCR-bound candidate",
+      "send private ledger keys from the untrusted parent without an attested key-release protocol",
+      "use zero/default keys for a production financial write",
+      "use the legacy writer or Durable Commands"
+    ],
+    "requiredCorrection": "Implement and independently verify an attested startup key/grant-release path that allows the exact measured enclave to verify the signed WriterGrant and receive or derive protected receipt/state keys before immutable-artifact recovery. Rebuild, re-attest, regenerate the candidate-bound WriterGrant, rerun restart/replay, and repeat this preflight before any funded command.",
+    "architecturalImpact": "runtime security boundary",
+    "safeToProceedFinancially": false
+  },
+  "mutationAudit": {
+    "privyUserCreated": true,
+    "embeddedWalletsCreatedByNormalPrivyFlow": true,
+    "directIdentityAdmitted": false,
+    "depositRequestCreated": false,
+    "withdrawalIntentCreated": false,
+    "custodyTransactionSigned": false,
+    "custodyTransactionSubmitted": false,
+    "privateLedgerMutation": false,
+    "projectionMutation": false,
+    "customerFundsMoved": false,
+    "archiveSuccessorCreated": false,
+    "tradeSubmitted": false,
+    "legacyWriterEnabled": false
+  }
+}
