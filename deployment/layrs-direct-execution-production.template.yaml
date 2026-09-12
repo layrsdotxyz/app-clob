@@ -47,6 +47,8 @@ Parameters:
   # A dormant verifier may run to support attestation and health checks, but
   # its process mode remains `dormant` and has no writer authority.
   DormantRuntimeDesiredCapacity: { Type: Number, Default: 1, MinValue: 0, MaxValue: 1 }
+Conditions:
+  FinancialWriterEnabled: !Equals [!Ref ExecutionMode, production-enabled]
 Resources:
   RuntimeLogGroup:
     Type: AWS::Logs::LogGroup
@@ -234,7 +236,12 @@ Resources:
                     "LAYRSV2_BASE_CONFIRMATIONS": "${BaseConfirmations}",
                 })
             def quote(value):
-                return '"' + value.replace('\\\\', '\\\\\\\\').replace('"', '\\\\"').replace('\n', '\\n') + '"'
+                # systemd EnvironmentFile consumes one shell-like escaping
+                # layer.  Escape each literal backslash exactly once and each
+                # double quote exactly once; double-escaping leaves JSON as
+                # {\"key\":...} in the service environment and makes the
+                # governed grant/binding fail closed during bootstrap.
+                return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n') + '"'
             fd, temporary = tempfile.mkstemp(prefix="direct-runtime.", dir="/etc/layrs-opening")
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as out:
@@ -252,7 +259,7 @@ Resources:
             systemctl restart layrs-opening-parent.service
         TagSpecifications:
           - ResourceType: instance
-            Tags: [{ Key: Project, Value: Layrs }, { Key: Environment, Value: production-dormant }, { Key: WriterEnabled, Value: 'false' }, { Key: TransactionModel, Value: layrs.direct-execution.v1 }, { Key: CandidateAmiId, Value: !Ref CandidateAmiId }]
+            Tags: [{ Key: Project, Value: Layrs }, { Key: Environment, Value: production-direct }, { Key: WriterEnabled, Value: !If [FinancialWriterEnabled, 'true', 'false'] }, { Key: TransactionModel, Value: layrs.direct-execution.v1 }, { Key: CandidateAmiId, Value: !Ref CandidateAmiId }]
   DormantAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
     UpdatePolicy:
@@ -268,7 +275,7 @@ Resources:
       MaxSize: '1'
       DesiredCapacity: !Ref DormantRuntimeDesiredCapacity
       TargetGroupARNs: [!Ref ReadOnlyRuntimeTargetGroup]
-      Tags: [{ Key: WriterEnabled, Value: 'false', PropagateAtLaunch: true }]
+      Tags: [{ Key: WriterEnabled, Value: !If [FinancialWriterEnabled, 'true', 'false'], PropagateAtLaunch: true }]
   ReadOnlyRuntimeLoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:

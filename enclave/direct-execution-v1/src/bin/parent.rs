@@ -592,8 +592,8 @@ impl PrivyBaseCustodyAdapter {
         body: &Value,
         idempotency_key: &str,
     ) -> Result<reqwest::header::HeaderMap, String> {
-        let expiry = now_unix()
-            .checked_add(60)
+        let expiry = now_unix_millis()
+            .checked_add(60_000)
             .ok_or("clock invalid")?
             .to_string();
         let headers = json!({"privy-app-id": self.app_id, "privy-request-expiry": expiry, "privy-idempotency-key": idempotency_key});
@@ -2423,6 +2423,13 @@ fn now_unix() -> u64 {
         .map(|value| value.as_secs())
         .unwrap_or(0)
 }
+fn now_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|value| u64::try_from(value.as_millis()).ok())
+        .unwrap_or(0)
+}
 fn constant_time_eq(a: &str, b: &str) -> bool {
     a.len() == b.len()
         && a.as_bytes()
@@ -2927,6 +2934,15 @@ mod tests {
         );
         assert_eq!(first.len(), 32);
         assert_ne!(first, secret);
+    }
+    #[test]
+    fn privy_request_expiry_uses_milliseconds() {
+        let before = now_unix_millis();
+        let expiry = now_unix_millis().checked_add(60_000).unwrap();
+        let after = now_unix_millis();
+        assert!(expiry >= before + 60_000);
+        assert!(expiry <= after + 60_000);
+        assert!(expiry >= 1_000_000_000_000);
     }
     #[test]
     fn bff_listener_is_loopback_until_governed_production_mode() {
