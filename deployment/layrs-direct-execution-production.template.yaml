@@ -4,7 +4,9 @@ Parameters:
   VpcId: { Type: AWS::EC2::VPC::Id }
   PrivateSubnetId: { Type: AWS::EC2::Subnet::Id }
   BffSecurityGroupId: { Type: AWS::EC2::SecurityGroup::Id }
-  CandidateAmiId: { Type: AWS::EC2::Image::Id, Default: ami-0a26d307d4920f05b }
+  # No default: the governed deployment must explicitly supply an AMI that is
+  # registered in the target region and matches the signed grant's EIF/PCRs.
+  CandidateAmiId: { Type: AWS::EC2::Image::Id }
   ArchiveBucketArn: { Type: String }
   ArchiveKmsKeyArn: { Type: String }
   AlertTopicArn: { Type: String }
