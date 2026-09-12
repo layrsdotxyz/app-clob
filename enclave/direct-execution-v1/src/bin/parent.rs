@@ -1075,6 +1075,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind_address = runtime_bind_address(
         env::var("LAYRS_DIRECT_BIND_ADDRESS").ok().as_deref(),
         env::var("LAYRS_DIRECT_EXECUTION_MODE").ok().as_deref(),
+        env::var("LAYRS_DIRECT_READ_ONLY_VPC_BIND").as_deref() == Ok("true"),
     )?;
     let listener = tokio::net::TcpListener::bind((bind_address, port)).await?;
     axum::serve(listener, app).await?;
@@ -1091,12 +1092,22 @@ fn derive_direct_session_key(privy_app_secret: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
-fn runtime_bind_address(requested: Option<&str>, mode: Option<&str>) -> Result<IpAddr, &'static str> {
+fn runtime_bind_address(
+    requested: Option<&str>,
+    mode: Option<&str>,
+    read_only_vpc_bind: bool,
+) -> Result<IpAddr, &'static str> {
     let address = requested
         .unwrap_or("127.0.0.1")
         .parse::<IpAddr>()
         .map_err(|_| "invalid direct runtime bind address")?;
-    if !address.is_loopback() && mode != Some("production-enabled") {
+    // The governed read-only BFF needs a VPC path to obtain encrypted balance
+    // responses.  It is explicitly limited to a dormant enclave: direct
+    // execution rejects every mutation before a candidate, custody call, or
+    // artifact can be created.  Any writable listener still requires the
+    // WriterGrant-gated production-enabled mode.
+    let read_only_listener = mode == Some("dormant") && read_only_vpc_bind;
+    if !address.is_loopback() && mode != Some("production-enabled") && !read_only_listener {
         return Err("non-loopback direct runtime listener requires production-enabled mode");
     }
     Ok(address)
@@ -1127,6 +1138,12 @@ async fn command(
         Ok(value) => value,
         Err(response) => return response,
     };
+    // Do not let a read-only deployment reach candidate creation, custody, or
+    // archive persistence merely because a BFF can reach its VPC listener.
+    // Dormant state remains independently enforced inside the enclave.
+    if env::var("LAYRS_DIRECT_EXECUTION_MODE").as_deref() != Ok("production-enabled") {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_DISABLED").into_response();
+    }
     let request_id = match headers
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
@@ -2044,12 +2061,16 @@ mod tests {
     #[test]
     fn bff_listener_is_loopback_until_governed_production_mode() {
         assert_eq!(
-            runtime_bind_address(None, Some("dormant")).unwrap(),
+            runtime_bind_address(None, Some("dormant"), false).unwrap(),
             std::net::Ipv4Addr::LOCALHOST,
         );
-        assert!(runtime_bind_address(Some("0.0.0.0"), Some("dormant")).is_err());
+        assert!(runtime_bind_address(Some("0.0.0.0"), Some("dormant"), false).is_err());
         assert_eq!(
-            runtime_bind_address(Some("0.0.0.0"), Some("production-enabled")).unwrap(),
+            runtime_bind_address(Some("0.0.0.0"), Some("dormant"), true).unwrap(),
+            "0.0.0.0".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            runtime_bind_address(Some("0.0.0.0"), Some("production-enabled"), false).unwrap(),
             std::net::Ipv4Addr::UNSPECIFIED,
         );
     }
