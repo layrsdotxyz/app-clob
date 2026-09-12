@@ -43,4 +43,24 @@ private, writer-disabled dormant instance from `ami-0781a67a374dc8a70`.
    preflight cannot create that irreversible effect, and no historical
    direct-runtime intent exists to substitute for it.
 
+## Revalidation after final-gate preparation
+
+- The WriterGrant request remains deliberately unsigned.  IAM-role and KMS
+  alias metadata expose no authorized governance signing endpoint; neither a
+  signature nor an activation ID/expiry was invented.
+- The existing operational SNS topic was queried directly and has zero
+  subscriptions.  The complete, individual 20-alarm disposition is recorded
+  in `PRODUCTION_ACTIVATION_CHECKLIST_20260912.md`; no alarm action was
+  changed.
+- The clean BFF bridge's deterministic real-Privy/JWKS suite passed five tests:
+  valid JWT acceptance and wallet-bound assertion minting, plus forged,
+  invalid-signature, expired, issuer/audience, and wrong-wallet rejection
+  coverage.  Production metadata contains no direct-session-key or
+  direct-projection credential reference.  Reusing or deriving an unrelated
+  operational secret would be an unauthorized security-boundary change, so no
+  BFF route, projection schema, or runtime configuration was deployed.
+- The canary record remains intentionally blank for source, destination,
+  amount, maximum fee, nonce, named observers, and rollback owner.  No intent,
+  transaction, custody request, archive write, or balance change was made.
+
 `PRODUCTION_ACTIVATION_STATUS = WAITING_FOR_EXTERNAL_AUTHORIZATION`
