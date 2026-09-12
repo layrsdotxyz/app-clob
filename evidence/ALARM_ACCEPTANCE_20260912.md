@@ -29,3 +29,9 @@ forced or suppressed while waiting for normal metric evaluation.
 Normal CloudWatch evaluation subsequently observed two zero-valued health
 datapoints and transitioned this activation-critical alarm to `OK`; no manual
 state override was used.
+
+After the final Step 7 candidate replaced the preceding verifier, the alarm was
+rebound to `i-064cb3cc76a773051` / `ami-0a0c4d0e2608aa701`. Missing telemetry
+remains breaching and the existing SNS action remains enabled. CloudWatch again
+observed two real zero-valued `StatusCheckFailed` datapoints and transitioned
+the alarm to `OK` without a manual state override.
