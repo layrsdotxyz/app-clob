@@ -112,8 +112,11 @@ impl PrivyBaseCustodyAdapter {
                 let wallet_address =
                     canonical_evm_address(&required("LAYRSV2_BASE_POOL_LEDGER_PRIVY_ADDRESS")?)?;
                 let pool_address = canonical_evm_address(&required("LAYRSV2_BASE_POOL_ADDRESS")?)?;
-                let confirmations = env::var("LAYRSV2_BASE_WITHDRAWAL_CONFIRMATIONS")
-                    .unwrap_or_else(|_| "1".into())
+                // Reuse the established Base finality setting.  There is no
+                // direct-runtime default: accepting a weaker confirmation
+                // threshold than the operational custody path would weaken
+                // the withdrawal invariant.
+                let confirmations = required("LAYRSV2_BASE_CONFIRMATIONS")?
                     .parse::<u64>()
                     .map_err(|_| "invalid Base confirmation count")?;
                 if confirmations == 0 {
