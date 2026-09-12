@@ -42,7 +42,7 @@ use sha2::Sha256;
 use std::{
     collections::{BTreeMap, HashSet},
     env, io,
-    net::Ipv4Addr,
+    net::{IpAddr, Ipv4Addr},
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -1064,7 +1064,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/direct/commands", post(command))
         .route("/v1/direct/balances/:identity", get(balance))
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
+    // The packaged and dormant runtime is loopback-only.  A governed BFF
+    // deployment may opt in to a VPC listener only when production mode is
+    // explicitly enabled; its security group is the other enforcement layer.
+    let bind_address = runtime_bind_address(
+        env::var("LAYRS_DIRECT_BIND_ADDRESS").ok().as_deref(),
+        env::var("LAYRS_DIRECT_EXECUTION_MODE").ok().as_deref(),
+    )?;
+    let listener = tokio::net::TcpListener::bind((bind_address, port)).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -1077,6 +1084,17 @@ fn derive_direct_session_key(privy_app_secret: &[u8]) -> Vec<u8> {
     mac.update(&[0]);
     mac.update(layrs_direct_execution_v1::EPOCH_STATE_SHA256.as_bytes());
     mac.finalize().into_bytes().to_vec()
+}
+
+fn runtime_bind_address(requested: Option<&str>, mode: Option<&str>) -> Result<IpAddr, &'static str> {
+    let address = requested
+        .unwrap_or("127.0.0.1")
+        .parse::<IpAddr>()
+        .map_err(|_| "invalid direct runtime bind address")?;
+    if !address.is_loopback() && mode != Some("production-enabled") {
+        return Err("non-loopback direct runtime listener requires production-enabled mode");
+    }
+    Ok(address)
 }
 async fn attestation(
     State(state): State<AppState>,
@@ -2017,6 +2035,15 @@ mod tests {
         );
         assert_eq!(first.len(), 32);
         assert_ne!(first, secret);
+    }
+    #[test]
+    fn bff_listener_is_loopback_until_governed_production_mode() {
+        assert_eq!(runtime_bind_address(None, Some("dormant")).unwrap(), Ipv4Addr::LOCALHOST);
+        assert!(runtime_bind_address(Some("0.0.0.0"), Some("dormant")).is_err());
+        assert_eq!(
+            runtime_bind_address(Some("0.0.0.0"), Some("production-enabled")).unwrap(),
+            Ipv4Addr::UNSPECIFIED,
+        );
     }
     #[test]
     fn signed_session_rejects_tampering() {
