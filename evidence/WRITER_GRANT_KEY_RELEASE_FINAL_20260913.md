@@ -1,9 +1,9 @@
 # WriterGrant and attested key-release closeout
 
-Status: `VERIFIED_PACKAGED_ATTESTED_DORMANT_NOT_ACTIVATED`
+Status: `VERIFIED_PACKAGED_ATTESTED_DORMANT_PRODUCTION_DEPLOYED_NOT_ACTIVATED`
 
 Machine evidence: `WRITER_GRANT_KEY_RELEASE_FINAL_20260913.json`  
-Machine evidence SHA-256: `6574322aba0759f8ff5fb5dce1ede5ca7458fac3f87dd57345ce2e0e450890c5`
+Machine evidence SHA-256: `d5602b6d84c0073181fd3d3cfe444aa8551e8072e6c4ebfc275486bb8d76be7a`
 
 ## Root cause and correction
 
@@ -69,11 +69,33 @@ All 40 Rust tests passed. Source and packaged-binary executable-path audits
 found no Durable Preparation, release-ready, command queue, lease coordinator,
 or Durable Command coordinator path.
 
+## Dormant Production deployment
+
+CloudFormation stack `layrs-production-direct-execution-dormant` rolled to the
+exact candidate as instance `i-0bbf2b5378f82a496`. The initial cloud-init run
+identified one additional deployment-policy omission: the already-existing RPC
+secret is encrypted by the operational-identity CMK, while the role had only
+the distinct Recipient-gated runtime-key permission. The template now grants
+`kms:Decrypt` on that same CMK only when invoked through Secrets Manager. It
+does not grant direct decrypt or writer-key release.
+
+After that bounded template fix, the stack reached `UPDATE_COMPLETE`, the NLB
+target became healthy, both runtime services were active, and runtime status
+reported `writerEnabled=false`, `admissionEnabled=false`, and 438 opening
+identities. No WriterGrant or custody configuration is installed in the
+dormant EnvironmentFile. An IAM simulation using the real grant commitment and
+PCR tuple returned `implicitDeny` for operational writer-key release.
+
+The deployed enclave independently passed nonce-bound Nitro attestation with
+the exact candidate PCRs and a dormant binding. Production-dormant attestation
+SHA-256: `3983cd087cd754e0c320c28020c599a1dfc987cb3245fdd990fbba3f01c4c8ad`.
+
 ## Final safety state
 
-The verifier was returned to dormant mode, its temporary secret-bearing
+The isolated verifier was returned to dormant mode, its temporary secret-bearing
 EnvironmentFile and signed-session fixture were securely removed, and its
 temporary key-release/archive/Secrets Manager inline permission was revoked.
-Production remains on `ami-0a0c4d0e2608aa701`; it was not updated or enabled.
-No customer funds moved, no custody transaction was submitted, no trade was
-created, and the funded canary was not executed.
+Production is now deployed on `ami-02b000f068cf6b5a9` in dormant mode with no
+WriterGrant installed and no writer-key release capability. No customer funds
+moved, no custody transaction was submitted, no trade was created, and the
+funded canary was not executed.

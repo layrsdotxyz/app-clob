@@ -1,5 +1,5 @@
 {
-  "status": "VERIFIED_PACKAGED_ATTESTED_DORMANT_NOT_ACTIVATED",
+  "status": "VERIFIED_PACKAGED_ATTESTED_DORMANT_PRODUCTION_DEPLOYED_NOT_ACTIVATED",
   "source": {
     "implementationCommit": "df846b8dbf0a0fbbb71700ac6cdb154dd42bb980",
     "transactionModel": "layrs.direct-execution.v1",
@@ -10,7 +10,9 @@
     "eifInheritedParentEnvironment": false,
     "missingProductionVsockGrantDelivery": true,
     "missingAttestedProtectedKeyRelease": true,
-    "isolatedBootstrapWasTestOnly": true
+    "isolatedBootstrapWasTestOnly": true,
+    "dormantDeploymentRpcSecretKmsPermissionMissing": true,
+    "dormantDeploymentRpcSecretKmsPermissionFixedViaSecretsManagerOnly": true
   },
   "candidate": {
     "amiId": "ami-02b000f068cf6b5a9",
@@ -59,6 +61,27 @@
     "bindingMatches": true,
     "attestationSha256": "ea3202b0b01ae47e9a06d9d0c79f0f7be499f0f1af6c62406333341602ec5f25"
   },
+  "productionDormantDeployment": {
+    "stack": "layrs-production-direct-execution-dormant",
+    "stackStatus": "UPDATE_COMPLETE",
+    "instanceId": "i-0bbf2b5378f82a496",
+    "amiId": "ami-02b000f068cf6b5a9",
+    "executionMode": "dormant",
+    "writerGrantInstalled": false,
+    "writerEnabled": false,
+    "admissionEnabled": false,
+    "targetHealth": "healthy",
+    "servicesActive": true,
+    "environmentFileMode": "0600 root:root",
+    "operationalWriterKeyReleaseDecision": "implicitDeny",
+    "attestationModuleId": "i-0bbf2b5378f82a496-enc01a09713500b7fe1",
+    "attestationSha256": "3983cd087cd754e0c320c28020c599a1dfc987cb3245fdd990fbba3f01c4c8ad",
+    "attestationCoseSignatureVerified": true,
+    "attestationPcrAndBindingMatch": true,
+    "rpcSecretReadByExistingReference": true,
+    "rpcSecretKmsConstraint": "kms:ViaService=secretsmanager.us-east-1.amazonaws.com",
+    "custodyConfigurationInjected": false
+  },
   "tests": {
     "A_validGrant": "PASS_UNIT_AND_PACKAGED",
     "B_wrongPcrEif": "PASS_UNIT_AND_IAM_FAIL_CLOSED",
@@ -88,8 +111,9 @@
     "immutableSuccessorArtifactCount": 1
   },
   "safety": {
-    "productionStackModified": false,
-    "productionCandidateStill": "ami-0a0c4d0e2608aa701",
+    "productionStackModified": true,
+    "productionModification": "dormant writer-disabled AMI rollout and Secrets Manager-only RPC CMK permission",
+    "productionCandidateNow": "ami-02b000f068cf6b5a9",
     "customerFundsMoved": false,
     "fundedCanaryExecuted": false,
     "custodyTransactionSubmitted": false,

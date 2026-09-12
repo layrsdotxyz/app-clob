@@ -85,6 +85,16 @@ Resources:
               - Effect: Allow
                 Action: [kms:DescribeKey]
                 Resource: !Ref OperationalIdentityKmsKeyArn
+              # The existing RPC reference is encrypted by the established
+              # operational-identity CMK.  This separate Secrets Manager-only
+              # decrypt duty cannot release runtime key material directly and
+              # cannot satisfy the Recipient-gated writer-key statement above.
+              - Effect: Allow
+                Action: [kms:Decrypt]
+                Resource: !Ref OperationalIdentityKmsKeyArn
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
               # The read-only runtime may retrieve only its existing Privy
               # application configuration.  It cannot list,
               # create, update, rotate, or delete Secrets Manager objects.
