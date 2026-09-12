@@ -1711,6 +1711,10 @@ impl Projection {
         } else {
             let ca_pem = env::var("LAYRS_DIRECT_PROJECTION_DATABASE_CA_PEM")
                 .map_err(|_| "production projection CA is required")?;
+            // Secrets Manager JSON commonly stores PEM newlines as the two
+            // characters `\\n`. Normalize that representation in memory;
+            // never write or log the certificate or database credentials.
+            let ca_pem = ca_pem.replace("\\n", "\n");
             let certificate = native_tls::Certificate::from_pem(ca_pem.as_bytes())?;
             let connector = native_tls::TlsConnector::builder()
                 .add_root_certificate(certificate)
