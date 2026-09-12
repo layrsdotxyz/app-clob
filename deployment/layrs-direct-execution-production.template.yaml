@@ -44,22 +44,12 @@ Resources:
               - Effect: Allow
                 Action: [kms:Encrypt, kms:Decrypt, kms:GenerateDataKey, kms:DescribeKey]
                 Resource: !Ref ArchiveKmsKeyArn
-              # The dormant runtime may retrieve exactly the two existing
-              # operational configuration objects it needs.  It cannot list,
+              # The read-only runtime may retrieve only its existing Privy
+              # application configuration.  It cannot list,
               # create, update, rotate, or delete Secrets Manager objects.
               - Effect: Allow
                 Action: [secretsmanager:GetSecretValue]
-                Resource: [!Ref RuntimeSecretArn, !Ref RpcSecretArn]
-              # The RPC configuration secret uses this existing CMK.  The
-              # context/service condition prevents its use as a general KMS
-              # decrypt capability.
-              - Effect: Allow
-                Action: [kms:Decrypt, kms:DescribeKey]
-                Resource: !Ref OperationalIdentityKmsKeyArn
-                Condition:
-                  StringEquals:
-                    kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
-                    kms:EncryptionContext:SecretARN: !Ref RpcSecretArn
+                Resource: [!Ref RuntimeSecretArn]
               - Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
                 Resource: !GetAtt RuntimeLogGroup.Arn
@@ -119,23 +109,20 @@ Resources:
                 return item
 
             runtime = secret("${RuntimeSecretArn}")
-            rpc = secret("${RpcSecretArn}")
             values = {
                 "LAYRS_DIRECT_EXECUTION_MODE": "dormant",
-                "LAYRS_DIRECT_CUSTODY_PROVIDER": "privy-base-existing-pool-ledger",
+                # This guarded VPC listener serves only signed, encrypted
+                # balance reads from the dedicated BFF.  The enclave remains
+                # dormant and the parent rejects every financial command.
+                "LAYRS_DIRECT_BIND_ADDRESS": "0.0.0.0",
+                "LAYRS_DIRECT_READ_ONLY_VPC_BIND": "true",
                 "LAYRS_DIRECT_ARCHIVE_BACKEND": "s3-object-lock",
                 "LAYRS_DIRECT_ARCHIVE_BUCKET": "${ArchiveBucketName}",
                 "LAYRS_DIRECT_ARCHIVE_PREFIX": "${ArchivePrefix}",
                 "LAYRS_DIRECT_ARCHIVE_KMS_KEY_ID": "${ArchiveKmsKeyArn}",
                 "LAYRS_DIRECT_ARCHIVE_RETENTION_SECONDS": "${ArchiveRetentionSeconds}",
-                "LAYRSV2_BASE_POOL_ADDRESS": "${BasePoolAddress}",
-                "LAYRSV2_BASE_CONFIRMATIONS": "${BaseConfirmations}",
                 "LAYRSV2_PRIVY_APP_ID": required(runtime, "privyAppId"),
                 "LAYRSV2_PRIVY_APP_SECRET": required(runtime, "privyAppSecret"),
-                "LAYRSV2_BASE_POOL_LEDGER_PRIVY_WALLET_ID": required(runtime, "basePoolLedgerPrivyWalletId"),
-                "LAYRSV2_BASE_POOL_LEDGER_PRIVY_ADDRESS": required(runtime, "basePoolLedgerPrivyAddress"),
-                "LAYRSV2_BASE_POOL_LEDGER_PRIVY_AUTH_PRIVATE_KEY_PEM": required(runtime, "basePoolLedgerPrivyAuthPrivateKeyPem"),
-                "LAYRSV2_BASE_RPC_URL": required(rpc, "baseRpcUrl"),
             }
             def quote(value):
                 return '"' + value.replace('\\\\', '\\\\\\\\').replace('"', '\\\\"').replace('\n', '\\n') + '"'

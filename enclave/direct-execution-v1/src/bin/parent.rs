@@ -1046,8 +1046,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|value| hex::decode(value).ok())
             .filter(|value| value.len() == 32)
             .unwrap_or_default(),
-        custody: PrivyBaseCustodyAdapter::from_environment()
-            .map_err(|error| format!("direct custody configuration invalid: {error}"))?,
+        // A read-only runtime must not construct a custody adapter at all.
+        // This removes both execution capability and any reason to load an
+        // operational payout signer before the separately governed canary.
+        custody: if dormant {
+            None
+        } else {
+            PrivyBaseCustodyAdapter::from_environment()
+                .map_err(|error| format!("direct custody configuration invalid: {error}"))?
+        },
         financial_gate: Arc::new(Mutex::new(())),
         committed_state_root: Arc::new(Mutex::new(None)),
         unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
