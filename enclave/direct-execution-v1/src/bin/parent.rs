@@ -614,23 +614,30 @@ fn canonical_json(value: &Value) -> String {
 
 impl ArchiveStore {
     async fn from_environment(
-        isolated_test: bool,
+        local_filesystem_permitted: bool,
     ) -> Result<Option<Self>, Box<dyn std::error::Error>> {
         match env::var("LAYRS_DIRECT_ARCHIVE_BACKEND").as_deref() {
             Ok("s3-object-lock") => Ok(Some(Self::S3(
                 S3ImmutableArtifactStore::from_environment().await?,
             ))),
-            Ok("filesystem") if isolated_test => Ok(env::var("LAYRS_DIRECT_ARTIFACT_DIR")
-                .ok()
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-                .map(FilesystemImmutableArtifactStore::new)
-                .map(Self::Filesystem)),
+            // A package started in dormant mode can expose only health and
+            // attestation.  It cannot execute a financial request, so its
+            // predeclared local directory is safe for sealed-epoch recovery.
+            // An enabled writer must always use the immutable S3/Object-Lock
+            // archive below.
+            Ok("filesystem") if local_filesystem_permitted => {
+                Ok(env::var("LAYRS_DIRECT_ARTIFACT_DIR")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from)
+                    .map(FilesystemImmutableArtifactStore::new)
+                    .map(Self::Filesystem))
+            }
             Ok("filesystem") => {
                 Err("filesystem archive is prohibited outside isolated test".into())
             }
             Ok(_) => Err("invalid direct archive backend".into()),
-            Err(_) if isolated_test => Ok(env::var("LAYRS_DIRECT_ARTIFACT_DIR")
+            Err(_) if local_filesystem_permitted => Ok(env::var("LAYRS_DIRECT_ARTIFACT_DIR")
                 .ok()
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
@@ -960,6 +967,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // later governed activation injects the BFF verification key.
         .unwrap_or_default();
     let isolated_test = env::var("LAYRS_DIRECT_ISOLATED_TEST").as_deref() == Ok("true");
+    let dormant = matches!(
+        env::var("LAYRS_DIRECT_EXECUTION_MODE").as_deref(),
+        Err(_) | Ok("dormant")
+    );
     let projection = match env::var("LAYRS_DIRECT_PROJECTION_DATABASE_URL") {
         Ok(url) => Some(Projection::connect(&url, &epoch).await?),
         Err(_) if isolated_test => {
@@ -987,7 +998,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         isolated_test,
         projection,
         local_used_sessions: Arc::new(Mutex::new(HashSet::new())),
-        artifact_store: ArchiveStore::from_environment(isolated_test).await?,
+        // Filesystem storage is accepted only for an explicitly isolated test
+        // or a dormant package.  The production-enabled path remains S3 with
+        // Object Lock and KMS only.
+        artifact_store: ArchiveStore::from_environment(isolated_test || dormant).await?,
         commit_ack_key: env::var("LAYRS_DIRECT_COMMIT_ACK_KEY_HEX")
             .ok()
             .and_then(|value| hex::decode(value).ok())
