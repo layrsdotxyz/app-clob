@@ -43,3 +43,8 @@ The activation-critical `layrs-production-direct-runtime-health-missing`
 alarm was then rebound to the replacement instance.  It retains its existing
 production SNS action and breaching treatment for missing telemetry; it was
 not silenced, disabled, or state-forced.
+
+A final read-only archive check found no successor artifacts under the direct
+opening-epoch archive prefix.  This is consistent with the intentionally
+writer-disabled runtime: no direct financial commit, custody payout, or funded
+canary was performed during the deployment.
