@@ -1,0 +1,126 @@
+[
+  {
+    "ParameterKey": "VpcId",
+    "UsePreviousValue": true
+  },
+  {
+    "ParameterKey": "PrivateSubnetId",
+    "UsePreviousValue": true
+  },
+  {
+    "ParameterKey": "ReadOnlyLoadBalancerSubnetId",
+    "UsePreviousValue": true
+  },
+  {
+    "ParameterKey": "BffSecurityGroupId",
+    "UsePreviousValue": true
+  },
+  {
+    "ParameterKey": "DatabaseSecurityGroupId",
+    "UsePreviousValue": true
+  },
+  {
+    "ParameterKey": "CandidateAmiId",
+    "ParameterValue": "ami-0c6e26a5461b89937"
+  },
+  {
+    "ParameterKey": "ArchiveBucketArn",
+    "UsePreviousValue": true
+  },
+  {
+    "ParameterKey": "ArchiveBucketName",
+    "UsePreviousValue": true
+  },
+  {
+    "ParameterKey": "ArchiveKmsKeyArn",
+    "UsePreviousValue": true
+  },
+  {
+    "ParameterKey": "ArchivePrefix",
+    "UsePreviousValue": true
+  },
+  {
+    "ParameterKey": "ArchiveRetentionSeconds",
+    "UsePreviousValue": true
+  },
+  {
+    "ParameterKey": "AlertTopicArn",
+    "UsePreviousValue": true
+  },
+  {
+    "ParameterKey": "RuntimeSecretArn",
+    "UsePreviousValue": true
+  },
+  {
+    "ParameterKey": "DatabaseSecretArn",
+    "UsePreviousValue": true
+  },
+  {
+    "ParameterKey": "DatabaseSecretKmsKeyArn",
+    "UsePreviousValue": true
+  },
+  {
+    "ParameterKey": "DatabaseCaSecretArn",
+    "UsePreviousValue": true
+  },
+  {
+    "ParameterKey": "DatabaseHost",
+    "UsePreviousValue": true
+  },
+  {
+    "ParameterKey": "DatabaseName",
+    "UsePreviousValue": true
+  },
+  {
+    "ParameterKey": "DatabasePort",
+    "UsePreviousValue": true
+  },
+  {
+    "ParameterKey": "RpcSecretArn",
+    "UsePreviousValue": true
+  },
+  {
+    "ParameterKey": "OperationalIdentityKmsKeyArn",
+    "UsePreviousValue": true
+  },
+  {
+    "ParameterKey": "ExecutionMode",
+    "ParameterValue": "production-enabled"
+  },
+  {
+    "ParameterKey": "WriterGrantBase64",
+    "ParameterValue": "eyJhY3RpdmF0aW9uSWQiOiJsYXlycy1kaXJlY3QtNGQxNDE2My1wMC13aXRoZHJhd2FsLTIwMjYwOTE0IiwiZW52aXJvbm1lbnQiOiJwcm9kdWN0aW9uIiwiYXV0aG9yaXphdGlvblNjb3BlIjoicHJvZHVjdGlvbi1lbmFibGVkIiwiZXBvY2hJZCI6ImxheXJzLW9wZW5pbmctZXBvY2gtMjAyNjA5MTEtOTQxMTA3NTM3NzI4Yzk4YiIsInJ1bnRpbWUiOiJsYXlycy5kaXJlY3QtZXhlY3V0aW9uLnYxIiwib3BlbmluZ0Vwb2NoU2hhMjU2IjoiODQ4MzVkYTgyMjEwNjcxZDg3MzIxYTIxMjQ2MzE3ZDg5OGFmZDM1MzgxYzU3YmU4NTIyZGYxYTUxNmRjMzU5MCIsIm9wZW5pbmdFdmlkZW5jZU1hbmlmZXN0U2hhMjU2IjoiNzBlNTc5ZjYzMGM3NTkyNTg3MjhkOTFjYjk1N2ZhODRlMjAwNjc0YWVlYmQzZWFlNTk5NzQzMGE2MjIwMzk1NyIsInJ1bnRpbWVNZWFzdXJlbWVudCI6eyJhbWlJZCI6ImFtaS0wYzZlMjZhNTQ2MWI4OTkzNyIsImVpZlNoYTI1NiI6ImViMTExYmIxMTVmNTNjYWMzOTIyYmI3ZWVhMmMyYzZjYjRiNTg0MzYwNzkxYTA3YmUwNTk0ZWFlYWI0MzM0MDkiLCJwY3IwIjoiZjk3MjE2ODU5ZmM0Y2Y3NGY3ZDkzY2ZjNjc0MDEyYTNiNjA1YTc3MTNlNGMxN2I0YTFhNWI3MDdlMzVlM2ZiNWI5ZDcwMTM4MzIyMDI5N2Q3NGI0ZDM1ZTdhZmI2NmZiIiwicGNyMSI6IjRiNGQ1YjM2NjFiM2VmYzEyOTIwOTAwYzgwZTEyNmU0Y2U3ODNjNTIyZGU2YzAyYTJhNWJmN2FmM2EyYjkzMjdiODY3NzZmMTg4ZTRiZTFjMWM0MDRhMTI5ZGJkYTQ5MyIsInBjcjIiOiI4MGI4ZWMyNWJiNzFlNmJmNzJiZDY4OGY5MTBjMzlkZDFmZjEzMmU2ZGRmNjNmZWQyMGNjOWI2MWRmYTQxNmVlNWE3ZTk4YjM2NzlkYjMyMGRmMzI0YWI5Y2QzOTg2Y2MiLCJzb3VyY2VDb21taXQiOiI0ZDE0MTYzMjkwNmEyYTFiNTVmYzUzNjY2NTc0OTc2ZGEwYzZiYjhiIiwiZW5jbGF2ZVNoYTI1NiI6IjhmMDc4MGFmZjdkNmUyYzUwNTBkOTRiOTZmYmU2ZWJhNmIyMDY3YmMwMmFiNjcwNzUwNzg4ODQ2ZjYyNGJmODQiLCJwYXJlbnRTaGEyNTYiOiJmNTkwMGVmNzM2ZWM5NTZiNmM5YmY2NTJlODQ1YTFmYWMwNGM4ODQ5YmNjNDcxMTIzMTc2NzQxMDc0MzRjMzA0In0sIm9sZFdyaXRlckZlbmNlRXZpZGVuY2VTaGEyNTYiOiJiOTkxZTQxNjgyZDAxYzU0NmUxMWMwM2JjYTc5YThlMTQxYjRmNmQ4OTJhM2FmYjZhNWEwZmU2NzIwMTgyMzY0Iiwia2V5UmVsZWFzZUttc0tleUlkIjoiYXJuOmF3czprbXM6dXMtZWFzdC0xOjA4MjIyMzU0ODUxNjprZXkvZTExMDVkZjUtNTI1My00YzZkLWFmMjgtMzU4OWJjZDQ0MDZlIiwia2V5UmVsZWFzZVByZWRlY2Vzc29yIjp7ImFjdGl2YXRpb25JZCI6ImxheXJzLWRpcmVjdC1iOWUxMzRhLXByaXZ5LWF1dGgtb25seS0yMDI2MDkxMyIsImFydGlmYWN0U2hhMjU2IjoiNzkzNWJmMDVlNDhkZmNlNWQzMmY1YWM5ZWExNjI5MDZlNTJiMmZkMDkxMjczODMzODZmN2I1YjM4MDg0NWI4NCIsIndyaXRlckdyYW50Q29tbWl0bWVudCI6IjBlNzc4MTc0ZDNmYjE5YzRkMGRlMWMzZTMyZGQ5ODI1NzBlMzA0ZDY5N2YzNmY1NzM2NzI2NzkxMTFkZDViYzEifSwiZXhwaXJlc0F0VW5peCI6MTc4OTQxOTc5MywiZ292ZXJuYW5jZUtleUlkIjoiYWxpYXMvbGF5cnMvcHJvZHVjdGlvbi9yZWNvdmVyeS1ldmlkZW5jZS1zaWduaW5nIiwic2lnbmluZ0FsZ29yaXRobSI6IkVDRFNBX1NIQV8yNTYiLCJzaWduYXR1cmUiOiJNRVFDSUJxYjk3a3U5R3g4dTlhRURQU0xLRnlGak1ybUxaTHcwR1hyalRHajNVa3JBaUJyZGtNa2d5ZXFsdW5NU3gveGFyTy9pOG5UaEJNRFNBUFdubG1wQnN4OG9BPT0ifQo="
+  },
+  {
+    "ParameterKey": "ApprovedRuntimeBindingBase64",
+    "ParameterValue": "eyJhbWlJZCI6ImFtaS0wYzZlMjZhNTQ2MWI4OTkzNyIsImVpZlNoYTI1NiI6ImViMTExYmIxMTVmNTNjYWMzOTIyYmI3ZWVhMmMyYzZjYjRiNTg0MzYwNzkxYTA3YmUwNTk0ZWFlYWI0MzM0MDkiLCJwY3IwIjoiZjk3MjE2ODU5ZmM0Y2Y3NGY3ZDkzY2ZjNjc0MDEyYTNiNjA1YTc3MTNlNGMxN2I0YTFhNWI3MDdlMzVlM2ZiNWI5ZDcwMTM4MzIyMDI5N2Q3NGI0ZDM1ZTdhZmI2NmZiIiwicGNyMSI6IjRiNGQ1YjM2NjFiM2VmYzEyOTIwOTAwYzgwZTEyNmU0Y2U3ODNjNTIyZGU2YzAyYTJhNWJmN2FmM2EyYjkzMjdiODY3NzZmMTg4ZTRiZTFjMWM0MDRhMTI5ZGJkYTQ5MyIsInBjcjIiOiI4MGI4ZWMyNWJiNzFlNmJmNzJiZDY4OGY5MTBjMzlkZDFmZjEzMmU2ZGRmNjNmZWQyMGNjOWI2MWRmYTQxNmVlNWE3ZTk4YjM2NzlkYjMyMGRmMzI0YWI5Y2QzOTg2Y2MiLCJzb3VyY2VDb21taXQiOiI0ZDE0MTYzMjkwNmEyYTFiNTVmYzUzNjY2NTc0OTc2ZGEwYzZiYjhiIiwiZW5jbGF2ZVNoYTI1NiI6IjhmMDc4MGFmZjdkNmUyYzUwNTBkOTRiOTZmYmU2ZWJhNmIyMDY3YmMwMmFiNjcwNzUwNzg4ODQ2ZjYyNGJmODQiLCJwYXJlbnRTaGEyNTYiOiJmNTkwMGVmNzM2ZWM5NTZiNmM5YmY2NTJlODQ1YTFmYWMwNGM4ODQ5YmNjNDcxMTIzMTc2NzQxMDc0MzRjMzA0In0K"
+  },
+  {
+    "ParameterKey": "WriterGrantCommitment",
+    "ParameterValue": "f577563b8d72afae62d168bb21bb91a79ceaf6480ac5f41a5533a0faf3a15aad"
+  },
+  {
+    "ParameterKey": "ApprovedPcr0",
+    "ParameterValue": "f97216859fc4cf74f7d93cfc674012a3b605a7713e4c17b4a1a5b707e35e3fb5b9d701383220297d74b4d35e7afb66fb"
+  },
+  {
+    "ParameterKey": "ApprovedPcr1",
+    "ParameterValue": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493"
+  },
+  {
+    "ParameterKey": "ApprovedPcr2",
+    "ParameterValue": "80b8ec25bb71e6bf72bd688f910c39dd1ff132e6ddf63fed20cc9b61dfa416ee5a7e98b3679db320df324ab9cd3986cc"
+  },
+  {
+    "ParameterKey": "BasePoolAddress",
+    "UsePreviousValue": true
+  },
+  {
+    "ParameterKey": "BaseConfirmations",
+    "UsePreviousValue": true
+  },
+  {
+    "ParameterKey": "DormantRuntimeDesiredCapacity",
+    "UsePreviousValue": true
+  }
+]
