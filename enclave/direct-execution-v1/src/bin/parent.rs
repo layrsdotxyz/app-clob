@@ -75,7 +75,6 @@ const POOL_WITHDRAW_TOPIC: &str =
     "0xcbcdbdf10631a43cc99c80acace8232649421c3f4f73919f16013d47c83a687a";
 const USER_OPERATION_EVENT_TOPIC: &str =
     "0x49628fd1471006c1482da88028e9ce4dbb080b815c9b0344d39e5a8e6ec1419f";
-const ERC4337_ENTRYPOINT_V07_ADDRESS: &str = "0x0000000071727de22e5e9d8baf0edac6f37da032";
 #[derive(Clone)]
 struct AppState {
     enclave_cid: u32,
@@ -809,31 +808,23 @@ fn classify_base_deposit(
     head: u128,
 ) -> Result<DepositFinality, String> {
     let expected_input = erc20_transfer_calldata(pool_address, amount)?;
-    let direct_call = transaction
+    if transaction
         .get("from")
         .and_then(Value::as_str)
         .and_then(|value| canonical_evm_address(value).ok())
         .as_deref()
-        == Some(source_wallet)
-        && transaction
+        != Some(source_wallet)
+        || transaction
             .get("to")
             .and_then(Value::as_str)
             .and_then(|value| canonical_evm_address(value).ok())
             .as_deref()
-            == Some(BASE_USDC_ADDRESS)
-        && transaction
+            != Some(BASE_USDC_ADDRESS)
+        || transaction
             .get("input")
             .and_then(Value::as_str)
             .map(|value| value.eq_ignore_ascii_case(&expected_input))
-            == Some(true);
-    let sponsored_call = transaction
-        .get("to")
-        .and_then(Value::as_str)
-        .and_then(|value| canonical_evm_address(value).ok())
-        .as_deref()
-        == Some(ERC4337_ENTRYPOINT_V07_ADDRESS)
-        && sponsored_deposit_receipt_matches(source_wallet, pool_address, amount, receipt);
-    if (!direct_call && !sponsored_call)
+            != Some(true)
         || transaction
             .get("value")
             .and_then(Value::as_str)
@@ -903,58 +894,6 @@ fn classify_base_deposit(
         return Ok(DepositFinality::Pending);
     }
     Ok(DepositFinality::Finalized)
-}
-
-/// Bind a Privy-sponsored ERC-4337 deposit to the authenticated embedded
-/// wallet without trusting the bundler's outer transaction sender.  Both the
-/// successful EntryPoint operation and the exact USDC transfer must occur
-/// exactly once in the same successful receipt.
-fn sponsored_deposit_receipt_matches(
-    source_wallet: &str,
-    pool_address: &str,
-    amount: u128,
-    receipt: &Value,
-) -> bool {
-    let Some(logs) = receipt.get("logs").and_then(Value::as_array) else {
-        return false;
-    };
-    let source_topic = address_topic(source_wallet);
-    let pool_topic = address_topic(pool_address);
-    let mut matching_user_operations = 0usize;
-    let mut matching_transfers = 0usize;
-    for log in logs {
-        let address = log
-            .get("address")
-            .and_then(Value::as_str)
-            .and_then(|value| canonical_evm_address(value).ok());
-        let topics = log.get("topics").and_then(Value::as_array);
-        let data = log.get("data").and_then(Value::as_str);
-        let topic = |index: usize| {
-            topics
-                .and_then(|values| values.get(index))
-                .and_then(Value::as_str)
-        };
-        if address.as_deref() == Some(ERC4337_ENTRYPOINT_V07_ADDRESS)
-            && topic(0).is_some_and(|value| value.eq_ignore_ascii_case(USER_OPERATION_EVENT_TOPIC))
-            && topic(2).is_some_and(|value| value.eq_ignore_ascii_case(&source_topic))
-            && data
-                .and_then(|value| value.strip_prefix("0x"))
-                .filter(|value| value.len() >= 128)
-                .and_then(|value| u128::from_str_radix(&value[64..128], 16).ok())
-                == Some(1)
-        {
-            matching_user_operations += 1;
-        }
-        if address.as_deref() == Some(BASE_USDC_ADDRESS)
-            && topic(0).is_some_and(|value| value.eq_ignore_ascii_case(ERC20_TRANSFER_TOPIC))
-            && topic(1).is_some_and(|value| value.eq_ignore_ascii_case(&source_topic))
-            && topic(2).is_some_and(|value| value.eq_ignore_ascii_case(&pool_topic))
-            && data.and_then(parse_quantity) == Some(amount)
-        {
-            matching_transfers += 1;
-        }
-    }
-    matching_user_operations == 1 && matching_transfers == 1
 }
 fn canonical_json(value: &Value) -> String {
     match value {
@@ -3536,87 +3475,6 @@ mod tests {
             )
             .unwrap(),
             DepositFinality::Reverted
-        );
-    }
-
-    #[test]
-    fn sponsored_deposit_is_bound_to_successful_user_operation_and_exact_transfer() {
-        let source = "0xd5d8f363b2122c1fcedaff313990b049fbd11e61";
-        let pool = "0xb07627b0d646f5c82c8e30975a37650dc272a35f";
-        let hash = format!("0x{}", "11".repeat(32));
-        let block_hash = format!("0x{}", "22".repeat(32));
-        let amount = 5_000_000u128;
-        let transaction = json!({
-            "from": "0x2fbf4c11589b8a96a6da17a9c19cc51460aaec65",
-            "to": ERC4337_ENTRYPOINT_V07_ADDRESS,
-            "input": "0x765e827f",
-            "value": "0x0",
-            "blockHash": block_hash,
-        });
-        let receipt = json!({
-            "transactionHash": hash,
-            "blockHash": block_hash,
-            "blockNumber": "0x64",
-            "status": "0x1",
-            "logs": [
-                {
-                    "address": ERC4337_ENTRYPOINT_V07_ADDRESS,
-                    "topics": [USER_OPERATION_EVENT_TOPIC, format!("0x{}", "33".repeat(32)), address_topic(source)],
-                    "data": format!("0x{:064x}{:064x}{:064x}{:064x}", 0, 1, 0, 129_564),
-                },
-                {
-                    "address": BASE_USDC_ADDRESS,
-                    "topics": [ERC20_TRANSFER_TOPIC, address_topic(source), address_topic(pool)],
-                    "data": quantity(amount),
-                }
-            ],
-        });
-        assert_eq!(
-            classify_base_deposit(source, pool, &hash, amount, 20, &transaction, &receipt, 119)
-                .unwrap(),
-            DepositFinality::Finalized
-        );
-
-        let mut failed_operation = receipt.clone();
-        failed_operation["logs"][0]["data"] =
-            json!(format!("0x{:064x}{:064x}{:064x}{:064x}", 0, 0, 0, 129_564));
-        assert_eq!(
-            classify_base_deposit(
-                source,
-                pool,
-                &hash,
-                amount,
-                20,
-                &transaction,
-                &failed_operation,
-                119
-            )
-            .unwrap(),
-            DepositFinality::Conflict
-        );
-
-        let mut duplicate_transfer = receipt;
-        duplicate_transfer["logs"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({
-                "address": BASE_USDC_ADDRESS,
-                "topics": [ERC20_TRANSFER_TOPIC, address_topic(source), address_topic(pool)],
-                "data": quantity(amount),
-            }));
-        assert_eq!(
-            classify_base_deposit(
-                source,
-                pool,
-                &hash,
-                amount,
-                20,
-                &transaction,
-                &duplicate_transfer,
-                119
-            )
-            .unwrap(),
-            DepositFinality::Conflict
         );
     }
 
