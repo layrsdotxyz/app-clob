@@ -31,10 +31,11 @@ use layrs_direct_execution_v1::{
     artifact_hash, identity_commitment_for, reference_for, request_hash, sha256, sign,
     DirectAction, DirectReceipt, DirectRequest, DirectResult, DirectStateArtifact, DurabilityAck,
     ExternalEffectIntent, ExternalEffectRecovery, FilesystemImmutableArtifactStore,
-    FilesystemImmutableIntentStore, GovernedKeyReleaseArtifact, GovernedMarketRegistration,
-    ImmutableExternalEffectIntentStore, OrderAction, Outcome, ProjectionBalanceRow,
-    ProjectionIdentityRow, ProjectionWalletRow, RuntimeMeasurementBinding, RuntimeRequest,
-    RuntimeResponse, SealedEpoch, TimeInForce, WriterGrant, EPOCH_ID, POSTGRES_PROJECTION_DDL,
+    FilesystemImmutableIntentStore, GovernedBalanceRecovery, GovernedKeyReleaseArtifact,
+    GovernedMarketRegistration, ImmutableExternalEffectIntentStore, OrderAction, Outcome,
+    ProjectionBalanceRow, ProjectionIdentityRow, ProjectionWalletRow, RuntimeMeasurementBinding,
+    RuntimeRequest, RuntimeResponse, SealedEpoch, TimeInForce, WriterGrant, EPOCH_ID,
+    POSTGRES_PROJECTION_DDL,
 };
 use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
@@ -1515,6 +1516,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/attestation", get(attestation))
         .route("/v1/runtime/status", get(status))
         .route("/v1/operator/markets", post(register_market))
+        .route(
+            "/v1/operator/balance-recoveries",
+            post(apply_balance_recovery),
+        )
         .route("/v1/direct/admissions", post(admit_identity))
         .route("/v1/direct/commands", post(command))
         .route("/v1/direct/balances/:identity", get(balance))
@@ -1895,6 +1900,50 @@ async fn register_market(
                     return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE")
                         .into_response();
                 }
+            }
+            Json(result).into_response()
+        }
+        Ok(RuntimeResponse::Error { code }) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, code).into_response()
+        }
+        _ => (StatusCode::BAD_GATEWAY, "ENCLOSURE_UNAVAILABLE").into_response(),
+    }
+}
+
+async fn apply_balance_recovery(
+    State(state): State<AppState>,
+    Json(recovery): Json<GovernedBalanceRecovery>,
+) -> impl IntoResponse {
+    if env::var("LAYRS_DIRECT_EXECUTION_MODE").as_deref() != Ok("production-enabled") {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_DISABLED").into_response();
+    }
+    let now = now_unix();
+    if !recovery.verify(now) {
+        return (StatusCode::FORBIDDEN, "BALANCE_RECOVERY_SIGNATURE_INVALID").into_response();
+    }
+    let mut request = DirectRequest {
+        account_id: recovery.account_id.clone(),
+        identity_commitment: recovery.identity_commitment.clone(),
+        request_id: recovery.recovery_id.clone(),
+        request_hash: String::new(),
+        financial_wallet_address: None,
+        action: DirectAction::GovernedBalanceRecovery {
+            recovery,
+            now_unix: now,
+        },
+    };
+    request.request_hash = request_hash(&request);
+    let _guard = state.financial_gate.lock().await;
+    match exchange_direct(&state, request).await {
+        Ok(RuntimeResponse::Execute { result }) => {
+            if let Some(projection) = &state.projection {
+                if projection.record_result(&result).await.is_err() {
+                    return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE")
+                        .into_response();
+                }
+            } else if !state.isolated_test {
+                return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_NOT_CONFIGURED")
+                    .into_response();
             }
             Json(result).into_response()
         }

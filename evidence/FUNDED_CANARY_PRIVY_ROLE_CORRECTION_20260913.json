@@ -13,6 +13,17 @@
   },
   "externalEffects": [
     {
+      "purpose": "ERRONEOUS_MM02_PRIVATE_WITHDRAWAL_TO_AUTH_ONLY_PRIVY_WALLET",
+      "transactionHash": "0x8d2b8605e915fb11bcb6421b2c7077186c7d6cbf7cb75a6c224067bac7906ad7",
+      "blockNumber": 51232996,
+      "status": "FINALIZED_SUCCESS",
+      "asset": "USDC",
+      "amountAtomic": "5000000",
+      "from": "0xb07627b0D646F5c82C8E30975a37650Dc272a35f",
+      "to": "0xB69ac21b8a96234A09Ba6c7644F1c2b106FD4A01",
+      "privateEffect": "MM02_AVAILABLE_DEBITED_5000000"
+    },
+    {
       "purpose": "MM02_TO_MM20_WALLET_TRANSFER",
       "transactionHash": "0xaffae9b929976ebe3f0a6bf7556fcfa1c6f04767d6269612bfa05177e5ed7340",
       "blockNumber": 51237383,
@@ -42,6 +53,14 @@
     "failedDepositAccountingEventCount": 0,
     "failedDepositCustodyEventCount": 0,
     "requiredReconciliation": "Restore MM02's 5000000-atomic liability through a governed auditable recovery; do not manually edit a balance."
+  },
+  "economicReconciliation": {
+    "canaryPoolOutflowAtomic": "5000000",
+    "canaryPoolReturnAtomic": "5000000",
+    "canaryNetCustodyChangeAtomic": "0",
+    "requiredPrivateLiabilityRestorationAtomic": "5000000",
+    "unrelatedInterveningPoolOutflowAtomic": "5000000",
+    "unrelatedInterveningPoolOutflowTreatment": "EXCLUDED_FROM_CANARY_AND_REQUIRES_SEPARATE_ATTRIBUTION"
   },
   "archiveCounts": {
     "artifacts": 2,

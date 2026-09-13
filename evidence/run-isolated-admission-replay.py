@@ -59,6 +59,7 @@ def make_token() -> str:
         "epochId": EPOCH_ID,
         "epochStateSha256": EPOCH_SHA,
         "walletAddress": WALLET,
+        "financialWalletAddress": None,
         "identityCommitment": identity,
         "expiresAtUnix": int(time.time()) + 900,
         "responseKey": b64url(bytes([23]) * 32),

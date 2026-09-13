@@ -46,6 +46,7 @@ pub const TRANSACTION_MODEL: &str = "layrs.direct-execution.v1";
 pub const PROJECTION_SCHEMA_VERSION: u32 = 1;
 pub const IDENTITY_ADMISSION_DOMAIN: &str = "layrs.direct-identity-admission.v1\0";
 pub const MARKET_REGISTRATION_DOMAIN: &str = "layrs.direct-market-registration.v1\0";
+pub const BALANCE_RECOVERY_DOMAIN: &str = "layrs.direct-balance-recovery.v1\0";
 /// Existing production recovery-evidence KMS signer.  This public key is
 /// deliberately compiled into the measured enclave so the untrusted parent
 /// cannot substitute governance verification material at activation time.
@@ -622,6 +623,79 @@ impl GovernedMarketRegistration {
         verifying_key.verify(&payload, &signature).is_ok()
     }
 }
+
+/// Exact, one-use governance authorization for correcting a proven customer
+/// liability discrepancy. It is executed synchronously as one direct request;
+/// it is neither an external-effect instruction nor a resumable command.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GovernedBalanceRecovery {
+    pub recovery_id: String,
+    pub epoch_id: String,
+    pub runtime: String,
+    pub account_id: String,
+    pub identity_commitment: String,
+    pub asset: String,
+    pub bucket: String,
+    pub amount_atomic: String,
+    pub expected_balance_before_atomic: String,
+    pub evidence_sha256: String,
+    pub reason_code: String,
+    pub expires_at_unix: u64,
+    pub governance_key_id: String,
+    pub signing_algorithm: String,
+    pub signature: String,
+}
+
+impl GovernedBalanceRecovery {
+    pub fn verify(&self, now_unix: u64) -> bool {
+        if self.recovery_id.is_empty()
+            || self.epoch_id != EPOCH_ID
+            || self.runtime != TRANSACTION_MODEL
+            || self.account_id.len() != 64
+            || !self.account_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || self.identity_commitment.len() != 64
+            || !self
+                .identity_commitment
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || self.asset != "USDC"
+            || self.bucket != "USER_AVAILABLE"
+            || amount(&self.amount_atomic).is_err()
+            || self.expected_balance_before_atomic.parse::<u128>().is_err()
+            || self.evidence_sha256.len() != 64
+            || !self
+                .evidence_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || self.reason_code != "RESTORE_RETURNED_CANARY_PRINCIPAL"
+            || self.expires_at_unix <= now_unix
+            || self.governance_key_id != GOVERNANCE_KEY_ID
+            || self.signing_algorithm != GOVERNANCE_SIGNING_ALGORITHM
+        {
+            return false;
+        }
+        let Ok(public_key_der) = STANDARD.decode(GOVERNANCE_PUBLIC_KEY_DER_BASE64) else {
+            return false;
+        };
+        let Ok(verifying_key) = VerifyingKey::from_public_key_der(&public_key_der) else {
+            return false;
+        };
+        let mut unsigned = self.clone();
+        unsigned.signature.clear();
+        let Ok(payload) = serde_json::to_vec(&(BALANCE_RECOVERY_DOMAIN, unsigned)) else {
+            return false;
+        };
+        let Ok(signature_der) = STANDARD.decode(&self.signature) else {
+            return false;
+        };
+        let Ok(signature) = Signature::from_der(&signature_der) else {
+            return false;
+        };
+        verifying_key.verify(&payload, &signature).is_ok()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DirectAction {
@@ -633,6 +707,10 @@ pub enum DirectAction {
     },
     RegisterMarket {
         registration: GovernedMarketRegistration,
+        now_unix: u64,
+    },
+    GovernedBalanceRecovery {
+        recovery: GovernedBalanceRecovery,
         now_unix: u64,
     },
     CreditDeposit {
@@ -1235,6 +1313,35 @@ impl DirectRuntime {
                         PriceTimeBook::default(),
                     );
                     ("MARKET_REGISTERED".into(), None, None)
+                }
+                DirectAction::GovernedBalanceRecovery { recovery, now_unix } => {
+                    let expected = recovery
+                        .expected_balance_before_atomic
+                        .parse::<u128>()
+                        .map_err(|_| RuntimeError::InvalidRequest)?;
+                    let valid_authorization = recovery.verify(*now_unix)
+                        || (self.mode == RuntimeMode::IsolatedTest
+                            && recovery.signature == "isolated-governed-balance-recovery"
+                            && recovery.expires_at_unix > *now_unix);
+                    if !valid_authorization
+                        || request.request_id != recovery.recovery_id
+                        || request.account_id != recovery.account_id
+                        || request.identity_commitment != recovery.identity_commitment
+                        || self.balance(
+                            &request.identity_commitment,
+                            &recovery.asset,
+                            &recovery.bucket,
+                        ) != expected
+                    {
+                        return Err(RuntimeError::InvalidRequest);
+                    }
+                    let value = amount(&recovery.amount_atomic)?;
+                    self.add(&request.identity_commitment, &recovery.bucket, value)?;
+                    (
+                        "GOVERNED_BALANCE_RECOVERY_APPLIED".into(),
+                        Some(recovery.amount_atomic.clone()),
+                        Some(format!("recovery-evidence:{}", recovery.evidence_sha256)),
+                    )
                 }
                 DirectAction::CreditDeposit {
                     amount_atomic,
@@ -2937,6 +3044,93 @@ mod tests {
             ),
             5100000
         );
+    }
+
+    #[test]
+    fn governed_canary_liability_recovery_is_exact_once_restart_safe_and_has_no_custody_effect() {
+        let subject = "7619baaa0831003f3ca58bfcf5b2c773c8bc302a015124b1c432d220ddaa704b";
+        let identity = "88dff4a4d5ab480024423e999bd92463a6474bb00e56f46c264b944aaba39871";
+        let state_key = [9u8; 32];
+        let epoch = SealedEpoch::load(epoch_path()).unwrap();
+        let mut runtime =
+            DirectRuntime::new(epoch.clone(), RuntimeMode::IsolatedTest, vec![7; 32]).unwrap();
+        let mut store = InMemoryDirectStateStore::default();
+        runtime
+            .execute_committed(
+                request_for(
+                    subject,
+                    identity,
+                    "simulate-returned-canary-principal",
+                    DirectAction::ReserveWithdrawal {
+                        destination: "0xfefefefefefefefefefefefefefefefefefefefe".into(),
+                        amount_atomic: "5000000".into(),
+                        custody_reference: "isolated-returned-canary-principal".into(),
+                    },
+                ),
+                &state_key,
+                &mut store,
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.balance(identity, "USDC", "USER_AVAILABLE"),
+            4_404_611
+        );
+
+        let recovery = GovernedBalanceRecovery {
+            recovery_id: "recover-mm02-returned-canary-principal-20260913".into(),
+            epoch_id: EPOCH_ID.into(),
+            runtime: TRANSACTION_MODEL.into(),
+            account_id: subject.into(),
+            identity_commitment: identity.into(),
+            asset: "USDC".into(),
+            bucket: "USER_AVAILABLE".into(),
+            amount_atomic: "5000000".into(),
+            expected_balance_before_atomic: "4404611".into(),
+            evidence_sha256: "a".repeat(64),
+            reason_code: "RESTORE_RETURNED_CANARY_PRINCIPAL".into(),
+            expires_at_unix: 2_000,
+            governance_key_id: GOVERNANCE_KEY_ID.into(),
+            signing_algorithm: GOVERNANCE_SIGNING_ALGORITHM.into(),
+            signature: "isolated-governed-balance-recovery".into(),
+        };
+        let command = request_for(
+            subject,
+            identity,
+            &recovery.recovery_id.clone(),
+            DirectAction::GovernedBalanceRecovery {
+                recovery,
+                now_unix: 1_000,
+            },
+        );
+        let applied = runtime
+            .execute_committed(command.clone(), &state_key, &mut store)
+            .unwrap();
+        assert_eq!(applied.effect, "GOVERNED_BALANCE_RECOVERY_APPLIED");
+        assert_eq!(
+            runtime.balance(identity, "USDC", "USER_AVAILABLE"),
+            9_404_611
+        );
+        assert_eq!(store.artifacts().unwrap().len(), 2);
+
+        let mut restarted = DirectRuntime::restore_committed(
+            epoch,
+            RuntimeMode::IsolatedTest,
+            vec![7; 32],
+            &state_key,
+            &store,
+        )
+        .unwrap();
+        assert_eq!(
+            restarted.balance(identity, "USDC", "USER_AVAILABLE"),
+            9_404_611
+        );
+        assert_eq!(
+            restarted
+                .execute_committed(command, &state_key, &mut store)
+                .unwrap(),
+            applied
+        );
+        assert_eq!(store.artifacts().unwrap().len(), 2);
     }
 
     #[test]
