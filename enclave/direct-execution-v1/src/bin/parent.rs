@@ -1578,6 +1578,15 @@ fn runtime_bind_address(
     }
     Ok(address)
 }
+
+fn direct_writer_route_enabled(isolated_test: bool, mode: Option<&str>) -> bool {
+    isolated_test || mode == Some("production-enabled")
+}
+
+fn direct_admission_route_enabled(isolated_test: bool, mode: Option<&str>) -> bool {
+    isolated_test || matches!(mode, Some("admission-enabled" | "production-enabled"))
+}
+
 async fn attestation(
     State(state): State<AppState>,
     Query(query): Query<AttestationQuery>,
@@ -1607,7 +1616,10 @@ async fn command(
     // Do not let a read-only deployment reach candidate creation, custody, or
     // archive persistence merely because a BFF can reach its VPC listener.
     // Dormant state remains independently enforced inside the enclave.
-    if env::var("LAYRS_DIRECT_EXECUTION_MODE").as_deref() != Ok("production-enabled") {
+    if !direct_writer_route_enabled(
+        state.isolated_test,
+        env::var("LAYRS_DIRECT_EXECUTION_MODE").ok().as_deref(),
+    ) {
         return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_DISABLED").into_response();
     }
     let request_id = match headers
@@ -1803,9 +1815,9 @@ async fn admit_identity(State(state): State<AppState>, headers: HeaderMap) -> im
         Ok(value) => value,
         Err(response) => return response,
     };
-    if !matches!(
-        env::var("LAYRS_DIRECT_EXECUTION_MODE").as_deref(),
-        Ok("admission-enabled" | "production-enabled")
+    if !direct_admission_route_enabled(
+        state.isolated_test,
+        env::var("LAYRS_DIRECT_EXECUTION_MODE").ok().as_deref(),
     ) {
         return (StatusCode::SERVICE_UNAVAILABLE, "ADMISSION_DISABLED").into_response();
     }
@@ -1870,9 +1882,9 @@ async fn register_market(
     State(state): State<AppState>,
     Json(body): Json<MarketRegistrationCommand>,
 ) -> impl IntoResponse {
-    if !matches!(
-        env::var("LAYRS_DIRECT_EXECUTION_MODE").as_deref(),
-        Ok("admission-enabled" | "production-enabled")
+    if !direct_admission_route_enabled(
+        state.isolated_test,
+        env::var("LAYRS_DIRECT_EXECUTION_MODE").ok().as_deref(),
     ) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1881,7 +1893,7 @@ async fn register_market(
             .into_response();
     }
     let now = now_unix();
-    if !body.registration.verify(now) {
+    if !state.isolated_test && !body.registration.verify(now) {
         return (
             StatusCode::FORBIDDEN,
             "MARKET_REGISTRATION_SIGNATURE_INVALID",
@@ -1938,11 +1950,14 @@ async fn resolve_market(
     State(state): State<AppState>,
     Json(body): Json<MarketResolutionCommand>,
 ) -> impl IntoResponse {
-    if env::var("LAYRS_DIRECT_EXECUTION_MODE").as_deref() != Ok("production-enabled") {
+    if !direct_writer_route_enabled(
+        state.isolated_test,
+        env::var("LAYRS_DIRECT_EXECUTION_MODE").ok().as_deref(),
+    ) {
         return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_DISABLED").into_response();
     }
     let now = now_unix();
-    if !body.resolution.verify(now) {
+    if !state.isolated_test && !body.resolution.verify(now) {
         return (StatusCode::FORBIDDEN, "MARKET_RESOLUTION_SIGNATURE_INVALID").into_response();
     }
     let mut request = DirectRequest {
@@ -3506,6 +3521,29 @@ mod tests {
             runtime_bind_address(Some("0.0.0.0"), Some("production-enabled"), false).unwrap(),
             std::net::Ipv4Addr::UNSPECIFIED,
         );
+    }
+    #[test]
+    fn packaged_isolated_routes_are_test_only_and_production_routes_remain_grant_scoped() {
+        assert!(direct_writer_route_enabled(true, Some("dormant")));
+        assert!(direct_admission_route_enabled(true, Some("dormant")));
+        assert!(!direct_writer_route_enabled(false, Some("dormant")));
+        assert!(!direct_admission_route_enabled(false, Some("dormant")));
+        assert!(!direct_writer_route_enabled(
+            false,
+            Some("admission-enabled")
+        ));
+        assert!(direct_admission_route_enabled(
+            false,
+            Some("admission-enabled")
+        ));
+        assert!(direct_writer_route_enabled(
+            false,
+            Some("production-enabled")
+        ));
+        assert!(direct_admission_route_enabled(
+            false,
+            Some("production-enabled")
+        ));
     }
     #[test]
     fn signed_session_rejects_tampering() {
