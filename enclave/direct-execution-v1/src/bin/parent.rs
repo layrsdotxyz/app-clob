@@ -1914,6 +1914,36 @@ async fn prepare_external_withdrawal(
             "DIRECT_ARTIFACT_STORE_NOT_CONFIGURED",
         ));
     };
+    // Resolve an already-terminal request from the immutable private-state
+    // lineage before doing any custody work. The external-effect reference is
+    // part of the signed request hash, so recreating an intent from the newer
+    // state root on replay would produce a different reference even though the
+    // customer request is already terminal.
+    let retained_intents = store.load_intents().await.map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "EXTERNAL_EFFECT_INTENT_RECOVERY_FAILED",
+        )
+    })?;
+    let committed_artifacts = store.load_committed().await.map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "DIRECT_STATE_RECOVERY_FAILED",
+        )
+    })?;
+    if let Some(action) = committed_external_effect_action(
+        &retained_intents,
+        &committed_artifacts,
+        &claims.subject_hash,
+        identity_commitment,
+        request_id,
+        &destination,
+        &amount_atomic,
+    )
+    .map_err(|_| (StatusCode::CONFLICT, "EXTERNAL_EFFECT_REPLAY_CONFLICT"))?
+    {
+        return Ok(action);
+    }
     let prior_state_hash = state.committed_state_root.lock().await.clone().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "DIRECT_STATE_ROOT_UNAVAILABLE",
@@ -2628,6 +2658,94 @@ fn intent_is_committed(intent: &ExternalEffectIntent, artifacts: &[DirectStateAr
     })
 }
 
+fn same_external_effect_request(a: &ExternalEffectIntent, b: &ExternalEffectIntent) -> bool {
+    a.account_id == b.account_id
+        && a.request_id == b.request_id
+        && a.identity_commitment == b.identity_commitment
+        && a.chain == b.chain
+        && a.asset == b.asset
+        && a.destination.eq_ignore_ascii_case(&b.destination)
+        && a.amount_atomic == b.amount_atomic
+        && a.provider_wallet_id == b.provider_wallet_id
+        && a.custody_target.eq_ignore_ascii_case(&b.custody_target)
+}
+
+fn committed_external_effect_action(
+    intents: &[ExternalEffectIntent],
+    artifacts: &[DirectStateArtifact],
+    account_id: &str,
+    identity_commitment: &str,
+    request_id: &str,
+    destination: &str,
+    amount_atomic: &str,
+) -> Result<Option<DirectAction>, io::Error> {
+    let related = intents
+        .iter()
+        .filter(|intent| intent.account_id == account_id && intent.request_id == request_id)
+        .collect::<Vec<_>>();
+    if related.is_empty() {
+        return Ok(None);
+    }
+    if related.iter().any(|intent| {
+        intent.identity_commitment != identity_commitment
+            || intent.chain != "base"
+            || intent.asset != "USDC"
+            || !intent.destination.eq_ignore_ascii_case(destination)
+            || intent.amount_atomic != amount_atomic
+    }) {
+        return Err(invalid("external-effect replay binding conflict"));
+    }
+    for intent in related {
+        let prefix = format!("{}:", intent.external_effect_reference);
+        let Some(artifact) = artifacts.iter().find(|artifact| {
+            artifact.receipt.account_id == account_id
+                && artifact.receipt.identity_commitment == identity_commitment
+                && artifact.receipt.request_id == request_id
+                && artifact.receipt.amount_atomic.as_deref() == Some(amount_atomic)
+                && artifact
+                    .receipt
+                    .custody_reference
+                    .as_deref()
+                    .is_some_and(|value| value.starts_with(&prefix))
+        }) else {
+            continue;
+        };
+        let custody_reference = artifact
+            .receipt
+            .custody_reference
+            .clone()
+            .ok_or_else(|| invalid("committed withdrawal is missing custody binding"))?;
+        let action = match artifact.receipt.effect.as_str() {
+            "WITHDRAWAL_SETTLED" => DirectAction::ReserveWithdrawal {
+                destination: destination.into(),
+                amount_atomic: amount_atomic.into(),
+                custody_reference,
+            },
+            "WITHDRAWAL_REVERTED" => DirectAction::RecordWithdrawalReverted {
+                destination: destination.into(),
+                amount_atomic: amount_atomic.into(),
+                custody_reference,
+            },
+            _ => return Err(invalid("committed external effect has unexpected effect")),
+        };
+        let mut request = DirectRequest {
+            account_id: account_id.into(),
+            identity_commitment: identity_commitment.into(),
+            request_id: request_id.into(),
+            request_hash: String::new(),
+            action: action.clone(),
+        };
+        request.request_hash = request_hash(&request);
+        if request.request_hash != intent.request_hash
+            || request.request_hash != artifact.receipt.request_hash
+        {
+            return Err(invalid("committed external-effect replay hash mismatch"));
+        }
+        return Ok(Some(action));
+    }
+    Ok(None)
+}
+
 fn request_for_external_effect(
     intent: &ExternalEffectIntent,
     outcome: ExternalEffectRecovery,
@@ -2684,9 +2802,26 @@ async fn recover_external_effect_intents(state: &AppState) -> io::Result<()> {
         .load_committed()
         .await
         .map_err(|error| invalid(format!("direct artifact recovery failed:{error}")))?;
-    for intent in intents {
+    for intent in intents.iter().cloned() {
         if intent_is_committed(&intent, &artifacts) {
             continue;
+        }
+        if let Some(committed_sibling) = intents.iter().find(|candidate| {
+            candidate.account_id == intent.account_id
+                && candidate.request_id == intent.request_id
+                && intent_is_committed(candidate, &artifacts)
+        }) {
+            if same_external_effect_request(&intent, committed_sibling) {
+                // A superseded implementation could derive a second immutable
+                // intent from the post-commit root before checking the enclave
+                // replay map. The already-committed sibling is authoritative;
+                // this unsubmitted duplicate is retained as audit evidence and
+                // is never executable or considered unresolved.
+                continue;
+            }
+            return Err(invalid(
+                "conflicting external-effect intent follows a committed request",
+            ));
         }
         let root = state.committed_state_root.lock().await.clone();
         if root.as_deref() != Some(intent.prior_state_hash.as_str()) {
@@ -3469,6 +3604,117 @@ mod tests {
         assert!(
             matches!(rebuilt.action, DirectAction::ReserveWithdrawal { custody_reference, .. } if custody_reference.starts_with(&format!("{}:", intent.external_effect_reference)))
         );
+    }
+
+    #[test]
+    fn committed_withdrawal_replay_precedes_a_duplicate_unsubmitted_intent() {
+        let account = "b".repeat(64);
+        let destination = "0xCCB96357dEB4cbF0808208d55916774f0B51a908";
+        let reference = reference_for(
+            &"a".repeat(64),
+            "request-1",
+            &account,
+            "identity",
+            "base",
+            "USDC",
+            destination,
+            "1000000",
+            "existing-wallet",
+        );
+        let custody_reference = format!("{}:0x{}", reference, "11".repeat(32));
+        let mut request = DirectRequest {
+            account_id: account.clone(),
+            identity_commitment: "identity".into(),
+            request_id: "request-1".into(),
+            request_hash: String::new(),
+            action: DirectAction::ReserveWithdrawal {
+                destination: destination.into(),
+                amount_atomic: "1000000".into(),
+                custody_reference: custody_reference.clone(),
+            },
+        };
+        request.request_hash = request_hash(&request);
+        let committed = ExternalEffectIntent::create(
+            "a".repeat(64),
+            "request-1".into(),
+            request.request_hash.clone(),
+            account.clone(),
+            "identity".into(),
+            "base".into(),
+            "USDC".into(),
+            destination.into(),
+            "1000000".into(),
+            "existing-wallet".into(),
+            "0x1111111111111111111111111111111111111111".into(),
+            "7".into(),
+            "180000".into(),
+            "2000000000".into(),
+            "1000000000".into(),
+            100,
+        )
+        .unwrap();
+        let duplicate = ExternalEffectIntent::create(
+            "d".repeat(64),
+            "request-1".into(),
+            "e".repeat(64),
+            account.clone(),
+            "identity".into(),
+            "base".into(),
+            "USDC".into(),
+            destination.into(),
+            "1000000".into(),
+            "existing-wallet".into(),
+            "0x1111111111111111111111111111111111111111".into(),
+            "8".into(),
+            "180000".into(),
+            "2000000000".into(),
+            "1000000000".into(),
+            101,
+        )
+        .unwrap();
+        assert!(same_external_effect_request(&committed, &duplicate));
+        let artifact = DirectStateArtifact {
+            epoch_id: EPOCH_ID.into(),
+            sequence: 2,
+            prior_state_hash: "a".repeat(64),
+            state_hash: "d".repeat(64),
+            request_hash: request.request_hash.clone(),
+            nonce: vec![1; 12],
+            ciphertext: vec![2; 16],
+            ciphertext_hash: "f".repeat(64),
+            receipt: DirectReceipt {
+                receipt_id: "receipt".into(),
+                account_id: account.clone(),
+                identity_commitment: "identity".into(),
+                request_id: "request-1".into(),
+                request_hash: request.request_hash,
+                status: layrs_direct_execution_v1::TerminalStatus::Applied,
+                effect: "WITHDRAWAL_SETTLED".into(),
+                amount_atomic: Some("1000000".into()),
+                custody_reference: Some(custody_reference.clone()),
+                execution: None,
+                projection_balance_updates: vec![],
+                genesis_ordinal: 0,
+                signature: "signature".into(),
+            },
+        };
+        let replay = committed_external_effect_action(
+            &[committed, duplicate],
+            &[artifact],
+            &account,
+            "identity",
+            "request-1",
+            destination,
+            "1000000",
+        )
+        .unwrap();
+        assert!(matches!(
+            replay,
+            Some(DirectAction::ReserveWithdrawal {
+                custody_reference: value,
+                ..
+            }) if value == custody_reference
+        ));
     }
 
     #[test]
