@@ -1,0 +1,360 @@
+{
+  "protocol": "layrs.direct-market-registration-evidence.v1",
+  "source": {
+    "authority": "production PostgreSQL layrsv2.market_specs joined to immutable layrsv2.market_release_manifests.payload",
+    "transaction": "REPEATABLE READ READ ONLY",
+    "capturedAt": "2026-09-13T19:19:26.578Z",
+    "capturedAtUnix": 1789327166,
+    "releaseManifestSha256": "f156932795e74e5dc37089ace56bc088b8b2a006e66902d42a68fcf8bef7810a",
+    "filters": {
+      "lifecycle": "OPEN",
+      "publicState": "OPEN",
+      "visible": true,
+      "namespace": "layrs:v5",
+      "settlementAsset": "USDC",
+      "executionMode": "NATIVE_ONLY",
+      "resolutionKinds": [
+        "BINANCE_SPOT_KLINE_MEDIAN",
+        "KRAKEN_SPOT_TRADE_MEDIAN"
+      ],
+      "closesAfterCapture": true,
+      "selectedWindow": "1mo"
+    }
+  },
+  "signing": {
+    "domain": "layrs.direct-market-registration.v1\u0000",
+    "governanceKeyId": "alias/layrs/production/recovery-evidence-signing",
+    "signingAlgorithm": "ECDSA_SHA_256",
+    "publicKeyDerSha256": "a001a573309c778b0b1f90ecd93eaf1cb07a37f4bea501c32c43afd754871f22",
+    "expiresAtUnix": 1789430400,
+    "expiresAt": "2026-09-15T00:00:00.000Z",
+    "signatureEncoding": "standard-base64 DER ECDSA P-256"
+  },
+  "registrations": [
+    {
+      "marketId": "layrs:v5:BTC:USDC:1mo:1788220800",
+      "sourceContentHash": "1f9b3a006f4397cf2fa5bc2f829b7132fc837011ae97721e1be92e3d85ffeaeb",
+      "sourceManifestSha256": "f156932795e74e5dc37089ace56bc088b8b2a006e66902d42a68fcf8bef7810a",
+      "unsignedRegistration": {
+        "registrationId": "direct-market:1f9b3a006f4397cf2fa5bc2f829b7132fc837011ae97721e1be92e3d85ffeaeb",
+        "epochId": "layrs-opening-epoch-20260911-941107537728c98b",
+        "runtime": "layrs.direct-execution.v1",
+        "market": {
+          "market_id": "layrs:v5:BTC:USDC:1mo:1788220800",
+          "settlement_asset": "USDC",
+          "settlement_decimals": 6,
+          "public_settlement_chain": "horizen",
+          "opens_at_millis": 1788220800000,
+          "closes_at_millis": 1790812800000,
+          "minimum_quantity_micros": "1000",
+          "maximum_quantity_micros": "1000000000",
+          "minimum_order_notional_micros": "1000000",
+          "maximum_order_notional_micros": "1000000000",
+          "maximum_user_position_micros": "2500000000",
+          "maximum_pending_bootstrap_notional_micros": "1000000000",
+          "tick_size_micros": 1000,
+          "oracle_feed_id": 9002,
+          "fee_profile_id": "LAYRS_CRYPTO_V2",
+          "execution": "NATIVE_CLOB"
+        },
+        "expiresAtUnix": 1789430400,
+        "governanceKeyId": "alias/layrs/production/recovery-evidence-signing",
+        "signingAlgorithm": "ECDSA_SHA_256",
+        "signature": ""
+      },
+      "signingPayloadBase64": "WyJsYXlycy5kaXJlY3QtbWFya2V0LXJlZ2lzdHJhdGlvbi52MVx1MDAwMCIseyJyZWdpc3RyYXRpb25JZCI6ImRpcmVjdC1tYXJrZXQ6MWY5YjNhMDA2ZjQzOTdjZjJmYTViYzJmODI5YjcxMzJmYzgzNzAxMWFlOTc3MjFlMWJlOTJlM2Q4NWZmZWFlYiIsImVwb2NoSWQiOiJsYXlycy1vcGVuaW5nLWVwb2NoLTIwMjYwOTExLTk0MTEwNzUzNzcyOGM5OGIiLCJydW50aW1lIjoibGF5cnMuZGlyZWN0LWV4ZWN1dGlvbi52MSIsIm1hcmtldCI6eyJtYXJrZXRfaWQiOiJsYXlyczp2NTpCVEM6VVNEQzoxbW86MTc4ODIyMDgwMCIsInNldHRsZW1lbnRfYXNzZXQiOiJVU0RDIiwic2V0dGxlbWVudF9kZWNpbWFscyI6NiwicHVibGljX3NldHRsZW1lbnRfY2hhaW4iOiJob3JpemVuIiwib3BlbnNfYXRfbWlsbGlzIjoxNzg4MjIwODAwMDAwLCJjbG9zZXNfYXRfbWlsbGlzIjoxNzkwODEyODAwMDAwLCJtaW5pbXVtX3F1YW50aXR5X21pY3JvcyI6IjEwMDAiLCJtYXhpbXVtX3F1YW50aXR5X21pY3JvcyI6IjEwMDAwMDAwMDAiLCJtaW5pbXVtX29yZGVyX25vdGlvbmFsX21pY3JvcyI6IjEwMDAwMDAiLCJtYXhpbXVtX29yZGVyX25vdGlvbmFsX21pY3JvcyI6IjEwMDAwMDAwMDAiLCJtYXhpbXVtX3VzZXJfcG9zaXRpb25fbWljcm9zIjoiMjUwMDAwMDAwMCIsIm1heGltdW1fcGVuZGluZ19ib290c3RyYXBfbm90aW9uYWxfbWljcm9zIjoiMTAwMDAwMDAwMCIsInRpY2tfc2l6ZV9taWNyb3MiOjEwMDAsIm9yYWNsZV9mZWVkX2lkIjo5MDAyLCJmZWVfcHJvZmlsZV9pZCI6IkxBWVJTX0NSWVBUT19WMiIsImV4ZWN1dGlvbiI6Ik5BVElWRV9DTE9CIn0sImV4cGlyZXNBdFVuaXgiOjE3ODk0MzA0MDAsImdvdmVybmFuY2VLZXlJZCI6ImFsaWFzL2xheXJzL3Byb2R1Y3Rpb24vcmVjb3ZlcnktZXZpZGVuY2Utc2lnbmluZyIsInNpZ25pbmdBbGdvcml0aG0iOiJFQ0RTQV9TSEFfMjU2Iiwic2lnbmF0dXJlIjoiIn1d",
+      "signingPayloadSha256": "b95b49d84eaf80f6fe5af5a0bac39e8e52c3ef7794e08d66816a6bfc6acab48e",
+      "kmsSignatureVerifiedAtCreation": true,
+      "localSignatureVerification": true,
+      "httpBody": {
+        "registration": {
+          "registrationId": "direct-market:1f9b3a006f4397cf2fa5bc2f829b7132fc837011ae97721e1be92e3d85ffeaeb",
+          "epochId": "layrs-opening-epoch-20260911-941107537728c98b",
+          "runtime": "layrs.direct-execution.v1",
+          "market": {
+            "market_id": "layrs:v5:BTC:USDC:1mo:1788220800",
+            "settlement_asset": "USDC",
+            "settlement_decimals": 6,
+            "public_settlement_chain": "horizen",
+            "opens_at_millis": 1788220800000,
+            "closes_at_millis": 1790812800000,
+            "minimum_quantity_micros": "1000",
+            "maximum_quantity_micros": "1000000000",
+            "minimum_order_notional_micros": "1000000",
+            "maximum_order_notional_micros": "1000000000",
+            "maximum_user_position_micros": "2500000000",
+            "maximum_pending_bootstrap_notional_micros": "1000000000",
+            "tick_size_micros": 1000,
+            "oracle_feed_id": 9002,
+            "fee_profile_id": "LAYRS_CRYPTO_V2",
+            "execution": "NATIVE_CLOB"
+          },
+          "expiresAtUnix": 1789430400,
+          "governanceKeyId": "alias/layrs/production/recovery-evidence-signing",
+          "signingAlgorithm": "ECDSA_SHA_256",
+          "signature": "MEQCIB+ifDjEqsayRAliI1kMliymft36d9DJPbPkcaecy17tAiAYzWG8YujhVf4UW7LZO3BL0OhB6Z8TS10Z7r5ID6dkRQ=="
+        }
+      }
+    },
+    {
+      "marketId": "layrs:v5:ETH:USDC:1mo:1788220800",
+      "sourceContentHash": "a9064871759503838b9b9b6c8cecbc733fa1ba17f34dbe69a3ff84cba95175e7",
+      "sourceManifestSha256": "f156932795e74e5dc37089ace56bc088b8b2a006e66902d42a68fcf8bef7810a",
+      "unsignedRegistration": {
+        "registrationId": "direct-market:a9064871759503838b9b9b6c8cecbc733fa1ba17f34dbe69a3ff84cba95175e7",
+        "epochId": "layrs-opening-epoch-20260911-941107537728c98b",
+        "runtime": "layrs.direct-execution.v1",
+        "market": {
+          "market_id": "layrs:v5:ETH:USDC:1mo:1788220800",
+          "settlement_asset": "USDC",
+          "settlement_decimals": 6,
+          "public_settlement_chain": "horizen",
+          "opens_at_millis": 1788220800000,
+          "closes_at_millis": 1790812800000,
+          "minimum_quantity_micros": "1000",
+          "maximum_quantity_micros": "1000000000",
+          "minimum_order_notional_micros": "1000000",
+          "maximum_order_notional_micros": "1000000000",
+          "maximum_user_position_micros": "2500000000",
+          "maximum_pending_bootstrap_notional_micros": "1000000000",
+          "tick_size_micros": 1000,
+          "oracle_feed_id": 9003,
+          "fee_profile_id": "LAYRS_CRYPTO_V2",
+          "execution": "NATIVE_CLOB"
+        },
+        "expiresAtUnix": 1789430400,
+        "governanceKeyId": "alias/layrs/production/recovery-evidence-signing",
+        "signingAlgorithm": "ECDSA_SHA_256",
+        "signature": ""
+      },
+      "signingPayloadBase64": "WyJsYXlycy5kaXJlY3QtbWFya2V0LXJlZ2lzdHJhdGlvbi52MVx1MDAwMCIseyJyZWdpc3RyYXRpb25JZCI6ImRpcmVjdC1tYXJrZXQ6YTkwNjQ4NzE3NTk1MDM4MzhiOWI5YjZjOGNlY2JjNzMzZmExYmExN2YzNGRiZTY5YTNmZjg0Y2JhOTUxNzVlNyIsImVwb2NoSWQiOiJsYXlycy1vcGVuaW5nLWVwb2NoLTIwMjYwOTExLTk0MTEwNzUzNzcyOGM5OGIiLCJydW50aW1lIjoibGF5cnMuZGlyZWN0LWV4ZWN1dGlvbi52MSIsIm1hcmtldCI6eyJtYXJrZXRfaWQiOiJsYXlyczp2NTpFVEg6VVNEQzoxbW86MTc4ODIyMDgwMCIsInNldHRsZW1lbnRfYXNzZXQiOiJVU0RDIiwic2V0dGxlbWVudF9kZWNpbWFscyI6NiwicHVibGljX3NldHRsZW1lbnRfY2hhaW4iOiJob3JpemVuIiwib3BlbnNfYXRfbWlsbGlzIjoxNzg4MjIwODAwMDAwLCJjbG9zZXNfYXRfbWlsbGlzIjoxNzkwODEyODAwMDAwLCJtaW5pbXVtX3F1YW50aXR5X21pY3JvcyI6IjEwMDAiLCJtYXhpbXVtX3F1YW50aXR5X21pY3JvcyI6IjEwMDAwMDAwMDAiLCJtaW5pbXVtX29yZGVyX25vdGlvbmFsX21pY3JvcyI6IjEwMDAwMDAiLCJtYXhpbXVtX29yZGVyX25vdGlvbmFsX21pY3JvcyI6IjEwMDAwMDAwMDAiLCJtYXhpbXVtX3VzZXJfcG9zaXRpb25fbWljcm9zIjoiMjUwMDAwMDAwMCIsIm1heGltdW1fcGVuZGluZ19ib290c3RyYXBfbm90aW9uYWxfbWljcm9zIjoiMTAwMDAwMDAwMCIsInRpY2tfc2l6ZV9taWNyb3MiOjEwMDAsIm9yYWNsZV9mZWVkX2lkIjo5MDAzLCJmZWVfcHJvZmlsZV9pZCI6IkxBWVJTX0NSWVBUT19WMiIsImV4ZWN1dGlvbiI6Ik5BVElWRV9DTE9CIn0sImV4cGlyZXNBdFVuaXgiOjE3ODk0MzA0MDAsImdvdmVybmFuY2VLZXlJZCI6ImFsaWFzL2xheXJzL3Byb2R1Y3Rpb24vcmVjb3ZlcnktZXZpZGVuY2Utc2lnbmluZyIsInNpZ25pbmdBbGdvcml0aG0iOiJFQ0RTQV9TSEFfMjU2Iiwic2lnbmF0dXJlIjoiIn1d",
+      "signingPayloadSha256": "6c23cb3ddb1fea8500dbc514047c7cecfc760f0874b67d894eec9e45b4b3a236",
+      "kmsSignatureVerifiedAtCreation": true,
+      "localSignatureVerification": true,
+      "httpBody": {
+        "registration": {
+          "registrationId": "direct-market:a9064871759503838b9b9b6c8cecbc733fa1ba17f34dbe69a3ff84cba95175e7",
+          "epochId": "layrs-opening-epoch-20260911-941107537728c98b",
+          "runtime": "layrs.direct-execution.v1",
+          "market": {
+            "market_id": "layrs:v5:ETH:USDC:1mo:1788220800",
+            "settlement_asset": "USDC",
+            "settlement_decimals": 6,
+            "public_settlement_chain": "horizen",
+            "opens_at_millis": 1788220800000,
+            "closes_at_millis": 1790812800000,
+            "minimum_quantity_micros": "1000",
+            "maximum_quantity_micros": "1000000000",
+            "minimum_order_notional_micros": "1000000",
+            "maximum_order_notional_micros": "1000000000",
+            "maximum_user_position_micros": "2500000000",
+            "maximum_pending_bootstrap_notional_micros": "1000000000",
+            "tick_size_micros": 1000,
+            "oracle_feed_id": 9003,
+            "fee_profile_id": "LAYRS_CRYPTO_V2",
+            "execution": "NATIVE_CLOB"
+          },
+          "expiresAtUnix": 1789430400,
+          "governanceKeyId": "alias/layrs/production/recovery-evidence-signing",
+          "signingAlgorithm": "ECDSA_SHA_256",
+          "signature": "MEUCIC/I3f7hD2PNNCH7NDQQO4xRPyPXIQetY/MM4tNXsWWoAiEA1zXAaiUWTaPC7cm6QiNhlAd0F2HLEWT71dMTj/j7v2o="
+        }
+      }
+    },
+    {
+      "marketId": "layrs:v5:HYPE:USDC:1mo:1788220800",
+      "sourceContentHash": "2e217e3c185a62bf4930b83a5160d590637726fe9764768534cc5fe3f1c13990",
+      "sourceManifestSha256": "f156932795e74e5dc37089ace56bc088b8b2a006e66902d42a68fcf8bef7810a",
+      "unsignedRegistration": {
+        "registrationId": "direct-market:2e217e3c185a62bf4930b83a5160d590637726fe9764768534cc5fe3f1c13990",
+        "epochId": "layrs-opening-epoch-20260911-941107537728c98b",
+        "runtime": "layrs.direct-execution.v1",
+        "market": {
+          "market_id": "layrs:v5:HYPE:USDC:1mo:1788220800",
+          "settlement_asset": "USDC",
+          "settlement_decimals": 6,
+          "public_settlement_chain": "horizen",
+          "opens_at_millis": 1788220800000,
+          "closes_at_millis": 1790812800000,
+          "minimum_quantity_micros": "1000",
+          "maximum_quantity_micros": "1000000000",
+          "minimum_order_notional_micros": "1000000",
+          "maximum_order_notional_micros": "1000000000",
+          "maximum_user_position_micros": "2500000000",
+          "maximum_pending_bootstrap_notional_micros": "1000000000",
+          "tick_size_micros": 1000,
+          "oracle_feed_id": 9006,
+          "fee_profile_id": "LAYRS_CRYPTO_V2",
+          "execution": "NATIVE_CLOB"
+        },
+        "expiresAtUnix": 1789430400,
+        "governanceKeyId": "alias/layrs/production/recovery-evidence-signing",
+        "signingAlgorithm": "ECDSA_SHA_256",
+        "signature": ""
+      },
+      "signingPayloadBase64": "WyJsYXlycy5kaXJlY3QtbWFya2V0LXJlZ2lzdHJhdGlvbi52MVx1MDAwMCIseyJyZWdpc3RyYXRpb25JZCI6ImRpcmVjdC1tYXJrZXQ6MmUyMTdlM2MxODVhNjJiZjQ5MzBiODNhNTE2MGQ1OTA2Mzc3MjZmZTk3NjQ3Njg1MzRjYzVmZTNmMWMxMzk5MCIsImVwb2NoSWQiOiJsYXlycy1vcGVuaW5nLWVwb2NoLTIwMjYwOTExLTk0MTEwNzUzNzcyOGM5OGIiLCJydW50aW1lIjoibGF5cnMuZGlyZWN0LWV4ZWN1dGlvbi52MSIsIm1hcmtldCI6eyJtYXJrZXRfaWQiOiJsYXlyczp2NTpIWVBFOlVTREM6MW1vOjE3ODgyMjA4MDAiLCJzZXR0bGVtZW50X2Fzc2V0IjoiVVNEQyIsInNldHRsZW1lbnRfZGVjaW1hbHMiOjYsInB1YmxpY19zZXR0bGVtZW50X2NoYWluIjoiaG9yaXplbiIsIm9wZW5zX2F0X21pbGxpcyI6MTc4ODIyMDgwMDAwMCwiY2xvc2VzX2F0X21pbGxpcyI6MTc5MDgxMjgwMDAwMCwibWluaW11bV9xdWFudGl0eV9taWNyb3MiOiIxMDAwIiwibWF4aW11bV9xdWFudGl0eV9taWNyb3MiOiIxMDAwMDAwMDAwIiwibWluaW11bV9vcmRlcl9ub3Rpb25hbF9taWNyb3MiOiIxMDAwMDAwIiwibWF4aW11bV9vcmRlcl9ub3Rpb25hbF9taWNyb3MiOiIxMDAwMDAwMDAwIiwibWF4aW11bV91c2VyX3Bvc2l0aW9uX21pY3JvcyI6IjI1MDAwMDAwMDAiLCJtYXhpbXVtX3BlbmRpbmdfYm9vdHN0cmFwX25vdGlvbmFsX21pY3JvcyI6IjEwMDAwMDAwMDAiLCJ0aWNrX3NpemVfbWljcm9zIjoxMDAwLCJvcmFjbGVfZmVlZF9pZCI6OTAwNiwiZmVlX3Byb2ZpbGVfaWQiOiJMQVlSU19DUllQVE9fVjIiLCJleGVjdXRpb24iOiJOQVRJVkVfQ0xPQiJ9LCJleHBpcmVzQXRVbml4IjoxNzg5NDMwNDAwLCJnb3Zlcm5hbmNlS2V5SWQiOiJhbGlhcy9sYXlycy9wcm9kdWN0aW9uL3JlY292ZXJ5LWV2aWRlbmNlLXNpZ25pbmciLCJzaWduaW5nQWxnb3JpdGhtIjoiRUNEU0FfU0hBXzI1NiIsInNpZ25hdHVyZSI6IiJ9XQ==",
+      "signingPayloadSha256": "b6158b6fd0d7d607cba5b89cd2f178da45ea986bb98bed67ed469fe02b1fcbf6",
+      "kmsSignatureVerifiedAtCreation": true,
+      "localSignatureVerification": true,
+      "httpBody": {
+        "registration": {
+          "registrationId": "direct-market:2e217e3c185a62bf4930b83a5160d590637726fe9764768534cc5fe3f1c13990",
+          "epochId": "layrs-opening-epoch-20260911-941107537728c98b",
+          "runtime": "layrs.direct-execution.v1",
+          "market": {
+            "market_id": "layrs:v5:HYPE:USDC:1mo:1788220800",
+            "settlement_asset": "USDC",
+            "settlement_decimals": 6,
+            "public_settlement_chain": "horizen",
+            "opens_at_millis": 1788220800000,
+            "closes_at_millis": 1790812800000,
+            "minimum_quantity_micros": "1000",
+            "maximum_quantity_micros": "1000000000",
+            "minimum_order_notional_micros": "1000000",
+            "maximum_order_notional_micros": "1000000000",
+            "maximum_user_position_micros": "2500000000",
+            "maximum_pending_bootstrap_notional_micros": "1000000000",
+            "tick_size_micros": 1000,
+            "oracle_feed_id": 9006,
+            "fee_profile_id": "LAYRS_CRYPTO_V2",
+            "execution": "NATIVE_CLOB"
+          },
+          "expiresAtUnix": 1789430400,
+          "governanceKeyId": "alias/layrs/production/recovery-evidence-signing",
+          "signingAlgorithm": "ECDSA_SHA_256",
+          "signature": "MEUCIQCQFg77ptc76qlUjZ1U3UO7uK7ONINWbGz2DyHbSa83xgIgYm7sB7RnqAj9rLC7fg3t/XvkMqP1E5wptEdZrU2sKBw="
+        }
+      }
+    },
+    {
+      "marketId": "layrs:v5:SOL:USDC:1mo:1788220800",
+      "sourceContentHash": "9ea85e8f788fc29bc920aaf97e31cf94d99dbfef4679b8829a6a22df6570735e",
+      "sourceManifestSha256": "f156932795e74e5dc37089ace56bc088b8b2a006e66902d42a68fcf8bef7810a",
+      "unsignedRegistration": {
+        "registrationId": "direct-market:9ea85e8f788fc29bc920aaf97e31cf94d99dbfef4679b8829a6a22df6570735e",
+        "epochId": "layrs-opening-epoch-20260911-941107537728c98b",
+        "runtime": "layrs.direct-execution.v1",
+        "market": {
+          "market_id": "layrs:v5:SOL:USDC:1mo:1788220800",
+          "settlement_asset": "USDC",
+          "settlement_decimals": 6,
+          "public_settlement_chain": "horizen",
+          "opens_at_millis": 1788220800000,
+          "closes_at_millis": 1790812800000,
+          "minimum_quantity_micros": "1000",
+          "maximum_quantity_micros": "1000000000",
+          "minimum_order_notional_micros": "1000000",
+          "maximum_order_notional_micros": "1000000000",
+          "maximum_user_position_micros": "2500000000",
+          "maximum_pending_bootstrap_notional_micros": "1000000000",
+          "tick_size_micros": 1000,
+          "oracle_feed_id": 9004,
+          "fee_profile_id": "LAYRS_CRYPTO_V2",
+          "execution": "NATIVE_CLOB"
+        },
+        "expiresAtUnix": 1789430400,
+        "governanceKeyId": "alias/layrs/production/recovery-evidence-signing",
+        "signingAlgorithm": "ECDSA_SHA_256",
+        "signature": ""
+      },
+      "signingPayloadBase64": "WyJsYXlycy5kaXJlY3QtbWFya2V0LXJlZ2lzdHJhdGlvbi52MVx1MDAwMCIseyJyZWdpc3RyYXRpb25JZCI6ImRpcmVjdC1tYXJrZXQ6OWVhODVlOGY3ODhmYzI5YmM5MjBhYWY5N2UzMWNmOTRkOTlkYmZlZjQ2NzliODgyOWE2YTIyZGY2NTcwNzM1ZSIsImVwb2NoSWQiOiJsYXlycy1vcGVuaW5nLWVwb2NoLTIwMjYwOTExLTk0MTEwNzUzNzcyOGM5OGIiLCJydW50aW1lIjoibGF5cnMuZGlyZWN0LWV4ZWN1dGlvbi52MSIsIm1hcmtldCI6eyJtYXJrZXRfaWQiOiJsYXlyczp2NTpTT0w6VVNEQzoxbW86MTc4ODIyMDgwMCIsInNldHRsZW1lbnRfYXNzZXQiOiJVU0RDIiwic2V0dGxlbWVudF9kZWNpbWFscyI6NiwicHVibGljX3NldHRsZW1lbnRfY2hhaW4iOiJob3JpemVuIiwib3BlbnNfYXRfbWlsbGlzIjoxNzg4MjIwODAwMDAwLCJjbG9zZXNfYXRfbWlsbGlzIjoxNzkwODEyODAwMDAwLCJtaW5pbXVtX3F1YW50aXR5X21pY3JvcyI6IjEwMDAiLCJtYXhpbXVtX3F1YW50aXR5X21pY3JvcyI6IjEwMDAwMDAwMDAiLCJtaW5pbXVtX29yZGVyX25vdGlvbmFsX21pY3JvcyI6IjEwMDAwMDAiLCJtYXhpbXVtX29yZGVyX25vdGlvbmFsX21pY3JvcyI6IjEwMDAwMDAwMDAiLCJtYXhpbXVtX3VzZXJfcG9zaXRpb25fbWljcm9zIjoiMjUwMDAwMDAwMCIsIm1heGltdW1fcGVuZGluZ19ib290c3RyYXBfbm90aW9uYWxfbWljcm9zIjoiMTAwMDAwMDAwMCIsInRpY2tfc2l6ZV9taWNyb3MiOjEwMDAsIm9yYWNsZV9mZWVkX2lkIjo5MDA0LCJmZWVfcHJvZmlsZV9pZCI6IkxBWVJTX0NSWVBUT19WMiIsImV4ZWN1dGlvbiI6Ik5BVElWRV9DTE9CIn0sImV4cGlyZXNBdFVuaXgiOjE3ODk0MzA0MDAsImdvdmVybmFuY2VLZXlJZCI6ImFsaWFzL2xheXJzL3Byb2R1Y3Rpb24vcmVjb3ZlcnktZXZpZGVuY2Utc2lnbmluZyIsInNpZ25pbmdBbGdvcml0aG0iOiJFQ0RTQV9TSEFfMjU2Iiwic2lnbmF0dXJlIjoiIn1d",
+      "signingPayloadSha256": "8811ccb06b5deb3f0e0d76209ca441e04a033ce3a78283bef69c7107441c31e0",
+      "kmsSignatureVerifiedAtCreation": true,
+      "localSignatureVerification": true,
+      "httpBody": {
+        "registration": {
+          "registrationId": "direct-market:9ea85e8f788fc29bc920aaf97e31cf94d99dbfef4679b8829a6a22df6570735e",
+          "epochId": "layrs-opening-epoch-20260911-941107537728c98b",
+          "runtime": "layrs.direct-execution.v1",
+          "market": {
+            "market_id": "layrs:v5:SOL:USDC:1mo:1788220800",
+            "settlement_asset": "USDC",
+            "settlement_decimals": 6,
+            "public_settlement_chain": "horizen",
+            "opens_at_millis": 1788220800000,
+            "closes_at_millis": 1790812800000,
+            "minimum_quantity_micros": "1000",
+            "maximum_quantity_micros": "1000000000",
+            "minimum_order_notional_micros": "1000000",
+            "maximum_order_notional_micros": "1000000000",
+            "maximum_user_position_micros": "2500000000",
+            "maximum_pending_bootstrap_notional_micros": "1000000000",
+            "tick_size_micros": 1000,
+            "oracle_feed_id": 9004,
+            "fee_profile_id": "LAYRS_CRYPTO_V2",
+            "execution": "NATIVE_CLOB"
+          },
+          "expiresAtUnix": 1789430400,
+          "governanceKeyId": "alias/layrs/production/recovery-evidence-signing",
+          "signingAlgorithm": "ECDSA_SHA_256",
+          "signature": "MEUCIQDseIFWqG9DBA6ooKg1xG1vMgowftYVdk+udBzO8y6D0AIgHIZtch00tFtHjaCUcLwMHT8MTyUeOsaoG+6DwmpjmT8="
+        }
+      }
+    },
+    {
+      "marketId": "layrs:v5:ZEC:USDC:1mo:1788220800",
+      "sourceContentHash": "ad4adb70ef8c7f4449696f7645f372d21775453954b7808391e524308452ca82",
+      "sourceManifestSha256": "f156932795e74e5dc37089ace56bc088b8b2a006e66902d42a68fcf8bef7810a",
+      "unsignedRegistration": {
+        "registrationId": "direct-market:ad4adb70ef8c7f4449696f7645f372d21775453954b7808391e524308452ca82",
+        "epochId": "layrs-opening-epoch-20260911-941107537728c98b",
+        "runtime": "layrs.direct-execution.v1",
+        "market": {
+          "market_id": "layrs:v5:ZEC:USDC:1mo:1788220800",
+          "settlement_asset": "USDC",
+          "settlement_decimals": 6,
+          "public_settlement_chain": "horizen",
+          "opens_at_millis": 1788220800000,
+          "closes_at_millis": 1790812800000,
+          "minimum_quantity_micros": "1000",
+          "maximum_quantity_micros": "1000000000",
+          "minimum_order_notional_micros": "1000000",
+          "maximum_order_notional_micros": "1000000000",
+          "maximum_user_position_micros": "2500000000",
+          "maximum_pending_bootstrap_notional_micros": "1000000000",
+          "tick_size_micros": 1000,
+          "oracle_feed_id": 9005,
+          "fee_profile_id": "LAYRS_CRYPTO_V2",
+          "execution": "NATIVE_CLOB"
+        },
+        "expiresAtUnix": 1789430400,
+        "governanceKeyId": "alias/layrs/production/recovery-evidence-signing",
+        "signingAlgorithm": "ECDSA_SHA_256",
+        "signature": ""
+      },
+      "signingPayloadBase64": "WyJsYXlycy5kaXJlY3QtbWFya2V0LXJlZ2lzdHJhdGlvbi52MVx1MDAwMCIseyJyZWdpc3RyYXRpb25JZCI6ImRpcmVjdC1tYXJrZXQ6YWQ0YWRiNzBlZjhjN2Y0NDQ5Njk2Zjc2NDVmMzcyZDIxNzc1NDUzOTU0Yjc4MDgzOTFlNTI0MzA4NDUyY2E4MiIsImVwb2NoSWQiOiJsYXlycy1vcGVuaW5nLWVwb2NoLTIwMjYwOTExLTk0MTEwNzUzNzcyOGM5OGIiLCJydW50aW1lIjoibGF5cnMuZGlyZWN0LWV4ZWN1dGlvbi52MSIsIm1hcmtldCI6eyJtYXJrZXRfaWQiOiJsYXlyczp2NTpaRUM6VVNEQzoxbW86MTc4ODIyMDgwMCIsInNldHRsZW1lbnRfYXNzZXQiOiJVU0RDIiwic2V0dGxlbWVudF9kZWNpbWFscyI6NiwicHVibGljX3NldHRsZW1lbnRfY2hhaW4iOiJob3JpemVuIiwib3BlbnNfYXRfbWlsbGlzIjoxNzg4MjIwODAwMDAwLCJjbG9zZXNfYXRfbWlsbGlzIjoxNzkwODEyODAwMDAwLCJtaW5pbXVtX3F1YW50aXR5X21pY3JvcyI6IjEwMDAiLCJtYXhpbXVtX3F1YW50aXR5X21pY3JvcyI6IjEwMDAwMDAwMDAiLCJtaW5pbXVtX29yZGVyX25vdGlvbmFsX21pY3JvcyI6IjEwMDAwMDAiLCJtYXhpbXVtX29yZGVyX25vdGlvbmFsX21pY3JvcyI6IjEwMDAwMDAwMDAiLCJtYXhpbXVtX3VzZXJfcG9zaXRpb25fbWljcm9zIjoiMjUwMDAwMDAwMCIsIm1heGltdW1fcGVuZGluZ19ib290c3RyYXBfbm90aW9uYWxfbWljcm9zIjoiMTAwMDAwMDAwMCIsInRpY2tfc2l6ZV9taWNyb3MiOjEwMDAsIm9yYWNsZV9mZWVkX2lkIjo5MDA1LCJmZWVfcHJvZmlsZV9pZCI6IkxBWVJTX0NSWVBUT19WMiIsImV4ZWN1dGlvbiI6Ik5BVElWRV9DTE9CIn0sImV4cGlyZXNBdFVuaXgiOjE3ODk0MzA0MDAsImdvdmVybmFuY2VLZXlJZCI6ImFsaWFzL2xheXJzL3Byb2R1Y3Rpb24vcmVjb3ZlcnktZXZpZGVuY2Utc2lnbmluZyIsInNpZ25pbmdBbGdvcml0aG0iOiJFQ0RTQV9TSEFfMjU2Iiwic2lnbmF0dXJlIjoiIn1d",
+      "signingPayloadSha256": "f079dc300ae6685b5c8927430e7d891b1d48abf2b56654663410f1e7d047a160",
+      "kmsSignatureVerifiedAtCreation": true,
+      "localSignatureVerification": true,
+      "httpBody": {
+        "registration": {
+          "registrationId": "direct-market:ad4adb70ef8c7f4449696f7645f372d21775453954b7808391e524308452ca82",
+          "epochId": "layrs-opening-epoch-20260911-941107537728c98b",
+          "runtime": "layrs.direct-execution.v1",
+          "market": {
+            "market_id": "layrs:v5:ZEC:USDC:1mo:1788220800",
+            "settlement_asset": "USDC",
+            "settlement_decimals": 6,
+            "public_settlement_chain": "horizen",
+            "opens_at_millis": 1788220800000,
+            "closes_at_millis": 1790812800000,
+            "minimum_quantity_micros": "1000",
+            "maximum_quantity_micros": "1000000000",
+            "minimum_order_notional_micros": "1000000",
+            "maximum_order_notional_micros": "1000000000",
+            "maximum_user_position_micros": "2500000000",
+            "maximum_pending_bootstrap_notional_micros": "1000000000",
+            "tick_size_micros": 1000,
+            "oracle_feed_id": 9005,
+            "fee_profile_id": "LAYRS_CRYPTO_V2",
+            "execution": "NATIVE_CLOB"
+          },
+          "expiresAtUnix": 1789430400,
+          "governanceKeyId": "alias/layrs/production/recovery-evidence-signing",
+          "signingAlgorithm": "ECDSA_SHA_256",
+          "signature": "MEUCIQDoduIvsTPEB4vraBOe39bga9wrAUpFb8YhyJFOy2lq2QIgRATIMWCxJaAYMuUn+zEIUOQXXD413ZTpjjq+wbHNeRc="
+        }
+      }
+    }
+  ]
+}
