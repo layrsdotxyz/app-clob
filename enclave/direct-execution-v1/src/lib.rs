@@ -1141,11 +1141,18 @@ struct DirectState {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     resolved_markets: BTreeMap<String, DirectMarketResolutionRecord>,
     fee_revenue_atomic: u128,
-    #[serde(default)]
+    // This field was added after the opening lineage already had committed
+    // artifacts.  Omitting its zero value preserves the exact pre-upgrade
+    // CBOR and therefore the predecessor/state hashes for that lineage.
+    #[serde(default, skip_serializing_if = "is_zero_u128")]
     rounding_reserve_atomic: u128,
     #[serde(default)]
     credited_custody_references: BTreeSet<String>,
     requests: BTreeMap<(String, String), (String, DirectResult)>,
+}
+
+fn is_zero_u128(value: &u128) -> bool {
+    *value == 0
 }
 
 /// Minimal immutable artifact boundary.  Production implements this with the
@@ -3523,6 +3530,16 @@ mod tests {
     }
     fn runtime(mode: RuntimeMode) -> DirectRuntime {
         DirectRuntime::new(SealedEpoch::load(epoch_path()).unwrap(), mode, vec![7; 32]).unwrap()
+    }
+
+    #[test]
+    fn opening_state_hash_matches_existing_production_lineage() {
+        let runtime = runtime(RuntimeMode::IsolatedTest);
+        assert_eq!(runtime.committed_sequence(), 0);
+        assert_eq!(
+            runtime.state_hash(),
+            "9fc0fd8e9699d23dcbb6fd85753035896dce219f6551a0540ea352c7089abe98"
+        );
     }
     fn isolated_market(market_id: &str) -> MarketConfig {
         MarketConfig {
