@@ -2444,6 +2444,7 @@ pub enum RuntimeRequest {
     Balance {
         account_id: String,
         identity_commitment: String,
+        asset: String,
         bucket: String,
     },
 }

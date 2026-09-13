@@ -165,6 +165,7 @@ where
         RuntimeRequest::Balance {
             account_id,
             identity_commitment,
+            asset,
             bucket,
         } => {
             let state = state.lock().await;
@@ -180,7 +181,7 @@ where
                 RuntimeResponse::Balance {
                     amount_atomic: state
                         .runtime
-                        .balance(&identity_commitment, "USDC", &bucket)
+                        .balance(&identity_commitment, &asset, &bucket)
                         .to_string(),
                 }
             }

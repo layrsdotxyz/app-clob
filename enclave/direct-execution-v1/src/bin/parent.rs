@@ -1504,6 +1504,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // enclave has independently reconstructed it.  PostgreSQL is excluded.
     recover_enclave(&state).await?;
     recover_external_effect_intents(&state).await?;
+    verify_recovered_projection(&state).await?;
     let port = env::var("PORT").unwrap_or_else(|_| "8443".into()).parse()?;
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -2101,6 +2102,7 @@ async fn balance(
         RuntimeRequest::Balance {
             account_id: claims.subject_hash.clone(),
             identity_commitment: identity,
+            asset: "USDC".into(),
             bucket: query.bucket.unwrap_or_else(|| "USER_AVAILABLE".into()),
         },
     )
@@ -2304,9 +2306,14 @@ impl Projection {
                 "SELECT amount_atomic::text, auth_subject_hash FROM direct_execution_epoch_balances WHERE epoch_id=$1 AND identity_commitment=$2 AND asset=$3 AND bucket=$4",
                 &[&EPOCH_ID, &row.identity_commitment, &row.asset, &row.bucket],
             ).await.map_err(|_| ProjectionError::Database)?.ok_or(ProjectionError::OpeningMismatch)?;
-            let amount: String = actual.get(0);
+            let _amount: String = actual.get(0);
             let subject: String = actual.get(1);
-            if amount != row.amount_atomic || subject != row.auth_subject_hash {
+            // A committed direct request legitimately advances this disposable
+            // projection beyond genesis. Startup reconciles every current row
+            // against the recovered enclave before serving; this opening pass
+            // therefore verifies ownership and row presence without treating
+            // the genesis amount as permanently authoritative.
+            if subject != row.auth_subject_hash {
                 return Err(ProjectionError::OpeningMismatch);
             }
         }
@@ -2717,6 +2724,68 @@ async fn recover_external_effect_intents(state: &AppState) -> io::Result<()> {
                     .lock()
                     .await
                     .insert(intent.intent_hash.clone(), intent);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compare the disposable PostgreSQL projection with the private state only
+/// after the enclave has recovered the authoritative encrypted lineage.
+async fn verify_recovered_projection(state: &AppState) -> io::Result<()> {
+    let Some(projection) = &state.projection else {
+        return Ok(());
+    };
+    let rows = projection
+        .client
+        .query(
+            "SELECT auth_subject_hash, identity_commitment, asset, bucket, amount_atomic::text FROM direct_execution_epoch_balances WHERE epoch_id=$1 ORDER BY identity_commitment,asset,bucket",
+            &[&EPOCH_ID],
+        )
+        .await
+        .map_err(|_| invalid("projection reconciliation query failed"))?;
+    let mut projected_keys = HashSet::new();
+    for row in rows {
+        let account_id: String = row.get(0);
+        let identity_commitment: String = row.get(1);
+        let asset: String = row.get(2);
+        let bucket: String = row.get(3);
+        let expected: String = row.get(4);
+        projected_keys.insert(format!("{identity_commitment}\0{asset}\0{bucket}"));
+        match exchange(
+            state,
+            RuntimeRequest::Balance {
+                account_id,
+                identity_commitment,
+                asset,
+                bucket,
+            },
+        )
+        .await?
+        {
+            RuntimeResponse::Balance { amount_atomic } if amount_atomic == expected => {}
+            _ => return Err(invalid("projection does not match recovered private state")),
+        }
+    }
+    let receipts = projection
+        .client
+        .query(
+            "SELECT receipt_json::text FROM direct_execution_receipts WHERE epoch_id=$1",
+            &[&EPOCH_ID],
+        )
+        .await
+        .map_err(|_| invalid("projection receipt reconciliation query failed"))?;
+    for row in receipts {
+        let encoded: String = row.get(0);
+        let receipt: DirectReceipt = serde_json::from_str(&encoded)
+            .map_err(|_| invalid("projection receipt is malformed"))?;
+        for update in receipt.projection_balance_updates {
+            let key = format!(
+                "{}\0{}\0{}",
+                update.identity_commitment, update.asset, update.bucket
+            );
+            if !projected_keys.contains(&key) {
+                return Err(invalid("projection is missing a committed balance row"));
             }
         }
     }
