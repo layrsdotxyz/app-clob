@@ -98,3 +98,83 @@ Submission, when separately reviewed, is `POST /v1/operator/markets` with one
 generated `httpBody` at a time. Exact retries reuse the same deterministic
 `registrationId` (`direct-market:<source-content-hash>`); conflicting reuse is
 rejected by the direct runtime.
+
+## Bounded production transport and verification
+
+`scripts/submit-direct-market-registrations.mjs` is the fail-closed runner for
+the separately reviewed execution. Its default mode is local validation only:
+
+```bash
+node scripts/submit-direct-market-registrations.mjs --validate
+```
+
+The read-only production preflight and mutating execution additionally require
+the exact reviewed candidate AMI and WriterGrant commitment. They deliberately
+have no defaults:
+
+```bash
+LAYRS_EXPECTED_AMI_ID=<reviewed-ami> \
+LAYRS_EXPECTED_WRITER_GRANT_COMMITMENT=<reviewed-commitment> \
+  node scripts/submit-direct-market-registrations.mjs --preflight
+
+LAYRS_EXPECTED_AMI_ID=<reviewed-ami> \
+LAYRS_EXPECTED_WRITER_GRANT_COMMITMENT=<reviewed-commitment> \
+  node scripts/submit-direct-market-registrations.mjs --execute
+```
+
+The runner resolves the single healthy instance from the CloudFormation-owned
+Auto Scaling group. It then uses AWS Systems Manager to call only the parent's
+loopback endpoint. It does not expose the operator endpoint through the NLB,
+Cloudflare, or the customer BFF. No secret, session, JWT, wallet credential, or
+EnvironmentFile is read or logged.
+
+Before any submission the runner verifies:
+
+- the immutable evidence SHA-256 and all five existing-signature flags;
+- at least 15 minutes remain on both the registrations and WriterGrant;
+- exactly one healthy, SSM-online runtime instance uses the reviewed AMI;
+- runtime, opening epoch hash, evidence-manifest hash, enabled mode, and exact
+  WriterGrant commitment;
+- the immutable archive and head prefixes are one-to-one and gap-free;
+- the starting archive sequence is `5` plus only an already-registered serial
+  prefix of these exact five markets; and
+- enclave market readback is absent or byte-for-byte equal to the signed
+  configuration.
+
+It submits in the fixed order BTC, ETH, HYPE, SOL, ZEC. After each synchronous
+HTTP 200 it requires a terminal `MARKET_REGISTERED` receipt, exactly one new
+artifact/head pair, the next sequence, and exact enclave readback. It first
+replays any already-present prefix so a response loss after private-state
+commit can repair the idempotent PostgreSQL projection. It finally replays all
+five exact requests and requires that neither the archive keys nor sequence
+change. The required lineage transition is therefore exactly `5 -> 10`.
+
+An HTTP 200 from this route is emitted only after the parent has executed
+`record_result`, but the following independent read-only projection query is
+also required before declaring trading unblocked:
+
+```sql
+SELECT r.request_id,
+       r.terminal_status,
+       r.effect,
+       count(a.receipt_id) AS accounting_rows
+  FROM layrs_direct_v1.direct_execution_receipts r
+  LEFT JOIN layrs_direct_v1.direct_execution_accounting_events a
+    ON a.receipt_id = r.receipt_id
+ WHERE r.epoch_id = 'layrs-opening-epoch-20260911-941107537728c98b'
+   AND r.request_id IN (
+     'direct-market:1f9b3a006f4397cf2fa5bc2f829b7132fc837011ae97721e1be92e3d85ffeaeb',
+     'direct-market:a9064871759503838b9b9b6c8cecbc733fa1ba17f34dbe69a3ff84cba95175e7',
+     'direct-market:2e217e3c185a62bf4930b83a5160d590637726fe9764768534cc5fe3f1c13990',
+     'direct-market:9ea85e8f788fc29bc920aaf97e31cf94d99dbfef4679b8829a6a22df6570735e',
+     'direct-market:ad4adb70ef8c7f4449696f7645f372d21775453954b7808391e524308452ca82'
+   )
+ GROUP BY r.request_id, r.terminal_status, r.effect
+ ORDER BY r.request_id;
+```
+
+Acceptance is exactly five rows, each `APPLIED`, each `MARKET_REGISTERED`, and
+each with `accounting_rows=1`. The same receipt IDs must have zero rows in
+`direct_execution_order_events`, `direct_execution_trade_events`, and
+`direct_execution_custody_events`. PostgreSQL remains projection-only; enclave
+readback and the immutable artifact lineage are the authoritative checks.
