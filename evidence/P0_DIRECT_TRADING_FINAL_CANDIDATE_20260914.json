@@ -1,0 +1,120 @@
+{
+  "protocol": "layrs.p0-direct-trading-final-candidate-evidence.v1",
+  "capturedAt": "2026-09-13T19:54:05Z",
+  "source": {
+    "commit": "2a1a7ec60777dc709d7bb81ec9e42ab30b1340fa",
+    "includedCommits": {
+      "directTradingLifecycle": "8041cc489ef4aa27c48d2517bd25fb6af1c5332e",
+      "packagedIsolatedRouteGate": "dd266f793df885d8399100b2bc3d20cc2792c6b0",
+      "relayDestinationFinality": "61c8bc7",
+      "governedMarketRegistrationEvidence": "a79c70c",
+      "governedHttpReplayTimeInvariant": "2a1a7ec60777dc709d7bb81ec9e42ab30b1340fa"
+    }
+  },
+  "sealedOpeningState": {
+    "epochId": "layrs-opening-epoch-20260911-941107537728c98b",
+    "epochStateSha256": "84835da82210671d87321a21246317d898afd35381c57be8522df1a516dc3590",
+    "evidenceManifestSha256": "70e579f630c759258728d91cb957fa84e200674aeebd3eae5997430a62203957",
+    "transactionModel": "layrs.direct-execution.v1"
+  },
+  "build": {
+    "status": "VERIFIED_BUILD_AND_LAUNCHED_ISOLATED_ONLY",
+    "packerTemplateSha256": "6e4238614ba6f26a87ff794c49ffd5c65b4527e8b2907c166d0c13c38a78a682",
+    "dockerfileSha256": "fcdd71ae9511a40ee891ea0145987eee564ba7d53ce9a2e9aaabf003d400d509",
+    "baseImage": "gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e",
+    "dockerImageId": "d703753114cab79735d81b9483a199c790a69a533e3c54403a615a30ea3b8fce",
+    "enclaveBinarySha256": "16ab95b9fb3af0a012306d0e441ec376ab0aa441affda6b3563fdcef431c6ebb",
+    "parentBinarySha256": "22e7ced7d7495b75c9ee918196325bb42952a5ec1d398e67a279f137305de860",
+    "eifSha256": "892a5b46518d4802206280ba4f90ca25275ae29f5b13eaf3837ef04b8b481a98",
+    "amiId": "ami-0653ed41b0f02d676",
+    "amiCreationDate": "2026-09-13T19:45:46.000Z",
+    "snapshotId": "snap-00a5e1acef60811a2",
+    "snapshotEncrypted": true,
+    "productionAccess": "denied",
+    "productionWriterTag": false
+  },
+  "measurements": {
+    "pcr0": "770ec42ca6e6daa215430268eca9b759a8a5a501ea3d23e9494cdc90e0ed7b7bddf451826438438c5dd7809135cc42a0",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "433ea0cbc2bc04b94f6afa4d0d014dfe08afeb17caeb21897886b0ca62489a13c510542edf0dfd388de76e9341051a59"
+  },
+  "attestation": {
+    "verifierInstanceId": "i-0a1b0a213b05dd0f6",
+    "moduleId": "i-0a1b0a213b05dd0f6-enc01a09c520fac757f",
+    "coseAlgorithm": "ES384",
+    "coseSignatureVerified": true,
+    "certificateChainSignaturesVerified": 5,
+    "nonceMatches": true,
+    "bindingMatches": true,
+    "attestationBytes": 4889,
+    "attestationSha256": "d7d9161469b5cc1c5edb7dd3338563c1f02fc57d37bb5bd67940a44279b9e658",
+    "attestedProductionWriterEnabled": false,
+    "attestedAdmissionEnabled": false
+  },
+  "tests": {
+    "cargo": {
+      "library": 27,
+      "actualEnclaveVsock": 14,
+      "parent": 16,
+      "failed": 0
+    },
+    "governedMarketRegistrations": {
+      "verified": 5,
+      "evidence": "evidence/P0_DIRECT_MARKET_REGISTRATIONS_SIGNED_20260914.json"
+    },
+    "packagedRuntimeCanary": {
+      "transport": "actual HTTP parent to Nitro VSOCK enclave",
+      "marketId": "layrs:v5:BTC:USDC:15m:packaged-2a1a7ec",
+      "registrationEffect": "MARKET_REGISTERED",
+      "makerEffect": "ORDER_PLACED",
+      "takerEffect": "ORDER_EXECUTED",
+      "matchType": "MINT",
+      "tradeId": "e6384234-2417-5a0c-8cbf-1b31755802d2",
+      "resolutionEffect": "MARKET_RESOLVED",
+      "resolutionOutcome": "UP",
+      "grossPayoutAtomic": "1000000",
+      "roundingReserveAtomic": "0",
+      "makerAvailableAfterAtomic": "5600000",
+      "takerAvailableAfterAtomic": "4483200",
+      "makerPositionsAfter": 0,
+      "takerPositionsAfter": 0,
+      "makerOpenOrdersAfter": 0,
+      "takerOpenOrdersAfter": 0,
+      "fullParentAndEnclaveRestart": "PASS",
+      "marketResolutionExactReplayAfterRestart": "PASS",
+      "tradeExactReplayAfterRestart": "PASS",
+      "restoredPortfoliosExact": "PASS",
+      "artifactsBeforeReplay": 4,
+      "artifactsAfterReplay": 4,
+      "artifactHashesUnchanged": true,
+      "artifactSha256": [
+        "3c5377e0c27692da1c44b022fb94774b7e28b7a8f23321a21f99a2d7d50f4b66",
+        "aa88d7e397f5811f9b6cc3b129f26613ad9d4873736e768cf2bb7c3ec246fb05",
+        "f096835dbfd3e8756cd2210e1bf9703ee98278033c856f16cc45f7b3421ec9df",
+        "fe20ac24102a68109423341c872b7b02f63b53a095933f7359081f50b35802e7"
+      ],
+      "committedHeadSha256": "7415fdfa752dd71f662a879ddf78b0810fcd781124e18adf5fd55e4c92c58917"
+    }
+  },
+  "architectureAudit": {
+    "directRuntimeSourceDurableCommandIdentifiers": 0,
+    "parentBinaryDurableCommandIdentifiers": 0,
+    "enclaveBinaryDurableCommandIdentifiers": 0,
+    "queues": 0,
+    "leases": 0,
+    "coordinators": 0,
+    "postgresAuthoritativeRecovery": false,
+    "privateStateAuthority": "encrypted immutable artifact lineage inside the direct runtime"
+  },
+  "safety": {
+    "productionMutated": false,
+    "productionWriterEnabled": false,
+    "customerFundsMoved": false,
+    "custodyCalled": false,
+    "productionDatabaseTouched": false,
+    "greenTouched": false,
+    "sequence75594Touched": false,
+    "testFinancialWallet": null,
+    "privyWalletRole": "authentication and identity binding only"
+  }
+}
