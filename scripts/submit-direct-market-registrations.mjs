@@ -26,9 +26,10 @@ const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const canonical = (value) => JSON.stringify(value);
 
 function aws(args, { json = true } = {}) {
+  const outputArguments = json ? ['--output', 'json'] : [];
   const output = execFileSync(
     'aws',
-    ['--profile', 'predifi-root', '--region', 'us-east-1', ...args],
+    ['--profile', 'predifi-root', '--region', 'us-east-1', ...outputArguments, ...args],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
   ).trim();
   return json ? JSON.parse(output || 'null') : output;
