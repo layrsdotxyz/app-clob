@@ -758,7 +758,7 @@ mod tests {
             IDENTITY,
             id,
             DirectAction::ReserveWithdrawal {
-                destination: "0xCCB96357dEB4cbF0808208d55916774f0B51a908".into(),
+                destination: "0x2222222222222222222222222222222222222222".into(),
                 amount_atomic: "1000000".into(),
                 custody_reference: "isolated-vsock-custody-finality".into(),
             },
@@ -770,11 +770,22 @@ mod tests {
         id: &str,
         action: DirectAction,
     ) -> DirectRequest {
+        let financial_wallet_address = match &action {
+            DirectAction::CreditDeposit { .. } => {
+                Some("0xfefefefefefefefefefefefefefefefefefefefe".into())
+            }
+            DirectAction::ReserveWithdrawal { destination, .. }
+            | DirectAction::RecordWithdrawalReverted { destination, .. } => {
+                Some(destination.to_ascii_lowercase())
+            }
+            _ => None,
+        };
         let mut request = DirectRequest {
             account_id: account_id.into(),
             identity_commitment: identity_commitment.into(),
             request_id: id.into(),
             request_hash: String::new(),
+            financial_wallet_address,
             action,
         };
         request.request_hash = request_hash(&request);

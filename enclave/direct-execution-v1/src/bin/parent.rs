@@ -1364,7 +1364,11 @@ struct SessionClaims {
     audience: String,
     epoch_id: String,
     epoch_state_sha256: String,
+    /// Privy's embedded wallet remains an authentication/identity binding
+    /// only. Financial commands must carry a separately proven non-Privy EOA.
     wallet_address: String,
+    #[serde(default)]
+    financial_wallet_address: Option<String>,
     identity_commitment: String,
     expires_at_unix: u64,
     response_key: String,
@@ -1611,6 +1615,9 @@ async fn command(
             transaction_hash,
             amount_atomic,
         } if !external_effect_pending => {
+            let Some(financial_wallet_address) = claims.financial_wallet_address.as_deref() else {
+                return (StatusCode::FORBIDDEN, "DIRECT_FINANCIAL_WALLET_REQUIRED").into_response();
+            };
             let canonical_hash = transaction_hash.to_ascii_lowercase();
             let required_request_id = format!("base-deposit:{canonical_hash}");
             if request_id != required_request_id {
@@ -1625,7 +1632,7 @@ async fn command(
                     .into_response();
             };
             match custody
-                .deposit_finality(&claims.wallet_address, &canonical_hash, &amount_atomic)
+                .deposit_finality(financial_wallet_address, &canonical_hash, &amount_atomic)
                 .await
             {
                 Ok(DepositFinality::Finalized) => DirectAction::CreditDeposit {
@@ -1698,13 +1705,14 @@ async fn command(
             destination,
             amount_atomic,
         } => {
-            // A direct withdrawal is deliberately not a general-purpose
-            // transfer instruction.  The Privy-verifying BFF has bound this
-            // short-lived assertion to one embedded EVM wallet, and the
-            // parent must enforce that binding before a candidate exists.
-            // Comparing canonical EVM spellings is case-insensitive only;
-            // no alternate destination can be authorized by this route.
-            if !withdrawal_destination_matches(&destination, &claims.wallet_address) {
+            // Privy's embedded wallet authenticates the account but never
+            // serves as the payout rail. The BFF separately verifies control
+            // of a non-Privy EOA for this exact request and signs it into the
+            // short-lived direct session.
+            let Some(financial_wallet_address) = claims.financial_wallet_address.as_deref() else {
+                return (StatusCode::FORBIDDEN, "DIRECT_FINANCIAL_WALLET_REQUIRED").into_response();
+            };
+            if !withdrawal_destination_matches(&destination, financial_wallet_address) {
                 return (StatusCode::FORBIDDEN, "DIRECT_DESTINATION_BINDING_DENIED")
                     .into_response();
             }
@@ -1728,6 +1736,7 @@ async fn command(
         identity_commitment: body.identity_commitment,
         request_id,
         request_hash: String::new(),
+        financial_wallet_address: claims.financial_wallet_address.clone(),
         action,
     };
     request.request_hash = request_hash(&request);
@@ -1806,6 +1815,7 @@ async fn admit_identity(State(state): State<AppState>, headers: HeaderMap) -> im
         identity_commitment: claims.identity_commitment.clone(),
         request_id,
         request_hash: String::new(),
+        financial_wallet_address: None,
         action: DirectAction::AdmitIdentity {
             wallet_address: claims.wallet_address.clone(),
         },
@@ -1870,6 +1880,7 @@ async fn register_market(
         identity_commitment: "governance".into(),
         request_id: body.registration.registration_id.clone(),
         request_hash: String::new(),
+        financial_wallet_address: None,
         action: DirectAction::RegisterMarket {
             registration: body.registration,
             now_unix: now,
@@ -2041,6 +2052,7 @@ async fn prepare_external_withdrawal(
         identity_commitment: identity_commitment.into(),
         request_id: request_id.into(),
         request_hash: String::new(),
+        financial_wallet_address: claims.financial_wallet_address.clone(),
         action: DirectAction::ReserveWithdrawal {
             destination: destination.clone(),
             amount_atomic: amount_atomic.clone(),
@@ -2172,6 +2184,18 @@ fn authenticated(
         || claims.epoch_state_sha256 != layrs_direct_execution_v1::EPOCH_STATE_SHA256
         || !claims.wallet_address.starts_with("0x")
         || claims.wallet_address.len() != 42
+        || !claims.wallet_address[2..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || claims
+            .financial_wallet_address
+            .as_ref()
+            .is_some_and(|address| {
+                !address.starts_with("0x")
+                    || address.len() != 42
+                    || !address[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+                    || address.eq_ignore_ascii_case(&claims.wallet_address)
+            })
         || claims.identity_commitment.len() != 64
         || !claims
             .identity_commitment
@@ -2733,6 +2757,7 @@ fn committed_external_effect_action(
             identity_commitment: identity_commitment.into(),
             request_id: request_id.into(),
             request_hash: String::new(),
+            financial_wallet_address: Some(destination.to_ascii_lowercase()),
             action: action.clone(),
         };
         request.request_hash = request_hash(&request);
@@ -2778,6 +2803,7 @@ fn request_for_external_effect(
         identity_commitment: intent.identity_commitment.clone(),
         request_id: intent.request_id.clone(),
         request_hash: String::new(),
+        financial_wallet_address: Some(intent.destination.to_ascii_lowercase()),
         action,
     };
     request.request_hash = request_hash(&request);
@@ -3340,6 +3366,7 @@ mod tests {
             epoch_id: EPOCH_ID.into(),
             epoch_state_sha256: layrs_direct_execution_v1::EPOCH_STATE_SHA256.into(),
             wallet_address: "0x1111111111111111111111111111111111111111".into(),
+            financial_wallet_address: None,
             identity_commitment: "c".repeat(64),
             expires_at_unix: now_unix() + 60,
             response_key: URL_SAFE_NO_PAD.encode([3u8; 32]),
@@ -3371,6 +3398,35 @@ mod tests {
             governed_bootstrap: None,
         };
         assert!(authenticated(&headers, &state).is_ok());
+
+        claims.financial_wallet_address = Some(claims.wallet_address.clone());
+        claims.signature.clear();
+        claims.signature = sign(&state.session_key, &serde_json::to_vec(&claims).unwrap());
+        headers.insert(
+            "authorization",
+            format!(
+                "Bearer {}",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+            )
+            .parse()
+            .unwrap(),
+        );
+        assert!(authenticated(&headers, &state).is_err());
+
+        claims.financial_wallet_address = Some("0x2222222222222222222222222222222222222222".into());
+        claims.signature.clear();
+        claims.signature = sign(&state.session_key, &serde_json::to_vec(&claims).unwrap());
+        headers.insert(
+            "authorization",
+            format!(
+                "Bearer {}",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+            )
+            .parse()
+            .unwrap(),
+        );
+        assert!(authenticated(&headers, &state).is_ok());
+
         headers.insert("authorization", "Bearer bad".parse().unwrap());
         assert!(authenticated(&headers, &state).is_err());
     }
@@ -3557,7 +3613,7 @@ mod tests {
             "identity",
             "base",
             "USDC",
-            "0xCCB96357dEB4cbF0808208d55916774f0B51a908",
+            "0x2222222222222222222222222222222222222222",
             "1000000",
             "existing-wallet",
         );
@@ -3566,8 +3622,9 @@ mod tests {
             identity_commitment: "identity".into(),
             request_id: "request-1".into(),
             request_hash: String::new(),
+            financial_wallet_address: Some("0x2222222222222222222222222222222222222222".into()),
             action: DirectAction::ReserveWithdrawal {
-                destination: "0xCCB96357dEB4cbF0808208d55916774f0B51a908".into(),
+                destination: "0x2222222222222222222222222222222222222222".into(),
                 amount_atomic: "1000000".into(),
                 custody_reference: reference,
             },
@@ -3581,7 +3638,7 @@ mod tests {
             "identity".into(),
             "base".into(),
             "USDC".into(),
-            "0xCCB96357dEB4cbF0808208d55916774f0B51a908".into(),
+            "0x2222222222222222222222222222222222222222".into(),
             "1000000".into(),
             "existing-wallet".into(),
             "0x1111111111111111111111111111111111111111".into(),
@@ -3627,6 +3684,7 @@ mod tests {
             identity_commitment: "identity".into(),
             request_id: "request-1".into(),
             request_hash: String::new(),
+            financial_wallet_address: Some(destination.to_ascii_lowercase()),
             action: DirectAction::ReserveWithdrawal {
                 destination: destination.into(),
                 amount_atomic: "1000000".into(),
@@ -3729,7 +3787,7 @@ mod tests {
     }
 
     #[test]
-    fn withdrawal_destination_must_equal_session_bound_privy_wallet() {
+    fn withdrawal_destination_must_equal_separately_proven_financial_wallet() {
         assert!(withdrawal_destination_matches(
             "0xCCB96357dEB4cbF0808208d55916774f0B51a908",
             "0xccb96357deb4cbf0808208d55916774f0b51a908"

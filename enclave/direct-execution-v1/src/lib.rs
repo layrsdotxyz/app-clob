@@ -74,7 +74,9 @@ pub enum RuntimeError {
     IdentityDenied,
     #[error("identity or wallet is already admitted")]
     IdentityAlreadyAdmitted,
-    #[error("withdrawal destination is not the caller's verified embedded wallet")]
+    #[error(
+        "financial wallet is invalid, Privy-managed, or does not match the payout destination"
+    )]
     DestinationDenied,
     #[error("custody reference has already been committed")]
     CustodyReferenceReuse,
@@ -567,6 +569,11 @@ pub struct DirectRequest {
     pub identity_commitment: String,
     pub request_id: String,
     pub request_hash: String,
+    /// A separately proven customer-controlled EOA. Privy's embedded wallet
+    /// is retained only in `subject_wallets` for authentication and identity
+    /// resolution and is explicitly ineligible for financial use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub financial_wallet_address: Option<String>,
     pub action: DirectAction,
 }
 
@@ -1141,6 +1148,31 @@ impl DirectRuntime {
         {
             return Err(RuntimeError::IdentityDenied);
         }
+        let carries_external_financial_effect = matches!(
+            &request.action,
+            DirectAction::CreditDeposit { .. }
+                | DirectAction::ReserveWithdrawal { .. }
+                | DirectAction::RecordWithdrawalReverted { .. }
+        );
+        let financial_wallet = request
+            .financial_wallet_address
+            .as_deref()
+            .map(str::to_ascii_lowercase);
+        if carries_external_financial_effect {
+            let Some(wallet) = financial_wallet.as_deref() else {
+                return Err(RuntimeError::DestinationDenied);
+            };
+            if !valid_evm_wallet(wallet)
+                || self
+                    .subject_wallets
+                    .values()
+                    .any(|wallets| wallets.contains(wallet))
+            {
+                return Err(RuntimeError::DestinationDenied);
+            }
+        } else if financial_wallet.is_some() {
+            return Err(RuntimeError::InvalidRequest);
+        }
         let mut execution = None;
         let mut touched_identities = BTreeSet::from([request.identity_commitment.clone()]);
         let (effect, amount_atomic, custody_reference): (String, Option<String>, Option<String>) =
@@ -1284,10 +1316,7 @@ impl DirectRuntime {
                     let value = amount(amount_atomic)?;
                     let destination = destination.to_ascii_lowercase();
                     if !valid_withdrawal_custody_reference(custody_reference, self.mode)
-                        || !self
-                            .subject_wallets
-                            .get(&request.account_id)
-                            .is_some_and(|wallets| wallets.contains(&destination))
+                        || financial_wallet.as_deref() != Some(destination.as_str())
                     {
                         return Err(RuntimeError::DestinationDenied);
                     }
@@ -1317,10 +1346,7 @@ impl DirectRuntime {
                     let _ = amount(amount_atomic)?;
                     let destination = destination.to_ascii_lowercase();
                     if !valid_withdrawal_custody_reference(custody_reference, self.mode)
-                        || !self
-                            .subject_wallets
-                            .get(&request.account_id)
-                            .is_some_and(|wallets| wallets.contains(&destination))
+                        || financial_wallet.as_deref() != Some(destination.as_str())
                     {
                         return Err(RuntimeError::DestinationDenied);
                     }
@@ -2670,11 +2696,22 @@ mod tests {
         )
     }
     fn request_for(subject: &str, identity: &str, id: &str, action: DirectAction) -> DirectRequest {
+        let financial_wallet_address = match &action {
+            DirectAction::CreditDeposit { .. } => {
+                Some("0xfefefefefefefefefefefefefefefefefefefefe".into())
+            }
+            DirectAction::ReserveWithdrawal { destination, .. }
+            | DirectAction::RecordWithdrawalReverted { destination, .. } => {
+                Some(destination.to_ascii_lowercase())
+            }
+            _ => None,
+        };
         let mut r = DirectRequest {
             account_id: subject.into(),
             identity_commitment: identity.into(),
             request_id: id.into(),
             request_hash: String::new(),
+            financial_wallet_address,
             action,
         };
         r.request_hash = request_hash(&r);
@@ -2696,6 +2733,7 @@ mod tests {
             identity_commitment: "governance".into(),
             request_id: request_id.into(),
             request_hash: String::new(),
+            financial_wallet_address: None,
             action: DirectAction::RegisterMarket {
                 registration,
                 now_unix: 1,
@@ -2740,12 +2778,21 @@ mod tests {
         assert_eq!(epoch.projection_wallet_rows().len(), 414);
     }
     #[test]
-    fn immediate_withdrawal_is_idempotent_and_bound_to_embedded_wallet() {
+    fn immediate_withdrawal_is_idempotent_and_rejects_privy_wallet_as_financial_rail() {
         let mut r = runtime(RuntimeMode::IsolatedTest);
+        let denied = request(
+            "withdrawal-privy-wallet-denied",
+            DirectAction::ReserveWithdrawal {
+                destination: "0xCCB96357dEB4cbF0808208d55916774f0B51a908".into(),
+                amount_atomic: "1000000".into(),
+                custody_reference: "mock-base-tx-denied".into(),
+            },
+        );
+        assert_eq!(r.execute(denied), Err(RuntimeError::DestinationDenied));
         let q = request(
             "withdrawal-1",
             DirectAction::ReserveWithdrawal {
-                destination: "0xCCB96357dEB4cbF0808208d55916774f0B51a908".into(),
+                destination: "0x2222222222222222222222222222222222222222".into(),
                 amount_atomic: "1000000".into(),
                 custody_reference: "mock-base-tx-1".into(),
             },
@@ -2829,11 +2876,13 @@ mod tests {
         let mut q = request(
             "denied",
             DirectAction::ReserveWithdrawal {
-                destination: "0x0000000000000000000000000000000000000000".into(),
+                destination: "0x2222222222222222222222222222222222222222".into(),
                 amount_atomic: "1".into(),
                 custody_reference: "mock".into(),
             },
         );
+        q.financial_wallet_address = Some("0xfefefefefefefefefefefefefefefefefefefefe".into());
+        q.request_hash = request_hash(&q);
         assert_eq!(
             r.execute(q.clone()).unwrap_err(),
             RuntimeError::DestinationDenied
@@ -2841,6 +2890,21 @@ mod tests {
         q.account_id = "bae54f222a79c2ea394fa5b087d6a843e4b82562d0f3dfa33b8149b4beea21b3".into();
         q.request_hash = request_hash(&q);
         assert_eq!(r.execute(q).unwrap_err(), RuntimeError::IdentityDenied);
+
+        let mut privy_deposit = request(
+            "privy-deposit-denied",
+            DirectAction::CreditDeposit {
+                amount_atomic: "1".into(),
+                custody_reference: "mock-deposit".into(),
+            },
+        );
+        privy_deposit.financial_wallet_address =
+            Some("0xccb96357deb4cbf0808208d55916774f0b51a908".into());
+        privy_deposit.request_hash = request_hash(&privy_deposit);
+        assert_eq!(
+            r.execute(privy_deposit).unwrap_err(),
+            RuntimeError::DestinationDenied
+        );
     }
     #[test]
     fn dormant_has_no_effect() {
@@ -2885,6 +2949,7 @@ mod tests {
             identity_commitment: identity.clone(),
             request_id: "identity-admission-fixture-01".into(),
             request_hash: String::new(),
+            financial_wallet_address: None,
             action: DirectAction::AdmitIdentity {
                 wallet_address: wallet.into(),
             },
@@ -2927,6 +2992,7 @@ mod tests {
             identity_commitment: identity_commitment_for(&subject, other_wallet),
             request_id: "identity-admission-fixture-02".into(),
             request_hash: String::new(),
+            financial_wallet_address: None,
             action: DirectAction::AdmitIdentity {
                 wallet_address: other_wallet.into(),
             },
@@ -3079,6 +3145,7 @@ mod tests {
             identity_commitment: identity.clone(),
             request_id: "mm20-admission".into(),
             request_hash: String::new(),
+            financial_wallet_address: None,
             action: DirectAction::AdmitIdentity {
                 wallet_address: wallet.into(),
             },
@@ -3168,7 +3235,7 @@ mod tests {
             &identity,
             "mm20-withdrawal",
             DirectAction::ReserveWithdrawal {
-                destination: wallet.into(),
+                destination: "0x2222222222222222222222222222222222222222".into(),
                 amount_atomic: "4383200".into(),
                 custody_reference: "isolated-final-withdrawal".into(),
             },
@@ -3269,7 +3336,7 @@ mod tests {
             .execute(request(
                 "withdraw-e2e",
                 DirectAction::ReserveWithdrawal {
-                    destination: "0xccb96357deb4cbf0808208d55916774f0b51a908".into(),
+                    destination: "0x2222222222222222222222222222222222222222".into(),
                     amount_atomic: "9".into(),
                     custody_reference: "mock-withdrawal-finality-1".into(),
                 },
@@ -3429,7 +3496,7 @@ mod tests {
         let command = request(
             "restart-safe-withdrawal",
             DirectAction::ReserveWithdrawal {
-                destination: "0xccb96357deb4cbf0808208d55916774f0b51a908".into(),
+                destination: "0x2222222222222222222222222222222222222222".into(),
                 amount_atomic: "1000000".into(),
                 custody_reference: "mock-finality-commit".into(),
             },
