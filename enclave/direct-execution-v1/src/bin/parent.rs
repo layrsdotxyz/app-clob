@@ -1727,7 +1727,10 @@ struct SessionClaims {
     epoch_id: String,
     epoch_state_sha256: String,
     /// Privy's embedded wallet remains an authentication/identity binding
-    /// only. Financial commands must carry a separately proven non-Privy EOA.
+    /// only. For a direct Base withdrawal, the BFF copies the independently
+    /// customer-provided destination into this signed field without requiring
+    /// ownership proof. The parent requires it to equal the action destination
+    /// so a signed session for destination A cannot authorize destination B.
     wallet_address: String,
     #[serde(default)]
     financial_wallet_address: Option<String>,
@@ -2095,16 +2098,22 @@ async fn command(
                         .into_response();
                 }
             } else {
-                // Direct Base withdrawals retain the existing separately
-                // proven non-Privy financial-wallet binding. Relay routes are
-                // instead bound to their one-time immutable route/recipient.
-                let Some(financial_wallet_address) = claims.financial_wallet_address.as_deref()
-                else {
-                    return (StatusCode::FORBIDDEN, "DIRECT_FINANCIAL_WALLET_REQUIRED")
+                // A direct Base withdrawal may target any syntactically valid
+                // customer-provided address. The BFF signs that exact value
+                // into the session and the action/intent bind it again. Privy
+                // neither selects nor restricts the destination.
+                let Some(signed_destination) = claims.financial_wallet_address.as_deref() else {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        "SIGNED_WITHDRAWAL_DESTINATION_REQUIRED",
+                    )
                         .into_response();
                 };
-                if !withdrawal_destination_matches(&destination, financial_wallet_address) {
-                    return (StatusCode::FORBIDDEN, "DIRECT_DESTINATION_BINDING_DENIED")
+                if !signed_base_withdrawal_destination_matches(&destination, signed_destination) {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        "SIGNED_WITHDRAWAL_DESTINATION_MISMATCH",
+                    )
                         .into_response();
                 }
             }
@@ -2633,12 +2642,20 @@ async fn prepare_external_withdrawal(
     }
 }
 
-fn withdrawal_destination_matches(destination: &str, verified_wallet: &str) -> bool {
-    destination.len() == 42
-        && verified_wallet.len() == 42
-        && destination.starts_with("0x")
-        && verified_wallet.starts_with("0x")
-        && destination.eq_ignore_ascii_case(verified_wallet)
+fn valid_base_withdrawal_destination(value: &str) -> bool {
+    value.len() == 42
+        && value.starts_with("0x")
+        && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        && value[2..].bytes().any(|byte| byte != b'0')
+}
+
+fn signed_base_withdrawal_destination_matches(
+    action_destination: &str,
+    signed_destination: &str,
+) -> bool {
+    valid_base_withdrawal_destination(action_destination)
+        && valid_base_withdrawal_destination(signed_destination)
+        && action_destination.eq_ignore_ascii_case(signed_destination)
 }
 async fn balance(
     State(state): State<AppState>,
@@ -2724,12 +2741,7 @@ fn authenticated(
         || claims
             .financial_wallet_address
             .as_ref()
-            .is_some_and(|address| {
-                !address.starts_with("0x")
-                    || address.len() != 42
-                    || !address[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
-                    || address.eq_ignore_ascii_case(&claims.wallet_address)
-            })
+            .is_some_and(|address| !valid_base_withdrawal_destination(address))
         || claims.identity_commitment.len() != 64
         || !claims
             .identity_commitment
@@ -4295,7 +4307,10 @@ mod tests {
             .parse()
             .unwrap(),
         );
-        assert!(authenticated(&headers, &state).is_err());
+        // Equality with the Privy auth wallet is not an authorization error:
+        // this optional field does not select or restrict a withdrawal
+        // destination. The signed action supplies that destination.
+        assert!(authenticated(&headers, &state).is_ok());
 
         claims.financial_wallet_address = Some("0x2222222222222222222222222222222222222222".into());
         claims.signature.clear();
@@ -4310,6 +4325,20 @@ mod tests {
             .unwrap(),
         );
         assert!(authenticated(&headers, &state).is_ok());
+
+        claims.financial_wallet_address = Some("not-an-address".into());
+        claims.signature.clear();
+        claims.signature = sign(&state.session_key, &serde_json::to_vec(&claims).unwrap());
+        headers.insert(
+            "authorization",
+            format!(
+                "Bearer {}",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+            )
+            .parse()
+            .unwrap(),
+        );
+        assert!(authenticated(&headers, &state).is_err());
 
         headers.insert("authorization", "Bearer bad".parse().unwrap());
         assert!(authenticated(&headers, &state).is_err());
@@ -4673,14 +4702,26 @@ mod tests {
     }
 
     #[test]
-    fn withdrawal_destination_must_equal_separately_proven_financial_wallet() {
-        assert!(withdrawal_destination_matches(
-            "0xCCB96357dEB4cbF0808208d55916774f0B51a908",
+    fn base_withdrawal_requires_signed_action_equality_without_an_allowlist() {
+        let destination = "0xCCB96357dEB4cbF0808208d55916774f0B51a908";
+        assert!(signed_base_withdrawal_destination_matches(
+            destination,
             "0xccb96357deb4cbf0808208d55916774f0b51a908"
         ));
-        assert!(!withdrawal_destination_matches(
-            "0xCCB96357dEB4cbF0808208d55916774f0B51a908",
+
+        // Both are valid Base addresses, but a session signed for one may not
+        // authorize the other.
+        assert!(!signed_base_withdrawal_destination_matches(
+            destination,
             "0x1cBE2DDB7C7AC4C67BC692CB463f759D0D7b4dED"
+        ));
+        assert!(!signed_base_withdrawal_destination_matches(
+            "not-an-address",
+            "not-an-address"
+        ));
+        assert!(!signed_base_withdrawal_destination_matches(
+            "0x0000000000000000000000000000000000000000",
+            "0x0000000000000000000000000000000000000000"
         ));
     }
 }

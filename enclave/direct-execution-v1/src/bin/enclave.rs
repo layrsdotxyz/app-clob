@@ -792,7 +792,11 @@ mod tests {
             IDENTITY,
             id,
             DirectAction::ReserveWithdrawal {
-                destination: "0x2222222222222222222222222222222222222222".into(),
+                // Deliberately matches a Privy auth-wallet mapping in the
+                // sealed epoch. The packaged VSOCK path must accept it only as
+                // the caller's explicit action destination, never auto-select
+                // it from authentication state.
+                destination: "0xCCB96357dEB4cbF0808208d55916774f0B51a908".into(),
                 amount_atomic: "1000000".into(),
                 custody_reference: "isolated-vsock-custody-finality".into(),
             },

@@ -78,9 +78,7 @@ pub enum RuntimeError {
     IdentityDenied,
     #[error("identity or wallet is already admitted")]
     IdentityAlreadyAdmitted,
-    #[error(
-        "financial wallet is invalid, Privy-managed, or does not match the payout destination"
-    )]
+    #[error("external financial address is invalid or does not match the bound action")]
     DestinationDenied,
     #[error("custody reference has already been committed")]
     CustodyReferenceReuse,
@@ -573,9 +571,11 @@ pub struct DirectRequest {
     pub identity_commitment: String,
     pub request_id: String,
     pub request_hash: String,
-    /// A separately proven customer-controlled EOA. Privy's embedded wallet
-    /// is retained only in `subject_wallets` for authentication and identity
-    /// resolution and is explicitly ineligible for financial use.
+    /// For a direct Base withdrawal, this is the customer-provided destination
+    /// copied from the independently signed session. It must equal the action
+    /// destination already bound into `request_hash`; the authenticated Privy
+    /// wallet never selects it. Other external-effect lanes retain their
+    /// existing interpretation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub financial_wallet_address: Option<String>,
     pub action: DirectAction,
@@ -1410,37 +1410,47 @@ impl DirectRuntime {
         {
             return Err(RuntimeError::IdentityDenied);
         }
-        let carries_external_financial_effect = matches!(
-            &request.action,
-            DirectAction::CreditDeposit { .. }
-                | DirectAction::ReserveWithdrawal { .. }
-                | DirectAction::RecordWithdrawalReverted { .. }
-                | DirectAction::SettleRelayWithdrawal { .. }
-                | DirectAction::RecordRelayWithdrawalReverted { .. }
-        );
-        let relay_external_effect = matches!(
-            &request.action,
-            DirectAction::SettleRelayWithdrawal { .. }
-                | DirectAction::RecordRelayWithdrawalReverted { .. }
-        );
         let financial_wallet = request
             .financial_wallet_address
             .as_deref()
             .map(str::to_ascii_lowercase);
-        if carries_external_financial_effect && !relay_external_effect {
-            let Some(wallet) = financial_wallet.as_deref() else {
-                return Err(RuntimeError::DestinationDenied);
-            };
-            if !valid_evm_wallet(wallet)
-                || self
-                    .subject_wallets
-                    .values()
-                    .any(|wallets| wallets.contains(wallet))
-            {
-                return Err(RuntimeError::DestinationDenied);
+        match &request.action {
+            // Preserve the existing deposit lane unchanged. Base deposit
+            // attribution is handled separately and is outside this patch.
+            DirectAction::CreditDeposit { .. } => {
+                let Some(wallet) = financial_wallet.as_deref() else {
+                    return Err(RuntimeError::DestinationDenied);
+                };
+                if !valid_evm_wallet(wallet)
+                    || self
+                        .subject_wallets
+                        .values()
+                        .any(|wallets| wallets.contains(wallet))
+                {
+                    return Err(RuntimeError::DestinationDenied);
+                }
             }
-        } else if financial_wallet.is_some() {
-            return Err(RuntimeError::InvalidRequest);
+            DirectAction::ReserveWithdrawal { destination, .. }
+            | DirectAction::RecordWithdrawalReverted { destination, .. } => {
+                let Some(wallet) = financial_wallet.as_deref() else {
+                    return Err(RuntimeError::DestinationDenied);
+                };
+                // The user-selected destination, including an address that
+                // also happens to be a Privy wallet, is permitted. Equality
+                // here binds the normalized transport field to the signed
+                // action; it is not an identity or ownership allowlist.
+                if !valid_evm_wallet(wallet) || !wallet.eq_ignore_ascii_case(destination) {
+                    return Err(RuntimeError::DestinationDenied);
+                }
+            }
+            DirectAction::SettleRelayWithdrawal { .. }
+            | DirectAction::RecordRelayWithdrawalReverted { .. } => {
+                if financial_wallet.is_some() {
+                    return Err(RuntimeError::InvalidRequest);
+                }
+            }
+            _ if financial_wallet.is_some() => return Err(RuntimeError::InvalidRequest),
+            _ => {}
         }
         let mut execution = None;
         let mut resolution_execution = None;
@@ -3578,21 +3588,15 @@ mod tests {
         assert_eq!(epoch.projection_wallet_rows().len(), 414);
     }
     #[test]
-    fn immediate_withdrawal_is_idempotent_and_rejects_privy_wallet_as_financial_rail() {
+    fn immediate_withdrawal_accepts_any_explicit_valid_destination_and_is_idempotent() {
         let mut r = runtime(RuntimeMode::IsolatedTest);
-        let denied = request(
-            "withdrawal-privy-wallet-denied",
+        // This address is also present in the opening auth-wallet mapping.
+        // It is accepted only because the customer supplied it explicitly as
+        // the action destination; the runtime never selected it from Privy.
+        let q = request(
+            "withdrawal-customer-selected-destination",
             DirectAction::ReserveWithdrawal {
                 destination: "0xCCB96357dEB4cbF0808208d55916774f0B51a908".into(),
-                amount_atomic: "1000000".into(),
-                custody_reference: "mock-base-tx-denied".into(),
-            },
-        );
-        assert_eq!(r.execute(denied), Err(RuntimeError::DestinationDenied));
-        let q = request(
-            "withdrawal-1",
-            DirectAction::ReserveWithdrawal {
-                destination: "0x2222222222222222222222222222222222222222".into(),
                 amount_atomic: "1000000".into(),
                 custody_reference: "mock-base-tx-1".into(),
             },
@@ -3764,6 +3768,19 @@ mod tests {
         q.request_hash = request_hash(&q);
         assert_eq!(
             r.execute(q.clone()).unwrap_err(),
+            RuntimeError::DestinationDenied
+        );
+        let mut invalid_destination = request(
+            "invalid-destination",
+            DirectAction::ReserveWithdrawal {
+                destination: "0x0000000000000000000000000000000000000000".into(),
+                amount_atomic: "1".into(),
+                custody_reference: "mock-invalid-destination".into(),
+            },
+        );
+        invalid_destination.request_hash = request_hash(&invalid_destination);
+        assert_eq!(
+            r.execute(invalid_destination).unwrap_err(),
             RuntimeError::DestinationDenied
         );
         q.account_id = "bae54f222a79c2ea394fa5b087d6a843e4b82562d0f3dfa33b8149b4beea21b3".into();
