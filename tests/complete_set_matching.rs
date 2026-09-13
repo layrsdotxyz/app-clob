@@ -1022,10 +1022,9 @@ fn btc_direct_execution_feasibility_survives_replay_and_restart() {
     let taker_commitment = [205u8; 32];
     let maker_owner = derived_private_user(journal_key, maker_commitment);
     let taker_owner = derived_private_user(journal_key, taker_commitment);
-    let mut core = PrivateTradingCore::new(
-        JournalKey::from_bytes(journal_key),
-        ReceiptSigner::generate([206u8; 48]),
-    );
+    let receipt_signer = ReceiptSigner::from_seed([206u8; 32], [206u8; 48]);
+    let mut core =
+        PrivateTradingCore::new(JournalKey::from_bytes(journal_key), receipt_signer.clone());
     core.register_market(
         "sys:market:btc-direct-gate".into(),
         MarketConfig {
@@ -1237,7 +1236,7 @@ fn btc_direct_execution_feasibility_survives_replay_and_restart() {
     let snapshot = core.export_encrypted_snapshot().unwrap();
     let mut restored = PrivateTradingCore::restore_encrypted_snapshot(
         JournalKey::from_bytes(journal_key),
-        ReceiptSigner::generate([209u8; 48]),
+        receipt_signer,
         &snapshot,
         snapshot.sequence,
     )
@@ -1288,10 +1287,9 @@ async fn btc_direct_execution_handles_one_thousand_orders_from_concurrent_sessio
     assert!(makers > 0 && takers > 0 && orders_per_session > 0);
     assert_eq!(makers * orders_per_session, takers * orders_per_session);
     let journal_key = [210u8; 32];
-    let mut core = PrivateTradingCore::new(
-        JournalKey::from_bytes(journal_key),
-        ReceiptSigner::generate([211u8; 48]),
-    );
+    let receipt_signer = ReceiptSigner::from_seed([211u8; 32], [211u8; 48]);
+    let mut core =
+        PrivateTradingCore::new(JournalKey::from_bytes(journal_key), receipt_signer.clone());
     core.register_market(
         "sys:market:btc-direct-scale".into(),
         MarketConfig {
@@ -1540,7 +1538,7 @@ async fn btc_direct_execution_handles_one_thousand_orders_from_concurrent_sessio
     let snapshot = core.export_encrypted_snapshot().unwrap();
     let restored = PrivateTradingCore::restore_encrypted_snapshot(
         JournalKey::from_bytes(journal_key),
-        ReceiptSigner::generate([212u8; 48]),
+        receipt_signer,
         &snapshot,
         snapshot.sequence,
     )

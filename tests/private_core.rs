@@ -794,9 +794,10 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
     let alice = SigningKey::from_bytes(&[12u8; 32]);
     let bob = SigningKey::from_bytes(&[13u8; 32]);
     let journal_key = JournalKey::from_bytes([14u8; 32]);
+    let receipt_signer = ReceiptSigner::from_seed([15u8; 32], [15u8; 48]);
     let mut core = PrivateTradingCore::new_with_oracle(
         journal_key.clone(),
-        ReceiptSigner::generate([15u8; 48]),
+        receipt_signer.clone(),
         oracle.verifying_key().to_bytes(),
     )
     .unwrap();
@@ -1079,7 +1080,7 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
     let snapshot = core.export_encrypted_snapshot().unwrap();
     let restored = PrivateTradingCore::restore_encrypted_snapshot(
         journal_key.clone(),
-        ReceiptSigner::generate([16u8; 48]),
+        receipt_signer.clone(),
         &snapshot,
         snapshot.sequence,
     )
@@ -1096,7 +1097,7 @@ fn private_core_executes_collateralized_trade_and_profit_fee_resolution() {
     assert!(matches!(
         PrivateTradingCore::restore_encrypted_snapshot(
             journal_key,
-            ReceiptSigner::generate([17u8; 48]),
+            receipt_signer,
             &snapshot,
             snapshot.sequence + 1,
         ),
@@ -1109,10 +1110,9 @@ fn native_clob_partial_fill_locks_remainder_and_cancel_releases_once() {
     let alice = SigningKey::from_bytes(&[61u8; 32]);
     let bob = SigningKey::from_bytes(&[62u8; 32]);
     let journal_key = [63u8; 32];
-    let mut core = PrivateTradingCore::new(
-        JournalKey::from_bytes(journal_key),
-        ReceiptSigner::generate([64u8; 48]),
-    );
+    let receipt_signer = ReceiptSigner::from_seed([64u8; 32], [64u8; 48]);
+    let mut core =
+        PrivateTradingCore::new(JournalKey::from_bytes(journal_key), receipt_signer.clone());
     let market_id = "layrs:v3:ZEN:15m:3000";
     core.register_market(
         "sys:market:partial".into(),
@@ -1534,7 +1534,7 @@ fn native_clob_partial_fill_locks_remainder_and_cancel_releases_once() {
     let snapshot_sequence = snapshot.sequence;
     let mut restored = PrivateTradingCore::restore_encrypted_snapshot(
         JournalKey::from_bytes(journal_key),
-        ReceiptSigner::generate([67u8; 48]),
+        receipt_signer,
         &snapshot,
         snapshot_sequence,
     )
@@ -2601,12 +2601,13 @@ fn polymarket_bootstrap_never_credits_an_unconfirmed_fill() {
 #[test]
 fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
     let user = SigningKey::from_bytes(&[31u8; 32]);
-    let receipt_signer = ReceiptSigner::generate([32u8; 48]);
+    let receipt_signer = ReceiptSigner::from_seed([32u8; 32], [32u8; 48]);
     let receipt_public_key = receipt_signer.verifying_key();
     let journal_key = [33u8; 32];
     let identity_commitment = [35u8; 32];
     let private_user = derived_private_user(journal_key, identity_commitment);
-    let mut core = PrivateTradingCore::new(JournalKey::from_bytes(journal_key), receipt_signer);
+    let mut core =
+        PrivateTradingCore::new(JournalKey::from_bytes(journal_key), receipt_signer.clone());
     core.register_session(
         "sys:session:withdrawal".into(),
         "session:withdrawal".into(),
@@ -2758,7 +2759,7 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
     let snapshot = core.export_encrypted_snapshot().unwrap();
     let mut restored = PrivateTradingCore::restore_encrypted_snapshot(
         JournalKey::from_bytes(journal_key),
-        ReceiptSigner::generate([32u8; 48]),
+        receipt_signer.clone(),
         &snapshot,
         0,
     )
@@ -2803,7 +2804,7 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
     let replaced_snapshot = restored.export_encrypted_snapshot().unwrap();
     let restarted_after_replacement = PrivateTradingCore::restore_encrypted_snapshot(
         JournalKey::from_bytes(journal_key),
-        ReceiptSigner::generate([32u8; 48]),
+        receipt_signer.clone(),
         &replaced_snapshot,
         0,
     )
@@ -2846,7 +2847,7 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
     let release_snapshot = core.export_encrypted_snapshot().unwrap();
     let mut release_restored = PrivateTradingCore::restore_encrypted_snapshot(
         JournalKey::from_bytes(journal_key),
-        ReceiptSigner::generate([32u8; 48]),
+        receipt_signer.clone(),
         &release_snapshot,
         0,
     )
@@ -2906,7 +2907,7 @@ fn portfolio_and_withdrawal_remain_signed_enclave_commands() {
     let confirmed_snapshot = core.export_encrypted_snapshot().unwrap();
     let mut confirmed_restored = PrivateTradingCore::restore_encrypted_snapshot(
         JournalKey::from_bytes(journal_key),
-        ReceiptSigner::generate([32u8; 48]),
+        receipt_signer,
         &confirmed_snapshot,
         0,
     )
@@ -3158,10 +3159,9 @@ fn private_user_transfer_is_registered_atomic_available_only_and_replay_safe() {
     let recipient_identity = [85u8; 32];
     let sender_private_user = derived_private_user(journal_key, sender_identity);
     let recipient_private_user = derived_private_user(journal_key, recipient_identity);
-    let mut core = PrivateTradingCore::new(
-        JournalKey::from_bytes(journal_key),
-        ReceiptSigner::generate([86u8; 48]),
-    );
+    let receipt_signer = ReceiptSigner::from_seed([86u8; 32], [86u8; 48]);
+    let mut core =
+        PrivateTradingCore::new(JournalKey::from_bytes(journal_key), receipt_signer.clone());
 
     core.register_session(
         "sys:session:transfer:sender".into(),
@@ -3398,7 +3398,7 @@ fn private_user_transfer_is_registered_atomic_available_only_and_replay_safe() {
     let snapshot = core.export_encrypted_snapshot().unwrap();
     let restored = PrivateTradingCore::restore_encrypted_snapshot(
         JournalKey::from_bytes(journal_key),
-        ReceiptSigner::generate([93u8; 48]),
+        receipt_signer,
         &snapshot,
         snapshot.sequence,
     )
@@ -3495,10 +3495,9 @@ fn private_rewards_accrue_cumulatively_and_authorize_only_the_bound_account() {
     let user = SigningKey::from_bytes(&[41u8; 32]);
     let journal_key = [42u8; 32];
     let identity_commitment = [43u8; 32];
-    let mut core = PrivateTradingCore::new(
-        JournalKey::from_bytes(journal_key),
-        ReceiptSigner::generate([44u8; 48]),
-    );
+    let receipt_signer = ReceiptSigner::from_seed([44u8; 32], [44u8; 48]);
+    let mut core =
+        PrivateTradingCore::new(JournalKey::from_bytes(journal_key), receipt_signer.clone());
     core.register_session(
         "sys:session:rewards".into(),
         "session:rewards".into(),
@@ -3635,7 +3634,7 @@ fn private_rewards_accrue_cumulatively_and_authorize_only_the_bound_account() {
     let snapshot = core.export_encrypted_snapshot().unwrap();
     let mut restored = PrivateTradingCore::restore_encrypted_snapshot(
         JournalKey::from_bytes(journal_key),
-        ReceiptSigner::generate([44u8; 48]),
+        receipt_signer,
         &snapshot,
         snapshot.sequence,
     )
@@ -4780,9 +4779,10 @@ fn api_position_close_previews_and_executes_exact_protected_payout_atomically() 
     let bob_commitment = [146u8; 32];
     let alice_owner = derived_private_user(journal_key, alice_commitment);
     let market_id = "layrs:v5:BTC:USDC:15m:2500";
+    let receipt_signer = ReceiptSigner::from_seed([147u8; 32], [147u8; 48]);
     let mut core = PrivateTradingCore::new_with_oracle(
         JournalKey::from_bytes(journal_key),
-        ReceiptSigner::generate([147u8; 48]),
+        receipt_signer.clone(),
         oracle.verifying_key().to_bytes(),
     )
     .unwrap();
@@ -5157,7 +5157,7 @@ fn api_position_close_previews_and_executes_exact_protected_payout_atomically() 
     ] {
         let mut expiry_core = PrivateTradingCore::restore_encrypted_snapshot(
             JournalKey::from_bytes(journal_key),
-            ReceiptSigner::generate([147u8; 48]),
+            receipt_signer.clone(),
             &pre_close_snapshot,
             pre_close_snapshot.sequence,
         )
@@ -5362,7 +5362,7 @@ fn api_position_close_previews_and_executes_exact_protected_payout_atomically() 
     let snapshot_sequence = snapshot.sequence;
     let mut restored = PrivateTradingCore::restore_encrypted_snapshot(
         JournalKey::from_bytes(journal_key),
-        ReceiptSigner::generate([147u8; 48]),
+        receipt_signer,
         &snapshot,
         snapshot_sequence,
     )

@@ -1,0 +1,160 @@
+{
+  "schema": "layrs.step7-final-pre-canary-evidence.v1",
+  "createdAt": "2026-09-12T17:26:13Z",
+  "step7Status": "COMPLETE",
+  "productionActivationStatus": "READY_FOR_FUNDED_CANARY",
+  "fundedCanaryExecuted": false,
+  "candidate": {
+    "sourceCommit": "40ca230d40799f0d45a488cf220d863699c0051a",
+    "ami": "ami-0a0c4d0e2608aa701",
+    "amiState": "available",
+    "eifSha256": "28c4f8ad242ebb5b0525961cc5994b6b6426c98dd48a39ae133e7cac476912c2",
+    "enclaveSha256": "130470d61d6d9f7a5e30b40e49ed2b3f6ae6adfd1da59ea3de433bdeb5114914",
+    "parentSha256": "49a530ecd8fd4423b827ed49176f6f76ed6674341dc5dfa42fb54f4d917d74d7",
+    "pcr0": "6e5b8a58f751dc7302bea45ffb30c19c964477f1d24bccb898afc25747d5cdf92077508c581057bbd167bc936c287724",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "01bc5c31debd74f1485639ef772d10c4bb2717e183884b5bf6e895d48e221f382f47c89ba602ed0b3e8986a2531a3548",
+    "openingStateSha256": "84835da82210671d87321a21246317d898afd35381c57be8522df1a516dc3590",
+    "openingEvidenceManifestSha256": "70e579f630c759258728d91cb957fa84e200674aeebd3eae5997430a62203957",
+    "runtimeIdentity": "layrs.direct-execution.nitro.v1",
+    "transactionModel": "layrs.direct-execution.v1"
+  },
+  "attestation": {
+    "postRestartDocumentSha256": "305675978e5d15f12fbe01e054f67c6423eb568876da6977068a438a259aa70d",
+    "awsNitroRootVerified": true,
+    "certificateChainVerified": true,
+    "signatureVerified": true,
+    "nonceAndBindingVerified": true,
+    "measurementsVerified": true,
+    "writerEnabled": false,
+    "admissionEnabled": false,
+    "genesisOrdinal": 0,
+    "identityCount": 438
+  },
+  "writerGrant": {
+    "activationId": "layrs-direct-40ca230-20260912",
+    "unsignedPayloadSha256": "f02913a91dc353a8cb6b89028aaf31372f48b1b2a60992e8cd5721895f76a34e",
+    "signedEnvelopeSha256": "d0b110965d7c4505a402673a2600261793974e35e4f55b2fe7003e4428cc9782",
+    "governanceAuthority": "alias/layrs/production/recovery-evidence-signing",
+    "algorithm": "ECDSA_SHA_256",
+    "signatureVerifiedByKms": true,
+    "exactCandidateBindingVerified": true,
+    "oldWriterFenceEvidenceSha256": "b991e41682d01c546e11c03bca79a8e141b4f6d892a3afb6a5a0fe6720182364",
+    "expiresAtUnix": 1789492554,
+    "installedToEnableWriter": false
+  },
+  "runtimeDeployment": {
+    "stack": "layrs-production-direct-execution-dormant",
+    "stackStatus": "UPDATE_COMPLETE",
+    "instance": "i-064cb3cc76a773051",
+    "instanceState": "running",
+    "runtimeTargetHealth": "healthy",
+    "writerTag": false,
+    "archiveBackend": "S3 Object Lock with KMS",
+    "archiveSuccessorArtifacts": 0
+  },
+  "bffDeployment": {
+    "sourceCommit": "1699cf9904fc18e93f9c54e858cf02338ff1daa2",
+    "stack": "layrs-production-direct-bff-readonly",
+    "stackStatus": "UPDATE_COMPLETE",
+    "ecsCluster": "layrs-production-services",
+    "ecsService": "layrs-production-direct-bff-readonly",
+    "taskDefinitionRevision": 11,
+    "desired": 1,
+    "running": 1,
+    "targetHealth": "healthy",
+    "imageDigest": "sha256:f3f0039877008399e562e06bf14f46bcaa2d2d32ba0dc0c98b63f4e6242ebf29",
+    "financialCommandRoutesPublished": false
+  },
+  "adoption": {
+    "marketingSourceCommit": "2472b6a",
+    "pageSha256": "c6f92c6ce021f19dc07ddd7a1a7078d71cb6b3ff3b7efbeb1ab21066be9f4aae",
+    "scriptSha256": "f66b9d3861a4cfdabc4a01c814966caac458f22eca055c27f4b5345ae7134e37",
+    "usesRealProjectionApi": true,
+    "mockOrStaticFallback": false,
+    "dependsOnGreen": false,
+    "dependsOnDurableCommands": false,
+    "identities": 438,
+    "authSubjects": 413,
+    "fundedIdentities": 322,
+    "walletMappings": 414,
+    "projectedUsdcLiabilityAtomic": "238747549"
+  },
+  "authenticatedPublicBalanceReads": {
+    "mm01": {
+      "account": "layrs-mm-01@predifi.com",
+      "httpStatus": 200,
+      "identityAndWalletBindingVerified": true,
+      "usdcBalanceAtomic": "160453499",
+      "projectionAndFrozenCensusMatch": true
+    },
+    "mm02": {
+      "account": "layrs-mm-02@predifi.com",
+      "httpStatus": 200,
+      "identityAndWalletBindingVerified": true,
+      "usdcBalanceAtomic": "9404611",
+      "projectionAndFrozenCensusMatch": true
+    }
+  },
+  "projectionReconciliation": {
+    "schema": "layrs_direct_v1",
+    "privateFinancialAuthority": false,
+    "historicToOpeningMismatches": 0,
+    "openingToProjectionMismatches": 0,
+    "preRestartExactMatch": true,
+    "postRestartExactMatch": true,
+    "machineEvidenceSha256": "0734c53b34f2d39187cdfa37af365c03057bbf1a9591c11a88c5ea1ade480c99"
+  },
+  "legacyWriterFence": {
+    "servicesChecked": 6,
+    "servicesDesiredRunning": "0/0 each",
+    "legacyPublicCommandIngressPublished": false,
+    "currentDirectWriterEnabled": false
+  },
+  "publicRouteSafety": {
+    "unauthenticatedBalanceStatus": 401,
+    "directCommandsStatus": 404,
+    "directAdmissionsStatus": 404,
+    "directDepositsStatus": 404,
+    "directWithdrawalsStatus": 404
+  },
+  "custody": {
+    "existingProductionReferencesReused": true,
+    "baseConfirmations": 20,
+    "readOnlyRpcAndSignerConfigurationPreflight": true,
+    "immutableExternalEffectIntentVerified": true,
+    "signOrSubmitAttempts": 0,
+    "fundsMoved": false
+  },
+  "alerting": {
+    "topic": "layrs-production-operational-alerts",
+    "confirmedRecipient": "layrs.support@predifi.com",
+    "controlledDeliveryObserved": true,
+    "acceptedNoncriticalAlarms": 19,
+    "acceptanceOwner": "Devendra Tanwar",
+    "acceptanceExpiresAt": "2026-09-15T10:30:00Z",
+    "activationCriticalRuntimeAlarm": "OK",
+    "activationCriticalRuntimeAlarmInstance": "i-064cb3cc76a773051"
+  },
+  "audits": {
+    "runtimeTestsPassed": 35,
+    "bffTestsPassed": 421,
+    "bffTypecheckPassed": true,
+    "marketingTestsPassed": 12,
+    "marketingValidationAndBuildPassed": true,
+    "durableCommandExecutableTermsInFinalParent": 0,
+    "durableCommandExecutableTermsInFinalEnclave": 0,
+    "replacementQueueLeaseCoordinatorDetected": false
+  },
+  "safety": {
+    "productionWriterEnabled": false,
+    "fundedCanaryExecuted": false,
+    "custodyTransactionSubmitted": false,
+    "customerFundsMoved": false,
+    "customerBalancesModified": false,
+    "newCustomerCreated": false,
+    "newWalletOrKeyCreated": false,
+    "greenTouched": false,
+    "sequence75594Touched": false
+  }
+}

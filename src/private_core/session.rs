@@ -53,6 +53,28 @@ impl SessionGuard {
         })
     }
 
+    /// Confirms the complete immutable registration tuple without advancing
+    /// session sequence state. This lets a coordinator recover after the
+    /// enclave committed REGISTER_SESSION but its response was lost.
+    pub(crate) fn registration_matches(
+        &self,
+        session_id: &str,
+        private_user_id: &str,
+        public_key: &[u8; 32],
+        expires_at_millis: i64,
+    ) -> (bool, bool) {
+        match self.registered.get(session_id) {
+            Some(session) => (
+                true,
+                session.private_user_id == private_user_id
+                    && &session.public_key == public_key
+                    && session.expires_at_millis == expires_at_millis
+                    && !session.revoked,
+            ),
+            None => (false, false),
+        }
+    }
+
     /// Removes sessions that can no longer authorize a command. This keeps the
     /// authenticated enclave state bounded by active sessions instead of every
     /// browser session ever issued.

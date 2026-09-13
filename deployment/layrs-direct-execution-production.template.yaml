@@ -1,0 +1,340 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Governed Layrs direct-execution Nitro runtime. Defaults dormant and writer-disabled.
+Parameters:
+  VpcId: { Type: AWS::EC2::VPC::Id }
+  PrivateSubnetId: { Type: AWS::EC2::Subnet::Id }
+  ReadOnlyLoadBalancerSubnetId: { Type: AWS::EC2::Subnet::Id }
+  BffSecurityGroupId: { Type: AWS::EC2::SecurityGroup::Id }
+  DatabaseSecurityGroupId: { Type: AWS::EC2::SecurityGroup::Id }
+  # No default: the governed deployment must explicitly supply an AMI that is
+  # registered in the target region and matches the signed grant's EIF/PCRs.
+  CandidateAmiId: { Type: AWS::EC2::Image::Id }
+  ArchiveBucketArn: { Type: String }
+  ArchiveBucketName: { Type: String }
+  ArchiveKmsKeyArn: { Type: String }
+  ArchivePrefix: { Type: String, AllowedPattern: '^[A-Za-z0-9!_.*''()/-]+$' }
+  ArchiveRetentionSeconds: { Type: Number, MinValue: 1 }
+  AlertTopicArn: { Type: String }
+  # These are references only.  No secret value is passed through
+  # CloudFormation, EC2 user data, instance tags, or logs.
+  RuntimeSecretArn: { Type: String }
+  DatabaseSecretArn: { Type: String }
+  DatabaseSecretKmsKeyArn: { Type: String }
+  DatabaseCaSecretArn: { Type: String }
+  DatabaseHost: { Type: String }
+  DatabaseName: { Type: String, Default: layrsv2 }
+  DatabasePort: { Type: Number, Default: 5432 }
+  RpcSecretArn: { Type: String }
+  OperationalIdentityKmsKeyArn: { Type: String }
+  ExecutionMode:
+    Type: String
+    Default: dormant
+    AllowedValues: [dormant, admission-enabled, production-enabled]
+  WriterGrantBase64:
+    Type: String
+    Default: ''
+    NoEcho: true
+  ApprovedRuntimeBindingBase64:
+    Type: String
+    Default: ''
+    NoEcho: true
+  WriterGrantCommitment: { Type: String, Default: '' }
+  ApprovedPcr0: { Type: String, Default: '' }
+  ApprovedPcr1: { Type: String, Default: '' }
+  ApprovedPcr2: { Type: String, Default: '' }
+  BasePoolAddress: { Type: String, AllowedPattern: '^0x[0-9a-fA-F]{40}$' }
+  BaseConfirmations: { Type: Number, MinValue: 1 }
+  # A dormant verifier may run to support attestation and health checks, but
+  # its process mode remains `dormant` and has no writer authority.
+  DormantRuntimeDesiredCapacity: { Type: Number, Default: 1, MinValue: 0, MaxValue: 1 }
+Conditions:
+  FinancialWriterEnabled: !Equals [!Ref ExecutionMode, production-enabled]
+Resources:
+  RuntimeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /layrs/direct-execution/runtime, RetentionInDays: 365 }
+  RuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: 'sts:AssumeRole' }]
+      Policies:
+        - PolicyName: direct-runtime-dormant-archive-only
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket, s3:GetBucketObjectLockConfiguration, s3:GetObjectRetention, s3:PutObjectRetention]
+                Resource: [!Ref ArchiveBucketArn, !Sub '${ArchiveBucketArn}/*']
+              - Effect: Allow
+                Action: [kms:Encrypt, kms:Decrypt, kms:GenerateDataKey, kms:DescribeKey]
+                Resource: !Ref ArchiveKmsKeyArn
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:DescribeKey]
+                Resource: !Ref DatabaseSecretKmsKeyArn
+              - Effect: Allow
+                Action: [kms:GenerateDataKey, kms:Decrypt]
+                Resource: !Ref OperationalIdentityKmsKeyArn
+                Condition:
+                  StringEquals:
+                    kms:RecipientAttestation:PCR0: !Ref ApprovedPcr0
+                    kms:RecipientAttestation:PCR1: !Ref ApprovedPcr1
+                    kms:RecipientAttestation:PCR2: !Ref ApprovedPcr2
+                    kms:EncryptionContext:layrs-runtime: layrs.direct-execution.v1
+                    kms:EncryptionContext:layrs-epoch: layrs-opening-epoch-20260911-941107537728c98b
+                    kms:EncryptionContext:layrs-writer-grant: !Ref WriterGrantCommitment
+              # A measured-runtime upgrade may rewrap the exact prior root-key
+              # ciphertext under the newly signed grant context. KMS performs
+              # this entirely inside the service; the parent cannot receive
+              # plaintext, change keys, or re-encrypt to another CMK.
+              - Effect: Allow
+                Action: [kms:ReEncryptFrom, kms:ReEncryptTo]
+                Resource: !Ref OperationalIdentityKmsKeyArn
+                Condition:
+                  Bool:
+                    kms:ReEncryptOnSameKey: 'true'
+              - Effect: Allow
+                Action: [kms:DescribeKey]
+                Resource: !Ref OperationalIdentityKmsKeyArn
+              # The existing RPC reference is encrypted by the established
+              # operational-identity CMK.  This separate Secrets Manager-only
+              # decrypt duty cannot release runtime key material directly and
+              # cannot satisfy the Recipient-gated writer-key statement above.
+              - Effect: Allow
+                Action: [kms:Decrypt]
+                Resource: !Ref OperationalIdentityKmsKeyArn
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
+              # The read-only runtime may retrieve only its existing Privy
+              # application configuration.  It cannot list,
+              # create, update, rotate, or delete Secrets Manager objects.
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: [!Ref RuntimeSecretArn, !Ref DatabaseSecretArn, !Ref DatabaseCaSecretArn, !Ref RpcSecretArn]
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt RuntimeLogGroup.Arn
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore]
+  RuntimeProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: { Roles: [!Ref RuntimeRole] }
+  RuntimeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Direct runtime accepts only BFF health and command traffic
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8443, ToPort: 8443, SourceSecurityGroupId: !Ref ReadOnlyLoadBalancerSecurityGroup }
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: !Ref DatabasePort, ToPort: !Ref DatabasePort, DestinationSecurityGroupId: !Ref DatabaseSecurityGroupId }
+  RuntimeToProjectionIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroupId
+      IpProtocol: tcp
+      FromPort: !Ref DatabasePort
+      ToPort: !Ref DatabasePort
+      SourceSecurityGroupId: !Ref RuntimeSecurityGroup
+      Description: Attested direct runtime signed projection only
+  ReadOnlyLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Direct runtime read-only NLB accepts only the dedicated BFF
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8443, ToPort: 8443, SourceSecurityGroupId: !Ref BffSecurityGroupId }
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 8443, ToPort: 8443, CidrIp: 0.0.0.0/0 }
+  DormantLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref CandidateAmiId
+        InstanceType: m6i.xlarge
+        IamInstanceProfile: { Arn: !GetAtt RuntimeProfile.Arn }
+        SecurityGroupIds: [!Ref RuntimeSecurityGroup]
+        EnclaveOptions: { Enabled: true }
+        MetadataOptions: { HttpTokens: required, HttpEndpoint: enabled }
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # The process obtains secret values only in memory and writes a
+            # root-only EnvironmentFile.  It never emits a value to stdout,
+            # stderr, CloudFormation, EC2 metadata, or a tag.
+            set -euo pipefail
+            install -d -m 0700 /etc/layrs-opening
+            /usr/bin/python3 - <<'PY'
+            import json
+            import base64
+            import hashlib
+            import os
+            import subprocess
+            import tempfile
+            from urllib.parse import quote
+
+            def secret(secret_arn):
+                raw = subprocess.check_output(
+                    ["aws", "secretsmanager", "get-secret-value", "--region", "${AWS::Region}",
+                     "--secret-id", secret_arn, "--query", "SecretString", "--output", "text"],
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                )
+                value = json.loads(raw)
+                if not isinstance(value, dict):
+                    raise RuntimeError("secret object required")
+                return value
+
+            def required(value, key):
+                item = value.get(key)
+                if not isinstance(item, str) or not item:
+                    raise RuntimeError("required runtime secret field unavailable")
+                return item
+
+            runtime = secret("${RuntimeSecretArn}")
+            database = secret("${DatabaseSecretArn}")
+            database_ca = secret("${DatabaseCaSecretArn}")
+            rpc = secret("${RpcSecretArn}")
+            database_url = "postgresql://{}:{}@{}:{}/{}?sslmode=require".format(
+                quote(required(database, "username"), safe=""),
+                quote(required(database, "password"), safe=""),
+                "${DatabaseHost}",
+                "${DatabasePort}",
+                quote("${DatabaseName}", safe=""),
+            )
+            values = {
+                "LAYRS_DIRECT_EXECUTION_MODE": "${ExecutionMode}",
+                # This guarded VPC listener serves only signed, encrypted
+                # balance reads from the dedicated BFF.  The enclave remains
+                # dormant and the parent rejects every financial command.
+                "LAYRS_DIRECT_BIND_ADDRESS": "0.0.0.0",
+                "LAYRS_DIRECT_READ_ONLY_VPC_BIND": "true",
+                "LAYRS_DIRECT_ARCHIVE_BACKEND": "s3-object-lock",
+                "LAYRS_DIRECT_ARCHIVE_BUCKET": "${ArchiveBucketName}",
+                "LAYRS_DIRECT_ARCHIVE_PREFIX": "${ArchivePrefix}",
+                "LAYRS_DIRECT_ARCHIVE_KMS_KEY_ID": "${ArchiveKmsKeyArn}",
+                "LAYRS_DIRECT_ARCHIVE_RETENTION_SECONDS": "${ArchiveRetentionSeconds}",
+                "LAYRSV2_PRIVY_APP_ID": required(runtime, "privyAppId"),
+                "LAYRSV2_PRIVY_APP_SECRET": required(runtime, "privyAppSecret"),
+                "LAYRS_DIRECT_PROJECTION_DATABASE_URL": database_url,
+                "LAYRS_DIRECT_PROJECTION_DATABASE_CA_PEM": required(database_ca, "databaseCaPem"),
+                "LAYRS_DIRECT_KEY_RELEASE_KMS_KEY_ID": "${OperationalIdentityKmsKeyArn}",
+                "LAYRS_DIRECT_COMMIT_ACK_KEY_HEX": hashlib.sha256(
+                    b"layrs.direct-execution.durability-ack.v1\\0" +
+                    required(runtime, "receiptShareHmacSecret").encode("utf-8")
+                ).hexdigest(),
+            }
+            if "${ExecutionMode}" in ("admission-enabled", "production-enabled"):
+                # CloudFormation callers commonly construct these values from
+                # line-oriented JSON tools.  Remove only trailing record
+                # delimiters before writing the systemd EnvironmentFile;
+                # otherwise systemd preserves them as literal ``\\n`` bytes
+                # and serde_json correctly rejects the grant as extra data.
+                writer_grant = base64.b64decode("${WriterGrantBase64}", validate=True).decode("utf-8").rstrip("\r\n")
+                runtime_binding = base64.b64decode("${ApprovedRuntimeBindingBase64}", validate=True).decode("utf-8").rstrip("\r\n")
+                json.loads(writer_grant)
+                json.loads(runtime_binding)
+                values.update({
+                    "LAYRS_DIRECT_WRITER_GRANT_JSON": writer_grant,
+                    "LAYRS_DIRECT_APPROVED_RUNTIME_BINDING_JSON": runtime_binding,
+                })
+            if "${ExecutionMode}" == "production-enabled":
+                values.update({
+                    "LAYRS_DIRECT_CUSTODY_PROVIDER": "privy-base-existing-pool-ledger",
+                    "LAYRSV2_BASE_POOL_LEDGER_PRIVY_ADDRESS": required(runtime, "basePoolLedgerPrivyAddress"),
+                    "LAYRSV2_BASE_POOL_LEDGER_PRIVY_WALLET_ID": required(runtime, "basePoolLedgerPrivyWalletId"),
+                    "LAYRSV2_BASE_POOL_LEDGER_PRIVY_AUTH_PRIVATE_KEY_PEM": required(runtime, "basePoolLedgerPrivyAuthPrivateKeyPem"),
+                    "LAYRSV2_BASE_POOL_ADDRESS": "${BasePoolAddress}",
+                    "LAYRSV2_BASE_RPC_URL": required(rpc, "baseRpcUrl"),
+                    "LAYRSV2_BASE_CONFIRMATIONS": "${BaseConfirmations}",
+                })
+            def quote(value):
+                # systemd EnvironmentFile consumes one shell-like escaping
+                # layer.  Escape each literal backslash exactly once and each
+                # double quote exactly once; double-escaping leaves JSON as
+                # {\"key\":...} in the service environment and makes the
+                # governed grant/binding fail closed during bootstrap.
+                return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n') + '"'
+            fd, temporary = tempfile.mkstemp(prefix="direct-runtime.", dir="/etc/layrs-opening")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as out:
+                    for key, value in values.items():
+                        out.write(key + "=" + quote(value) + "\n")
+                    out.flush()
+                    os.fsync(out.fileno())
+                os.chmod(temporary, 0o600)
+                os.replace(temporary, "/etc/layrs-opening/direct-runtime.env")
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+            PY
+            systemctl restart layrs-opening-enclave.service
+            systemctl restart layrs-opening-parent.service
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{ Key: Project, Value: Layrs }, { Key: Environment, Value: production-direct }, { Key: WriterEnabled, Value: !If [FinancialWriterEnabled, 'true', 'false'] }, { Key: TransactionModel, Value: layrs.direct-execution.v1 }, { Key: CandidateAmiId, Value: !Ref CandidateAmiId }]
+  DormantAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 0
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        WaitOnResourceSignals: false
+    Properties:
+      VPCZoneIdentifier: [!Ref PrivateSubnetId]
+      LaunchTemplate: { LaunchTemplateId: !Ref DormantLaunchTemplate, Version: !GetAtt DormantLaunchTemplate.LatestVersionNumber }
+      MinSize: '0'
+      MaxSize: '1'
+      DesiredCapacity: !Ref DormantRuntimeDesiredCapacity
+      TargetGroupARNs: [!Ref ReadOnlyRuntimeTargetGroup]
+      Tags: [{ Key: WriterEnabled, Value: !If [FinancialWriterEnabled, 'true', 'false'], PropagateAtLaunch: true }]
+  ReadOnlyRuntimeLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: layrs-direct-readonly
+      Scheme: internal
+      Type: network
+      IpAddressType: ipv4
+      SecurityGroups: [!Ref ReadOnlyLoadBalancerSecurityGroup]
+      Subnets: [!Ref PrivateSubnetId, !Ref ReadOnlyLoadBalancerSubnetId]
+  ReadOnlyRuntimeTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: layrs-direct-readonly
+      VpcId: !Ref VpcId
+      TargetType: instance
+      Protocol: TCP
+      Port: 8443
+      HealthCheckProtocol: TCP
+      HealthCheckPort: '8443'
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 3
+  ReadOnlyRuntimeListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ReadOnlyRuntimeLoadBalancer
+      Protocol: TCP
+      Port: 8443
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref ReadOnlyRuntimeTargetGroup }]
+  RuntimeHealthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: layrs-production-direct-runtime-health-missing
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlertTopicArn]
+Outputs:
+  ReadOnlyRuntimeEndpoint:
+    Description: Private, encrypted balance-read endpoint for the dedicated BFF.
+    Value: !Sub 'http://${ReadOnlyRuntimeLoadBalancer.DNSName}:8443'
+  ReadOnlyRuntimeTargetGroupArn:
+    Value: !Ref ReadOnlyRuntimeTargetGroup

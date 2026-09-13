@@ -1,0 +1,136 @@
+{
+  "schema": "layrs.pre-canary-historical-reconciliation.v1",
+  "createdAt": "2026-09-12T17:20:01Z",
+  "status": "VERIFIED_NO_UNEXPLAINED_VARIANCE",
+  "scope": "Account-by-account preservation from the frozen post-P0-3 census through the sealed opening epoch and the live writer-disabled direct projection.",
+  "sources": {
+    "postP03CensusSha256": "cfbe19d87b214943ca95c2b535b0c89316755bf822b797e703d568743454d243",
+    "postP03EvidenceSha256": "941107537728c98b85c3b23a90d8380921ce8270841a0a05c94312e8b80c4084",
+    "cutoverManifestSha256": "6e1bc7f0832ed2e4548b9406625b18abae27c63b04d04018d957ab66e5944201",
+    "openingStateSha256": "84835da82210671d87321a21246317d898afd35381c57be8522df1a516dc3590",
+    "perAccountEqualitySha256": "9378a76aa9eff35e8019a0980ffacd0530ec8b74510952f31d5947eb54347e65",
+    "aggregateEqualitySha256": "00e8af4e6c36ab53b9beaa23d76c5ab4af2551b7d49fa509671efd74d136b796",
+    "identityPrivyEqualitySha256": "820c03365a913883f0974e389b5c245bab4922474b9d6a56cdcd3cdbb88d9708",
+    "independentOpeningVerificationSha256": "4e94d95511f01b836fb1812e9538c6f0e7a65fb572bdb921a198df0e8d05e660"
+  },
+  "finalCandidate": {
+    "sourceCommit": "40ca230d40799f0d45a488cf220d863699c0051a",
+    "ami": "ami-0a0c4d0e2608aa701",
+    "instance": "i-064cb3cc76a773051",
+    "eifSha256": "28c4f8ad242ebb5b0525961cc5994b6b6426c98dd48a39ae133e7cac476912c2",
+    "enclaveSha256": "130470d61d6d9f7a5e30b40e49ed2b3f6ae6adfd1da59ea3de433bdeb5114914",
+    "parentSha256": "49a530ecd8fd4423b827ed49176f6f76ed6674341dc5dfa42fb54f4d917d74d7",
+    "packerTemplateSha256": "6e4238614ba6f26a87ff794c49ffd5c65b4527e8b2907c166d0c13c38a78a682",
+    "pcr0": "6e5b8a58f751dc7302bea45ffb30c19c964477f1d24bccb898afc25747d5cdf92077508c581057bbd167bc936c287724",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "01bc5c31debd74f1485639ef772d10c4bb2717e183884b5bf6e895d48e221f382f47c89ba602ed0b3e8986a2531a3548",
+    "runtimeIdentity": "layrs.direct-execution.nitro.v1",
+    "transactionModel": "layrs.direct-execution.v1",
+    "writerEnabled": false,
+    "admissionEnabled": false
+  },
+  "accountReconciliation": {
+    "historicToOpening": {
+      "accountsCompared": 438,
+      "bucketIdentical": 437,
+      "approvedTransformOnly": 1,
+      "missingAccounts": [],
+      "unexpectedAccounts": [],
+      "unexplainedMismatches": []
+    },
+    "openingToProjection": {
+      "identitiesCompared": 438,
+      "balanceRowsCompared": 322,
+      "walletMappingsCompared": 414,
+      "missingIdentities": [],
+      "unexpectedIdentities": [],
+      "balanceMismatches": [],
+      "walletMismatches": [],
+      "identityCanonicalDigestSha256": "db3a27a44eb5a297df6b63e1938dfd8d5dd757609dac47a0866f1661978a14d6",
+      "balanceCanonicalDigestSha256": "77f1f0f79bae5c6a1c686e16d869a0c0a28e0e51a9013bc0aa0cef300c6b710e",
+      "walletCanonicalDigestSha256": "0f6a5068f689f99f54a4afe24982ca975e1b4b5fbc968f7b38016f16c6e63e16",
+      "preRestartVerificationCommand": "ffd30789-4ff0-4d37-967b-174c9bb2d445",
+      "restartCommand": "0f86592f-0c3f-49bc-bb69-a50ce3cc2bc9",
+      "postRestartVerificationCommand": "c5988fdd-a044-4c6c-b7b4-80a645f41b5f"
+    }
+  },
+  "approvedOpeningTransform": {
+    "identityCommitment": "ecefd0c2c92887812ee1f53c38ddf61483900c5d734ee2f4ddfbcc3becea8c6a",
+    "authSubjectHash": "cffdcb64ba7d34e7ee6d523c8d0e3281827ad94d160975df770192dc08a1fcd8",
+    "classification": "GOVERNED_OPENING_BUCKET_RECLASSIFICATION",
+    "beforeAvailableUsdcAtomic": "3306",
+    "beforeWithdrawalHoldUsdcAtomic": "4840000",
+    "afterAvailableUsdcAtomic": "4843306",
+    "afterWithdrawalHoldUsdcAtomic": "0",
+    "totalLiabilityChanged": false
+  },
+  "aggregateState": {
+    "identities": 438,
+    "authSubjects": 413,
+    "balanceRows": 322,
+    "zeroBalanceIdentities": 116,
+    "validEmbeddedEvmWalletMappings": 414,
+    "openingWalletObjects": 416,
+    "usdcLiabilityAtomic": "238747549",
+    "zenLiabilityAtomic": "3000000000000000000",
+    "offTeeCustomerObligationsAtomic": "40761",
+    "baseControlledCustodyAtomic": "263212620",
+    "baseClassifiedObligationsAtomic": "238788310",
+    "baseUnclassifiedCustodyAtomic": "24424310",
+    "economicallyOpenPositions": 0,
+    "economicallyOpenOrders": 0,
+    "nonterminalWithdrawals": 0,
+    "p01UsdcLiabilityAtomic": "5000000",
+    "p02UsdcLiabilityAtomic": "5100000",
+    "p03OutstandingLiabilityAtomic": "0"
+  },
+  "publicAuthenticatedReads": [
+    {
+      "account": "layrs-mm-01@predifi.com",
+      "identityBindingMatchedFrozenCensus": true,
+      "httpStatus": 200,
+      "usdcBalanceAtomic": "160453499",
+      "frozenCensusUsdcBalanceAtomic": "160453499",
+      "exactMatch": true,
+      "encryptedResponseSha256": "a82caaf4c8452f0c12d133031c9afa1f595fcf5a5ae26784a49d0bfc05b1238e",
+      "decryptedResponseSha256": "7bccd96f7427544000e07be5d7f0e4c1148f3a6235f86da4214de64ed5ea2998"
+    },
+    {
+      "account": "layrs-mm-02@predifi.com",
+      "identityBindingMatchedFrozenCensus": true,
+      "httpStatus": 200,
+      "usdcBalanceAtomic": "9404611",
+      "frozenCensusUsdcBalanceAtomic": "9404611",
+      "exactMatch": true,
+      "encryptedResponseSha256": "eccac9a75a645b10483cf6c289b2e1420e2200f8f808525aa54005b0f1dc8693",
+      "decryptedResponseSha256": "7e816ec8ee3bcfc25723e3f8828d0d3902891f0b9b1d66273d4feb0e4a319e58"
+    }
+  ],
+  "attestation": {
+    "postRestartCommand": "c72cd859-df5a-4eb2-b8e5-3378b8638adf",
+    "documentSha256": "305675978e5d15f12fbe01e054f67c6423eb568876da6977068a438a259aa70d",
+    "certificateChainVerified": true,
+    "signatureVerified": true,
+    "nonceVerified": true,
+    "pcrsVerified": true,
+    "openingStateVerified": true,
+    "evidenceManifestVerified": true,
+    "genesisOrdinal": 0,
+    "identityCount": 438
+  },
+  "projection": {
+    "schema": "layrs_direct_v1",
+    "authoritativeForPrivateFinancialState": false,
+    "restartEquality": true
+  },
+  "controls": {
+    "customerBalancesModified": false,
+    "customerFundsMoved": false,
+    "custodyCalled": false,
+    "writerEnabled": false,
+    "fundedCanaryExecuted": false,
+    "newCustomerCreated": false,
+    "greenTouched": false,
+    "sequence75594Touched": false
+  }
+}

@@ -1,0 +1,84 @@
+{
+  "schema": "layrs.funded-canary.privy-role-correction.v1",
+  "generatedAt": "2026-09-13T02:23:03Z",
+  "status": "PAUSED_FAIL_CLOSED",
+  "correctedInvariant": "Privy is authentication only and is not a normal deposit or withdrawal wallet rail.",
+  "provenance": {
+    "legacyPrivyPrimaryWalletCommit": "421eea6eb7997ff072a7f323720a6250d1e7babf",
+    "legacyPrivyPrimaryWalletIntroducedAt": "2026-07-23T05:27:13+05:30",
+    "directSessionWalletBindingCommit": "6c7ead3ea6edcf78a309ab4ed5d866ba2c1c21bd",
+    "directWithdrawalWalletBindingCommit": "d6202ae81990128ac60e9323dcb0c8d9576eda92",
+    "directDepositWalletBindingCommit": "1cd1d8c17dc3262b61ee76c56446403176d2a6d6",
+    "correctionRollbackCommit": "aaad820c1f6ae4533d701b44ae67015a161072ed"
+  },
+  "externalEffects": [
+    {
+      "purpose": "ERRONEOUS_MM02_PRIVATE_WITHDRAWAL_TO_AUTH_ONLY_PRIVY_WALLET",
+      "transactionHash": "0x8d2b8605e915fb11bcb6421b2c7077186c7d6cbf7cb75a6c224067bac7906ad7",
+      "blockNumber": 51232996,
+      "status": "FINALIZED_SUCCESS",
+      "asset": "USDC",
+      "amountAtomic": "5000000",
+      "from": "0xb07627b0D646F5c82C8E30975a37650Dc272a35f",
+      "to": "0xB69ac21b8a96234A09Ba6c7644F1c2b106FD4A01",
+      "privateEffect": "MM02_AVAILABLE_DEBITED_5000000"
+    },
+    {
+      "purpose": "MM02_TO_MM20_WALLET_TRANSFER",
+      "transactionHash": "0xaffae9b929976ebe3f0a6bf7556fcfa1c6f04767d6269612bfa05177e5ed7340",
+      "blockNumber": 51237383,
+      "status": "FINALIZED_SUCCESS",
+      "asset": "USDC",
+      "amountAtomic": "5000000",
+      "from": "0xB69ac21b8a96234A09Ba6c7644F1c2b106FD4A01",
+      "to": "0xd5d8f363b2122C1fcedAFF313990b049Fbd11E61"
+    },
+    {
+      "purpose": "MM20_WALLET_TO_POOL_TRANSFER",
+      "transactionHash": "0x74f9f8d77384c7cb79e1c2a99578ec154cbf2e4163826b7560387512c40dda0b",
+      "blockNumber": 51237435,
+      "status": "FINALIZED_SUCCESS",
+      "asset": "USDC",
+      "amountAtomic": "5000000",
+      "from": "0xd5d8f363b2122C1fcedAFF313990b049Fbd11E61",
+      "to": "0xb07627b0D646F5c82C8E30975a37650Dc272a35f",
+      "poolBalanceBeforeAtomic": "253171859",
+      "poolBalanceAfterAtomic": "258171859"
+    }
+  ],
+  "privateState": {
+    "mm02AvailableUsdcAtomic": "4404611",
+    "mm20AvailableUsdcAtomic": "0",
+    "failedDepositReceiptCount": 0,
+    "failedDepositAccountingEventCount": 0,
+    "failedDepositCustodyEventCount": 0,
+    "requiredReconciliation": "Restore MM02's 5000000-atomic liability through a governed auditable recovery; do not manually edit a balance."
+  },
+  "economicReconciliation": {
+    "canaryPoolOutflowAtomic": "5000000",
+    "canaryPoolReturnAtomic": "5000000",
+    "canaryNetCustodyChangeAtomic": "0",
+    "requiredPrivateLiabilityRestorationAtomic": "5000000",
+    "unrelatedInterveningPoolOutflowAtomic": "5000000",
+    "unrelatedInterveningPoolOutflowTreatment": "EXCLUDED_FROM_CANARY_AND_REQUIRES_SEPARATE_ATTRIBUTION"
+  },
+  "archiveCounts": {
+    "artifacts": 2,
+    "authorization": 6,
+    "externalEffectIntents": 2,
+    "externalEffectIdempotencyRecoveries": 1,
+    "heads": 2
+  },
+  "writerSafety": {
+    "oldWriterAuthorized": false,
+    "targetWriterEnabled": false,
+    "runtimeDesiredCapacity": 0,
+    "runtimeInServiceInstances": 0
+  },
+  "abortedBuildCleanup": {
+    "deregisteredAmi": "ami-0e19a8c17162d09f8",
+    "deletedSnapshot": "snap-0b6bebf87cf717744",
+    "deployed": false
+  },
+  "nextRequiredDecision": "Select and authorize the existing non-Privy deposit source and withdrawal destination binding model before any further funded-canary mutation."
+}

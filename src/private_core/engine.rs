@@ -3751,6 +3751,75 @@ mod direct_execution_contract_tests {
         ));
     }
 
+    #[test]
+    fn session_registration_returns_the_original_result_after_retry_and_restart() {
+        use ed25519_dalek::SigningKey;
+
+        let now = 1_800_000_000_000i64;
+        let journal_key = JournalKey::from_bytes([0xb1; 32]);
+        let signer = ReceiptSigner::from_seed([0xb2; 32], [0xb3; 48]);
+        let identity = [0xb4; 32];
+        let public_key = SigningKey::from_bytes(&[0xb5; 32])
+            .verifying_key()
+            .to_bytes();
+        let mut core = PrivateTradingCore::new(journal_key.clone(), signer.clone());
+        let first = core
+            .register_session(
+                "session:crash-recovery".into(),
+                "session_crash_recovery_exact".into(),
+                identity,
+                public_key,
+                now + 60_000,
+                now,
+            )
+            .unwrap();
+        let sequence = core.sequence;
+        let retry = core
+            .register_session(
+                "session:crash-recovery".into(),
+                "session_crash_recovery_exact".into(),
+                identity,
+                public_key,
+                now + 60_000,
+                now,
+            )
+            .unwrap();
+        assert_eq!(retry, first);
+        assert_eq!(core.sequence, sequence);
+        assert!(matches!(
+            core.register_session(
+                "session:crash-recovery".into(),
+                "session_crash_recovery_exact".into(),
+                identity,
+                public_key,
+                now + 60_000,
+                now + 1,
+            ),
+            Err(CoreError::DuplicateCommand)
+        ));
+
+        let snapshot = core.export_encrypted_snapshot().unwrap();
+        let mut restored = PrivateTradingCore::restore_encrypted_snapshot(
+            journal_key,
+            signer,
+            &snapshot,
+            sequence,
+        )
+        .unwrap();
+        let recovered = restored
+            .register_session(
+                "session:crash-recovery".into(),
+                "session_crash_recovery_exact".into(),
+                identity,
+                public_key,
+                now + 60_000,
+                now,
+            )
+            .unwrap();
+        assert_eq!(recovered, first);
+        assert_eq!(restored.sequence, sequence);
+    }
+
     #[cfg(feature = "green-pool-certification")]
     #[test]
     fn green_native_refund_completion_is_rooted_and_restart_safe() {
@@ -5033,6 +5102,17 @@ pub struct GreenNativeRefundTerminalTransaction {
     pub raw_transaction_hex: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionRegistrationResult {
+    session_id: String,
+    identity_commitment: [u8; 32],
+    public_key: [u8; 32],
+    expires_at_millis: i64,
+    now_millis: i64,
+    response: SystemResponse,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CoreStateSnapshot {
     #[serde(deserialize_with = "Ledger::deserialize_snapshot_compatible")]
@@ -5048,6 +5128,11 @@ struct CoreStateSnapshot {
     recovery_capsules: BTreeMap<String, RecoveryCapsule>,
     #[serde(default, skip_serializing_if = "DirectFinalResultIndex::is_empty")]
     direct_final_results: DirectFinalResultIndex,
+    /// Exact active-session registration responses retained only until their
+    /// session expiry. They close the commit/response crash window without
+    /// retaining an unbounded history in the enclave snapshot.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    session_registration_results: BTreeMap<String, SessionRegistrationResult>,
     system_keys: BTreeSet<String>,
     position_cost_basis: Vec<(PositionKey, u128)>,
     resolutions: BTreeMap<String, MarketResolution>,
@@ -5248,6 +5333,7 @@ pub struct PrivateTradingCore {
     processed: BTreeMap<String, ProcessedCommand>,
     recovery_capsules: BTreeMap<String, RecoveryCapsule>,
     direct_final_results: DirectFinalResultIndex,
+    session_registration_results: BTreeMap<String, SessionRegistrationResult>,
     system_keys: BTreeSet<String>,
     journal: EncryptedJournal,
     receipt_signer: ReceiptSigner,
@@ -5273,6 +5359,7 @@ impl PrivateTradingCore {
             processed: BTreeMap::new(),
             recovery_capsules: BTreeMap::new(),
             direct_final_results: DirectFinalResultIndex::default(),
+            session_registration_results: BTreeMap::new(),
             system_keys: BTreeSet::new(),
             journal: EncryptedJournal::new(journal_key),
             receipt_signer,
@@ -6782,6 +6869,7 @@ impl PrivateTradingCore {
                 processed_hashes: processed_hashes(&self.processed),
                 recovery_capsules: self.recovery_capsules.clone(),
                 direct_final_results: self.direct_final_results.clone(),
+                session_registration_results: self.session_registration_results.clone(),
                 system_keys: self.system_keys.clone(),
                 position_cost_basis: self
                     .position_cost_basis
@@ -6812,6 +6900,7 @@ impl PrivateTradingCore {
             processed_hashes: processed_hashes(&self.processed),
             recovery_capsules: self.recovery_capsules.clone(),
             direct_final_results: self.direct_final_results.clone(),
+            session_registration_results: self.session_registration_results.clone(),
             system_keys: self.system_keys.clone(),
             position_cost_basis: self
                 .position_cost_basis
@@ -6861,6 +6950,7 @@ impl PrivateTradingCore {
             processed_hashes: processed_hashes(&self.processed),
             recovery_capsules: self.recovery_capsules.clone(),
             direct_final_results: self.direct_final_results.clone(),
+            session_registration_results: self.session_registration_results.clone(),
             system_keys: self.system_keys.clone(),
             position_cost_basis: self
                 .position_cost_basis
@@ -6915,6 +7005,7 @@ impl PrivateTradingCore {
             processed_hashes: processed_hashes(&self.processed),
             recovery_capsules: self.recovery_capsules.clone(),
             direct_final_results: self.direct_final_results.clone(),
+            session_registration_results: self.session_registration_results.clone(),
             system_keys: self.system_keys.clone(),
             position_cost_basis: self
                 .position_cost_basis
@@ -7087,6 +7178,13 @@ impl PrivateTradingCore {
             .direct_final_results
             .validate_direct_withdrawal_records(receipt_signer.verifying_key(), &state.system_keys)
             .map_err(|_| CoreError::JournalChainMismatch)?;
+        validate_session_registration_results(
+            &state.session_registration_results,
+            &state.sessions,
+            &state.system_keys,
+            receipt_signer.verifying_key(),
+            &identity_key,
+        )?;
         let processed: BTreeMap<String, ProcessedCommand> = state
             .processed_hashes
             .into_iter()
@@ -7165,6 +7263,7 @@ impl PrivateTradingCore {
             processed,
             recovery_capsules: state.recovery_capsules,
             direct_final_results: state.direct_final_results,
+            session_registration_results: state.session_registration_results,
             system_keys: state.system_keys,
             journal,
             receipt_signer,
@@ -7389,6 +7488,13 @@ impl PrivateTradingCore {
                 &state.system_keys,
             )
             .map_err(|_| CoreError::JournalChainMismatch)?;
+        validate_session_registration_results(
+            &state.session_registration_results,
+            &state.sessions,
+            &state.system_keys,
+            self.receipt_signer.verifying_key(),
+            &self.identity_key,
+        )?;
         let processed: BTreeMap<String, ProcessedCommand> = state
             .processed_hashes
             .into_iter()
@@ -7433,6 +7539,7 @@ impl PrivateTradingCore {
             processed,
             recovery_capsules: state.recovery_capsules,
             direct_final_results: state.direct_final_results,
+            session_registration_results: state.session_registration_results,
             system_keys: state.system_keys,
             journal,
             receipt_signer: self.receipt_signer.clone(),
@@ -8149,6 +8256,17 @@ impl PrivateTradingCore {
         expires_at_millis: i64,
         now_millis: i64,
     ) -> CoreResult<SystemResponse> {
+        if let Some(stored) = self.session_registration_results.get(&idempotency_key) {
+            if stored.session_id == session_id
+                && stored.identity_commitment == identity_commitment
+                && stored.public_key == public_key
+                && stored.expires_at_millis == expires_at_millis
+                && stored.now_millis == now_millis
+            {
+                return Ok(stored.response.clone());
+            }
+            return Err(CoreError::DuplicateCommand);
+        }
         self.validate_new_system_key(&idempotency_key)?;
         let prior_root = self.state_root();
         let mut sessions = self.sessions.clone();
@@ -8163,6 +8281,14 @@ impl PrivateTradingCore {
         )?;
         let mut keys = self.system_keys.clone();
         keys.insert(idempotency_key.clone());
+        keys.insert(session_registration_result_marker(
+            &idempotency_key,
+            &session_id,
+            identity_commitment,
+            public_key,
+            expires_at_millis,
+            now_millis,
+        ));
         let next_sequence = checked_sequence(self.sequence)?;
         let next_root = state_root(
             &self.ledger,
@@ -8181,7 +8307,7 @@ impl PrivateTradingCore {
         );
         let entry = JournaledSystemCommand::RegisterSession {
             idempotency_key: idempotency_key.clone(),
-            session_id,
+            session_id: session_id.clone(),
             identity_commitment,
             public_key,
             expires_at_millis,
@@ -8195,7 +8321,7 @@ impl PrivateTradingCore {
         self.sequence = next_sequence;
         let receipt = self.receipt_signer.sign(
             "register-session".into(),
-            idempotency_key,
+            idempotency_key.clone(),
             Some(command_commitment),
             Some(true),
             Some(system_result_commitment(
@@ -8210,14 +8336,46 @@ impl PrivateTradingCore {
             record.record_hash,
             now_millis,
         );
-        Ok(SystemResponse {
+        let response = SystemResponse {
             receipt,
             encrypted_record: record,
             audit_fills: Vec::new(),
             evidence_commitment: Some(registration_evidence.commitment),
             registration_evidence: Some(registration_evidence),
             transfer_account: None,
-        })
+        };
+        self.session_registration_results
+            .retain(|_, stored| stored.expires_at_millis > now_millis);
+        self.session_registration_results.insert(
+            idempotency_key,
+            SessionRegistrationResult {
+                session_id,
+                identity_commitment,
+                public_key,
+                expires_at_millis,
+                now_millis,
+                response: response.clone(),
+            },
+        );
+        Ok(response)
+    }
+
+    /// Read-only recovery probe for the exact tuple persisted by the
+    /// coordinator before REGISTER_SESSION is dispatched.
+    pub fn session_registration_status(
+        &self,
+        session_id: &str,
+        identity_commitment: [u8; 32],
+        public_key: [u8; 32],
+        expires_at_millis: i64,
+    ) -> (bool, bool) {
+        let private_user_id = derive_private_user_id(&self.identity_key, &identity_commitment);
+        self.sessions.registration_matches(
+            session_id,
+            &private_user_id,
+            &public_key,
+            expires_at_millis,
+        )
     }
 
     /// Registers an opaque, stable receive handle for an enclave-local user.
@@ -11695,6 +11853,95 @@ fn registration_evidence(
         commitment: commitment.finalize().into(),
         nullifier: nullifier.finalize().into(),
     }
+}
+
+fn session_registration_result_marker(
+    idempotency_key: &str,
+    session_id: &str,
+    identity_commitment: [u8; 32],
+    public_key: [u8; 32],
+    expires_at_millis: i64,
+    now_millis: i64,
+) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.session-registration-result.v1\0");
+    hash.update((idempotency_key.len() as u32).to_be_bytes());
+    hash.update(idempotency_key.as_bytes());
+    hash.update((session_id.len() as u32).to_be_bytes());
+    hash.update(session_id.as_bytes());
+    hash.update(identity_commitment);
+    hash.update(public_key);
+    hash.update(expires_at_millis.to_be_bytes());
+    hash.update(now_millis.to_be_bytes());
+    format!(
+        "session-registration-result:v1:{}",
+        hex::encode(hash.finalize())
+    )
+}
+
+fn validate_session_registration_results(
+    results: &BTreeMap<String, SessionRegistrationResult>,
+    sessions: &SessionGuard,
+    system_keys: &BTreeSet<String>,
+    verifying_key: [u8; 32],
+    identity_key: &[u8; 32],
+) -> CoreResult<()> {
+    for (idempotency_key, stored) in results {
+        let private_user_id = derive_private_user_id(identity_key, &stored.identity_commitment);
+        let (registered, exact_match) = sessions.registration_matches(
+            &stored.session_id,
+            &private_user_id,
+            &stored.public_key,
+            stored.expires_at_millis,
+        );
+        let expected_evidence =
+            registration_evidence(stored.identity_commitment, stored.public_key);
+        let expected_entry = JournaledSystemCommand::RegisterSession {
+            idempotency_key: idempotency_key.clone(),
+            session_id: stored.session_id.clone(),
+            identity_commitment: stored.identity_commitment,
+            public_key: stored.public_key,
+            expires_at_millis: stored.expires_at_millis,
+            now_millis: stored.now_millis,
+        };
+        let expected_commitment = system_command_commitment(&expected_entry)?;
+        let receipt = &stored.response.receipt;
+        let record = &stored.response.encrypted_record;
+        if !registered
+            || !exact_match
+            || !system_keys.contains(idempotency_key)
+            || !system_keys.contains(&session_registration_result_marker(
+                idempotency_key,
+                &stored.session_id,
+                stored.identity_commitment,
+                stored.public_key,
+                stored.expires_at_millis,
+                stored.now_millis,
+            ))
+            || receipt.command_id != "register-session"
+            || receipt.idempotency_key != *idempotency_key
+            || receipt.command_commitment_sha256 != Some(expected_commitment)
+            || receipt.publication_eligible != Some(true)
+            || receipt.result_commitment_sha256
+                != Some(system_result_commitment(
+                    "register-session",
+                    &record.record_hash,
+                ))
+            || receipt.journal_committed != Some(true)
+            || receipt.reviewer_event != Some(reviewer_event("PRIVATE_SESSION_REGISTERED"))
+            || receipt.enclave_sequence != record.sequence
+            || receipt.state_root != record.state_root
+            || receipt.journal_hash != record.record_hash
+            || receipt.occurred_at_millis != stored.now_millis
+            || stored.response.registration_evidence.as_ref() != Some(&expected_evidence)
+            || stored.response.evidence_commitment != Some(expected_evidence.commitment)
+            || stored.response.transfer_account.is_some()
+            || verify_enclave_receipt_signature(receipt, verifying_key).is_err()
+        {
+            return Err(CoreError::JournalChainMismatch);
+        }
+    }
+    Ok(())
 }
 
 pub fn command_request_hash(

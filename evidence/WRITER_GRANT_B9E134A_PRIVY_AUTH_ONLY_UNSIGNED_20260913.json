@@ -1,0 +1,30 @@
+{
+  "activationId": "layrs-direct-b9e134a-privy-auth-only-20260913",
+  "environment": "production",
+  "authorizationScope": "production-enabled",
+  "epochId": "layrs-opening-epoch-20260911-941107537728c98b",
+  "runtime": "layrs.direct-execution.v1",
+  "openingEpochSha256": "84835da82210671d87321a21246317d898afd35381c57be8522df1a516dc3590",
+  "openingEvidenceManifestSha256": "70e579f630c759258728d91cb957fa84e200674aeebd3eae5997430a62203957",
+  "runtimeMeasurement": {
+    "amiId": "ami-006284c9ae020ea1a",
+    "eifSha256": "1cf70b78bc693a4ee4c35fcc0869a19ea846412ec46b8d5c2cd732bee502e479",
+    "pcr0": "c8f8635052ef4f63f813863b837192cff261712fe8855f0bacc00d3f22335a1cd0c76dafddef6da84d3dcb47d2dbe2f0",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "2ef35f0ef5fbbd1d810b6ab33fa99b131ae4166181689f64d23d4e8bda5c97e6d9bb5ce3b832072f6b5dbd82d578478a",
+    "sourceCommit": "b9e134aa0961a052446461e9fdbd11ae1d2f1513",
+    "enclaveSha256": "593657ca1cedcf9742e2723953f260e4fcde1aad270d3ccd703110eb3faf7bd5",
+    "parentSha256": "d72fde7aaff1834cbcb4dfab90c26dcd2186faeab5a7ad92f3701cb0c2b91e47"
+  },
+  "oldWriterFenceEvidenceSha256": "b991e41682d01c546e11c03bca79a8e141b4f6d892a3afb6a5a0fe6720182364",
+  "keyReleaseKmsKeyId": "arn:aws:kms:us-east-1:082223548516:key/e1105df5-5253-4c6d-af28-3589bcd4406e",
+  "keyReleasePredecessor": {
+    "activationId": "layrs-direct-3742838-funded-canary-20260913",
+    "artifactSha256": "53c409e86feb588b75e137bb6fec2d4d520195f209d75906974a03be75b12259",
+    "writerGrantCommitment": "326bf0e452f01745a1859c7d76fb141a670223f096cff581d890cc9c7da9605c"
+  },
+  "expiresAtUnix": 1789357049,
+  "governanceKeyId": "alias/layrs/production/recovery-evidence-signing",
+  "signingAlgorithm": "ECDSA_SHA_256",
+  "signature": ""
+}

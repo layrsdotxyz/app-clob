@@ -733,6 +733,12 @@ enum OperatorCommand {
         expires_at_millis: i64,
         now_millis: i64,
     },
+    SessionRegistrationStatus {
+        session_id: String,
+        identity_commitment: [u8; 32],
+        public_key: [u8; 32],
+        expires_at_millis: i64,
+    },
     RegisterTransferAccount {
         idempotency_key: String,
         identity_commitment: [u8; 32],
@@ -1119,6 +1125,10 @@ enum PlainResponse {
     TransferAccountStatus {
         transfer_account: String,
         registered: bool,
+    },
+    SessionRegistrationStatus {
+        registered: bool,
+        exact_match: bool,
     },
     DelegatedPortfolioRead {
         envelope: EncryptedDelegatedRead,
@@ -1663,47 +1673,47 @@ async fn handle_encrypted(
         };
     }
     let direct_execution = direct_execution_request(&state, &request);
-    let writer_trusted_now_millis = if request_requires_writer_authorization(&request)
-        && !direct_execution
-    {
-        let Some(authorization) = writer_authorization.as_ref() else {
-            return WireResponse::Error {
-                code: "DURABLE_WRITER_AUTHORIZATION_REQUIRED",
+    let writer_trusted_now_millis =
+        if should_verify_writer_authorization(&request, direct_execution) {
+            let Some(authorization) = writer_authorization.as_ref() else {
+                return WireResponse::Error {
+                    code: "DURABLE_WRITER_AUTHORIZATION_REQUIRED",
+                };
             };
-        };
-        let now = match trusted_nsm_now_millis(state.nsm_fd, &state.enclave_measurement_sha384) {
-            Ok(value) => value,
-            Err(()) => {
-                return WireResponse::Error {
-                    code: "TRUSTED_TIME_UNAVAILABLE",
+            let now = match trusted_nsm_now_millis(state.nsm_fd, &state.enclave_measurement_sha384)
+            {
+                Ok(value) => value,
+                Err(()) => {
+                    return WireResponse::Error {
+                        code: "TRUSTED_TIME_UNAVAILABLE",
+                    }
+                }
+            };
+            if let Err(code) = verify_writer_authorization(
+                &mut state,
+                authorization,
+                &actor_domain,
+                &command_idempotency_key,
+                durable_command_commitment,
+                request_context_sha256,
+                request_envelope_sha256,
+                now,
+            ) {
+                return WireResponse::Error { code };
+            }
+            Some(now)
+        } else if direct_execution && request_requires_trusted_execution_time(&request) {
+            match trusted_nsm_now_millis(state.nsm_fd, &state.enclave_measurement_sha384) {
+                Ok(value) => Some(value),
+                Err(()) => {
+                    return WireResponse::Error {
+                        code: "TRUSTED_TIME_UNAVAILABLE",
+                    }
                 }
             }
+        } else {
+            None
         };
-        if let Err(code) = verify_writer_authorization(
-            &mut state,
-            authorization,
-            &actor_domain,
-            &command_idempotency_key,
-            durable_command_commitment,
-            request_context_sha256,
-            request_envelope_sha256,
-            now,
-        ) {
-            return WireResponse::Error { code };
-        }
-        Some(now)
-    } else if direct_execution && request_requires_trusted_execution_time(&request) {
-        match trusted_nsm_now_millis(state.nsm_fd, &state.enclave_measurement_sha384) {
-            Ok(value) => Some(value),
-            Err(()) => {
-                return WireResponse::Error {
-                    code: "TRUSTED_TIME_UNAVAILABLE",
-                }
-            }
-        }
-    } else {
-        None
-    };
     if transport_replay == TransportReplayDecision::ExactRetry
         && state
             .pending_preparation
@@ -2993,6 +3003,7 @@ fn direct_quest_operator_command(command: &OperatorCommand) -> bool {
     match command {
         OperatorCommand::AcknowledgeRecoveryArchive { .. }
         | OperatorCommand::RegisterSession { .. }
+        | OperatorCommand::SessionRegistrationStatus { .. }
         | OperatorCommand::RegisterTransferAccount { .. }
         | OperatorCommand::TransferAccountStatus { .. } => true,
         // Crypto rollover must not inherit a protocol-wide Durable preparation.
@@ -3097,6 +3108,11 @@ fn direct_quest_operator_command(command: &OperatorCommand) -> bool {
             recurring_crypto_window(market_id).is_some()
         }
         OperatorCommand::TradingFreezeStatus => true,
+        OperatorCommand::SetTradingFreeze {
+            idempotency_key,
+            reason_commitment,
+            ..
+        } => direct_trading_freeze(idempotency_key, reason_commitment),
         OperatorCommand::SignResolutionEvidence { evidence, .. } => {
             recurring_crypto_window(unsigned_resolution_market_id(evidence)).is_some()
         }
@@ -3105,6 +3121,33 @@ fn direct_quest_operator_command(command: &OperatorCommand) -> bool {
         }
         _ => false,
     }
+}
+
+/// A Green reconciliation freeze is direct only when its idempotency key is
+/// exactly bound to the committed reason. The operator signature authenticates
+/// the command and the separately signed writer authorization still proves the
+/// current database lease inside the enclave.
+fn direct_trading_freeze(idempotency_key: &str, reason_commitment: &[u8; 32]) -> bool {
+    idempotency_key
+        .strip_prefix("trading-freeze:")
+        .is_some_and(|value| value == hex::encode(reason_commitment))
+}
+
+fn direct_execution_requires_writer_authorization(request: &PlainRequest) -> bool {
+    matches!(
+        request,
+        PlainRequest::Operator {
+            envelope: OperatorEnvelope {
+                command: OperatorCommand::SetTradingFreeze { .. },
+                ..
+            }
+        }
+    )
+}
+
+fn should_verify_writer_authorization(request: &PlainRequest, direct_execution: bool) -> bool {
+    request_requires_writer_authorization(request)
+        && (!direct_execution || direct_execution_requires_writer_authorization(request))
 }
 
 fn direct_base_usdc_withdrawal(action: &UserCommandAction) -> bool {
@@ -3696,7 +3739,7 @@ fn verify_durable_preparation(
         .map_err(|_| "DURABLE_PREPARATION_INVALID".to_string())
 }
 
-fn enclave_transition_policy_hash(source: &[u8], target: &[u8], schema: &str) -> [u8; 32] {
+fn legacy_enclave_transition_policy_hash(source: &[u8], target: &[u8], schema: &str) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"layrs.enclave-generation-transition.v1\0");
     hash.update((source.len() as u32).to_be_bytes());
@@ -3708,10 +3751,38 @@ fn enclave_transition_policy_hash(source: &[u8], target: &[u8], schema: &str) ->
     hash.finalize().into()
 }
 
+fn enclave_transition_policy_hash(
+    source: &[u8],
+    target_release_commit: &str,
+    schema: &str,
+) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"layrs.enclave-generation-transition.v2\0");
+    hash.update((source.len() as u32).to_be_bytes());
+    hash.update(source);
+    hash.update((target_release_commit.len() as u32).to_be_bytes());
+    hash.update(target_release_commit.as_bytes());
+    hash.update((schema.len() as u32).to_be_bytes());
+    hash.update(schema.as_bytes());
+    hash.finalize().into()
+}
+
 fn configured_transition_policy_hash() -> Option<[u8; 32]> {
     option_env!("LAYRS_ENCLAVE_TRANSITION_POLICY_SHA256")
         .and_then(|value| hex::decode(value).ok())
         .and_then(|value| value.try_into().ok())
+}
+
+fn valid_release_commit(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn configured_transition_target_release_commit() -> Option<&'static str> {
+    option_env!("LAYRS_ENCLAVE_TRANSITION_TARGET_RELEASE_COMMIT")
+        .filter(|value| valid_release_commit(value))
 }
 
 fn decode_exact_hex<const N: usize>(value: &str) -> Result<[u8; N], String> {
@@ -3844,20 +3915,55 @@ fn verify_enclave_generation_transition(
     schema: &str,
     supplied_policy: [u8; 32],
 ) -> Result<(), String> {
+    verify_enclave_generation_transition_with_policy(
+        source,
+        target,
+        current,
+        schema,
+        supplied_policy,
+        configured_transition_policy_hash(),
+        configured_transition_target_release_commit(),
+    )
+}
+
+fn verify_enclave_generation_transition_with_policy(
+    source: &[u8],
+    target: &[u8],
+    current: &[u8; 48],
+    schema: &str,
+    supplied_policy: [u8; 32],
+    configured_policy: Option<[u8; 32]>,
+    target_release_commit: Option<&str>,
+) -> Result<(), String> {
     if source.len() != 48
         || target != current.as_slice()
         || schema != "layrs.private-core-snapshot.s07.v1"
     {
         return Err("DURABLE_ENCLAVE_TRANSITION_INVALID".into());
     }
-    let expected = enclave_transition_policy_hash(source, target, schema);
+    if source == target {
+        let expected = legacy_enclave_transition_policy_hash(source, target, schema);
+        return if supplied_policy == expected {
+            Ok(())
+        } else {
+            Err("DURABLE_ENCLAVE_TRANSITION_INVALID".into())
+        };
+    }
+
+    // Target PCR0 cannot be part of a value compiled into that same target
+    // image: embedding the value changes PCR0 and creates an unsatisfiable
+    // fixed point. Bind cross-PCR authority to the immutable source PCR,
+    // target release commit and snapshot schema instead. The target PCR is
+    // independently bound above to the enclave's measured `current` value and
+    // by the signed release manifest plus the KMS attestation allowlist.
+    let target_release_commit = target_release_commit
+        .filter(|value| valid_release_commit(value))
+        .ok_or_else(|| "DURABLE_ENCLAVE_TRANSITION_NOT_AUTHORIZED".to_string())?;
+    let expected = enclave_transition_policy_hash(source, target_release_commit, schema);
     if supplied_policy != expected {
         return Err("DURABLE_ENCLAVE_TRANSITION_INVALID".into());
     }
-    if source != target && configured_transition_policy_hash() != Some(expected) {
-        // Cross-PCR roll-forward is disabled unless the target EIF embeds the
-        // exact reviewed source/target/schema policy commitment. Same-PCR
-        // recovery remains available without a transition policy.
+    if configured_policy != Some(expected) {
         return Err("DURABLE_ENCLAVE_TRANSITION_NOT_AUTHORIZED".into());
     }
     Ok(())
@@ -6065,6 +6171,27 @@ async fn dispatch_operator(
                 registered: status.registered,
             })
         }
+        OperatorCommand::SessionRegistrationStatus {
+            session_id,
+            identity_commitment,
+            public_key,
+            expires_at_millis,
+        } => {
+            let (registered, exact_match) = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "NOT_PROVISIONED".to_string())?
+                .session_registration_status(
+                    &session_id,
+                    identity_commitment,
+                    public_key,
+                    expires_at_millis,
+                );
+            Ok(PlainResponse::SessionRegistrationStatus {
+                registered,
+                exact_match,
+            })
+        }
         OperatorCommand::DelegatedPortfolioRead {
             request_id,
             identity_commitment,
@@ -6534,6 +6661,7 @@ async fn dispatch_operator(
                 | OperatorCommand::ResolutionReadiness { .. }
                 | OperatorCommand::CustodyReconciliationSnapshot { .. }
                 | OperatorCommand::TransferAccountStatus { .. }
+                | OperatorCommand::SessionRegistrationStatus { .. }
                 | OperatorCommand::DelegatedPortfolioRead { .. }
                 | OperatorCommand::TradingFreezeStatus
                 | OperatorCommand::RecoveryArchiveAckStatus { .. }
@@ -8175,23 +8303,61 @@ mod tests {
         let source = [0x31; 48];
         let target = [0x32; 48];
         let schema = "layrs.private-core-snapshot.s07.v1";
-        let same = enclave_transition_policy_hash(&target, &target, schema);
+        let target_release_commit = "37ed1f204e653626fdd3bdab3f425db813e8a25f";
+        let same = legacy_enclave_transition_policy_hash(&target, &target, schema);
         assert!(
             verify_enclave_generation_transition(&target, &target, &target, schema, same).is_ok()
         );
 
-        let cross = enclave_transition_policy_hash(&source, &target, schema);
+        let cross = enclave_transition_policy_hash(&source, target_release_commit, schema);
         assert_eq!(
-            verify_enclave_generation_transition(&source, &target, &target, schema, cross)
-                .unwrap_err(),
+            hex::encode(cross),
+            "c01f64acf9ccb88654c6ab92bf2948db72c3a97b5eb9f6cf01ec9a1d3c01e532"
+        );
+        assert_eq!(
+            verify_enclave_generation_transition_with_policy(
+                &source, &target, &target, schema, cross, None, None,
+            )
+            .unwrap_err(),
             "DURABLE_ENCLAVE_TRANSITION_NOT_AUTHORIZED"
         );
+        assert!(verify_enclave_generation_transition_with_policy(
+            &source,
+            &target,
+            &target,
+            schema,
+            cross,
+            Some(cross),
+            Some(target_release_commit),
+        )
+        .is_ok());
         let mut forged = cross;
         forged[0] ^= 1;
         assert_eq!(
-            verify_enclave_generation_transition(&source, &target, &target, schema, forged)
-                .unwrap_err(),
+            verify_enclave_generation_transition_with_policy(
+                &source,
+                &target,
+                &target,
+                schema,
+                forged,
+                Some(cross),
+                Some(target_release_commit),
+            )
+            .unwrap_err(),
             "DURABLE_ENCLAVE_TRANSITION_INVALID"
+        );
+        assert_eq!(
+            verify_enclave_generation_transition_with_policy(
+                &source,
+                &target,
+                &target,
+                schema,
+                cross,
+                Some([0x44; 32]),
+                Some(target_release_commit),
+            )
+            .unwrap_err(),
+            "DURABLE_ENCLAVE_TRANSITION_NOT_AUTHORIZED"
         );
     }
 
@@ -10317,7 +10483,10 @@ mod tests {
             Some(request.issued_at_millis + 1),
         )
         .await;
-        assert!(matches!(result, Err(error) if error == "invalid direct withdrawal payload"));
+        assert!(
+            matches!(&result, Err(error) if error == "invalid direct withdrawal payload"),
+            "unexpected generic-withdrawal result: {result:?}"
+        );
         assert_eq!(state.core.as_ref().unwrap().state_root(), root);
         assert_eq!(state.core.as_ref().unwrap().sequence(), sequence);
     }
@@ -10622,6 +10791,14 @@ mod tests {
             }
         ));
         assert!(direct_quest_operator_command(
+            &OperatorCommand::SessionRegistrationStatus {
+                session_id: "session_test".into(),
+                identity_commitment,
+                public_key: [8u8; 32],
+                expires_at_millis: 10_000,
+            }
+        ));
+        assert!(direct_quest_operator_command(
             &OperatorCommand::RegisterTransferAccount {
                 idempotency_key: "transfer-account:session_test".into(),
                 identity_commitment,
@@ -10681,7 +10858,7 @@ mod tests {
         assert!(direct_quest_operator_command(
             &OperatorCommand::TradingFreezeStatus
         ));
-        assert!(!direct_quest_operator_command(&freeze_command));
+        assert!(direct_quest_operator_command(&freeze_command));
         let freeze_status_request = PlainRequest::Operator {
             envelope: OperatorEnvelope {
                 nonce: [12; 32],
@@ -10699,13 +10876,25 @@ mod tests {
         };
         assert!(!durable_control_request(&freeze_request));
         assert!(request_requires_writer_authorization(&freeze_request));
-        for command in [
-            OperatorCommand::SetTradingFreeze {
+        assert!(direct_execution_requires_writer_authorization(
+            &freeze_request
+        ));
+        assert!(should_verify_writer_authorization(&freeze_request, true));
+        assert!(should_verify_writer_authorization(&freeze_request, false));
+        assert!(pending_preparation_blocks_request(
+            true,
+            &freeze_request,
+            true,
+        ));
+        assert!(!direct_quest_operator_command(
+            &OperatorCommand::SetTradingFreeze {
                 idempotency_key: format!("trading-freeze:{}", hex::encode([0xcdu8; 32])),
                 frozen: true,
                 reason_commitment: freeze_reason,
                 now_millis: 1,
-            },
+            }
+        ));
+        for command in [
             OperatorCommand::SetTradingFreeze {
                 idempotency_key: format!("trading-freeze:{}", hex::encode([0u8; 32])),
                 frozen: false,
@@ -10719,7 +10908,7 @@ mod tests {
                 now_millis: 0,
             },
         ] {
-            assert!(!direct_quest_operator_command(&command));
+            assert!(direct_quest_operator_command(&command));
         }
 
         let split_session_dust = OperatorCommand::CreditDeposit {

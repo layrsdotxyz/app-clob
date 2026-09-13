@@ -1,0 +1,58 @@
+{
+  "schema": "layrs.step5.evidence.v1",
+  "status": "VERIFIED_NOT_ACTIVATED",
+  "productionChangeStatus": "NONE",
+  "transactionModel": "layrs.direct-execution.v1",
+  "openingEpoch": {
+    "epochId": "layrs-opening-epoch-20260911-941107537728c98b",
+    "stateSha256": "84835da82210671d87321a21246317d898afd35381c57be8522df1a516dc3590",
+    "evidenceManifestSha256": "70e579f630c759258728d91cb957fa84e200674aeebd3eae5997430a62203957",
+    "genesisOrdinal": 0
+  },
+  "candidate": {
+    "ami": "ami-00b5f08fce6be9018",
+    "eifSha256": "138d35cb576bd07f2dcf37652d436fa4d2acdc5aa3431c6c4934a0ff8cbc1548",
+    "enclaveSha256": "fcbba5e7a469aa54de63ddb836b1c8ae95fb43282a626f753cfb9b95f00f46b5",
+    "parentSha256": "697823b3de72c82432c715df12103d6811443f6c5f9733c6db8d41a66a135ad7",
+    "pcr0": "d2a9db65dbcdc682f02b3023321aa9b1c9272a52cbe4ec8d36c112eadc48a351cfc0b11ca0af4dd744290836e31dba13",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "08f5b0adbcb270fd159b3f73630676415a6f30df3c8b7aeeb0ac34a1597f668f845f302463557cab8c9483feda2213bf",
+    "packagedSourceCommit": "92e9918"
+  },
+  "sourceCommits": {
+    "directRuntime": "6a3c331",
+    "privyAndCustodyBff": "100232ae"
+  },
+  "verified": {
+    "privyEs256JwtAndWalletBinding": true,
+    "signedSessionEpochWalletRuntimeBinding": true,
+    "candidateVsockAckAdoption": true,
+    "immutableArtifactReadback": true,
+    "parentRestartRecovery": true,
+    "exactReplayNoSecondEffect": true,
+    "postgresProjectionOneToOne": true,
+    "missingArtifactFailsClosed": true,
+    "corruptedArtifactFailsClosed": true,
+    "durableExecutablePathAbsent": true,
+    "nitroAttestationBinding": true,
+    "deterministicCustodyFinality": true,
+    "writerGrantValidation": true
+  },
+  "packagedCanary": {
+    "balanceAtomic": ["5000000", "4000000", "4000000", "4000000"],
+    "artifactCount": 1,
+    "receiptCount": 1,
+    "accountingEventCount": 1,
+    "custodyProjectionCount": 1,
+    "sessionCount": 1
+  },
+  "activationPrerequisites": [
+    "Attested live custody credential/configuration and independently observed finality evidence.",
+    "Governed old-writer fence evidence and a signed, unexpired writer grant bound to this exact runtime, PCR commitments, and opening epoch.",
+    "Explicit production activation approval and a separately approved funded canary."
+  ],
+  "prohibitionsObserved": [
+    "No Production, Green, customer funds, customer balances, custody, production database, production writer, or 75594 mutation.",
+    "No Durable Command executable path or replacement staged financial protocol."
+  ]
+}

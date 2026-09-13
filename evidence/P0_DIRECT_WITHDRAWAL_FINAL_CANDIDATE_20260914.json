@@ -1,0 +1,126 @@
+{
+  "protocol": "layrs.p0-direct-withdrawal-final-candidate-evidence.v1",
+  "capturedAt": "2026-09-13T21:03:30Z",
+  "status": "VERIFIED_ISOLATED_NOT_DEPLOYED",
+  "source": {
+    "commit": "4d141632906a2a1b55fc53666574976da0c6bb8b",
+    "mergeRequest": "https://git.layrs.xyz/layrs/app-clob/-/merge_requests/89",
+    "pipeline": 1262
+  },
+  "sealedOpeningState": {
+    "epochId": "layrs-opening-epoch-20260911-941107537728c98b",
+    "epochStateSha256": "84835da82210671d87321a21246317d898afd35381c57be8522df1a516dc3590",
+    "evidenceManifestSha256": "70e579f630c759258728d91cb957fa84e200674aeebd3eae5997430a62203957",
+    "transactionModel": "layrs.direct-execution.v1"
+  },
+  "build": {
+    "amiId": "ami-0c6e26a5461b89937",
+    "amiCreationDate": "2026-09-13T20:46:02.000Z",
+    "snapshotId": "snap-04b28451a5f782c6d",
+    "snapshotEncrypted": true,
+    "eifSha256": "eb111bb115f53cac3922bb7eea2c2c6cb4b584360791a07be0594eaeab433409",
+    "enclaveBinarySha256": "8f0780aff7d6e2c5050d94b96fbe6eba6b2067bc02ab670750788846f624bf84",
+    "parentBinarySha256": "f5900ef736ec956b6c9bf652e845a1fac04c8849bcc47112317674107434c304",
+    "packerTemplateSha256": "6e4238614ba6f26a87ff794c49ffd5c65b4527e8b2907c166d0c13c38a78a682",
+    "dockerfileSha256": "fcdd71ae9511a40ee891ea0145987eee564ba7d53ce9a2e9aaabf003d400d509",
+    "baseImage": "gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e",
+    "dockerImageId": "6ef6d8b70efa7a58ce432d1e3e43da95b5f781b05ef6e2b7c3fa5ad14c56ed16"
+  },
+  "measurements": {
+    "pcr0": "f97216859fc4cf74f7d93cfc674012a3b605a7713e4c17b4a1a5b707e35e3fb5b9d701383220297d74b4d35e7afb66fb",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "80b8ec25bb71e6bf72bd688f910c39dd1ff132e6ddf63fed20cc9b61dfa416ee5a7e98b3679db320df324ab9cd3986cc"
+  },
+  "attestation": {
+    "verifierInstanceId": "i-0191f2d6225127cd5",
+    "verifierFinalState": "stopped",
+    "moduleId": "i-0191f2d6225127cd5-enc01a09c89696dae7b",
+    "coseAlgorithm": "ES384",
+    "coseSignatureVerified": true,
+    "certificateChainSignaturesVerified": 5,
+    "nonceMatches": true,
+    "bindingMatches": true,
+    "attestationBytes": 4874,
+    "attestationSha256": "bfbedc1ab7b5cc66a3d80796cb0aa72964d2ab9852544474560b9dbea8b1194d",
+    "attestedWriterEnabledBeforeIsolatedFixture": false,
+    "attestedAdmissionEnabledBeforeIsolatedFixture": false
+  },
+  "tests": {
+    "cargoAllTargets": {"passed": 57, "failed": 0},
+    "destinationBinding": {
+      "arbitraryCustomerDestination": "0xA7CeAe412A6f6fe9771c9Ea31E269df45a9aC30c",
+      "matchingSignedDestinationResult": "503 CUSTODY_ADAPTER_NOT_ENABLED",
+      "meaning": "destination passed validation; isolated verifier had no custody adapter and caused no external effect",
+      "explicitAuthWalletDestinationResult": "503 CUSTODY_ADAPTER_NOT_ENABLED",
+      "mismatchedSignedDestinationResult": "403 SIGNED_WITHDRAWAL_DESTINATION_MISMATCH",
+      "missingSignedDestinationResult": "403 SIGNED_WITHDRAWAL_DESTINATION_REQUIRED",
+      "privyRole": "authentication only; never auto-selected as withdrawal destination"
+    },
+    "packagedRestartReplay": {
+      "transport": "actual HTTP parent to Nitro VSOCK enclave",
+      "marketRegistration": "MARKET_REGISTERED",
+      "financialCommand": "PLACE_ORDER",
+      "firstResponseStatus": 200,
+      "firstResponseSha256": "6560055077289020d437311032c19491b9210bc3a250c5097ec9114884d49b8b",
+      "restart": "full parent and enclave restart",
+      "replayResponseStatus": 200,
+      "replayResponseSha256": "6560055077289020d437311032c19491b9210bc3a250c5097ec9114884d49b8b",
+      "artifactCountBeforeRestart": 3,
+      "artifactCountAfterRestart": 3,
+      "artifactCountAfterReplay": 3,
+      "artifactSha256": [
+        "763bf6e93186b57a116e805263402d2564dd5fe6ec067d11db22ee84c175d8be",
+        "456ff356c1b0becfceee27b01685a6903a184477d7673a5b2258c5dec2c0a1aa",
+        "88ce31395d7370170d9b16ef11174dc4949cab0795b46cf731fd112defeeb33e"
+      ],
+      "committedHeadSha256": "f407495b52a4ce1b467bea8c0e45426f4c0da880d43b4a04481a261a39efd232",
+      "duplicateEffect": false
+    },
+    "governedMarketRegistrations": {
+      "verified": 5,
+      "evidence": "evidence/P0_DIRECT_MARKET_REGISTRATIONS_SIGNED_20260914.json",
+      "evidenceSha256": "f619b5be495668c08b098c535f9cf00802f20cb02ff76388356f0ac69eb711e6"
+    }
+  },
+  "writerGrant": {
+    "activationId": "layrs-direct-4d14163-p0-withdrawal-20260914",
+    "expiresAtUnix": 1789419793,
+    "kmsSignatureVerified": true,
+    "compiledPublicKeySignatureVerified": true,
+    "governancePublicKeyDerSha256": "a001a573309c778b0b1f90ecd93eaf1cb07a37f4bea501c32c43afd754871f22",
+    "commitment": "f577563b8d72afae62d168bb21bb91a79ceaf6480ac5f41a5533a0faf3a15aad",
+    "signedArtifact": "evidence/WRITER_GRANT_P0_TRADING_SIGNED_20260914.json",
+    "predecessor": {
+      "activationId": "layrs-direct-b9e134a-privy-auth-only-20260913",
+      "artifactSha256": "7935bf05e48dfce5d32f5ac9ea162906e52b2fd09127383386f7b5b380845b84",
+      "writerGrantCommitment": "0e778174d3fb19c4d0de1c3e32dd982570e304d697f36f573672679111dd5bc1",
+      "s3ObjectLockMode": "COMPLIANCE"
+    }
+  },
+  "productionBaseline": {
+    "candidateAmiId": "ami-006284c9ae020ea1a",
+    "writerGrantCommitment": "0e778174d3fb19c4d0de1c3e32dd982570e304d697f36f573672679111dd5bc1",
+    "immutableHeadSequence": 5,
+    "immutableHeadArtifactSha256": "b3ff84fef0cd61e8af04c024a37d922fadd73ddd71153209937596a550d1156e"
+  },
+  "architectureAudit": {
+    "durableCommandSourcePaths": 0,
+    "durablePreparationSourcePaths": 0,
+    "releaseReadySourcePaths": 0,
+    "commandQueueSourcePaths": 0,
+    "retryWorkerSourcePaths": 0,
+    "financialCoordinatorSourcePaths": 0,
+    "durableCommandPackagedParent": 0,
+    "durableCommandPackagedEnclave": 0
+  },
+  "safety": {
+    "productionStackChanged": false,
+    "productionWriterChanged": false,
+    "productionDatabaseTouched": false,
+    "productionCustodyCalled": false,
+    "customerFundsMoved": false,
+    "customerBalancesChanged": false,
+    "greenTouched": false,
+    "sequence75594Touched": false
+  }
+}

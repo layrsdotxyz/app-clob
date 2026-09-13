@@ -1,0 +1,105 @@
+{
+  "status": "PRODUCTION_READ_ONLY_VERIFIED_WRITER_DISABLED",
+  "verifiedAt": "2026-09-13T04:18:20Z",
+  "runtimeSourceCommit": "b9e134aa0961a052446461e9fdbd11ae1d2f1513",
+  "bffSourceCommit": "49b26cde4118d8cea61d0662bd6ad7aec22416a8",
+  "architectureBoundary": {
+    "privyEmbeddedWalletRole": "AUTHENTICATION_AND_IDENTITY_BINDING_ONLY",
+    "financialWalletMustBeSeparatelyProvenNonPrivyEoa": true,
+    "writerEnabled": false,
+    "custodyInvoked": false,
+    "financialMutationPerformed": false
+  },
+  "candidate": {
+    "amiId": "ami-006284c9ae020ea1a",
+    "eifSha256": "1cf70b78bc693a4ee4c35fcc0869a19ea846412ec46b8d5c2cd732bee502e479",
+    "enclaveSha256": "593657ca1cedcf9742e2723953f260e4fcde1aad270d3ccd703110eb3faf7bd5",
+    "parentSha256": "d72fde7aaff1834cbcb4dfab90c26dcd2186faeab5a7ad92f3701cb0c2b91e47",
+    "pcr0": "c8f8635052ef4f63f813863b837192cff261712fe8855f0bacc00d3f22335a1cd0c76dafddef6da84d3dcb47d2dbe2f0",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "2ef35f0ef5fbbd1d810b6ab33fa99b131ae4166181689f64d23d4e8bda5c97e6d9bb5ce3b832072f6b5dbd82d578478a",
+    "openingEpochSha256": "84835da82210671d87321a21246317d898afd35381c57be8522df1a516dc3590",
+    "openingEvidenceManifestSha256": "70e579f630c759258728d91cb957fa84e200674aeebd3eae5997430a62203957"
+  },
+  "bffPackage": {
+    "sourceArchiveSha256": "cff70648225752ffd51589dacb88a4bd0262a1a605965f61112a53e7653548f2",
+    "sourceObjectVersionId": "aQM60tjSJHy_0UekgwkAjcBW4lHSxt0A",
+    "codeBuildId": "layrs-production-backend-image-builder:f7e7050c-26f1-4ed7-94ae-da7200b27289",
+    "imageDigest": "sha256:d7c039d1429583290837c2687773ebefc3f2dcf5cc588985cb34db3fa2485976",
+    "ecsTaskDefinition": "layrs-production-direct-bff-readonly:15",
+    "canaryCommandRoutesEnabled": false
+  },
+  "readOnlyGrant": {
+    "activationId": "layrs-direct-b9e134a-privy-auth-only-readonly-20260913",
+    "authorizationScope": "admission-enabled",
+    "commitment": "eb5bfa07d8b17cc3066222222c5ed87af1e65c4fdfe0e6ccae5eacbf51ee1c50",
+    "signedArtifactSha256": "a3e236a1816a11871a6165a53dfee6dacda26a14cd0e8911cabd4efa8fdf470b",
+    "signatureVerifiedByKms": true,
+    "signatureVerifiedByRuntime": true,
+    "expiresAtUnix": 1789357049
+  },
+  "deployment": {
+    "stack": "layrs-production-direct-execution-dormant",
+    "instanceId": "i-048b921eb61f994dc",
+    "executionMode": "admission-enabled",
+    "writerEnabled": false,
+    "admissionEnabled": true,
+    "identityCount": 439,
+    "keyReleaseArtifactHash": "7225942d61032b8a8c83b419f009a274a739ec98efe18a3ebb4a573863dcad30",
+    "oldWriterAuthorized": false,
+    "targetWriterEnabled": false,
+    "templateSha256": "8be3f49a821d9873bee032e90269a950baa16ced89507d83f4c5edea1b1af3d7"
+  },
+  "attestation": {
+    "preRestartSha256": "956826068f066d32c680d24c9c5ff07e22e6041130e6664765b4d64952cb31fa",
+    "postRestartSha256": "3e21136a5fde5c1d15bcca9b6be00c6ddfa0dee3c7d60e9273fbf1d065f15039",
+    "postRestartModuleId": "i-048b921eb61f994dc-enc01a098faa670fd97",
+    "coseSignatureVerified": true,
+    "certificateChainSignaturesVerified": 5,
+    "nonceAndBindingVerified": true,
+    "pcrTupleVerified": true,
+    "restartCommandId": "e04433cb-c26d-431a-b889-bfd05bdb1dc8",
+    "postRestartAttestationCommandId": "e2c2b3c6-1b15-41ca-b9fd-a8655313464c"
+  },
+  "publicBalanceVerification": [
+    {
+      "account": "layrs-mm-01@predifi.com",
+      "privyAuthWallet": "0x8cb7376A0B09424fcD398d2F2A006202eE521E17",
+      "runtimeAmountAtomic": "160453499",
+      "projectionAmountAtomic": "160453499",
+      "asset": "USDC",
+      "matched": true
+    },
+    {
+      "account": "layrs-mm-02@predifi.com",
+      "privyAuthWallet": "0xB69ac21b8a96234A09Ba6c7644F1c2b106FD4A01",
+      "runtimeAmountAtomic": "4404611",
+      "projectionAmountAtomic": "4404611",
+      "asset": "USDC",
+      "matched": true
+    }
+  ],
+  "noFinancialMutationProof": {
+    "committedArtifactCount": 2,
+    "latestCommittedArtifact": "00000000000000000002-63f30a1d555e3725a6afcc7b5c69007ed1f093cac91ee9e651c2bea5a5a70721.cbor",
+    "latestCommittedArtifactTimestamp": "2026-09-13T00:07:54Z",
+    "receiptCount": 2,
+    "accountingEventCount": 2,
+    "custodyEventCount": 1,
+    "balanceReadsCreatedFinancialArtifact": false
+  },
+  "durableExecutableAudit": {
+    "parentMatchCount": 0,
+    "eifExecutableMatchCount": 0,
+    "eifDeclarativeManifestMarker": "durableCommands=PROHIBITED",
+    "auditCommandId": "eabde735-5d7b-44e6-8ae3-a0de3ec4c2a8"
+  },
+  "pendingFinancialBoundary": {
+    "mm02RecoveryApplied": false,
+    "mm02RecoverySignedArtifactSha256": "aee029dffd1084877fd8efce37f42f931a6621b6f0adef940a43dc9aa61d3ab4",
+    "mm02ExpectedRecoveryAmountAtomic": "5000000",
+    "mm02ExpectedPostRecoveryBalanceAtomic": "9404611",
+    "fundedCanaryExecuted": false,
+    "requirement": "Governed MM02 liability restoration plus a separately proven non-Privy financial EOA and exact customer authorization before any future payout."
+  }
+}

@@ -1,0 +1,78 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AttestedRuntimeKeyRelease",
+      "Effect": "Allow",
+      "Action": ["kms:GenerateDataKey", "kms:Decrypt"],
+      "Resource": "arn:aws:kms:us-east-1:082223548516:key/e1105df5-5253-4c6d-af28-3589bcd4406e",
+      "Condition": {
+        "StringEquals": {
+          "kms:RecipientAttestation:PCR0": "448ef35d38923ad72d25b9f208981219588308f8b0a5bb75be698c4d6bc420ffd30d669c8711acd87964691475a8a75c",
+          "kms:RecipientAttestation:PCR1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+          "kms:RecipientAttestation:PCR2": "acfb6c886b10d60e7ef821f0c4645e7fd7f0ad061129ac389367e7bea78904876af0aa810bcf43a6f983d243e598a7c2",
+          "kms:EncryptionContext:layrs-runtime": "layrs.direct-execution.v1",
+          "kms:EncryptionContext:layrs-epoch": "layrs-opening-epoch-20260911-941107537728c98b"
+        }
+      }
+    },
+    {
+      "Sid": "DescribeExistingKeys",
+      "Effect": "Allow",
+      "Action": "kms:DescribeKey",
+      "Resource": [
+        "arn:aws:kms:us-east-1:082223548516:key/e1105df5-5253-4c6d-af28-3589bcd4406e",
+        "arn:aws:kms:us-east-1:082223548516:key/f1e83e95-698d-4778-8df9-14d98998e651"
+      ]
+    },
+    {
+      "Sid": "ExistingConfigurationReferences",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": [
+        "arn:aws:secretsmanager:us-east-1:082223548516:secret:layrs/production/runtime/fresh-epoch-20260826-qVSXMW",
+        "arn:aws:secretsmanager:us-east-1:082223548516:secret:layrs/production/providers/rpc-bXcAga"
+      ]
+    },
+    {
+      "Sid": "ExistingConfigurationKms",
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": "arn:aws:kms:us-east-1:082223548516:key/e1105df5-5253-4c6d-af28-3589bcd4406e",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "secretsmanager.us-east-1.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "ReadArchiveObjectLockConfiguration",
+      "Effect": "Allow",
+      "Action": "s3:GetBucketObjectLockConfiguration",
+      "Resource": "arn:aws:s3:::layrs-production-082223548516-us-east-1-immutable"
+    },
+    {
+      "Sid": "ListIsolatedArchivePrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::layrs-production-082223548516-us-east-1-immutable",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": "verification/keyrelease/df846b8/*"
+        }
+      }
+    },
+    {
+      "Sid": "IsolatedArchiveObjects",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:GetObjectRetention", "s3:PutObjectRetention"],
+      "Resource": "arn:aws:s3:::layrs-production-082223548516-us-east-1-immutable/verification/keyrelease/df846b8/*"
+    },
+    {
+      "Sid": "ExistingArchiveKms",
+      "Effect": "Allow",
+      "Action": ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"],
+      "Resource": "arn:aws:kms:us-east-1:082223548516:key/f1e83e95-698d-4778-8df9-14d98998e651"
+    }
+  ]
+}
