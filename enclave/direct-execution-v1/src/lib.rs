@@ -32,9 +32,11 @@ use uuid::Uuid;
 
 mod external_effect;
 pub use external_effect::{
-    reference_for, ExternalEffectIntent, ExternalEffectObservation, ExternalEffectRecovery,
-    FilesystemImmutableIntentStore, ImmutableExternalEffectIntentStore,
-    EXTERNAL_EFFECT_INTENT_PROTOCOL_VERSION, MAX_PROVIDER_IDEMPOTENCY_WINDOW_SECONDS,
+    reference_for, relay_reference_for, relay_result_hash, relay_reverted_result_hash,
+    relay_terminal_result_hash, ExternalEffectIntent, ExternalEffectObservation,
+    ExternalEffectRecovery, FilesystemImmutableIntentStore, ImmutableExternalEffectIntentStore,
+    RelayWithdrawalBinding, EXTERNAL_EFFECT_INTENT_PROTOCOL_VERSION,
+    MAX_PROVIDER_IDEMPOTENCY_WINDOW_SECONDS,
 };
 
 pub const EPOCH_ID: &str = "layrs-opening-epoch-20260911-941107537728c98b";
@@ -808,10 +810,23 @@ pub enum DirectAction {
         amount_atomic: String,
         custody_reference: String,
     },
+    /// Cross-chain withdrawal whose Base transfer is only Relay intake.  This
+    /// action is constructed exclusively after Relay reports a destination
+    /// success bound to the immutable route and exact result hashes.
+    SettleRelayWithdrawal {
+        relay: RelayWithdrawalBinding,
+        amount_atomic: String,
+        custody_reference: String,
+    },
     /// A terminal external revert is recorded once in the same immutable
     /// lineage, with no balance movement.  It is not a retriable custody job.
     RecordWithdrawalReverted {
         destination: String,
+        amount_atomic: String,
+        custody_reference: String,
+    },
+    RecordRelayWithdrawalReverted {
+        relay: RelayWithdrawalBinding,
         amount_atomic: String,
         custody_reference: String,
     },
@@ -1400,12 +1415,19 @@ impl DirectRuntime {
             DirectAction::CreditDeposit { .. }
                 | DirectAction::ReserveWithdrawal { .. }
                 | DirectAction::RecordWithdrawalReverted { .. }
+                | DirectAction::SettleRelayWithdrawal { .. }
+                | DirectAction::RecordRelayWithdrawalReverted { .. }
+        );
+        let relay_external_effect = matches!(
+            &request.action,
+            DirectAction::SettleRelayWithdrawal { .. }
+                | DirectAction::RecordRelayWithdrawalReverted { .. }
         );
         let financial_wallet = request
             .financial_wallet_address
             .as_deref()
             .map(str::to_ascii_lowercase);
-        if carries_external_financial_effect {
+        if carries_external_financial_effect && !relay_external_effect {
             let Some(wallet) = financial_wallet.as_deref() else {
                 return Err(RuntimeError::DestinationDenied);
             };
@@ -1635,6 +1657,34 @@ impl DirectRuntime {
                         Some(custody_reference.clone()),
                     )
                 }
+                DirectAction::SettleRelayWithdrawal {
+                    relay,
+                    amount_atomic,
+                    custody_reference,
+                } => {
+                    let value = amount(amount_atomic)?;
+                    relay.verify(amount_atomic)?;
+                    if !valid_relay_withdrawal_custody_reference(custody_reference, relay, false) {
+                        return Err(RuntimeError::DestinationDenied);
+                    }
+                    self.move_bucket(
+                        &request.identity_commitment,
+                        "USER_AVAILABLE",
+                        "USER_WITHDRAWAL_HOLD",
+                        value,
+                    )?;
+                    self.move_bucket(
+                        &request.identity_commitment,
+                        "USER_WITHDRAWAL_HOLD",
+                        "USER_SETTLED",
+                        value,
+                    )?;
+                    (
+                        "WITHDRAWAL_SETTLED".into(),
+                        Some(amount_atomic.clone()),
+                        Some(custody_reference.clone()),
+                    )
+                }
                 DirectAction::RecordWithdrawalReverted {
                     destination,
                     amount_atomic,
@@ -1645,6 +1695,22 @@ impl DirectRuntime {
                     if !valid_withdrawal_custody_reference(custody_reference, self.mode)
                         || financial_wallet.as_deref() != Some(destination.as_str())
                     {
+                        return Err(RuntimeError::DestinationDenied);
+                    }
+                    (
+                        "WITHDRAWAL_REVERTED".into(),
+                        Some(amount_atomic.clone()),
+                        Some(custody_reference.clone()),
+                    )
+                }
+                DirectAction::RecordRelayWithdrawalReverted {
+                    relay,
+                    amount_atomic,
+                    custody_reference,
+                } => {
+                    let _ = amount(amount_atomic)?;
+                    relay.verify(amount_atomic)?;
+                    if !valid_relay_withdrawal_custody_reference(custody_reference, relay, true) {
                         return Err(RuntimeError::DestinationDenied);
                     }
                     (
@@ -3132,6 +3198,33 @@ pub fn request_hash(request: &DirectRequest) -> String {
                 .expect("serializable reverted direct withdrawal request"),
             )
         }
+        DirectAction::SettleRelayWithdrawal {
+            relay,
+            amount_atomic,
+            custody_reference,
+        }
+        | DirectAction::RecordRelayWithdrawalReverted {
+            relay,
+            amount_atomic,
+            custody_reference,
+        } if custody_reference.starts_with("lei-") => {
+            let reference = custody_reference
+                .split_once(':')
+                .map(|(reference, _)| reference)
+                .unwrap_or(custody_reference);
+            sha256(
+                &serde_json::to_vec(&(
+                    request.account_id.as_str(),
+                    request.identity_commitment.as_str(),
+                    request.request_id.as_str(),
+                    "SETTLE_RELAY_WITHDRAWAL",
+                    relay,
+                    amount_atomic,
+                    reference,
+                ))
+                .expect("serializable Relay withdrawal request"),
+            )
+        }
         _ => sha256(
             &serde_json::to_vec(&(
                 request.account_id.as_str(),
@@ -3161,6 +3254,80 @@ fn valid_withdrawal_custody_reference(reference: &str, mode: RuntimeMode) -> boo
         && transaction_hash[2..]
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_relay_withdrawal_custody_reference(
+    reference: &str,
+    relay: &RelayWithdrawalBinding,
+    reverted: bool,
+) -> bool {
+    let parts = reference.split(':').collect::<Vec<_>>();
+    if reverted {
+        return parts.len() == 8
+            && valid_external_effect_reference(parts[0])
+            && parts[1] == "relay-reverted"
+            && parts[2].eq_ignore_ascii_case(&relay.request_id)
+            && parts[3] == relay.destination_chain_id.to_string()
+            && valid_transaction_hash_value(parts[4])
+            && matches!(parts[5], "failure" | "refund" | "refunded")
+            && valid_sha256(parts[6])
+            && parts[6] == relay_reverted_result_hash(relay, parts[0], parts[4], parts[5])
+            && parts[7] == relay.binding_hash();
+    }
+    if parts.len() != 9
+        || !valid_external_effect_reference(parts[0])
+        || parts[1] != "relay"
+        || !parts[2].eq_ignore_ascii_case(&relay.request_id)
+        || parts[3] != relay.destination_chain_id.to_string()
+        || !valid_transaction_hash_value(parts[4])
+        || !valid_destination_transaction_hash(parts[5], relay.destination_chain_id)
+        || positive_atomic_value(parts[6]).is_none()
+        || !valid_sha256(parts[7])
+        || parts[8] != relay.binding_hash()
+    {
+        return false;
+    }
+    let amount = positive_atomic_value(parts[6]).unwrap_or_default();
+    let minimum =
+        positive_atomic_value(&relay.minimum_destination_amount_atomic).unwrap_or(u128::MAX);
+    amount >= minimum
+        && parts[7] == relay_terminal_result_hash(relay, parts[0], parts[4], parts[5], parts[6])
+}
+
+fn valid_external_effect_reference(value: &str) -> bool {
+    value.len() == 64
+        && value.starts_with("lei-")
+        && value[4..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_transaction_hash_value(value: &str) -> bool {
+    value.len() == 66
+        && value.starts_with("0x")
+        && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_destination_transaction_hash(value: &str, chain_id: u64) -> bool {
+    if chain_id == 792_703_809 {
+        (64..=96).contains(&value.len()) && value.bytes().all(is_base58_value)
+    } else {
+        value.len() == 66
+            && value.starts_with("0x")
+            && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
+}
+
+fn is_base58_value(byte: u8) -> bool {
+    matches!(byte,
+        b'1'..=b'9' | b'A'..=b'H' | b'J'..=b'N' | b'P'..=b'Z'
+        | b'a'..=b'k' | b'm'..=b'z')
+}
+
+fn positive_atomic_value(value: &str) -> Option<u128> {
+    value.parse::<u128>().ok().filter(|amount| *amount > 0)
 }
 
 fn valid_deposit_custody_reference(reference: &str) -> bool {
@@ -3375,6 +3542,85 @@ mod tests {
             ),
             1000000
         );
+    }
+
+    #[test]
+    fn relay_withdrawal_adopts_only_bound_destination_finality_and_replays_after_restart() {
+        let identity = "0bafc03d08d4951d769d58284db85c7ac2ee3c79de87ec680f58edc03017c418";
+        let relay = RelayWithdrawalBinding {
+            route_id: "11111111-2222-4333-8444-555555555555".into(),
+            request_id: format!("0x{}", "aa".repeat(32)),
+            deposit_address: "0x2222222222222222222222222222222222222222".into(),
+            destination_chain_id: 42_161,
+            destination_currency: "0xaf88d065e77c8cc2239327c5edb3a432268e5831".into(),
+            recipient: "0x3333333333333333333333333333333333333333".into(),
+            quoted_destination_amount_atomic: "999000".into(),
+            minimum_destination_amount_atomic: "998000".into(),
+            quote_payload_sha256: "44".repeat(32),
+            expires_at_unix: 10_000,
+        };
+        let reference = format!("lei-{}", "77".repeat(30));
+        let intake = format!("0x{}", "55".repeat(32));
+        let destination = format!("0x{}", "66".repeat(32));
+        let delivered = "998500";
+        let result =
+            relay_terminal_result_hash(&relay, &reference, &intake, &destination, delivered);
+        let custody_reference = format!(
+            "{reference}:relay:{}:{}:{intake}:{destination}:{delivered}:{result}:{}",
+            relay.request_id,
+            relay.destination_chain_id,
+            relay.binding_hash(),
+        );
+        let action = DirectAction::SettleRelayWithdrawal {
+            relay: relay.clone(),
+            amount_atomic: "1000000".into(),
+            custody_reference: custody_reference.clone(),
+        };
+        let state_key = [9u8; 32];
+        let mut store = InMemoryDirectStateStore::default();
+        let mut live = runtime(RuntimeMode::IsolatedTest);
+
+        let mut intake_only = request(
+            "relay-intake-only",
+            DirectAction::SettleRelayWithdrawal {
+                relay: relay.clone(),
+                amount_atomic: "1000000".into(),
+                custody_reference: format!("{reference}:{intake}"),
+            },
+        );
+        intake_only.financial_wallet_address = None;
+        intake_only.request_hash = request_hash(&intake_only);
+        assert_eq!(
+            live.execute(intake_only),
+            Err(RuntimeError::DestinationDenied)
+        );
+        assert_eq!(live.balance(identity, "USDC", "USER_AVAILABLE"), 5_000_000);
+
+        let command = request("relay-terminal", action);
+        live.execute_committed(command.clone(), &state_key, &mut store)
+            .unwrap();
+        assert_eq!(live.balance(identity, "USDC", "USER_AVAILABLE"), 4_000_000);
+        let mut restored = DirectRuntime::restore_committed(
+            SealedEpoch::load(epoch_path()).unwrap(),
+            RuntimeMode::IsolatedTest,
+            vec![7; 32],
+            &state_key,
+            &store,
+        )
+        .unwrap();
+        assert_eq!(
+            restored.balance(identity, "USDC", "USER_AVAILABLE"),
+            4_000_000
+        );
+        let replay = restored
+            .execute_committed(command, &state_key, &mut store)
+            .unwrap();
+        assert_eq!(replay.receipt.effect, "WITHDRAWAL_SETTLED");
+        assert_eq!(
+            restored.balance(identity, "USDC", "USER_AVAILABLE"),
+            4_000_000
+        );
+        assert_eq!(store.artifacts().unwrap().len(), 1);
     }
     #[test]
     fn finalized_deposit_reference_is_global_exactly_once_and_survives_restart() {

@@ -28,12 +28,13 @@ use chacha20poly1305::{
 };
 use hmac::{Hmac, Mac};
 use layrs_direct_execution_v1::{
-    artifact_hash, identity_commitment_for, reference_for, request_hash, sha256, sign,
-    DirectAction, DirectReceipt, DirectRequest, DirectResult, DirectStateArtifact, DurabilityAck,
-    ExternalEffectIntent, ExternalEffectRecovery, FilesystemImmutableArtifactStore,
-    FilesystemImmutableIntentStore, GovernedBalanceRecovery, GovernedKeyReleaseArtifact,
-    GovernedMarketRegistration, GovernedMarketResolution, ImmutableExternalEffectIntentStore,
-    OrderAction, Outcome, ProjectionBalanceRow, ProjectionIdentityRow, ProjectionWalletRow,
+    artifact_hash, identity_commitment_for, reference_for, relay_reference_for, relay_result_hash,
+    relay_reverted_result_hash, request_hash, sha256, sign, DirectAction, DirectReceipt,
+    DirectRequest, DirectResult, DirectStateArtifact, DurabilityAck, ExternalEffectIntent,
+    ExternalEffectRecovery, FilesystemImmutableArtifactStore, FilesystemImmutableIntentStore,
+    GovernedBalanceRecovery, GovernedKeyReleaseArtifact, GovernedMarketRegistration,
+    GovernedMarketResolution, ImmutableExternalEffectIntentStore, OrderAction, Outcome,
+    ProjectionBalanceRow, ProjectionIdentityRow, ProjectionWalletRow, RelayWithdrawalBinding,
     RuntimeMeasurementBinding, RuntimeRequest, RuntimeResponse, SealedEpoch, TimeInForce,
     WriterGrant, EPOCH_ID, POSTGRES_PROJECTION_DDL,
 };
@@ -132,6 +133,8 @@ struct PrivyBaseCustodyAdapter {
     pool_address: String,
     confirmations: u64,
     api_base_url: String,
+    relay_api_key: Option<String>,
+    relay_api_base_url: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,6 +173,7 @@ impl PrivyBaseCustodyAdapter {
                 Ok(Some(Self {
                     client: reqwest::Client::builder()
                         .https_only(true)
+                        .timeout(Duration::from_secs(15))
                         .user_agent("layrsv2-public-api/1.0")
                         .default_headers(default_headers)
                         .build()
@@ -187,6 +191,13 @@ impl PrivyBaseCustodyAdapter {
                     confirmations,
                     api_base_url: env::var("LAYRS_DIRECT_PRIVY_API_BASE_URL")
                         .unwrap_or_else(|_| "https://api.privy.io".into())
+                        .trim_end_matches('/')
+                        .into(),
+                    relay_api_key: env::var("LAYRSV2_RELAY_API_KEY")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty()),
+                    relay_api_base_url: env::var("LAYRSV2_RELAY_BASE_URL")
+                        .unwrap_or_else(|_| "https://api.relay.link".into())
                         .trim_end_matches('/')
                         .into(),
                 }))
@@ -534,6 +545,15 @@ impl PrivyBaseCustodyAdapter {
                         &receipt,
                     ) =>
             {
+                if intent.relay.is_some() {
+                    return self
+                        .relay_destination_finality(
+                            intent,
+                            provider_transaction_id,
+                            transaction_hash,
+                        )
+                        .await;
+                }
                 Ok(
                     layrs_direct_execution_v1::ExternalEffectObservation::Finalized {
                         provider_transaction_id,
@@ -549,6 +569,60 @@ impl PrivyBaseCustodyAdapter {
             ),
             _ => Ok(layrs_direct_execution_v1::ExternalEffectObservation::Conflict),
         }
+    }
+
+    /// Relay intake on Base is not withdrawal finality.  Once the intake leg
+    /// has authoritative Base finality, synchronously observe Relay's
+    /// provider-owned request and bind the destination result.  This function
+    /// creates no job or persisted lifecycle; restart calls the same lookup
+    /// from the write-once external-effect intent.
+    async fn relay_destination_finality(
+        &self,
+        intent: &ExternalEffectIntent,
+        provider_transaction_id: String,
+        intake_transaction_hash: String,
+    ) -> Result<layrs_direct_execution_v1::ExternalEffectObservation, String> {
+        let relay = intent
+            .relay
+            .as_ref()
+            .ok_or("Relay binding missing from external-effect intent")?;
+        let api_key = self
+            .relay_api_key
+            .as_deref()
+            .ok_or("Relay authoritative observation is not configured")?;
+        let status: Value = self
+            .client
+            .get(format!("{}/intents/status/v3", self.relay_api_base_url))
+            .query(&[("requestId", relay.request_id.as_str())])
+            .header("x-api-key", api_key)
+            .send()
+            .await
+            .map_err(|_| "Relay status lookup failed")?
+            .error_for_status()
+            .map_err(|_| "Relay status lookup rejected")?
+            .json()
+            .await
+            .map_err(|_| "Relay status lookup malformed")?;
+        let details: Value = self
+            .client
+            .get(format!("{}/requests/v3", self.relay_api_base_url))
+            .query(&[("id", relay.request_id.as_str())])
+            .header("x-api-key", api_key)
+            .send()
+            .await
+            .map_err(|_| "Relay request lookup failed")?
+            .error_for_status()
+            .map_err(|_| "Relay request lookup rejected")?
+            .json()
+            .await
+            .map_err(|_| "Relay request lookup malformed")?;
+        classify_relay_destination_finality(
+            intent,
+            provider_transaction_id,
+            intake_transaction_hash,
+            &status,
+            &details,
+        )
     }
 
     /// Verify one inbound Base USDC transfer from the authenticated embedded
@@ -671,6 +745,286 @@ impl PrivyBaseCustodyAdapter {
         );
         Ok(result)
     }
+}
+
+fn classify_relay_destination_finality(
+    intent: &ExternalEffectIntent,
+    provider_transaction_id: String,
+    intake_transaction_hash: String,
+    status: &Value,
+    details: &Value,
+) -> Result<layrs_direct_execution_v1::ExternalEffectObservation, String> {
+    let relay = intent
+        .relay
+        .as_ref()
+        .ok_or("Relay binding missing from external-effect intent")?;
+    relay
+        .verify(&intent.amount_atomic)
+        .map_err(|_| "Relay binding invalid")?;
+    if !valid_transaction_hash(&intake_transaction_hash) {
+        return Err("Relay intake transaction hash invalid".into());
+    }
+    let status_name = status
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or("Relay status missing")?;
+    if let Some(request_id) = status.get("requestId").and_then(Value::as_str) {
+        if !request_id.eq_ignore_ascii_case(&relay.request_id) {
+            return Ok(layrs_direct_execution_v1::ExternalEffectObservation::Conflict);
+        }
+    }
+    let origin_chain = status.get("originChainId").and_then(Value::as_u64);
+    let destination_chain = status.get("destinationChainId").and_then(Value::as_u64);
+    if origin_chain.is_some_and(|chain| chain != 8453)
+        || destination_chain.is_some_and(|chain| chain != relay.destination_chain_id)
+    {
+        return Ok(layrs_direct_execution_v1::ExternalEffectObservation::Conflict);
+    }
+    let status_intake_hashes = relay_hashes(status.get("inTxHashes"));
+    if !status_intake_hashes.is_empty()
+        && !status_intake_hashes
+            .iter()
+            .any(|hash| hash.eq_ignore_ascii_case(&intake_transaction_hash))
+    {
+        return Ok(layrs_direct_execution_v1::ExternalEffectObservation::Conflict);
+    }
+    if matches!(
+        status_name,
+        "waiting" | "depositing" | "pending" | "submitted" | "delayed"
+    ) {
+        return Ok(
+            layrs_direct_execution_v1::ExternalEffectObservation::Pending {
+                provider_transaction_id,
+            },
+        );
+    }
+    let requests = details
+        .get("requests")
+        .and_then(Value::as_array)
+        .ok_or("Relay request details malformed")?;
+    if requests.len() != 1 {
+        return Ok(layrs_direct_execution_v1::ExternalEffectObservation::Conflict);
+    }
+    let request = &requests[0];
+    if request
+        .get("id")
+        .and_then(Value::as_str)
+        .is_none_or(|id| !id.eq_ignore_ascii_case(&relay.request_id))
+        || request
+            .get("recipient")
+            .and_then(Value::as_str)
+            .is_none_or(|recipient| {
+                !relay_address_eq(recipient, &relay.recipient, relay.destination_chain_id)
+            })
+        || request
+            .pointer("/depositAddress/address")
+            .and_then(Value::as_str)
+            .is_none_or(|address| !address.eq_ignore_ascii_case(&relay.deposit_address))
+        || !relay_route_quote_matches(request, relay, &intent.amount_atomic)
+        || !relay_request_has_intake(request, &intake_transaction_hash)
+    {
+        return Ok(layrs_direct_execution_v1::ExternalEffectObservation::Conflict);
+    }
+    match status_name {
+        "success" => {
+            if request.get("status").and_then(Value::as_str) != Some("success") {
+                return Ok(layrs_direct_execution_v1::ExternalEffectObservation::Conflict);
+            }
+            let status_destination_hashes = relay_hashes(status.get("txHashes"));
+            let request_destination_hashes =
+                relay_destination_hashes(request, relay.destination_chain_id);
+            if status_destination_hashes.len() != 1
+                || request_destination_hashes.len() != 1
+                || status_destination_hashes[0] != request_destination_hashes[0]
+            {
+                return Ok(layrs_direct_execution_v1::ExternalEffectObservation::Conflict);
+            }
+            let destination_amount_atomic = relay_actual_destination_amount(request, relay)?;
+            let minimum = relay
+                .minimum_destination_amount_atomic
+                .parse::<u128>()
+                .map_err(|_| "Relay minimum amount invalid")?;
+            if destination_amount_atomic
+                .parse::<u128>()
+                .ok()
+                .is_none_or(|amount| amount < minimum)
+            {
+                return Ok(layrs_direct_execution_v1::ExternalEffectObservation::Conflict);
+            }
+            let result_hash = relay_result_hash(
+                intent,
+                &intake_transaction_hash,
+                &request_destination_hashes[0],
+                &destination_amount_atomic,
+            )
+            .ok_or("Relay result binding unavailable")?;
+            Ok(
+                layrs_direct_execution_v1::ExternalEffectObservation::RelayFinalized {
+                    provider_transaction_id,
+                    intake_transaction_hash,
+                    relay_request_id: relay.request_id.clone(),
+                    destination_transaction_hash: request_destination_hashes[0].clone(),
+                    destination_amount_atomic,
+                    result_hash,
+                },
+            )
+        }
+        "refund" | "refunded" | "failure" => {
+            let request_status = request.get("status").and_then(Value::as_str);
+            if !matches!(request_status, Some("refund" | "refunded" | "failure")) {
+                return Ok(layrs_direct_execution_v1::ExternalEffectObservation::Conflict);
+            }
+            let result_hash = relay_reverted_result_hash(
+                relay,
+                &intent.external_effect_reference,
+                &intake_transaction_hash,
+                status_name,
+            );
+            Ok(
+                layrs_direct_execution_v1::ExternalEffectObservation::RelayReverted {
+                    provider_transaction_id,
+                    intake_transaction_hash,
+                    relay_request_id: relay.request_id.clone(),
+                    terminal_status: status_name.into(),
+                    result_hash,
+                },
+            )
+        }
+        _ => Ok(layrs_direct_execution_v1::ExternalEffectObservation::Conflict),
+    }
+}
+
+fn relay_hashes(value: Option<&Value>) -> Vec<String> {
+    let mut hashes = value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|hash| valid_relay_transaction_hash(hash))
+        .map(|hash| {
+            if hash.starts_with("0x") {
+                hash.to_ascii_lowercase()
+            } else {
+                hash.to_owned()
+            }
+        })
+        .collect::<Vec<_>>();
+    hashes.sort();
+    hashes.dedup();
+    hashes
+}
+
+fn relay_request_has_intake(request: &Value, intake_transaction_hash: &str) -> bool {
+    request
+        .pointer("/data/inTxs")
+        .and_then(Value::as_array)
+        .is_some_and(|transactions| {
+            transactions.iter().any(|transaction| {
+                transaction.get("chainId").and_then(Value::as_u64) == Some(8453)
+                    && transaction.get("status").and_then(Value::as_str) == Some("success")
+                    && transaction
+                        .get("txHash")
+                        .and_then(Value::as_str)
+                        .is_some_and(|hash| hash.eq_ignore_ascii_case(intake_transaction_hash))
+            })
+        })
+}
+
+fn relay_destination_hashes(request: &Value, destination_chain_id: u64) -> Vec<String> {
+    let values = request
+        .pointer("/data/outTxs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|transaction| {
+            transaction.get("chainId").and_then(Value::as_u64) == Some(destination_chain_id)
+                && transaction.get("status").and_then(Value::as_str) == Some("success")
+        })
+        .filter_map(|transaction| transaction.get("txHash").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    relay_hashes(Some(&Value::Array(
+        values
+            .into_iter()
+            .map(|value| Value::String(value.into()))
+            .collect(),
+    )))
+}
+
+fn relay_route_quote_matches(
+    request: &Value,
+    relay: &RelayWithdrawalBinding,
+    source_amount_atomic: &str,
+) -> bool {
+    let origin = request.pointer("/data/route/quoted/origin/inputCurrency");
+    let destination = request.pointer("/data/route/quoted/destination/outputCurrency");
+    relay_currency_matches(origin, 8453, BASE_USDC_ADDRESS, source_amount_atomic)
+        && relay_currency_matches(
+            destination,
+            relay.destination_chain_id,
+            &relay.destination_currency,
+            &relay.quoted_destination_amount_atomic,
+        )
+}
+
+fn relay_actual_destination_amount(
+    request: &Value,
+    relay: &RelayWithdrawalBinding,
+) -> Result<String, String> {
+    let output = request
+        .pointer("/data/route/actual/destination/outputCurrency")
+        .ok_or("Relay actual destination result missing")?;
+    let amount = output
+        .get("amount")
+        .and_then(Value::as_str)
+        .ok_or("Relay actual destination amount missing")?;
+    if !relay_currency_matches(
+        Some(output),
+        relay.destination_chain_id,
+        &relay.destination_currency,
+        amount,
+    ) || amount
+        .parse::<u128>()
+        .ok()
+        .filter(|value| *value > 0)
+        .is_none()
+    {
+        return Err("Relay actual destination result mismatch".into());
+    }
+    Ok(amount.into())
+}
+
+fn relay_currency_matches(
+    value: Option<&Value>,
+    chain_id: u64,
+    currency: &str,
+    amount: &str,
+) -> bool {
+    value.is_some_and(|value| {
+        value.pointer("/currency/chainId").and_then(Value::as_u64) == Some(chain_id)
+            && value
+                .pointer("/currency/address")
+                .and_then(Value::as_str)
+                .is_some_and(|address| relay_address_eq(address, currency, chain_id))
+            && value.get("amount").and_then(Value::as_str) == Some(amount)
+    })
+}
+
+fn relay_address_eq(left: &str, right: &str, chain_id: u64) -> bool {
+    if chain_id == 792_703_809 {
+        left == right
+    } else {
+        left.eq_ignore_ascii_case(right)
+    }
+}
+
+fn valid_relay_transaction_hash(value: &str) -> bool {
+    valid_transaction_hash(value)
+        || ((64..=96).contains(&value.len())
+            && value.bytes().all(|byte| {
+                matches!(byte,
+                b'1'..=b'9' | b'A'..=b'H' | b'J'..=b'N' | b'P'..=b'Z'
+                | b'a'..=b'k' | b'm'..=b'z')
+            }))
 }
 
 fn canonical_evm_address(value: &str) -> Result<String, String> {
@@ -1357,6 +1711,8 @@ enum CustomerAction {
     ReserveWithdrawal {
         destination: String,
         amount_atomic: String,
+        #[serde(default)]
+        relay_route: Option<RelayWithdrawalBinding>,
     },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1729,17 +2085,28 @@ async fn command(
         CustomerAction::ReserveWithdrawal {
             destination,
             amount_atomic,
+            relay_route,
         } => {
-            // Privy's embedded wallet authenticates the account but never
-            // serves as the payout rail. The BFF separately verifies control
-            // of a non-Privy EOA for this exact request and signs it into the
-            // short-lived direct session.
-            let Some(financial_wallet_address) = claims.financial_wallet_address.as_deref() else {
-                return (StatusCode::FORBIDDEN, "DIRECT_FINANCIAL_WALLET_REQUIRED").into_response();
-            };
-            if !withdrawal_destination_matches(&destination, financial_wallet_address) {
-                return (StatusCode::FORBIDDEN, "DIRECT_DESTINATION_BINDING_DENIED")
-                    .into_response();
+            if let Some(relay) = relay_route.as_ref() {
+                if !destination.eq_ignore_ascii_case(&relay.deposit_address)
+                    || relay.verify(&amount_atomic).is_err()
+                {
+                    return (StatusCode::CONFLICT, "INVALID_RELAY_WITHDRAWAL_BINDING")
+                        .into_response();
+                }
+            } else {
+                // Direct Base withdrawals retain the existing separately
+                // proven non-Privy financial-wallet binding. Relay routes are
+                // instead bound to their one-time immutable route/recipient.
+                let Some(financial_wallet_address) = claims.financial_wallet_address.as_deref()
+                else {
+                    return (StatusCode::FORBIDDEN, "DIRECT_FINANCIAL_WALLET_REQUIRED")
+                        .into_response();
+                };
+                if !withdrawal_destination_matches(&destination, financial_wallet_address) {
+                    return (StatusCode::FORBIDDEN, "DIRECT_DESTINATION_BINDING_DENIED")
+                        .into_response();
+                }
             }
             match prepare_external_withdrawal(
                 &state,
@@ -1748,6 +2115,7 @@ async fn command(
                 &request_id,
                 destination,
                 amount_atomic,
+                relay_route,
             )
             .await
             {
@@ -2044,6 +2412,7 @@ async fn prepare_external_withdrawal(
     request_id: &str,
     destination: String,
     amount_atomic: String,
+    relay_route: Option<RelayWithdrawalBinding>,
 ) -> Result<DirectAction, (StatusCode, &'static str)> {
     let Some(custody) = &state.custody else {
         return Err((
@@ -2082,6 +2451,7 @@ async fn prepare_external_withdrawal(
         request_id,
         &destination,
         &amount_atomic,
+        relay_route.as_ref(),
     )
     .map_err(|_| (StatusCode::CONFLICT, "EXTERNAL_EFFECT_REPLAY_CONFLICT"))?
     {
@@ -2102,6 +2472,7 @@ async fn prepare_external_withdrawal(
                 && intent.identity_commitment == identity_commitment
                 && intent.destination.eq_ignore_ascii_case(&destination)
                 && intent.amount_atomic == amount_atomic
+                && intent.relay == relay_route
         })
         .cloned()
     {
@@ -2111,39 +2482,17 @@ async fn prepare_external_withdrawal(
                 "CUSTODY_FINALITY_UNAVAILABLE",
             )
         })? {
-            ExternalEffectRecovery::BindFinalized {
-                transaction_hash, ..
-            } => {
+            terminal @ (ExternalEffectRecovery::BindFinalized { .. }
+            | ExternalEffectRecovery::BindReverted { .. }
+            | ExternalEffectRecovery::BindRelayFinalized { .. }
+            | ExternalEffectRecovery::BindRelayReverted { .. }) => {
                 state
                     .unresolved_external_effects
                     .lock()
                     .await
                     .remove(&existing.intent_hash);
-                return Ok(DirectAction::ReserveWithdrawal {
-                    destination,
-                    amount_atomic,
-                    custody_reference: format!(
-                        "{}:{}",
-                        existing.external_effect_reference, transaction_hash
-                    ),
-                });
-            }
-            ExternalEffectRecovery::BindReverted {
-                transaction_hash, ..
-            } => {
-                state
-                    .unresolved_external_effects
-                    .lock()
-                    .await
-                    .remove(&existing.intent_hash);
-                return Ok(DirectAction::RecordWithdrawalReverted {
-                    destination,
-                    amount_atomic,
-                    custody_reference: format!(
-                        "{}:{}",
-                        existing.external_effect_reference, transaction_hash
-                    ),
-                });
+                return direct_action_for_external_effect(&existing, terminal)
+                    .map_err(|_| (StatusCode::CONFLICT, "EXTERNAL_EFFECT_RESULT_CONFLICT"));
             }
             ExternalEffectRecovery::AwaitExternalFinality
             | ExternalEffectRecovery::SubmitWithStableReference
@@ -2168,49 +2517,86 @@ async fn prepare_external_withdrawal(
                 "CUSTODY_TRANSACTION_PARAMETERS_UNAVAILABLE",
             )
         })?;
-    let reference = reference_for(
-        &prior_state_hash,
-        request_id,
-        &claims.subject_hash,
-        identity_commitment,
-        "base",
-        "USDC",
-        &destination,
-        &amount_atomic,
-        &custody.wallet_id,
-    );
+    let reference = match relay_route.as_ref() {
+        Some(relay) => relay_reference_for(
+            &prior_state_hash,
+            request_id,
+            &claims.subject_hash,
+            identity_commitment,
+            &amount_atomic,
+            &custody.wallet_id,
+            relay,
+        ),
+        None => reference_for(
+            &prior_state_hash,
+            request_id,
+            &claims.subject_hash,
+            identity_commitment,
+            "base",
+            "USDC",
+            &destination,
+            &amount_atomic,
+            &custody.wallet_id,
+        ),
+    };
+    let provisional_action = match relay_route.as_ref() {
+        Some(relay) => DirectAction::SettleRelayWithdrawal {
+            relay: relay.clone(),
+            amount_atomic: amount_atomic.clone(),
+            custody_reference: reference.clone(),
+        },
+        None => DirectAction::ReserveWithdrawal {
+            destination: destination.clone(),
+            amount_atomic: amount_atomic.clone(),
+            custody_reference: reference.clone(),
+        },
+    };
     let provisional = DirectRequest {
         account_id: claims.subject_hash.clone(),
         identity_commitment: identity_commitment.into(),
         request_id: request_id.into(),
         request_hash: String::new(),
         financial_wallet_address: claims.financial_wallet_address.clone(),
-        action: DirectAction::ReserveWithdrawal {
-            destination: destination.clone(),
-            amount_atomic: amount_atomic.clone(),
-            custody_reference: reference,
-        },
+        action: provisional_action,
     };
     let mut provisional = provisional;
     provisional.request_hash = request_hash(&provisional);
-    let intent = ExternalEffectIntent::create(
-        prior_state_hash,
-        request_id.into(),
-        provisional.request_hash.clone(),
-        claims.subject_hash.clone(),
-        identity_commitment.into(),
-        "base".into(),
-        "USDC".into(),
-        destination.clone(),
-        amount_atomic.clone(),
-        custody.wallet_id.clone(),
-        custody.pool_address.clone(),
-        nonce.to_string(),
-        gas_limit.to_string(),
-        max_fee_per_gas.to_string(),
-        max_priority_fee_per_gas.to_string(),
-        now_unix(),
-    )
+    let intent = match relay_route {
+        Some(relay) => ExternalEffectIntent::create_relay_withdrawal(
+            prior_state_hash,
+            request_id.into(),
+            provisional.request_hash.clone(),
+            claims.subject_hash.clone(),
+            identity_commitment.into(),
+            amount_atomic.clone(),
+            custody.wallet_id.clone(),
+            custody.pool_address.clone(),
+            nonce.to_string(),
+            gas_limit.to_string(),
+            max_fee_per_gas.to_string(),
+            max_priority_fee_per_gas.to_string(),
+            now_unix(),
+            relay,
+        ),
+        None => ExternalEffectIntent::create(
+            prior_state_hash,
+            request_id.into(),
+            provisional.request_hash.clone(),
+            claims.subject_hash.clone(),
+            identity_commitment.into(),
+            "base".into(),
+            "USDC".into(),
+            destination.clone(),
+            amount_atomic.clone(),
+            custody.wallet_id.clone(),
+            custody.pool_address.clone(),
+            nonce.to_string(),
+            gas_limit.to_string(),
+            max_fee_per_gas.to_string(),
+            max_priority_fee_per_gas.to_string(),
+            now_unix(),
+        ),
+    }
     .map_err(|_| (StatusCode::BAD_REQUEST, "INVALID_WITHDRAWAL_INTENT"))?;
     let intent = store.persist_intent_readback(&intent).await.map_err(|_| {
         (
@@ -2224,20 +2610,13 @@ async fn prepare_external_withdrawal(
             "CUSTODY_FINALITY_UNAVAILABLE",
         )
     })? {
-        ExternalEffectRecovery::BindFinalized {
-            transaction_hash, ..
-        } => Ok(DirectAction::ReserveWithdrawal {
-            destination,
-            amount_atomic,
-            custody_reference: format!("{}:{}", intent.external_effect_reference, transaction_hash),
-        }),
-        ExternalEffectRecovery::BindReverted {
-            transaction_hash, ..
-        } => Ok(DirectAction::RecordWithdrawalReverted {
-            destination,
-            amount_atomic,
-            custody_reference: format!("{}:{}", intent.external_effect_reference, transaction_hash),
-        }),
+        terminal @ (ExternalEffectRecovery::BindFinalized { .. }
+        | ExternalEffectRecovery::BindReverted { .. }
+        | ExternalEffectRecovery::BindRelayFinalized { .. }
+        | ExternalEffectRecovery::BindRelayReverted { .. }) => {
+            direct_action_for_external_effect(&intent, terminal)
+                .map_err(|_| (StatusCode::CONFLICT, "EXTERNAL_EFFECT_RESULT_CONFLICT"))
+        }
         ExternalEffectRecovery::AwaitExternalFinality
         | ExternalEffectRecovery::SubmitWithStableReference
         | ExternalEffectRecovery::FailClosed => {
@@ -2581,9 +2960,11 @@ impl Projection {
         if let (Some(reference), Some(direction), Some(amount)) =
             (&receipt.custody_reference, direction, amount)
         {
+            let (custody_chain_id, custody_transaction_hash) =
+                custody_projection_binding(reference);
             self.client.execute(
-                "INSERT INTO direct_execution_custody_events (epoch_id, custody_reference, direction, state, chain_id, tx_hash, auth_subject_hash, identity_commitment, amount_atomic) VALUES ($1,$2,$3,'FINAL',8453,$4,$5,$6,$7::text::numeric) ON CONFLICT DO NOTHING",
-                &[&EPOCH_ID, reference, &direction, reference, &receipt.account_id, &receipt.identity_commitment, &amount],
+                "INSERT INTO direct_execution_custody_events (epoch_id, custody_reference, direction, state, chain_id, tx_hash, auth_subject_hash, identity_commitment, amount_atomic) VALUES ($1,$2,$3,'FINAL',$4,$5,$6,$7,$8::text::numeric) ON CONFLICT DO NOTHING",
+                &[&EPOCH_ID, reference, &direction, &custody_chain_id, &custody_transaction_hash, &receipt.account_id, &receipt.identity_commitment, &amount],
             ).await.map_err(|_| ProjectionError::Database)?;
         }
         self.client.execute(
@@ -2691,6 +3072,19 @@ impl Projection {
             Err(ProjectionError::OpeningMismatch)
         }
     }
+}
+
+fn custody_projection_binding(reference: &str) -> (i64, String) {
+    let parts = reference.split(':').collect::<Vec<_>>();
+    if parts.get(1) == Some(&"relay") {
+        if let (Some(chain), Some(hash)) = (
+            parts.get(3).and_then(|value| value.parse::<i64>().ok()),
+            parts.get(5),
+        ) {
+            return (chain, (*hash).into());
+        }
+    }
+    (8453, reference.into())
 }
 
 fn enum_name<T: Serialize>(value: &T) -> Result<String, ProjectionError> {
@@ -2859,6 +3253,7 @@ fn same_external_effect_request(a: &ExternalEffectIntent, b: &ExternalEffectInte
         && a.amount_atomic == b.amount_atomic
         && a.provider_wallet_id == b.provider_wallet_id
         && a.custody_target.eq_ignore_ascii_case(&b.custody_target)
+        && a.relay == b.relay
 }
 
 fn committed_external_effect_action(
@@ -2869,6 +3264,7 @@ fn committed_external_effect_action(
     request_id: &str,
     destination: &str,
     amount_atomic: &str,
+    relay_route: Option<&RelayWithdrawalBinding>,
 ) -> Result<Option<DirectAction>, io::Error> {
     let related = intents
         .iter()
@@ -2883,6 +3279,7 @@ fn committed_external_effect_action(
             || intent.asset != "USDC"
             || !intent.destination.eq_ignore_ascii_case(destination)
             || intent.amount_atomic != amount_atomic
+            || intent.relay.as_ref() != relay_route
     }) {
         return Err(invalid("external-effect replay binding conflict"));
     }
@@ -2906,13 +3303,23 @@ fn committed_external_effect_action(
             .custody_reference
             .clone()
             .ok_or_else(|| invalid("committed withdrawal is missing custody binding"))?;
-        let action = match artifact.receipt.effect.as_str() {
-            "WITHDRAWAL_SETTLED" => DirectAction::ReserveWithdrawal {
+        let action = match (intent.relay.as_ref(), artifact.receipt.effect.as_str()) {
+            (Some(relay), "WITHDRAWAL_SETTLED") => DirectAction::SettleRelayWithdrawal {
+                relay: relay.clone(),
+                amount_atomic: amount_atomic.into(),
+                custody_reference,
+            },
+            (Some(relay), "WITHDRAWAL_REVERTED") => DirectAction::RecordRelayWithdrawalReverted {
+                relay: relay.clone(),
+                amount_atomic: amount_atomic.into(),
+                custody_reference,
+            },
+            (None, "WITHDRAWAL_SETTLED") => DirectAction::ReserveWithdrawal {
                 destination: destination.into(),
                 amount_atomic: amount_atomic.into(),
                 custody_reference,
             },
-            "WITHDRAWAL_REVERTED" => DirectAction::RecordWithdrawalReverted {
+            (None, "WITHDRAWAL_REVERTED") => DirectAction::RecordWithdrawalReverted {
                 destination: destination.into(),
                 amount_atomic: amount_atomic.into(),
                 custody_reference,
@@ -2924,7 +3331,10 @@ fn committed_external_effect_action(
             identity_commitment: identity_commitment.into(),
             request_id: request_id.into(),
             request_hash: String::new(),
-            financial_wallet_address: Some(destination.to_ascii_lowercase()),
+            financial_wallet_address: intent
+                .relay
+                .is_none()
+                .then(|| destination.to_ascii_lowercase()),
             action: action.clone(),
         };
         request.request_hash = request_hash(&request);
@@ -2938,39 +3348,147 @@ fn committed_external_effect_action(
     Ok(None)
 }
 
+fn direct_action_for_external_effect(
+    intent: &ExternalEffectIntent,
+    outcome: ExternalEffectRecovery,
+) -> Result<DirectAction, io::Error> {
+    match (intent.relay.as_ref(), outcome) {
+        (
+            Some(relay),
+            ExternalEffectRecovery::BindRelayFinalized {
+                intake_transaction_hash,
+                relay_request_id,
+                destination_transaction_hash,
+                destination_amount_atomic,
+                result_hash,
+                ..
+            },
+        ) if relay_request_id.eq_ignore_ascii_case(&relay.request_id)
+            && result_hash
+                == relay_result_hash(
+                    intent,
+                    &intake_transaction_hash,
+                    &destination_transaction_hash,
+                    &destination_amount_atomic,
+                )
+                .ok_or_else(|| invalid("Relay result binding missing"))? =>
+        {
+            Ok(DirectAction::SettleRelayWithdrawal {
+                relay: relay.clone(),
+                amount_atomic: intent.amount_atomic.clone(),
+                custody_reference: format!(
+                    "{}:relay:{}:{}:{}:{}:{}:{}:{}",
+                    intent.external_effect_reference,
+                    relay.request_id,
+                    relay.destination_chain_id,
+                    intake_transaction_hash,
+                    destination_transaction_hash,
+                    destination_amount_atomic,
+                    result_hash,
+                    relay.binding_hash(),
+                ),
+            })
+        }
+        (
+            Some(relay),
+            ExternalEffectRecovery::BindRelayReverted {
+                intake_transaction_hash,
+                relay_request_id,
+                terminal_status,
+                result_hash,
+                ..
+            },
+        ) if relay_request_id.eq_ignore_ascii_case(&relay.request_id)
+            && result_hash
+                == relay_reverted_result_hash(
+                    relay,
+                    &intent.external_effect_reference,
+                    &intake_transaction_hash,
+                    &terminal_status,
+                ) =>
+        {
+            Ok(DirectAction::RecordRelayWithdrawalReverted {
+                relay: relay.clone(),
+                amount_atomic: intent.amount_atomic.clone(),
+                custody_reference: format!(
+                    "{}:relay-reverted:{}:{}:{}:{}:{}:{}",
+                    intent.external_effect_reference,
+                    relay.request_id,
+                    relay.destination_chain_id,
+                    intake_transaction_hash,
+                    terminal_status,
+                    result_hash,
+                    relay.binding_hash(),
+                ),
+            })
+        }
+        (
+            Some(relay),
+            ExternalEffectRecovery::BindReverted {
+                transaction_hash, ..
+            },
+        ) => {
+            let terminal_status = "failure";
+            let result_hash = relay_reverted_result_hash(
+                relay,
+                &intent.external_effect_reference,
+                &transaction_hash,
+                terminal_status,
+            );
+            Ok(DirectAction::RecordRelayWithdrawalReverted {
+                relay: relay.clone(),
+                amount_atomic: intent.amount_atomic.clone(),
+                custody_reference: format!(
+                    "{}:relay-reverted:{}:{}:{}:{}:{}:{}",
+                    intent.external_effect_reference,
+                    relay.request_id,
+                    relay.destination_chain_id,
+                    transaction_hash,
+                    terminal_status,
+                    result_hash,
+                    relay.binding_hash(),
+                ),
+            })
+        }
+        (Some(_), _) => Err(invalid("Relay external-effect result mismatch")),
+        (
+            None,
+            ExternalEffectRecovery::BindFinalized {
+                transaction_hash, ..
+            },
+        ) => Ok(DirectAction::ReserveWithdrawal {
+            destination: intent.destination.clone(),
+            amount_atomic: intent.amount_atomic.clone(),
+            custody_reference: format!("{}:{}", intent.external_effect_reference, transaction_hash),
+        }),
+        (
+            None,
+            ExternalEffectRecovery::BindReverted {
+                transaction_hash, ..
+            },
+        ) => Ok(DirectAction::RecordWithdrawalReverted {
+            destination: intent.destination.clone(),
+            amount_atomic: intent.amount_atomic.clone(),
+            custody_reference: format!("{}:{}", intent.external_effect_reference, transaction_hash),
+        }),
+        (None, _) => Err(invalid("external effect is not terminal")),
+    }
+}
+
 fn request_for_external_effect(
     intent: &ExternalEffectIntent,
     outcome: ExternalEffectRecovery,
 ) -> Result<DirectRequest, io::Error> {
-    let (action, transaction_hash) = match outcome {
-        ExternalEffectRecovery::BindFinalized {
-            transaction_hash, ..
-        } => ("final", transaction_hash),
-        ExternalEffectRecovery::BindReverted {
-            transaction_hash, ..
-        } => ("reverted", transaction_hash),
-        _ => return Err(invalid("external effect is not terminal")),
-    };
-    let custody_reference = format!("{}:{}", intent.external_effect_reference, transaction_hash);
-    let action = if action == "final" {
-        DirectAction::ReserveWithdrawal {
-            destination: intent.destination.clone(),
-            amount_atomic: intent.amount_atomic.clone(),
-            custody_reference,
-        }
-    } else {
-        DirectAction::RecordWithdrawalReverted {
-            destination: intent.destination.clone(),
-            amount_atomic: intent.amount_atomic.clone(),
-            custody_reference,
-        }
-    };
+    let action = direct_action_for_external_effect(intent, outcome)?;
     let mut request = DirectRequest {
         account_id: intent.account_id.clone(),
         identity_commitment: intent.identity_commitment.clone(),
         request_id: intent.request_id.clone(),
         request_hash: String::new(),
-        financial_wallet_address: Some(intent.destination.to_ascii_lowercase()),
+        financial_wallet_address: intent
+            .relay
+            .is_none()
+            .then(|| intent.destination.to_ascii_lowercase()),
         action,
     };
     request.request_hash = request_hash(&request);
@@ -3032,7 +3550,9 @@ async fn recover_external_effect_intents(state: &AppState) -> io::Result<()> {
         };
         match custody.settle(&intent, now_unix()).await.map_err(invalid)? {
             terminal @ (ExternalEffectRecovery::BindFinalized { .. }
-            | ExternalEffectRecovery::BindReverted { .. }) => {
+            | ExternalEffectRecovery::BindReverted { .. }
+            | ExternalEffectRecovery::BindRelayFinalized { .. }
+            | ExternalEffectRecovery::BindRelayReverted { .. }) => {
                 let request = request_for_external_effect(&intent, terminal)?;
                 let response = exchange_direct(state, request).await?;
                 let RuntimeResponse::Execute { result } = response else {
@@ -3484,6 +4004,180 @@ async fn write_frame(stream: &mut VsockStream, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn relay_binding() -> RelayWithdrawalBinding {
+        RelayWithdrawalBinding {
+            route_id: "11111111-2222-4333-8444-555555555555".into(),
+            request_id: format!("0x{}", "aa".repeat(32)),
+            deposit_address: "0x2222222222222222222222222222222222222222".into(),
+            destination_chain_id: 42_161,
+            destination_currency: "0xaf88d065e77c8cc2239327c5edb3a432268e5831".into(),
+            recipient: "0x3333333333333333333333333333333333333333".into(),
+            quoted_destination_amount_atomic: "4990000".into(),
+            minimum_destination_amount_atomic: "4980000".into(),
+            quote_payload_sha256: "44".repeat(32),
+            expires_at_unix: 10_000,
+        }
+    }
+
+    fn relay_intent() -> ExternalEffectIntent {
+        let relay = relay_binding();
+        let reference = relay_reference_for(
+            &"a".repeat(64),
+            "relay-withdrawal:11111111-2222-4333-8444-555555555555",
+            &"b".repeat(64),
+            "identity",
+            "5000000",
+            "existing-wallet",
+            &relay,
+        );
+        let mut request = DirectRequest {
+            account_id: "b".repeat(64),
+            identity_commitment: "identity".into(),
+            request_id: "relay-withdrawal:11111111-2222-4333-8444-555555555555".into(),
+            request_hash: String::new(),
+            financial_wallet_address: None,
+            action: DirectAction::SettleRelayWithdrawal {
+                relay: relay.clone(),
+                amount_atomic: "5000000".into(),
+                custody_reference: reference,
+            },
+        };
+        request.request_hash = request_hash(&request);
+        ExternalEffectIntent::create_relay_withdrawal(
+            "a".repeat(64),
+            request.request_id,
+            request.request_hash,
+            request.account_id,
+            request.identity_commitment,
+            "5000000".into(),
+            "existing-wallet".into(),
+            "0x1111111111111111111111111111111111111111".into(),
+            "7".into(),
+            "180000".into(),
+            "2000000000".into(),
+            "1000000000".into(),
+            100,
+            relay,
+        )
+        .unwrap()
+    }
+
+    fn relay_success_evidence(intent: &ExternalEffectIntent) -> (Value, Value, String, String) {
+        let relay = intent.relay.as_ref().unwrap();
+        let intake = format!("0x{}", "55".repeat(32));
+        let destination = format!("0x{}", "66".repeat(32));
+        let status = json!({
+            "status": "success",
+            "requestId": relay.request_id,
+            "inTxHashes": [intake],
+            "txHashes": [destination],
+            "originChainId": 8453,
+            "destinationChainId": relay.destination_chain_id,
+        });
+        let details = json!({"requests": [{
+            "id": relay.request_id,
+            "status": "success",
+            "recipient": relay.recipient,
+            "depositAddress": {"address": relay.deposit_address, "type": "strict"},
+            "data": {
+                "inTxs": [{"txHash": intake, "chainId": 8453, "status": "success"}],
+                "outTxs": [{"txHash": destination, "chainId": relay.destination_chain_id, "status": "success"}],
+                "route": {
+                    "quoted": {
+                        "origin": {"inputCurrency": {"currency": {"chainId": 8453, "address": BASE_USDC_ADDRESS}, "amount": intent.amount_atomic}},
+                        "destination": {"outputCurrency": {"currency": {"chainId": relay.destination_chain_id, "address": relay.destination_currency}, "amount": relay.quoted_destination_amount_atomic}}
+                    },
+                    "actual": {
+                        "destination": {"outputCurrency": {"currency": {"chainId": relay.destination_chain_id, "address": relay.destination_currency}, "amount": "4985000"}}
+                    }
+                }
+            }
+        }]});
+        (status, details, intake, destination)
+    }
+
+    #[test]
+    fn relay_intake_never_finalizes_private_withdrawal_while_destination_is_pending() {
+        let intent = relay_intent();
+        let relay = intent.relay.as_ref().unwrap();
+        let intake = format!("0x{}", "55".repeat(32));
+        let observation = classify_relay_destination_finality(
+            &intent,
+            "privy-transaction".into(),
+            intake.clone(),
+            &json!({
+                "status": "pending", "requestId": relay.request_id,
+                "inTxHashes": [intake], "originChainId": 8453,
+                "destinationChainId": relay.destination_chain_id,
+            }),
+            &Value::Null,
+        )
+        .unwrap();
+        assert!(matches!(
+            intent.recovery_action(200, observation),
+            ExternalEffectRecovery::AwaitExternalFinality
+        ));
+    }
+
+    #[test]
+    fn relay_success_binds_exact_route_destination_result_and_replays_identically() {
+        let intent = relay_intent();
+        let (status, details, intake, destination) = relay_success_evidence(&intent);
+        let observation = classify_relay_destination_finality(
+            &intent,
+            "privy-transaction".into(),
+            intake,
+            &status,
+            &details,
+        )
+        .unwrap();
+        let terminal = intent.recovery_action(200, observation);
+        assert!(matches!(
+            terminal,
+            ExternalEffectRecovery::BindRelayFinalized { .. }
+        ));
+        let first = request_for_external_effect(&intent, terminal.clone()).unwrap();
+        let replay = request_for_external_effect(&intent, terminal).unwrap();
+        assert_eq!(first, replay);
+        assert_eq!(first.request_hash, intent.request_hash);
+        assert!(
+            matches!(first.action, DirectAction::SettleRelayWithdrawal { custody_reference, .. }
+            if custody_reference.contains(&destination))
+        );
+    }
+
+    #[test]
+    fn relay_conflicting_recipient_amount_or_transaction_fails_closed() {
+        let intent = relay_intent();
+        let (status, mut details, intake, _) = relay_success_evidence(&intent);
+        details["requests"][0]["recipient"] = json!("0x9999999999999999999999999999999999999999");
+        assert_eq!(
+            classify_relay_destination_finality(
+                &intent,
+                "privy-transaction".into(),
+                intake.clone(),
+                &status,
+                &details,
+            )
+            .unwrap(),
+            layrs_direct_execution_v1::ExternalEffectObservation::Conflict,
+        );
+        let (status, mut details, _, _) = relay_success_evidence(&intent);
+        details["requests"][0]["data"]["route"]["actual"]["destination"]["outputCurrency"]
+            ["amount"] = json!("1");
+        assert_eq!(
+            classify_relay_destination_finality(
+                &intent,
+                "privy-transaction".into(),
+                intake,
+                &status,
+                &details,
+            )
+            .unwrap(),
+            layrs_direct_execution_v1::ExternalEffectObservation::Conflict,
+        );
+    }
     #[test]
     fn privy_session_derivation_is_epoch_bound_and_deterministic() {
         let secret = b"p".repeat(32);
@@ -3955,6 +4649,7 @@ mod tests {
             "request-1",
             destination,
             "1000000",
+            None,
         )
         .unwrap();
         assert!(matches!(
