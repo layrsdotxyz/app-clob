@@ -227,8 +227,13 @@ Resources:
                 ).hexdigest(),
             }
             if "${ExecutionMode}" in ("admission-enabled", "production-enabled"):
-                writer_grant = base64.b64decode("${WriterGrantBase64}", validate=True).decode("utf-8")
-                runtime_binding = base64.b64decode("${ApprovedRuntimeBindingBase64}", validate=True).decode("utf-8")
+                # CloudFormation callers commonly construct these values from
+                # line-oriented JSON tools.  Remove only trailing record
+                # delimiters before writing the systemd EnvironmentFile;
+                # otherwise systemd preserves them as literal ``\\n`` bytes
+                # and serde_json correctly rejects the grant as extra data.
+                writer_grant = base64.b64decode("${WriterGrantBase64}", validate=True).decode("utf-8").rstrip("\r\n")
+                runtime_binding = base64.b64decode("${ApprovedRuntimeBindingBase64}", validate=True).decode("utf-8").rstrip("\r\n")
                 json.loads(writer_grant)
                 json.loads(runtime_binding)
                 values.update({
