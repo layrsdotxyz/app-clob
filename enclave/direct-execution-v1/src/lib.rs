@@ -46,6 +46,7 @@ pub const TRANSACTION_MODEL: &str = "layrs.direct-execution.v1";
 pub const PROJECTION_SCHEMA_VERSION: u32 = 1;
 pub const IDENTITY_ADMISSION_DOMAIN: &str = "layrs.direct-identity-admission.v1\0";
 pub const MARKET_REGISTRATION_DOMAIN: &str = "layrs.direct-market-registration.v1\0";
+pub const MARKET_RESOLUTION_DOMAIN: &str = "layrs.direct-market-resolution.v1\0";
 pub const BALANCE_RECOVERY_DOMAIN: &str = "layrs.direct-balance-recovery.v1\0";
 /// Existing production recovery-evidence KMS signer.  This public key is
 /// deliberately compiled into the measured enclave so the untrusted parent
@@ -591,6 +592,73 @@ pub struct GovernedMarketRegistration {
     pub signature: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DirectResolutionOutcome {
+    Up,
+    Down,
+    Push,
+}
+
+/// A terminal, governance-signed market outcome.  It is executed as one
+/// synchronous direct request and persisted through the same immutable state
+/// artifact as orders; it is not a queued or resumable lifecycle record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GovernedMarketResolution {
+    pub resolution_id: String,
+    pub epoch_id: String,
+    pub runtime: String,
+    pub market_id: String,
+    pub outcome: DirectResolutionOutcome,
+    pub evidence_sha256: String,
+    pub resolved_at_millis: i64,
+    pub expires_at_unix: u64,
+    pub governance_key_id: String,
+    pub signing_algorithm: String,
+    pub signature: String,
+}
+
+impl GovernedMarketResolution {
+    pub fn verify(&self, now_unix: u64) -> bool {
+        if self.resolution_id.is_empty()
+            || self.epoch_id != EPOCH_ID
+            || self.runtime != TRANSACTION_MODEL
+            || self.market_id.is_empty()
+            || self.evidence_sha256.len() != 64
+            || !self
+                .evidence_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || self.resolved_at_millis <= 0
+            || self.resolved_at_millis > now_unix.saturating_mul(1_000) as i64
+            || self.expires_at_unix <= now_unix
+            || self.governance_key_id != GOVERNANCE_KEY_ID
+            || self.signing_algorithm != GOVERNANCE_SIGNING_ALGORITHM
+        {
+            return false;
+        }
+        let Ok(public_key_der) = STANDARD.decode(GOVERNANCE_PUBLIC_KEY_DER_BASE64) else {
+            return false;
+        };
+        let Ok(verifying_key) = VerifyingKey::from_public_key_der(&public_key_der) else {
+            return false;
+        };
+        let mut unsigned = self.clone();
+        unsigned.signature.clear();
+        let Ok(payload) = serde_json::to_vec(&(MARKET_RESOLUTION_DOMAIN, unsigned)) else {
+            return false;
+        };
+        let Ok(signature_der) = STANDARD.decode(&self.signature) else {
+            return false;
+        };
+        let Ok(signature) = Signature::from_der(&signature_der) else {
+            return false;
+        };
+        verifying_key.verify(&payload, &signature).is_ok()
+    }
+}
+
 impl GovernedMarketRegistration {
     pub fn verify(&self, now_unix: u64) -> bool {
         if self.registration_id.is_empty()
@@ -709,6 +777,10 @@ pub enum DirectAction {
         registration: GovernedMarketRegistration,
         now_unix: u64,
     },
+    ResolveMarket {
+        resolution: GovernedMarketResolution,
+        now_unix: u64,
+    },
     GovernedBalanceRecovery {
         recovery: GovernedBalanceRecovery,
         now_unix: u64,
@@ -785,6 +857,8 @@ pub struct DirectReceipt {
     pub amount_atomic: Option<String>,
     pub custody_reference: Option<String>,
     pub execution: Option<OrderExecution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<DirectResolutionExecution>,
     /// Exact post-request balance rows for every identity touched by the
     /// request. These signed rows feed PostgreSQL's disposable read model;
     /// recovery continues to use only the encrypted state artifact.
@@ -843,6 +917,88 @@ pub struct OrderExecution {
     pub trades: Vec<TradeExecution>,
 }
 
+/// Authenticated private trading state returned directly by the enclave.  It
+/// is a read-only view of the recovered authoritative state; PostgreSQL is not
+/// consulted and producing it creates no request, receipt, or artifact.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectPortfolio {
+    pub identity_commitment: String,
+    pub balances: Vec<DirectPortfolioBalance>,
+    pub positions: Vec<DirectPortfolioPosition>,
+    pub open_orders: Vec<DirectPortfolioOrder>,
+    pub registered_market_ids: Vec<String>,
+    pub genesis_ordinal: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectPortfolioBalance {
+    pub asset: String,
+    pub bucket: String,
+    pub amount_atomic: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectPortfolioPosition {
+    pub market_id: String,
+    pub outcome: Outcome,
+    pub available_quantity_micros: String,
+    pub total_quantity_micros: String,
+    pub cost_basis_atomic: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectPortfolioOrder {
+    pub order_id: String,
+    pub market_id: String,
+    pub outcome: Outcome,
+    pub action: OrderAction,
+    pub price_micros: u64,
+    pub quantity_micros: String,
+    pub filled_quantity_micros: String,
+    pub remaining_quantity_micros: String,
+    pub time_in_force: TimeInForce,
+    pub expires_at_millis: Option<i64>,
+    pub status: OrderStatus,
+    pub hold_atomic: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectResolutionExecution {
+    pub resolution_id: String,
+    pub market_id: String,
+    pub outcome: DirectResolutionOutcome,
+    pub evidence_sha256: String,
+    pub cancelled_order_count: usize,
+    pub settled_position_count: usize,
+    pub gross_payout_atomic: String,
+    pub rounding_reserve_atomic: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct DirectMarketResolutionRecord {
+    outcome: DirectResolutionOutcome,
+    evidence_sha256: String,
+    resolved_at_millis: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectMarketStatus {
+    pub market: MarketConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_outcome: Option<DirectResolutionOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_evidence_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at_millis: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct OrderReservation {
@@ -862,7 +1018,9 @@ pub struct DirectRuntime {
     position_holds: BTreeMap<String, u128>,
     position_cost_basis: BTreeMap<(String, String, Outcome), u128>,
     market_collateral: BTreeMap<String, u128>,
+    resolved_markets: BTreeMap<String, DirectMarketResolutionRecord>,
     fee_revenue_atomic: u128,
+    rounding_reserve_atomic: u128,
     /// Finalized external inflows are consumed exactly once across every
     /// account and request id. The reference is derived from the Base
     /// transaction hash after the parent has independently verified the
@@ -965,7 +1123,11 @@ struct DirectState {
     position_holds: BTreeMap<String, u128>,
     position_cost_basis: BTreeMap<(String, String, Outcome), u128>,
     market_collateral: BTreeMap<String, u128>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    resolved_markets: BTreeMap<String, DirectMarketResolutionRecord>,
     fee_revenue_atomic: u128,
+    #[serde(default)]
+    rounding_reserve_atomic: u128,
     #[serde(default)]
     credited_custody_references: BTreeSet<String>,
     requests: BTreeMap<(String, String), (String, DirectResult)>,
@@ -1190,7 +1352,9 @@ impl DirectRuntime {
             position_holds: BTreeMap::new(),
             position_cost_basis: BTreeMap::new(),
             market_collateral: BTreeMap::new(),
+            resolved_markets: BTreeMap::new(),
             fee_revenue_atomic: 0,
+            rounding_reserve_atomic: 0,
             credited_custody_references: BTreeSet::new(),
             requests: BTreeMap::new(),
             receipt_key,
@@ -1217,12 +1381,17 @@ impl DirectRuntime {
             return Err(RuntimeError::WriterDisabled);
         }
         let admission = matches!(&request.action, DirectAction::AdmitIdentity { .. });
-        let governed_market = matches!(&request.action, DirectAction::RegisterMarket { .. });
-        if self.mode == RuntimeMode::AdmissionOnly && !(admission || governed_market) {
+        let governed_market_registration =
+            matches!(&request.action, DirectAction::RegisterMarket { .. });
+        let governed_market_resolution =
+            matches!(&request.action, DirectAction::ResolveMarket { .. });
+        if self.mode == RuntimeMode::AdmissionOnly && !(admission || governed_market_registration) {
             return Err(RuntimeError::WriterDisabled);
         }
-        if !(admission || governed_market)
-            && !self.owns(&request.account_id, &request.identity_commitment)
+        if !(admission
+            || governed_market_registration
+            || governed_market_resolution
+            || self.owns(&request.account_id, &request.identity_commitment))
         {
             return Err(RuntimeError::IdentityDenied);
         }
@@ -1252,6 +1421,7 @@ impl DirectRuntime {
             return Err(RuntimeError::InvalidRequest);
         }
         let mut execution = None;
+        let mut resolution_execution = None;
         let mut touched_identities = BTreeSet::from([request.identity_commitment.clone()]);
         let (effect, amount_atomic, custody_reference): (String, Option<String>, Option<String>) =
             match &request.action {
@@ -1313,6 +1483,26 @@ impl DirectRuntime {
                         PriceTimeBook::default(),
                     );
                     ("MARKET_REGISTERED".into(), None, None)
+                }
+                DirectAction::ResolveMarket {
+                    resolution,
+                    now_unix,
+                } => {
+                    let valid_authorization = resolution.verify(*now_unix)
+                        || (self.mode == RuntimeMode::IsolatedTest
+                            && resolution.signature == "isolated-market-resolution"
+                            && resolution.expires_at_unix > *now_unix);
+                    if request.account_id != "governance"
+                        || request.identity_commitment != "governance"
+                        || request.request_id != resolution.resolution_id
+                        || !valid_authorization
+                    {
+                        return Err(RuntimeError::InvalidMarket);
+                    }
+                    let (details, identities) = self.resolve_market(resolution)?;
+                    touched_identities.extend(identities);
+                    resolution_execution = Some(details);
+                    ("MARKET_RESOLVED".into(), None, None)
                 }
                 DirectAction::GovernedBalanceRecovery { recovery, now_unix } => {
                     let expected = recovery
@@ -1530,6 +1720,7 @@ impl DirectRuntime {
             amount_atomic,
             custody_reference,
             execution,
+            resolution: resolution_execution,
             projection_balance_updates,
             genesis_ordinal: 0,
             signature: String::new(),
@@ -1683,7 +1874,9 @@ impl DirectRuntime {
             position_holds: self.position_holds.clone(),
             position_cost_basis: self.position_cost_basis.clone(),
             market_collateral: self.market_collateral.clone(),
+            resolved_markets: self.resolved_markets.clone(),
             fee_revenue_atomic: self.fee_revenue_atomic,
+            rounding_reserve_atomic: self.rounding_reserve_atomic,
             credited_custody_references: self.credited_custody_references.clone(),
             requests: self.requests.clone(),
         }
@@ -1754,10 +1947,119 @@ impl DirectRuntime {
         self.position_holds = state.position_holds;
         self.position_cost_basis = state.position_cost_basis;
         self.market_collateral = state.market_collateral;
+        self.resolved_markets = state.resolved_markets;
         self.fee_revenue_atomic = state.fee_revenue_atomic;
+        self.rounding_reserve_atomic = state.rounding_reserve_atomic;
         self.credited_custody_references = state.credited_custody_references;
         self.requests = state.requests;
         Ok(())
+    }
+    fn resolve_market(
+        &mut self,
+        resolution: &GovernedMarketResolution,
+    ) -> Result<(DirectResolutionExecution, BTreeSet<String>), RuntimeError> {
+        let market = self
+            .markets
+            .get(&resolution.market_id)
+            .cloned()
+            .ok_or(RuntimeError::InvalidMarket)?;
+        if self.resolved_markets.contains_key(&resolution.market_id)
+            || resolution.resolved_at_millis < market.closes_at_millis
+        {
+            return Err(RuntimeError::InvalidMarket);
+        }
+
+        let position_keys = self
+            .positions
+            .keys()
+            .filter(|key| key.1 == resolution.market_id && self.total_position(key) > 0)
+            .cloned()
+            .collect::<Vec<_>>();
+        let gross_payout = position_keys.iter().try_fold(0u128, |total, key| {
+            let quantity = self.total_position(key);
+            let payout = match resolution.outcome {
+                DirectResolutionOutcome::Up if key.2 == Outcome::Up => quantity,
+                DirectResolutionOutcome::Down if key.2 == Outcome::Down => quantity,
+                DirectResolutionOutcome::Push => quantity / 2,
+                _ => 0,
+            };
+            total.checked_add(payout).ok_or(RuntimeError::InvalidOrder)
+        })?;
+        let collateral = self
+            .market_collateral
+            .get(&resolution.market_id)
+            .copied()
+            .unwrap_or_default();
+        if gross_payout > collateral {
+            return Err(RuntimeError::InvalidOrder);
+        }
+        let rounding_reserve = collateral - gross_payout;
+
+        // Apply to another clone even though the outer direct request already
+        // executes against a clone.  This keeps direct library callers from
+        // observing a partially applied resolution if an invariant fails.
+        let mut next = self.clone();
+        let order_ids = next
+            .orders
+            .iter()
+            .filter(|(_, record)| {
+                record.order.market_id == resolution.market_id
+                    && matches!(
+                        record.order.status,
+                        OrderStatus::Open | OrderStatus::PartiallyFilled
+                    )
+            })
+            .map(|(order_id, record)| (order_id.clone(), record.order.private_user_id.clone()))
+            .collect::<Vec<_>>();
+        let mut touched = BTreeSet::new();
+        for (order_id, owner) in &order_ids {
+            next.cancel_order(owner, order_id)?;
+            touched.insert(owner.clone());
+        }
+        for key in &position_keys {
+            let quantity = next.positions.get(key).copied().unwrap_or_default();
+            let payout = match resolution.outcome {
+                DirectResolutionOutcome::Up if key.2 == Outcome::Up => quantity,
+                DirectResolutionOutcome::Down if key.2 == Outcome::Down => quantity,
+                DirectResolutionOutcome::Push => quantity / 2,
+                _ => 0,
+            };
+            if payout > 0 {
+                next.add(&key.0, "USER_AVAILABLE", payout)?;
+            }
+            next.positions.remove(key);
+            next.position_cost_basis.remove(key);
+            touched.insert(key.0.clone());
+        }
+        next.position_cost_basis
+            .retain(|(_, market_id, _), _| market_id != &resolution.market_id);
+        next.market_collateral.remove(&resolution.market_id);
+        next.rounding_reserve_atomic = next
+            .rounding_reserve_atomic
+            .checked_add(rounding_reserve)
+            .ok_or(RuntimeError::InvalidOrder)?;
+        next.resolved_markets.insert(
+            resolution.market_id.clone(),
+            DirectMarketResolutionRecord {
+                outcome: resolution.outcome,
+                evidence_sha256: resolution.evidence_sha256.clone(),
+                resolved_at_millis: resolution.resolved_at_millis,
+            },
+        );
+        *self = next;
+        Ok((
+            DirectResolutionExecution {
+                resolution_id: resolution.resolution_id.clone(),
+                market_id: resolution.market_id.clone(),
+                outcome: resolution.outcome,
+                evidence_sha256: resolution.evidence_sha256.clone(),
+                cancelled_order_count: order_ids.len(),
+                settled_position_count: position_keys.len(),
+                gross_payout_atomic: gross_payout.to_string(),
+                rounding_reserve_atomic: rounding_reserve.to_string(),
+            },
+            touched,
+        ))
     }
     #[allow(clippy::too_many_arguments)]
     fn place_order(
@@ -1780,6 +2082,9 @@ impl DirectRuntime {
             .get(market_id)
             .cloned()
             .ok_or(RuntimeError::InvalidMarket)?;
+        if self.resolved_markets.contains_key(market_id) {
+            return Err(RuntimeError::InvalidMarket);
+        }
         validate_direct_market(&market, now_millis)?;
         if self.orders.contains_key(order_id)
             || now_millis < market.opens_at_millis
@@ -2351,6 +2656,108 @@ impl DirectRuntime {
             .copied()
             .unwrap_or(0)
     }
+    pub fn portfolio(&self, identity: &str) -> Result<DirectPortfolio, RuntimeError> {
+        let balances = self
+            .balances
+            .get(identity)
+            .ok_or(RuntimeError::IdentityDenied)?
+            .iter()
+            .map(|((asset, bucket), amount)| DirectPortfolioBalance {
+                asset: asset.clone(),
+                bucket: bucket.clone(),
+                amount_atomic: amount.to_string(),
+            })
+            .collect();
+        let mut position_keys = self
+            .positions
+            .keys()
+            .filter(|(owner, _, _)| owner == identity)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        position_keys.extend(
+            self.orders
+                .values()
+                .filter(|record| {
+                    record.order.private_user_id == identity
+                        && record.order.action == OrderAction::Sell
+                        && record.hold_atomic > 0
+                })
+                .map(|record| {
+                    (
+                        identity.to_string(),
+                        record.order.market_id.clone(),
+                        record.order.outcome,
+                    )
+                }),
+        );
+        let positions = position_keys
+            .into_iter()
+            .filter_map(|key| {
+                let available = self.positions.get(&key).copied().unwrap_or_default();
+                let total = self.total_position(&key);
+                (total > 0).then(|| DirectPortfolioPosition {
+                    market_id: key.1.clone(),
+                    outcome: key.2,
+                    available_quantity_micros: available.to_string(),
+                    total_quantity_micros: total.to_string(),
+                    cost_basis_atomic: self
+                        .position_cost_basis
+                        .get(&key)
+                        .copied()
+                        .unwrap_or_default()
+                        .to_string(),
+                })
+            })
+            .collect();
+        let open_orders = self
+            .orders
+            .values()
+            .filter(|record| {
+                record.order.private_user_id == identity
+                    && matches!(
+                        record.order.status,
+                        OrderStatus::Open | OrderStatus::PartiallyFilled
+                    )
+            })
+            .map(|record| DirectPortfolioOrder {
+                order_id: record.order.order_id.to_string(),
+                market_id: record.order.market_id.clone(),
+                outcome: record.order.outcome,
+                action: record.order.action,
+                price_micros: record.order.price_micros,
+                quantity_micros: record.order.quantity_micros.to_string(),
+                filled_quantity_micros: record.order.filled_micros.to_string(),
+                remaining_quantity_micros: record.order.remaining_micros.to_string(),
+                time_in_force: record.order.time_in_force,
+                expires_at_millis: record.order.expires_at_millis,
+                status: record.order.status,
+                hold_atomic: record.hold_atomic.to_string(),
+            })
+            .collect();
+        Ok(DirectPortfolio {
+            identity_commitment: identity.to_string(),
+            balances,
+            positions,
+            open_orders,
+            registered_market_ids: self
+                .markets
+                .keys()
+                .filter(|market_id| !self.resolved_markets.contains_key(*market_id))
+                .cloned()
+                .collect(),
+            genesis_ordinal: self.committed_sequence(),
+        })
+    }
+    pub fn market_status(&self, market_id: &str) -> Option<DirectMarketStatus> {
+        let market = self.markets.get(market_id)?.clone();
+        let resolution = self.resolved_markets.get(market_id);
+        Some(DirectMarketStatus {
+            market,
+            resolution_outcome: resolution.map(|value| value.outcome),
+            resolution_evidence_sha256: resolution.map(|value| value.evidence_sha256.clone()),
+            resolved_at_millis: resolution.map(|value| value.resolved_at_millis),
+        })
+    }
     pub fn owns(&self, subject: &str, identity: &str) -> bool {
         self.subject_identities
             .get(subject)
@@ -2580,6 +2987,13 @@ pub enum RuntimeRequest {
         asset: String,
         bucket: String,
     },
+    Portfolio {
+        account_id: String,
+        identity_commitment: String,
+    },
+    MarketStatus {
+        market_id: String,
+    },
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
@@ -2613,6 +3027,12 @@ pub enum RuntimeResponse {
     },
     Balance {
         amount_atomic: String,
+    },
+    Portfolio {
+        portfolio: DirectPortfolio,
+    },
+    MarketStatus {
+        market: Option<DirectMarketStatus>,
     },
     Error {
         code: String,
@@ -2844,6 +3264,38 @@ mod tests {
             action: DirectAction::RegisterMarket {
                 registration,
                 now_unix: 1,
+            },
+        };
+        request.request_hash = request_hash(&request);
+        request
+    }
+    fn market_resolution_request(
+        market_id: &str,
+        request_id: &str,
+        outcome: DirectResolutionOutcome,
+    ) -> DirectRequest {
+        let resolution = GovernedMarketResolution {
+            resolution_id: request_id.into(),
+            epoch_id: EPOCH_ID.into(),
+            runtime: TRANSACTION_MODEL.into(),
+            market_id: market_id.into(),
+            outcome,
+            evidence_sha256: "a".repeat(64),
+            resolved_at_millis: 10_000_000,
+            expires_at_unix: 20_000,
+            governance_key_id: GOVERNANCE_KEY_ID.into(),
+            signing_algorithm: GOVERNANCE_SIGNING_ALGORITHM.into(),
+            signature: "isolated-market-resolution".into(),
+        };
+        let mut request = DirectRequest {
+            account_id: "governance".into(),
+            identity_commitment: "governance".into(),
+            request_id: request_id.into(),
+            request_hash: String::new(),
+            financial_wallet_address: None,
+            action: DirectAction::ResolveMarket {
+                resolution,
+                now_unix: 10_000,
             },
         };
         request.request_hash = request_hash(&request);
@@ -3214,6 +3666,20 @@ mod tests {
                 .unwrap_err(),
             RuntimeError::WriterDisabled,
         );
+        runtime.markets.insert(
+            "layrs:v5:BTC:USDC:15m:admission-resolution-denied".into(),
+            isolated_market("layrs:v5:BTC:USDC:15m:admission-resolution-denied"),
+        );
+        assert_eq!(
+            runtime
+                .execute(market_resolution_request(
+                    "layrs:v5:BTC:USDC:15m:admission-resolution-denied",
+                    "admission-market-resolution",
+                    DirectResolutionOutcome::Push,
+                ))
+                .unwrap_err(),
+            RuntimeError::WriterDisabled,
+        );
     }
 
     #[test]
@@ -3290,6 +3756,15 @@ mod tests {
         assert_eq!(runtime.market_collateral.get(MARKET), Some(&1_000_000));
         assert_eq!(runtime.fee_revenue_atomic, 16_800);
         assert_eq!(store.artifacts().unwrap().len(), 3);
+        let portfolio = runtime.portfolio(TAKER_IDENTITY).unwrap();
+        assert_eq!(portfolio.identity_commitment, TAKER_IDENTITY);
+        assert_eq!(portfolio.registered_market_ids, vec![MARKET]);
+        assert_eq!(portfolio.open_orders.len(), 0);
+        assert_eq!(portfolio.positions.len(), 1);
+        assert_eq!(portfolio.positions[0].market_id, MARKET);
+        assert_eq!(portfolio.positions[0].outcome, Outcome::Down);
+        assert_eq!(portfolio.positions[0].total_quantity_micros, "1000000");
+        assert_eq!(portfolio.genesis_ordinal, 3);
 
         let mut restored = DirectRuntime::restore_committed(
             epoch,
@@ -3315,6 +3790,268 @@ mod tests {
         );
         assert_eq!(restored.fee_revenue_atomic, 16_800);
         assert_eq!(store.artifacts().unwrap().len(), 3);
+        assert_eq!(restored.portfolio(TAKER_IDENTITY).unwrap(), portfolio);
+        assert_eq!(
+            restored.portfolio(&"f".repeat(64)).unwrap_err(),
+            RuntimeError::IdentityDenied
+        );
+    }
+
+    #[test]
+    fn governed_market_resolution_pays_once_closes_market_and_survives_restart() {
+        const MARKET: &str = "layrs:v5:BTC:USDC:15m:direct-resolution-fixture";
+        const MAKER_IDENTITY: &str =
+            "0bafc03d08d4951d769d58284db85c7ac2ee3c79de87ec680f58edc03017c418";
+        const TAKER_SUBJECT: &str =
+            "bae54f222a79c2ea394fa5b087d6a843e4b82562d0f3dfa33b8149b4beea21b3";
+        const TAKER_IDENTITY: &str =
+            "9bf6b307e41f94a5f5ec4211d2ac9eb5e4f2743b25224573391d7e8903276481";
+        let epoch = SealedEpoch::load(epoch_path()).unwrap();
+        let mut runtime =
+            DirectRuntime::new(epoch.clone(), RuntimeMode::IsolatedTest, vec![7; 32]).unwrap();
+        let mut store = InMemoryDirectStateStore::default();
+        runtime
+            .execute_committed(
+                market_registration_request(MARKET, "resolution-market"),
+                &[8; 32],
+                &mut store,
+            )
+            .unwrap();
+        runtime
+            .execute_committed(
+                request(
+                    "resolution-maker",
+                    DirectAction::PlaceOrder {
+                        order_id: "55555555-6666-4777-8888-999999999999".into(),
+                        market_id: MARKET.into(),
+                        outcome: Outcome::Up,
+                        action: OrderAction::Buy,
+                        price_micros: 400_000,
+                        quantity_micros: "1000000".into(),
+                        time_in_force: TimeInForce::Gtc,
+                        expires_at_millis: None,
+                        now_millis: 1_000,
+                    },
+                ),
+                &[8; 32],
+                &mut store,
+            )
+            .unwrap();
+        runtime
+            .execute_committed(
+                request_for(
+                    TAKER_SUBJECT,
+                    TAKER_IDENTITY,
+                    "resolution-taker",
+                    DirectAction::PlaceOrder {
+                        order_id: "66666666-7777-4888-8999-000000000000".into(),
+                        market_id: MARKET.into(),
+                        outcome: Outcome::Down,
+                        action: OrderAction::Buy,
+                        price_micros: 600_000,
+                        quantity_micros: "1000000".into(),
+                        time_in_force: TimeInForce::Gtc,
+                        expires_at_millis: None,
+                        now_millis: 2_000,
+                    },
+                ),
+                &[8; 32],
+                &mut store,
+            )
+            .unwrap();
+        runtime
+            .execute_committed(
+                request(
+                    "resolution-resting-order",
+                    DirectAction::PlaceOrder {
+                        order_id: "88888888-9999-4000-8111-222222222222".into(),
+                        market_id: MARKET.into(),
+                        outcome: Outcome::Up,
+                        action: OrderAction::Buy,
+                        price_micros: 300_000,
+                        quantity_micros: "1000000".into(),
+                        time_in_force: TimeInForce::Gtc,
+                        expires_at_millis: None,
+                        now_millis: 3_000,
+                    },
+                ),
+                &[8; 32],
+                &mut store,
+            )
+            .unwrap();
+        let maker_before = runtime.balance(MAKER_IDENTITY, "USDC", "USER_AVAILABLE")
+            + runtime.balance(MAKER_IDENTITY, "USDC", "USER_ORDER_HOLD");
+        let taker_before = runtime.balance(TAKER_IDENTITY, "USDC", "USER_AVAILABLE");
+        let resolution = market_resolution_request(
+            MARKET,
+            "resolution-up-terminal",
+            DirectResolutionOutcome::Up,
+        );
+        let resolved = runtime
+            .execute_committed(resolution.clone(), &[8; 32], &mut store)
+            .unwrap();
+        assert_eq!(resolved.effect, "MARKET_RESOLVED");
+        let details = resolved.receipt.resolution.as_ref().unwrap();
+        assert_eq!(details.outcome, DirectResolutionOutcome::Up);
+        assert_eq!(details.gross_payout_atomic, "1000000");
+        assert_eq!(details.rounding_reserve_atomic, "0");
+        assert_eq!(details.cancelled_order_count, 1);
+        assert_eq!(details.settled_position_count, 2);
+        assert_eq!(
+            runtime.balance(MAKER_IDENTITY, "USDC", "USER_AVAILABLE"),
+            maker_before + 1_000_000
+        );
+        assert_eq!(
+            runtime.balance(MAKER_IDENTITY, "USDC", "USER_ORDER_HOLD"),
+            0
+        );
+        assert_eq!(
+            runtime.balance(TAKER_IDENTITY, "USDC", "USER_AVAILABLE"),
+            taker_before
+        );
+        assert!(runtime
+            .portfolio(MAKER_IDENTITY)
+            .unwrap()
+            .positions
+            .is_empty());
+        assert!(runtime
+            .portfolio(TAKER_IDENTITY)
+            .unwrap()
+            .positions
+            .is_empty());
+        assert!(!runtime
+            .portfolio(MAKER_IDENTITY)
+            .unwrap()
+            .registered_market_ids
+            .contains(&MARKET.to_string()));
+        let status = runtime.market_status(MARKET).unwrap();
+        assert_eq!(status.market.market_id, MARKET);
+        assert_eq!(status.resolution_outcome, Some(DirectResolutionOutcome::Up));
+        assert_eq!(status.resolution_evidence_sha256, Some("a".repeat(64)));
+        assert_eq!(store.artifacts().unwrap().len(), 5);
+
+        let mut restarted = DirectRuntime::restore_committed(
+            epoch,
+            RuntimeMode::IsolatedTest,
+            vec![7; 32],
+            &[8; 32],
+            &store,
+        )
+        .unwrap();
+        assert_eq!(
+            restarted
+                .execute_committed(resolution, &[8; 32], &mut store)
+                .unwrap(),
+            resolved
+        );
+        assert_eq!(store.artifacts().unwrap().len(), 5);
+        assert_eq!(
+            restarted
+                .execute(request(
+                    "post-resolution-order",
+                    DirectAction::PlaceOrder {
+                        order_id: "77777777-8888-4999-8000-111111111111".into(),
+                        market_id: MARKET.into(),
+                        outcome: Outcome::Up,
+                        action: OrderAction::Buy,
+                        price_micros: 500_000,
+                        quantity_micros: "1000000".into(),
+                        time_in_force: TimeInForce::Gtc,
+                        expires_at_millis: None,
+                        now_millis: 10_000_001,
+                    },
+                ))
+                .unwrap_err(),
+            RuntimeError::InvalidMarket
+        );
+    }
+
+    #[test]
+    fn push_resolution_moves_indivisible_dust_to_rounding_reserve() {
+        const MARKET: &str = "layrs:v5:BTC:USDC:15m:direct-push-rounding-fixture";
+        const TAKER_SUBJECT: &str =
+            "bae54f222a79c2ea394fa5b087d6a843e4b82562d0f3dfa33b8149b4beea21b3";
+        const TAKER_IDENTITY: &str =
+            "9bf6b307e41f94a5f5ec4211d2ac9eb5e4f2743b25224573391d7e8903276481";
+        let epoch = SealedEpoch::load(epoch_path()).unwrap();
+        let mut runtime =
+            DirectRuntime::new(epoch.clone(), RuntimeMode::IsolatedTest, vec![7; 32]).unwrap();
+        let mut store = InMemoryDirectStateStore::default();
+        runtime
+            .execute_committed(
+                market_registration_request(MARKET, "push-market"),
+                &[8; 32],
+                &mut store,
+            )
+            .unwrap();
+        runtime
+            .execute_committed(
+                request(
+                    "push-maker",
+                    DirectAction::PlaceOrder {
+                        order_id: "12345678-1111-4111-8111-111111111111".into(),
+                        market_id: MARKET.into(),
+                        outcome: Outcome::Up,
+                        action: OrderAction::Buy,
+                        price_micros: 400_000,
+                        quantity_micros: "3".into(),
+                        time_in_force: TimeInForce::Gtc,
+                        expires_at_millis: None,
+                        now_millis: 1_000,
+                    },
+                ),
+                &[8; 32],
+                &mut store,
+            )
+            .unwrap();
+        runtime
+            .execute_committed(
+                request_for(
+                    TAKER_SUBJECT,
+                    TAKER_IDENTITY,
+                    "push-taker",
+                    DirectAction::PlaceOrder {
+                        order_id: "12345678-2222-4222-8222-222222222222".into(),
+                        market_id: MARKET.into(),
+                        outcome: Outcome::Down,
+                        action: OrderAction::Buy,
+                        price_micros: 600_000,
+                        quantity_micros: "3".into(),
+                        time_in_force: TimeInForce::Gtc,
+                        expires_at_millis: None,
+                        now_millis: 2_000,
+                    },
+                ),
+                &[8; 32],
+                &mut store,
+            )
+            .unwrap();
+        let resolved = runtime
+            .execute_committed(
+                market_resolution_request(MARKET, "push-terminal", DirectResolutionOutcome::Push),
+                &[8; 32],
+                &mut store,
+            )
+            .unwrap();
+        let details = resolved.receipt.resolution.as_ref().unwrap();
+        assert_eq!(details.gross_payout_atomic, "2");
+        assert_eq!(details.rounding_reserve_atomic, "1");
+        assert_eq!(runtime.rounding_reserve_atomic, 1);
+        assert!(!runtime.market_collateral.contains_key(MARKET));
+
+        let restored = DirectRuntime::restore_committed(
+            epoch,
+            RuntimeMode::IsolatedTest,
+            vec![7; 32],
+            &[8; 32],
+            &store,
+        )
+        .unwrap();
+        assert_eq!(restored.rounding_reserve_atomic, 1);
+        assert_eq!(
+            restored.market_status(MARKET).unwrap().resolution_outcome,
+            Some(DirectResolutionOutcome::Push)
+        );
     }
 
     #[test]

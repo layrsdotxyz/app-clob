@@ -32,10 +32,10 @@ use layrs_direct_execution_v1::{
     DirectAction, DirectReceipt, DirectRequest, DirectResult, DirectStateArtifact, DurabilityAck,
     ExternalEffectIntent, ExternalEffectRecovery, FilesystemImmutableArtifactStore,
     FilesystemImmutableIntentStore, GovernedBalanceRecovery, GovernedKeyReleaseArtifact,
-    GovernedMarketRegistration, ImmutableExternalEffectIntentStore, OrderAction, Outcome,
-    ProjectionBalanceRow, ProjectionIdentityRow, ProjectionWalletRow, RuntimeMeasurementBinding,
-    RuntimeRequest, RuntimeResponse, SealedEpoch, TimeInForce, WriterGrant, EPOCH_ID,
-    POSTGRES_PROJECTION_DDL,
+    GovernedMarketRegistration, GovernedMarketResolution, ImmutableExternalEffectIntentStore,
+    OrderAction, Outcome, ProjectionBalanceRow, ProjectionIdentityRow, ProjectionWalletRow,
+    RuntimeMeasurementBinding, RuntimeRequest, RuntimeResponse, SealedEpoch, TimeInForce,
+    WriterGrant, EPOCH_ID, POSTGRES_PROJECTION_DDL,
 };
 use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
@@ -1325,6 +1325,11 @@ struct MarketRegistrationCommand {
     registration: GovernedMarketRegistration,
 }
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MarketResolutionCommand {
+    resolution: GovernedMarketResolution,
+}
+#[derive(Deserialize)]
 #[serde(
     tag = "type",
     rename_all = "SCREAMING_SNAKE_CASE",
@@ -1516,6 +1521,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/attestation", get(attestation))
         .route("/v1/runtime/status", get(status))
         .route("/v1/operator/markets", post(register_market))
+        .route("/v1/operator/markets/resolve", post(resolve_market))
+        .route("/v1/operator/markets/:market_id", get(market_status))
         .route(
             "/v1/operator/balance-recoveries",
             post(apply_balance_recovery),
@@ -1523,6 +1530,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/direct/admissions", post(admit_identity))
         .route("/v1/direct/commands", post(command))
         .route("/v1/direct/balances/:identity", get(balance))
+        .route("/v1/direct/portfolio/:identity", get(portfolio))
         .with_state(state);
     // The packaged and dormant runtime is loopback-only.  A governed BFF
     // deployment may opt in to a VPC listener only when production mode is
@@ -1910,6 +1918,66 @@ async fn register_market(
     }
 }
 
+async fn market_status(
+    State(state): State<AppState>,
+    Path(market_id): Path<String>,
+) -> impl IntoResponse {
+    match exchange(&state, RuntimeRequest::MarketStatus { market_id }).await {
+        Ok(RuntimeResponse::MarketStatus { market }) => Json(serde_json::json!({
+            "market": market
+        }))
+        .into_response(),
+        Ok(RuntimeResponse::Error { code }) => {
+            (StatusCode::SERVICE_UNAVAILABLE, code).into_response()
+        }
+        _ => (StatusCode::BAD_GATEWAY, "ENCLOSURE_UNAVAILABLE").into_response(),
+    }
+}
+
+async fn resolve_market(
+    State(state): State<AppState>,
+    Json(body): Json<MarketResolutionCommand>,
+) -> impl IntoResponse {
+    if env::var("LAYRS_DIRECT_EXECUTION_MODE").as_deref() != Ok("production-enabled") {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_DISABLED").into_response();
+    }
+    let now = now_unix();
+    if !body.resolution.verify(now) {
+        return (StatusCode::FORBIDDEN, "MARKET_RESOLUTION_SIGNATURE_INVALID").into_response();
+    }
+    let mut request = DirectRequest {
+        account_id: "governance".into(),
+        identity_commitment: "governance".into(),
+        request_id: body.resolution.resolution_id.clone(),
+        request_hash: String::new(),
+        financial_wallet_address: None,
+        action: DirectAction::ResolveMarket {
+            resolution: body.resolution,
+            now_unix: now,
+        },
+    };
+    request.request_hash = request_hash(&request);
+    let _guard = state.financial_gate.lock().await;
+    match exchange_direct(&state, request).await {
+        Ok(RuntimeResponse::Execute { result }) => {
+            if let Some(projection) = &state.projection {
+                if projection.record_result(&result).await.is_err() {
+                    return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE")
+                        .into_response();
+                }
+            } else if !state.isolated_test {
+                return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_NOT_CONFIGURED")
+                    .into_response();
+            }
+            Json(result).into_response()
+        }
+        Ok(RuntimeResponse::Error { code }) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, code).into_response()
+        }
+        _ => (StatusCode::BAD_GATEWAY, "ENCLOSURE_UNAVAILABLE").into_response(),
+    }
+}
+
 async fn apply_balance_recovery(
     State(state): State<AppState>,
     Json(recovery): Json<GovernedBalanceRecovery>,
@@ -2207,6 +2275,29 @@ async fn balance(
         _ => (StatusCode::BAD_GATEWAY, "ENCLOSURE_UNAVAILABLE").into_response(),
     }
 }
+async fn portfolio(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(identity): Path<String>,
+) -> impl IntoResponse {
+    let claims = match authenticated(&headers, &state) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match exchange(
+        &state,
+        RuntimeRequest::Portfolio {
+            account_id: claims.subject_hash.clone(),
+            identity_commitment: identity,
+        },
+    )
+    .await
+    {
+        Ok(RuntimeResponse::Portfolio { portfolio }) => encrypted(&claims, &portfolio),
+        Ok(RuntimeResponse::Error { code }) => (StatusCode::FORBIDDEN, code).into_response(),
+        _ => (StatusCode::BAD_GATEWAY, "ENCLOSURE_UNAVAILABLE").into_response(),
+    }
+}
 fn authenticated(
     headers: &HeaderMap,
     state: &AppState,
@@ -2340,6 +2431,7 @@ impl Projection {
             ("direct_execution_accounting_events", "SELECT,INSERT"),
             ("direct_execution_order_events", "SELECT,INSERT"),
             ("direct_execution_trade_events", "SELECT,INSERT"),
+            ("direct_execution_market_resolutions", "SELECT,INSERT"),
             ("direct_execution_writer_fence", "SELECT"),
             ("direct_execution_writer_grants", "SELECT"),
         ];
@@ -2499,6 +2591,17 @@ impl Projection {
                     &[&trade.trade_id, &receipt.receipt_id, &EPOCH_ID, &trade.market_id, &trade.maker_order_id, &trade.taker_order_id, &trade_outcome, &match_type, &trade.executed_quantity_micros, &(trade.execution_price_micros as i64), &trade.fee_atomic],
                 ).await.map_err(|_| ProjectionError::Database)?;
             }
+        }
+        if let Some(resolution) = &receipt.resolution {
+            let outcome = enum_name(&resolution.outcome)?;
+            let cancelled_order_count = i64::try_from(resolution.cancelled_order_count)
+                .map_err(|_| ProjectionError::Database)?;
+            let settled_position_count = i64::try_from(resolution.settled_position_count)
+                .map_err(|_| ProjectionError::Database)?;
+            self.client.execute(
+                "INSERT INTO direct_execution_market_resolutions (receipt_id, epoch_id, resolution_id, market_id, outcome, evidence_sha256, cancelled_order_count, settled_position_count, gross_payout_atomic, rounding_reserve_atomic) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::text::numeric,$10::text::numeric) ON CONFLICT DO NOTHING",
+                &[&receipt.receipt_id, &EPOCH_ID, &resolution.resolution_id, &resolution.market_id, &outcome, &resolution.evidence_sha256, &cancelled_order_count, &settled_position_count, &resolution.gross_payout_atomic, &resolution.rounding_reserve_atomic],
+            ).await.map_err(|_| ProjectionError::Database)?;
         }
         Ok(())
     }
@@ -3800,6 +3903,7 @@ mod tests {
                 amount_atomic: Some("1000000".into()),
                 custody_reference: Some(custody_reference.clone()),
                 execution: None,
+                resolution: None,
                 projection_balance_updates: vec![],
                 genesis_ordinal: 0,
                 signature: "signature".into(),

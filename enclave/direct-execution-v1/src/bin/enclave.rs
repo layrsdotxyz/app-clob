@@ -186,6 +186,40 @@ where
                 }
             }
         }
+        RuntimeRequest::Portfolio {
+            account_id,
+            identity_commitment,
+        } => {
+            let state = state.lock().await;
+            if !state.recovery_complete {
+                RuntimeResponse::Error {
+                    code: "DIRECT_STATE_RECOVERY_REQUIRED".into(),
+                }
+            } else if !state.runtime.owns(&account_id, &identity_commitment) {
+                RuntimeResponse::Error {
+                    code: "IDENTITY_DENIED".into(),
+                }
+            } else {
+                match state.runtime.portfolio(&identity_commitment) {
+                    Ok(portfolio) => RuntimeResponse::Portfolio { portfolio },
+                    Err(_) => RuntimeResponse::Error {
+                        code: "IDENTITY_DENIED".into(),
+                    },
+                }
+            }
+        }
+        RuntimeRequest::MarketStatus { market_id } => {
+            let state = state.lock().await;
+            if !state.recovery_complete {
+                RuntimeResponse::Error {
+                    code: "DIRECT_STATE_RECOVERY_REQUIRED".into(),
+                }
+            } else {
+                RuntimeResponse::MarketStatus {
+                    market: state.runtime.market_status(&market_id),
+                }
+            }
+        }
     };
     write_frame(
         &mut stream,
@@ -728,9 +762,9 @@ mod tests {
     use super::*;
     use layrs_direct_execution_v1::{
         artifact_hash, identity_commitment_for, request_hash, DirectAction, DirectRequest,
-        DurabilityAck, FeeProfileId, FilesystemImmutableArtifactStore, GovernedMarketRegistration,
-        MarketConfig, MarketExecution, OrderAction, Outcome, TimeInForce, EPOCH_ID,
-        TRANSACTION_MODEL,
+        DirectResolutionOutcome, DurabilityAck, FeeProfileId, FilesystemImmutableArtifactStore,
+        GovernedMarketRegistration, GovernedMarketResolution, MarketConfig, MarketExecution,
+        OrderAction, Outcome, TimeInForce, EPOCH_ID, TRANSACTION_MODEL,
     };
     use openssl::{
         asn1::Asn1Time,
@@ -825,6 +859,29 @@ mod tests {
                     signature: "isolated-market-release".into(),
                 },
                 now_unix: 1,
+            },
+        )
+    }
+    fn market_resolution(id: &str, market_id: &str) -> DirectRequest {
+        request_for(
+            "governance",
+            "governance",
+            id,
+            DirectAction::ResolveMarket {
+                resolution: GovernedMarketResolution {
+                    resolution_id: id.into(),
+                    epoch_id: EPOCH_ID.into(),
+                    runtime: TRANSACTION_MODEL.into(),
+                    market_id: market_id.into(),
+                    outcome: DirectResolutionOutcome::Up,
+                    evidence_sha256: "a".repeat(64),
+                    resolved_at_millis: 10_000_000,
+                    expires_at_unix: 20_000,
+                    governance_key_id: "isolated".into(),
+                    signing_algorithm: "isolated".into(),
+                    signature: "isolated-market-resolution".into(),
+                },
+                now_unix: 10_000,
             },
         )
     }
@@ -1029,6 +1086,19 @@ mod tests {
         request: DirectRequest,
     ) -> RuntimeResponse {
         let (mut parent, server) = begin(state, request).await;
+        let response = serde_cbor::from_slice(&read_frame(&mut parent).await.unwrap()).unwrap();
+        server.await.unwrap().unwrap();
+        response
+    }
+    async fn runtime_response(
+        state: Arc<Mutex<EnclaveState>>,
+        request: RuntimeRequest,
+    ) -> RuntimeResponse {
+        let (mut parent, enclave) = tokio::io::duplex(MAX_FRAME_BYTES * 2);
+        let server = tokio::spawn(serve(enclave, state));
+        write_frame(&mut parent, &serde_cbor::to_vec(&request).unwrap())
+            .await
+            .unwrap();
         let response = serde_cbor::from_slice(&read_frame(&mut parent).await.unwrap()).unwrap();
         server.await.unwrap().unwrap();
         response
@@ -1518,6 +1588,61 @@ mod tests {
         let replay = execute_response(Arc::clone(&restarted), trade).await;
         assert_eq!(replay, RuntimeResponse::Execute { result: expected });
         assert_eq!(store.load_committed().unwrap().len(), 5);
+        let portfolio = runtime_response(
+            Arc::clone(&restarted),
+            RuntimeRequest::Portfolio {
+                account_id: NEW_SUBJECT.into(),
+                identity_commitment: new_identity.clone(),
+            },
+        )
+        .await;
+        let RuntimeResponse::Portfolio { portfolio } = portfolio else {
+            panic!("expected private portfolio response");
+        };
+        assert_eq!(portfolio.registered_market_ids, vec![MARKET]);
+        assert_eq!(portfolio.positions.len(), 1);
+        assert_eq!(portfolio.positions[0].outcome, Outcome::Down);
+
+        let resolved = commit_through_parent_callback(
+            Arc::clone(&restarted),
+            market_resolution("vsock-resolution", MARKET),
+            &store,
+        )
+        .await;
+        let RuntimeResponse::Execute { result: resolved } = resolved else {
+            panic!("expected terminal resolution result");
+        };
+        assert_eq!(resolved.effect, "MARKET_RESOLVED");
+        assert_eq!(
+            resolved
+                .receipt
+                .resolution
+                .as_ref()
+                .unwrap()
+                .gross_payout_atomic,
+            "1000000"
+        );
+        assert_eq!(store.load_committed().unwrap().len(), 6);
+
+        let after_resolution_restart = state();
+        assert!(matches!(
+            recover(
+                Arc::clone(&after_resolution_restart),
+                store.load_committed().unwrap()
+            )
+            .await,
+            RuntimeResponse::RecoveryComplete {
+                recovered_sequence: 6,
+                ..
+            }
+        ));
+        let replay = execute_response(
+            Arc::clone(&after_resolution_restart),
+            market_resolution("vsock-resolution", MARKET),
+        )
+        .await;
+        assert_eq!(replay, RuntimeResponse::Execute { result: resolved });
+        assert_eq!(store.load_committed().unwrap().len(), 6);
     }
 
     #[tokio::test]

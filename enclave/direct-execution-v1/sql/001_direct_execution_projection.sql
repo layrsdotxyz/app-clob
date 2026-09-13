@@ -133,6 +133,22 @@ CREATE TABLE IF NOT EXISTS direct_execution_trade_events (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS direct_execution_market_resolutions (
+    receipt_id TEXT PRIMARY KEY REFERENCES direct_execution_receipts(receipt_id),
+    epoch_id TEXT NOT NULL,
+    resolution_id TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('UP','DOWN','PUSH')),
+    evidence_sha256 TEXT NOT NULL CHECK (length(evidence_sha256) = 64),
+    cancelled_order_count BIGINT NOT NULL CHECK (cancelled_order_count >= 0),
+    settled_position_count BIGINT NOT NULL CHECK (settled_position_count >= 0),
+    gross_payout_atomic NUMERIC(78,0) NOT NULL,
+    rounding_reserve_atomic NUMERIC(78,0) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (epoch_id, resolution_id),
+    UNIQUE (epoch_id, market_id)
+);
+
 CREATE TABLE IF NOT EXISTS direct_execution_writer_fence (
     epoch_id TEXT PRIMARY KEY,
     old_writer_fence_evidence_sha256 TEXT NOT NULL CHECK (length(old_writer_fence_evidence_sha256) = 64),
@@ -168,7 +184,8 @@ GRANT SELECT, INSERT ON
     direct_execution_custody_events,
     direct_execution_accounting_events,
     direct_execution_order_events,
-    direct_execution_trade_events
+    direct_execution_trade_events,
+    direct_execution_market_resolutions
 TO layrsv2_worker_role;
 GRANT SELECT, INSERT, UPDATE ON direct_execution_epoch_balances
 TO layrsv2_worker_role;
@@ -183,6 +200,7 @@ GRANT SELECT ON
     direct_execution_accounting_events,
     direct_execution_order_events,
     direct_execution_trade_events,
+    direct_execution_market_resolutions,
     direct_execution_writer_fence,
     direct_execution_writer_grants
 TO layrsv2_api_role, layrsv2_auditor_role, layrsv2_operator;
