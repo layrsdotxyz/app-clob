@@ -3154,6 +3154,49 @@ pub fn request_hash(request: &DirectRequest) -> String {
     // exact resulting hash.  This makes startup recovery able to rebuild the
     // same direct request without mutating or extending the intent artifact.
     match &request.action {
+        // `now_unix` is the enclave's observation used only to validate the
+        // signed governance expiry. It is not part of the governed intent.
+        // Excluding it keeps an exact HTTP retry stable across a parent or
+        // enclave restart while the signed object itself remains hash-bound.
+        DirectAction::RegisterMarket {
+            registration,
+            now_unix: _,
+        } => sha256(
+            &serde_json::to_vec(&(
+                request.account_id.as_str(),
+                request.identity_commitment.as_str(),
+                request.request_id.as_str(),
+                "REGISTER_MARKET",
+                registration,
+            ))
+            .expect("serializable governed market registration"),
+        ),
+        DirectAction::ResolveMarket {
+            resolution,
+            now_unix: _,
+        } => sha256(
+            &serde_json::to_vec(&(
+                request.account_id.as_str(),
+                request.identity_commitment.as_str(),
+                request.request_id.as_str(),
+                "RESOLVE_MARKET",
+                resolution,
+            ))
+            .expect("serializable governed market resolution"),
+        ),
+        DirectAction::GovernedBalanceRecovery {
+            recovery,
+            now_unix: _,
+        } => sha256(
+            &serde_json::to_vec(&(
+                request.account_id.as_str(),
+                request.identity_commitment.as_str(),
+                request.request_id.as_str(),
+                "GOVERNED_BALANCE_RECOVERY",
+                recovery,
+            ))
+            .expect("serializable governed balance recovery"),
+        ),
         DirectAction::ReserveWithdrawal {
             destination,
             amount_atomic,
@@ -3495,6 +3538,37 @@ mod tests {
         runtime
             .execute(market_registration_request(market_id, request_id))
             .unwrap();
+    }
+    #[test]
+    fn governed_request_hash_excludes_only_parent_observed_validation_time() {
+        let mut registration = market_registration_request(
+            "layrs:v5:BTC:USDC:15m:governed-replay-hash",
+            "governed-registration-replay-hash",
+        );
+        let original_registration_hash = registration.request_hash.clone();
+        let DirectAction::RegisterMarket { now_unix, .. } = &mut registration.action else {
+            unreachable!()
+        };
+        *now_unix = 2;
+        assert_eq!(request_hash(&registration), original_registration_hash);
+
+        let mut resolution_request = market_resolution_request(
+            "layrs:v5:BTC:USDC:15m:governed-replay-hash",
+            "governed-resolution-replay-hash",
+            DirectResolutionOutcome::Up,
+        );
+        let original_resolution_hash = resolution_request.request_hash.clone();
+        let DirectAction::ResolveMarket { now_unix, .. } = &mut resolution_request.action else {
+            unreachable!()
+        };
+        *now_unix = 10_001;
+        assert_eq!(request_hash(&resolution_request), original_resolution_hash);
+
+        let DirectAction::ResolveMarket { resolution, .. } = &mut resolution_request.action else {
+            unreachable!()
+        };
+        resolution.evidence_sha256 = "b".repeat(64);
+        assert_ne!(request_hash(&resolution_request), original_resolution_hash);
     }
     #[test]
     fn loads_exact_sealed_epoch() {
