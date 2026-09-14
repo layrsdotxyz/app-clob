@@ -1,0 +1,17 @@
+{
+  "recoveryId": "recover-mm02-returned-canary-principal-20260913",
+  "epochId": "layrs-opening-epoch-20260911-941107537728c98b",
+  "runtime": "layrs.direct-execution.v1",
+  "accountId": "7619baaa0831003f3ca58bfcf5b2c773c8bc302a015124b1c432d220ddaa704b",
+  "identityCommitment": "88dff4a4d5ab480024423e999bd92463a6474bb00e56f46c264b944aaba39871",
+  "asset": "USDC",
+  "bucket": "USER_AVAILABLE",
+  "amountAtomic": "5000000",
+  "expectedBalanceBeforeAtomic": "4404611",
+  "evidenceSha256": "79eeb296d8d26ecb4464c649d80bae7a8057b386c766b75bc51486f3d9471143",
+  "reasonCode": "RESTORE_RETURNED_CANARY_PRINCIPAL",
+  "expiresAtUnix": 1789364892,
+  "governanceKeyId": "alias/layrs/production/recovery-evidence-signing",
+  "signingAlgorithm": "ECDSA_SHA_256",
+  "signature": ""
+}
