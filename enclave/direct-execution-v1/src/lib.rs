@@ -46,6 +46,11 @@ pub const EVIDENCE_MANIFEST_SHA256: &str =
     "70e579f630c759258728d91cb957fa84e200674aeebd3eae5997430a62203957";
 pub const TRANSACTION_MODEL: &str = "layrs.direct-execution.v1";
 pub const PROJECTION_SCHEMA_VERSION: u32 = 1;
+/// Domain separator for the browser-verifiable commitment carried in Nitro
+/// attestation `user_data`.  The commitment is fixed-width so it remains well
+/// below Nitro's 512-byte user-data limit even when governed runtime metadata
+/// grows.
+pub const DIRECT_RUNTIME_BINDING_DOMAIN: &[u8] = b"layrs.direct-runtime-binding.v1\0";
 pub const IDENTITY_ADMISSION_DOMAIN: &str = "layrs.direct-identity-admission.v1\0";
 pub const MARKET_REGISTRATION_DOMAIN: &str = "layrs.direct-market-registration.v1\0";
 pub const MARKET_RESOLUTION_DOMAIN: &str = "layrs.direct-market-resolution.v1\0";
@@ -3084,6 +3089,7 @@ pub enum RuntimeResponse {
     Attestation {
         document: Vec<u8>,
         binding: RuntimeBinding,
+        binding_commitment: [u8; 32],
     },
     Status {
         status: RuntimeStatus,
@@ -3141,6 +3147,55 @@ pub struct RuntimeBinding {
     pub key_release_artifact_hash: Option<String>,
 }
 pub type RuntimeStatus = RuntimeBinding;
+
+/// Return the deterministic JSON representation committed by direct-runtime
+/// Nitro evidence. Object keys are lexicographically ordered and optional
+/// fields are absent (never encoded as null). The schema is flat and contains
+/// only JSON strings, booleans and non-negative integers, so this definition
+/// has an exact, dependency-free browser implementation.
+pub fn canonical_runtime_binding(binding: &RuntimeBinding) -> Vec<u8> {
+    let mut fields = BTreeMap::<&str, serde_json::Value>::new();
+    fields.insert("admissionEnabled", binding.admission_enabled.into());
+    fields.insert(
+        "epochStateSha256",
+        binding.epoch_state_sha256.clone().into(),
+    );
+    fields.insert(
+        "evidenceManifestSha256",
+        binding.evidence_manifest_sha256.clone().into(),
+    );
+    fields.insert("genesisOrdinal", binding.genesis_ordinal.into());
+    fields.insert("identityCount", binding.identity_count.into());
+    if let Some(value) = &binding.key_release_artifact_hash {
+        fields.insert("keyReleaseArtifactHash", value.clone().into());
+    }
+    fields.insert(
+        "projectionSchemaVersion",
+        binding.projection_schema_version.into(),
+    );
+    fields.insert("runtime", binding.runtime.clone().into());
+    fields.insert("transactionModel", binding.transaction_model.clone().into());
+    fields.insert("writerEnabled", binding.writer_enabled.into());
+    if let Some(value) = &binding.writer_grant_commitment {
+        fields.insert("writerGrantCommitment", value.clone().into());
+    }
+    if let Some(value) = binding.writer_grant_expires_at_unix {
+        fields.insert("writerGrantExpiresAtUnix", value.into());
+    }
+    // BTreeMap ordering and these JSON scalar types make serialization
+    // infallible. Avoid accepting a caller-supplied serialization of the
+    // binding: the measured enclave owns this exact encoding.
+    serde_json::to_vec(&fields).expect("runtime binding contains JSON scalar values only")
+}
+
+/// SHA-256(domain || canonical RuntimeBinding JSON). The raw 32-byte result is
+/// placed in NSM user_data and also returned by the parent as lowercase hex.
+pub fn runtime_binding_commitment(binding: &RuntimeBinding) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(DIRECT_RUNTIME_BINDING_DOMAIN);
+    digest.update(canonical_runtime_binding(binding));
+    digest.finalize().into()
+}
 pub fn runtime_binding(
     identity_count: usize,
     writer_enabled: bool,
@@ -3438,6 +3493,60 @@ pub const POSTGRES_PROJECTION_DDL: &str =
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn attestation_binding_vector() -> RuntimeBinding {
+        RuntimeBinding {
+            runtime: "layrs.direct-execution.nitro.v1".into(),
+            transaction_model: "layrs.direct-execution.v1".into(),
+            epoch_state_sha256: "11".repeat(32),
+            evidence_manifest_sha256: "22".repeat(32),
+            genesis_ordinal: 0,
+            writer_enabled: true,
+            admission_enabled: false,
+            identity_count: 30,
+            projection_schema_version: 1,
+            writer_grant_commitment: Some("33".repeat(32)),
+            writer_grant_expires_at_unix: Some(1_789_430_400),
+            key_release_artifact_hash: Some("44".repeat(32)),
+        }
+    }
+
+    #[test]
+    fn direct_runtime_attestation_binding_is_canonical_and_tamper_evident() {
+        let binding = attestation_binding_vector();
+        let canonical = canonical_runtime_binding(&binding);
+        assert_eq!(
+            String::from_utf8(canonical).unwrap(),
+            concat!(
+                "{\"admissionEnabled\":false,",
+                "\"epochStateSha256\":\"1111111111111111111111111111111111111111111111111111111111111111\",",
+                "\"evidenceManifestSha256\":\"2222222222222222222222222222222222222222222222222222222222222222\",",
+                "\"genesisOrdinal\":0,\"identityCount\":30,",
+                "\"keyReleaseArtifactHash\":\"4444444444444444444444444444444444444444444444444444444444444444\",",
+                "\"projectionSchemaVersion\":1,",
+                "\"runtime\":\"layrs.direct-execution.nitro.v1\",",
+                "\"transactionModel\":\"layrs.direct-execution.v1\",",
+                "\"writerEnabled\":true,",
+                "\"writerGrantCommitment\":\"3333333333333333333333333333333333333333333333333333333333333333\",",
+                "\"writerGrantExpiresAtUnix\":1789430400}"
+            )
+        );
+        let commitment = runtime_binding_commitment(&binding);
+        assert_eq!(
+            hex::encode(commitment),
+            "979c32717f176b43e5f06004d30cceac55bf4f54c79e1de85d0cad88cad0a20e"
+        );
+
+        let mut tampered = binding.clone();
+        tampered.writer_enabled = false;
+        assert_ne!(runtime_binding_commitment(&tampered), commitment);
+        let mut tampered = binding.clone();
+        tampered.epoch_state_sha256 = "55".repeat(32);
+        assert_ne!(runtime_binding_commitment(&tampered), commitment);
+        let mut tampered = binding;
+        tampered.writer_grant_commitment = None;
+        assert_ne!(runtime_binding_commitment(&tampered), commitment);
+    }
     fn epoch_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../../.codex-review-bundles/unified-direct-execution-20260905/new-epoch-20260911/OPENING_EPOCH_STATE_20260911.json")
     }

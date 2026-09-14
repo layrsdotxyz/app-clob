@@ -1954,7 +1954,22 @@ async fn attestation(
         Ok(value) if (16..=512).contains(&value.len()) => value,
         _ => return (StatusCode::BAD_REQUEST, "INVALID_NONCE").into_response(),
     };
-    match exchange(&state, RuntimeRequest::Attestation { nonce }).await { Ok(RuntimeResponse::Attestation { document, binding }) => Json(serde_json::json!({"attestationDocument": URL_SAFE_NO_PAD.encode(document), "binding": binding})).into_response(), Ok(RuntimeResponse::Error { code }) => (StatusCode::BAD_GATEWAY, code).into_response(), _ => (StatusCode::BAD_GATEWAY, "UNEXPECTED_RESPONSE").into_response() }
+    let request_nonce = URL_SAFE_NO_PAD.encode(&nonce);
+    match exchange(&state, RuntimeRequest::Attestation { nonce }).await {
+        Ok(RuntimeResponse::Attestation {
+            document,
+            binding,
+            binding_commitment,
+        }) => Json(serde_json::json!({
+            "attestationDocument": URL_SAFE_NO_PAD.encode(document),
+            "requestNonce": request_nonce,
+            "binding": binding,
+            "bindingCommitmentSha256": hex::encode(binding_commitment),
+        }))
+        .into_response(),
+        Ok(RuntimeResponse::Error { code }) => (StatusCode::BAD_GATEWAY, code).into_response(),
+        _ => (StatusCode::BAD_GATEWAY, "UNEXPECTED_RESPONSE").into_response(),
+    }
 }
 async fn status(State(state): State<AppState>) -> impl IntoResponse {
     match exchange(&state, RuntimeRequest::Status).await {
