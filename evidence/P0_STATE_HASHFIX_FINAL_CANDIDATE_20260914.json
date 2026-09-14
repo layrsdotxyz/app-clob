@@ -1,0 +1,98 @@
+{
+  "protocol": "layrs.p0-state-hashfix-final-candidate-evidence.v1",
+  "capturedAt": "2026-09-13T23:02:00Z",
+  "status": "VERIFIED_ISOLATED_NOT_DEPLOYED",
+  "source": {
+    "commit": "0d0d560e3a3e271c6f46a130369f01e497998946",
+    "change": "preserve exact pre-upgrade direct-state CBOR/state hash when rounding reserve is zero"
+  },
+  "sealedOpeningState": {
+    "epochId": "layrs-opening-epoch-20260911-941107537728c98b",
+    "epochStateSha256": "84835da82210671d87321a21246317d898afd35381c57be8522df1a516dc3590",
+    "evidenceManifestSha256": "70e579f630c759258728d91cb957fa84e200674aeebd3eae5997430a62203957",
+    "openingRuntimeStateHash": "9fc0fd8e9699d23dcbb6fd85753035896dce219f6551a0540ea352c7089abe98",
+    "transactionModel": "layrs.direct-execution.v1"
+  },
+  "build": {
+    "packerStatus": "SUCCESS",
+    "packerReleaseId": "p0-hashfix-0d0d560-20260914-0402",
+    "amiId": "ami-07bc5e5703da58ace",
+    "amiCreationDate": "2026-09-13T22:39:33.000Z",
+    "snapshotId": "snap-053f5e22cedf00568",
+    "snapshotEncrypted": true,
+    "productionAccess": "denied",
+    "writerEnabledTag": false,
+    "eifSha256": "c18bbd7c01e163d358e1913f02ffb8514f0026592589c5983d38bbd5c0ef0ec6",
+    "enclaveBinarySha256": "cd32464ebfe95828e1d1cc40988049c68b59da988b62644a961802157d6b984e",
+    "parentBinarySha256": "fc0ecc2543667e7265689ad7afd141c9de69dbe02f7ff6922953d09b672c084b",
+    "packerTemplateSha256": "6e4238614ba6f26a87ff794c49ffd5c65b4527e8b2907c166d0c13c38a78a682",
+    "dockerfileSha256": "fcdd71ae9511a40ee891ea0145987eee564ba7d53ce9a2e9aaabf003d400d509",
+    "baseImage": "gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e",
+    "dockerImageId": "ba696936becbb80aeb0d54ce34f38f634938e32583a81ed8c89a316ecca92f00"
+  },
+  "measurements": {
+    "pcr0": "7b8f7d691ea7dff214414da22e6d5e4e68ffc4831d47c255601f3729c57ff56a7755f6833a607d74674585d37f9dd334",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "a21f699dd58e303ead1039e6ed9635d62a07e9968ea38575c92f90f418b708b050bb7e70427284c7ac27598102105be6"
+  },
+  "attestation": {
+    "verifierInstanceId": "i-0fbc74c4b1f410864",
+    "moduleId": "i-0fbc74c4b1f410864-enc01a09cfe217c0d3a",
+    "coseAlgorithm": "ES384",
+    "coseSignatureVerified": true,
+    "certificateChainSignaturesVerified": 5,
+    "nonceMatches": true,
+    "bindingMatches": true,
+    "attestationBytes": 4880,
+    "attestationSha256": "7c0a552938310e063e166799f2c0dd28dcd843cf3ba2ed72bee47274bbeb0d0f"
+  },
+  "tests": {
+    "directCargoAllTargets": {
+      "passed": 58,
+      "failed": 0,
+      "zeroTestTargets": 1
+    },
+    "repositoryCargoAllTargets": {
+      "status": "PASS",
+      "command": "LAYRS_RECOVERY_ENVIRONMENT=development cargo test --locked --all-targets -- --test-threads=1",
+      "thousandOrderTradingStressSeconds": 526.10
+    },
+    "openingStateHash": "PASS",
+    "packagedRuntime": {
+      "transport": "actual HTTP parent to Nitro VSOCK enclave",
+      "marketRegistrationHttpStatus": 200,
+      "marketRegistrationResponseSha256": "d117f8211a304902c88152d527f0070b6a05da48a4504f635f695e4a8b5d13d7",
+      "orderHttpStatus": 200,
+      "orderEncryptedResponseSha256": "33d43165036c669efede3252a0e3c08de5d347051c64e9821384d300ac8188db",
+      "fullParentAndEnclaveRestart": "PASS",
+      "marketRecovered": true,
+      "marketRegistrationExactReplay": "PASS",
+      "orderExactReplay": "PASS",
+      "artifactCountBeforeRestart": 2,
+      "artifactCountAfterRestart": 2,
+      "artifactCountAfterReplay": 2,
+      "artifactHashesUnchanged": true,
+      "artifactSha256": [
+        "f632d7dd049f93334509e67576651daff0e19bf26f67f46fb884fb6a33598b78",
+        "10cd2fa797d5a56935a5c4a03cecef3793c500f9ff710ae6252e92056c2e9b7f"
+      ],
+      "committedHeadSha256": "dc63bebe53d3de09cbb5fe1dbca7b72ae2eb3ebeeb85f9f62decd3648e6f0ac7",
+      "duplicateEffect": false,
+      "custodyCalled": false,
+      "corruptLatestArtifactFailsClosed": true,
+      "missingLatestArtifactFailsClosed": true,
+      "restoredAfterFailureInjection": true
+    }
+  },
+  "safety": {
+    "isolatedOnly": true,
+    "productionDeployed": false,
+    "productionWriterChanged": false,
+    "productionDatabaseTouched": false,
+    "productionCustodyCalled": false,
+    "customerFundsMoved": false,
+    "customerBalancesChanged": false,
+    "greenTouched": false,
+    "sequence75594Touched": false
+  }
+}
