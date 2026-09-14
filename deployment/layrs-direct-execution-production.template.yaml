@@ -227,15 +227,20 @@ Resources:
                 ).hexdigest(),
             }
             if "${ExecutionMode}" in ("admission-enabled", "production-enabled"):
-                # CloudFormation callers commonly construct these values from
-                # line-oriented JSON tools.  Remove only trailing record
-                # delimiters before writing the systemd EnvironmentFile;
-                # otherwise systemd preserves them as literal ``\\n`` bytes
-                # and serde_json correctly rejects the grant as extra data.
-                writer_grant = base64.b64decode("${WriterGrantBase64}", validate=True).decode("utf-8").rstrip("\r\n")
-                runtime_binding = base64.b64decode("${ApprovedRuntimeBindingBase64}", validate=True).decode("utf-8").rstrip("\r\n")
-                json.loads(writer_grant)
-                json.loads(runtime_binding)
+                # EnvironmentFile cannot preserve pretty-printed JSON record
+                # separators: escaped newlines outside JSON strings are not
+                # valid JSON after systemd loads the value.  Parse and emit a
+                # canonical single-line representation before quoting it for
+                # systemd.  This changes only parent bootstrap configuration;
+                # it does not alter the measured enclave/runtime binaries.
+                writer_grant = json.dumps(
+                    json.loads(base64.b64decode("${WriterGrantBase64}", validate=True).decode("utf-8")),
+                    separators=(",", ":"),
+                )
+                runtime_binding = json.dumps(
+                    json.loads(base64.b64decode("${ApprovedRuntimeBindingBase64}", validate=True).decode("utf-8")),
+                    separators=(",", ":"),
+                )
                 values.update({
                     "LAYRS_DIRECT_WRITER_GRANT_JSON": writer_grant,
                     "LAYRS_DIRECT_APPROVED_RUNTIME_BINDING_JSON": runtime_binding,
