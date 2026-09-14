@@ -24,6 +24,13 @@ if (!['--validate', '--preflight', '--execute'].includes(mode)) {
 
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const canonical = (value) => JSON.stringify(value);
+const stableCanonical = (value) => {
+  if (Array.isArray(value)) return `[${value.map(stableCanonical).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableCanonical(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+};
 
 function aws(args, { json = true } = {}) {
   const outputArguments = json ? ['--output', 'json'] : [];
@@ -200,7 +207,7 @@ function validateResult(registration, result) {
 
 function validateMarketReadback(registration, response) {
   const expected = registration.unsignedRegistration.market;
-  if (canonical(response?.market?.market) !== canonical(expected)) {
+  if (stableCanonical(response?.market?.market) !== stableCanonical(expected)) {
     throw new Error(`market readback mismatch for ${registration.marketId}`);
   }
 }
