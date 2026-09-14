@@ -10,9 +10,9 @@ use aws_nitro_enclaves_nsm_api::{
 };
 use hmac::{Hmac, Mac};
 use layrs_direct_execution_v1::{
-    runtime_binding, DirectRuntime, InMemoryDirectStateStore, RuntimeMeasurementBinding,
-    RuntimeMode, RuntimeRequest, RuntimeResponse, SealedEpoch, WriterGrant, EPOCH_ID,
-    TRANSACTION_MODEL,
+    runtime_binding, runtime_binding_commitment, DirectRuntime, InMemoryDirectStateStore,
+    RuntimeMeasurementBinding, RuntimeMode, RuntimeRequest, RuntimeResponse, SealedEpoch,
+    WriterGrant, EPOCH_ID, TRANSACTION_MODEL,
 };
 use openssl::{
     cms::CmsContentInfo,
@@ -705,23 +705,23 @@ async fn attest(state: &Arc<Mutex<EnclaveState>>, nonce: Vec<u8>) -> RuntimeResp
         state.writer_grant_expires_at_unix,
         state.key_release_artifact_hash.clone(),
     );
-    let user_data = match serde_json::to_vec(&binding) {
-        Ok(value) => value,
-        Err(_) => {
-            return RuntimeResponse::Error {
-                code: "BINDING_ENCODE_FAILED".into(),
-            }
-        }
-    };
+    let binding_commitment = runtime_binding_commitment(&binding);
     match nsm_process_request(
         state.nsm_fd,
         NsmRequest::Attestation {
-            user_data: Some(user_data.into()),
+            // Fixed 32-byte commitment. The complete binding is returned next
+            // to the document and is accepted only when its recomputed,
+            // domain-separated hash equals these attested bytes.
+            user_data: Some(binding_commitment.to_vec().into()),
             nonce: Some(nonce.into()),
             public_key: None,
         },
     ) {
-        NsmResponse::Attestation { document } => RuntimeResponse::Attestation { document, binding },
+        NsmResponse::Attestation { document } => RuntimeResponse::Attestation {
+            document,
+            binding,
+            binding_commitment,
+        },
         _ => RuntimeResponse::Error {
             code: "ATTESTATION_FAILED".into(),
         },
