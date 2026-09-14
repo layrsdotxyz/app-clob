@@ -1,0 +1,95 @@
+{
+  "schema": "layrs.mm02-recovery-renewal-blocker-evidence.v1",
+  "verifiedAt": "2026-09-14T03:52:48Z",
+  "status": "AWAITING_FRESH_GOVERNANCE_SIGNATURE",
+  "existingSignedAuthorization": {
+    "path": ".codex-worktrees/direct-lifecycle-20260912/evidence/MM02_RETURNED_CANARY_PRINCIPAL_RECOVERY_SIGNED_20260913.json",
+    "sha256": "aee029dffd1084877fd8efce37f42f931a6621b6f0adef940a43dc9aa61d3ab4",
+    "signingPayloadSha256": "222c9b5aa356eb53adae2e1cdd7dbcb57e361b5d1b65f9fdb291ad08df542001",
+    "kmsSignatureValid": true,
+    "expiresAtUnix": 1789357049,
+    "expiresAt": "2026-09-14T03:37:29Z",
+    "expired": true
+  },
+  "failClosedProof": {
+    "ssmCommandId": "d946f2ee-1bdd-44ef-8e9a-0bed9ee0c0e2",
+    "httpStatus": 403,
+    "error": "BALANCE_RECOVERY_SIGNATURE_INVALID",
+    "financialMutation": false
+  },
+  "runtime": {
+    "instanceId": "i-041785209e534c1c2",
+    "statusSsmCommandId": "0229f31b-c1bf-4ce3-9eb7-dcefc4bd3956",
+    "transactionModel": "layrs.direct-execution.v1",
+    "epochStateSha256": "84835da82210671d87321a21246317d898afd35381c57be8522df1a516dc3590",
+    "writerEnabled": true,
+    "admissionEnabled": true,
+    "writerGrantCommitment": "fc5d056da5250e56752b6ffd757bc0e7d394cc4bf3c11275c96bbf25b2098264"
+  },
+  "authoritativeReadProof": {
+    "ssmCommandId": "17dc127b-7dc7-49f0-ab80-ecef7056b764",
+    "ordinal": 10,
+    "mm02": {
+      "identityCommitment": "88dff4a4d5ab480024423e999bd92463a6474bb00e56f46c264b944aaba39871",
+      "availableAtomic": "4404611",
+      "withdrawalHoldAtomic": "0",
+      "orderHoldAtomic": "0",
+      "positions": 0,
+      "openOrders": 0
+    },
+    "signupWallet511": {
+      "authSubjectHash": "bae54f222a79c2ea394fa5b087d6a843e4b82562d0f3dfa33b8149b4beea21b3",
+      "emptyIdentityCommitment": "7f4c67c76eed0cdf7e496358af186db61c79c08ffe424f2b3b3e47b7dfb01bea",
+      "fundedIdentityCommitment": "9bf6b307e41f94a5f5ec4211d2ac9eb5e4f2743b25224573391d7e8903276481",
+      "availableAtomic": "5100000",
+      "withdrawalHoldAtomic": "0",
+      "orderHoldAtomic": "0",
+      "positions": 0,
+      "openOrders": 0
+    },
+    "signupWallet7ef8": {
+      "authSubjectHash": "cffdcb64ba7d34e7ee6d523c8d0e3281827ad94d160975df770192dc08a1fcd8",
+      "emptyIdentityCommitment": "1af4f2296c17ce57d8553582095d2e4e70f1bd6eea8c2d29bbb3b1b75a940f74",
+      "fundedIdentityCommitment": "ecefd0c2c92887812ee1f53c38ddf61483900c5d734ee2f4ddfbcc3becea8c6a",
+      "availableAtomic": "4843306",
+      "withdrawalHoldAtomic": "0",
+      "orderHoldAtomic": "0",
+      "positions": 0,
+      "openOrders": 0
+    }
+  },
+  "archiveNoMutationProof": {
+    "artifactCount": 10,
+    "headCount": 10,
+    "latestSequence": 10,
+    "latestStateRoot": "f3718751936087f155fddcac3ad2b01d5ceb8b0ae675fac22ff0400f2c643057"
+  },
+  "baseCustodyObservation": {
+    "chain": "base-mainnet",
+    "pool": "0xb07627b0D646F5c82C8E30975a37650Dc272a35f",
+    "asset": "USDC",
+    "balanceAtomic": "153171859",
+    "mutationPerformed": false
+  },
+  "proposedRenewal": {
+    "unsignedPath": "/tmp/layrs-mm02-recovery-renewal-20260914/MM02_RETURNED_CANARY_PRINCIPAL_RECOVERY_UNSIGNED_RENEWAL_20260914.json",
+    "unsignedSha256": "a15a78d300abe0a77b2defce10b6d118f82c3fd58727b8113940ce7dd5d18578",
+    "signingPayloadSha256": "ec229c1e5a2c0d412783a502456c1f84768246dd7a520e543d5661057d0ad63d",
+    "expiresAtUnix": 1789364892,
+    "expiresAt": "2026-09-14T05:48:12Z",
+    "sameRecoveryId": true,
+    "sameEvidence": true,
+    "expectedBalanceBeforeAtomic": "4404611",
+    "amountAtomic": "5000000",
+    "expectedBalanceAfterAtomic": "9404611"
+  },
+  "governanceSigner": {
+    "alias": "alias/layrs/production/recovery-evidence-signing",
+    "arn": "arn:aws:kms:us-east-1:082223548516:key/4a6aab45-cb27-48b6-903e-2499bf251224",
+    "keySpec": "ECC_NIST_P256",
+    "keyUsage": "SIGN_VERIFY",
+    "signingAlgorithm": "ECDSA_SHA_256",
+    "enabled": true
+  },
+  "requiredExternalAction": "Authorized governance signer signs the exact proposed renewal payload before 2026-09-14T05:48:12Z. No other engineering or financial prerequisite is missing for this recovery."
+}
