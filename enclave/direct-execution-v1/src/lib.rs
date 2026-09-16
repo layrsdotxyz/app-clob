@@ -796,6 +796,7 @@ pub enum DirectAction {
         amount_atomic: String,
         custody_reference: String,
     },
+    CreditZenDeposit { amount_atomic: String, custody_reference: String },
     PlaceOrder {
         order_id: String,
         market_id: String,
@@ -815,6 +816,8 @@ pub enum DirectAction {
         amount_atomic: String,
         custody_reference: String,
     },
+    ReserveZenWithdrawal { destination_chain: String, destination: String, amount_atomic: String, custody_reference: String },
+    RecordZenWithdrawalReverted { destination_chain: String, destination: String, amount_atomic: String, custody_reference: String },
     /// Cross-chain withdrawal whose Base transfer is only Relay intake.  This
     /// action is constructed exclusively after Relay reports a destination
     /// success bound to the immutable route and exact result hashes.
@@ -1040,6 +1043,8 @@ pub struct DirectRuntime {
     market_collateral: BTreeMap<String, u128>,
     resolved_markets: BTreeMap<String, DirectMarketResolutionRecord>,
     fee_revenue_atomic: u128,
+    zen_fee_revenue_atomic: u128,
+    zen_rounding_reserve_atomic: u128,
     rounding_reserve_atomic: u128,
     /// Finalized external inflows are consumed exactly once across every
     /// account and request id. The reference is derived from the Base
@@ -1146,6 +1151,10 @@ struct DirectState {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     resolved_markets: BTreeMap<String, DirectMarketResolutionRecord>,
     fee_revenue_atomic: u128,
+    #[serde(default, skip_serializing_if = "is_zero_u128")]
+    zen_fee_revenue_atomic: u128,
+    #[serde(default, skip_serializing_if = "is_zero_u128")]
+    zen_rounding_reserve_atomic: u128,
     // This field was added after the opening lineage already had committed
     // artifacts.  Omitting its zero value preserves the exact pre-upgrade
     // CBOR and therefore the predecessor/state hashes for that lineage.
@@ -1381,6 +1390,8 @@ impl DirectRuntime {
             market_collateral: BTreeMap::new(),
             resolved_markets: BTreeMap::new(),
             fee_revenue_atomic: 0,
+            zen_fee_revenue_atomic: 0,
+            zen_rounding_reserve_atomic: 0,
             rounding_reserve_atomic: 0,
             credited_custody_references: BTreeSet::new(),
             requests: BTreeMap::new(),
@@ -1428,6 +1439,11 @@ impl DirectRuntime {
             .map(str::to_ascii_lowercase);
         match &request.action {
             // Preserve the existing deposit lane unchanged. Base deposit
+            DirectAction::CreditZenDeposit { .. } => {
+                let Some(wallet) = financial_wallet.as_deref() else { return Err(RuntimeError::DestinationDenied); };
+                if !valid_evm_wallet(wallet) || !self.subject_wallets.get(&request.account_id)
+                    .is_some_and(|wallets| wallets.contains(wallet)) { return Err(RuntimeError::DestinationDenied); }
+            }
             // attribution is handled separately and is outside this patch.
             DirectAction::CreditDeposit { .. } => {
                 let Some(wallet) = financial_wallet.as_deref() else {
@@ -1443,7 +1459,9 @@ impl DirectRuntime {
                 }
             }
             DirectAction::ReserveWithdrawal { destination, .. }
-            | DirectAction::RecordWithdrawalReverted { destination, .. } => {
+            | DirectAction::RecordWithdrawalReverted { destination, .. }
+            | DirectAction::ReserveZenWithdrawal { destination, .. }
+            | DirectAction::RecordZenWithdrawalReverted { destination, .. } => {
                 let Some(wallet) = financial_wallet.as_deref() else {
                     return Err(RuntimeError::DestinationDenied);
                 };
@@ -1601,6 +1619,13 @@ impl DirectRuntime {
                         Some(custody_reference.clone()),
                     )
                 }
+                DirectAction::CreditZenDeposit { amount_atomic, custody_reference } => {
+                    let value = amount(amount_atomic)?;
+                    let hash = custody_reference.strip_prefix("horizen-zen-deposit:").filter(|value| valid_transaction_hash_value(value)).ok_or(RuntimeError::InvalidRequest)?;
+                    if !self.credited_custody_references.insert(format!("horizen-zen-deposit:{}", hash.to_ascii_lowercase())) { return Err(RuntimeError::CustodyReferenceReuse); }
+                    self.add_asset(&request.identity_commitment, "ZEN", "USER_AVAILABLE", value)?;
+                    ("DEPOSIT_CREDITED".into(), Some(amount_atomic.clone()), Some(custody_reference.clone()))
+                }
                 DirectAction::PlaceOrder {
                     order_id,
                     market_id,
@@ -1678,6 +1703,19 @@ impl DirectRuntime {
                         Some(amount_atomic.clone()),
                         Some(custody_reference.clone()),
                     )
+                }
+                DirectAction::ReserveZenWithdrawal { destination_chain, destination, amount_atomic, custody_reference }
+                | DirectAction::RecordZenWithdrawalReverted { destination_chain, destination, amount_atomic, custody_reference } => {
+                    let value = amount(amount_atomic)?;
+                    if !matches!(destination_chain.as_str(), "base" | "horizen") || (destination_chain == "base" && value % 1_000_000_000_000 != 0)
+                        || !valid_withdrawal_custody_reference(custody_reference, self.mode)
+                        || financial_wallet.as_deref() != Some(destination.to_ascii_lowercase().as_str()) { return Err(RuntimeError::DestinationDenied); }
+                    if matches!(&request.action, DirectAction::RecordZenWithdrawalReverted { .. }) {
+                        ("WITHDRAWAL_REVERTED".into(), Some(amount_atomic.clone()), Some(custody_reference.clone()))
+                    } else {
+                        self.move_asset_bucket(&request.identity_commitment, "ZEN", "USER_AVAILABLE", "USER_SETTLED", value)?;
+                        ("WITHDRAWAL_SETTLED".into(), Some(amount_atomic.clone()), Some(custody_reference.clone()))
+                    }
                 }
                 DirectAction::SettleRelayWithdrawal {
                     relay,
@@ -1964,6 +2002,8 @@ impl DirectRuntime {
             market_collateral: self.market_collateral.clone(),
             resolved_markets: self.resolved_markets.clone(),
             fee_revenue_atomic: self.fee_revenue_atomic,
+            zen_fee_revenue_atomic: self.zen_fee_revenue_atomic,
+            zen_rounding_reserve_atomic: self.zen_rounding_reserve_atomic,
             rounding_reserve_atomic: self.rounding_reserve_atomic,
             credited_custody_references: self.credited_custody_references.clone(),
             requests: self.requests.clone(),
@@ -2026,6 +2066,8 @@ impl DirectRuntime {
         let state: DirectState =
             serde_cbor::from_slice(&plain).map_err(|_| RuntimeError::StateArtifact)?;
         self.balances = state.balances;
+        self.zen_fee_revenue_atomic = state.zen_fee_revenue_atomic;
+        self.zen_rounding_reserve_atomic = state.zen_rounding_reserve_atomic;
         self.subject_identities = state.subject_identities;
         self.subject_wallets = state.subject_wallets;
         self.markets = state.markets;
@@ -2064,7 +2106,7 @@ impl DirectRuntime {
             .cloned()
             .collect::<Vec<_>>();
         let gross_payout = position_keys.iter().try_fold(0u128, |total, key| {
-            let quantity = self.total_position(key);
+            let quantity = settlement_atomic(&market, self.total_position(key))?;
             let payout = match resolution.outcome {
                 DirectResolutionOutcome::Up if key.2 == Outcome::Up => quantity,
                 DirectResolutionOutcome::Down if key.2 == Outcome::Down => quantity,
@@ -2105,7 +2147,7 @@ impl DirectRuntime {
             touched.insert(owner.clone());
         }
         for key in &position_keys {
-            let quantity = next.positions.get(key).copied().unwrap_or_default();
+            let quantity = settlement_atomic(&market, next.positions.get(key).copied().unwrap_or_default())?;
             let payout = match resolution.outcome {
                 DirectResolutionOutcome::Up if key.2 == Outcome::Up => quantity,
                 DirectResolutionOutcome::Down if key.2 == Outcome::Down => quantity,
@@ -2113,7 +2155,7 @@ impl DirectRuntime {
                 _ => 0,
             };
             if payout > 0 {
-                next.add(&key.0, "USER_AVAILABLE", payout)?;
+                next.add_asset(&key.0, &market.settlement_asset, "USER_AVAILABLE", payout)?;
             }
             next.positions.remove(key);
             next.position_cost_basis.remove(key);
@@ -2122,10 +2164,8 @@ impl DirectRuntime {
         next.position_cost_basis
             .retain(|(_, market_id, _), _| market_id != &resolution.market_id);
         next.market_collateral.remove(&resolution.market_id);
-        next.rounding_reserve_atomic = next
-            .rounding_reserve_atomic
-            .checked_add(rounding_reserve)
-            .ok_or(RuntimeError::InvalidOrder)?;
+        let reserve = if market.settlement_asset == "ZEN" { &mut next.zen_rounding_reserve_atomic } else { &mut next.rounding_reserve_atomic };
+        *reserve = reserve.checked_add(rounding_reserve).ok_or(RuntimeError::InvalidOrder)?;
         next.resolved_markets.insert(
             resolution.market_id.clone(),
             DirectMarketResolutionRecord {
@@ -2202,8 +2242,8 @@ impl DirectRuntime {
             return Err(RuntimeError::InvalidOrder);
         }
         let initial_hold = match action {
-            OrderAction::Buy => order_notional
-                .checked_add(maximum_direct_taker_fee(&market, quantity, price_micros)?)
+            OrderAction::Buy => settlement_atomic(&market, order_notional)?
+                .checked_add(settlement_atomic(&market, maximum_direct_taker_fee(&market, quantity, price_micros)?)?)
                 .ok_or(RuntimeError::InvalidOrder)?,
             OrderAction::Sell => {
                 let available = self.positions.entry(position_key.clone()).or_default();
@@ -2215,7 +2255,7 @@ impl DirectRuntime {
             }
         };
         if action == OrderAction::Buy {
-            self.move_bucket(identity, "USER_AVAILABLE", "USER_ORDER_HOLD", initial_hold)?;
+            self.move_asset_bucket(identity, &market.settlement_asset, "USER_AVAILABLE", "USER_ORDER_HOLD", initial_hold)?;
         }
         let incoming = BookOrder::with_id(
             order_uuid,
@@ -2255,8 +2295,8 @@ impl DirectRuntime {
                 .order(fill.maker_order_id)
                 .cloned()
                 .ok_or(RuntimeError::InvalidOrder)?;
-            let taker_fee =
-                direct_taker_fee(&market, fill.quantity_micros, fill.taker_price_micros())?;
+            let taker_fee = settlement_atomic(&market,
+                direct_taker_fee(&market, fill.quantity_micros, fill.taker_price_micros())?)?;
             total_fee = total_fee
                 .checked_add(taker_fee)
                 .ok_or(RuntimeError::InvalidOrder)?;
@@ -2323,7 +2363,7 @@ impl DirectRuntime {
             total_fee_atomic: total_fee.to_string(),
             resulting_position_micros: self.total_position(&position_key).to_string(),
             resulting_available_atomic: self
-                .balance(identity, "USDC", "USER_AVAILABLE")
+                .balance(identity, &market.settlement_asset, "USER_AVAILABLE")
                 .to_string(),
             trades,
         })
@@ -2337,7 +2377,8 @@ impl DirectRuntime {
         price_micros: u64,
         taker_fee: u128,
     ) -> Result<(), RuntimeError> {
-        let notional = direct_notional(price_micros, quantity)?;
+        let market = self.markets.get(&maker.market_id).cloned().ok_or(RuntimeError::InvalidMarket)?;
+        let notional = settlement_atomic(&market, direct_notional(price_micros, quantity)?)?;
         let (buyer, seller) = if taker.action == OrderAction::Buy {
             (taker, maker)
         } else {
@@ -2359,11 +2400,8 @@ impl DirectRuntime {
         } else {
             notional
         };
-        self.add(&seller.private_user_id, "USER_AVAILABLE", seller_proceeds)?;
-        self.fee_revenue_atomic = self
-            .fee_revenue_atomic
-            .checked_add(taker_fee)
-            .ok_or(RuntimeError::InvalidOrder)?;
+        self.add_asset(&seller.private_user_id, &market.settlement_asset, "USER_AVAILABLE", seller_proceeds)?;
+        self.add_market_fee(&market, taker_fee)?;
         let seller_key = (
             seller.private_user_id.clone(),
             seller.market_id.clone(),
@@ -2410,8 +2448,10 @@ impl DirectRuntime {
         {
             return Err(RuntimeError::InvalidOrder);
         }
-        let maker_amount = direct_notional(maker_price_micros, quantity)?;
-        let taker_amount = quantity
+        let market = self.markets.get(&maker.market_id).cloned().ok_or(RuntimeError::InvalidMarket)?;
+        let collateral_atomic = settlement_atomic(&market, quantity)?;
+        let maker_amount = settlement_atomic(&market, direct_notional(maker_price_micros, quantity)?)?;
+        let taker_amount = collateral_atomic
             .checked_sub(maker_amount)
             .ok_or(RuntimeError::InvalidOrder)?;
         self.debit_order_hold(&maker.order_id.to_string(), maker_amount, true)?;
@@ -2430,12 +2470,9 @@ impl DirectRuntime {
             .get(&maker.market_id)
             .copied()
             .unwrap_or_default()
-            .checked_add(quantity)
+            .checked_add(collateral_atomic)
             .ok_or(RuntimeError::InvalidOrder)?;
-        self.fee_revenue_atomic = self
-            .fee_revenue_atomic
-            .checked_add(taker_fee)
-            .ok_or(RuntimeError::InvalidOrder)?;
+        self.add_market_fee(&market, taker_fee)?;
         for (order, basis) in [(maker, maker_amount), (taker, taker_amount)] {
             let key = (
                 order.private_user_id.clone(),
@@ -2480,26 +2517,26 @@ impl DirectRuntime {
             .market_collateral
             .entry(maker.market_id.clone())
             .or_default();
-        if *collateral < quantity {
+        let market = self.markets.get(&maker.market_id).cloned().ok_or(RuntimeError::InvalidMarket)?;
+        let collateral_atomic = settlement_atomic(&market, quantity)?;
+        if *collateral < collateral_atomic {
             return Err(RuntimeError::InsufficientAvailable);
         }
-        *collateral -= quantity;
-        let maker_amount = direct_notional(maker_price_micros, quantity)?;
-        let taker_amount = quantity
+        *collateral -= collateral_atomic;
+        let maker_amount = settlement_atomic(&market, direct_notional(maker_price_micros, quantity)?)?;
+        let taker_amount = collateral_atomic
             .checked_sub(maker_amount)
             .ok_or(RuntimeError::InvalidOrder)?;
-        self.add(&maker.private_user_id, "USER_AVAILABLE", maker_amount)?;
-        self.add(
+        self.add_asset(&maker.private_user_id, &market.settlement_asset, "USER_AVAILABLE", maker_amount)?;
+        self.add_asset(
             &taker.private_user_id,
+            &market.settlement_asset,
             "USER_AVAILABLE",
             taker_amount
                 .checked_sub(taker_fee)
                 .ok_or(RuntimeError::InvalidOrder)?,
         )?;
-        self.fee_revenue_atomic = self
-            .fee_revenue_atomic
-            .checked_add(taker_fee)
-            .ok_or(RuntimeError::InvalidOrder)?;
+        self.add_market_fee(&market, taker_fee)?;
         self.reduce_position_basis(
             &(
                 maker.private_user_id.clone(),
@@ -2525,7 +2562,7 @@ impl DirectRuntime {
         amount: u128,
         cash: bool,
     ) -> Result<(), RuntimeError> {
-        let owner = {
+        let (owner, market_id) = {
             let reservation = self
                 .orders
                 .get_mut(order_id)
@@ -2537,10 +2574,11 @@ impl DirectRuntime {
                 return Err(RuntimeError::InsufficientAvailable);
             }
             reservation.hold_atomic -= amount;
-            reservation.order.private_user_id.clone()
+            (reservation.order.private_user_id.clone(), reservation.order.market_id.clone())
         };
         if cash {
-            self.subtract_bucket(&owner, "USER_ORDER_HOLD", amount)?;
+            let asset = self.markets.get(&market_id).ok_or(RuntimeError::InvalidMarket)?.settlement_asset.clone();
+            self.subtract_asset(&owner, &asset, "USER_ORDER_HOLD", amount)?;
         }
         Ok(())
     }
@@ -2552,10 +2590,10 @@ impl DirectRuntime {
                 .get(order_id)
                 .ok_or(RuntimeError::UnknownOrder)?;
             let desired = match reservation.order.action {
-                OrderAction::Buy => direct_notional(
+                OrderAction::Buy => settlement_atomic(self.markets.get(&reservation.order.market_id).ok_or(RuntimeError::InvalidMarket)?, direct_notional(
                     reservation.order.price_micros,
                     reservation.order.remaining_micros,
-                )?,
+                )?)?,
                 OrderAction::Sell => reservation.order.remaining_micros,
             };
             if reservation.hold_atomic < desired {
@@ -2576,7 +2614,8 @@ impl DirectRuntime {
         if release > 0 {
             match action {
                 OrderAction::Buy => {
-                    self.move_bucket(&owner, "USER_ORDER_HOLD", "USER_AVAILABLE", release)?
+                    let asset = self.markets.get(&position_key.1).ok_or(RuntimeError::InvalidMarket)?.settlement_asset.clone();
+                    self.move_asset_bucket(&owner, &asset, "USER_ORDER_HOLD", "USER_AVAILABLE", release)?
                 }
                 OrderAction::Sell => {
                     *self.positions.entry(position_key.clone()).or_default() = self
@@ -2621,7 +2660,8 @@ impl DirectRuntime {
         let release = reservation.hold_atomic;
         match reservation.order.action {
             OrderAction::Buy => {
-                self.move_bucket(identity, "USER_ORDER_HOLD", "USER_AVAILABLE", release)?
+                let asset = self.markets.get(&reservation.order.market_id).ok_or(RuntimeError::InvalidMarket)?.settlement_asset.clone();
+                self.move_asset_bucket(identity, &asset, "USER_ORDER_HOLD", "USER_AVAILABLE", release)?
             }
             OrderAction::Sell => {
                 let key = (
@@ -2693,29 +2733,38 @@ impl DirectRuntime {
         Ok(())
     }
 
-    fn subtract_bucket(
-        &mut self,
-        identity: &str,
-        bucket: &str,
-        value: u128,
-    ) -> Result<(), RuntimeError> {
-        let account = self
-            .balances
-            .get_mut(identity)
-            .ok_or(RuntimeError::IdentityDenied)?;
-        let balance = account.entry(("USDC".into(), bucket.into())).or_default();
-        if *balance < value {
-            return Err(RuntimeError::InsufficientAvailable);
-        }
-        *balance -= value;
-        Ok(())
-    }
     fn add(&mut self, identity: &str, bucket: &str, value: u128) -> Result<(), RuntimeError> {
         let account = self
             .balances
             .get_mut(identity)
             .ok_or(RuntimeError::IdentityDenied)?;
         *account.entry(("USDC".into(), bucket.into())).or_default() += value;
+        Ok(())
+    }
+    fn add_asset(&mut self, identity: &str, asset: &str, bucket: &str, value: u128) -> Result<(), RuntimeError> {
+        let account = self.balances.get_mut(identity).ok_or(RuntimeError::IdentityDenied)?;
+        let balance = account.entry((asset.into(), bucket.into())).or_default();
+        *balance = balance.checked_add(value).ok_or(RuntimeError::InvalidRequest)?;
+        Ok(())
+    }
+    fn subtract_asset(&mut self, identity: &str, asset: &str, bucket: &str, value: u128) -> Result<(), RuntimeError> {
+        let account = self.balances.get_mut(identity).ok_or(RuntimeError::IdentityDenied)?;
+        let balance = account.entry((asset.into(), bucket.into())).or_default();
+        *balance = balance.checked_sub(value).ok_or(RuntimeError::InsufficientAvailable)?;
+        Ok(())
+    }
+    fn add_market_fee(&mut self, market: &MarketConfig, value: u128) -> Result<(), RuntimeError> {
+        let balance = if market.settlement_asset == "ZEN" { &mut self.zen_fee_revenue_atomic } else { &mut self.fee_revenue_atomic };
+        *balance = balance.checked_add(value).ok_or(RuntimeError::InvalidOrder)?;
+        Ok(())
+    }
+    fn move_asset_bucket(&mut self, identity: &str, asset: &str, from: &str, to: &str, value: u128) -> Result<(), RuntimeError> {
+        let account = self.balances.get_mut(identity).ok_or(RuntimeError::IdentityDenied)?;
+        let available = *account.get(&(asset.into(), from.into())).unwrap_or(&0);
+        if available < value { return Err(RuntimeError::InsufficientAvailable); }
+        let destination = account.get(&(asset.into(), to.into())).unwrap_or(&0).checked_add(value).ok_or(RuntimeError::InvalidRequest)?;
+        account.insert((asset.into(), from.into()), available - value);
+        account.insert((asset.into(), to.into()), destination);
         Ok(())
     }
     fn move_bucket(
@@ -2891,8 +2940,9 @@ fn validate_direct_market(market: &MarketConfig, now_millis: i64) -> Result<(), 
     let namespace =
         market.market_id.starts_with("layrs:v4:") || market.market_id.starts_with("layrs:v5:");
     if !namespace
-        || market.settlement_asset != "USDC"
-        || market.settlement_decimals != 6
+        || !matches!((market.settlement_asset.as_str(), market.settlement_decimals), ("USDC", 6) | ("ZEN", 18))
+        || (market.settlement_asset == "ZEN" && (!market.market_id.starts_with("layrs:v4:ZEN:") && !market.market_id.starts_with("layrs:v5:ZEN:ZEN:")))
+        || (market.settlement_asset == "ZEN" && market.public_settlement_chain.as_deref() != Some("horizen"))
         || !matches!(
             market.public_settlement_chain.as_deref(),
             None | Some("base" | "horizen")
@@ -2915,6 +2965,16 @@ fn validate_direct_market(market: &MarketConfig, now_millis: i64) -> Result<(), 
     } else {
         Ok(())
     }
+}
+
+/// Books and risk limits stay in token micros; custody balances use token atomics.
+fn settlement_atomic(market: &MarketConfig, micros: u128) -> Result<u128, RuntimeError> {
+    let scale = match (market.settlement_asset.as_str(), market.settlement_decimals) {
+        ("USDC", 6) => 1,
+        ("ZEN", 18) => 1_000_000_000_000,
+        _ => return Err(RuntimeError::InvalidMarket),
+    };
+    micros.checked_mul(scale).ok_or(RuntimeError::InvalidOrder)
 }
 
 fn direct_notional(price_micros: u64, quantity_micros: u128) -> Result<u128, RuntimeError> {
@@ -3224,8 +3284,14 @@ pub fn request_hash(request: &DirectRequest) -> String {
     // intent.  For an immutable external-effect intent the request binds the
     // stable provider reference, while the receipt/artifact still records the
     // exact resulting hash.  This makes startup recovery able to rebuild the
-    // same direct request without mutating or extending the intent artifact.
+        // same direct request without mutating or extending the intent artifact.
     match &request.action {
+        DirectAction::ReserveZenWithdrawal { destination_chain, destination, amount_atomic, custody_reference }
+        | DirectAction::RecordZenWithdrawalReverted { destination_chain, destination, amount_atomic, custody_reference } => {
+            let reference = custody_reference.split_once(':').map(|(reference, _)| reference).unwrap_or(custody_reference);
+            sha256(&serde_json::to_vec(&(request.account_id.as_str(), request.identity_commitment.as_str(), request.request_id.as_str(),
+                "RESERVE_ZEN_WITHDRAWAL", destination_chain, destination.to_ascii_lowercase(), amount_atomic, reference)).expect("ZEN withdrawal binding serializes"))
+        }
         // `now_unix` is the enclave's observation used only to validate the
         // signed governance expiry. It is not part of the governed intent.
         // Excluding it keeps an exact HTTP retry stable across a parent or
@@ -3649,6 +3715,94 @@ mod tests {
             runtime.state_hash(),
             "9fc0fd8e9699d23dcbb6fd85753035896dce219f6551a0540ea352c7089abe98"
         );
+    }
+    #[test]
+    fn all_six_zen_windows_conserve_token_custody_through_fills_cancel_resolution_withdraw_and_restart() {
+        const ONE: u128 = 1_000_000_000_000_000_000;
+        for window in ["15m", "1h", "4h", "1d", "1w", "1mo"] {
+            let epoch = SealedEpoch::load(epoch_path()).unwrap();
+            let mut live = DirectRuntime::new(epoch.clone(), RuntimeMode::IsolatedTest, vec![7;32]).unwrap();
+            let mut store = InMemoryDirectStateStore::default();
+            let market_id = format!("layrs:v4:ZEN:{window}:1789344000");
+            let mut registration = market_registration_request(&market_id,"zen-register");
+            let DirectAction::RegisterMarket { registration: release, .. } = &mut registration.action else { unreachable!() };
+            release.market.settlement_asset = "ZEN".into();
+            release.market.settlement_decimals = 18;
+            release.market.oracle_feed_id = 9001;
+            registration.request_hash = request_hash(&registration);
+            live.execute_committed(registration, &[8;32], &mut store).unwrap();
+            let maker = "a".repeat(64);
+            let taker = "b".repeat(64);
+            let maker_wallet = "0x1111111111111111111111111111111111111111";
+            let taker_wallet = "0x2222222222222222222222222222222222222222";
+            let maker_id = identity_commitment_for(&maker,maker_wallet);
+            let taker_id = identity_commitment_for(&taker,taker_wallet);
+            for (subject,identity,wallet,hash) in [(&maker,&maker_id,maker_wallet,"1"),(&taker,&taker_id,taker_wallet,"2")] {
+                live.execute_committed(request_for(subject,identity,"zen-admit",DirectAction::AdmitIdentity { wallet_address:wallet.into() }),&[8;32],&mut store).unwrap();
+                let mut deposit = request_for(subject,identity,"zen-deposit",DirectAction::CreditZenDeposit {amount_atomic:(3*ONE).to_string(),custody_reference:format!("horizen-zen-deposit:0x{}",hash.repeat(64))});
+                deposit.financial_wallet_address = Some(wallet.into());deposit.request_hash = request_hash(&deposit);
+                let result=live.execute_committed(deposit.clone(),&[8;32],&mut store).unwrap();
+                assert_eq!(result.effect,"DEPOSIT_CREDITED");
+                assert_eq!(live.execute_committed(deposit,&[8;32],&mut store).unwrap(),result);
+                assert_eq!(live.balance(identity,"ZEN","USER_AVAILABLE"),3*ONE);
+                assert_eq!(live.balance(identity,"USDC","USER_AVAILABLE"),0);
+            }
+            let mut sequence=0u128;
+            let order = |sequence:&mut u128, subject:&str,identity:&str,outcome,action,price,quantity| {
+                *sequence+=1;
+                let id=Uuid::from_u128(0x11111111222243338444000000000000+*sequence).to_string();
+                (id.clone(),request_for(subject,identity,&format!("zen-order-{sequence}"),DirectAction::PlaceOrder {order_id:id,market_id:market_id.clone(),outcome,action,price_micros:price,quantity_micros:quantity,time_in_force:TimeInForce::Gtc,expires_at_millis:None,now_millis:1000}))
+            };
+            let (_,buy_up)=order(&mut sequence,&maker,&maker_id,Outcome::Up,OrderAction::Buy,400_000,"1000000".into());
+            live.execute_committed(buy_up,&[8;32],&mut store).unwrap();
+            let (_,buy_down)=order(&mut sequence,&taker,&taker_id,Outcome::Down,OrderAction::Buy,600_000,"1000000".into());
+            let fill=live.execute_committed(buy_down.clone(),&[8;32],&mut store).unwrap();
+            assert_eq!(fill.receipt.execution.as_ref().unwrap().trades[0].match_type,MatchType::Mint);
+            assert_eq!(fill.receipt.execution.as_ref().unwrap().total_fee_atomic,"16800000000000000");
+            assert_eq!(live.market_collateral.get(&market_id),Some(&ONE));
+            assert_eq!(live.fee_revenue_atomic,0);
+            let (sell_id,sell_up)=order(&mut sequence,&maker,&maker_id,Outcome::Up,OrderAction::Sell,450_000,"1000000".into());
+            live.execute_committed(sell_up,&[8;32],&mut store).unwrap();
+            let (_,normal_buy)=order(&mut sequence,&taker,&taker_id,Outcome::Up,OrderAction::Buy,450_000,"500000".into());
+            let normal=live.execute_committed(normal_buy,&[8;32],&mut store).unwrap();
+            assert_eq!(normal.receipt.execution.as_ref().unwrap().trades[0].match_type,MatchType::Normal);
+            live.execute_committed(request_for(&maker,&maker_id,"zen-cancel",DirectAction::CancelOrder {order_id:sell_id}),&[8;32],&mut store).unwrap();
+            assert_eq!(live.total_position(&(maker_id.clone(),market_id.clone(),Outcome::Up)),500_000);
+            let (_,merge_up)=order(&mut sequence,&maker,&maker_id,Outcome::Up,OrderAction::Sell,400_000,"500000".into());
+            live.execute_committed(merge_up,&[8;32],&mut store).unwrap();
+            let (_,merge_down)=order(&mut sequence,&taker,&taker_id,Outcome::Down,OrderAction::Sell,600_000,"500000".into());
+            let merge=live.execute_committed(merge_down,&[8;32],&mut store).unwrap();
+            assert_eq!(merge.receipt.execution.as_ref().unwrap().trades[0].match_type,MatchType::Merge);
+            let resolution=market_resolution_request(&market_id,"zen-resolution",DirectResolutionOutcome::Up);
+            let settled=live.execute_committed(resolution.clone(),&[8;32],&mut store).unwrap();
+            assert_eq!(settled.receipt.resolution.as_ref().unwrap().gross_payout_atomic,(ONE/2).to_string());
+            assert_eq!(live.balance(&maker_id,"ZEN","USER_ORDER_HOLD"),0);
+            assert_eq!(live.balance(&taker_id,"ZEN","USER_ORDER_HOLD"),0);
+            assert_eq!(live.balance(&maker_id,"ZEN","USER_AVAILABLE")+live.balance(&taker_id,"ZEN","USER_AVAILABLE")+live.zen_fee_revenue_atomic+live.zen_rounding_reserve_atomic,6*ONE);
+            for chain in ["base","horizen"] {
+                let mut withdrawal=request_for(&maker,&maker_id,&format!("zen-withdraw-{chain}"),DirectAction::ReserveZenWithdrawal {destination_chain:chain.into(),destination:maker_wallet.into(),amount_atomic:(ONE/10).to_string(),custody_reference:format!("isolated-{chain}")});
+                withdrawal.financial_wallet_address=Some(maker_wallet.into());withdrawal.request_hash=request_hash(&withdrawal);
+                live.execute_committed(withdrawal,&[8;32],&mut store).unwrap();
+            }
+            let state_hash=live.state_hash();
+            let mut restored=DirectRuntime::restore_committed(epoch,RuntimeMode::IsolatedTest,vec![7;32],&[8;32],&store).unwrap();
+            assert_eq!(restored.state_hash(),state_hash);
+            assert_eq!(restored.execute_committed(buy_down,&[8;32],&mut store).unwrap(),fill);
+            assert_eq!(restored.execute_committed(resolution,&[8;32],&mut store).unwrap(),settled);
+            assert_eq!(restored.state_hash(),state_hash);
+            assert_eq!(restored.balance(&maker_id,"USDC","USER_AVAILABLE"),0);
+            assert_eq!(restored.balance(&maker_id,"ZEN","USER_SETTLED"),ONE/5);
+        }
+    }
+
+    #[test]
+    fn zen_market_registration_rejects_wrong_token_precision_chain_and_family() {
+        let mut market=isolated_market("layrs:v4:ZEN:15m:1789344000");
+        market.settlement_asset="ZEN".into();market.settlement_decimals=18;
+        assert!(validate_direct_market(&market,1).is_ok());
+        market.settlement_decimals=6;assert!(validate_direct_market(&market,1).is_err());
+        market.settlement_decimals=18;market.public_settlement_chain=Some("base".into());assert!(validate_direct_market(&market,1).is_err());
+        market.public_settlement_chain=Some("horizen".into());market.market_id="layrs:v5:BTC:ZEN:15m:1789344000".into();assert!(validate_direct_market(&market,1).is_err());
     }
     fn isolated_market(market_id: &str) -> MarketConfig {
         MarketConfig {

@@ -117,6 +117,8 @@ pub struct ExternalEffectIntent {
     pub submit_not_after_unix: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<RelayWithdrawalBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zen_destination_chain: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -143,6 +145,8 @@ struct UnsignedIntent<'a> {
     submit_not_after_unix: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     relay: Option<&'a RelayWithdrawalBinding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    zen_destination_chain: Option<&'a String>,
 }
 
 impl ExternalEffectIntent {
@@ -183,6 +187,7 @@ impl ExternalEffectIntent {
             max_priority_fee_per_gas,
             now_unix,
             None,
+            None,
         )
     }
 
@@ -222,7 +227,20 @@ impl ExternalEffectIntent {
             max_priority_fee_per_gas,
             now_unix,
             Some(relay),
+            None,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_zen_withdrawal(
+        prior_state_hash: String, request_id: String, request_hash: String, account_id: String,
+        identity_commitment: String, destination_chain: String, destination: String, amount_atomic: String,
+        provider_wallet_id: String, custody_target: String, transaction_nonce: String, gas_limit: String,
+        max_fee_per_gas: String, max_priority_fee_per_gas: String, now_unix: u64,
+    ) -> Result<Self, RuntimeError> {
+        Self::create_bound(prior_state_hash, request_id, request_hash, account_id, identity_commitment,
+            "horizen".into(), "ZEN".into(), destination, amount_atomic, provider_wallet_id, custody_target,
+            transaction_nonce, gas_limit, max_fee_per_gas, max_priority_fee_per_gas, now_unix, None, Some(destination_chain))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -244,7 +262,14 @@ impl ExternalEffectIntent {
         max_priority_fee_per_gas: String,
         now_unix: u64,
         relay: Option<RelayWithdrawalBinding>,
+        zen_destination_chain: Option<String>,
     ) -> Result<Self, RuntimeError> {
+        if zen_destination_chain.as_ref().is_some_and(|destination_chain|
+            chain != "horizen" || asset != "ZEN" || relay.is_some()
+            || !matches!(destination_chain.as_str(), "base" | "horizen")
+            || (destination_chain == "base" && amount_atomic.parse::<u128>().map_or(true, |value| value % 1_000_000_000_000 != 0))) {
+            return Err(RuntimeError::InvalidRequest);
+        }
         if prior_state_hash.len() != 64
             || request_hash.len() != 64
             || request_id.is_empty()
@@ -308,7 +333,7 @@ impl ExternalEffectIntent {
                 &request_id,
                 &account_id,
                 &identity_commitment,
-                &chain,
+                &zen_destination_chain.as_ref().map_or_else(|| chain.clone(), |destination_chain| format!("horizen-zen-{destination_chain}")),
                 &asset,
                 &normalized_destination,
                 &amount_atomic,
@@ -336,6 +361,7 @@ impl ExternalEffectIntent {
             max_priority_fee_per_gas: &max_priority_fee_per_gas,
             submit_not_after_unix,
             relay: relay.as_ref(),
+            zen_destination_chain: zen_destination_chain.as_ref(),
         };
         let intent_hash = intent_hash(&unsigned)?;
         Ok(Self {
@@ -362,6 +388,7 @@ impl ExternalEffectIntent {
             external_effect_reference,
             submit_not_after_unix,
             relay,
+            zen_destination_chain,
         })
     }
 
@@ -420,6 +447,7 @@ impl ExternalEffectIntent {
             max_priority_fee_per_gas: &self.max_priority_fee_per_gas,
             submit_not_after_unix: self.submit_not_after_unix,
             relay: self.relay.as_ref(),
+            zen_destination_chain: self.zen_destination_chain.as_ref(),
         };
         if let Some(binding) = &self.relay {
             binding.verify(&self.amount_atomic)?;
@@ -428,6 +456,12 @@ impl ExternalEffectIntent {
             {
                 return Err(RuntimeError::StateArtifact);
             }
+        }
+        if self.zen_destination_chain.as_ref().is_some_and(|destination_chain|
+            self.chain != "horizen" || self.asset != "ZEN" || self.relay.is_some()
+            || !matches!(destination_chain.as_str(), "base" | "horizen")
+            || (destination_chain == "base" && self.amount_atomic.parse::<u128>().map_or(true, |value| value % 1_000_000_000_000 != 0))) {
+            return Err(RuntimeError::StateArtifact);
         }
         let expected_reference = match self.relay.as_ref() {
             Some(binding) => relay_reference_for(
@@ -444,7 +478,7 @@ impl ExternalEffectIntent {
                 &self.request_id,
                 &self.account_id,
                 &self.identity_commitment,
-                &self.chain,
+                &self.zen_destination_chain.as_ref().map_or_else(|| self.chain.clone(), |destination_chain| format!("horizen-zen-{destination_chain}")),
                 &self.asset,
                 &self.destination,
                 &self.amount_atomic,

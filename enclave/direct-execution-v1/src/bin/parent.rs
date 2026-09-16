@@ -77,6 +77,9 @@ const POOL_WITHDRAW_TOPIC: &str =
     "0xcbcdbdf10631a43cc99c80acace8232649421c3f4f73919f16013d47c83a687a";
 const USER_OPERATION_EVENT_TOPIC: &str =
     "0x49628fd1471006c1482da88028e9ce4dbb080b815c9b0344d39e5a8e6ec1419f";
+#[path = "../zen_custody.rs"]
+mod zen_custody;
+use zen_custody::ZenCustodyAdapter;
 #[derive(Clone)]
 struct AppState {
     enclave_cid: u32,
@@ -87,6 +90,7 @@ struct AppState {
     artifact_store: Option<ArchiveStore>,
     commit_ack_key: Vec<u8>,
     custody: Option<PrivyBaseCustodyAdapter>,
+    zen_custody: Option<ZenCustodyAdapter>,
     /// Serializes only the bounded synchronous request and an unresolved
     /// external intent.  It is process memory, never durable workflow state.
     financial_gate: Arc<Mutex<()>>,
@@ -1694,6 +1698,8 @@ enum CustomerAction {
         transaction_hash: String,
         amount_atomic: String,
     },
+    CreditZenDeposit { transaction_hash: String, amount_atomic: String },
+    ReserveZenWithdrawal { destination_chain: String, destination: String, amount_atomic: String },
     PlaceOrder {
         order_id: String,
         market_id: String,
@@ -1836,7 +1842,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         enclave_cid: env::var("LAYRS_ENCLAVE_CID")
             .unwrap_or_else(|_| "16".into())
             .parse()?,
-        session_key,
+        session_key: session_key.clone(),
         isolated_test,
         projection,
         local_used_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -1858,6 +1864,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             None
         },
+        zen_custody: if financial_enabled {
+            ZenCustodyAdapter::from_environment(&session_key).map_err(|error| format!("ZEN custody configuration invalid:{error}"))?
+        } else { None },
         financial_gate: Arc::new(Mutex::new(())),
         committed_state_root: Arc::new(Mutex::new(None)),
         unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
@@ -2010,6 +2019,27 @@ async fn command(
     let _financial_guard = state.financial_gate.lock().await;
     let external_effect_pending = !state.unresolved_external_effects.lock().await.is_empty();
     let action = match body.action {
+        CustomerAction::CreditZenDeposit { transaction_hash, amount_atomic } if !external_effect_pending => {
+            let Some(source) = claims.financial_wallet_address.as_deref() else {return (StatusCode::FORBIDDEN,"DIRECT_FINANCIAL_WALLET_REQUIRED").into_response();};
+            let hash = transaction_hash.to_ascii_lowercase();
+            let reference = format!("horizen-zen-deposit:{hash}");
+            if request_id != reference {return (StatusCode::BAD_REQUEST,"DEPOSIT_IDEMPOTENCY_KEY_MISMATCH").into_response();}
+            let Some(custody) = &state.zen_custody else {return (StatusCode::SERVICE_UNAVAILABLE,"ZEN_CUSTODY_ADAPTER_NOT_ENABLED").into_response();};
+            match custody.deposit_finality(source,&hash,&amount_atomic).await {
+                Ok(DepositFinality::Finalized) => DirectAction::CreditZenDeposit {amount_atomic,custody_reference:reference},
+                Ok(DepositFinality::Pending) => return (StatusCode::SERVICE_UNAVAILABLE,"DEPOSIT_FINALITY_PENDING").into_response(),
+                Ok(DepositFinality::Reverted | DepositFinality::Conflict) => return (StatusCode::CONFLICT,"DEPOSIT_TRANSACTION_BINDING_CONFLICT").into_response(),
+                Err(_) => return (StatusCode::SERVICE_UNAVAILABLE,"DEPOSIT_FINALITY_UNAVAILABLE").into_response(),
+            }
+        }
+        CustomerAction::CreditZenDeposit {..} => return (StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING").into_response(),
+        CustomerAction::ReserveZenWithdrawal {destination_chain,destination,amount_atomic} => {
+            if !matches!(destination_chain.as_str(),"base"|"horizen") {return (StatusCode::BAD_REQUEST,"ZEN_ROUTE_UNSUPPORTED").into_response();}
+            if !claims.financial_wallet_address.as_deref().is_some_and(|signed| signed_base_withdrawal_destination_matches(&destination,signed)) {return (StatusCode::FORBIDDEN,"SIGNED_WITHDRAWAL_DESTINATION_MISMATCH").into_response();}
+            match prepare_zen_withdrawal(&state,&claims,&body.identity_commitment,&request_id,destination_chain,destination,amount_atomic).await {
+                Ok(action)=>action,Err((status,code))=>return (status,code).into_response(),
+            }
+        }
         CustomerAction::CreditDeposit {
             transaction_hash,
             amount_atomic,
@@ -2159,6 +2189,11 @@ async fn command(
     request.request_hash = request_hash(&request);
     match exchange_direct(&state, request).await {
         Ok(RuntimeResponse::Execute { result }) => {
+            if matches!(result.effect.as_str(), "WITHDRAWAL_SETTLED" | "WITHDRAWAL_REVERTED") {
+                state.unresolved_external_effects.lock().await.retain(|_, intent| !(intent.asset == "ZEN"
+                    && intent.account_id == result.receipt.account_id && intent.request_id == result.receipt.request_id
+                    && result.receipt.custody_reference.as_deref().is_some_and(|reference| reference.starts_with(&format!("{}:",intent.external_effect_reference)))));
+            }
             // Session consumption is projection/audit only and happens after
             // authoritative adoption.  A crash after external submission can
             // therefore be recovered from the immutable intent rather than a
@@ -2426,6 +2461,64 @@ async fn apply_balance_recovery(
             (StatusCode::UNPROCESSABLE_ENTITY, code).into_response()
         }
         _ => (StatusCode::BAD_GATEWAY, "ENCLOSURE_UNAVAILABLE").into_response(),
+    }
+}
+
+async fn prepare_zen_withdrawal(
+    state: &AppState, claims: &SessionClaims, identity: &str, request_id: &str,
+    destination_chain: String, destination: String, amount_atomic: String,
+) -> Result<DirectAction,(StatusCode,&'static str)> {
+    let amount = amount_atomic.parse::<u128>().ok().filter(|value|*value>0)
+        .ok_or((StatusCode::BAD_REQUEST,"ZEN_AMOUNT_INVALID"))?;
+    if destination_chain == "base" && amount % 1_000_000_000_000 != 0 {return Err((StatusCode::BAD_REQUEST,"ZEN_BRIDGE_PRECISION_EXCEEDED"));}
+    let custody=state.zen_custody.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE,"ZEN_CUSTODY_ADAPTER_NOT_ENABLED"))?;
+    let store=state.artifact_store.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE,"DIRECT_ARTIFACT_STORE_NOT_CONFIGURED"))?;
+    let intents=store.load_intents().await.map_err(|_|(StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_INTENT_RECOVERY_FAILED"))?;
+    let artifacts=store.load_committed().await.map_err(|_|(StatusCode::SERVICE_UNAVAILABLE,"DIRECT_STATE_RECOVERY_FAILED"))?;
+    let related=intents.iter().filter(|intent|intent.account_id==claims.subject_hash && intent.request_id==request_id).collect::<Vec<_>>();
+    if related.iter().any(|intent|intent.identity_commitment!=identity || intent.asset!="ZEN" || intent.chain!="horizen"
+        || intent.zen_destination_chain.as_ref()!=Some(&destination_chain) || !intent.destination.eq_ignore_ascii_case(&destination)
+        || intent.amount_atomic!=amount_atomic || intent.provider_wallet_id!=custody.wallet_id || intent.custody_target!=custody.pool_address) {
+        return Err((StatusCode::CONFLICT,"EXTERNAL_EFFECT_REPLAY_CONFLICT"));
+    }
+    for intent in &related {
+        if let Some(artifact)=artifacts.iter().find(|artifact|artifact.receipt.account_id==claims.subject_hash && artifact.receipt.request_id==request_id
+            && artifact.receipt.request_hash==intent.request_hash && artifact.receipt.custody_reference.as_deref().is_some_and(|reference|reference.starts_with(&format!("{}:",intent.external_effect_reference)))) {
+            let reference=artifact.receipt.custody_reference.clone().ok_or((StatusCode::CONFLICT,"EXTERNAL_EFFECT_RESULT_CONFLICT"))?;
+            return match artifact.receipt.effect.as_str() {
+                "WITHDRAWAL_SETTLED"=>Ok(DirectAction::ReserveZenWithdrawal {destination_chain,destination,amount_atomic,custody_reference:reference}),
+                "WITHDRAWAL_REVERTED"=>Ok(DirectAction::RecordZenWithdrawalReverted {destination_chain,destination,amount_atomic,custody_reference:reference}),
+                _=>Err((StatusCode::CONFLICT,"EXTERNAL_EFFECT_RESULT_CONFLICT")),
+            };
+        }
+    }
+    let root=state.committed_state_root.lock().await.clone().ok_or((StatusCode::SERVICE_UNAVAILABLE,"DIRECT_STATE_ROOT_UNAVAILABLE"))?;
+    let intent=if let Some(intent)=related.first() {
+        if related.len()!=1 || intent.prior_state_hash!=root {return Err((StatusCode::CONFLICT,"EXTERNAL_EFFECT_LINEAGE_CONFLICT"));}
+        (*intent).clone()
+    } else {
+        if !state.unresolved_external_effects.lock().await.is_empty() {return Err((StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING"));}
+        // Balance comes from the recovered private enclave, not Aurora or UI.
+        let balance=exchange(state,RuntimeRequest::Balance {account_id:claims.subject_hash.clone(),identity_commitment:identity.into(),asset:"ZEN".into(),bucket:"USER_AVAILABLE".into()})
+            .await.map_err(|_|(StatusCode::SERVICE_UNAVAILABLE,"ZEN_BALANCE_UNAVAILABLE"))?;
+        if !matches!(balance,RuntimeResponse::Balance {amount_atomic:available} if available.parse::<u128>().is_ok_and(|value|value>=amount)) {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY,"INSUFFICIENT_AVAILABLE"));
+        }
+        let (nonce,gas,fee,priority)=custody.transaction_parameters().await.map_err(|_|(StatusCode::SERVICE_UNAVAILABLE,"CUSTODY_TRANSACTION_PARAMETERS_UNAVAILABLE"))?;
+        let reference=reference_for(&root,request_id,&claims.subject_hash,identity,&format!("horizen-zen-{destination_chain}"),"ZEN",&destination,&amount_atomic,&custody.wallet_id);
+        let mut request=DirectRequest {account_id:claims.subject_hash.clone(),identity_commitment:identity.into(),request_id:request_id.into(),request_hash:String::new(),
+            financial_wallet_address:claims.financial_wallet_address.clone(),action:DirectAction::ReserveZenWithdrawal {destination_chain:destination_chain.clone(),destination:destination.clone(),amount_atomic:amount_atomic.clone(),custody_reference:reference}};
+        request.request_hash=request_hash(&request);
+        let intent=ExternalEffectIntent::create_zen_withdrawal(root,request_id.into(),request.request_hash,claims.subject_hash.clone(),identity.into(),destination_chain,destination,amount_atomic,
+            custody.wallet_id.clone(),custody.pool_address.clone(),nonce.to_string(),gas.to_string(),fee.to_string(),priority.to_string(),now_unix())
+            .map_err(|_|(StatusCode::BAD_REQUEST,"INVALID_WITHDRAWAL_INTENT"))?;
+        store.persist_intent_readback(&intent).await.map_err(|_|(StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_INTENT_PERSISTENCE_FAILED"))?
+    };
+    // Keep the gate on every ambiguous error and until authoritative adoption.
+    state.unresolved_external_effects.lock().await.insert(intent.intent_hash.clone(),intent.clone());
+    match custody.settle(&intent,now_unix()).await.map_err(|_|(StatusCode::SERVICE_UNAVAILABLE,"CUSTODY_FINALITY_UNAVAILABLE"))? {
+        terminal @ (ExternalEffectRecovery::BindFinalized {..}|ExternalEffectRecovery::BindReverted {..}) => direct_action_for_external_effect(&intent,terminal).map_err(|_|(StatusCode::CONFLICT,"EXTERNAL_EFFECT_RESULT_CONFLICT")),
+        _=>Err((StatusCode::SERVICE_UNAVAILABLE,"CUSTODY_FINALITY_PENDING_FAIL_CLOSED")),
     }
 }
 
@@ -3281,6 +3374,7 @@ fn same_external_effect_request(a: &ExternalEffectIntent, b: &ExternalEffectInte
         && a.provider_wallet_id == b.provider_wallet_id
         && a.custody_target.eq_ignore_ascii_case(&b.custody_target)
         && a.relay == b.relay
+        && a.zen_destination_chain == b.zen_destination_chain
 }
 
 fn committed_external_effect_action(
@@ -3379,6 +3473,13 @@ fn direct_action_for_external_effect(
     intent: &ExternalEffectIntent,
     outcome: ExternalEffectRecovery,
 ) -> Result<DirectAction, io::Error> {
+    if let Some(chain)=&intent.zen_destination_chain {
+        return match outcome {
+            ExternalEffectRecovery::BindFinalized {transaction_hash,..}=>Ok(DirectAction::ReserveZenWithdrawal {destination_chain:chain.clone(),destination:intent.destination.clone(),amount_atomic:intent.amount_atomic.clone(),custody_reference:format!("{}:{transaction_hash}",intent.external_effect_reference)}),
+            ExternalEffectRecovery::BindReverted {transaction_hash,..}=>Ok(DirectAction::RecordZenWithdrawalReverted {destination_chain:chain.clone(),destination:intent.destination.clone(),amount_atomic:intent.amount_atomic.clone(),custody_reference:format!("{}:{transaction_hash}",intent.external_effect_reference)}),
+            _=>Err(invalid("ZEN external result is not terminal")),
+        };
+    }
     match (intent.relay.as_ref(), outcome) {
         (
             Some(relay),
@@ -3567,7 +3668,10 @@ async fn recover_external_effect_intents(state: &AppState) -> io::Result<()> {
                 "unresolved external-effect intent does not match committed lineage",
             ));
         }
-        let Some(custody) = &state.custody else {
+        let settled = if intent.asset == "ZEN" {
+            match &state.zen_custody {Some(custody)=>Some(custody.settle(&intent,now_unix()).await),None=>None}
+        } else {match &state.custody {Some(custody)=>Some(custody.settle(&intent,now_unix()).await),None=>None}};
+        let Some(settled) = settled else {
             state
                 .unresolved_external_effects
                 .lock()
@@ -3575,7 +3679,7 @@ async fn recover_external_effect_intents(state: &AppState) -> io::Result<()> {
                 .insert(intent.intent_hash.clone(), intent);
             continue;
         };
-        match custody.settle(&intent, now_unix()).await.map_err(invalid)? {
+        match settled.map_err(invalid)? {
             terminal @ (ExternalEffectRecovery::BindFinalized { .. }
             | ExternalEffectRecovery::BindReverted { .. }
             | ExternalEffectRecovery::BindRelayFinalized { .. }
@@ -4303,6 +4407,7 @@ mod tests {
             artifact_store: None,
             commit_ack_key: Vec::new(),
             custody: None,
+            zen_custody: None,
             financial_gate: Arc::new(Mutex::new(())),
             committed_state_root: Arc::new(Mutex::new(None)),
             unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
