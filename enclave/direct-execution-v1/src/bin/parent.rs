@@ -2333,6 +2333,8 @@ async fn admit_identity(State(state): State<AppState>, headers: HeaderMap) -> im
     };
     let _guard = state.financial_gate.lock().await;
     let mut request = DirectRequest {
+        // Admission is also a private-state mutation; its zero balance does
+        // not make advancing an outstanding payout's root safe.
         account_id: claims.subject_hash.clone(),
         identity_commitment: claims.identity_commitment.clone(),
         request_id,
@@ -2343,6 +2345,7 @@ async fn admit_identity(State(state): State<AppState>, headers: HeaderMap) -> im
         },
     };
     request.request_hash = request_hash(&request);
+    if !state.unresolved_external_effects.lock().await.is_empty() { return (StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING").into_response(); }
     match exchange_direct(&state, request).await {
         Ok(RuntimeResponse::Execute { result }) => {
             let Some(projection) = &state.projection else {
@@ -2410,6 +2413,7 @@ async fn register_market(
     };
     request.request_hash = request_hash(&request);
     let _guard = state.financial_gate.lock().await;
+    if !state.unresolved_external_effects.lock().await.is_empty() { return (StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING").into_response(); }
     match exchange_direct(&state, request).await {
         Ok(RuntimeResponse::Execute { result }) => {
             if let Some(projection) = &state.projection {
@@ -2470,6 +2474,7 @@ async fn resolve_market(
     };
     request.request_hash = request_hash(&request);
     let _guard = state.financial_gate.lock().await;
+    if !state.unresolved_external_effects.lock().await.is_empty() { return (StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING").into_response(); }
     match exchange_direct(&state, request).await {
         Ok(RuntimeResponse::Execute { result }) => {
             if let Some(projection) = &state.projection {
@@ -2514,6 +2519,7 @@ async fn apply_balance_recovery(
     };
     request.request_hash = request_hash(&request);
     let _guard = state.financial_gate.lock().await;
+    if !state.unresolved_external_effects.lock().await.is_empty() { return (StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING").into_response(); }
     match exchange_direct(&state, request).await {
         Ok(RuntimeResponse::Execute { result }) => {
             if let Some(projection) = &state.projection {
