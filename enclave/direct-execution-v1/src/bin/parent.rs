@@ -1336,6 +1336,16 @@ impl ArchiveStore {
             Self::S3(store) => store.load_committed().await,
         }
     }
+    async fn receipt_sequence(&self, receipt: &DirectReceipt) -> Result<i64, ProjectionError> {
+        match self {
+            Self::S3(store) => {
+                let records = store.verified_receipt_records.lock().await;
+                verified_receipt_sequence(records.as_deref().ok_or(ProjectionError::Database)?, receipt)
+            }
+            Self::Filesystem(store) => verified_receipt_sequence(
+                &store.load_committed().map_err(|_| ProjectionError::Database)?, receipt),
+        }
+    }
     async fn persist_intent_readback(
         &self,
         intent: &ExternalEffectIntent,
@@ -1683,7 +1693,7 @@ impl S3ImmutableArtifactStore {
 
 #[derive(Clone)]
 struct Projection {
-    client: Arc<Client>,
+    client: Arc<Mutex<Client>>,
 }
 #[derive(Deserialize)]
 struct AttestationQuery {
@@ -2245,7 +2255,7 @@ async fn command(
                 ));
             }
             if let Some(projection) = &state.projection {
-                if projection.record_result(&result).await.is_err() {
+                if projection.record_result(&state, &result).await.is_err() {
                     return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE")
                         .into_response();
                 }
@@ -2305,7 +2315,7 @@ async fn admit_identity(State(state): State<AppState>, headers: HeaderMap) -> im
                 .consume_session(&claims, &result.receipt.request_hash)
                 .await
                 .is_err()
-                || projection.record_result(&result).await.is_err()
+                || projection.record_result(&state, &result).await.is_err()
                 || projection
                     .record_identity_admission(
                         &claims.subject_hash,
@@ -2365,7 +2375,7 @@ async fn register_market(
     match exchange_direct(&state, request).await {
         Ok(RuntimeResponse::Execute { result }) => {
             if let Some(projection) = &state.projection {
-                if projection.record_result(&result).await.is_err() {
+                if projection.record_result(&state, &result).await.is_err() {
                     return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE")
                         .into_response();
                 }
@@ -2425,7 +2435,7 @@ async fn resolve_market(
     match exchange_direct(&state, request).await {
         Ok(RuntimeResponse::Execute { result }) => {
             if let Some(projection) = &state.projection {
-                if projection.record_result(&result).await.is_err() {
+                if projection.record_result(&state, &result).await.is_err() {
                     return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE")
                         .into_response();
                 }
@@ -2469,7 +2479,7 @@ async fn apply_balance_recovery(
     match exchange_direct(&state, request).await {
         Ok(RuntimeResponse::Execute { result }) => {
             if let Some(projection) = &state.projection {
-                if projection.record_result(&result).await.is_err() {
+                if projection.record_result(&state, &result).await.is_err() {
                     return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE")
                         .into_response();
                 }
@@ -2898,6 +2908,15 @@ enum ProjectionError {
     OpeningMismatch,
 }
 
+fn verified_receipt_sequence(records: &[DirectStateArtifact], receipt: &DirectReceipt) -> Result<i64, ProjectionError> {
+    let mut matching = records.iter().filter(|record| record.receipt.receipt_id == receipt.receipt_id);
+    let record = matching.next().ok_or(ProjectionError::Database)?;
+    if matching.next().is_some() || record.receipt != *receipt || record.epoch_id != EPOCH_ID || record.sequence == 0 {
+        return Err(ProjectionError::Database);
+    }
+    i64::try_from(record.sequence).map_err(|_| ProjectionError::Database)
+}
+
 impl Projection {
     async fn connect(
         url: &str,
@@ -2929,13 +2948,13 @@ impl Projection {
             client
         };
         let projection = Self {
-            client: Arc::new(client),
+            client: Arc::new(Mutex::new(client)),
         };
         if isolated_test {
-            projection
-                .client
+            projection.client.lock().await
                 .batch_execute(POSTGRES_PROJECTION_DDL)
                 .await?;
+            projection.client.lock().await.batch_execute(include_str!("../../sql/005_projection_frontier.sql")).await?;
         } else {
             // Production schema changes are applied once through the existing
             // migration principal. The long-running runtime receives only the
@@ -2945,8 +2964,7 @@ impl Projection {
                 return Err(format!("projection schema verification failed: {error:?}").into());
             }
         }
-        projection
-            .client
+        projection.client.lock().await
             .batch_execute("SET search_path TO layrs_direct_v1, pg_catalog")
             .await?;
         if let Err(error) = projection.import_opening(epoch).await {
@@ -2956,6 +2974,10 @@ impl Projection {
     }
 
     async fn verify_schema_and_privileges(&self) -> Result<(), ProjectionError> {
+        let frontier = self.client.lock().await.query_one(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='layrs_direct_v1' AND table_name='direct_execution_epoch_balances' AND column_name='projection_sequence' AND data_type='bigint' AND is_nullable='NO')", &[]
+        ).await.map_err(|_| ProjectionError::Database)?;
+        if !frontier.get::<_, bool>(0) { return Err(ProjectionError::OpeningMismatch); }
         let tables = [
             ("direct_execution_receipts", "SELECT,INSERT"),
             ("direct_execution_epoch_balances", "SELECT,INSERT,UPDATE"),
@@ -2973,8 +2995,7 @@ impl Projection {
         ];
         for (table, privileges) in tables {
             let qualified = format!("layrs_direct_v1.{table}");
-            let row = self
-                .client
+            let row = self.client.lock().await
                 .query_one(
                     "SELECT to_regclass($1)::text, has_table_privilege(current_user,$1,$2)",
                     &[&qualified, &privileges],
@@ -2995,19 +3016,19 @@ impl Projection {
         let identities = epoch.projection_identity_rows();
         let wallets = epoch.projection_wallet_rows();
         for row in &identities {
-            self.client.execute(
+            self.client.lock().await.execute(
                 "INSERT INTO direct_execution_identities (epoch_id, auth_subject_hash, identity_commitment, admitted_post_genesis) VALUES ($1,$2,$3,false) ON CONFLICT (epoch_id, identity_commitment) DO NOTHING",
                 &[&EPOCH_ID, &row.auth_subject_hash, &row.identity_commitment],
             ).await.map_err(|_| ProjectionError::Database)?;
         }
         for row in &balances {
-            self.client.execute(
+            self.client.lock().await.execute(
                 "INSERT INTO direct_execution_epoch_balances (epoch_id, auth_subject_hash, identity_commitment, asset, bucket, amount_atomic) VALUES ($1,$2,$3,$4,$5,$6::text::numeric) ON CONFLICT (epoch_id, identity_commitment, asset, bucket) DO NOTHING",
                 &[&EPOCH_ID, &row.auth_subject_hash, &row.identity_commitment, &row.asset, &row.bucket, &row.amount_atomic],
             ).await.map_err(|_| ProjectionError::Database)?;
         }
         for row in &wallets {
-            self.client.execute(
+            self.client.lock().await.execute(
                 "INSERT INTO direct_execution_privy_wallets (epoch_id, auth_subject_hash, wallet_address) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
                 &[&EPOCH_ID, &row.auth_subject_hash, &row.wallet_address],
             ).await.map_err(|_| ProjectionError::Database)?;
@@ -3022,7 +3043,7 @@ impl Projection {
         wallets: &[ProjectionWalletRow],
     ) -> Result<(), ProjectionError> {
         for row in identities {
-            let actual = self.client.query_opt(
+            let actual = self.client.lock().await.query_opt(
                 "SELECT auth_subject_hash, admitted_post_genesis FROM direct_execution_identities WHERE epoch_id=$1 AND identity_commitment=$2",
                 &[&EPOCH_ID, &row.identity_commitment],
             ).await.map_err(|_| ProjectionError::Database)?.ok_or(ProjectionError::OpeningMismatch)?;
@@ -3033,7 +3054,7 @@ impl Projection {
             }
         }
         for row in balances {
-            let actual = self.client.query_opt(
+            let actual = self.client.lock().await.query_opt(
                 "SELECT amount_atomic::text, auth_subject_hash FROM direct_execution_epoch_balances WHERE epoch_id=$1 AND identity_commitment=$2 AND asset=$3 AND bucket=$4",
                 &[&EPOCH_ID, &row.identity_commitment, &row.asset, &row.bucket],
             ).await.map_err(|_| ProjectionError::Database)?.ok_or(ProjectionError::OpeningMismatch)?;
@@ -3049,7 +3070,7 @@ impl Projection {
             }
         }
         for row in wallets {
-            let found = self.client.query_opt(
+            let found = self.client.lock().await.query_opt(
                 "SELECT 1 FROM direct_execution_privy_wallets WHERE epoch_id=$1 AND auth_subject_hash=$2 AND wallet_address=$3",
                 &[&EPOCH_ID, &row.auth_subject_hash, &row.wallet_address],
             ).await.map_err(|_| ProjectionError::Database)?.is_some();
@@ -3065,14 +3086,14 @@ impl Projection {
         claims: &SessionClaims,
         request_hash: &str,
     ) -> Result<(), ProjectionError> {
-        let inserted = self.client.execute(
+        let inserted = self.client.lock().await.execute(
             "INSERT INTO direct_execution_sessions (epoch_id, session_id, auth_subject_hash, request_hash, expires_at_unix) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
             &[&EPOCH_ID, &claims.session_id, &claims.subject_hash, &request_hash, &(claims.expires_at_unix as i64)],
         ).await.map_err(|_| ProjectionError::Database)?;
         if inserted == 1 {
             return Ok(());
         }
-        let existing = self.client.query_opt(
+        let existing = self.client.lock().await.query_opt(
             "SELECT auth_subject_hash, request_hash FROM direct_execution_sessions WHERE epoch_id=$1 AND session_id=$2",
             &[&EPOCH_ID, &claims.session_id],
         ).await.map_err(|_| ProjectionError::Database)?.ok_or(ProjectionError::Database)?;
@@ -3085,16 +3106,21 @@ impl Projection {
         }
     }
 
-    async fn record_result(&self, result: &DirectResult) -> Result<(), ProjectionError> {
+    async fn record_result(&self, state: &AppState, result: &DirectResult) -> Result<(), ProjectionError> {
         let receipt = &result.receipt;
-        self.client.execute(
+        // Ordering is bound to the fully verified immutable artifact, never a
+        // user-supplied sequence or PostgreSQL's disposable receipt ordering.
+        let sequence = state.artifact_store.as_ref().ok_or(ProjectionError::Database)?.receipt_sequence(receipt).await?;
+        let mut client = self.client.lock().await;
+        let transaction = client.transaction().await.map_err(|_| ProjectionError::Database)?;
+        transaction.execute(
             "INSERT INTO direct_execution_receipts (receipt_id, epoch_id, auth_subject_hash, identity_commitment, request_id, request_hash, terminal_status, effect, custody_reference, receipt_json) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::text::jsonb) ON CONFLICT (receipt_id) DO NOTHING",
             &[&receipt.receipt_id, &EPOCH_ID, &receipt.account_id, &receipt.identity_commitment, &receipt.request_id, &receipt.request_hash, &format!("{:?}", receipt.status).to_uppercase(), &receipt.effect, &receipt.custody_reference, &serde_json::to_string(receipt).map_err(|_| ProjectionError::Database)?],
         ).await.map_err(|_| ProjectionError::Database)?;
         for update in &receipt.projection_balance_updates {
-            self.client.execute(
-                "INSERT INTO direct_execution_epoch_balances (epoch_id, auth_subject_hash, identity_commitment, asset, bucket, amount_atomic) VALUES ($1,$2,$3,$4,$5,$6::text::numeric) ON CONFLICT (epoch_id, identity_commitment, asset, bucket) DO UPDATE SET auth_subject_hash=EXCLUDED.auth_subject_hash, amount_atomic=EXCLUDED.amount_atomic, updated_at=now()",
-                &[&EPOCH_ID, &update.auth_subject_hash, &update.identity_commitment, &update.asset, &update.bucket, &update.amount_atomic],
+            transaction.execute(
+                "INSERT INTO direct_execution_epoch_balances (epoch_id, auth_subject_hash, identity_commitment, asset, bucket, amount_atomic, projection_sequence) VALUES ($1,$2,$3,$4,$5,$6::text::numeric,$7) ON CONFLICT (epoch_id, identity_commitment, asset, bucket) DO UPDATE SET auth_subject_hash=EXCLUDED.auth_subject_hash, amount_atomic=EXCLUDED.amount_atomic, projection_sequence=EXCLUDED.projection_sequence, updated_at=now() WHERE direct_execution_epoch_balances.projection_sequence<=EXCLUDED.projection_sequence",
+                &[&EPOCH_ID, &update.auth_subject_hash, &update.identity_commitment, &update.asset, &update.bucket, &update.amount_atomic, &sequence],
             ).await.map_err(|_| ProjectionError::Database)?;
         }
         let accounting_amount = receipt.amount_atomic.clone();
@@ -3104,12 +3130,12 @@ impl Projection {
         {
             let (custody_chain_id, custody_transaction_hash) =
                 custody_projection_binding(reference);
-            self.client.execute(
+            transaction.execute(
                 "INSERT INTO direct_execution_custody_events (epoch_id, custody_reference, direction, state, chain_id, tx_hash, auth_subject_hash, identity_commitment, amount_atomic) VALUES ($1,$2,$3,'FINAL',$4,$5,$6,$7,$8::text::numeric) ON CONFLICT DO NOTHING",
                 &[&EPOCH_ID, reference, &direction, &custody_chain_id, &custody_transaction_hash, &receipt.account_id, &receipt.identity_commitment, &amount],
             ).await.map_err(|_| ProjectionError::Database)?;
         }
-        self.client.execute(
+        transaction.execute(
             "INSERT INTO direct_execution_accounting_events (receipt_id, epoch_id, auth_subject_hash, identity_commitment, effect, amount_atomic) VALUES ($1,$2,$3,$4,$5,$6::text::numeric) ON CONFLICT DO NOTHING",
             &[&receipt.receipt_id, &EPOCH_ID, &receipt.account_id, &receipt.identity_commitment, &receipt.effect, &accounting_amount],
         ).await.map_err(|_| ProjectionError::Database)?;
@@ -3117,14 +3143,14 @@ impl Projection {
             let status = enum_name(&execution.status)?;
             let outcome = enum_name(&execution.outcome)?;
             let action = enum_name(&execution.action)?;
-            self.client.execute(
+            transaction.execute(
                 "INSERT INTO direct_execution_order_events (receipt_id, epoch_id, order_id, auth_subject_hash, identity_commitment, market_id, outcome, action, status, limit_price_micros, quantity_micros, executed_quantity_micros, remaining_quantity_micros, fee_atomic, resulting_position_micros, resulting_available_atomic) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::text::numeric,$12::text::numeric,$13::text::numeric,$14::text::numeric,$15::text::numeric,$16::text::numeric) ON CONFLICT DO NOTHING",
                 &[&receipt.receipt_id, &EPOCH_ID, &execution.order_id, &receipt.account_id, &receipt.identity_commitment, &execution.market_id, &outcome, &action, &status, &(execution.limit_price_micros as i64), &execution.quantity_micros, &execution.executed_quantity_micros, &execution.remaining_quantity_micros, &execution.total_fee_atomic, &execution.resulting_position_micros, &execution.resulting_available_atomic],
             ).await.map_err(|_| ProjectionError::Database)?;
             for trade in &execution.trades {
                 let trade_outcome = enum_name(&trade.outcome)?;
                 let match_type = enum_name(&trade.match_type)?;
-                self.client.execute(
+                transaction.execute(
                     "INSERT INTO direct_execution_trade_events (trade_id, receipt_id, epoch_id, market_id, maker_order_id, taker_order_id, outcome, match_type, executed_quantity_micros, execution_price_micros, fee_atomic) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::text::numeric,$10,$11::text::numeric) ON CONFLICT DO NOTHING",
                     &[&trade.trade_id, &receipt.receipt_id, &EPOCH_ID, &trade.market_id, &trade.maker_order_id, &trade.taker_order_id, &trade_outcome, &match_type, &trade.executed_quantity_micros, &(trade.execution_price_micros as i64), &trade.fee_atomic],
                 ).await.map_err(|_| ProjectionError::Database)?;
@@ -3136,11 +3162,12 @@ impl Projection {
                 .map_err(|_| ProjectionError::Database)?;
             let settled_position_count = i64::try_from(resolution.settled_position_count)
                 .map_err(|_| ProjectionError::Database)?;
-            self.client.execute(
+            transaction.execute(
                 "INSERT INTO direct_execution_market_resolutions (receipt_id, epoch_id, resolution_id, market_id, outcome, evidence_sha256, cancelled_order_count, settled_position_count, gross_payout_atomic, rounding_reserve_atomic) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::text::numeric,$10::text::numeric) ON CONFLICT DO NOTHING",
                 &[&receipt.receipt_id, &EPOCH_ID, &resolution.resolution_id, &resolution.market_id, &outcome, &resolution.evidence_sha256, &cancelled_order_count, &settled_position_count, &resolution.gross_payout_atomic, &resolution.rounding_reserve_atomic],
             ).await.map_err(|_| ProjectionError::Database)?;
         }
+        transaction.commit().await.map_err(|_| ProjectionError::Database)?;
         Ok(())
     }
 
@@ -3151,23 +3178,23 @@ impl Projection {
         wallet_address: &str,
         receipt_id: &str,
     ) -> Result<(), ProjectionError> {
-        self.client.execute(
+        self.client.lock().await.execute(
             "INSERT INTO direct_execution_identities (epoch_id, auth_subject_hash, identity_commitment, admitted_post_genesis) VALUES ($1,$2,$3,true) ON CONFLICT (epoch_id, identity_commitment) DO NOTHING",
             &[&EPOCH_ID, &auth_subject_hash, &identity_commitment],
         ).await.map_err(|_| ProjectionError::Database)?;
-        self.client.execute(
+        self.client.lock().await.execute(
             "INSERT INTO direct_execution_epoch_balances (epoch_id, auth_subject_hash, identity_commitment, asset, bucket, amount_atomic) VALUES ($1,$2,$3,'USDC','USER_AVAILABLE',0) ON CONFLICT (epoch_id, identity_commitment, asset, bucket) DO NOTHING",
             &[&EPOCH_ID, &auth_subject_hash, &identity_commitment],
         ).await.map_err(|_| ProjectionError::Database)?;
-        self.client.execute(
+        self.client.lock().await.execute(
             "INSERT INTO direct_execution_privy_wallets (epoch_id, auth_subject_hash, wallet_address) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
             &[&EPOCH_ID, &auth_subject_hash, &wallet_address],
         ).await.map_err(|_| ProjectionError::Database)?;
-        self.client.execute(
+        self.client.lock().await.execute(
             "INSERT INTO direct_execution_identity_admissions (receipt_id, epoch_id, auth_subject_hash, identity_commitment, wallet_address) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
             &[&receipt_id, &EPOCH_ID, &auth_subject_hash, &identity_commitment, &wallet_address],
         ).await.map_err(|_| ProjectionError::Database)?;
-        let row = self.client.query_opt(
+        let row = self.client.lock().await.query_opt(
             "SELECT identity.auth_subject_hash, wallet.wallet_address, admission.receipt_id FROM direct_execution_identities identity JOIN direct_execution_epoch_balances balance ON balance.epoch_id=identity.epoch_id AND balance.identity_commitment=identity.identity_commitment JOIN direct_execution_privy_wallets wallet ON wallet.epoch_id=identity.epoch_id AND wallet.auth_subject_hash=identity.auth_subject_hash JOIN direct_execution_identity_admissions admission ON admission.epoch_id=identity.epoch_id AND admission.identity_commitment=identity.identity_commitment WHERE identity.epoch_id=$1 AND identity.identity_commitment=$2 AND identity.admitted_post_genesis=true AND balance.asset='USDC' AND balance.bucket='USER_AVAILABLE' AND balance.amount_atomic=0",
             &[&EPOCH_ID, &identity_commitment],
         ).await.map_err(|_| ProjectionError::Database)?.ok_or(ProjectionError::OpeningMismatch)?;
@@ -3189,7 +3216,7 @@ impl Projection {
         grant: &WriterGrant,
         financial_writer_enabled: bool,
     ) -> Result<(), ProjectionError> {
-        let row = self.client.query_opt(
+        let row = self.client.lock().await.query_opt(
             "SELECT old_writer_fence_evidence_sha256, old_writer_authorized, target_writer_enabled, activation_id FROM direct_execution_writer_fence WHERE epoch_id=$1",
             &[&EPOCH_ID],
         ).await.map_err(|_| ProjectionError::Database)?.ok_or(ProjectionError::OpeningMismatch)?;
@@ -3204,7 +3231,7 @@ impl Projection {
         {
             return Err(ProjectionError::OpeningMismatch);
         }
-        let grant_row = self.client.query_opt(
+        let grant_row = self.client.lock().await.query_opt(
             "SELECT 1 FROM direct_execution_writer_grants WHERE activation_id=$1 AND epoch_id=$2 AND old_writer_fence_evidence_sha256=$3 AND expires_at_unix=$4",
             &[&grant.activation_id, &EPOCH_ID, &grant.old_writer_fence_evidence_sha256, &(grant.expires_at_unix as i64)],
         ).await.map_err(|_| ProjectionError::Database)?.is_some();
@@ -3713,7 +3740,7 @@ async fn recover_external_effect_intents(state: &AppState) -> io::Result<()> {
                     return Err(invalid("external-effect recovery execution failed"));
                 };
                 if let Some(projection) = &state.projection {
-                    projection.record_result(&result).await.map_err(|_| {
+                    projection.record_result(&state, &result).await.map_err(|_| {
                         invalid("projection unavailable during external-effect recovery")
                     })?;
                 }
@@ -3740,6 +3767,7 @@ async fn verify_recovered_projection(state: &AppState) -> io::Result<()> {
     };
     let rows = projection
         .client
+        .lock().await
         .query(
             "SELECT auth_subject_hash, identity_commitment, asset, bucket, amount_atomic::text FROM direct_execution_epoch_balances WHERE epoch_id=$1 ORDER BY identity_commitment,asset,bucket",
             &[&EPOCH_ID],
@@ -3771,6 +3799,7 @@ async fn verify_recovered_projection(state: &AppState) -> io::Result<()> {
     }
     let receipts = projection
         .client
+        .lock().await
         .query(
             "SELECT receipt_json::text FROM direct_execution_receipts WHERE epoch_id=$1",
             &[&EPOCH_ID],
@@ -3791,6 +3820,20 @@ async fn verify_recovered_projection(state: &AppState) -> io::Result<()> {
             }
         }
     }
+    // Legacy rows have no ordering metadata. Stamp only after every amount
+    // was independently compared with the recovered private state above.
+    // This changes no financial amount and prevents an old first-time retry
+    // from overwriting a newer, already-reconciled projection.
+    let records = state.artifact_store.as_ref().ok_or_else(|| invalid("projection archive unavailable"))?.load_committed().await.map_err(invalid)?;
+    let sequence = records.last().map_or(0, |record| record.sequence);
+    let sequence = i64::try_from(sequence).map_err(|_| invalid("projection sequence overflow"))?;
+    let invalid_frontier = projection.client.lock().await.query_one(
+        "SELECT EXISTS (SELECT 1 FROM direct_execution_epoch_balances WHERE epoch_id=$1 AND (projection_sequence<0 OR projection_sequence>$2))", &[&EPOCH_ID, &sequence]
+    ).await.map_err(|_| invalid("projection ordering verification failed"))?;
+    if invalid_frontier.get::<_, bool>(0) { return Err(invalid("projection ordering exceeds recovered private state")); }
+    projection.client.lock().await.execute(
+        "UPDATE direct_execution_epoch_balances SET projection_sequence=$2 WHERE epoch_id=$1 AND projection_sequence<$2", &[&EPOCH_ID, &sequence]
+    ).await.map_err(|_| invalid("projection ordering initialization failed"))?;
     Ok(())
 }
 
@@ -4158,6 +4201,32 @@ async fn write_frame(stream: &mut VsockStream, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn projection_sequence_fixture() -> DirectStateArtifact {
+        DirectStateArtifact {
+            epoch_id: EPOCH_ID.into(), sequence: 7, prior_state_hash: "a".repeat(64), state_hash: "b".repeat(64), request_hash: "c".repeat(64),
+            nonce: vec![1;12], ciphertext: vec![], ciphertext_hash: "d".repeat(64),
+            receipt: DirectReceipt { receipt_id: "receipt".into(), account_id: "account".into(), identity_commitment: "identity".into(), request_id: "request".into(), request_hash: "c".repeat(64), status: layrs_direct_execution_v1::TerminalStatus::Applied, effect: "BALANCE_READ".into(), amount_atomic: None, custody_reference: None, execution: None, resolution: None, projection_balance_updates: vec![], genesis_ordinal: 0, signature: "signature".into() }
+        }
+    }
+    #[test]
+    fn projection_sequence_requires_exact_verified_receipt() {
+        let artifact = projection_sequence_fixture();
+        assert_eq!(verified_receipt_sequence(&[artifact.clone()], &artifact.receipt).unwrap(), 7);
+        let mut altered = artifact.receipt.clone(); altered.effect = "OTHER".into();
+        assert!(verified_receipt_sequence(&[artifact.clone()], &altered).is_err());
+        assert!(verified_receipt_sequence(&[], &artifact.receipt).is_err());
+        assert!(verified_receipt_sequence(&[artifact.clone(), artifact.clone()], &artifact.receipt).is_err());
+    }
+    #[test]
+    fn projection_sequence_rejects_foreign_zero_and_overflow_artifacts() {
+        let original = projection_sequence_fixture();
+        for sequence in [0, i64::MAX as u64 + 1] {
+            let mut artifact = original.clone(); artifact.sequence = sequence;
+            assert!(verified_receipt_sequence(&[artifact], &original.receipt).is_err());
+        }
+        let mut foreign = original.clone(); foreign.epoch_id = "foreign".into();
+        assert!(verified_receipt_sequence(&[foreign], &original.receipt).is_err());
+    }
     #[test]
     fn receipt_cache_releases_entire_snapshot_allocation() {
         let artifact=DirectStateArtifact {epoch_id:EPOCH_ID.into(),sequence:1,prior_state_hash:"a".repeat(64),state_hash:"b".repeat(64),request_hash:"c".repeat(64),nonce:vec![1;12],ciphertext:vec![7;2_000_000],ciphertext_hash:"d".repeat(64),
