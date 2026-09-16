@@ -1967,6 +1967,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     verify_recovered_projection(&state).await?;
     recover_external_effect_intents(&state).await?;
     verify_recovered_projection(&state).await?;
+    // Observe already-admitted Base withdrawals independently of the browser.
+    // This observer has no submission capability and shares the financial lock.
+    start_base_withdrawal_observer(state.clone());
     let port = env::var("PORT").unwrap_or_else(|_| "8443".into()).parse()?;
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -2715,6 +2718,14 @@ async fn prepare_external_withdrawal(
             "EXTERNAL_EFFECT_FINALITY_PENDING",
         ));
     }
+    // The financial mutex is held by command(): authorize principal against
+    // the current private state BEFORE an intent, quote or payout can exist.
+    // UI/Aurora checks cannot substitute for this serialized enclave check.
+    let balance = exchange(state, RuntimeRequest::Balance {
+        account_id: claims.subject_hash.clone(), identity_commitment: identity_commitment.into(),
+        asset: "USDC".into(), bucket: "USER_AVAILABLE".into(),
+    }).await.map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "USDC_BALANCE_UNAVAILABLE"))?;
+    validate_usdc_pre_payout_balance(&balance, &amount_atomic)?;
     let (nonce, gas_limit, max_fee_per_gas, max_priority_fee_per_gas) =
         custody.transaction_parameters().await.map_err(|_| {
             (
@@ -3800,6 +3811,62 @@ fn request_for_external_effect(
     Ok(request)
 }
 
+fn validate_usdc_pre_payout_balance(balance: &RuntimeResponse, requested: &str) -> Result<(), (StatusCode, &'static str)> {
+    let requested = requested.parse::<u128>().ok().filter(|v| *v > 0)
+        .ok_or((StatusCode::BAD_REQUEST, "WITHDRAWAL_AMOUNT_INVALID"))?;
+    let RuntimeResponse::Balance { amount_atomic } = balance else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "USDC_BALANCE_UNAVAILABLE"));
+    };
+    let available = amount_atomic.parse::<u128>()
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "USDC_BALANCE_UNAVAILABLE"))?;
+    if available < requested { return Err((StatusCode::UNPROCESSABLE_ENTITY, "INSUFFICIENT_AVAILABLE")); }
+    Ok(())
+}
+
+fn start_base_withdrawal_observer(state: AppState) {
+    if state.isolated_test || state.custody.is_none() { return; }
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(std::time::Duration::from_secs(5));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            timer.tick().await;
+            if state.unresolved_external_effects.lock().await.is_empty() { continue; }
+            let _guard = state.financial_gate.lock().await;
+            let pending: Vec<_> = state.unresolved_external_effects.lock().await.values()
+                .filter(|i| i.chain == "base" && i.asset == "USDC" && i.relay.is_none())
+                .cloned().collect();
+            for intent in pending {
+                if reconcile_observed_base_withdrawal(&state, &intent).await.is_err() {
+                    // Stable trace/code only; never raw provider bodies or keys.
+                    eprintln!("WITHDRAWAL_OBSERVATION_PENDING request_id={} intent_hash={}", intent.request_id, intent.intent_hash);
+                }
+            }
+        }
+    });
+}
+
+async fn reconcile_observed_base_withdrawal(state: &AppState, intent: &ExternalEffectIntent) -> io::Result<()> {
+    let custody = state.custody.as_ref().ok_or_else(|| invalid("Base custody unavailable"))?;
+    // Unlike settle(), this cannot call submit_once even if the index is absent.
+    let outcome = custody.observe_terminal_only(intent).await.map_err(invalid)?;
+    let request = request_for_external_effect(intent, outcome)?;
+    let RuntimeResponse::Execute { result } = exchange_direct(state, request).await? else {
+        return Err(invalid("withdrawal observation execution unavailable"));
+    };
+    if result.receipt.account_id != intent.account_id || result.receipt.identity_commitment != intent.identity_commitment
+        || result.receipt.request_id != intent.request_id || result.receipt.amount_atomic.as_deref() != Some(intent.amount_atomic.as_str())
+        || !matches!(result.receipt.effect.as_str(), "WITHDRAWAL_SETTLED" | "WITHDRAWAL_REVERTED")
+        || result.receipt.status != layrs_direct_execution_v1::TerminalStatus::Applied {
+        return Err(invalid("withdrawal observation receipt conflict"));
+    }
+    state.projection.as_ref().ok_or_else(|| invalid("withdrawal observation projection unavailable"))?
+        .record_result(state, &result).await.map_err(|_| invalid("withdrawal observation projection failed"))?;
+    // Remove the gate only AFTER the genuine receipt and atomic projection.
+    state.unresolved_external_effects.lock().await.remove(&intent.intent_hash);
+    eprintln!("WITHDRAWAL_OBSERVATION_SETTLED request_id={} intent_hash={} receipt_id={}", intent.request_id, intent.intent_hash, result.receipt.receipt_id);
+    Ok(())
+}
+
 async fn recover_external_effect_intents(state: &AppState) -> io::Result<()> {
     let Some(store) = state.artifact_store.as_ref() else {
         return Ok(());
@@ -4344,6 +4411,18 @@ async fn write_frame(stream: &mut VsockStream, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn usdc_pre_payout_requires_current_private_principal() {
+        for (available, requested, expected) in [("5000000","5000000",true),("0","5000000",false),("4999999","5000000",false),("5000000","5000001",false)] {
+            assert_eq!(validate_usdc_pre_payout_balance(&RuntimeResponse::Balance {amount_atomic:available.into()}, requested).is_ok(), expected);
+        }
+        assert_eq!(validate_usdc_pre_payout_balance(&RuntimeResponse::Balance {amount_atomic:"0".into()}, "5000000").unwrap_err().1, "INSUFFICIENT_AVAILABLE");
+        for amount in ["0","-1","5.0","","340282366920938463463374607431768211456"] {
+            assert_eq!(validate_usdc_pre_payout_balance(&RuntimeResponse::Balance {amount_atomic:"5000000".into()}, amount).unwrap_err().1,"WITHDRAWAL_AMOUNT_INVALID");
+        }
+        assert_eq!(validate_usdc_pre_payout_balance(&RuntimeResponse::Balance {amount_atomic:"corrupt".into()}, "5").unwrap_err().1,"USDC_BALANCE_UNAVAILABLE");
+        assert_eq!(validate_usdc_pre_payout_balance(&RuntimeResponse::Error {code:"unavailable".into()}, "5").unwrap_err().1,"USDC_BALANCE_UNAVAILABLE");
+    }
     #[test]
     fn bounded_prefetch_covers_every_archive_record_exactly_once_in_order() {
         for total in [0,1,3,4,5,1001,4724,4725] {
