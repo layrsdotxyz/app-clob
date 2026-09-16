@@ -238,6 +238,17 @@ impl PrivyBaseCustodyAdapter {
         }
     }
 
+    /// Historical reconciliation must have no path to submit_once, even if
+    /// the provider temporarily loses its reference index.
+    async fn observe_terminal_only(&self, intent: &ExternalEffectIntent) -> Result<ExternalEffectRecovery, String> {
+        self.validate_intent(intent)?;
+        let outcome = intent.recovery_action(now_unix(), self.observe(intent).await?);
+        match outcome {
+            terminal @ (ExternalEffectRecovery::BindFinalized { .. } | ExternalEffectRecovery::BindReverted { .. }) => Ok(terminal),
+            _ => Err("historical custody effect is not authoritatively terminal".into()),
+        }
+    }
+
     fn validate_intent(&self, intent: &ExternalEffectIntent) -> Result<(), String> {
         intent
             .verify()
@@ -1369,6 +1380,27 @@ impl ArchiveStore {
             Self::S3(store) => store.load_intents().await,
         }
     }
+
+    async fn persist_extra_payout(&self, evidence: &ExtraPayoutEvidence) -> Result<(), String> {
+        let bytes = serde_json::to_vec(evidence).map_err(|_| "extra payout evidence encoding failed")?;
+        match self {
+            Self::S3(store) => store.write_once(&format!("{}/external-effect-reconciliations/{}.json", store.prefix, evidence.intent_hash), bytes).await,
+            Self::Filesystem(store) => {
+                let directory = store.root().join("external-effect-reconciliations");
+                fs::create_dir_all(&directory).map_err(|_| "extra payout directory unavailable")?;
+                let path = directory.join(format!("{}.json", evidence.intent_hash));
+                match OpenOptions::new().write(true).create_new(true).open(&path) {
+                    Ok(mut file) => {
+                        std::io::Write::write_all(&mut file, &bytes).and_then(|_| file.sync_all()).map_err(|_| "extra payout evidence persistence failed")?;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
+                    Err(_) => return Err("extra payout evidence persistence failed".into()),
+                }
+                if fs::read(path).map_err(|_| "extra payout readback failed")? != bytes { return Err("extra payout immutable evidence conflict".into()); }
+                Ok(())
+            }
+        }
+    }
     async fn load_key_release(
         &self,
         activation_id: &str,
@@ -1913,6 +1945,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the immutable archive's complete, head-verified recovery set and the
     // enclave has independently reconstructed it.  PostgreSQL is excluded.
     recover_enclave(&state).await?;
+    // Reconciliation starts only after the old projection is proven equal to
+    // the fully recovered private state, not from database balance guesses.
+    verify_recovered_projection(&state).await?;
     recover_external_effect_intents(&state).await?;
     verify_recovered_projection(&state).await?;
     let port = env::var("PORT").unwrap_or_else(|_| "8443".into()).parse()?;
@@ -2221,11 +2256,6 @@ async fn command(
     request.request_hash = request_hash(&request);
     match exchange_direct(&state, request).await {
         Ok(RuntimeResponse::Execute { result }) => {
-            if matches!(result.effect.as_str(), "WITHDRAWAL_SETTLED" | "WITHDRAWAL_REVERTED") {
-                state.unresolved_external_effects.lock().await.retain(|_, intent| !(intent.asset == "ZEN"
-                    && intent.account_id == result.receipt.account_id && intent.request_id == result.receipt.request_id
-                    && result.receipt.custody_reference.as_deref().is_some_and(|reference| reference.starts_with(&format!("{}:",intent.external_effect_reference)))));
-            }
             // Session consumption is projection/audit only and happens after
             // authoritative adoption.  A crash after external submission can
             // therefore be recovered from the immutable intent rather than a
@@ -2259,6 +2289,14 @@ async fn command(
                     return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE")
                         .into_response();
                 }
+            }
+            // Retain both asset gates through private adoption AND atomic
+            // projection; failures cannot open a second payout path.
+            if matches!(result.receipt.effect.as_str(),"WITHDRAWAL_SETTLED"|"WITHDRAWAL_REVERTED") {
+                state.unresolved_external_effects.lock().await.retain(|_, intent| !(intent.account_id == result.receipt.account_id
+                    && intent.identity_commitment == result.receipt.identity_commitment && intent.request_id == result.receipt.request_id
+                    && result.receipt.amount_atomic.as_deref() == Some(intent.amount_atomic.as_str())
+                    && result.receipt.custody_reference.as_deref().is_some_and(|reference| reference.starts_with(&format!("{}:",intent.external_effect_reference)))));
             }
             encrypted(&claims, &result)
         }
@@ -2635,11 +2673,6 @@ async fn prepare_external_withdrawal(
             | ExternalEffectRecovery::BindReverted { .. }
             | ExternalEffectRecovery::BindRelayFinalized { .. }
             | ExternalEffectRecovery::BindRelayReverted { .. }) => {
-                state
-                    .unresolved_external_effects
-                    .lock()
-                    .await
-                    .remove(&existing.intent_hash);
                 return direct_action_for_external_effect(&existing, terminal)
                     .map_err(|_| (StatusCode::CONFLICT, "EXTERNAL_EFFECT_RESULT_CONFLICT"));
             }
@@ -2753,6 +2786,9 @@ async fn prepare_external_withdrawal(
             "EXTERNAL_EFFECT_INTENT_PERSISTENCE_FAILED",
         )
     })?;
+    // Establish the gate BEFORE custody may submit or return an ambiguous
+    // error, not only after a provider pending response.
+    state.unresolved_external_effects.lock().await.insert(intent.intent_hash.clone(), intent.clone());
     match custody.settle(&intent, now_unix()).await.map_err(|_| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2918,6 +2954,18 @@ fn verified_receipt_sequence(records: &[DirectStateArtifact], receipt: &DirectRe
 }
 
 impl Projection {
+    async fn record_extra_payout(&self, evidence: &ExtraPayoutEvidence) -> Result<(), ProjectionError> {
+        let json = serde_json::to_string(evidence).map_err(|_| ProjectionError::Database)?;
+        let digest = sha256(&serde_json::to_vec(evidence).map_err(|_| ProjectionError::Database)?);
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await.map_err(|_| ProjectionError::Database)?;
+        tx.execute("INSERT INTO direct_execution_extra_payouts(epoch_id,intent_hash,original_receipt_id,transaction_hash,amount_atomic,evidence_sha256,evidence_json,disposition) VALUES($1,$2,$3,$4,$5::text::numeric,$6,$7::text::jsonb,'PROTOCOL_OVERPAYMENT_UNRECOVERED') ON CONFLICT DO NOTHING", &[&evidence.epoch_id,&evidence.intent_hash,&evidence.original_receipt_id,&evidence.transaction_hash,&evidence.amount_atomic,&digest,&json]).await.map_err(|_| ProjectionError::Database)?;
+        let row = tx.query_opt("SELECT evidence_json::text,evidence_sha256,customer_debit_atomic::text FROM direct_execution_extra_payouts WHERE epoch_id=$1 AND intent_hash=$2", &[&evidence.epoch_id,&evidence.intent_hash]).await.map_err(|_| ProjectionError::Database)?.ok_or(ProjectionError::Database)?;
+        let stored: ExtraPayoutEvidence = serde_json::from_str(&row.get::<_,String>(0)).map_err(|_|ProjectionError::Database)?;
+        if stored != *evidence || row.get::<_, String>(1) != digest || row.get::<_, String>(2) != "0" { return Err(ProjectionError::Database); }
+        tx.commit().await.map_err(|_| ProjectionError::Database)
+    }
+
     async fn connect(
         url: &str,
         epoch: &SealedEpoch,
@@ -2955,6 +3003,7 @@ impl Projection {
                 .batch_execute(POSTGRES_PROJECTION_DDL)
                 .await?;
             projection.client.lock().await.batch_execute(include_str!("../../sql/005_projection_frontier.sql")).await?;
+            projection.client.lock().await.batch_execute(include_str!("../../sql/006_external_effect_reconciliation.sql")).await?;
         } else {
             // Production schema changes are applied once through the existing
             // migration principal. The long-running runtime receives only the
@@ -2992,6 +3041,7 @@ impl Projection {
             ("direct_execution_market_resolutions", "SELECT,INSERT"),
             ("direct_execution_writer_fence", "SELECT"),
             ("direct_execution_writer_grants", "SELECT"),
+            ("direct_execution_extra_payouts", "SELECT,INSERT"),
         ];
         for (table, privileges) in tables {
             let qualified = format!("layrs_direct_v1.{table}");
@@ -3427,6 +3477,57 @@ fn same_external_effect_request(a: &ExternalEffectIntent, b: &ExternalEffectInte
         && a.zen_destination_chain == b.zen_destination_chain
 }
 
+/// This is external cash evidence, never a fabricated enclave receipt or a
+/// second debit of the already-completed customer request. Stable fields make
+/// write-once persistence and restart replay byte-identical.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ExtraPayoutEvidence {
+    protocol_version: String,
+    epoch_id: String,
+    intent_hash: String,
+    original_intent_hash: String,
+    original_receipt_id: String,
+    original_transaction_hash: String,
+    provider_transaction_id: String,
+    transaction_hash: String,
+    account_id: String,
+    request_id: String,
+    destination: String,
+    chain: String,
+    asset: String,
+    amount_atomic: String,
+    customer_debit_atomic: String,
+    disposition: String,
+}
+
+fn extra_payout_evidence(intent: &ExternalEffectIntent, original: &ExternalEffectIntent, artifacts: &[DirectStateArtifact], outcome: ExternalEffectRecovery) -> io::Result<Option<ExtraPayoutEvidence>> {
+    intent.verify().map_err(invalid)?;
+    original.verify().map_err(invalid)?;
+    if !same_external_effect_request(intent, original) || intent.intent_hash == original.intent_hash || intent.chain != "base" || intent.asset != "USDC" || intent.relay.is_some() || intent.zen_destination_chain.is_some() { return Err(invalid("extra payout binding conflict")); }
+    let prefix = format!("{}:", original.external_effect_reference);
+    let committed = artifacts.iter().find(|a| a.epoch_id == EPOCH_ID && a.receipt.account_id == original.account_id && a.receipt.request_id == original.request_id && a.receipt.request_hash == original.request_hash && a.receipt.effect == "WITHDRAWAL_SETTLED" && a.receipt.amount_atomic.as_deref() == Some(original.amount_atomic.as_str()) && a.receipt.custody_reference.as_deref().is_some_and(|r|r.starts_with(&prefix))).ok_or_else(|| invalid("original payout is not committed"))?;
+    let original_hash = committed.receipt.custody_reference.as_deref().and_then(|r|r.strip_prefix(&prefix)).filter(|r|valid_transaction_hash(r)).ok_or_else(||invalid("original payout hash invalid"))?;
+    let ExternalEffectRecovery::BindFinalized {provider_transaction_id,transaction_hash} = outcome else {return Err(invalid("extra payout is not canonically finalized"));};
+    if !valid_transaction_hash(&transaction_hash) { return Err(invalid("extra payout hash invalid")); }
+    if original_hash.eq_ignore_ascii_case(&transaction_hash) { return Ok(None); } // Two references to one tx are not two payments.
+    Ok(Some(ExtraPayoutEvidence {protocol_version:"layrs.external-extra-payout.v1".into(),epoch_id:EPOCH_ID.into(),intent_hash:intent.intent_hash.clone(),original_intent_hash:original.intent_hash.clone(),original_receipt_id:committed.receipt.receipt_id.clone(),original_transaction_hash:original_hash.to_ascii_lowercase(),provider_transaction_id,transaction_hash:transaction_hash.to_ascii_lowercase(),account_id:intent.account_id.clone(),request_id:intent.request_id.clone(),destination:intent.destination.to_ascii_lowercase(),chain:intent.chain.clone(),asset:intent.asset.clone(),amount_atomic:intent.amount_atomic.clone(),customer_debit_atomic:"0".into(),disposition:"PROTOCOL_OVERPAYMENT_UNRECOVERED".into()}))
+}
+
+/// Rebase ONLY a confirmed direct Base USDC outcome across an independently
+/// verified successor chain with no intervening change to that user's USDC.
+/// Unknown roots, gaps, request collisions and balance changes fail closed.
+fn historical_intent_lineage_safe(intent: &ExternalEffectIntent, artifacts: &[DirectStateArtifact], current_root: &str) -> bool {
+    if intent.chain != "base" || intent.asset != "USDC" || intent.relay.is_some() || intent.zen_destination_chain.is_some() || artifacts.is_empty() || artifacts.last().is_none_or(|a|a.state_hash != current_root) { return false; }
+    if artifacts.iter().enumerate().any(|(i,a)|a.epoch_id != EPOCH_ID || a.sequence != i as u64+1 || (i>0 && a.prior_state_hash != artifacts[i-1].state_hash)) { return false; }
+    let starts = artifacts.iter().enumerate().filter(|(_,a)|a.prior_state_hash == intent.prior_state_hash).map(|(i,_)|i).collect::<Vec<_>>();
+    if starts.len()!=1 { return false; }
+    artifacts[starts[0]..].iter().all(|a| {
+        !(a.receipt.account_id == intent.account_id && a.receipt.request_id == intent.request_id)
+        && !a.receipt.projection_balance_updates.iter().any(|b|b.identity_commitment == intent.identity_commitment && b.asset == intent.asset)
+    })
+}
+
 fn committed_external_effect_action(
     intents: &[ExternalEffectIntent],
     artifacts: &[DirectStateArtifact],
@@ -3701,11 +3802,24 @@ async fn recover_external_effect_intents(state: &AppState) -> io::Result<()> {
                 && intent_is_committed(candidate, &artifacts)
         }) {
             if same_external_effect_request(&intent, committed_sibling) {
-                // A superseded implementation could derive a second immutable
-                // intent from the post-commit root before checking the enclave
-                // replay map. The already-committed sibling is authoritative;
-                // this unsubmitted duplicate is retained as audit evidence and
-                // is never executable or considered unresolved.
+                // A second intent is NOT proof that it remained unsubmitted.
+                // Observe canonical finality without any submission capability.
+                let custody = state.custody.as_ref().ok_or_else(|| invalid("duplicate custody effect cannot be verified"))?;
+                custody.validate_intent(&intent).map_err(invalid)?;
+                let observation = custody.observe(&intent).await.map_err(invalid)?;
+                match observation {
+                    layrs_direct_execution_v1::ExternalEffectObservation::NotFound => return Err(invalid("duplicate custody reference is missing; no-effect cannot be assumed")),
+                    finalized @ layrs_direct_execution_v1::ExternalEffectObservation::Finalized { .. } => {
+                        let terminal = intent.recovery_action(now_unix(), finalized);
+                        if let Some(evidence) = extra_payout_evidence(&intent, committed_sibling, &artifacts, terminal)? {
+                            store.persist_extra_payout(&evidence).await.map_err(invalid)?;
+                            state.projection.as_ref().ok_or_else(|| invalid("extra payout projection unavailable"))?.record_extra_payout(&evidence).await.map_err(|_|invalid("extra payout projection reconciliation failed"))?;
+                            eprintln!("VERIFIED_EXTRA_PAYOUT_RECONCILED {} customer_debit=0", evidence.intent_hash);
+                        }
+                    }
+                    layrs_direct_execution_v1::ExternalEffectObservation::Reverted { .. } => {}, // Canonical revert: no principal payout.
+                    _ => return Err(invalid("duplicate custody effect remains ambiguous")),
+                }
                 continue;
             }
             return Err(invalid(
@@ -3713,12 +3827,17 @@ async fn recover_external_effect_intents(state: &AppState) -> io::Result<()> {
             ));
         }
         let root = state.committed_state_root.lock().await.clone();
-        if root.as_deref() != Some(intent.prior_state_hash.as_str()) {
+        let historical = root.as_deref() != Some(intent.prior_state_hash.as_str());
+        if historical && !root.as_deref().is_some_and(|r|historical_intent_lineage_safe(&intent,&artifacts,r)) {
             return Err(invalid(
                 "unresolved external-effect intent does not match committed lineage",
             ));
         }
-        let settled = if intent.asset == "ZEN" {
+        let settled = if historical {
+            // This branch cannot rebroadcast, even inside an old provider
+            // idempotency window. Only an existing canonical result can bind.
+            match &state.custody {Some(custody)=>Some(custody.observe_terminal_only(&intent).await),None=>None}
+        } else if intent.asset == "ZEN" {
             match &state.zen_custody {Some(custody)=>Some(custody.settle(&intent,now_unix()).await),None=>None}
         } else {match &state.custody {Some(custody)=>Some(custody.settle(&intent,now_unix()).await),None=>None}};
         let Some(settled) = settled else {
@@ -3744,6 +3863,7 @@ async fn recover_external_effect_intents(state: &AppState) -> io::Result<()> {
                         invalid("projection unavailable during external-effect recovery")
                     })?;
                 }
+                if historical { eprintln!("VERIFIED_HISTORICAL_WITHDRAWAL_RECONCILED {}", intent.intent_hash); }
             }
             ExternalEffectRecovery::AwaitExternalFinality
             | ExternalEffectRecovery::SubmitWithStableReference
@@ -4201,6 +4321,34 @@ async fn write_frame(stream: &mut VsockStream, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn reconciled_intent(root: &str) -> ExternalEffectIntent {
+        ExternalEffectIntent::create(root.into(),"reconciliation-request".into(),"f".repeat(64),"c".repeat(64),"identity".into(),"base".into(),"USDC".into(),"0x2222222222222222222222222222222222222222".into(),"5000000".into(),"existing-wallet".into(),"0x1111111111111111111111111111111111111111".into(),"1".into(),"180000".into(),"11000000".into(),"1000000".into(),now_unix()).unwrap()
+    }
+    fn nonfinancial_chain() -> Vec<DirectStateArtifact> {
+        (0..3).map(|i| { let mut a=projection_sequence_fixture(); a.sequence=i+1; a.prior_state_hash=((b'a'+i as u8) as char).to_string().repeat(64);a.state_hash=((b'b'+i as u8) as char).to_string().repeat(64);a.receipt.account_id="governance".into();a.receipt.request_id=format!("register-{i}");a.receipt.effect="MARKET_REGISTERED".into();a }).collect()
+    }
+    #[test]
+    fn historical_withdrawal_requires_exact_unchanged_verified_ancestry() {
+        let intent=reconciled_intent(&"b".repeat(64));let records=nonfinancial_chain();
+        assert!(historical_intent_lineage_safe(&intent,&records,&"d".repeat(64)));
+        assert!(!historical_intent_lineage_safe(&intent,&records,&"e".repeat(64)));
+        assert!(!historical_intent_lineage_safe(&reconciled_intent(&"e".repeat(64)),&records,&"d".repeat(64)));
+        let mut gap=records.clone();gap[1].sequence=7;assert!(!historical_intent_lineage_safe(&intent,&gap,&"d".repeat(64)));
+        let mut fork=records.clone();fork[1].prior_state_hash="e".repeat(64);assert!(!historical_intent_lineage_safe(&intent,&fork,&"d".repeat(64)));
+        let mut collision=records.clone();collision[2].receipt.account_id=intent.account_id.clone();collision[2].receipt.request_id=intent.request_id.clone();assert!(!historical_intent_lineage_safe(&intent,&collision,&"d".repeat(64)));
+        let mut changed=records.clone();changed[2].receipt.projection_balance_updates.push(layrs_direct_execution_v1::ProjectionBalanceUpdate {auth_subject_hash:intent.account_id.clone(),identity_commitment:intent.identity_commitment.clone(),asset:"USDC".into(),bucket:"USER_AVAILABLE".into(),amount_atomic:"1".into()});assert!(!historical_intent_lineage_safe(&intent,&changed,&"d".repeat(64)));
+    }
+    #[test]
+    fn confirmed_extra_payout_never_becomes_a_second_customer_debit() {
+        let original=reconciled_intent(&"a".repeat(64));let extra=reconciled_intent(&"b".repeat(64));let mut committed=projection_sequence_fixture();
+        committed.receipt.account_id=original.account_id.clone();committed.receipt.identity_commitment=original.identity_commitment.clone();committed.receipt.request_id=original.request_id.clone();committed.receipt.request_hash=original.request_hash.clone();committed.receipt.effect="WITHDRAWAL_SETTLED".into();committed.receipt.amount_atomic=Some(original.amount_atomic.clone());committed.receipt.custody_reference=Some(format!("{}:0x{}",original.external_effect_reference,"11".repeat(32)));
+        let outcome=ExternalEffectRecovery::BindFinalized {provider_transaction_id:"provider-2".into(),transaction_hash:format!("0x{}","22".repeat(32))};
+        let evidence=extra_payout_evidence(&extra,&original,&[committed.clone()],outcome.clone()).unwrap().unwrap();assert_eq!(evidence.amount_atomic,"5000000");assert_eq!(evidence.customer_debit_atomic,"0");assert_eq!(evidence.disposition,"PROTOCOL_OVERPAYMENT_UNRECOVERED");
+        assert_eq!(evidence,extra_payout_evidence(&extra,&original,&[committed.clone()],outcome).unwrap().unwrap());
+        assert!(extra_payout_evidence(&extra,&original,&[committed.clone()],ExternalEffectRecovery::BindFinalized {provider_transaction_id:"alias".into(),transaction_hash:format!("0x{}","11".repeat(32))}).unwrap().is_none());
+        assert!(extra_payout_evidence(&extra,&original,&[committed.clone()],ExternalEffectRecovery::SubmitWithStableReference).is_err());
+        assert!(extra_payout_evidence(&extra,&original,&[committed],ExternalEffectRecovery::BindReverted {provider_transaction_id:"reverted".into(),transaction_hash:format!("0x{}","22".repeat(32))}).is_err());
+    }
     fn projection_sequence_fixture() -> DirectStateArtifact {
         DirectStateArtifact {
             epoch_id: EPOCH_ID.into(), sequence: 7, prior_state_hash: "a".repeat(64), state_hash: "b".repeat(64), request_hash: "c".repeat(64),
