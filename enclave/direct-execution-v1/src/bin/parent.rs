@@ -1414,6 +1414,14 @@ impl ArchiveStore {
     }
 }
 
+fn receipt_only_record(artifact:&DirectStateArtifact)->DirectStateArtifact {
+    let mut record=artifact.clone();
+    // clear() leaves the entire snapshot allocation alive. This cache is only
+    // receipt metadata; release the encrypted snapshot allocation completely.
+    record.ciphertext=Vec::new();
+    record
+}
+
 impl S3ImmutableArtifactStore {
     async fn from_environment() -> Result<Self, Box<dyn std::error::Error>> {
         let bucket = env::var("LAYRS_DIRECT_ARCHIVE_BUCKET")?;
@@ -1530,7 +1538,7 @@ impl S3ImmutableArtifactStore {
         }
         if let Some(records)=self.verified_receipt_records.lock().await.as_mut() {
             if !records.iter().any(|record|record.sequence==artifact.sequence) {
-                let mut record=restored.clone();record.ciphertext.clear();records.push(record);
+                records.push(receipt_only_record(&restored));
             }
         }
         Ok(restored)
@@ -1562,7 +1570,7 @@ impl S3ImmutableArtifactStore {
             let artifact:DirectStateArtifact=serde_cbor::from_slice(&bytes).map_err(|_|"artifact decode failed")?;
             if artifact.sequence!=index as u64+1 || artifact.prior_state_hash!=root || key!=&self.artifact_key(&artifact) || heads[index]!=self.head_key(&artifact) || self.read(&heads[index]).await?!=bytes {return Err("archive encrypted successor/head mismatch".into());}
             root=artifact.state_hash.clone();let sequence=artifact.sequence;
-            let mut record=artifact.clone();record.ciphertext.clear();records.push(record);
+            records.push(receipt_only_record(&artifact));
             let response=exchange(state,RuntimeRequest::AppendCommittedRestore {artifact}).await.map_err(|_|"restore successor transport failed")?;
             if !matches!(response,RuntimeResponse::RestoreProgress {recovered_sequence,recovered_state_hash} if recovered_sequence==sequence && recovered_state_hash==root){return Err("restore encrypted successor rejected".into());}
             if sequence%250==0 {eprintln!("VERIFIED_ARCHIVE_RESTORE_PROGRESS {sequence}/{}",keys.len());}
@@ -4144,6 +4152,17 @@ async fn write_frame(stream: &mut VsockStream, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn receipt_cache_releases_entire_snapshot_allocation() {
+        let artifact=DirectStateArtifact {epoch_id:EPOCH_ID.into(),sequence:1,prior_state_hash:"a".repeat(64),state_hash:"b".repeat(64),request_hash:"c".repeat(64),nonce:vec![1;12],ciphertext:vec![7;2_000_000],ciphertext_hash:"d".repeat(64),
+            receipt:DirectReceipt {receipt_id:"receipt".into(),account_id:"account".into(),identity_commitment:"identity".into(),request_id:"request".into(),request_hash:"c".repeat(64),status:layrs_direct_execution_v1::TerminalStatus::Applied,effect:"BALANCE_READ".into(),amount_atomic:None,custody_reference:None,execution:None,resolution:None,projection_balance_updates:vec![],genesis_ordinal:0,signature:"signature".into()}};
+        let record=receipt_only_record(&artifact);
+        assert_eq!(record.ciphertext.capacity(),0);
+        assert!(record.ciphertext.is_empty());
+        assert_eq!(record.receipt,artifact.receipt);
+        assert_eq!(record.state_hash,artifact.state_hash);
+        assert_eq!(artifact.ciphertext.len(),2_000_000);
+    }
     #[tokio::test]
     async fn s3_restore_listing_reads_beyond_the_first_thousand_without_skipping_keys() {
         let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
