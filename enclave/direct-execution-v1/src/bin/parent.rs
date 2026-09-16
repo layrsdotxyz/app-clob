@@ -68,6 +68,11 @@ use tokio_vsock::{VsockAddr, VsockStream};
 const ENCLOSURE_PORT: u32 = 5_003;
 // Must match the enclave's finite parent-only VSOCK recovery ceiling.
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+// Fixed encrypted-download window, not a verification bypass.
+const RESTORE_PREFETCH_WIDTH: usize = 4;
+fn restore_prefetch_ranges(total: usize) -> Vec<std::ops::Range<usize>> {
+    (0..total).step_by(RESTORE_PREFETCH_WIDTH).map(|start|start..start.saturating_add(RESTORE_PREFETCH_WIDTH).min(total)).collect()
+}
 const SESSION_AUDIENCE: &str = "layrs.direct-execution.v1";
 const DIRECT_SESSION_KEY_DERIVATION_DOMAIN: &[u8] = b"layrs.direct-session.v1\0";
 const BASE_USDC_ADDRESS: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
@@ -1613,15 +1618,27 @@ impl S3ImmutableArtifactStore {
         let begin=exchange(state,RuntimeRequest::BeginCommittedRestore).await.map_err(|_|"restore begin transport failed")?;
         let RuntimeResponse::RestoreProgress {recovered_sequence:0,recovered_state_hash:mut root}=begin else {return Err("restore begin rejected".into());};
         let mut records=Vec::with_capacity(keys.len());
-        for (index,key) in keys.iter().enumerate(){
-            let bytes=self.read(key).await?;
-            let artifact:DirectStateArtifact=serde_cbor::from_slice(&bytes).map_err(|_|"artifact decode failed")?;
-            if artifact.sequence!=index as u64+1 || artifact.prior_state_hash!=root || key!=&self.artifact_key(&artifact) || heads[index]!=self.head_key(&artifact) || self.read(&heads[index]).await?!=bytes {return Err("archive encrypted successor/head mismatch".into());}
-            root=artifact.state_hash.clone();let sequence=artifact.sequence;
-            records.push(receipt_only_record(&artifact));
-            let response=exchange(state,RuntimeRequest::AppendCommittedRestore {artifact}).await.map_err(|_|"restore successor transport failed")?;
-            if !matches!(response,RuntimeResponse::RestoreProgress {recovered_sequence,recovered_state_hash} if recovered_sequence==sequence && recovered_state_hash==root){return Err("restore encrypted successor rejected".into());}
-            if sequence%250==0 {eprintln!("VERIFIED_ARCHIVE_RESTORE_PROGRESS {sequence}/{}",keys.len());}
+        for window in restore_prefetch_ranges(keys.len()) {
+            let mut downloads=Vec::with_capacity(window.len());
+            for index in window {
+                let store=self.clone();let key=keys[index].clone();let head=heads[index].clone();
+                downloads.push((index,tokio::spawn(async move {
+                    let (bytes,head_bytes)=tokio::try_join!(store.read(&key),store.read(&head))?;
+                    if bytes!=head_bytes {return Err("archive encrypted artifact/head byte mismatch".to_string());}
+                    serde_cbor::from_slice::<DirectStateArtifact>(&bytes).map_err(|_|"artifact decode failed".to_string())
+                })));
+            }
+            // Await in key order, regardless of download completion order.
+            // Each native append must verify before the next append is sent.
+            for (index,download) in downloads {
+                let artifact=download.await.map_err(|_|"bounded archive download failed")??;
+                if artifact.sequence!=index as u64+1 || artifact.prior_state_hash!=root || keys[index]!=self.artifact_key(&artifact) || heads[index]!=self.head_key(&artifact) {return Err("archive encrypted successor/head mismatch".into());}
+                root=artifact.state_hash.clone();let sequence=artifact.sequence;
+                records.push(receipt_only_record(&artifact));
+                let response=exchange(state,RuntimeRequest::AppendCommittedRestore {artifact}).await.map_err(|_|"restore successor transport failed")?;
+                if !matches!(response,RuntimeResponse::RestoreProgress {recovered_sequence,recovered_state_hash} if recovered_sequence==sequence && recovered_state_hash==root){return Err("restore encrypted successor rejected".into());}
+                if sequence%250==0 {eprintln!("VERIFIED_ARCHIVE_RESTORE_PROGRESS {sequence}/{}",keys.len());}
+            }
         }
         let result=exchange(state,RuntimeRequest::FinishCommittedRestore {expected_sequence:keys.len() as u64,expected_state_hash:root.clone()}).await.map_err(|_|"restore finish transport failed")?;
         if !matches!(result,RuntimeResponse::RecoveryComplete {recovered_sequence,recovered_state_hash} if recovered_sequence==keys.len() as u64 && recovered_state_hash==root){return Err("restore final encrypted head rejected".into());}
@@ -4327,6 +4344,14 @@ async fn write_frame(stream: &mut VsockStream, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bounded_prefetch_covers_every_archive_record_exactly_once_in_order() {
+        for total in [0,1,3,4,5,1001,4724,4725] {
+            let ranges=restore_prefetch_ranges(total);
+            assert!(ranges.iter().all(|r|r.len()>0 && r.len()<=RESTORE_PREFETCH_WIDTH));
+            assert_eq!(ranges.into_iter().flatten().collect::<Vec<_>>(),(0..total).collect::<Vec<_>>());
+        }
+    }
     fn reconciled_intent(root: &str) -> ExternalEffectIntent {
         ExternalEffectIntent::create(root.into(),"reconciliation-request".into(),"f".repeat(64),"c".repeat(64),"identity".into(),"base".into(),"USDC".into(),"0x2222222222222222222222222222222222222222".into(),"5000000".into(),"existing-wallet".into(),"0x1111111111111111111111111111111111111111".into(),"1".into(),"180000".into(),"11000000".into(),"1000000".into(),now_unix()).unwrap()
     }
