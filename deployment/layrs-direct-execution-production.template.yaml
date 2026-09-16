@@ -44,6 +44,10 @@ Parameters:
   ApprovedPcr2: { Type: String, Default: '' }
   BasePoolAddress: { Type: String, AllowedPattern: '^0x[0-9a-fA-F]{40}$' }
   BaseConfirmations: { Type: Number, MinValue: 1 }
+  ZenCustodyEnabled: { Type: String, Default: 'false', AllowedValues: ['true', 'false'] }
+  ZenCustodyUrl: { Type: String, Default: 'https://api.layrs.xyz', AllowedPattern: '^https://[A-Za-z0-9.-]+(?::[0-9]+)?$' }
+  HorizenZenPoolAddress: { Type: String, Default: '0x4B31ad17e964cB6Da440B28405AB110eaF7b52A0', AllowedPattern: '^0x[0-9a-fA-F]{40}$' }
+  HorizenConfirmations: { Type: Number, Default: 20, MinValue: 1 }
   # A dormant verifier may run to support attestation and health checks, but
   # its process mode remains `dormant` and has no writer authority.
   DormantRuntimeDesiredCapacity: { Type: Number, Default: 1, MinValue: 0, MaxValue: 1 }
@@ -255,6 +259,16 @@ Resources:
                     "LAYRSV2_BASE_RPC_URL": required(rpc, "baseRpcUrl"),
                     "LAYRSV2_BASE_CONFIRMATIONS": "${BaseConfirmations}",
                 })
+                if "${ZenCustodyEnabled}" == "true":
+                    values.update({
+                        "LAYRS_DIRECT_ZEN_CUSTODY_ENABLED": "true",
+                        "LAYRS_DIRECT_ZEN_CUSTODY_URL": "${ZenCustodyUrl}",
+                        "LAYRSV2_HORIZEN_ZEN_POOL_ADDRESS": "${HorizenZenPoolAddress}",
+                        "LAYRSV2_HORIZEN_POOL_LEDGER_PRIVY_WALLET_ID": required(runtime, "horizenPoolLedgerPrivyWalletId"),
+                        "LAYRSV2_HORIZEN_POOL_LEDGER_PRIVY_ADDRESS": required(runtime, "horizenPoolLedgerPrivyAddress"),
+                        "LAYRSV2_HORIZEN_RPC_URL": required(rpc, "horizenRpcUrl"),
+                        "LAYRSV2_HORIZEN_CONFIRMATIONS": "${HorizenConfirmations}",
+                    })
             def quote(value):
                 # systemd EnvironmentFile consumes one shell-like escaping
                 # layer.  Escape each literal backslash exactly once and each

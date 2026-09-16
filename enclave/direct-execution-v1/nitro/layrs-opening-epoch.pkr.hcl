@@ -5,6 +5,14 @@ packer {
 }
 variable "aws_region" { type = string }
 variable "release_id" { type = string }
+variable "binary_directory" {
+  type = string
+  default = ""
+  description = "Explicit release binary directory; empty uses the crate's local target/release."
+}
+locals {
+  binary_directory = var.binary_directory == "" ? "${path.root}/../target/release" : var.binary_directory
+}
 source "amazon-ebs" "opening_epoch" {
   region               = var.aws_region
   instance_type        = "m6i.xlarge"
@@ -26,11 +34,11 @@ source "amazon-ebs" "opening_epoch" {
 build {
   sources = ["source.amazon-ebs.opening_epoch"]
   provisioner "file" {
-    source      = "${path.root}/../target/release/layrs-direct-enclave"
+    source      = "${local.binary_directory}/layrs-direct-enclave"
     destination = "/tmp/layrs-direct-enclave"
   }
   provisioner "file" {
-    source      = "${path.root}/../target/release/layrs-direct-parent"
+    source      = "${local.binary_directory}/layrs-direct-parent"
     destination = "/tmp/layrs-direct-parent"
   }
   provisioner "file" {
