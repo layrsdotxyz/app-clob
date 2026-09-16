@@ -43,6 +43,7 @@ struct EnclaveState {
     state_key: Vec<u8>,
     commit_ack_key: Vec<u8>,
     recovery_complete: bool,
+    restore_candidate: Option<DirectRuntime>,
     pending_governed_bootstrap: Option<PendingGovernedBootstrap>,
     writer_grant_commitment: Option<String>,
     writer_grant_expires_at_unix: Option<u64>,
@@ -93,6 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state_key,
         commit_ack_key,
         recovery_complete: false,
+        restore_candidate: None,
         pending_governed_bootstrap: None,
         writer_grant_commitment: None,
         writer_grant_expires_at_unix: None,
@@ -162,6 +164,9 @@ where
             code: "UNEXPECTED_DURABILITY_ACK".into(),
         },
         RuntimeRequest::RecoverCommitted { artifacts } => recover_committed(state, artifacts).await,
+        RuntimeRequest::BeginCommittedRestore => begin_committed_restore(state).await,
+        RuntimeRequest::AppendCommittedRestore { artifact } => append_committed_restore(state,artifact).await,
+        RuntimeRequest::FinishCommittedRestore { expected_sequence,expected_state_hash } => finish_committed_restore(state,expected_sequence,expected_state_hash).await,
         RuntimeRequest::Balance {
             account_id,
             identity_commitment,
@@ -605,6 +610,33 @@ async fn recover_committed(
     response
 }
 
+async fn begin_committed_restore(state: Arc<Mutex<EnclaveState>>) -> RuntimeResponse {
+    let mut state=state.lock().await;
+    if state.restore_candidate.is_some() { return RuntimeResponse::Error {code:"RESTORE_ALREADY_IN_PROGRESS".into()}; }
+    match DirectRuntime::new(state.epoch.clone(),state.mode,state.receipt_key.clone()) {
+        Ok(runtime)=>{let response=RuntimeResponse::RestoreProgress {recovered_sequence:0,recovered_state_hash:runtime.committed_state_hash()};state.restore_candidate=Some(runtime);response},
+        Err(_)=>RuntimeResponse::Error {code:"RESTORE_BEGIN_FAILED".into()},
+    }
+}
+async fn append_committed_restore(state: Arc<Mutex<EnclaveState>>,artifact:layrs_direct_execution_v1::DirectStateArtifact)->RuntimeResponse {
+    let mut state=state.lock().await;
+    let Some(candidate)=state.restore_candidate.take() else {return RuntimeResponse::Error {code:"RESTORE_NOT_STARTED".into()};};
+    match candidate.restore_next_committed(&artifact,&state.state_key) {
+        Ok(candidate)=>{let response=RuntimeResponse::RestoreProgress {recovered_sequence:candidate.committed_sequence(),recovered_state_hash:candidate.committed_state_hash()};state.restore_candidate=Some(candidate);response},
+        Err(_)=>RuntimeResponse::Error {code:"RESTORE_SUCCESSOR_INVALID".into()},
+    }
+}
+async fn finish_committed_restore(state: Arc<Mutex<EnclaveState>>,expected_sequence:u64,expected_state_hash:String)->RuntimeResponse {
+    let mut state=state.lock().await;
+    let Some(candidate)=state.restore_candidate.take() else {return RuntimeResponse::Error {code:"RESTORE_NOT_STARTED".into()};};
+    if candidate.committed_sequence()!=expected_sequence || candidate.committed_state_hash()!=expected_state_hash
+        || (state.recovery_complete && (candidate.committed_sequence()!=state.runtime.committed_sequence() || candidate.committed_state_hash()!=state.runtime.committed_state_hash())) {
+        return RuntimeResponse::Error {code:"RESTORE_FINAL_HEAD_MISMATCH".into()};
+    }
+    state.runtime=candidate;state.recovery_complete=true;
+    RuntimeResponse::RecoveryComplete {recovered_sequence:expected_sequence,recovered_state_hash:expected_state_hash}
+}
+
 /// This is the only persistence callback in direct execution.  The mutex is
 /// deliberately held across the bounded request/ACK exchange so two commands
 /// cannot derive competing successors from one committed root.  The candidate
@@ -618,7 +650,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut state = state.lock().await;
-    if !state.recovery_complete {
+    if !state.recovery_complete || state.restore_candidate.is_some() {
         return write_response(
             stream,
             RuntimeResponse::Error {
@@ -902,6 +934,7 @@ mod tests {
             state_key: vec![8; 32],
             commit_ack_key: vec![9; 32],
             recovery_complete: false,
+            restore_candidate: None,
             pending_governed_bootstrap: None,
             writer_grant_commitment: None,
             writer_grant_expires_at_unix: None,
@@ -919,6 +952,7 @@ mod tests {
             state_key: vec![0; 32],
             commit_ack_key: vec![0; 32],
             recovery_complete: false,
+            restore_candidate: None,
             pending_governed_bootstrap: None,
             writer_grant_commitment: None,
             writer_grant_expires_at_unix: None,
@@ -1017,6 +1051,33 @@ mod tests {
         let response = serde_cbor::from_slice(&read_frame(&mut parent).await.unwrap()).unwrap();
         server.await.unwrap().unwrap();
         response
+    }
+    #[tokio::test]
+    async fn streamed_restore_verifies_every_successor_and_final_head_before_adoption() {
+        let running=state();let store=FilesystemImmutableArtifactStore::new(artifact_dir());
+        assert!(matches!(recover(Arc::clone(&running),vec![]).await,RuntimeResponse::RecoveryComplete{..}));
+        for id in ["stream-one","stream-two","stream-three"] {
+            assert!(matches!(commit_through_parent_callback(Arc::clone(&running),request(id),&store).await,RuntimeResponse::Execute{..}));
+        }
+        let artifacts=store.load_committed().unwrap();let expected=artifacts.last().unwrap().state_hash.clone();
+        let restarted=state();assert!(matches!(begin_committed_restore(Arc::clone(&restarted)).await,RuntimeResponse::RestoreProgress{..}));
+        assert!(matches!(execute_response(Arc::clone(&restarted),request("blocked-during-restore")).await,RuntimeResponse::Error{..}));
+        assert!(matches!(append_committed_restore(Arc::clone(&restarted),artifacts[1].clone()).await,RuntimeResponse::Error{..}));
+        assert!(!restarted.lock().await.recovery_complete);
+        assert!(matches!(finish_committed_restore(Arc::clone(&restarted),3,expected.clone()).await,RuntimeResponse::Error{..}));
+        assert!(matches!(begin_committed_restore(Arc::clone(&restarted)).await,RuntimeResponse::RestoreProgress{..}));
+        for artifact in artifacts.iter().cloned(){assert!(matches!(append_committed_restore(Arc::clone(&restarted),artifact).await,RuntimeResponse::RestoreProgress{..}));}
+        assert!(matches!(finish_committed_restore(Arc::clone(&restarted),2,expected.clone()).await,RuntimeResponse::Error{..}));
+        assert!(!restarted.lock().await.recovery_complete);
+        assert!(matches!(begin_committed_restore(Arc::clone(&restarted)).await,RuntimeResponse::RestoreProgress{..}));
+        for artifact in artifacts.iter().cloned(){assert!(matches!(append_committed_restore(Arc::clone(&restarted),artifact).await,RuntimeResponse::RestoreProgress{..}));}
+        assert!(matches!(finish_committed_restore(Arc::clone(&restarted),3,expected.clone()).await,RuntimeResponse::RecoveryComplete{recovered_sequence:3,..}));
+        assert_eq!(restarted.lock().await.runtime.committed_state_hash(),expected);
+        assert!(matches!(execute_response(Arc::clone(&restarted),request("stream-one")).await,RuntimeResponse::Execute{..}));
+        let mut corrupt=artifacts[0].clone();corrupt.ciphertext[0]^=1;
+        assert!(matches!(begin_committed_restore(Arc::clone(&restarted)).await,RuntimeResponse::RestoreProgress{..}));
+        assert!(matches!(append_committed_restore(Arc::clone(&restarted),corrupt).await,RuntimeResponse::Error{..}));
+        assert_eq!(restarted.lock().await.runtime.committed_state_hash(),expected);
     }
     async fn begin(
         state: Arc<Mutex<EnclaveState>>,
@@ -1120,6 +1181,7 @@ mod tests {
             state_key: Vec::new(),
             commit_ack_key: Vec::new(),
             recovery_complete: false,
+            restore_candidate: None,
             pending_governed_bootstrap: None,
             writer_grant_commitment: None,
             writer_grant_expires_at_unix: None,

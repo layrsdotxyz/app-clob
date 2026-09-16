@@ -1988,6 +1988,20 @@ impl DirectRuntime {
         }
         Ok(runtime)
     }
+    /// Restore one encrypted successor without collecting the entire archive
+    /// in one VSOCK frame. Call only on a startup candidate, never adopted state.
+    pub fn restore_next_committed(mut self, artifact: &DirectStateArtifact, key: &[u8]) -> Result<Self, RuntimeError> {
+        if artifact.sequence != self.committed_sequence()+1
+            || artifact.prior_state_hash != self.state_hash()
+            || !self.verify_artifact(artifact,key)? {
+            return Err(RuntimeError::StateArtifact);
+        }
+        self.apply_artifact(artifact,key)?;
+        if self.state_hash()!=artifact.state_hash || self.committed_sequence()!=artifact.sequence {
+            return Err(RuntimeError::StateArtifact);
+        }
+        Ok(self)
+    }
     fn snapshot(&self) -> DirectState {
         DirectState {
             balances: self.balances.clone(),
@@ -3129,6 +3143,9 @@ pub enum RuntimeRequest {
     RecoverCommitted {
         artifacts: Vec<DirectStateArtifact>,
     },
+    BeginCommittedRestore,
+    AppendCommittedRestore { artifact: DirectStateArtifact },
+    FinishCommittedRestore { expected_sequence: u64, expected_state_hash: String },
     Balance {
         account_id: String,
         identity_commitment: String,
@@ -3174,6 +3191,7 @@ pub enum RuntimeResponse {
         recovered_sequence: u64,
         recovered_state_hash: String,
     },
+    RestoreProgress { recovered_sequence: u64, recovered_state_hash: String },
     Balance {
         amount_atomic: String,
     },

@@ -120,6 +120,9 @@ struct S3ImmutableArtifactStore {
     prefix: String,
     kms_key_id: String,
     retention_seconds: i64,
+    // Receipt-only cache built after full encrypted-chain verification. It is
+    // never a state-restore input and never contains private ledger plaintext.
+    verified_receipt_records: Arc<Mutex<Option<Vec<DirectStateArtifact>>>>,
 }
 
 /// Direct, synchronous adapter for the existing Base pool-ledger Privy
@@ -1438,6 +1441,7 @@ impl S3ImmutableArtifactStore {
             prefix: prefix.trim_end_matches('/').into(),
             kms_key_id,
             retention_seconds,
+            verified_receipt_records: Arc::new(Mutex::new(None)),
         })
     }
     fn artifact_key(&self, artifact: &DirectStateArtifact) -> String {
@@ -1524,46 +1528,50 @@ impl S3ImmutableArtifactStore {
         if restored != *artifact || artifact_hash(&restored) != artifact_hash(artifact) {
             return Err("artifact integrity mismatch".into());
         }
+        if let Some(records)=self.verified_receipt_records.lock().await.as_mut() {
+            if !records.iter().any(|record|record.sequence==artifact.sequence) {
+                let mut record=restored.clone();record.ciphertext.clear();records.push(record);
+            }
+        }
         Ok(restored)
     }
     async fn load_committed(&self) -> Result<Vec<DirectStateArtifact>, String> {
-        let listing = self
-            .client
-            .list_objects_v2()
-            .bucket(&self.bucket)
-            .prefix(format!("{}/artifacts/", self.prefix))
-            .send()
-            .await
-            .map_err(|_| "archive listing failed")?;
-        if listing.is_truncated.unwrap_or(false) {
-            return Err("archive listing exceeds bounded recovery set".into());
+        self.verified_receipt_records.lock().await.clone().ok_or("verified archive receipt cache unavailable".into())
+    }
+    async fn list_restore_keys(&self,namespace:&str)->Result<Vec<String>,String> {
+        let mut token=None;let mut seen_tokens=HashSet::new();let mut keys=Vec::new();
+        loop {
+            let page=self.client.list_objects_v2().bucket(&self.bucket).prefix(format!("{}/{namespace}/",self.prefix)).set_continuation_token(token).send().await.map_err(|_|"archive listing failed")?;
+            for object in page.contents(){keys.push(object.key().ok_or("archive object key missing")?.to_string());}
+            if keys.len()>100_000 {return Err("archive exceeds finite restore bound".into());}
+            if !page.is_truncated.unwrap_or(false){break;}
+            let next=page.next_continuation_token().filter(|s|!s.is_empty()).ok_or("archive pagination token missing")?.to_string();
+            if !seen_tokens.insert(next.clone()){return Err("archive pagination token repeated".into());}token=Some(next);
         }
-        let mut artifacts = Vec::new();
-        let mut object_hashes = HashSet::new();
-        let mut sequences = HashSet::new();
-        for object in listing.contents() {
-            let key = object.key().ok_or("archive object key missing")?;
-            let artifact: DirectStateArtifact = serde_cbor::from_slice(&self.read(key).await?)
-                .map_err(|_| "artifact decode failed")?;
-            // The object name is part of the immutable commitment.  Accepting
-            // a second spelling for the same encrypted artifact could hide a
-            // duplicate or a conflicting archive object from recovery.
-            if key != self.artifact_key(&artifact)
-                || !object_hashes.insert(artifact_hash(&artifact))
-                || !sequences.insert(artifact.sequence)
-            {
-                return Err("duplicate or conflicting archive artifact".into());
-            }
-            artifacts.push(artifact);
+        keys.sort();if keys.windows(2).any(|pair|pair[0]==pair[1]){return Err("archive duplicate key".into());}Ok(keys)
+    }
+    async fn restore_streamed(&self,state:&AppState)->Result<(),String> {
+        let keys=self.list_restore_keys("artifacts").await?;
+        let heads=self.list_restore_keys("heads").await?;
+        if keys.len()!=heads.len(){return Err("archive artifact/head count mismatch".into());}
+        let begin=exchange(state,RuntimeRequest::BeginCommittedRestore).await.map_err(|_|"restore begin transport failed")?;
+        let RuntimeResponse::RestoreProgress {recovered_sequence:0,recovered_state_hash:mut root}=begin else {return Err("restore begin rejected".into());};
+        let mut records=Vec::with_capacity(keys.len());
+        for (index,key) in keys.iter().enumerate(){
+            let bytes=self.read(key).await?;
+            let artifact:DirectStateArtifact=serde_cbor::from_slice(&bytes).map_err(|_|"artifact decode failed")?;
+            if artifact.sequence!=index as u64+1 || artifact.prior_state_hash!=root || key!=&self.artifact_key(&artifact) || heads[index]!=self.head_key(&artifact) || self.read(&heads[index]).await?!=bytes {return Err("archive encrypted successor/head mismatch".into());}
+            root=artifact.state_hash.clone();let sequence=artifact.sequence;
+            let mut record=artifact.clone();record.ciphertext.clear();records.push(record);
+            let response=exchange(state,RuntimeRequest::AppendCommittedRestore {artifact}).await.map_err(|_|"restore successor transport failed")?;
+            if !matches!(response,RuntimeResponse::RestoreProgress {recovered_sequence,recovered_state_hash} if recovered_sequence==sequence && recovered_state_hash==root){return Err("restore encrypted successor rejected".into());}
+            if sequence%250==0 {eprintln!("VERIFIED_ARCHIVE_RESTORE_PROGRESS {sequence}/{}",keys.len());}
         }
-        artifacts.sort_by_key(|artifact: &DirectStateArtifact| artifact.sequence);
-        for artifact in &artifacts {
-            let head = self.read(&self.head_key(artifact)).await?;
-            if head != serde_cbor::to_vec(artifact).map_err(|_| "head encoding failed")? {
-                return Err("archive head mismatch".into());
-            }
-        }
-        Ok(artifacts)
+        let result=exchange(state,RuntimeRequest::FinishCommittedRestore {expected_sequence:keys.len() as u64,expected_state_hash:root.clone()}).await.map_err(|_|"restore finish transport failed")?;
+        if !matches!(result,RuntimeResponse::RecoveryComplete {recovered_sequence,recovered_state_hash} if recovered_sequence==keys.len() as u64 && recovered_state_hash==root){return Err("restore final encrypted head rejected".into());}
+        *self.verified_receipt_records.lock().await=Some(records);
+        *state.committed_state_root.lock().await=Some(root);
+        eprintln!("VERIFIED_ARCHIVE_RESTORE_COMPLETE {}",keys.len());Ok(())
     }
     async fn persist_intent_readback(
         &self,
@@ -3306,6 +3314,7 @@ async fn recover_enclave(state: &AppState) -> io::Result<()> {
             "DIRECT_ARTIFACT_STORE_NOT_CONFIGURED",
         )
     })?;
+    if let ArchiveStore::S3(s3)=store {return s3.restore_streamed(state).await.map_err(|error|invalid(format!("DIRECT_STATE_RECOVERY_FAILED:{error}")));}
     let artifacts = store.load_committed().await.map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -4135,6 +4144,24 @@ async fn write_frame(stream: &mut VsockStream, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn s3_restore_listing_reads_beyond_the_first_thousand_without_skipping_keys() {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
+        let server=tokio::spawn(async move {
+            for page in 0..2 {
+                let (mut socket,_)=listener.accept().await.unwrap();let mut buffer=vec![0;8192];let size=socket.read(&mut buffer).await.unwrap();let request=String::from_utf8_lossy(&buffer[..size]);
+                if page==1 {assert!(request.contains("continuation-token=page-two"));}
+                let start=page*1000;let end=if page==0 {1000}else{1250};
+                let objects=(start..end).map(|i|format!("<Contents><Key>epoch/artifacts/{:020}.cbor</Key><Size>1</Size></Contents>",i+1)).collect::<String>();
+                let next=if page==0 {"<NextContinuationToken>page-two</NextContinuationToken>"}else{""};
+                let body=format!("<?xml version=\"1.0\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><IsTruncated>{}</IsTruncated>{next}{objects}</ListBucketResult>",page==0);
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let configuration=aws_sdk_s3::config::Builder::new().behavior_version_latest().region(aws_sdk_s3::config::Region::new("us-east-1")).credentials_provider(aws_sdk_s3::config::Credentials::new("unit-test","unit-test",None,None,"local-only")).endpoint_url(format!("http://{address}")).force_path_style(true).build();
+        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None))};
+        let keys=store.list_restore_keys("artifacts").await.unwrap();assert_eq!(keys.len(),1250);assert!(keys.first().unwrap().contains("00000000000000000001"));assert!(keys.last().unwrap().contains("00000000000000001250"));server.await.unwrap();
+    }
 
     fn relay_binding() -> RelayWithdrawalBinding {
         RelayWithdrawalBinding {
