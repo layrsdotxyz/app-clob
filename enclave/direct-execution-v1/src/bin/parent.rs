@@ -1478,20 +1478,26 @@ impl S3ImmutableArtifactStore {
         format!("{}/authorization/{}.cbor", self.prefix, activation_id)
     }
     async fn read(&self, key: &str) -> Result<Vec<u8>, String> {
-        Ok(self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|_| "archive read failed")?
-            .body
-            .collect()
-            .await
-            .map_err(|_| "archive read body failed")?
-            .into_bytes()
-            .to_vec())
+        // SDK request retries do not retry a response stream after headers.
+        // Discard an incomplete body and GET the same immutable key again;
+        // no partial bytes ever reach the encrypted successor verifier.
+        for attempt in 0..5 {
+            let result=timeout(Duration::from_secs(60),async {
+                let response=self.client.get_object().bucket(&self.bucket).key(key)
+                    .send().await.map_err(|_|"archive read failed")?;
+                let length=response.content_length.filter(|length|*length>0 && *length<=MAX_FRAME_BYTES as i64)
+                    .ok_or("archive read size invalid")?;
+                let bytes=response.body.collect().await.map_err(|_|"archive read body failed")?.into_bytes();
+                if bytes.len()!=length as usize {return Err("archive read body length mismatch");}
+                Ok(bytes.to_vec())
+            }).await;
+            if let Ok(Ok(bytes))=result {return Ok(bytes);}
+            if attempt<4 {
+                eprintln!("ARCHIVE_READ_RETRY {}/5",attempt+2);
+                tokio::time::sleep(Duration::from_millis(100u64<<attempt)).await;
+            }
+        }
+        Err("archive complete read retries exhausted".into())
     }
     async fn write_once(&self, key: &str, bytes: Vec<u8>) -> Result<(), String> {
         let until = DateTime::from_secs(
@@ -4162,6 +4168,35 @@ mod tests {
         assert_eq!(record.receipt,artifact.receipt);
         assert_eq!(record.state_hash,artifact.state_hash);
         assert_eq!(artifact.ciphertext.len(),2_000_000);
+    }
+    #[tokio::test]
+    async fn s3_archive_read_discards_truncated_body_and_retries_same_immutable_key() {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
+        let server=tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut socket,_)=listener.accept().await.unwrap();let mut buffer=vec![0;8192];let size=socket.read(&mut buffer).await.unwrap();
+                assert!(String::from_utf8_lossy(&buffer[..size]).contains("/unit-test/epoch/immutable.cbor"));
+                let body=if attempt==0 {"bad"}else{"complete-opaque-ciphertext"};
+                let length=if attempt==0 {64}else{body.len()};
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}").as_bytes()).await.unwrap();
+            }
+        });
+        let configuration=aws_sdk_s3::config::Builder::new().behavior_version_latest().region(aws_sdk_s3::config::Region::new("us-east-1")).credentials_provider(aws_sdk_s3::config::Credentials::new("unit-test","unit-test",None,None,"local-only")).endpoint_url(format!("http://{address}")).force_path_style(true).build();
+        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None))};
+        assert_eq!(store.read("epoch/immutable.cbor").await.unwrap(),b"complete-opaque-ciphertext");server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn s3_archive_read_fails_closed_after_five_truncated_bodies() {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
+        let server=tokio::spawn(async move {
+            for _ in 0..5 {
+                let (mut socket,_)=listener.accept().await.unwrap();let mut buffer=vec![0;8192];socket.read(&mut buffer).await.unwrap();
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\nbad").await.unwrap();
+            }
+        });
+        let configuration=aws_sdk_s3::config::Builder::new().behavior_version_latest().region(aws_sdk_s3::config::Region::new("us-east-1")).credentials_provider(aws_sdk_s3::config::Credentials::new("unit-test","unit-test",None,None,"local-only")).endpoint_url(format!("http://{address}")).force_path_style(true).build();
+        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None))};
+        assert_eq!(store.read("epoch/immutable.cbor").await.unwrap_err(),"archive complete read retries exhausted");server.await.unwrap();
     }
     #[tokio::test]
     async fn s3_restore_listing_reads_beyond_the_first_thousand_without_skipping_keys() {
