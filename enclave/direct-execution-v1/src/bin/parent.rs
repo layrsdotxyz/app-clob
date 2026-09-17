@@ -68,6 +68,11 @@ use tokio_vsock::{VsockAddr, VsockStream};
 const ENCLOSURE_PORT: u32 = 5_003;
 // Must match the enclave's finite parent-only VSOCK recovery ceiling.
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+// Fixed encrypted-download window, not a verification bypass.
+const RESTORE_PREFETCH_WIDTH: usize = 4;
+fn restore_prefetch_ranges(total: usize) -> Vec<std::ops::Range<usize>> {
+    (0..total).step_by(RESTORE_PREFETCH_WIDTH).map(|start|start..start.saturating_add(RESTORE_PREFETCH_WIDTH).min(total)).collect()
+}
 const SESSION_AUDIENCE: &str = "layrs.direct-execution.v1";
 const DIRECT_SESSION_KEY_DERIVATION_DOMAIN: &[u8] = b"layrs.direct-session.v1\0";
 const BASE_USDC_ADDRESS: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
@@ -247,6 +252,17 @@ impl PrivyBaseCustodyAdapter {
                 })
             }
             decision => Ok(decision),
+        }
+    }
+
+    /// Historical reconciliation must have no path to submit_once, even if
+    /// the provider temporarily loses its reference index.
+    async fn observe_terminal_only(&self, intent: &ExternalEffectIntent) -> Result<ExternalEffectRecovery, String> {
+        self.validate_intent(intent)?;
+        let outcome = intent.recovery_action(now_unix(), self.observe(intent).await?);
+        match outcome {
+            terminal @ (ExternalEffectRecovery::BindFinalized { .. } | ExternalEffectRecovery::BindReverted { .. }) => Ok(terminal),
+            _ => Err("historical custody effect is not authoritatively terminal".into()),
         }
     }
 
@@ -1348,6 +1364,16 @@ impl ArchiveStore {
             Self::S3(store) => store.load_committed().await,
         }
     }
+    async fn receipt_sequence(&self, receipt: &DirectReceipt) -> Result<i64, ProjectionError> {
+        match self {
+            Self::S3(store) => {
+                let records = store.verified_receipt_records.lock().await;
+                verified_receipt_sequence(records.as_deref().ok_or(ProjectionError::Database)?, receipt)
+            }
+            Self::Filesystem(store) => verified_receipt_sequence(
+                &store.load_committed().map_err(|_| ProjectionError::Database)?, receipt),
+        }
+    }
     async fn persist_intent_readback(
         &self,
         intent: &ExternalEffectIntent,
@@ -1369,6 +1395,27 @@ impl ArchiveStore {
                     .map_err(|error| error.to_string())
             }
             Self::S3(store) => store.load_intents().await,
+        }
+    }
+
+    async fn persist_extra_payout(&self, evidence: &ExtraPayoutEvidence) -> Result<(), String> {
+        let bytes = serde_json::to_vec(evidence).map_err(|_| "extra payout evidence encoding failed")?;
+        match self {
+            Self::S3(store) => store.write_once(&format!("{}/external-effect-reconciliations/{}.json", store.prefix, evidence.intent_hash), bytes).await,
+            Self::Filesystem(store) => {
+                let directory = store.root().join("external-effect-reconciliations");
+                fs::create_dir_all(&directory).map_err(|_| "extra payout directory unavailable")?;
+                let path = directory.join(format!("{}.json", evidence.intent_hash));
+                match OpenOptions::new().write(true).create_new(true).open(&path) {
+                    Ok(mut file) => {
+                        std::io::Write::write_all(&mut file, &bytes).and_then(|_| file.sync_all()).map_err(|_| "extra payout evidence persistence failed")?;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
+                    Err(_) => return Err("extra payout evidence persistence failed".into()),
+                }
+                if fs::read(path).map_err(|_| "extra payout readback failed")? != bytes { return Err("extra payout immutable evidence conflict".into()); }
+                Ok(())
+            }
         }
     }
     async fn load_key_release(
@@ -1583,15 +1630,27 @@ impl S3ImmutableArtifactStore {
         let begin=exchange(state,RuntimeRequest::BeginCommittedRestore).await.map_err(|_|"restore begin transport failed")?;
         let RuntimeResponse::RestoreProgress {recovered_sequence:0,recovered_state_hash:mut root}=begin else {return Err("restore begin rejected".into());};
         let mut records=Vec::with_capacity(keys.len());
-        for (index,key) in keys.iter().enumerate(){
-            let bytes=self.read(key).await?;
-            let artifact:DirectStateArtifact=serde_cbor::from_slice(&bytes).map_err(|_|"artifact decode failed")?;
-            if artifact.sequence!=index as u64+1 || artifact.prior_state_hash!=root || key!=&self.artifact_key(&artifact) || heads[index]!=self.head_key(&artifact) || self.read(&heads[index]).await?!=bytes {return Err("archive encrypted successor/head mismatch".into());}
-            root=artifact.state_hash.clone();let sequence=artifact.sequence;
-            records.push(receipt_only_record(&artifact));
-            let response=exchange(state,RuntimeRequest::AppendCommittedRestore {artifact}).await.map_err(|_|"restore successor transport failed")?;
-            if !matches!(response,RuntimeResponse::RestoreProgress {recovered_sequence,recovered_state_hash} if recovered_sequence==sequence && recovered_state_hash==root){return Err("restore encrypted successor rejected".into());}
-            if sequence%250==0 {eprintln!("VERIFIED_ARCHIVE_RESTORE_PROGRESS {sequence}/{}",keys.len());}
+        for window in restore_prefetch_ranges(keys.len()) {
+            let mut downloads=Vec::with_capacity(window.len());
+            for index in window {
+                let store=self.clone();let key=keys[index].clone();let head=heads[index].clone();
+                downloads.push((index,tokio::spawn(async move {
+                    let (bytes,head_bytes)=tokio::try_join!(store.read(&key),store.read(&head))?;
+                    if bytes!=head_bytes {return Err("archive encrypted artifact/head byte mismatch".to_string());}
+                    serde_cbor::from_slice::<DirectStateArtifact>(&bytes).map_err(|_|"artifact decode failed".to_string())
+                })));
+            }
+            // Await in key order, regardless of download completion order.
+            // Each native append must verify before the next append is sent.
+            for (index,download) in downloads {
+                let artifact=download.await.map_err(|_|"bounded archive download failed")??;
+                if artifact.sequence!=index as u64+1 || artifact.prior_state_hash!=root || keys[index]!=self.artifact_key(&artifact) || heads[index]!=self.head_key(&artifact) {return Err("archive encrypted successor/head mismatch".into());}
+                root=artifact.state_hash.clone();let sequence=artifact.sequence;
+                records.push(receipt_only_record(&artifact));
+                let response=exchange(state,RuntimeRequest::AppendCommittedRestore {artifact}).await.map_err(|_|"restore successor transport failed")?;
+                if !matches!(response,RuntimeResponse::RestoreProgress {recovered_sequence,recovered_state_hash} if recovered_sequence==sequence && recovered_state_hash==root){return Err("restore encrypted successor rejected".into());}
+                if sequence%250==0 {eprintln!("VERIFIED_ARCHIVE_RESTORE_PROGRESS {sequence}/{}",keys.len());}
+            }
         }
         let result=exchange(state,RuntimeRequest::FinishCommittedRestore {expected_sequence:keys.len() as u64,expected_state_hash:root.clone()}).await.map_err(|_|"restore finish transport failed")?;
         if !matches!(result,RuntimeResponse::RecoveryComplete {recovered_sequence,recovered_state_hash} if recovered_sequence==keys.len() as u64 && recovered_state_hash==root){return Err("restore final encrypted head rejected".into());}
@@ -1695,7 +1754,7 @@ impl S3ImmutableArtifactStore {
 
 #[derive(Clone)]
 struct Projection {
-    client: Arc<Client>,
+    client: Arc<Mutex<Client>>,
 }
 #[derive(Deserialize)]
 struct AttestationQuery {
@@ -1926,8 +1985,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the immutable archive's complete, head-verified recovery set and the
     // enclave has independently reconstructed it.  PostgreSQL is excluded.
     recover_enclave(&state).await?;
+    // Reconciliation starts only after the old projection is proven equal to
+    // the fully recovered private state, not from database balance guesses.
+    verify_recovered_projection(&state).await?;
     recover_external_effect_intents(&state).await?;
     verify_recovered_projection(&state).await?;
+    // Observe already-admitted Base withdrawals independently of the browser.
+    // This observer has no submission capability and shares the financial lock.
+    start_base_withdrawal_observer(state.clone());
     let port = env::var("PORT").unwrap_or_else(|_| "8443".into()).parse()?;
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -2325,11 +2390,6 @@ async fn command(
     request.request_hash = request_hash(&request);
     match exchange_direct(&state, request).await {
         Ok(RuntimeResponse::Execute { result }) => {
-            if matches!(result.effect.as_str(), "WITHDRAWAL_SETTLED" | "WITHDRAWAL_REVERTED") {
-                state.unresolved_external_effects.lock().await.retain(|_, intent| !(intent.asset == "ZEN"
-                    && intent.account_id == result.receipt.account_id && intent.request_id == result.receipt.request_id
-                    && result.receipt.custody_reference.as_deref().is_some_and(|reference| reference.starts_with(&format!("{}:",intent.external_effect_reference)))));
-            }
             // Session consumption is projection/audit only and happens after
             // authoritative adoption.  A crash after external submission can
             // therefore be recovered from the immutable intent rather than a
@@ -2359,10 +2419,18 @@ async fn command(
                 ));
             }
             if let Some(projection) = &state.projection {
-                if projection.record_result(&result).await.is_err() {
+                if projection.record_result(&state, &result).await.is_err() {
                     return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE")
                         .into_response();
                 }
+            }
+            // Retain both asset gates through private adoption AND atomic
+            // projection; failures cannot open a second payout path.
+            if matches!(result.receipt.effect.as_str(),"WITHDRAWAL_SETTLED"|"WITHDRAWAL_REVERTED") {
+                state.unresolved_external_effects.lock().await.retain(|_, intent| !(intent.account_id == result.receipt.account_id
+                    && intent.identity_commitment == result.receipt.identity_commitment && intent.request_id == result.receipt.request_id
+                    && result.receipt.amount_atomic.as_deref() == Some(intent.amount_atomic.as_str())
+                    && result.receipt.custody_reference.as_deref().is_some_and(|reference| reference.starts_with(&format!("{}:",intent.external_effect_reference)))));
             }
             encrypted(&claims, &result)
         }
@@ -2399,6 +2467,8 @@ async fn admit_identity(State(state): State<AppState>, headers: HeaderMap) -> im
     };
     let _guard = state.financial_gate.lock().await;
     let mut request = DirectRequest {
+        // Admission is also a private-state mutation; its zero balance does
+        // not make advancing an outstanding payout's root safe.
         account_id: claims.subject_hash.clone(),
         identity_commitment: claims.identity_commitment.clone(),
         request_id,
@@ -2409,6 +2479,7 @@ async fn admit_identity(State(state): State<AppState>, headers: HeaderMap) -> im
         },
     };
     request.request_hash = request_hash(&request);
+    if !state.unresolved_external_effects.lock().await.is_empty() { return (StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING").into_response(); }
     match exchange_direct(&state, request).await {
         Ok(RuntimeResponse::Execute { result }) => {
             let Some(projection) = &state.projection else {
@@ -2419,7 +2490,7 @@ async fn admit_identity(State(state): State<AppState>, headers: HeaderMap) -> im
                 .consume_session(&claims, &result.receipt.request_hash)
                 .await
                 .is_err()
-                || projection.record_result(&result).await.is_err()
+                || projection.record_result(&state, &result).await.is_err()
                 || projection
                     .record_identity_admission(
                         &claims.subject_hash,
@@ -2476,10 +2547,11 @@ async fn register_market(
     };
     request.request_hash = request_hash(&request);
     let _guard = state.financial_gate.lock().await;
+    if !state.unresolved_external_effects.lock().await.is_empty() { return (StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING").into_response(); }
     match exchange_direct(&state, request).await {
         Ok(RuntimeResponse::Execute { result }) => {
             if let Some(projection) = &state.projection {
-                if projection.record_result(&result).await.is_err() {
+                if projection.record_result(&state, &result).await.is_err() {
                     return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE")
                         .into_response();
                 }
@@ -2536,10 +2608,11 @@ async fn resolve_market(
     };
     request.request_hash = request_hash(&request);
     let _guard = state.financial_gate.lock().await;
+    if !state.unresolved_external_effects.lock().await.is_empty() { return (StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING").into_response(); }
     match exchange_direct(&state, request).await {
         Ok(RuntimeResponse::Execute { result }) => {
             if let Some(projection) = &state.projection {
-                if projection.record_result(&result).await.is_err() {
+                if projection.record_result(&state, &result).await.is_err() {
                     return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE")
                         .into_response();
                 }
@@ -2580,10 +2653,11 @@ async fn apply_balance_recovery(
     };
     request.request_hash = request_hash(&request);
     let _guard = state.financial_gate.lock().await;
+    if !state.unresolved_external_effects.lock().await.is_empty() { return (StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING").into_response(); }
     match exchange_direct(&state, request).await {
         Ok(RuntimeResponse::Execute { result }) => {
             if let Some(projection) = &state.projection {
-                if projection.record_result(&result).await.is_err() {
+                if projection.record_result(&state, &result).await.is_err() {
                     return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE")
                         .into_response();
                 }
@@ -2739,11 +2813,6 @@ async fn prepare_external_withdrawal(
             | ExternalEffectRecovery::BindReverted { .. }
             | ExternalEffectRecovery::BindRelayFinalized { .. }
             | ExternalEffectRecovery::BindRelayReverted { .. }) => {
-                state
-                    .unresolved_external_effects
-                    .lock()
-                    .await
-                    .remove(&existing.intent_hash);
                 return direct_action_for_external_effect(&existing, terminal)
                     .map_err(|_| (StatusCode::CONFLICT, "EXTERNAL_EFFECT_RESULT_CONFLICT"));
             }
@@ -2774,6 +2843,14 @@ async fn prepare_external_withdrawal(
             .map_err(|_|(StatusCode::SERVICE_UNAVAILABLE,"USDC_WITHDRAWAL_PREFLIGHT_UNAVAILABLE"))?;
         usdc_withdrawal_preflight(&hold,&available,&amount_atomic)?;
     }
+    // The financial mutex is held by command(): authorize principal against
+    // the current private state BEFORE an intent, quote or payout can exist.
+    // UI/Aurora checks cannot substitute for this serialized enclave check.
+    let balance = exchange(state, RuntimeRequest::Balance {
+        account_id: claims.subject_hash.clone(), identity_commitment: identity_commitment.into(),
+        asset: "USDC".into(), bucket: "USER_AVAILABLE".into(),
+    }).await.map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "USDC_BALANCE_UNAVAILABLE"))?;
+    validate_usdc_pre_payout_balance(&balance, &amount_atomic)?;
     let (nonce, gas_limit, max_fee_per_gas, max_priority_fee_per_gas) =
         custody.transaction_parameters().await.map_err(|_| {
             (
@@ -2868,6 +2945,9 @@ async fn prepare_external_withdrawal(
             "EXTERNAL_EFFECT_INTENT_PERSISTENCE_FAILED",
         )
     })?;
+    // Establish the gate BEFORE custody may submit or return an ambiguous
+    // error, not only after a provider pending response.
+    state.unresolved_external_effects.lock().await.insert(intent.intent_hash.clone(), intent.clone());
     match custody.settle(&intent, now_unix()).await.map_err(|_| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3046,7 +3126,28 @@ enum ProjectionError {
     OpeningMismatch,
 }
 
+fn verified_receipt_sequence(records: &[DirectStateArtifact], receipt: &DirectReceipt) -> Result<i64, ProjectionError> {
+    let mut matching = records.iter().filter(|record| record.receipt.receipt_id == receipt.receipt_id);
+    let record = matching.next().ok_or(ProjectionError::Database)?;
+    if matching.next().is_some() || record.receipt != *receipt || record.epoch_id != EPOCH_ID || record.sequence == 0 {
+        return Err(ProjectionError::Database);
+    }
+    i64::try_from(record.sequence).map_err(|_| ProjectionError::Database)
+}
+
 impl Projection {
+    async fn record_extra_payout(&self, evidence: &ExtraPayoutEvidence) -> Result<(), ProjectionError> {
+        let json = serde_json::to_string(evidence).map_err(|_| ProjectionError::Database)?;
+        let digest = sha256(&serde_json::to_vec(evidence).map_err(|_| ProjectionError::Database)?);
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await.map_err(|_| ProjectionError::Database)?;
+        tx.execute("INSERT INTO direct_execution_extra_payouts(epoch_id,intent_hash,original_receipt_id,transaction_hash,amount_atomic,evidence_sha256,evidence_json,disposition) VALUES($1,$2,$3,$4,$5::text::numeric,$6,$7::text::jsonb,'PROTOCOL_OVERPAYMENT_UNRECOVERED') ON CONFLICT DO NOTHING", &[&evidence.epoch_id,&evidence.intent_hash,&evidence.original_receipt_id,&evidence.transaction_hash,&evidence.amount_atomic,&digest,&json]).await.map_err(|_| ProjectionError::Database)?;
+        let row = tx.query_opt("SELECT evidence_json::text,evidence_sha256,customer_debit_atomic::text FROM direct_execution_extra_payouts WHERE epoch_id=$1 AND intent_hash=$2", &[&evidence.epoch_id,&evidence.intent_hash]).await.map_err(|_| ProjectionError::Database)?.ok_or(ProjectionError::Database)?;
+        let stored: ExtraPayoutEvidence = serde_json::from_str(&row.get::<_,String>(0)).map_err(|_|ProjectionError::Database)?;
+        if stored != *evidence || row.get::<_, String>(1) != digest || row.get::<_, String>(2) != "0" { return Err(ProjectionError::Database); }
+        tx.commit().await.map_err(|_| ProjectionError::Database)
+    }
+
     async fn connect(
         url: &str,
         epoch: &SealedEpoch,
@@ -3077,14 +3178,15 @@ impl Projection {
             client
         };
         let projection = Self {
-            client: Arc::new(client),
+            client: Arc::new(Mutex::new(client)),
         };
         if isolated_test {
-            projection
-                .client
+            projection.client.lock().await
                 .batch_execute(POSTGRES_PROJECTION_DDL)
                 .await?;
-            projection.client.batch_execute(include_str!("../../sql/002_financial_wallet_aliases.sql")).await?;
+            projection.client.lock().await.batch_execute(include_str!("../../sql/002_financial_wallet_aliases.sql")).await?;
+            projection.client.lock().await.batch_execute(include_str!("../../sql/005_projection_frontier.sql")).await?;
+            projection.client.lock().await.batch_execute(include_str!("../../sql/006_external_effect_reconciliation.sql")).await?;
         } else {
             // Production schema changes are applied once through the existing
             // migration principal. The long-running runtime receives only the
@@ -3094,8 +3196,7 @@ impl Projection {
                 return Err(format!("projection schema verification failed: {error:?}").into());
             }
         }
-        projection
-            .client
+        projection.client.lock().await
             .batch_execute("SET search_path TO layrs_direct_v1, pg_catalog")
             .await?;
         if let Err(error) = projection.import_opening(epoch).await {
@@ -3105,6 +3206,10 @@ impl Projection {
     }
 
     async fn verify_schema_and_privileges(&self) -> Result<(), ProjectionError> {
+        let frontier = self.client.lock().await.query_one(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='layrs_direct_v1' AND table_name='direct_execution_epoch_balances' AND column_name='projection_sequence' AND data_type='bigint' AND is_nullable='NO')", &[]
+        ).await.map_err(|_| ProjectionError::Database)?;
+        if !frontier.get::<_, bool>(0) { return Err(ProjectionError::OpeningMismatch); }
         let tables = [
             ("direct_execution_receipts", "SELECT,INSERT"),
             ("direct_execution_epoch_balances", "SELECT,INSERT,UPDATE"),
@@ -3120,11 +3225,11 @@ impl Projection {
             ("direct_execution_market_resolutions", "SELECT,INSERT"),
             ("direct_execution_writer_fence", "SELECT"),
             ("direct_execution_writer_grants", "SELECT"),
+            ("direct_execution_extra_payouts", "SELECT,INSERT"),
         ];
         for (table, privileges) in tables {
             let qualified = format!("layrs_direct_v1.{table}");
-            let row = self
-                .client
+            let row = self.client.lock().await
                 .query_one(
                     "SELECT to_regclass($1)::text, has_table_privilege(current_user,$1,$2)",
                     &[&qualified, &privileges],
@@ -3145,19 +3250,19 @@ impl Projection {
         let identities = epoch.projection_identity_rows();
         let wallets = epoch.projection_wallet_rows();
         for row in &identities {
-            self.client.execute(
+            self.client.lock().await.execute(
                 "INSERT INTO direct_execution_identities (epoch_id, auth_subject_hash, identity_commitment, admitted_post_genesis) VALUES ($1,$2,$3,false) ON CONFLICT (epoch_id, identity_commitment) DO NOTHING",
                 &[&EPOCH_ID, &row.auth_subject_hash, &row.identity_commitment],
             ).await.map_err(|_| ProjectionError::Database)?;
         }
         for row in &balances {
-            self.client.execute(
+            self.client.lock().await.execute(
                 "INSERT INTO direct_execution_epoch_balances (epoch_id, auth_subject_hash, identity_commitment, asset, bucket, amount_atomic) VALUES ($1,$2,$3,$4,$5,$6::text::numeric) ON CONFLICT (epoch_id, identity_commitment, asset, bucket) DO NOTHING",
                 &[&EPOCH_ID, &row.auth_subject_hash, &row.identity_commitment, &row.asset, &row.bucket, &row.amount_atomic],
             ).await.map_err(|_| ProjectionError::Database)?;
         }
         for row in &wallets {
-            self.client.execute(
+            self.client.lock().await.execute(
                 "INSERT INTO direct_execution_privy_wallets (epoch_id, auth_subject_hash, wallet_address) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
                 &[&EPOCH_ID, &row.auth_subject_hash, &row.wallet_address],
             ).await.map_err(|_| ProjectionError::Database)?;
@@ -3172,7 +3277,7 @@ impl Projection {
         wallets: &[ProjectionWalletRow],
     ) -> Result<(), ProjectionError> {
         for row in identities {
-            let actual = self.client.query_opt(
+            let actual = self.client.lock().await.query_opt(
                 "SELECT auth_subject_hash, admitted_post_genesis FROM direct_execution_identities WHERE epoch_id=$1 AND identity_commitment=$2",
                 &[&EPOCH_ID, &row.identity_commitment],
             ).await.map_err(|_| ProjectionError::Database)?.ok_or(ProjectionError::OpeningMismatch)?;
@@ -3183,7 +3288,7 @@ impl Projection {
             }
         }
         for row in balances {
-            let actual = self.client.query_opt(
+            let actual = self.client.lock().await.query_opt(
                 "SELECT amount_atomic::text, auth_subject_hash FROM direct_execution_epoch_balances WHERE epoch_id=$1 AND identity_commitment=$2 AND asset=$3 AND bucket=$4",
                 &[&EPOCH_ID, &row.identity_commitment, &row.asset, &row.bucket],
             ).await.map_err(|_| ProjectionError::Database)?.ok_or(ProjectionError::OpeningMismatch)?;
@@ -3199,7 +3304,7 @@ impl Projection {
             }
         }
         for row in wallets {
-            let found = self.client.query_opt(
+            let found = self.client.lock().await.query_opt(
                 "SELECT 1 FROM direct_execution_privy_wallets WHERE epoch_id=$1 AND auth_subject_hash=$2 AND wallet_address=$3",
                 &[&EPOCH_ID, &row.auth_subject_hash, &row.wallet_address],
             ).await.map_err(|_| ProjectionError::Database)?.is_some();
@@ -3215,14 +3320,14 @@ impl Projection {
         claims: &SessionClaims,
         request_hash: &str,
     ) -> Result<(), ProjectionError> {
-        let inserted = self.client.execute(
+        let inserted = self.client.lock().await.execute(
             "INSERT INTO direct_execution_sessions (epoch_id, session_id, auth_subject_hash, request_hash, expires_at_unix) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
             &[&EPOCH_ID, &claims.session_id, &claims.subject_hash, &request_hash, &(claims.expires_at_unix as i64)],
         ).await.map_err(|_| ProjectionError::Database)?;
         if inserted == 1 {
             return Ok(());
         }
-        let existing = self.client.query_opt(
+        let existing = self.client.lock().await.query_opt(
             "SELECT auth_subject_hash, request_hash FROM direct_execution_sessions WHERE epoch_id=$1 AND session_id=$2",
             &[&EPOCH_ID, &claims.session_id],
         ).await.map_err(|_| ProjectionError::Database)?.ok_or(ProjectionError::Database)?;
@@ -3235,18 +3340,23 @@ impl Projection {
         }
     }
 
-    async fn record_result(&self, result: &DirectResult) -> Result<(), ProjectionError> {
+    async fn record_result(&self, state: &AppState, result: &DirectResult) -> Result<(), ProjectionError> {
         let receipt = &result.receipt;
-        self.client.execute(
+        // Ordering is bound to the fully verified immutable artifact, never a
+        // user-supplied sequence or PostgreSQL's disposable receipt ordering.
+        let sequence = state.artifact_store.as_ref().ok_or(ProjectionError::Database)?.receipt_sequence(receipt).await?;
+        let mut client = self.client.lock().await;
+        let transaction = client.transaction().await.map_err(|_| ProjectionError::Database)?;
+        transaction.execute(
             "INSERT INTO direct_execution_receipts (receipt_id, epoch_id, auth_subject_hash, identity_commitment, request_id, request_hash, terminal_status, effect, custody_reference, receipt_json) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::text::jsonb) ON CONFLICT (receipt_id) DO NOTHING",
             &[&receipt.receipt_id, &EPOCH_ID, &receipt.account_id, &receipt.identity_commitment, &receipt.request_id, &receipt.request_hash, &format!("{:?}", receipt.status).to_uppercase(), &receipt.effect, &receipt.custody_reference, &serde_json::to_string(receipt).map_err(|_| ProjectionError::Database)?],
         ).await.map_err(|_| ProjectionError::Database)?;
         if let Some(wallet) = receipt_wallet_alias(receipt)? {
-            self.client.execute(
+            transaction.execute(
                 "INSERT INTO direct_execution_financial_wallet_aliases (epoch_id,auth_subject_hash,identity_commitment,wallet_address,receipt_id) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (epoch_id,wallet_address) DO NOTHING",
                 &[&EPOCH_ID,&receipt.account_id,&receipt.identity_commitment,&wallet,&receipt.receipt_id],
             ).await.map_err(|_| ProjectionError::Database)?;
-            let row = self.client.query_one(
+            let row = transaction.query_one(
                 "SELECT auth_subject_hash,identity_commitment FROM direct_execution_financial_wallet_aliases WHERE epoch_id=$1 AND wallet_address=$2",
                 &[&EPOCH_ID,&wallet],
             ).await.map_err(|_| ProjectionError::Database)?;
@@ -3255,9 +3365,9 @@ impl Projection {
             }
         }
         for update in &receipt.projection_balance_updates {
-            self.client.execute(
-                "INSERT INTO direct_execution_epoch_balances (epoch_id, auth_subject_hash, identity_commitment, asset, bucket, amount_atomic) VALUES ($1,$2,$3,$4,$5,$6::text::numeric) ON CONFLICT (epoch_id, identity_commitment, asset, bucket) DO UPDATE SET auth_subject_hash=EXCLUDED.auth_subject_hash, amount_atomic=EXCLUDED.amount_atomic, updated_at=now()",
-                &[&EPOCH_ID, &update.auth_subject_hash, &update.identity_commitment, &update.asset, &update.bucket, &update.amount_atomic],
+            transaction.execute(
+                "INSERT INTO direct_execution_epoch_balances (epoch_id, auth_subject_hash, identity_commitment, asset, bucket, amount_atomic, projection_sequence) VALUES ($1,$2,$3,$4,$5,$6::text::numeric,$7) ON CONFLICT (epoch_id, identity_commitment, asset, bucket) DO UPDATE SET auth_subject_hash=EXCLUDED.auth_subject_hash, amount_atomic=EXCLUDED.amount_atomic, projection_sequence=EXCLUDED.projection_sequence, updated_at=now() WHERE direct_execution_epoch_balances.projection_sequence<=EXCLUDED.projection_sequence",
+                &[&EPOCH_ID, &update.auth_subject_hash, &update.identity_commitment, &update.asset, &update.bucket, &update.amount_atomic, &sequence],
             ).await.map_err(|_| ProjectionError::Database)?;
         }
         let accounting_amount = receipt.amount_atomic.clone();
@@ -3267,12 +3377,12 @@ impl Projection {
         {
             let (custody_chain_id, custody_transaction_hash) =
                 custody_projection_binding(reference);
-            self.client.execute(
+            transaction.execute(
                 "INSERT INTO direct_execution_custody_events (epoch_id, custody_reference, direction, state, chain_id, tx_hash, auth_subject_hash, identity_commitment, amount_atomic) VALUES ($1,$2,$3,'FINAL',$4,$5,$6,$7,$8::text::numeric) ON CONFLICT DO NOTHING",
                 &[&EPOCH_ID, reference, &direction, &custody_chain_id, &custody_transaction_hash, &receipt.account_id, &receipt.identity_commitment, &amount],
             ).await.map_err(|_| ProjectionError::Database)?;
         }
-        self.client.execute(
+        transaction.execute(
             "INSERT INTO direct_execution_accounting_events (receipt_id, epoch_id, auth_subject_hash, identity_commitment, effect, amount_atomic) VALUES ($1,$2,$3,$4,$5,$6::text::numeric) ON CONFLICT DO NOTHING",
             &[&receipt.receipt_id, &EPOCH_ID, &receipt.account_id, &receipt.identity_commitment, &receipt.effect, &accounting_amount],
         ).await.map_err(|_| ProjectionError::Database)?;
@@ -3280,14 +3390,14 @@ impl Projection {
             let status = enum_name(&execution.status)?;
             let outcome = enum_name(&execution.outcome)?;
             let action = enum_name(&execution.action)?;
-            self.client.execute(
+            transaction.execute(
                 "INSERT INTO direct_execution_order_events (receipt_id, epoch_id, order_id, auth_subject_hash, identity_commitment, market_id, outcome, action, status, limit_price_micros, quantity_micros, executed_quantity_micros, remaining_quantity_micros, fee_atomic, resulting_position_micros, resulting_available_atomic) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::text::numeric,$12::text::numeric,$13::text::numeric,$14::text::numeric,$15::text::numeric,$16::text::numeric) ON CONFLICT DO NOTHING",
                 &[&receipt.receipt_id, &EPOCH_ID, &execution.order_id, &receipt.account_id, &receipt.identity_commitment, &execution.market_id, &outcome, &action, &status, &(execution.limit_price_micros as i64), &execution.quantity_micros, &execution.executed_quantity_micros, &execution.remaining_quantity_micros, &execution.total_fee_atomic, &execution.resulting_position_micros, &execution.resulting_available_atomic],
             ).await.map_err(|_| ProjectionError::Database)?;
             for trade in &execution.trades {
                 let trade_outcome = enum_name(&trade.outcome)?;
                 let match_type = enum_name(&trade.match_type)?;
-                self.client.execute(
+                transaction.execute(
                     "INSERT INTO direct_execution_trade_events (trade_id, receipt_id, epoch_id, market_id, maker_order_id, taker_order_id, outcome, match_type, executed_quantity_micros, execution_price_micros, fee_atomic) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::text::numeric,$10,$11::text::numeric) ON CONFLICT DO NOTHING",
                     &[&trade.trade_id, &receipt.receipt_id, &EPOCH_ID, &trade.market_id, &trade.maker_order_id, &trade.taker_order_id, &trade_outcome, &match_type, &trade.executed_quantity_micros, &(trade.execution_price_micros as i64), &trade.fee_atomic],
                 ).await.map_err(|_| ProjectionError::Database)?;
@@ -3299,11 +3409,12 @@ impl Projection {
                 .map_err(|_| ProjectionError::Database)?;
             let settled_position_count = i64::try_from(resolution.settled_position_count)
                 .map_err(|_| ProjectionError::Database)?;
-            self.client.execute(
+            transaction.execute(
                 "INSERT INTO direct_execution_market_resolutions (receipt_id, epoch_id, resolution_id, market_id, outcome, evidence_sha256, cancelled_order_count, settled_position_count, gross_payout_atomic, rounding_reserve_atomic) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::text::numeric,$10::text::numeric) ON CONFLICT DO NOTHING",
                 &[&receipt.receipt_id, &EPOCH_ID, &resolution.resolution_id, &resolution.market_id, &outcome, &resolution.evidence_sha256, &cancelled_order_count, &settled_position_count, &resolution.gross_payout_atomic, &resolution.rounding_reserve_atomic],
             ).await.map_err(|_| ProjectionError::Database)?;
         }
+        transaction.commit().await.map_err(|_| ProjectionError::Database)?;
         Ok(())
     }
 
@@ -3314,23 +3425,23 @@ impl Projection {
         wallet_address: &str,
         receipt_id: &str,
     ) -> Result<(), ProjectionError> {
-        self.client.execute(
+        self.client.lock().await.execute(
             "INSERT INTO direct_execution_identities (epoch_id, auth_subject_hash, identity_commitment, admitted_post_genesis) VALUES ($1,$2,$3,true) ON CONFLICT (epoch_id, identity_commitment) DO NOTHING",
             &[&EPOCH_ID, &auth_subject_hash, &identity_commitment],
         ).await.map_err(|_| ProjectionError::Database)?;
-        self.client.execute(
+        self.client.lock().await.execute(
             "INSERT INTO direct_execution_epoch_balances (epoch_id, auth_subject_hash, identity_commitment, asset, bucket, amount_atomic) VALUES ($1,$2,$3,'USDC','USER_AVAILABLE',0) ON CONFLICT (epoch_id, identity_commitment, asset, bucket) DO NOTHING",
             &[&EPOCH_ID, &auth_subject_hash, &identity_commitment],
         ).await.map_err(|_| ProjectionError::Database)?;
-        self.client.execute(
+        self.client.lock().await.execute(
             "INSERT INTO direct_execution_privy_wallets (epoch_id, auth_subject_hash, wallet_address) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
             &[&EPOCH_ID, &auth_subject_hash, &wallet_address],
         ).await.map_err(|_| ProjectionError::Database)?;
-        self.client.execute(
+        self.client.lock().await.execute(
             "INSERT INTO direct_execution_identity_admissions (receipt_id, epoch_id, auth_subject_hash, identity_commitment, wallet_address) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
             &[&receipt_id, &EPOCH_ID, &auth_subject_hash, &identity_commitment, &wallet_address],
         ).await.map_err(|_| ProjectionError::Database)?;
-        let row = self.client.query_opt(
+        let row = self.client.lock().await.query_opt(
             "SELECT identity.auth_subject_hash, wallet.wallet_address, admission.receipt_id FROM direct_execution_identities identity JOIN direct_execution_epoch_balances balance ON balance.epoch_id=identity.epoch_id AND balance.identity_commitment=identity.identity_commitment JOIN direct_execution_privy_wallets wallet ON wallet.epoch_id=identity.epoch_id AND wallet.auth_subject_hash=identity.auth_subject_hash JOIN direct_execution_identity_admissions admission ON admission.epoch_id=identity.epoch_id AND admission.identity_commitment=identity.identity_commitment WHERE identity.epoch_id=$1 AND identity.identity_commitment=$2 AND identity.admitted_post_genesis=true AND balance.asset='USDC' AND balance.bucket='USER_AVAILABLE' AND balance.amount_atomic=0",
             &[&EPOCH_ID, &identity_commitment],
         ).await.map_err(|_| ProjectionError::Database)?.ok_or(ProjectionError::OpeningMismatch)?;
@@ -3352,7 +3463,7 @@ impl Projection {
         grant: &WriterGrant,
         financial_writer_enabled: bool,
     ) -> Result<(), ProjectionError> {
-        let row = self.client.query_opt(
+        let row = self.client.lock().await.query_opt(
             "SELECT old_writer_fence_evidence_sha256, old_writer_authorized, target_writer_enabled, activation_id FROM direct_execution_writer_fence WHERE epoch_id=$1",
             &[&EPOCH_ID],
         ).await.map_err(|_| ProjectionError::Database)?.ok_or(ProjectionError::OpeningMismatch)?;
@@ -3367,7 +3478,7 @@ impl Projection {
         {
             return Err(ProjectionError::OpeningMismatch);
         }
-        let grant_row = self.client.query_opt(
+        let grant_row = self.client.lock().await.query_opt(
             "SELECT 1 FROM direct_execution_writer_grants WHERE activation_id=$1 AND epoch_id=$2 AND old_writer_fence_evidence_sha256=$3 AND expires_at_unix=$4",
             &[&grant.activation_id, &EPOCH_ID, &grant.old_writer_fence_evidence_sha256, &(grant.expires_at_unix as i64)],
         ).await.map_err(|_| ProjectionError::Database)?.is_some();
@@ -3613,6 +3724,57 @@ fn same_external_effect_request(a: &ExternalEffectIntent, b: &ExternalEffectInte
         && a.custody_target.eq_ignore_ascii_case(&b.custody_target)
         && a.relay == b.relay
         && a.zen_destination_chain == b.zen_destination_chain
+}
+
+/// This is external cash evidence, never a fabricated enclave receipt or a
+/// second debit of the already-completed customer request. Stable fields make
+/// write-once persistence and restart replay byte-identical.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ExtraPayoutEvidence {
+    protocol_version: String,
+    epoch_id: String,
+    intent_hash: String,
+    original_intent_hash: String,
+    original_receipt_id: String,
+    original_transaction_hash: String,
+    provider_transaction_id: String,
+    transaction_hash: String,
+    account_id: String,
+    request_id: String,
+    destination: String,
+    chain: String,
+    asset: String,
+    amount_atomic: String,
+    customer_debit_atomic: String,
+    disposition: String,
+}
+
+fn extra_payout_evidence(intent: &ExternalEffectIntent, original: &ExternalEffectIntent, artifacts: &[DirectStateArtifact], outcome: ExternalEffectRecovery) -> io::Result<Option<ExtraPayoutEvidence>> {
+    intent.verify().map_err(invalid)?;
+    original.verify().map_err(invalid)?;
+    if !same_external_effect_request(intent, original) || intent.intent_hash == original.intent_hash || intent.chain != "base" || intent.asset != "USDC" || intent.relay.is_some() || intent.zen_destination_chain.is_some() { return Err(invalid("extra payout binding conflict")); }
+    let prefix = format!("{}:", original.external_effect_reference);
+    let committed = artifacts.iter().find(|a| a.epoch_id == EPOCH_ID && a.receipt.account_id == original.account_id && a.receipt.request_id == original.request_id && a.receipt.request_hash == original.request_hash && a.receipt.effect == "WITHDRAWAL_SETTLED" && a.receipt.amount_atomic.as_deref() == Some(original.amount_atomic.as_str()) && a.receipt.custody_reference.as_deref().is_some_and(|r|r.starts_with(&prefix))).ok_or_else(|| invalid("original payout is not committed"))?;
+    let original_hash = committed.receipt.custody_reference.as_deref().and_then(|r|r.strip_prefix(&prefix)).filter(|r|valid_transaction_hash(r)).ok_or_else(||invalid("original payout hash invalid"))?;
+    let ExternalEffectRecovery::BindFinalized {provider_transaction_id,transaction_hash} = outcome else {return Err(invalid("extra payout is not canonically finalized"));};
+    if !valid_transaction_hash(&transaction_hash) { return Err(invalid("extra payout hash invalid")); }
+    if original_hash.eq_ignore_ascii_case(&transaction_hash) { return Ok(None); } // Two references to one tx are not two payments.
+    Ok(Some(ExtraPayoutEvidence {protocol_version:"layrs.external-extra-payout.v1".into(),epoch_id:EPOCH_ID.into(),intent_hash:intent.intent_hash.clone(),original_intent_hash:original.intent_hash.clone(),original_receipt_id:committed.receipt.receipt_id.clone(),original_transaction_hash:original_hash.to_ascii_lowercase(),provider_transaction_id,transaction_hash:transaction_hash.to_ascii_lowercase(),account_id:intent.account_id.clone(),request_id:intent.request_id.clone(),destination:intent.destination.to_ascii_lowercase(),chain:intent.chain.clone(),asset:intent.asset.clone(),amount_atomic:intent.amount_atomic.clone(),customer_debit_atomic:"0".into(),disposition:"PROTOCOL_OVERPAYMENT_UNRECOVERED".into()}))
+}
+
+/// Rebase ONLY a confirmed direct Base USDC outcome across an independently
+/// verified successor chain with no intervening change to that user's USDC.
+/// Unknown roots, gaps, request collisions and balance changes fail closed.
+fn historical_intent_lineage_safe(intent: &ExternalEffectIntent, artifacts: &[DirectStateArtifact], current_root: &str) -> bool {
+    if intent.chain != "base" || intent.asset != "USDC" || intent.relay.is_some() || intent.zen_destination_chain.is_some() || artifacts.is_empty() || artifacts.last().is_none_or(|a|a.state_hash != current_root) { return false; }
+    if artifacts.iter().enumerate().any(|(i,a)|a.epoch_id != EPOCH_ID || a.sequence != i as u64+1 || (i>0 && a.prior_state_hash != artifacts[i-1].state_hash)) { return false; }
+    let starts = artifacts.iter().enumerate().filter(|(_,a)|a.prior_state_hash == intent.prior_state_hash).map(|(i,_)|i).collect::<Vec<_>>();
+    if starts.len()!=1 { return false; }
+    artifacts[starts[0]..].iter().all(|a| {
+        !(a.receipt.account_id == intent.account_id && a.receipt.request_id == intent.request_id)
+        && !a.receipt.projection_balance_updates.iter().any(|b|b.identity_commitment == intent.identity_commitment && b.asset == intent.asset)
+    })
 }
 
 fn committed_external_effect_action(
@@ -3864,6 +4026,62 @@ fn request_for_external_effect(
     Ok(request)
 }
 
+fn validate_usdc_pre_payout_balance(balance: &RuntimeResponse, requested: &str) -> Result<(), (StatusCode, &'static str)> {
+    let requested = requested.parse::<u128>().ok().filter(|v| *v > 0)
+        .ok_or((StatusCode::BAD_REQUEST, "WITHDRAWAL_AMOUNT_INVALID"))?;
+    let RuntimeResponse::Balance { amount_atomic } = balance else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "USDC_BALANCE_UNAVAILABLE"));
+    };
+    let available = amount_atomic.parse::<u128>()
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "USDC_BALANCE_UNAVAILABLE"))?;
+    if available < requested { return Err((StatusCode::UNPROCESSABLE_ENTITY, "INSUFFICIENT_AVAILABLE")); }
+    Ok(())
+}
+
+fn start_base_withdrawal_observer(state: AppState) {
+    if state.isolated_test || state.custody.is_none() { return; }
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(std::time::Duration::from_secs(5));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            timer.tick().await;
+            if state.unresolved_external_effects.lock().await.is_empty() { continue; }
+            let _guard = state.financial_gate.lock().await;
+            let pending: Vec<_> = state.unresolved_external_effects.lock().await.values()
+                .filter(|i| i.chain == "base" && i.asset == "USDC" && i.relay.is_none())
+                .cloned().collect();
+            for intent in pending {
+                if reconcile_observed_base_withdrawal(&state, &intent).await.is_err() {
+                    // Stable trace/code only; never raw provider bodies or keys.
+                    eprintln!("WITHDRAWAL_OBSERVATION_PENDING request_id={} intent_hash={}", intent.request_id, intent.intent_hash);
+                }
+            }
+        }
+    });
+}
+
+async fn reconcile_observed_base_withdrawal(state: &AppState, intent: &ExternalEffectIntent) -> io::Result<()> {
+    let custody = state.custody.as_ref().ok_or_else(|| invalid("Base custody unavailable"))?;
+    // Unlike settle(), this cannot call submit_once even if the index is absent.
+    let outcome = custody.observe_terminal_only(intent).await.map_err(invalid)?;
+    let request = request_for_external_effect(intent, outcome)?;
+    let RuntimeResponse::Execute { result } = exchange_direct(state, request).await? else {
+        return Err(invalid("withdrawal observation execution unavailable"));
+    };
+    if result.receipt.account_id != intent.account_id || result.receipt.identity_commitment != intent.identity_commitment
+        || result.receipt.request_id != intent.request_id || result.receipt.amount_atomic.as_deref() != Some(intent.amount_atomic.as_str())
+        || !matches!(result.receipt.effect.as_str(), "WITHDRAWAL_SETTLED" | "WITHDRAWAL_REVERTED")
+        || result.receipt.status != layrs_direct_execution_v1::TerminalStatus::Applied {
+        return Err(invalid("withdrawal observation receipt conflict"));
+    }
+    state.projection.as_ref().ok_or_else(|| invalid("withdrawal observation projection unavailable"))?
+        .record_result(state, &result).await.map_err(|_| invalid("withdrawal observation projection failed"))?;
+    // Remove the gate only AFTER the genuine receipt and atomic projection.
+    state.unresolved_external_effects.lock().await.remove(&intent.intent_hash);
+    eprintln!("WITHDRAWAL_OBSERVATION_SETTLED request_id={} intent_hash={} receipt_id={}", intent.request_id, intent.intent_hash, result.receipt.receipt_id);
+    Ok(())
+}
+
 async fn recover_external_effect_intents(state: &AppState) -> io::Result<()> {
     let Some(store) = state.artifact_store.as_ref() else {
         return Ok(());
@@ -3889,11 +4107,24 @@ async fn recover_external_effect_intents(state: &AppState) -> io::Result<()> {
                 && intent_is_committed(candidate, &artifacts)
         }) {
             if same_external_effect_request(&intent, committed_sibling) {
-                // A superseded implementation could derive a second immutable
-                // intent from the post-commit root before checking the enclave
-                // replay map. The already-committed sibling is authoritative;
-                // this unsubmitted duplicate is retained as audit evidence and
-                // is never executable or considered unresolved.
+                // A second intent is NOT proof that it remained unsubmitted.
+                // Observe canonical finality without any submission capability.
+                let custody = state.custody.as_ref().ok_or_else(|| invalid("duplicate custody effect cannot be verified"))?;
+                custody.validate_intent(&intent).map_err(invalid)?;
+                let observation = custody.observe(&intent).await.map_err(invalid)?;
+                match observation {
+                    layrs_direct_execution_v1::ExternalEffectObservation::NotFound => return Err(invalid("duplicate custody reference is missing; no-effect cannot be assumed")),
+                    finalized @ layrs_direct_execution_v1::ExternalEffectObservation::Finalized { .. } => {
+                        let terminal = intent.recovery_action(now_unix(), finalized);
+                        if let Some(evidence) = extra_payout_evidence(&intent, committed_sibling, &artifacts, terminal)? {
+                            store.persist_extra_payout(&evidence).await.map_err(invalid)?;
+                            state.projection.as_ref().ok_or_else(|| invalid("extra payout projection unavailable"))?.record_extra_payout(&evidence).await.map_err(|_|invalid("extra payout projection reconciliation failed"))?;
+                            eprintln!("VERIFIED_EXTRA_PAYOUT_RECONCILED {} customer_debit=0", evidence.intent_hash);
+                        }
+                    }
+                    layrs_direct_execution_v1::ExternalEffectObservation::Reverted { .. } => {}, // Canonical revert: no principal payout.
+                    _ => return Err(invalid("duplicate custody effect remains ambiguous")),
+                }
                 continue;
             }
             return Err(invalid(
@@ -3901,12 +4132,17 @@ async fn recover_external_effect_intents(state: &AppState) -> io::Result<()> {
             ));
         }
         let root = state.committed_state_root.lock().await.clone();
-        if root.as_deref() != Some(intent.prior_state_hash.as_str()) {
+        let historical = root.as_deref() != Some(intent.prior_state_hash.as_str());
+        if historical && !root.as_deref().is_some_and(|r|historical_intent_lineage_safe(&intent,&artifacts,r)) {
             return Err(invalid(
                 "unresolved external-effect intent does not match committed lineage",
             ));
         }
-        let settled = if intent.asset == "ZEN" {
+        let settled = if historical {
+            // This branch cannot rebroadcast, even inside an old provider
+            // idempotency window. Only an existing canonical result can bind.
+            match &state.custody {Some(custody)=>Some(custody.observe_terminal_only(&intent).await),None=>None}
+        } else if intent.asset == "ZEN" {
             match &state.zen_custody {Some(custody)=>Some(custody.settle(&intent,now_unix()).await),None=>None}
         } else {match &state.custody {Some(custody)=>Some(custody.settle(&intent,now_unix()).await),None=>None}};
         let Some(settled) = settled else {
@@ -3928,10 +4164,11 @@ async fn recover_external_effect_intents(state: &AppState) -> io::Result<()> {
                     return Err(invalid("external-effect recovery execution failed"));
                 };
                 if let Some(projection) = &state.projection {
-                    projection.record_result(&result).await.map_err(|_| {
+                    projection.record_result(&state, &result).await.map_err(|_| {
                         invalid("projection unavailable during external-effect recovery")
                     })?;
                 }
+                if historical { eprintln!("VERIFIED_HISTORICAL_WITHDRAWAL_RECONCILED {}", intent.intent_hash); }
             }
             ExternalEffectRecovery::AwaitExternalFinality
             | ExternalEffectRecovery::SubmitWithStableReference
@@ -3955,6 +4192,7 @@ async fn verify_recovered_projection(state: &AppState) -> io::Result<()> {
     };
     let rows = projection
         .client
+        .lock().await
         .query(
             "SELECT auth_subject_hash, identity_commitment, asset, bucket, amount_atomic::text FROM direct_execution_epoch_balances WHERE epoch_id=$1 ORDER BY identity_commitment,asset,bucket",
             &[&EPOCH_ID],
@@ -3986,6 +4224,7 @@ async fn verify_recovered_projection(state: &AppState) -> io::Result<()> {
     }
     let receipts = projection
         .client
+        .lock().await
         .query(
             "SELECT receipt_json::text FROM direct_execution_receipts WHERE epoch_id=$1",
             &[&EPOCH_ID],
@@ -4006,6 +4245,20 @@ async fn verify_recovered_projection(state: &AppState) -> io::Result<()> {
             }
         }
     }
+    // Legacy rows have no ordering metadata. Stamp only after every amount
+    // was independently compared with the recovered private state above.
+    // This changes no financial amount and prevents an old first-time retry
+    // from overwriting a newer, already-reconciled projection.
+    let records = state.artifact_store.as_ref().ok_or_else(|| invalid("projection archive unavailable"))?.load_committed().await.map_err(invalid)?;
+    let sequence = records.last().map_or(0, |record| record.sequence);
+    let sequence = i64::try_from(sequence).map_err(|_| invalid("projection sequence overflow"))?;
+    let invalid_frontier = projection.client.lock().await.query_one(
+        "SELECT EXISTS (SELECT 1 FROM direct_execution_epoch_balances WHERE epoch_id=$1 AND (projection_sequence<0 OR projection_sequence>$2))", &[&EPOCH_ID, &sequence]
+    ).await.map_err(|_| invalid("projection ordering verification failed"))?;
+    if invalid_frontier.get::<_, bool>(0) { return Err(invalid("projection ordering exceeds recovered private state")); }
+    projection.client.lock().await.execute(
+        "UPDATE direct_execution_epoch_balances SET projection_sequence=$2 WHERE epoch_id=$1 AND projection_sequence<$2", &[&EPOCH_ID, &sequence]
+    ).await.map_err(|_| invalid("projection ordering initialization failed"))?;
     Ok(())
 }
 
@@ -4416,6 +4669,80 @@ mod tests {
         for kind in ["SETTLE_USDC_BUS_WITHDRAWAL", "REVERT_USDC_BUS_WITHDRAWAL"] {
             assert!(serde_json::from_value::<CustomerAction>(serde_json::json!({"type":kind,"withdrawalId":"11111111-1111-4111-8111-111111111111", "destination":"0x1111111111111111111111111111111111111111", "amountAtomic":"5000000", "custodyReference":"fake"})).is_err());
         }
+    }
+    #[test]
+    fn usdc_pre_payout_requires_current_private_principal() {
+        for (available, requested, expected) in [("5000000","5000000",true),("0","5000000",false),("4999999","5000000",false),("5000000","5000001",false)] {
+            assert_eq!(validate_usdc_pre_payout_balance(&RuntimeResponse::Balance {amount_atomic:available.into()}, requested).is_ok(), expected);
+        }
+        assert_eq!(validate_usdc_pre_payout_balance(&RuntimeResponse::Balance {amount_atomic:"0".into()}, "5000000").unwrap_err().1, "INSUFFICIENT_AVAILABLE");
+        for amount in ["0","-1","5.0","","340282366920938463463374607431768211456"] {
+            assert_eq!(validate_usdc_pre_payout_balance(&RuntimeResponse::Balance {amount_atomic:"5000000".into()}, amount).unwrap_err().1,"WITHDRAWAL_AMOUNT_INVALID");
+        }
+        assert_eq!(validate_usdc_pre_payout_balance(&RuntimeResponse::Balance {amount_atomic:"corrupt".into()}, "5").unwrap_err().1,"USDC_BALANCE_UNAVAILABLE");
+        assert_eq!(validate_usdc_pre_payout_balance(&RuntimeResponse::Error {code:"unavailable".into()}, "5").unwrap_err().1,"USDC_BALANCE_UNAVAILABLE");
+    }
+    #[test]
+    fn bounded_prefetch_covers_every_archive_record_exactly_once_in_order() {
+        for total in [0,1,3,4,5,1001,4724,4725] {
+            let ranges=restore_prefetch_ranges(total);
+            assert!(ranges.iter().all(|r|r.len()>0 && r.len()<=RESTORE_PREFETCH_WIDTH));
+            assert_eq!(ranges.into_iter().flatten().collect::<Vec<_>>(),(0..total).collect::<Vec<_>>());
+        }
+    }
+    fn reconciled_intent(root: &str) -> ExternalEffectIntent {
+        ExternalEffectIntent::create(root.into(),"reconciliation-request".into(),"f".repeat(64),"c".repeat(64),"identity".into(),"base".into(),"USDC".into(),"0x2222222222222222222222222222222222222222".into(),"5000000".into(),"existing-wallet".into(),"0x1111111111111111111111111111111111111111".into(),"1".into(),"180000".into(),"11000000".into(),"1000000".into(),now_unix()).unwrap()
+    }
+    fn nonfinancial_chain() -> Vec<DirectStateArtifact> {
+        (0..3).map(|i| { let mut a=projection_sequence_fixture(); a.sequence=i+1; a.prior_state_hash=((b'a'+i as u8) as char).to_string().repeat(64);a.state_hash=((b'b'+i as u8) as char).to_string().repeat(64);a.receipt.account_id="governance".into();a.receipt.request_id=format!("register-{i}");a.receipt.effect="MARKET_REGISTERED".into();a }).collect()
+    }
+    #[test]
+    fn historical_withdrawal_requires_exact_unchanged_verified_ancestry() {
+        let intent=reconciled_intent(&"b".repeat(64));let records=nonfinancial_chain();
+        assert!(historical_intent_lineage_safe(&intent,&records,&"d".repeat(64)));
+        assert!(!historical_intent_lineage_safe(&intent,&records,&"e".repeat(64)));
+        assert!(!historical_intent_lineage_safe(&reconciled_intent(&"e".repeat(64)),&records,&"d".repeat(64)));
+        let mut gap=records.clone();gap[1].sequence=7;assert!(!historical_intent_lineage_safe(&intent,&gap,&"d".repeat(64)));
+        let mut fork=records.clone();fork[1].prior_state_hash="e".repeat(64);assert!(!historical_intent_lineage_safe(&intent,&fork,&"d".repeat(64)));
+        let mut collision=records.clone();collision[2].receipt.account_id=intent.account_id.clone();collision[2].receipt.request_id=intent.request_id.clone();assert!(!historical_intent_lineage_safe(&intent,&collision,&"d".repeat(64)));
+        let mut changed=records.clone();changed[2].receipt.projection_balance_updates.push(layrs_direct_execution_v1::ProjectionBalanceUpdate {auth_subject_hash:intent.account_id.clone(),identity_commitment:intent.identity_commitment.clone(),asset:"USDC".into(),bucket:"USER_AVAILABLE".into(),amount_atomic:"1".into()});assert!(!historical_intent_lineage_safe(&intent,&changed,&"d".repeat(64)));
+    }
+    #[test]
+    fn confirmed_extra_payout_never_becomes_a_second_customer_debit() {
+        let original=reconciled_intent(&"a".repeat(64));let extra=reconciled_intent(&"b".repeat(64));let mut committed=projection_sequence_fixture();
+        committed.receipt.account_id=original.account_id.clone();committed.receipt.identity_commitment=original.identity_commitment.clone();committed.receipt.request_id=original.request_id.clone();committed.receipt.request_hash=original.request_hash.clone();committed.receipt.effect="WITHDRAWAL_SETTLED".into();committed.receipt.amount_atomic=Some(original.amount_atomic.clone());committed.receipt.custody_reference=Some(format!("{}:0x{}",original.external_effect_reference,"11".repeat(32)));
+        let outcome=ExternalEffectRecovery::BindFinalized {provider_transaction_id:"provider-2".into(),transaction_hash:format!("0x{}","22".repeat(32))};
+        let evidence=extra_payout_evidence(&extra,&original,&[committed.clone()],outcome.clone()).unwrap().unwrap();assert_eq!(evidence.amount_atomic,"5000000");assert_eq!(evidence.customer_debit_atomic,"0");assert_eq!(evidence.disposition,"PROTOCOL_OVERPAYMENT_UNRECOVERED");
+        assert_eq!(evidence,extra_payout_evidence(&extra,&original,&[committed.clone()],outcome).unwrap().unwrap());
+        assert!(extra_payout_evidence(&extra,&original,&[committed.clone()],ExternalEffectRecovery::BindFinalized {provider_transaction_id:"alias".into(),transaction_hash:format!("0x{}","11".repeat(32))}).unwrap().is_none());
+        assert!(extra_payout_evidence(&extra,&original,&[committed.clone()],ExternalEffectRecovery::SubmitWithStableReference).is_err());
+        assert!(extra_payout_evidence(&extra,&original,&[committed],ExternalEffectRecovery::BindReverted {provider_transaction_id:"reverted".into(),transaction_hash:format!("0x{}","22".repeat(32))}).is_err());
+    }
+    fn projection_sequence_fixture() -> DirectStateArtifact {
+        DirectStateArtifact {
+            epoch_id: EPOCH_ID.into(), sequence: 7, prior_state_hash: "a".repeat(64), state_hash: "b".repeat(64), request_hash: "c".repeat(64),
+            nonce: vec![1;12], ciphertext: vec![], ciphertext_hash: "d".repeat(64),
+            receipt: DirectReceipt { receipt_id: "receipt".into(), account_id: "account".into(), identity_commitment: "identity".into(), request_id: "request".into(), request_hash: "c".repeat(64), status: layrs_direct_execution_v1::TerminalStatus::Applied, effect: "BALANCE_READ".into(), amount_atomic: None, custody_reference: None, execution: None, resolution: None, projection_balance_updates: vec![], genesis_ordinal: 0, signature: "signature".into() }
+        }
+    }
+    #[test]
+    fn projection_sequence_requires_exact_verified_receipt() {
+        let artifact = projection_sequence_fixture();
+        assert_eq!(verified_receipt_sequence(&[artifact.clone()], &artifact.receipt).unwrap(), 7);
+        let mut altered = artifact.receipt.clone(); altered.effect = "OTHER".into();
+        assert!(verified_receipt_sequence(&[artifact.clone()], &altered).is_err());
+        assert!(verified_receipt_sequence(&[], &artifact.receipt).is_err());
+        assert!(verified_receipt_sequence(&[artifact.clone(), artifact.clone()], &artifact.receipt).is_err());
+    }
+    #[test]
+    fn projection_sequence_rejects_foreign_zero_and_overflow_artifacts() {
+        let original = projection_sequence_fixture();
+        for sequence in [0, i64::MAX as u64 + 1] {
+            let mut artifact = original.clone(); artifact.sequence = sequence;
+            assert!(verified_receipt_sequence(&[artifact], &original.receipt).is_err());
+        }
+        let mut foreign = original.clone(); foreign.epoch_id = "foreign".into();
+        assert!(verified_receipt_sequence(&[foreign], &original.receipt).is_err());
     }
     #[test]
     fn receipt_cache_releases_entire_snapshot_allocation() {
