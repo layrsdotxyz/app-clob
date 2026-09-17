@@ -156,7 +156,15 @@ fn terminal_effect(ledger:&str,destination:&str,amount:&str,max_subsidy:u128,max
         word(224),word(256),word(288),word(0),word(0),word(1),format!("01{}","0".repeat(62)),"");
     if ticket>=1u128<<72||fare>native||!eq(&rides[0]["data"],&ride_data)||rides[0]["topics"].as_array().map(Vec::len)!=Some(1)
         ||!eq(&boarding.tx["from"],ledger)||!eq(&boarding.tx["to"],HZ_BRIDGE)||!eq(&boarding.tx["input"],&send_call)
-        ||transfer(&boarding.receipt,HZ_TOKEN,ledger,ZERO,gross).len()!=1 {return Err(denied());}
+        {return Err(denied());}
+    let direct_burn=transfer(&boarding.receipt,HZ_TOKEN,ledger,ZERO,gross);
+    if direct_burn.len()!=1 {
+        let pulls=transfer(&boarding.receipt,HZ_TOKEN,ledger,HZ_BRIDGE,gross);
+        let burns=transfer(&boarding.receipt,HZ_TOKEN,HZ_BRIDGE,ZERO,gross);
+        if !direct_burn.is_empty()||pulls.len()!=1||burns.len()!=1 {return Err(denied());}
+        let index=|log:&Value|log["logIndex"].as_str().and_then(parse_quantity).ok_or_else(denied);
+        if index(pulls[0])?>=index(burns[0])?||index(burns[0])?>=index(rides[0])? {return Err(denied());}
+    }
     let drives=events(&driving.receipt,HZ_MESSAGING,"BusDriven(uint32,uint72,uint8,bytes32)");
     if drives.len()!=1||drives[0]["topics"].as_array().map(Vec::len)!=Some(1)||integer(&drives[0]["data"],0)?!=30110 {return Err(denied());}
     let start=integer(&drives[0]["data"],1)?;let count=integer(&drives[0]["data"],2)?;
@@ -229,6 +237,21 @@ mod tests {
     fn node_abi_golden_links_pool_burn_ticket_foreign_driver_seat_and_actual_native_usdc_delivery(){
         let value=fixture();let reference=verify(&value).unwrap();
         assert_eq!(reference,format!("horizen-usdc-bus:{}:0x{}:{}:1:1",value["proof"]["poolTransactionHash"].as_str().unwrap(),"f".repeat(64),value["proof"]["destinationTransactionHash"].as_str().unwrap()));
+    }
+    #[test]
+    fn deployed_horizen_adapter_pull_then_burn_is_bound_to_the_same_exact_gross(){
+        let mut value=fixture();let logs=value["boarding"]["receipt"]["logs"].as_array_mut().unwrap();
+        let mut burn=logs[0].clone();burn["topics"][1]=json!(format!("0x{}",address_word(HZ_BRIDGE)));burn["logIndex"]=json!("0x1");
+        logs[0]["topics"][2]=json!(format!("0x{}",address_word(HZ_BRIDGE)));
+        for log in logs.iter_mut().skip(1){let n=log["logIndex"].as_str().and_then(parse_quantity).unwrap();log["logIndex"]=json!(format!("0x{:x}",n+1));}
+        logs.insert(1,burn);assert!(verify(&value).is_ok());
+        for kind in ["missing","short","duplicate","reordered"]{
+            let mut wrong=value.clone();let logs=wrong["boarding"]["receipt"]["logs"].as_array_mut().unwrap();
+            match kind {"missing"=>{logs.remove(1);},"short"=>logs[1]["data"]=json!(format!("0x{}",word(1))),
+                "duplicate"=>{let mut extra=logs[1].clone();extra["logIndex"]=json!("0x9");logs.push(extra);},
+                _=>{logs[0]["logIndex"]=json!("0x1");logs[1]["logIndex"]=json!("0x0");}}
+            assert!(verify(&wrong).is_err(),"{kind}");
+        }
     }
     #[test]
     fn rejects_receipt_preimage_rebinding_or_canonical_log_corruption_at_every_stage(){
