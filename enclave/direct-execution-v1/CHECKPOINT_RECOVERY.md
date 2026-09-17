@@ -82,17 +82,24 @@ checkpoint plus every committed successor. Startup seeds/readbacks a fresh
 checkpoint before serving the restored writer. There is no mutable `latest`
 pointer and no financial effect in checkpoint recovery.
 
-Older runtime code ignores the additive checkpoint namespace and skipped
-optional frontier field. Checkpoint support does not authorize restoring an old
+Older runtime code ignores the additive checkpoint namespace. Original grants
+serialize unchanged when the optional frontier is absent; a newly signed grant
+containing the frontier requires a checkpoint-aware verifier. An older fallback
+therefore needs its own freshly governed compatible grant, not the new grant.
+Checkpoint support does not authorize restoring an old
 writer grant, key artifact or balances. Any fallback rolls forward the current
 key/history and still obeys existing Bus-hold drain restrictions.
 
 ## Local acceptance / remaining release gates
 
-133 tests pass: 58 library, 20 enclave, 52 parent and three bootstrap-helper tests.
+134 tests pass: 58 library, 20 enclave, 53 parent and three bootstrap-helper tests.
 They cover exact-tip adoption, reconnect, invalid MAC/ciphertext/keys/epochs,
 missing receipts, substituted identities/archive hashes, suffix gaps, signed
 frontier rollback/forks, active-hold preservation and original-ID no-op recovery.
+Independently persisted original PostgreSQL receipts must also occur exactly in
+the authenticated recovered lineage: even a balance-free successor cannot be
+hidden by presenting an older archive tip. The database can fence incomplete
+recovery but never supplies/adopts private state.
 The 4827→4828 fixture has genuine signed request results and a genuine encrypted
 final snapshot but **synthetic intermediate archive metadata**; it is a bounded
 protocol-size/counter test, not funded or production cold-start evidence.

@@ -49,7 +49,7 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 use sha3::{Digest as KeccakDigest, Keccak256};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     fs::{self, OpenOptions},
     io,
@@ -3323,6 +3323,24 @@ fn verified_receipt_sequence(records: &[DirectStateArtifact], receipt: &DirectRe
     }
     i64::try_from(record.sequence).map_err(|_| ProjectionError::Database)
 }
+fn verify_projected_receipt_lineage(records: &[DirectStateArtifact], receipts: &[DirectReceipt]) -> Result<(), ProjectionError> {
+    let mut verified = HashMap::with_capacity(records.len());
+    for record in records {
+        if record.epoch_id != EPOCH_ID || record.sequence == 0
+            || verified.insert(record.receipt.receipt_id.as_str(), &record.receipt).is_some() {
+            return Err(ProjectionError::Database);
+        }
+    }
+    // An independently persisted original receipt proves a lower bound on
+    // committed history even when it made no balance change. PostgreSQL can
+    // fence incomplete recovery, but cannot supply/decrypt/adopt private state.
+    for receipt in receipts {
+        if verified.get(receipt.receipt_id.as_str()).copied() != Some(receipt) {
+            return Err(ProjectionError::Database);
+        }
+    }
+    Ok(())
+}
 
 impl Projection {
     async fn record_extra_payout(&self, evidence: &ExtraPayoutEvidence) -> Result<(), ProjectionError> {
@@ -4446,10 +4464,13 @@ async fn verify_recovered_projection(state: &AppState) -> io::Result<()> {
         )
         .await
         .map_err(|_| invalid("projection receipt reconciliation query failed"))?;
-    for row in receipts {
+    let records = state.artifact_store.as_ref().ok_or_else(|| invalid("projection archive unavailable"))?.load_committed().await.map_err(invalid)?;
+    let receipts: Vec<DirectReceipt> = receipts.into_iter().map(|row| {
         let encoded: String = row.get(0);
-        let receipt: DirectReceipt = serde_json::from_str(&encoded)
-            .map_err(|_| invalid("projection receipt is malformed"))?;
+        serde_json::from_str(&encoded).map_err(|_| invalid("projection receipt is malformed"))
+    }).collect::<io::Result<_>>()?;
+    verify_projected_receipt_lineage(&records, &receipts).map_err(|_| invalid("projection receipt exceeds or conflicts with recovered immutable history"))?;
+    for receipt in receipts {
         for update in receipt.projection_balance_updates {
             let key = format!(
                 "{}\0{}\0{}",
@@ -4464,7 +4485,6 @@ async fn verify_recovered_projection(state: &AppState) -> io::Result<()> {
     // was independently compared with the recovered private state above.
     // This changes no financial amount and prevents an old first-time retry
     // from overwriting a newer, already-reconciled projection.
-    let records = state.artifact_store.as_ref().ok_or_else(|| invalid("projection archive unavailable"))?.load_committed().await.map_err(invalid)?;
     let sequence = records.last().map_or(0, |record| record.sequence);
     let sequence = i64::try_from(sequence).map_err(|_| invalid("projection sequence overflow"))?;
     let invalid_frontier = projection.client.lock().await.query_one(
@@ -4979,6 +4999,19 @@ mod tests {
         assert!(validate_checkpoint_archive(&changed,&keys,&heads,"epoch").is_err());
         let mut changed = checkpoint; changed.artifact.sequence = 0;
         assert!(validate_checkpoint_archive(&changed,&keys,&heads,"epoch").is_err());
+    }
+    #[test]
+    fn checkpoint_recovery_cannot_hide_an_independently_persisted_balance_free_successor() {
+        let mut records = nonfinancial_chain();
+        for (index, record) in records.iter_mut().enumerate() { record.receipt.receipt_id = format!("receipt-{index}"); }
+        let receipts: Vec<_> = records.iter().map(|record| record.receipt.clone()).collect();
+        assert!(verify_projected_receipt_lineage(&records,&receipts).is_ok());
+        assert!(verify_projected_receipt_lineage(&records[..2],&receipts).is_err());
+        let mut changed = receipts.clone(); changed[0].request_hash = "b".repeat(64);
+        assert!(verify_projected_receipt_lineage(&records,&changed).is_err());
+        let mut duplicate = records.clone(); duplicate.push(records[0].clone());
+        assert!(verify_projected_receipt_lineage(&duplicate,&receipts).is_err());
+        assert!(verify_projected_receipt_lineage(&records,&receipts[..2]).is_ok()); // a lost projection reply is not new state authority
     }
     #[test]
     fn projection_sequence_requires_exact_verified_receipt() {
