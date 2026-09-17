@@ -1,0 +1,20 @@
+{
+  "publicKeyDerBase64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEcTX6T9k6Cdzpi79oG0v89Q58DWNU5ir7C/8qNClheGXtTB8C3bkCPuVqVX5RXWqdxmwR8iCWDeWUM031iHdnJA==",
+  "grant": {
+    "protocolVersion": "layrs.usdc-wallet-link.v1",
+    "appId": "app_fixture_123",
+    "policyVersion": "usdc-quest-arb-own-wallet-v1",
+    "accountId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "identityCommitment": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "privyUserIdHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "canonicalWallet": "0x0000000000000000000000000000000000000001",
+    "walletId": "participantwallet000001",
+    "walletAddress": "0x0000000000000000000000000000000000000002",
+    "ownerQuorumId": "participantquorum000001",
+    "policyId": "participantpolicy000001",
+    "snapshotSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "requestId": "wallet-link:26e5aa458e64f71d82096493c8746243d68b969c79eb07908c7949e80f90ce5d",
+    "expiresAtUnix": 1180
+  },
+  "signature": "MEQCIFn/fRp/Qcexa5yFCHl9y/IXhMVQY6XZRrplRdJKaL06AiAJmlVshtqCq49zhyiGzOjxQKMnRi9DrOjtfyWKUjFR5Q=="
+}

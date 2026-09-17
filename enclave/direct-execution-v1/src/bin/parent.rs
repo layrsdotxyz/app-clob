@@ -80,6 +80,15 @@ const USER_OPERATION_EVENT_TOPIC: &str =
 #[path = "../zen_custody.rs"]
 mod zen_custody;
 use zen_custody::ZenCustodyAdapter;
+#[path = "../usdc_custody.rs"]
+mod usdc_custody;
+use usdc_custody::UsdcCustodyAdapter;
+#[path = "../usdc_wallet_link.rs"]
+mod usdc_wallet_link;
+use usdc_wallet_link::{WalletLinkAuthority,WalletLinkGrant};
+#[path = "../usdc_bus_custody.rs"]
+mod usdc_bus_custody;
+use usdc_bus_custody::{UsdcBusCustodyAdapter,BusWithdrawalProof};
 #[derive(Clone)]
 struct AppState {
     enclave_cid: u32,
@@ -91,6 +100,9 @@ struct AppState {
     commit_ack_key: Vec<u8>,
     custody: Option<PrivyBaseCustodyAdapter>,
     zen_custody: Option<ZenCustodyAdapter>,
+    usdc_custody: Option<UsdcCustodyAdapter>,
+    usdc_link_authority: Option<WalletLinkAuthority>,
+    usdc_bus_custody: Option<UsdcBusCustodyAdapter>,
     /// Serializes only the bounded synchronous request and an unresolved
     /// external intent.  It is process memory, never durable workflow state.
     financial_gate: Arc<Mutex<()>>,
@@ -1721,6 +1733,10 @@ enum CustomerAction {
         amount_atomic: String,
     },
     CreditZenDeposit { transaction_hash: String, amount_atomic: String },
+    CreditHorizenUsdcDeposit { transaction_hash: String, amount_atomic: String },
+    BeginUsdcBusWithdrawal { destination: String, amount_atomic: String },
+    VerifyUsdcBusWithdrawal {withdrawal_id:String,destination:String,amount_atomic:String,proof:BusWithdrawalProof},
+    LinkFinancialWallet {grant:WalletLinkGrant,signature:String},
     ReserveZenWithdrawal { destination_chain: String, destination: String, amount_atomic: String },
     PlaceOrder {
         order_id: String,
@@ -1889,6 +1905,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         zen_custody: if financial_enabled {
             ZenCustodyAdapter::from_environment(&session_key).map_err(|error| format!("ZEN custody configuration invalid:{error}"))?
         } else { None },
+        usdc_custody: if financial_enabled {
+            UsdcCustodyAdapter::from_environment().map_err(|_|"USDC custody configuration invalid")?
+        } else {None},
+        usdc_bus_custody: if financial_enabled {UsdcBusCustodyAdapter::from_environment()?} else {None},
+        usdc_link_authority: if financial_enabled {
+            WalletLinkAuthority::from_environment().map_err(|_|"USDC linking authority configuration invalid")?
+        } else {None},
         financial_gate: Arc::new(Mutex::new(())),
         committed_state_root: Arc::new(Mutex::new(None)),
         unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1909,6 +1932,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/v1/attestation", get(attestation))
+        .route("/v1/privacy/receipt-key-attestation", get(quest_receipt_attestation))
         .route("/v1/runtime/status", get(status))
         .route("/v1/operator/markets", post(register_market))
         .route("/v1/operator/markets/resolve", post(resolve_market))
@@ -1921,6 +1945,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/direct/commands", post(command))
         .route("/v1/direct/balances/:identity", get(balance))
         .route("/v1/direct/portfolio/:identity", get(portfolio))
+        .route("/v1/direct/privacy/receipts", post(quest_receipt))
         .with_state(state);
     // The packaged and dormant runtime is loopback-only.  A governed BFF
     // deployment may opt in to a VPC listener only when production mode is
@@ -2009,6 +2034,45 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
         _ => (StatusCode::BAD_GATEWAY, "UNEXPECTED_RESPONSE").into_response(),
     }
 }
+async fn quest_receipt_attestation(State(state):State<AppState>,Query(query):Query<AttestationQuery>)->impl IntoResponse {
+    let nonce=match URL_SAFE_NO_PAD.decode(query.nonce) {
+        Ok(nonce) if (16..=512).contains(&nonce.len())=>nonce,
+        _=>return (StatusCode::BAD_REQUEST,"INVALID_NONCE").into_response(),
+    };
+    let request_nonce=URL_SAFE_NO_PAD.encode(&nonce);
+    match exchange(&state,RuntimeRequest::QuestReceiptAttestation{nonce}).await {
+        Ok(RuntimeResponse::QuestReceiptAttestation{document,binding,binding_commitment,public_key})=>Json(json!({
+            "protocol":layrs_direct_execution_v1::QUEST_RECEIPT_PROTOCOL,
+            "attestationDocument":URL_SAFE_NO_PAD.encode(document),"requestNonce":request_nonce,
+            "binding":binding,"bindingCommitmentSha256":hex::encode(binding_commitment),"publicKey":hex::encode(public_key),
+        })).into_response(),
+        Ok(RuntimeResponse::Error{code})=>(StatusCode::SERVICE_UNAVAILABLE,code).into_response(),
+        _=>(StatusCode::BAD_GATEWAY,"ENCLOSURE_UNAVAILABLE").into_response(),
+    }
+}
+#[derive(Debug,Deserialize)]
+#[serde(rename_all="camelCase",deny_unknown_fields)]
+struct QuestReceiptQuery { receipt_account_id:String, request_id:String, nonce:String }
+fn quest_receipt_frame(claims:&SessionClaims,query:QuestReceiptQuery)->Result<RuntimeRequest,()> {
+    let owner=&query.receipt_account_id;
+    if query.nonce.len()!=64||!query.nonce.bytes().all(|byte|byte.is_ascii_digit()||(b'a'..=b'f').contains(&byte))
+        ||owner.len()!=64||!owner.bytes().all(|byte|byte.is_ascii_digit()||(b'a'..=b'f').contains(&byte))
+        ||query.request_id.is_empty()||query.request_id.len()>128
+        ||!query.request_id.bytes().all(|byte|byte.is_ascii_alphanumeric()||b"-_:".contains(&byte)) {return Err(());}
+    Ok(RuntimeRequest::PublicQuestReceipt{participant_account:claims.subject_hash.clone(),receipt_account:query.receipt_account_id,request_id:query.request_id,nonce:hex::decode(query.nonce).map_err(|_|())?})
+}
+async fn quest_receipt(State(state):State<AppState>,headers:HeaderMap,Json(query):Json<QuestReceiptQuery>)->impl IntoResponse {
+    let claims=match authenticated(&headers,&state) {Ok(claims)=>claims,Err(response)=>return response};
+    // Participant identity is always taken from the verified short-lived BFF
+    // session. An affected maker may witness a taker's committed fill only if
+    // the enclave's signed projection proves that participant was affected.
+    let request=match quest_receipt_frame(&claims,query) {Ok(request)=>request,Err(_)=>return (StatusCode::BAD_REQUEST,"INVALID_PRIVACY_RECEIPT_REQUEST").into_response()};
+    match exchange(&state,request).await {
+        Ok(RuntimeResponse::PublicQuestReceipt{witness})=>encrypted_quest_witness(&claims,&witness),
+        Ok(RuntimeResponse::Error{code})=>(StatusCode::FORBIDDEN,code).into_response(),
+        _=>(StatusCode::BAD_GATEWAY,"ENCLOSURE_UNAVAILABLE").into_response(),
+    }
+}
 async fn command(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2041,6 +2105,56 @@ async fn command(
     let _financial_guard = state.financial_gate.lock().await;
     let external_effect_pending = !state.unresolved_external_effects.lock().await.is_empty();
     let action = match body.action {
+        CustomerAction::VerifyUsdcBusWithdrawal {withdrawal_id,destination,amount_atomic,proof} => {
+            let Some(custody)=&state.usdc_bus_custody else {return (StatusCode::SERVICE_UNAVAILABLE,"USDC_BUS_CUSTODY_NOT_ENABLED").into_response();};
+            if request_id!=format!("usdc-bus-settle:{withdrawal_id}")
+                ||usdc_bus_reservation_action(&withdrawal_id,claims.financial_wallet_address.as_deref(),&destination,&amount_atomic).is_err() {
+                return (StatusCode::FORBIDDEN,"USDC_BUS_SETTLEMENT_BINDING_DENIED").into_response();
+            }
+            match custody.settlement(&destination,&amount_atomic,&proof).await {
+                Ok(Some(reference))=>DirectAction::SettleUsdcBusWithdrawal {withdrawal_id,destination,amount_atomic,custody_reference:reference},
+                Ok(None)=>return (StatusCode::SERVICE_UNAVAILABLE,"USDC_BUS_DESTINATION_FINALITY_PENDING").into_response(),
+                Err(error)=>return match error.as_str() {
+                    "USDC Bus custody proof conflict"=>(StatusCode::CONFLICT,"USDC_BUS_CUSTODY_PROOF_CONFLICT").into_response(),
+                    "USDC Bus token cached"=>(StatusCode::SERVICE_UNAVAILABLE,"USDC_BUS_TOKEN_RECOVERY_PENDING").into_response(),
+                    "USDC Bus RPC reorg"=>(StatusCode::SERVICE_UNAVAILABLE,"USDC_BUS_FINALITY_RECHECK_REQUIRED").into_response(),
+                    _=>(StatusCode::SERVICE_UNAVAILABLE,"USDC_BUS_CUSTODY_PROOF_UNAVAILABLE").into_response(),
+                },
+            }
+        }
+        CustomerAction::LinkFinancialWallet {grant,signature} => {
+            let Some(authority)=&state.usdc_link_authority else {return (StatusCode::SERVICE_UNAVAILABLE,"USDC_LINK_AUTHORITY_NOT_ENABLED").into_response();};
+            if external_effect_pending {return (StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING").into_response();}
+            match authority.verify(&grant,&signature,&claims,&request_id,now_unix()) {
+                Ok(action)=>action,
+                Err(_)=>return (StatusCode::FORBIDDEN,"USDC_WALLET_LINK_DENIED").into_response(),
+            }
+        }
+        CustomerAction::BeginUsdcBusWithdrawal { destination, amount_atomic } => {
+            if external_effect_pending {
+                return (StatusCode::SERVICE_UNAVAILABLE, "EXTERNAL_EFFECT_FINALITY_PENDING").into_response();
+            }
+            if state.usdc_custody.is_none() {
+                return (StatusCode::SERVICE_UNAVAILABLE, "USDC_CUSTODY_ADAPTER_NOT_ENABLED").into_response();
+            }
+            match usdc_bus_reservation_action(&request_id, claims.financial_wallet_address.as_deref(), &destination, &amount_atomic) {
+                Ok(action) => action,
+                Err((status, code)) => return (status, code).into_response(),
+            }
+        }
+        CustomerAction::CreditHorizenUsdcDeposit {transaction_hash,amount_atomic} if !external_effect_pending => {
+            let Some(source)=claims.financial_wallet_address.as_deref() else {return (StatusCode::FORBIDDEN,"DIRECT_FINANCIAL_WALLET_REQUIRED").into_response();};
+            let hash=transaction_hash.to_ascii_lowercase();let reference=format!("horizen-usdc-deposit:{hash}");
+            if request_id!=reference {return (StatusCode::BAD_REQUEST,"DEPOSIT_IDEMPOTENCY_KEY_MISMATCH").into_response();}
+            let Some(custody)=&state.usdc_custody else {return (StatusCode::SERVICE_UNAVAILABLE,"USDC_CUSTODY_ADAPTER_NOT_ENABLED").into_response();};
+            match custody.deposit_finality(source,&hash,&amount_atomic).await {
+                Ok(DepositFinality::Finalized)=>DirectAction::CreditHorizenUsdcDeposit {amount_atomic,custody_reference:reference},
+                Ok(DepositFinality::Pending)=>return (StatusCode::SERVICE_UNAVAILABLE,"DEPOSIT_FINALITY_PENDING").into_response(),
+                Ok(DepositFinality::Reverted|DepositFinality::Conflict)=>return (StatusCode::CONFLICT,"DEPOSIT_TRANSACTION_BINDING_CONFLICT").into_response(),
+                Err(_)=>return (StatusCode::SERVICE_UNAVAILABLE,"DEPOSIT_FINALITY_UNAVAILABLE").into_response(),
+            }
+        }
+        CustomerAction::CreditHorizenUsdcDeposit {..}=>return (StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING").into_response(),
         CustomerAction::CreditZenDeposit { transaction_hash, amount_atomic } if !external_effect_pending => {
             let Some(source) = claims.financial_wallet_address.as_deref() else {return (StatusCode::FORBIDDEN,"DIRECT_FINANCIAL_WALLET_REQUIRED").into_response();};
             let hash = transaction_hash.to_ascii_lowercase();
@@ -2649,6 +2763,17 @@ async fn prepare_external_withdrawal(
             "EXTERNAL_EFFECT_FINALITY_PENDING",
         ));
     }
+    if state.usdc_custody.is_some() {
+        // Fail before a legacy custody payout, not after money has moved.
+        // The new per-account Bus hold cannot be bypassed through Base/Relay.
+        let hold=exchange(state,RuntimeRequest::Balance {account_id:claims.subject_hash.clone(),identity_commitment:identity_commitment.into(),
+            asset:"USDC".into(),bucket:"USER_WITHDRAWAL_HOLD".into()}).await
+            .map_err(|_|(StatusCode::SERVICE_UNAVAILABLE,"USDC_WITHDRAWAL_PREFLIGHT_UNAVAILABLE"))?;
+        let available=exchange(state,RuntimeRequest::Balance {account_id:claims.subject_hash.clone(),identity_commitment:identity_commitment.into(),
+            asset:"USDC".into(),bucket:"USER_AVAILABLE".into()}).await
+            .map_err(|_|(StatusCode::SERVICE_UNAVAILABLE,"USDC_WITHDRAWAL_PREFLIGHT_UNAVAILABLE"))?;
+        usdc_withdrawal_preflight(&hold,&available,&amount_atomic)?;
+    }
     let (nonce, gas_limit, max_fee_per_gas, max_priority_fee_per_gas) =
         custody.transaction_parameters().await.map_err(|_| {
             (
@@ -2786,6 +2911,29 @@ fn signed_base_withdrawal_destination_matches(
     valid_base_withdrawal_destination(action_destination)
         && valid_base_withdrawal_destination(signed_destination)
         && action_destination.eq_ignore_ascii_case(signed_destination)
+}
+
+/// Reserve entitlement in the trusted ledger before any worker moves money.
+/// The route is exclusively Horizen -> Arbitrum; other phases use separate
+/// certified actions, not caller-supplied chain IDs or generic calldata.
+fn usdc_bus_reservation_action(
+    request_id: &str,
+    signed_destination: Option<&str>,
+    destination: &str,
+    amount_atomic: &str,
+) -> Result<DirectAction, (StatusCode, &'static str)> {
+    if !uuid::Uuid::parse_str(request_id).is_ok_and(|id| id.to_string() == request_id && !id.is_nil()) {
+        return Err((StatusCode::BAD_REQUEST, "WITHDRAWAL_ID_INVALID"));
+    }
+    if !signed_destination.is_some_and(|signed| signed_base_withdrawal_destination_matches(destination, signed)) {
+        return Err((StatusCode::FORBIDDEN, "SIGNED_WITHDRAWAL_DESTINATION_MISMATCH"));
+    }
+    if !amount_atomic.parse::<u128>().is_ok_and(|amount| amount > 0 && amount.to_string() == amount_atomic) {
+        return Err((StatusCode::BAD_REQUEST, "WITHDRAWAL_AMOUNT_INVALID"));
+    }
+    Ok(DirectAction::BeginUsdcBusWithdrawal {
+        withdrawal_id: request_id.into(), destination: destination.to_ascii_lowercase(), amount_atomic: amount_atomic.into(),
+    })
 }
 async fn balance(
     State(state): State<AppState>,
@@ -2936,6 +3084,7 @@ impl Projection {
                 .client
                 .batch_execute(POSTGRES_PROJECTION_DDL)
                 .await?;
+            projection.client.batch_execute(include_str!("../../sql/002_financial_wallet_aliases.sql")).await?;
         } else {
             // Production schema changes are applied once through the existing
             // migration principal. The long-running runtime receives only the
@@ -2961,6 +3110,7 @@ impl Projection {
             ("direct_execution_epoch_balances", "SELECT,INSERT,UPDATE"),
             ("direct_execution_identities", "SELECT,INSERT"),
             ("direct_execution_privy_wallets", "SELECT,INSERT"),
+            ("direct_execution_financial_wallet_aliases", "SELECT,INSERT"),
             ("direct_execution_identity_admissions", "SELECT,INSERT"),
             ("direct_execution_sessions", "SELECT,INSERT"),
             ("direct_execution_custody_events", "SELECT,INSERT"),
@@ -3091,6 +3241,19 @@ impl Projection {
             "INSERT INTO direct_execution_receipts (receipt_id, epoch_id, auth_subject_hash, identity_commitment, request_id, request_hash, terminal_status, effect, custody_reference, receipt_json) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::text::jsonb) ON CONFLICT (receipt_id) DO NOTHING",
             &[&receipt.receipt_id, &EPOCH_ID, &receipt.account_id, &receipt.identity_commitment, &receipt.request_id, &receipt.request_hash, &format!("{:?}", receipt.status).to_uppercase(), &receipt.effect, &receipt.custody_reference, &serde_json::to_string(receipt).map_err(|_| ProjectionError::Database)?],
         ).await.map_err(|_| ProjectionError::Database)?;
+        if let Some(wallet) = receipt_wallet_alias(receipt)? {
+            self.client.execute(
+                "INSERT INTO direct_execution_financial_wallet_aliases (epoch_id,auth_subject_hash,identity_commitment,wallet_address,receipt_id) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (epoch_id,wallet_address) DO NOTHING",
+                &[&EPOCH_ID,&receipt.account_id,&receipt.identity_commitment,&wallet,&receipt.receipt_id],
+            ).await.map_err(|_| ProjectionError::Database)?;
+            let row = self.client.query_one(
+                "SELECT auth_subject_hash,identity_commitment FROM direct_execution_financial_wallet_aliases WHERE epoch_id=$1 AND wallet_address=$2",
+                &[&EPOCH_ID,&wallet],
+            ).await.map_err(|_| ProjectionError::Database)?;
+            if row.get::<_,String>(0) != receipt.account_id || row.get::<_,String>(1) != receipt.identity_commitment {
+                return Err(ProjectionError::OpeningMismatch);
+            }
+        }
         for update in &receipt.projection_balance_updates {
             self.client.execute(
                 "INSERT INTO direct_execution_epoch_balances (epoch_id, auth_subject_hash, identity_commitment, asset, bucket, amount_atomic) VALUES ($1,$2,$3,$4,$5,$6::text::numeric) ON CONFLICT (epoch_id, identity_commitment, asset, bucket) DO UPDATE SET auth_subject_hash=EXCLUDED.auth_subject_hash, amount_atomic=EXCLUDED.amount_atomic, updated_at=now()",
@@ -3216,8 +3379,43 @@ impl Projection {
     }
 }
 
+fn usdc_withdrawal_preflight(hold:&RuntimeResponse,available:&RuntimeResponse,amount:&str)->Result<(),(StatusCode,&'static str)>{
+    let RuntimeResponse::Balance {amount_atomic:held}=hold else {return Err((StatusCode::SERVICE_UNAVAILABLE,"USDC_WITHDRAWAL_PREFLIGHT_UNAVAILABLE"));};
+    let held=held.parse::<u128>().map_err(|_|(StatusCode::SERVICE_UNAVAILABLE,"USDC_WITHDRAWAL_PREFLIGHT_UNAVAILABLE"))?;
+    if held>0 {return Err((StatusCode::CONFLICT,"WITHDRAWAL_PENDING"));}
+    let RuntimeResponse::Balance {amount_atomic:available}=available else {return Err((StatusCode::SERVICE_UNAVAILABLE,"USDC_WITHDRAWAL_PREFLIGHT_UNAVAILABLE"));};
+    let available=available.parse::<u128>().map_err(|_|(StatusCode::SERVICE_UNAVAILABLE,"USDC_WITHDRAWAL_PREFLIGHT_UNAVAILABLE"))?;
+    let amount=amount.parse::<u128>().ok().filter(|value|*value>0&&value.to_string()==amount)
+        .ok_or((StatusCode::BAD_REQUEST,"WITHDRAWAL_AMOUNT_INVALID"))?;
+    if available<amount {return Err((StatusCode::UNPROCESSABLE_ENTITY,"INSUFFICIENT_AVAILABLE"));}Ok(())
+}
+
+fn receipt_wallet_alias(receipt: &DirectReceipt) -> Result<Option<String>, ProjectionError> {
+    if receipt.effect != "FINANCIAL_WALLET_LINKED" { return Ok(None); }
+    if receipt.status != layrs_direct_execution_v1::TerminalStatus::Applied {
+        return Err(ProjectionError::OpeningMismatch);
+    }
+    let wallet = receipt.custody_reference.as_deref().and_then(|value| value.strip_prefix("wallet-link:"))
+        .filter(|value| value.len() == 42 && value.starts_with("0x")
+            && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+            && *value != "0x0000000000000000000000000000000000000000")
+        .ok_or(ProjectionError::OpeningMismatch)?;
+    Ok(Some(wallet.to_ascii_lowercase()))
+}
+
 fn custody_projection_binding(reference: &str) -> (i64, String) {
     let parts = reference.split(':').collect::<Vec<_>>();
+    // The trusted receipt identifies the pool-side custody event. A Bus
+    // settlement also carries the message GUID and destination hash; neither
+    // replaces the Horizen pool transaction in the custody projection.
+    if matches!(parts.first(), Some(&"horizen-usdc-deposit") | Some(&"horizen-usdc-bus")) {
+        if let Some(hash) = parts.get(1).filter(|hash| {
+            hash.len() == 66 && hash.starts_with("0x")
+                && hash[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            return (26514, hash.to_ascii_lowercase());
+        }
+    }
     if parts.get(1) == Some(&"relay") {
         if let (Some(chain), Some(hash)) = (
             parts.get(3).and_then(|value| value.parse::<i64>().ok()),
@@ -3240,6 +3438,23 @@ fn receipt_custody(receipt: &DirectReceipt) -> (Option<&'static str>, Option<Str
         "WITHDRAWAL_SETTLED" => (Some("WITHDRAWAL"), receipt.amount_atomic.clone()),
         "DEPOSIT_CREDITED" => (Some("DEPOSIT"), receipt.amount_atomic.clone()),
         _ => (None, None),
+    }
+}
+fn encrypted_quest_witness<T:Serialize>(claims:&SessionClaims,body:&T)->axum::response::Response {
+    let key=match URL_SAFE_NO_PAD.decode(&claims.response_key) {
+        Ok(key) if key.len()==32=>zeroize::Zeroizing::new(key),
+        _=>return (StatusCode::INTERNAL_SERVER_ERROR,"SESSION_ENCRYPTION_KEY_INVALID").into_response(),
+    };
+    let plaintext=match serde_json::to_vec(body) {
+        Ok(bytes) if bytes.len()<=65536=>zeroize::Zeroizing::new(bytes),
+        _=>return (StatusCode::INTERNAL_SERVER_ERROR,"RESPONSE_ENCODING_FAILED").into_response(),
+    };
+    let mut nonce=[0;12];
+    if openssl::rand::rand_bytes(&mut nonce).is_err() {return (StatusCode::INTERNAL_SERVER_ERROR,"RESPONSE_ENCRYPTION_FAILED").into_response();}
+    let cipher=ChaCha20Poly1305::new(Key::from_slice(&key));
+    match cipher.encrypt(Nonce::from_slice(&nonce),plaintext.as_slice()) {
+        Ok(ciphertext)=>Json(EncryptedResponse{algorithm:"CHACHA20_POLY1305",nonce:URL_SAFE_NO_PAD.encode(nonce),ciphertext:URL_SAFE_NO_PAD.encode(ciphertext)}).into_response(),
+        Err(_)=>(StatusCode::INTERNAL_SERVER_ERROR,"RESPONSE_ENCRYPTION_FAILED").into_response(),
     }
 }
 fn encrypted<T: Serialize>(claims: &SessionClaims, body: &T) -> axum::response::Response {
@@ -4159,6 +4374,50 @@ async fn write_frame(stream: &mut VsockStream, bytes: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn usdc_preflight_rejects_a_cross_rail_hold_or_insufficient_balance_before_payout() {
+        let balance=|amount:&str|RuntimeResponse::Balance {amount_atomic:amount.into()};
+        assert_eq!(usdc_withdrawal_preflight(&balance("4840000"),&balance("5160000"),"5000000"),Err((StatusCode::CONFLICT,"WITHDRAWAL_PENDING")));
+        assert_eq!(usdc_withdrawal_preflight(&balance("0"),&balance("4840000"),"5000000"),Err((StatusCode::UNPROCESSABLE_ENTITY,"INSUFFICIENT_AVAILABLE")));
+        assert!(usdc_withdrawal_preflight(&balance("0"),&balance("4840000"),"4840000").is_ok());
+        for invalid in ["0","-1","4.84","04840000"] {assert!(usdc_withdrawal_preflight(&balance("0"),&balance("4840000"),invalid).is_err());}
+        assert!(usdc_withdrawal_preflight(&RuntimeResponse::Error {code:"unavailable".into()},&balance("5000000"),"5000000").is_err());
+    }
+    #[test]
+    fn usdc_custody_projection_binds_horizen_pool_transaction_not_bus_guid() {
+        let pool_hash = format!("0x{}", "ab".repeat(32));
+        let guid = format!("0x{}", "cd".repeat(32));
+        let destination_hash = format!("0x{}", "ef".repeat(32));
+        assert_eq!(custody_projection_binding(&format!("horizen-usdc-deposit:{pool_hash}")), (26514, pool_hash.clone()));
+        assert_eq!(custody_projection_binding(&format!("horizen-usdc-bus:{pool_hash}:{guid}:{destination_hash}")), (26514, pool_hash));
+        assert_eq!(custody_projection_binding("legacy-base-reference"), (8453, "legacy-base-reference".into()));
+        assert_eq!(custody_projection_binding("withdrawal:relay:id:42161:destination:0x123"), (42161, "0x123".into()));
+        assert_eq!(custody_projection_binding("horizen-usdc-deposit:invalid"), (8453, "horizen-usdc-deposit:invalid".into()));
+    }
+    #[test]
+    fn usdc_bus_reservation_requires_original_id_signed_recipient_and_positive_canonical_amount() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        let destination = "0x193a0F49Be79D12957f8a362fff0F43EBfD7527f";
+        let action = usdc_bus_reservation_action(id, Some(destination), destination, "4840000").unwrap();
+        assert!(matches!(action, DirectAction::BeginUsdcBusWithdrawal {withdrawal_id, destination: to, amount_atomic}
+            if withdrawal_id == id && to == destination.to_ascii_lowercase() && amount_atomic == "4840000"));
+        for invalid_id in ["new", "00000000-0000-0000-0000-000000000000", "11111111-1111-4111-8111-11111111111A"] {
+            assert!(usdc_bus_reservation_action(invalid_id, Some(destination), destination, "5000000").is_err());
+        }
+        for amount in ["0", "-1", "5.1", "5e6", "05000000", "0x4c4b40", "340282366920938463463374607431768211456"] {
+            assert!(usdc_bus_reservation_action(id, Some(destination), destination, amount).is_err());
+        }
+        assert!(usdc_bus_reservation_action(id, None, destination, "5000000").is_err());
+        assert!(usdc_bus_reservation_action(id, Some("0x2222222222222222222222222222222222222222"), destination, "5000000").is_err());
+    }
+    #[test]
+    fn usdc_bus_public_action_cannot_supply_a_terminal_worker_assertion() {
+        let action = serde_json::json!({"type":"BEGIN_USDC_BUS_WITHDRAWAL","destination":"0x1111111111111111111111111111111111111111","amountAtomic":"5000000"});
+        assert!(serde_json::from_value::<CustomerAction>(action).is_ok());
+        for kind in ["SETTLE_USDC_BUS_WITHDRAWAL", "REVERT_USDC_BUS_WITHDRAWAL"] {
+            assert!(serde_json::from_value::<CustomerAction>(serde_json::json!({"type":kind,"withdrawalId":"11111111-1111-4111-8111-111111111111", "destination":"0x1111111111111111111111111111111111111111", "amountAtomic":"5000000", "custodyReference":"fake"})).is_err());
+        }
+    }
+    #[test]
     fn receipt_cache_releases_entire_snapshot_allocation() {
         let artifact=DirectStateArtifact {epoch_id:EPOCH_ID.into(),sequence:1,prior_state_hash:"a".repeat(64),state_hash:"b".repeat(64),request_hash:"c".repeat(64),nonce:vec![1;12],ciphertext:vec![7;2_000_000],ciphertext_hash:"d".repeat(64),
             receipt:DirectReceipt {receipt_id:"receipt".into(),account_id:"account".into(),identity_commitment:"identity".into(),request_id:"request".into(),request_hash:"c".repeat(64),status:layrs_direct_execution_v1::TerminalStatus::Applied,effect:"BALANCE_READ".into(),amount_atomic:None,custody_reference:None,execution:None,resolution:None,projection_balance_updates:vec![],genesis_ordinal:0,signature:"signature".into()}};
@@ -4469,6 +4728,12 @@ mod tests {
             signature: String::new(),
         };
         claims.signature = sign(&key, &serde_json::to_vec(&claims).unwrap());
+        let frame=quest_receipt_frame(&claims,QuestReceiptQuery{receipt_account_id:"d".repeat(64),request_id:"taker-fill-01".into(),nonce:hex::encode([42;32])}).unwrap();
+        assert_eq!(frame,RuntimeRequest::PublicQuestReceipt{participant_account:claims.subject_hash.clone(),receipt_account:"d".repeat(64),request_id:"taker-fill-01".into(),nonce:vec![42;32]});
+        for (owner,request) in [("D".repeat(64),"valid".into()),("d".repeat(64),"x".repeat(129)),("d".repeat(64),"bad/request".into())] {
+            assert!(quest_receipt_frame(&claims,QuestReceiptQuery{receipt_account_id:owner,request_id:request,nonce:hex::encode([42;32])}).is_err());
+        }
+        assert!(serde_json::from_value::<QuestReceiptQuery>(json!({"receiptAccountId":"d".repeat(64),"requestId":"fill","participantAccount":"e".repeat(64)})).is_err());
         let mut headers = HeaderMap::new();
         headers.insert(
             "authorization",
@@ -4489,6 +4754,9 @@ mod tests {
             commit_ack_key: Vec::new(),
             custody: None,
             zen_custody: None,
+            usdc_custody: None,
+            usdc_link_authority: None,
+            usdc_bus_custody: None,
             financial_gate: Arc::new(Mutex::new(())),
             committed_state_root: Arc::new(Mutex::new(None)),
             unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
@@ -4543,6 +4811,26 @@ mod tests {
 
         headers.insert("authorization", "Bearer bad".parse().unwrap());
         assert!(authenticated(&headers, &state).is_err());
+    }
+    #[tokio::test]
+    async fn private_quest_witness_encryption_uses_fresh_nonce_even_for_repeated_equal_length_queries() {
+        let claims=SessionClaims{session_id:"unit-test-only-session".into(),subject_hash:"a".repeat(64),privy_user_id_hash:"b".repeat(64),
+            audience:SESSION_AUDIENCE.into(),epoch_id:EPOCH_ID.into(),epoch_state_sha256:layrs_direct_execution_v1::EPOCH_STATE_SHA256.into(),
+            wallet_address:"0x1111111111111111111111111111111111111111".into(),financial_wallet_address:None,identity_commitment:"c".repeat(64),
+            expires_at_unix:now_unix()+60,response_key:URL_SAFE_NO_PAD.encode([3;32]),signature:String::new()};
+        let mut nonces=HashSet::new();
+        for query in ["query-A","query-B","query-A"] {
+            let body=json!({"syntheticPrivateLookup":query});
+            let response=encrypted_quest_witness(&claims,&body);
+            assert_eq!(response.status(),StatusCode::OK);
+            let bytes=axum::body::to_bytes(response.into_body(),65536).await.unwrap();
+            let envelope:Value=serde_json::from_slice(&bytes).unwrap();
+            let nonce=URL_SAFE_NO_PAD.decode(envelope["nonce"].as_str().unwrap()).unwrap();
+            assert_eq!(nonce.len(),12);assert!(nonces.insert(nonce.clone()));
+            let ciphertext=URL_SAFE_NO_PAD.decode(envelope["ciphertext"].as_str().unwrap()).unwrap();
+            let cipher=ChaCha20Poly1305::new(Key::from_slice(&[3;32]));
+            assert_eq!(serde_json::from_slice::<Value>(&cipher.decrypt(Nonce::from_slice(&nonce),ciphertext.as_slice()).unwrap()).unwrap(),body);
+        }
     }
 
     #[test]

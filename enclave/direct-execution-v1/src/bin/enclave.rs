@@ -10,7 +10,7 @@ use aws_nitro_enclaves_nsm_api::{
 };
 use hmac::{Hmac, Mac};
 use layrs_direct_execution_v1::{
-    runtime_binding, runtime_binding_commitment, DirectRuntime, InMemoryDirectStateStore,
+    runtime_binding, runtime_binding_commitment, quest_receipt_public_key, quest_receipt_attestation_commitment, DirectRuntime, InMemoryDirectStateStore,
     RuntimeMeasurementBinding, RuntimeMode, RuntimeRequest, RuntimeResponse, SealedEpoch,
     WriterGrant, EPOCH_ID, TRANSACTION_MODEL,
 };
@@ -118,6 +118,10 @@ where
         serde_cbor::from_slice(&read_frame(&mut stream).await?).map_err(invalid)?;
     let response = match request {
         RuntimeRequest::Attestation { nonce } => attest(&state, nonce).await,
+        RuntimeRequest::QuestReceiptAttestation { nonce } => attest_quest_receipt_key(&state,nonce).await,
+        RuntimeRequest::PublicQuestReceipt { participant_account,receipt_account,request_id,nonce } => {
+            public_quest_receipt(&state,&participant_account,&receipt_account,&request_id,&nonce).await
+        },
         RuntimeRequest::Status => {
             let state = state.lock().await;
             RuntimeResponse::Status {
@@ -760,6 +764,50 @@ async fn attest(state: &Arc<Mutex<EnclaveState>>, nonce: Vec<u8>) -> RuntimeResp
     }
 }
 
+fn quest_evidence_gate(state:&EnclaveState)->Result<(),&'static str> {
+    if !state.recovery_complete||state.restore_candidate.is_some() {return Err("DIRECT_STATE_RECOVERY_REQUIRED");}
+    if !state.runtime.writer_enabled() {return Err("DIRECT_WRITER_DISABLED");}
+    let now=SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|duration|duration.as_secs());
+    if state.mode==RuntimeMode::ProductionEnabled && !state.writer_grant_expires_at_unix.zip(now).is_some_and(|(expiry,now)|expiry>now) {
+        return Err("DIRECT_AUTHORIZATION_EXPIRED");
+    }
+    Ok(())
+}
+async fn public_quest_receipt(state:&Arc<Mutex<EnclaveState>>,participant:&str,owner:&str,request:&str,nonce:&[u8])->RuntimeResponse {
+    let state=state.lock().await;
+    if let Err(code)=quest_evidence_gate(&state) {return RuntimeResponse::Error{code:code.into()};}
+    // Bound lookup frames before consulting private committed state. No
+    // arbitrary payload or caller-selected financial fields are accepted.
+    let hash=|value:&str|value.len()==64&&value.bytes().all(|byte|byte.is_ascii_digit()||(b'a'..=b'f').contains(&byte));
+    if nonce.len()!=32||!hash(participant)||!hash(owner)||request.is_empty()||request.len()>128||!request.bytes().all(|byte|byte.is_ascii_alphanumeric()||b"-_:".contains(&byte)) {
+        return RuntimeResponse::Error{code:"INVALID_PRIVACY_RECEIPT_REQUEST".into()};
+    }
+    match state.runtime.quest_receipt_witness(participant,owner,request,nonce) {
+        Ok(witness)=>RuntimeResponse::PublicQuestReceipt{witness},
+        Err(_)=>RuntimeResponse::Error{code:"PRIVACY_RECEIPT_UNAVAILABLE".into()},
+    }
+}
+async fn attest_quest_receipt_key(state:&Arc<Mutex<EnclaveState>>,nonce:Vec<u8>)->RuntimeResponse {
+    attest_quest_receipt_key_with(state,nonce,|fd,commitment,nonce,key|match nsm_process_request(fd,NsmRequest::Attestation {
+        user_data:Some(commitment.to_vec().into()),nonce:Some(nonce.into()),public_key:Some(key.into()),
+    }) {
+        NsmResponse::Attestation{document}=>Ok(document), _=>Err(()),
+    }).await
+}
+async fn attest_quest_receipt_key_with<F>(state:&Arc<Mutex<EnclaveState>>,nonce:Vec<u8>,attestor:F)->RuntimeResponse
+where F:FnOnce(i32,[u8;32],Vec<u8>,Vec<u8>)->Result<Vec<u8>,()> {
+    if !(16..=512).contains(&nonce.len()) {return RuntimeResponse::Error{code:"INVALID_NONCE".into()};}
+    let state=state.lock().await;
+    if let Err(code)=quest_evidence_gate(&state) {return RuntimeResponse::Error{code:code.into()};}
+    let binding=runtime_binding(state.runtime.identity_count(),state.runtime.writer_enabled(),state.runtime.admission_enabled(),state.writer_grant_commitment.clone(),state.writer_grant_expires_at_unix,state.key_release_artifact_hash.clone());
+    let Ok(public_key)=quest_receipt_public_key(&state.receipt_key) else {return RuntimeResponse::Error{code:"ATTESTATION_FAILED".into()};};
+    let Ok(binding_commitment)=quest_receipt_attestation_commitment(&binding,&public_key) else {return RuntimeResponse::Error{code:"ATTESTATION_FAILED".into()};};
+    match attestor(state.nsm_fd,binding_commitment,nonce,public_key.clone()) {
+        Ok(document) if !document.is_empty()=>RuntimeResponse::QuestReceiptAttestation{document,binding,binding_commitment,public_key},
+        _=>RuntimeResponse::Error{code:"ATTESTATION_FAILED".into()},
+    }
+}
+
 fn invalid(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
@@ -958,6 +1006,65 @@ mod tests {
             writer_grant_expires_at_unix: None,
             key_release_artifact_hash: None,
         }))
+    }
+    #[tokio::test]
+    async fn quest_key_attestation_refuses_invalid_nonce_unrecovered_dormant_and_expired_writer() {
+        let live=state();
+        let forbidden=|_:i32,_:[u8;32],_:Vec<u8>,_:Vec<u8>|->Result<Vec<u8>,()>{panic!("unauthorized attestation invoked NSM");};
+        for nonce in [vec![0;15],vec![0;513]] {
+            assert_eq!(attest_quest_receipt_key_with(&live,nonce,forbidden).await,RuntimeResponse::Error{code:"INVALID_NONCE".into()});
+        }
+        assert_eq!(attest_quest_receipt_key_with(&live,vec![1;16],forbidden).await,RuntimeResponse::Error{code:"DIRECT_STATE_RECOVERY_REQUIRED".into()});
+        let dormant=dormant_state();dormant.lock().await.recovery_complete=true;
+        assert_eq!(attest_quest_receipt_key_with(&dormant,vec![1;16],forbidden).await,RuntimeResponse::Error{code:"DIRECT_WRITER_DISABLED".into()});
+        {let mut state=live.lock().await;state.recovery_complete=true;state.mode=RuntimeMode::ProductionEnabled;state.writer_grant_expires_at_unix=Some(1);}
+        assert_eq!(attest_quest_receipt_key_with(&live,vec![1;16],forbidden).await,RuntimeResponse::Error{code:"DIRECT_AUTHORIZATION_EXPIRED".into()});
+        {let mut state=live.lock().await;state.mode=RuntimeMode::IsolatedTest;state.restore_candidate=Some(state.runtime.clone());}
+        assert_eq!(attest_quest_receipt_key_with(&live,vec![1;16],forbidden).await,RuntimeResponse::Error{code:"DIRECT_STATE_RECOVERY_REQUIRED".into()});
+    }
+    #[tokio::test]
+    async fn quest_key_attestation_binds_only_public_key_and_nonce_without_ledger_mutation() {
+        let live=state();recover(Arc::clone(&live),Vec::new()).await;
+        let before={let state=live.lock().await;(state.runtime.committed_state_hash(),state.runtime.committed_sequence())};
+        let expected_key=quest_receipt_public_key(&[7;32]).unwrap();
+        let nonce=vec![42;32];
+        let result=attest_quest_receipt_key_with(&live,nonce.clone(),|_,commitment,actual_nonce,key| {
+            assert_eq!(key,expected_key);assert_eq!(actual_nonce,nonce);
+            assert_ne!(commitment,runtime_binding_commitment(&runtime_binding(421,true,true,None,None,None)));
+            Ok(b"synthetic-unit-test-attestation-not-a-Nitro-document".to_vec())
+        }).await;
+        let RuntimeResponse::QuestReceiptAttestation{binding,binding_commitment,public_key,..}=result else {panic!("expected receipt-key attestation");};
+        assert_eq!(public_key,expected_key);
+        assert_eq!(binding_commitment,quest_receipt_attestation_commitment(&binding,&public_key).unwrap());
+        let mut changed=binding.clone();changed.writer_enabled=false;
+        assert_ne!(binding_commitment,quest_receipt_attestation_commitment(&changed,&public_key).unwrap());
+        assert_ne!(binding_commitment,quest_receipt_attestation_commitment(&binding,&[0;32]).unwrap());
+        assert_eq!(before,{let state=live.lock().await;(state.runtime.committed_state_hash(),state.runtime.committed_sequence())});
+        assert_eq!(attest_quest_receipt_key_with(&live,vec![1;16],|_,_,_,_|Ok(Vec::new())).await,RuntimeResponse::Error{code:"ATTESTATION_FAILED".into()});
+    }
+    #[tokio::test]
+    async fn vsock_public_receipt_requires_committed_recovered_owned_activity() {
+        let live=state();
+        assert_eq!(public_quest_receipt(&live,SUBJECT,SUBJECT,"new-admission",&[42;32]).await,RuntimeResponse::Error{code:"DIRECT_STATE_RECOVERY_REQUIRED".into()});
+        recover(Arc::clone(&live),Vec::new()).await;
+        let subject="a".repeat(64);let wallet="0x1111111111111111111111111111111111111111";
+        let identity=identity_commitment_for(&subject,wallet);
+        let store=FilesystemImmutableArtifactStore::new(artifact_dir());
+        let admission=request_for(&subject,&identity,"new-admission",DirectAction::AdmitIdentity{wallet_address:wallet.into()});
+        let RuntimeResponse::Execute{..}=commit_through_parent_callback(Arc::clone(&live),admission,&store).await else {panic!("admission was not committed");};
+        let request=RuntimeRequest::PublicQuestReceipt{participant_account:subject.clone(),receipt_account:subject.clone(),request_id:"new-admission".into(),nonce:vec![42;32]};
+        let response=runtime_response(Arc::clone(&live),request.clone()).await;
+        let RuntimeResponse::PublicQuestReceipt{witness}=response.clone() else {panic!("expected owned witness");};
+        let receipt=&witness.receipt;
+        assert_eq!(witness.lookup.participant_account,subject);
+        assert_eq!(witness.lookup.request_id,"new-admission");
+        assert_eq!(witness.lookup.nonce,hex::encode([42;32]));
+        assert!(layrs_direct_execution_v1::verify_public_quest_receipt(&receipt,&quest_receipt_public_key(&[7;32]).unwrap()));
+        assert_eq!(public_quest_receipt(&live,SUBJECT,&subject,"new-admission",&[42;32]).await,RuntimeResponse::Error{code:"PRIVACY_RECEIPT_UNAVAILABLE".into()});
+        assert_eq!(public_quest_receipt(&live,&subject,&subject,&"x".repeat(129),&[42;32]).await,RuntimeResponse::Error{code:"INVALID_PRIVACY_RECEIPT_REQUEST".into()});
+        let restarted=state();recover(Arc::clone(&restarted),store.load_committed().unwrap()).await;
+        assert_eq!(runtime_response(restarted,request).await,response);
+        assert_eq!(store.load_committed().unwrap().len(),1);
     }
     fn measurement_binding() -> RuntimeMeasurementBinding {
         RuntimeMeasurementBinding {

@@ -31,6 +31,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod external_effect;
+mod quest_receipts;
+pub use quest_receipts::{PublicQuestReceipt,QuestReceiptPayload,QuestReceiptKind,QuestReceiptWitness,QuestReceiptLookupPayload,quest_public_receipt_hash,QUEST_RECEIPT_PROTOCOL,
+    quest_receipt_public_key,canonical_quest_receipt_payload,quest_receipt_attestation_commitment,verify_public_quest_receipt};
 pub use external_effect::{
     reference_for, relay_reference_for, relay_result_hash, relay_reverted_result_hash,
     relay_terminal_result_hash, ExternalEffectIntent, ExternalEffectObservation,
@@ -89,6 +92,8 @@ pub enum RuntimeError {
     CustodyReferenceReuse,
     #[error("insufficient available balance")]
     InsufficientAvailable,
+    #[error("an existing withdrawal is awaiting destination confirmation")]
+    WithdrawalPending,
     #[error("unknown order")]
     UnknownOrder,
     #[error("unknown or invalid market")]
@@ -797,6 +802,19 @@ pub enum DirectAction {
         custody_reference: String,
     },
     CreditZenDeposit { amount_atomic: String, custody_reference: String },
+    /// Parent constructs this only after independently observing the user's
+    /// individual Horizen USDC.e pool deposit at canonical finality.
+    CreditHorizenUsdcDeposit { amount_atomic: String, custody_reference: String },
+    /// Add a newly verified participant wallet to the same canonical identity.
+    /// Historical wallet references and every financial bucket remain intact.
+    LinkFinancialWallet { wallet_address: String },
+    /// Commit a per-user hold before custody movement. A Bus wait must not
+    /// become the legacy global unresolved-external-effect writer fence.
+    BeginUsdcBusWithdrawal { withdrawal_id: String, destination: String, amount_atomic: String },
+    /// Internal, parent-verified terminal proof; never a public customer action.
+    SettleUsdcBusWithdrawal { withdrawal_id: String, destination: String, amount_atomic: String, custody_reference: String },
+    /// Release only on an independently verified reverted pool transaction.
+    RevertUsdcBusWithdrawal { withdrawal_id: String, destination: String, amount_atomic: String, custody_reference: String },
     PlaceOrder {
         order_id: String,
         market_id: String,
@@ -1051,6 +1069,7 @@ pub struct DirectRuntime {
     /// transaction hash after the parent has independently verified the
     /// transfer and finality.
     credited_custody_references: BTreeSet<String>,
+    usdc_bus_withdrawals: BTreeMap<String, UsdcBusHold>,
     requests: BTreeMap<(String, String), (String, DirectResult)>,
     receipt_key: Vec<u8>,
     mode: RuntimeMode,
@@ -1137,6 +1156,14 @@ pub struct DirectCandidate {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+struct UsdcBusHold {
+    account_id: String,
+    identity_commitment: String,
+    destination: String,
+    amount_atomic: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 struct DirectState {
     balances: BTreeMap<String, BTreeMap<(String, String), u128>>,
     subject_identities: BTreeMap<String, BTreeSet<String>>,
@@ -1167,6 +1194,59 @@ struct DirectState {
 
 fn is_zero_u128(value: &u128) -> bool {
     *value == 0
+}
+
+fn reconstruct_bus_holds(state: &DirectState, receipt_key: &[u8]) -> Result<BTreeMap<String, UsdcBusHold>, RuntimeError> {
+    let invalid = || RuntimeError::StateArtifact;
+    let mut holds = BTreeMap::new();
+    let mut totals = BTreeMap::<String, u128>::new();
+    for ((account, id), (hash, result)) in &state.requests {
+        let receipt = &result.receipt;
+        let terminal = id.starts_with("usdc-bus-settle:") || id.starts_with("usdc-bus-revert:");
+        if result.effect != "WITHDRAWAL_RESERVED" && !terminal { continue; }
+        if receipt.account_id != *account || receipt.request_id != *id || receipt.request_hash != *hash
+            || result.status != TerminalStatus::Applied || receipt.status != result.status || receipt.effect != result.effect
+            || !verify_receipt(receipt_key, receipt)
+            || !state.subject_identities.get(account).is_some_and(|set| set.contains(&receipt.identity_commitment)) {
+            return Err(invalid());
+        }
+        if terminal {
+            let (prefix, effect, reverted) = if id.starts_with("usdc-bus-revert:") {
+                ("usdc-bus-revert:", "WITHDRAWAL_REVERTED", true)
+            } else { ("usdc-bus-settle:", "WITHDRAWAL_SETTLED", false) };
+            let original_id = id.strip_prefix(prefix).ok_or_else(invalid)?;
+            let original = &state.requests.get(&(account.clone(), original_id.into())).ok_or_else(invalid)?.1.receipt;
+            if result.effect != effect || original.effect != "WITHDRAWAL_RESERVED"
+                || original.identity_commitment != receipt.identity_commitment || original.amount_atomic != receipt.amount_atomic
+                || !receipt.custody_reference.as_deref().is_some_and(|reference| valid_bus_terminal_reference(reference, reverted)) {
+                return Err(invalid());
+            }
+            continue;
+        }
+        let reference = receipt.custody_reference.as_deref().ok_or_else(invalid)?;
+        let destination = reference.strip_prefix(&format!("usdc-bus-reservation:{id}:")).ok_or_else(invalid)?;
+        let atomic = receipt.amount_atomic.as_deref().ok_or_else(invalid)?;
+        let value = amount(atomic).map_err(|_| invalid())?;
+        if !valid_bus_withdrawal_id(id) || !valid_evm_wallet(destination) || destination != destination.to_ascii_lowercase()
+            || value.to_string() != atomic { return Err(invalid()); }
+        let settled = state.requests.contains_key(&(account.clone(), format!("usdc-bus-settle:{id}")));
+        let reverted = state.requests.contains_key(&(account.clone(), format!("usdc-bus-revert:{id}")));
+        if settled && reverted { return Err(invalid()); }
+        if settled || reverted { continue; }
+        if holds.values().any(|hold: &UsdcBusHold| hold.identity_commitment == receipt.identity_commitment)
+            || holds.insert(id.clone(), UsdcBusHold { account_id: account.clone(), identity_commitment: receipt.identity_commitment.clone(),
+                destination: destination.into(), amount_atomic: atomic.into() }).is_some() { return Err(invalid()); }
+        let total = totals.entry(receipt.identity_commitment.clone()).or_default();
+        *total = total.checked_add(value).ok_or_else(invalid)?;
+    }
+    // Legacy withdrawals move through this bucket atomically and leave no
+    // persistent USDC hold. A missing receipt must never unlock held value.
+    for (identity, balances) in &state.balances {
+        let actual = balances.get(&("USDC".into(), "USER_WITHDRAWAL_HOLD".into())).copied().unwrap_or_default();
+        if actual != totals.remove(identity).unwrap_or_default() { return Err(invalid()); }
+    }
+    if !totals.is_empty() { return Err(invalid()); }
+    Ok(holds)
 }
 
 /// Minimal immutable artifact boundary.  Production implements this with the
@@ -1394,6 +1474,7 @@ impl DirectRuntime {
             zen_rounding_reserve_atomic: 0,
             rounding_reserve_atomic: 0,
             credited_custody_references: BTreeSet::new(),
+            usdc_bus_withdrawals: BTreeMap::new(),
             requests: BTreeMap::new(),
             receipt_key,
             mode,
@@ -1433,13 +1514,17 @@ impl DirectRuntime {
         {
             return Err(RuntimeError::IdentityDenied);
         }
+        if matches!(&request.action,DirectAction::ReserveWithdrawal {..}|DirectAction::SettleRelayWithdrawal {..})
+            &&self.usdc_bus_withdrawals.values().any(|hold|hold.identity_commitment==request.identity_commitment) {
+            return Err(RuntimeError::WithdrawalPending);
+        }
         let financial_wallet = request
             .financial_wallet_address
             .as_deref()
             .map(str::to_ascii_lowercase);
         match &request.action {
             // Preserve the existing deposit lane unchanged. Base deposit
-            DirectAction::CreditZenDeposit { .. } => {
+            DirectAction::CreditZenDeposit { .. } | DirectAction::CreditHorizenUsdcDeposit { .. } => {
                 let Some(wallet) = financial_wallet.as_deref() else { return Err(RuntimeError::DestinationDenied); };
                 if !valid_evm_wallet(wallet) || !self.subject_wallets.get(&request.account_id)
                     .is_some_and(|wallets| wallets.contains(wallet)) { return Err(RuntimeError::DestinationDenied); }
@@ -1461,7 +1546,10 @@ impl DirectRuntime {
             DirectAction::ReserveWithdrawal { destination, .. }
             | DirectAction::RecordWithdrawalReverted { destination, .. }
             | DirectAction::ReserveZenWithdrawal { destination, .. }
-            | DirectAction::RecordZenWithdrawalReverted { destination, .. } => {
+            | DirectAction::RecordZenWithdrawalReverted { destination, .. }
+            | DirectAction::BeginUsdcBusWithdrawal { destination, .. }
+            | DirectAction::SettleUsdcBusWithdrawal { destination, .. }
+            | DirectAction::RevertUsdcBusWithdrawal { destination, .. } => {
                 let Some(wallet) = financial_wallet.as_deref() else {
                     return Err(RuntimeError::DestinationDenied);
                 };
@@ -1625,6 +1713,82 @@ impl DirectRuntime {
                     if !self.credited_custody_references.insert(format!("horizen-zen-deposit:{}", hash.to_ascii_lowercase())) { return Err(RuntimeError::CustodyReferenceReuse); }
                     self.add_asset(&request.identity_commitment, "ZEN", "USER_AVAILABLE", value)?;
                     ("DEPOSIT_CREDITED".into(), Some(amount_atomic.clone()), Some(custody_reference.clone()))
+                }
+                DirectAction::CreditHorizenUsdcDeposit { amount_atomic, custody_reference } => {
+                    let value=amount(amount_atomic)?;
+                    let hash=custody_reference.strip_prefix("horizen-usdc-deposit:")
+                        .filter(|value|valid_transaction_hash_value(value)).ok_or(RuntimeError::InvalidRequest)?;
+                    if value<5_000_000 {return Err(RuntimeError::InvalidRequest);}
+                    let reference=format!("horizen-usdc-deposit:{}",hash.to_ascii_lowercase());
+                    if self.credited_custody_references.contains(&reference) {
+                        return Err(RuntimeError::CustodyReferenceReuse);
+                    }
+                    self.add(&request.identity_commitment,"USER_AVAILABLE",value)?;
+                    self.credited_custody_references.insert(reference);
+                    ("DEPOSIT_CREDITED".into(),Some(amount_atomic.clone()),Some(custody_reference.clone()))
+                }
+                DirectAction::LinkFinancialWallet {wallet_address} => {
+                    let wallet=wallet_address.to_ascii_lowercase();
+                    if !valid_evm_wallet(&wallet) {return Err(RuntimeError::DestinationDenied);}
+                    if self.usdc_bus_withdrawals.values().any(|hold|hold.identity_commitment==request.identity_commitment) {
+                        return Err(RuntimeError::WithdrawalPending);
+                    }
+                    if self.subject_wallets.iter().any(|(subject,wallets)|subject!=&request.account_id&&wallets.contains(&wallet)) {
+                        return Err(RuntimeError::IdentityAlreadyAdmitted);
+                    }
+                    self.subject_wallets.entry(request.account_id.clone()).or_default().insert(wallet.clone());
+                    ("FINANCIAL_WALLET_LINKED".into(),None,Some(format!("wallet-link:{wallet}")))
+                }
+                DirectAction::BeginUsdcBusWithdrawal {withdrawal_id,destination,amount_atomic} => {
+                    let value=amount(amount_atomic)?;
+                    if !valid_bus_withdrawal_id(withdrawal_id)||withdrawal_id!=&request.request_id||value.to_string()!=*amount_atomic {return Err(RuntimeError::InvalidRequest);}
+                    if self.usdc_bus_withdrawals.contains_key(withdrawal_id) {return Err(RuntimeError::RequestReuse);}
+                    if self.usdc_bus_withdrawals.values().any(|hold|hold.identity_commitment==request.identity_commitment) {
+                        return Err(RuntimeError::WithdrawalPending);
+                    }
+                    if self.balance(&request.identity_commitment,"USDC","USER_AVAILABLE")<value {
+                        // Commit a money-free rejection under the original ID.
+                        // A future deposit must never turn this refused request
+                        // into a delayed payout after the UI cleared it.
+                        ("WITHDRAWAL_REJECTED".into(),Some(amount_atomic.clone()),Some(format!("usdc-bus-rejection:{withdrawal_id}:INSUFFICIENT_AVAILABLE")))
+                    } else {
+                        self.move_asset_bucket(&request.identity_commitment,"USDC","USER_AVAILABLE","USER_WITHDRAWAL_HOLD",value)?;
+                        self.usdc_bus_withdrawals.insert(withdrawal_id.clone(),UsdcBusHold {account_id:request.account_id.clone(),
+                            identity_commitment:request.identity_commitment.clone(),destination:destination.to_ascii_lowercase(),amount_atomic:amount_atomic.clone()});
+                        ("WITHDRAWAL_RESERVED".into(),Some(amount_atomic.clone()),Some(format!("usdc-bus-reservation:{withdrawal_id}:{}",destination.to_ascii_lowercase())))
+                    }
+                }
+                DirectAction::SettleUsdcBusWithdrawal {withdrawal_id,destination,amount_atomic,custody_reference}
+                | DirectAction::RevertUsdcBusWithdrawal {withdrawal_id,destination,amount_atomic,custody_reference} => {
+                    let value=amount(amount_atomic)?;
+                    let reverted=matches!(&request.action,DirectAction::RevertUsdcBusWithdrawal {..});
+                    let expected_request=format!("usdc-bus-{}:{withdrawal_id}",if reverted {"revert"} else {"settle"});
+                    let hold=self.usdc_bus_withdrawals.get(withdrawal_id).ok_or(RuntimeError::InvalidRequest)?;
+                    if request.request_id!=expected_request || hold.account_id!=request.account_id
+                        ||hold.identity_commitment!=request.identity_commitment||hold.destination!=destination.to_ascii_lowercase()
+                        ||hold.amount_atomic!=*amount_atomic||!valid_bus_terminal_reference(custody_reference,reverted) {
+                        return Err(RuntimeError::DestinationDenied);
+                    }
+                    // Existing state field, domain-separated references. No new
+                    // always-present schema field breaks a drained fallback.
+                    let parts=custody_reference.split(':').collect::<Vec<_>>();
+                    let pool_reference=format!("horizen-usdc-bus-pool:{}",parts[1]);
+                    let delivery_reference=if reverted {None} else {Some(format!("horizen-usdc-bus-delivery:{}:{}",parts[3],parts[5]))};
+                    let seat_reference=if reverted {None} else {Some(format!("horizen-usdc-bus-seat:{}:{}",parts[2],parts[4]))};
+                    if self.credited_custody_references.contains(custody_reference)
+                        ||self.credited_custody_references.contains(&pool_reference)
+                        ||delivery_reference.as_ref().is_some_and(|reference|self.credited_custody_references.contains(reference))
+                        ||seat_reference.as_ref().is_some_and(|reference|self.credited_custody_references.contains(reference)) {
+                        return Err(RuntimeError::CustodyReferenceReuse);
+                    }
+                    self.move_asset_bucket(&request.identity_commitment,"USDC","USER_WITHDRAWAL_HOLD",
+                        if reverted {"USER_AVAILABLE"} else {"USER_SETTLED"},value)?;
+                    self.credited_custody_references.insert(custody_reference.clone());
+                    self.credited_custody_references.insert(pool_reference);
+                    if let Some(reference)=delivery_reference {self.credited_custody_references.insert(reference);}
+                    if let Some(reference)=seat_reference {self.credited_custody_references.insert(reference);}
+                    self.usdc_bus_withdrawals.remove(withdrawal_id);
+                    ((if reverted {"WITHDRAWAL_REVERTED"} else {"WITHDRAWAL_SETTLED"}).into(),Some(amount_atomic.clone()),Some(custody_reference.clone()))
                 }
                 DirectAction::PlaceOrder {
                     order_id,
@@ -2079,6 +2243,10 @@ impl DirectRuntime {
             .map_err(|_| RuntimeError::StateArtifact)?;
         let state: DirectState =
             serde_cbor::from_slice(&plain).map_err(|_| RuntimeError::StateArtifact)?;
+        // Keep every historical CBOR state compatible with the predecessor.
+        // The signed original reservation binds the recipient; reconstruct
+        // only its still-active entitlement, never from a disposable index.
+        let bus_holds = reconstruct_bus_holds(&state, &self.receipt_key)?;
         self.balances = state.balances;
         self.zen_fee_revenue_atomic = state.zen_fee_revenue_atomic;
         self.zen_rounding_reserve_atomic = state.zen_rounding_reserve_atomic;
@@ -2095,6 +2263,7 @@ impl DirectRuntime {
         self.fee_revenue_atomic = state.fee_revenue_atomic;
         self.rounding_reserve_atomic = state.rounding_reserve_atomic;
         self.credited_custody_references = state.credited_custody_references;
+        self.usdc_bus_withdrawals = bus_holds;
         self.requests = state.requests;
         Ok(())
     }
@@ -2807,6 +2976,13 @@ impl DirectRuntime {
             .copied()
             .unwrap_or(0)
     }
+    /// A full old-core fallback cannot discard active per-user holds. BFF/UI
+    /// fallback may stop new admissions while the new runtime drains them.
+    pub fn has_pending_usdc_bus_withdrawals(&self)->bool { !self.usdc_bus_withdrawals.is_empty() }
+    pub fn pending_usdc_bus_withdrawal(&self,account:&str,id:&str)->Option<(String,String)> {
+        self.usdc_bus_withdrawals.get(id).filter(|hold|hold.account_id==account)
+            .map(|hold|(hold.destination.clone(),hold.amount_atomic.clone()))
+    }
     pub fn portfolio(&self, identity: &str) -> Result<DirectPortfolio, RuntimeError> {
         let balances = self
             .balances
@@ -3096,6 +3272,10 @@ pub enum RuntimeRequest {
     Attestation {
         nonce: Vec<u8>,
     },
+    /// Independent receipt-key attestation. Existing runtime attestation and
+    /// financial HMAC receipts retain their original protocol and bytes.
+    QuestReceiptAttestation { nonce: Vec<u8> },
+    PublicQuestReceipt { participant_account: String, receipt_account: String, request_id: String, nonce: Vec<u8> },
     Status,
     /// First half of the production startup authorization. The enclave
     /// verifies the governed grant before creating an NSM-attested ephemeral
@@ -3168,6 +3348,11 @@ pub enum RuntimeResponse {
         binding: RuntimeBinding,
         binding_commitment: [u8; 32],
     },
+    QuestReceiptAttestation {
+        document: Vec<u8>, binding: RuntimeBinding,
+        binding_commitment: [u8;32], public_key: Vec<u8>,
+    },
+    PublicQuestReceipt { witness: QuestReceiptWitness },
     Status {
         status: RuntimeStatus,
     },
@@ -3539,6 +3724,19 @@ fn valid_deposit_custody_reference(reference: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
 }
+fn valid_bus_withdrawal_id(value:&str)->bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|id|id.to_string()==value&&!id.is_nil())
+}
+fn valid_bus_terminal_reference(value:&str,reverted:bool)->bool {
+    let prefix=if reverted {"horizen-usdc-bus-reverted:"} else {"horizen-usdc-bus:"};
+    let Some(rest)=value.strip_prefix(prefix) else {return false;};
+    let parts=rest.split(':').collect::<Vec<_>>();
+    if parts.len()!=if reverted {1} else {5} {return false;}
+    let hash_count=if reverted {1} else {3};
+    if !parts[..hash_count].iter().all(|hash|valid_transaction_hash_value(hash)&&*hash==hash.to_ascii_lowercase()) {return false;}
+    reverted || (parts[3].parse::<u8>().is_ok_and(|seat|seat<255&&seat.to_string()==parts[3])
+        &&parts[4].parse::<u64>().is_ok_and(|index|index.to_string()==parts[4]))
+}
 pub fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -3648,7 +3846,10 @@ mod tests {
                 Some("0xfefefefefefefefefefefefefefefefefefefefe".into())
             }
             DirectAction::ReserveWithdrawal { destination, .. }
-            | DirectAction::RecordWithdrawalReverted { destination, .. } => {
+            | DirectAction::RecordWithdrawalReverted { destination, .. }
+            | DirectAction::BeginUsdcBusWithdrawal { destination, .. }
+            | DirectAction::SettleUsdcBusWithdrawal { destination, .. }
+            | DirectAction::RevertUsdcBusWithdrawal { destination, .. } => {
                 Some(destination.to_ascii_lowercase())
             }
             _ => None,
@@ -3997,6 +4198,370 @@ mod tests {
             4_000_000
         );
         assert_eq!(store.artifacts().unwrap().len(), 1);
+    }
+    fn bus_fixture()->(DirectRuntime,String,String,String,InMemoryDirectStateStore) {
+        bus_fixture_funded("10000000")
+    }
+    fn bus_fixture_funded(funded:&str)->(DirectRuntime,String,String,String,InMemoryDirectStateStore) {
+        let mut live=runtime(RuntimeMode::IsolatedTest);
+        let mut store=InMemoryDirectStateStore::default();
+        let subject="a".repeat(64);
+        let wallet="0x1111111111111111111111111111111111111111".to_string();
+        let identity=identity_commitment_for(&subject,&wallet);
+        live.execute_committed(request_for(&subject,&identity,"bus-admission",DirectAction::AdmitIdentity {wallet_address:wallet.clone()}),&[8;32],&mut store).unwrap();
+        let mut deposit=request_for(&subject,&identity,"bus-deposit",DirectAction::CreditHorizenUsdcDeposit {
+            amount_atomic:funded.into(),custody_reference:format!("horizen-usdc-deposit:0x{}","ab".repeat(32))});
+        deposit.financial_wallet_address=Some(wallet.clone());deposit.request_hash=request_hash(&deposit);
+        live.execute_committed(deposit,&[8;32],&mut store).unwrap();
+        (live,subject,identity,wallet,store)
+    }
+    const BUS_ID:&str="11111111-2222-4333-8444-555555555555";
+    #[test]
+    fn public_quest_witness_is_owned_read_only_and_stable_after_recovery() {
+        let (live,subject,identity,_,store)=bus_fixture();
+        let before=(live.committed_sequence(),live.committed_state_hash(),live.portfolio(&identity).unwrap(),store.artifacts().unwrap());
+        let key=quest_receipt_public_key(&[7;32]).unwrap();
+        let witness=live.quest_receipt_witness(&subject,&subject,"bus-deposit",&[42;32]).unwrap();
+        assert_eq!(witness.lookup.public_receipt_hash,quest_public_receipt_hash(&witness.receipt).unwrap());
+        assert_eq!(witness.lookup.participant_account,subject);
+        assert_eq!(witness.lookup.request_id,"bus-deposit");
+        let public=openssl::pkey::PKey::public_key_from_raw_bytes(&key,openssl::pkey::Id::ED25519).unwrap();
+        let payload=serde_json::to_vec(&serde_json::to_value(&witness.lookup).unwrap()).unwrap();
+        let signature=hex::decode(&witness.lookup_signature).unwrap();
+        assert!(openssl::sign::Verifier::new_without_digest(&public).unwrap().verify_oneshot(&signature,&[b"layrs.direct-receipt-lookup-signature.v1\0".as_slice(),&payload].concat()).unwrap());
+        let mut changed=witness.lookup.clone();changed.request_id="another-deposit".into();
+        let payload=serde_json::to_vec(&serde_json::to_value(changed).unwrap()).unwrap();
+        assert!(!openssl::sign::Verifier::new_without_digest(&public).unwrap().verify_oneshot(&signature,&[b"layrs.direct-receipt-lookup-signature.v1\0".as_slice(),&payload].concat()).unwrap());
+        assert!(live.quest_receipt_witness(&subject,&subject,"bus-deposit",&[42;31]).is_err());
+        for (request,kind) in [("bus-admission",QuestReceiptKind::IdentityAdmission),("bus-deposit",QuestReceiptKind::Deposit)] {
+            let witness=live.public_quest_receipt(&subject,&subject,request).unwrap();
+            assert_eq!(witness.payload.kind,kind);
+            assert!(verify_public_quest_receipt(&witness,&key));
+            assert_eq!(witness.payload.enclave_sequence,"2");
+            assert_eq!(witness.payload.state_root,before.1);
+            let public=serde_json::to_string(&witness).unwrap();
+            for private in [&subject,&identity,&request.to_string(),&"10000000".to_string()] {assert!(!public.contains(private));}
+            let restored=DirectRuntime::restore_committed(SealedEpoch::load(epoch_path()).unwrap(),RuntimeMode::IsolatedTest,vec![7;32],&[8;32],&store).unwrap();
+            assert_eq!(restored.public_quest_receipt(&subject,&subject,request).unwrap(),witness);
+        }
+        assert_eq!(before,(live.committed_sequence(),live.committed_state_hash(),live.portfolio(&identity).unwrap(),store.artifacts().unwrap()));
+        assert_eq!(live.public_quest_receipt(&"b".repeat(64),&subject,"bus-deposit").unwrap_err(),RuntimeError::IdentityDenied);
+        assert_eq!(live.public_quest_receipt(&subject,&"b".repeat(64),"bus-deposit").unwrap_err(),RuntimeError::InvalidRequest);
+        assert_eq!(live.public_quest_receipt(&subject,&subject,"not-committed").unwrap_err(),RuntimeError::InvalidRequest);
+        let dormant=runtime(RuntimeMode::Dormant);
+        assert_eq!(dormant.public_quest_receipt(&subject,&subject,"bus-deposit").unwrap_err(),RuntimeError::WriterDisabled);
+    }
+    #[test]
+    fn public_quest_witness_rejects_modified_payload_keys_and_private_receipts() {
+        let (mut live,subject,_,_,_)=bus_fixture();
+        let witness=live.public_quest_receipt(&subject,&subject,"bus-deposit").unwrap();
+        let key=quest_receipt_public_key(&[7;32]).unwrap();
+        assert!(!verify_public_quest_receipt(&witness,&quest_receipt_public_key(&[6;32]).unwrap()));
+        assert!(!verify_public_quest_receipt(&witness,&[]));
+        let value=serde_json::to_value(&witness).unwrap();
+        for (field,replacement) in [
+            ("protocol",serde_json::json!("other")),("epochId",serde_json::json!("other")),
+            ("receiptId",serde_json::json!(format!("receipt_{}","a".repeat(64)))),
+            ("participantCommitment",serde_json::json!("b".repeat(64))),
+            ("kind",serde_json::json!("PRIVATE_FILL")),("enclaveSequence",serde_json::json!("3")),
+            ("enclaveSequence",serde_json::json!("02")),("enclaveSequence",serde_json::json!("0")),
+            ("enclaveSequence",serde_json::json!("18446744073709551616")),
+            ("stateRoot",serde_json::json!("c".repeat(64))),
+            ("commandCommitment",serde_json::json!("d".repeat(64))),
+        ] {
+            let mut changed=value.clone();changed["payload"][field]=replacement;
+            assert!(!verify_public_quest_receipt(&serde_json::from_value(changed).unwrap(),&key),"{field}");
+        }
+        let mut changed=witness.clone();changed.signature.replace_range(..2,"00");
+        assert!(!verify_public_quest_receipt(&changed,&key));
+        changed=witness.clone();changed.public_key="00".repeat(32);
+        assert!(!verify_public_quest_receipt(&changed,&key));
+        let mut extra=value;extra["payload"]["amount"]=serde_json::json!("5000000");
+        assert!(serde_json::from_value::<PublicQuestReceipt>(extra).is_err());
+        live.requests.get_mut(&(subject.clone(),"bus-deposit".into())).unwrap().1.receipt.signature="00".repeat(32);
+        assert_eq!(live.public_quest_receipt(&subject,&subject,"bus-deposit").unwrap_err(),RuntimeError::StateArtifact);
+    }
+    #[test]
+    fn public_quest_withdrawal_witness_requires_committed_terminal_settlement() {
+        let (mut live,subject,identity,wallet,mut store)=bus_fixture();
+        live.execute_committed(bus_begin(&subject,&identity,&wallet,BUS_ID),&[8;32],&mut store).unwrap();
+        assert_eq!(live.public_quest_receipt(&subject,&subject,BUS_ID).unwrap_err(),RuntimeError::InvalidRequest);
+        let terminal=bus_terminal(&subject,&identity,&wallet,false);
+        let request_id=terminal.request_id.clone();
+        live.execute_committed(terminal,&[8;32],&mut store).unwrap();
+        let witness=live.public_quest_receipt(&subject,&subject,&request_id).unwrap();
+        assert_eq!(witness.payload.kind,QuestReceiptKind::Withdrawal);
+        assert!(verify_public_quest_receipt(&witness,&quest_receipt_public_key(&[7;32]).unwrap()));
+    }
+    fn bus_begin(subject:&str,identity:&str,wallet:&str,id:&str)->DirectRequest {
+        request_for(subject,identity,id,DirectAction::BeginUsdcBusWithdrawal {withdrawal_id:id.into(),destination:wallet.into(),amount_atomic:"4840000".into()})
+    }
+    fn bus_terminal(subject:&str,identity:&str,wallet:&str,reverted:bool)->DirectRequest {
+        let custody=if reverted {format!("horizen-usdc-bus-reverted:0x{}","ef".repeat(32))}
+            else {format!("horizen-usdc-bus:0x{}:0x{}:0x{}:0:1","11".repeat(32),"22".repeat(32),"33".repeat(32))};
+        let action=if reverted {DirectAction::RevertUsdcBusWithdrawal {withdrawal_id:BUS_ID.into(),destination:wallet.into(),amount_atomic:"4840000".into(),custody_reference:custody}}
+            else {DirectAction::SettleUsdcBusWithdrawal {withdrawal_id:BUS_ID.into(),destination:wallet.into(),amount_atomic:"4840000".into(),custody_reference:custody}};
+        request_for(subject,identity,&format!("usdc-bus-{}:{BUS_ID}",if reverted {"revert"} else {"settle"}),action)
+    }
+    #[test]
+    fn usdc_bus_reservation_is_committed_once_and_survives_restart() {
+        let (mut live,subject,identity,wallet,mut store)=bus_fixture();
+        let begin=bus_begin(&subject,&identity,&wallet,BUS_ID);
+        let first=live.execute_committed(begin.clone(),&[8;32],&mut store).unwrap();
+        assert_eq!(first.effect,"WITHDRAWAL_RESERVED");
+        assert_eq!(live.balance(&identity,"USDC","USER_AVAILABLE"),5_160_000);
+        assert_eq!(live.balance(&identity,"USDC","USER_WITHDRAWAL_HOLD"),4_840_000);
+        assert!(live.has_pending_usdc_bus_withdrawals());
+        assert_eq!(live.execute_committed(begin.clone(),&[8;32],&mut store).unwrap(),first);
+        let mut restarted=DirectRuntime::restore_committed(SealedEpoch::load(epoch_path()).unwrap(),RuntimeMode::IsolatedTest,vec![7;32],&[8;32],&store).unwrap();
+        assert!(restarted.has_pending_usdc_bus_withdrawals());assert_eq!(restarted.pending_usdc_bus_withdrawal(&subject,BUS_ID),Some((wallet.clone(),"4840000".into())));
+        assert_eq!(restarted.pending_usdc_bus_withdrawal(&"b".repeat(64),BUS_ID),None);
+        assert_eq!(restarted.execute_committed(begin,&[8;32],&mut store).unwrap(),first);
+    }
+    #[test]
+    fn refused_usdc_bus_request_cannot_become_a_payout_after_funding_or_restart() {
+        let (mut live,subject,identity,wallet,mut store)=bus_fixture_funded("5000000");
+        let refused=request_for(&subject,&identity,BUS_ID,DirectAction::BeginUsdcBusWithdrawal {
+            withdrawal_id:BUS_ID.into(),destination:wallet.clone(),amount_atomic:"5100000".into()});
+        let first=live.execute_committed(refused.clone(),&[8;32],&mut store).unwrap();
+        assert_eq!(first.effect,"WITHDRAWAL_REJECTED");
+        assert_eq!(first.receipt.custody_reference,Some(format!("usdc-bus-rejection:{BUS_ID}:INSUFFICIENT_AVAILABLE")));
+        assert_eq!(live.balance(&identity,"USDC","USER_AVAILABLE"),5_000_000);
+        assert_eq!(live.balance(&identity,"USDC","USER_WITHDRAWAL_HOLD"),0);
+        assert!(!live.has_pending_usdc_bus_withdrawals());
+        let mut deposit=request_for(&subject,&identity,"later-deposit",DirectAction::CreditHorizenUsdcDeposit {
+            amount_atomic:"5000000".into(),custody_reference:format!("horizen-usdc-deposit:0x{}","cd".repeat(32))});
+        deposit.financial_wallet_address=Some(wallet.clone());deposit.request_hash=request_hash(&deposit);
+        live.execute_committed(deposit,&[8;32],&mut store).unwrap();
+        assert_eq!(live.execute_committed(refused.clone(),&[8;32],&mut store).unwrap(),first);
+        let mut restarted=DirectRuntime::restore_committed(SealedEpoch::load(epoch_path()).unwrap(),RuntimeMode::IsolatedTest,vec![7;32],&[8;32],&store).unwrap();
+        assert_eq!(restarted.execute_committed(refused,&[8;32],&mut store).unwrap(),first);
+        assert_eq!(restarted.balance(&identity,"USDC","USER_AVAILABLE"),10_000_000);
+        let next="21111111-2222-4333-8444-555555555555";
+        assert_eq!(restarted.execute_committed(bus_begin(&subject,&identity,&wallet,next),&[8;32],&mut store).unwrap().effect,"WITHDRAWAL_RESERVED");
+    }
+    #[test]
+    fn pending_bus_hold_blocks_another_user_withdrawal_not_other_user_deposits() {
+        let (mut live,subject,identity,wallet,_)=bus_fixture();live.execute(bus_begin(&subject,&identity,&wallet,BUS_ID)).unwrap();
+        let root=live.state_hash();
+        assert_eq!(live.execute(bus_begin(&subject,&identity,&wallet,"21111111-2222-4333-8444-555555555555")).unwrap_err(),RuntimeError::WithdrawalPending);
+        assert_eq!(live.state_hash(),root);
+        let other_subject="b".repeat(64);let other_wallet="0x2222222222222222222222222222222222222222";
+        let other_identity=identity_commitment_for(&other_subject,other_wallet);
+        live.execute(request_for(&other_subject,&other_identity,"other-admit",DirectAction::AdmitIdentity {wallet_address:other_wallet.into()})).unwrap();
+        let mut deposit=request_for(&other_subject,&other_identity,"other-deposit",DirectAction::CreditHorizenUsdcDeposit {
+            amount_atomic:"5000000".into(),custody_reference:format!("horizen-usdc-deposit:0x{}","cd".repeat(32))});
+        deposit.financial_wallet_address=Some(other_wallet.into());deposit.request_hash=request_hash(&deposit);
+        assert_eq!(live.execute(deposit).unwrap().effect,"DEPOSIT_CREDITED");
+        assert_eq!(live.balance(&other_identity,"USDC","USER_AVAILABLE"),5_000_000);
+        assert_eq!(live.balance(&identity,"USDC","USER_WITHDRAWAL_HOLD"),4_840_000);
+    }
+    #[test]
+    fn pending_bus_hold_cannot_be_bypassed_by_an_immediate_base_withdrawal() {
+        let (mut live,subject,identity,wallet,_)=bus_fixture();
+        live.execute(bus_begin(&subject,&identity,&wallet,BUS_ID)).unwrap();let root=live.state_hash();
+        let withdrawal=request_for(&subject,&identity,"different-base-withdrawal",DirectAction::ReserveWithdrawal {
+            destination:wallet,amount_atomic:"5000000".into(),custody_reference:"base-new-custody-proof".into()});
+        assert_eq!(live.execute(withdrawal).unwrap_err(),RuntimeError::WithdrawalPending);
+        assert_eq!(live.state_hash(),root);assert_eq!(live.balance(&identity,"USDC","USER_AVAILABLE"),5_160_000);
+    }
+    #[test]
+    fn thirty_concurrent_requests_cannot_reserve_a_five_usdc_balance_twice() {
+        use std::sync::{Arc,Mutex};
+        let (live,subject,identity,wallet,store)=bus_fixture_funded("5000000");
+        let shared=Arc::new(Mutex::new((live,store)));
+        let begin=|id:&str|request_for(&subject,&identity,id,DirectAction::BeginUsdcBusWithdrawal {
+            withdrawal_id:id.into(),destination:wallet.clone(),amount_atomic:"5000000".into()});
+        let original=begin(BUS_ID);
+        {let mut locked=shared.lock().unwrap();let (live,store)=&mut *locked;live.execute_committed(original.clone(),&[8;32],store).unwrap();}
+        let mut threads=Vec::new();
+        for index in 0..30 {
+            let shared=shared.clone();let repeated=index%2==0;
+            let request=if repeated {original.clone()} else {begin(&format!("{:08x}-2222-4333-8444-555555555555",index+2))};
+            threads.push(std::thread::spawn(move ||{
+                let mut locked=shared.lock().unwrap();let (live,store)=&mut *locked;
+                let result=live.execute_committed(request,&[8;32],store);
+                if repeated {assert_eq!(result.unwrap().effect,"WITHDRAWAL_RESERVED");}else {assert_eq!(result.unwrap_err(),RuntimeError::WithdrawalPending);}
+            }));
+        }
+        for thread in threads {thread.join().unwrap();}
+        let locked=shared.lock().unwrap();let (live,store)=&*locked;
+        assert_eq!(live.balance(&identity,"USDC","USER_AVAILABLE"),0);
+        assert_eq!(live.balance(&identity,"USDC","USER_WITHDRAWAL_HOLD"),5_000_000);
+        let restarted=DirectRuntime::restore_committed(SealedEpoch::load(epoch_path()).unwrap(),RuntimeMode::IsolatedTest,vec![7;32],&[8;32],store).unwrap();
+        assert_eq!(restarted.balance(&identity,"USDC","USER_AVAILABLE"),0);
+        assert_eq!(restarted.balance(&identity,"USDC","USER_WITHDRAWAL_HOLD"),5_000_000);
+    }
+    #[test]
+    fn destination_settlement_consumes_only_the_original_hold_once() {
+        let (mut live,subject,identity,wallet,_)=bus_fixture();live.execute(bus_begin(&subject,&identity,&wallet,BUS_ID)).unwrap();
+        let terminal=bus_terminal(&subject,&identity,&wallet,false);
+        let first=live.execute(terminal.clone()).unwrap();assert_eq!(first.effect,"WITHDRAWAL_SETTLED");
+        assert_eq!(live.balance(&identity,"USDC","USER_AVAILABLE"),5_160_000);
+        assert_eq!(live.balance(&identity,"USDC","USER_WITHDRAWAL_HOLD"),0);
+        assert_eq!(live.balance(&identity,"USDC","USER_SETTLED"),4_840_000);
+        assert!(!live.has_pending_usdc_bus_withdrawals());assert_eq!(live.execute(terminal).unwrap(),first);
+    }
+    #[test]
+    fn verified_pool_revert_releases_hold_once_without_a_payout() {
+        let (mut live,subject,identity,wallet,_)=bus_fixture();live.execute(bus_begin(&subject,&identity,&wallet,BUS_ID)).unwrap();
+        let terminal=bus_terminal(&subject,&identity,&wallet,true);let first=live.execute(terminal.clone()).unwrap();
+        assert_eq!(first.effect,"WITHDRAWAL_REVERTED");assert_eq!(live.balance(&identity,"USDC","USER_AVAILABLE"),10_000_000);
+        assert_eq!(live.balance(&identity,"USDC","USER_WITHDRAWAL_HOLD"),0);assert_eq!(live.balance(&identity,"USDC","USER_SETTLED"),0);
+        assert_eq!(live.execute(terminal).unwrap(),first);
+    }
+    #[test]
+    fn terminal_bus_proof_cannot_change_destination_amount_or_request_identity() {
+        for changed in ["destination","amount","request","proof"] {
+            let (mut live,subject,identity,wallet,_)=bus_fixture();live.execute(bus_begin(&subject,&identity,&wallet,BUS_ID)).unwrap();
+            let root=live.state_hash();let mut terminal=bus_terminal(&subject,&identity,&wallet,false);
+            let DirectAction::SettleUsdcBusWithdrawal {destination,amount_atomic,custody_reference,..}=&mut terminal.action else {unreachable!()};
+            match changed {"destination"=>*destination="0x3333333333333333333333333333333333333333".into(),
+                "amount"=>*amount_atomic="5000000".into(),"request"=>terminal.request_id="other-request".into(),_=>*custody_reference="submitted-but-not-delivered".into()};
+            terminal.request_hash=request_hash(&terminal);assert!(live.execute(terminal).is_err());assert_eq!(live.state_hash(),root);
+        }
+    }
+    #[test]
+    fn bus_delivery_reference_cannot_settle_a_second_hold() {
+        let (mut live,subject,identity,wallet,_)=bus_fixture();live.execute(bus_begin(&subject,&identity,&wallet,BUS_ID)).unwrap();
+        live.execute(bus_terminal(&subject,&identity,&wallet,false)).unwrap();
+        let second="21111111-2222-4333-8444-555555555555";live.execute(bus_begin(&subject,&identity,&wallet,second)).unwrap();
+        let root=live.state_hash();let mut terminal=bus_terminal(&subject,&identity,&wallet,false);
+        let DirectAction::SettleUsdcBusWithdrawal {withdrawal_id,..}=&mut terminal.action else {unreachable!()};*withdrawal_id=second.into();
+        terminal.request_id=format!("usdc-bus-settle:{second}");terminal.request_hash=request_hash(&terminal);
+        assert_eq!(live.execute(terminal).unwrap_err(),RuntimeError::CustodyReferenceReuse);assert_eq!(live.state_hash(),root);
+    }
+    #[test]
+    fn changing_only_one_bus_proof_hash_cannot_reuse_a_pool_release_or_delivery() {
+        for changed in ["pool","guid","destination_transaction"] {
+            let (mut live,subject,identity,wallet,mut store)=bus_fixture();
+            live.execute_committed(bus_begin(&subject,&identity,&wallet,BUS_ID),&[8;32],&mut store).unwrap();
+            live.execute_committed(bus_terminal(&subject,&identity,&wallet,false),&[8;32],&mut store).unwrap();
+            let second="21111111-2222-4333-8444-555555555555";
+            live.execute_committed(bus_begin(&subject,&identity,&wallet,second),&[8;32],&mut store).unwrap();
+            let mut restarted=DirectRuntime::restore_committed(SealedEpoch::load(epoch_path()).unwrap(),RuntimeMode::IsolatedTest,vec![7;32],&[8;32],&store).unwrap();
+            let root=restarted.state_hash();let mut terminal=bus_terminal(&subject,&identity,&wallet,false);
+            let DirectAction::SettleUsdcBusWithdrawal {withdrawal_id,custody_reference,..}=&mut terminal.action else {unreachable!()};
+            *withdrawal_id=second.into();
+            let mut parts=custody_reference.split(':').map(str::to_string).collect::<Vec<_>>();
+            parts[match changed {"pool"=>1,"guid"=>2,_=>3}]=format!("0x{}","44".repeat(32));
+            *custody_reference=parts.join(":");terminal.request_id=format!("usdc-bus-settle:{second}");terminal.request_hash=request_hash(&terminal);
+            assert_eq!(restarted.execute_committed(terminal,&[8;32],&mut store).unwrap_err(),RuntimeError::CustodyReferenceReuse);
+            assert_eq!(restarted.state_hash(),root);assert_eq!(restarted.balance(&identity,"USDC","USER_WITHDRAWAL_HOLD"),4_840_000);
+        }
+    }
+    #[test]
+    fn distinct_seats_can_settle_identical_recipient_amounts_but_not_reuse_an_event_or_seat() {
+        for variant in ["legitimate","same_event","same_seat"] {
+            let (mut live,subject,identity,wallet,_)=bus_fixture();
+            live.execute(bus_begin(&subject,&identity,&wallet,BUS_ID)).unwrap();
+            live.execute(bus_terminal(&subject,&identity,&wallet,false)).unwrap();
+            let second="21111111-2222-4333-8444-555555555555";
+            live.execute(bus_begin(&subject,&identity,&wallet,second)).unwrap();
+            let root=live.state_hash();let mut terminal=bus_terminal(&subject,&identity,&wallet,false);
+            let DirectAction::SettleUsdcBusWithdrawal {withdrawal_id,custody_reference,..}=&mut terminal.action else {unreachable!()};
+            *withdrawal_id=second.into();
+            let mut parts=custody_reference.split(':').map(str::to_string).collect::<Vec<_>>();
+            parts[1]=format!("0x{}","44".repeat(32));
+            parts[4]=if variant=="same_seat" {"0"} else {"1"}.into();
+            parts[5]=if variant=="same_event" {"1"} else {"3"}.into();
+            *custody_reference=parts.join(":");terminal.request_id=format!("usdc-bus-settle:{second}");terminal.request_hash=request_hash(&terminal);
+            if variant=="legitimate" {
+                assert_eq!(live.execute(terminal).unwrap().effect,"WITHDRAWAL_SETTLED");
+                assert_eq!(live.balance(&identity,"USDC","USER_SETTLED"),9_680_000);
+            }else{
+                assert_eq!(live.execute(terminal).unwrap_err(),RuntimeError::CustodyReferenceReuse);assert_eq!(live.state_hash(),root);
+            }
+        }
+    }
+    #[test]
+    fn bus_terminal_references_require_canonical_seat_and_actual_event_index() {
+        let valid=format!("horizen-usdc-bus:0x{}:0x{}:0x{}","11".repeat(32),"22".repeat(32),"33".repeat(32));
+        for suffix in ["",":255:1",":-1:1",":01:1",":0:01",":0:-1",":0:1:extra"] {
+            assert!(!valid_bus_terminal_reference(&format!("{valid}{suffix}"),false));
+        }
+        assert!(valid_bus_terminal_reference(&format!("{valid}:254:0"),false));
+    }
+    #[test]
+    fn every_bus_state_uses_the_predecessor_schema_and_reconstructs_signed_holds() {
+        let (mut live,subject,identity,wallet,_)=bus_fixture();
+        let has_hold_field=|runtime:&DirectRuntime| {
+            let bytes=serde_cbor::to_vec(&runtime.snapshot()).unwrap();
+            let serde_cbor::Value::Map(map)=serde_cbor::from_slice::<serde_cbor::Value>(&bytes).unwrap() else {unreachable!()};
+            map.contains_key(&serde_cbor::Value::Text("usdc_bus_withdrawals".into()))
+        };
+        assert!(!has_hold_field(&live));
+        live.execute(bus_begin(&subject,&identity,&wallet,BUS_ID)).unwrap();
+        assert!(!has_hold_field(&live));
+        let holds=reconstruct_bus_holds(&live.snapshot(),&live.receipt_key).unwrap();
+        assert_eq!(holds.get(BUS_ID).unwrap().destination,wallet);
+        assert_eq!(holds.get(BUS_ID).unwrap().amount_atomic,"4840000");
+        live.execute(bus_terminal(&subject,&identity,&wallet,false)).unwrap();
+        assert!(!has_hold_field(&live));
+        assert!(reconstruct_bus_holds(&live.snapshot(),&live.receipt_key).unwrap().is_empty());
+    }
+    #[test]
+    fn bus_hold_restore_rejects_missing_or_forged_binding_and_unbacked_balance() {
+        let (mut live,subject,identity,wallet,_)=bus_fixture();
+        live.execute(bus_begin(&subject,&identity,&wallet,BUS_ID)).unwrap();
+        for variant in ["missing","signature","destination","amount","balance","terminal"] {
+            let mut state=live.snapshot();
+            if variant=="missing" { state.requests.remove(&(subject.clone(),BUS_ID.into())); }
+            else if variant=="balance" { *state.balances.get_mut(&identity).unwrap().get_mut(&("USDC".into(),"USER_WITHDRAWAL_HOLD".into())).unwrap()+=1; }
+            else if variant=="terminal" {
+                let mut record=state.requests.get(&(subject.clone(),BUS_ID.into())).unwrap().clone();
+                record.1.receipt.request_id=format!("usdc-bus-settle:{BUS_ID}");
+                record.1.receipt.signature=receipt_signature(&live.receipt_key,&record.1.receipt);
+                state.requests.insert((subject.clone(),record.1.receipt.request_id.clone()),record);
+            } else {
+                let receipt=&mut state.requests.get_mut(&(subject.clone(),BUS_ID.into())).unwrap().1.receipt;
+                if variant=="signature" {receipt.signature="0".repeat(64);}
+                if variant=="destination" {receipt.custody_reference=Some(format!("usdc-bus-reservation:{BUS_ID}:not-an-address"));receipt.signature=receipt_signature(&live.receipt_key,receipt);}
+                if variant=="amount" {receipt.amount_atomic=Some("04840000".into());receipt.signature=receipt_signature(&live.receipt_key,receipt);}
+            }
+            assert!(matches!(reconstruct_bus_holds(&state,&live.receipt_key),Err(RuntimeError::StateArtifact)),"{variant}");
+        }
+    }
+    #[test]
+    fn horizen_usdc_credit_requires_the_own_admitted_wallet_minimum_and_unique_proof() {
+        let (mut live,subject,identity,wallet,_)=bus_fixture();
+        for (amount,source,reference) in [("4999999",wallet.as_str(),format!("horizen-usdc-deposit:0x{}","aa".repeat(32))),
+            ("5000000","0x3333333333333333333333333333333333333333",format!("horizen-usdc-deposit:0x{}","aa".repeat(32))),
+            ("5000000",wallet.as_str(),format!("base-deposit:0x{}","aa".repeat(32))),
+            ("5000000",wallet.as_str(),format!("horizen-usdc-deposit:0x{}","ab".repeat(32)))] {
+            let root=live.state_hash();let mut credit=request_for(&subject,&identity,"invalid-credit",DirectAction::CreditHorizenUsdcDeposit {
+                amount_atomic:amount.into(),custody_reference:reference});credit.financial_wallet_address=Some(source.into());credit.request_hash=request_hash(&credit);
+            assert!(live.execute(credit).is_err());assert_eq!(live.state_hash(),root);
+        }
+    }
+    #[test]
+    fn replacement_wallet_links_to_existing_identity_without_resetting_balance_or_history() {
+        let (mut live,subject,identity,wallet,mut store)=bus_fixture();
+        let replacement="0x2222222222222222222222222222222222222222";
+        let before_balance=live.balance(&identity,"USDC","USER_AVAILABLE");let before_count=live.identity_count();
+        let link=request_for(&subject,&identity,"wallet-link-new",DirectAction::LinkFinancialWallet {wallet_address:replacement.into()});
+        let first=live.execute_committed(link.clone(),&[8;32],&mut store).unwrap();
+        assert_eq!(first.effect,"FINANCIAL_WALLET_LINKED");assert_eq!(live.balance(&identity,"USDC","USER_AVAILABLE"),before_balance);
+        assert_eq!(first.receipt.custody_reference,Some(format!("wallet-link:{replacement}")));
+        assert_eq!(live.identity_count(),before_count);assert!(live.subject_wallets[&subject].contains(&wallet));
+        let mut restarted=DirectRuntime::restore_committed(SealedEpoch::load(epoch_path()).unwrap(),RuntimeMode::IsolatedTest,vec![7;32],&[8;32],&store).unwrap();
+        assert!(restarted.subject_wallets[&subject].contains(replacement));assert_eq!(restarted.execute_committed(link,&[8;32],&mut store).unwrap(),first);
+        let mut credit=request_for(&subject,&identity,"replacement-deposit",DirectAction::CreditHorizenUsdcDeposit {
+            amount_atomic:"5000000".into(),custody_reference:format!("horizen-usdc-deposit:0x{}","ee".repeat(32))});
+        credit.financial_wallet_address=Some(replacement.into());credit.request_hash=request_hash(&credit);
+        assert_eq!(restarted.execute_committed(credit,&[8;32],&mut store).unwrap().effect,"DEPOSIT_CREDITED");
+        assert_eq!(restarted.balance(&identity,"USDC","USER_AVAILABLE"),before_balance+5_000_000);
+    }
+    #[test]
+    fn wallet_link_cannot_take_over_another_account_or_change_during_a_pending_withdrawal() {
+        let (mut live,subject,identity,wallet,_)=bus_fixture();
+        let other="b".repeat(64);let other_wallet="0x2222222222222222222222222222222222222222";
+        let other_identity=identity_commitment_for(&other,other_wallet);
+        live.execute(request_for(&other,&other_identity,"other-admit",DirectAction::AdmitIdentity {wallet_address:other_wallet.into()})).unwrap();
+        let before=live.state_hash();assert_eq!(live.execute(request_for(&subject,&identity,"takeover",DirectAction::LinkFinancialWallet {wallet_address:other_wallet.into()})).unwrap_err(),RuntimeError::IdentityAlreadyAdmitted);
+        assert_eq!(live.state_hash(),before);live.execute(bus_begin(&subject,&identity,&wallet,BUS_ID)).unwrap();let before=live.state_hash();
+        assert_eq!(live.execute(request_for(&subject,&identity,"pending-link",DirectAction::LinkFinancialWallet {wallet_address:"0x3333333333333333333333333333333333333333".into()})).unwrap_err(),RuntimeError::WithdrawalPending);
+        assert_eq!(live.state_hash(),before);
     }
     #[test]
     fn finalized_deposit_reference_is_global_exactly_once_and_survives_restart() {
@@ -4354,6 +4919,8 @@ mod tests {
         runtime
             .execute_committed(maker, &[8; 32], &mut store)
             .unwrap();
+        let maker_subject="88fff7d9668cf8b00cd7faa0680d05c6415221e6ab28c5be7fa71e047054d8fc";
+        assert_eq!(runtime.public_quest_receipt(maker_subject,maker_subject,"maker-order-01").unwrap_err(),RuntimeError::InvalidRequest);
         let taker = request_for(
             TAKER_SUBJECT,
             TAKER_IDENTITY,
@@ -4380,6 +4947,15 @@ mod tests {
         assert_eq!(detail.trades[0].executed_quantity_micros, "1000000");
         assert_eq!(detail.trades[0].execution_price_micros, 600_000);
         assert_eq!(detail.trades[0].fee_atomic, "16800");
+        let before_witness=(runtime.committed_state_hash(),runtime.committed_sequence());
+        for participant in [maker_subject,TAKER_SUBJECT] {
+            let witness=runtime.public_quest_receipt(participant,TAKER_SUBJECT,"taker-order-01").unwrap();
+            assert_eq!(witness.payload.kind,QuestReceiptKind::PrivateFill);
+            assert!(verify_public_quest_receipt(&witness,&quest_receipt_public_key(&[7;32]).unwrap()));
+        }
+        assert_eq!(before_witness,(runtime.committed_state_hash(),runtime.committed_sequence()));
+        let mut wrong_asset=runtime.clone();wrong_asset.markets.get_mut(MARKET).unwrap().settlement_asset="ZEN".into();
+        assert_eq!(wrong_asset.public_quest_receipt(TAKER_SUBJECT,TAKER_SUBJECT,"taker-order-01").unwrap_err(),RuntimeError::InvalidRequest);
         assert_eq!(
             runtime.total_position(&(MAKER_IDENTITY.into(), MARKET.into(), Outcome::Up)),
             1_000_000
