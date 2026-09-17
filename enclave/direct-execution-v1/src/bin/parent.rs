@@ -260,10 +260,7 @@ impl PrivyBaseCustodyAdapter {
     async fn observe_terminal_only(&self, intent: &ExternalEffectIntent) -> Result<ExternalEffectRecovery, String> {
         self.validate_intent(intent)?;
         let outcome = intent.recovery_action(now_unix(), self.observe(intent).await?);
-        match outcome {
-            terminal @ (ExternalEffectRecovery::BindFinalized { .. } | ExternalEffectRecovery::BindReverted { .. }) => Ok(terminal),
-            _ => Err("historical custody effect is not authoritatively terminal".into()),
-        }
+        observed_terminal_recovery(outcome)
     }
 
     fn validate_intent(&self, intent: &ExternalEffectIntent) -> Result<(), String> {
@@ -651,12 +648,30 @@ impl PrivyBaseCustodyAdapter {
             .json()
             .await
             .map_err(|_| "Relay request lookup malformed")?;
-        classify_relay_destination_finality(
+        let forwarding = if relay_hashes(status.get("inTxHashes"))
+            .iter().any(|hash| hash.eq_ignore_ascii_case(&intake_transaction_hash)) {
+            None
+        } else if let Some(hash) = relay_forwarding_candidate(intent, &self.pool_address, &intake_transaction_hash, &status, &details) {
+            // GET/RPC observation only. Never submit or repeat either transfer.
+            let deposit_receipt = self.rpc("eth_getTransactionReceipt", json!([intake_transaction_hash])).await?;
+            let deposit_number = deposit_receipt.get("blockNumber").and_then(Value::as_str).ok_or("Relay deposit receipt pending")?;
+            let deposit_block = self.rpc("eth_getBlockByNumber", json!([deposit_number, false])).await?;
+            let receipt = self.rpc("eth_getTransactionReceipt", json!([hash])).await?;
+            let block_number = receipt.get("blockNumber").and_then(Value::as_str).ok_or("Relay forwarding receipt pending")?;
+            let block = self.rpc("eth_getBlockByNumber", json!([block_number, false])).await?;
+            let head = self.rpc("eth_blockNumber", json!([])).await?.as_str().and_then(parse_quantity).ok_or("Base head malformed")?;
+            if !relay_forwarding_is_canonical(intent, &self.pool_address, &intake_transaction_hash, &hash, &deposit_receipt, &deposit_block, &receipt, &block, head, self.confirmations) {
+                return Ok(layrs_direct_execution_v1::ExternalEffectObservation::Conflict);
+            }
+            Some(VerifiedRelayForwarding { deposit_hash: intake_transaction_hash.clone(), forwarding_hash: hash })
+        } else { None };
+        classify_relay_destination_finality_with_forwarding(
             intent,
             provider_transaction_id,
             intake_transaction_hash,
             &status,
             &details,
+            forwarding.as_ref(),
         )
     }
 
@@ -782,12 +797,95 @@ impl PrivyBaseCustodyAdapter {
     }
 }
 
+#[cfg(test)]
 fn classify_relay_destination_finality(
     intent: &ExternalEffectIntent,
     provider_transaction_id: String,
     intake_transaction_hash: String,
     status: &Value,
     details: &Value,
+) -> Result<layrs_direct_execution_v1::ExternalEffectObservation, String> {
+    classify_relay_destination_finality_with_forwarding(intent, provider_transaction_id, intake_transaction_hash, status, details, None)
+}
+
+/// Constructed only after canonical Base forwarding verification. It does not
+/// replace the original custody hash in the immutable intent or ledger result.
+struct VerifiedRelayForwarding { deposit_hash: String, forwarding_hash: String }
+
+fn relay_forwarding_candidate(intent: &ExternalEffectIntent, pool_address: &str, deposit_hash: &str, status: &Value, details: &Value) -> Option<String> {
+    let relay = intent.relay.as_ref()?;
+    if status.get("status")?.as_str()? != "success" { return None; }
+    let requests = details.get("requests")?.as_array()?;
+    if requests.len() != 1 { return None; }
+    let request = &requests[0];
+    let deposit = request.get("depositAddress")?;
+    if request.get("id")?.as_str()? != relay.request_id
+        || deposit.get("type")?.as_str()? != "strict"
+        || !deposit.get("address")?.as_str()?.eq_ignore_ascii_case(&relay.deposit_address)
+        || !deposit.get("depositor")?.as_str()?.eq_ignore_ascii_case(pool_address)
+        || !deposit.get("depositTxHash")?.as_str()?.eq_ignore_ascii_case(deposit_hash) { return None; }
+    let hashes = relay_hashes(status.get("inTxHashes"));
+    if hashes.len() != 1 || !valid_transaction_hash(&hashes[0]) || hashes[0].eq_ignore_ascii_case(deposit_hash)
+        || !relay_request_has_intake(request, &hashes[0]) { return None; }
+    Some(hashes[0].clone())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn relay_forwarding_is_canonical(intent: &ExternalEffectIntent, pool: &str, deposit_hash: &str, hash: &str, deposit_receipt: &Value, deposit_block: &Value, receipt: &Value, block: &Value, head: u128, confirmations: u64) -> bool {
+    let Some(relay) = intent.relay.as_ref() else { return false; };
+    let Some(amount) = intent.amount_atomic.parse::<u128>().ok().filter(|n| *n > 0) else { return false; };
+    let number = receipt.get("blockNumber").and_then(Value::as_str).and_then(parse_quantity);
+    let deposit_number = deposit_receipt.get("blockNumber").and_then(Value::as_str).and_then(parse_quantity);
+    if receipt.get("status").and_then(Value::as_str) != Some("0x1")
+        || !receipt.get("transactionHash").and_then(Value::as_str).is_some_and(|h| h.eq_ignore_ascii_case(hash))
+        || receipt.get("blockHash").and_then(Value::as_str).is_none()
+        || receipt.get("blockHash") != block.get("hash")
+        || number.is_none() || number != block.get("number").and_then(Value::as_str).and_then(parse_quantity)
+        || deposit_receipt.get("status").and_then(Value::as_str) != Some("0x1")
+        || !deposit_receipt.get("transactionHash").and_then(Value::as_str).is_some_and(|h| h.eq_ignore_ascii_case(deposit_hash))
+        || !deposit_receipt.get("blockHash").and_then(Value::as_str).is_some_and(valid_transaction_hash)
+        || deposit_receipt.get("blockHash") != deposit_block.get("hash")
+        || deposit_number != deposit_block.get("number").and_then(Value::as_str).and_then(parse_quantity)
+        || deposit_number.is_none() || deposit_number > number
+        || head.checked_sub(number.unwrap()).and_then(|n| n.checked_add(1)).unwrap_or(0) < u128::from(confirmations.max(1)) { return false; }
+    // Prove the original pool payment as well as forwarding. Provider metadata
+    // cannot substitute another payment or a deposit orphaned by a reorg.
+    let pool_topic = address_topic(pool);
+    let sender = address_topic(&relay.deposit_address);
+    let deposits = deposit_receipt.get("logs").and_then(Value::as_array).into_iter().flatten().filter(|log| {
+        log.get("removed").and_then(Value::as_bool) != Some(true)
+            && log.get("address").and_then(Value::as_str).is_some_and(|a| a.eq_ignore_ascii_case(BASE_USDC_ADDRESS))
+            && log.get("transactionHash").and_then(Value::as_str).is_some_and(|h| h.eq_ignore_ascii_case(deposit_hash))
+            && log.get("blockHash") == deposit_receipt.get("blockHash")
+            && log.get("topics").and_then(Value::as_array).is_some_and(|t| t.len() == 3
+                && t[0].as_str().is_some_and(|v| v.eq_ignore_ascii_case(ERC20_TRANSFER_TOPIC))
+                && t[1].as_str().is_some_and(|v| v.eq_ignore_ascii_case(&pool_topic))
+                && t[2].as_str().is_some_and(|v| v.eq_ignore_ascii_case(&sender)))
+            && log.get("data").and_then(Value::as_str).and_then(parse_quantity) == Some(amount)
+    }).count();
+    if deposits != 1 { return false; }
+    let matching = receipt.get("logs").and_then(Value::as_array).into_iter().flatten().filter(|log| {
+        log.get("removed").and_then(Value::as_bool) != Some(true)
+            && log.get("address").and_then(Value::as_str).is_some_and(|a| a.eq_ignore_ascii_case(BASE_USDC_ADDRESS))
+            && log.get("transactionHash").and_then(Value::as_str).is_some_and(|h| h.eq_ignore_ascii_case(hash))
+            && log.get("blockHash") == receipt.get("blockHash")
+            && log.get("topics").and_then(Value::as_array).is_some_and(|t| t.len() == 3
+                && t[0].as_str().is_some_and(|v| v.eq_ignore_ascii_case(ERC20_TRANSFER_TOPIC))
+                && t[1].as_str().is_some_and(|v| v.eq_ignore_ascii_case(&sender))
+                && t[2].as_str().is_some_and(|v| v.len() == 66 && v.starts_with("0x") && v[2..].bytes().all(|b| b.is_ascii_hexdigit())
+                    && !v.eq_ignore_ascii_case(&sender) && !v.eq_ignore_ascii_case(&format!("0x{}", "00".repeat(32)))))
+            && log.get("data").and_then(Value::as_str).and_then(parse_quantity) == Some(amount)
+    }).count();
+    matching == 1
+}
+
+fn classify_relay_destination_finality_with_forwarding(
+    intent: &ExternalEffectIntent,
+    provider_transaction_id: String,
+    intake_transaction_hash: String,
+    status: &Value,
+    details: &Value,
+    forwarding: Option<&VerifiedRelayForwarding>,
 ) -> Result<layrs_direct_execution_v1::ExternalEffectObservation, String> {
     let relay = intent
         .relay
@@ -816,10 +914,13 @@ fn classify_relay_destination_finality(
         return Ok(layrs_direct_execution_v1::ExternalEffectObservation::Conflict);
     }
     let status_intake_hashes = relay_hashes(status.get("inTxHashes"));
+    let forwarded = forwarding.is_some_and(|proof| proof.deposit_hash.eq_ignore_ascii_case(&intake_transaction_hash)
+        && status_intake_hashes.len() == 1 && status_intake_hashes[0].eq_ignore_ascii_case(&proof.forwarding_hash));
     if !status_intake_hashes.is_empty()
         && !status_intake_hashes
             .iter()
             .any(|hash| hash.eq_ignore_ascii_case(&intake_transaction_hash))
+        && !forwarded
     {
         return Ok(layrs_direct_execution_v1::ExternalEffectObservation::Conflict);
     }
@@ -856,7 +957,10 @@ fn classify_relay_destination_finality(
             .and_then(Value::as_str)
             .is_none_or(|address| !address.eq_ignore_ascii_case(&relay.deposit_address))
         || !relay_route_quote_matches(request, relay, &intent.amount_atomic)
-        || !relay_request_has_intake(request, &intake_transaction_hash)
+        || !(relay_request_has_intake(request, &intake_transaction_hash)
+            || forwarded && forwarding.is_some_and(|proof| request.pointer("/depositAddress/depositTxHash").and_then(Value::as_str)
+                .is_some_and(|h| h.eq_ignore_ascii_case(&proof.deposit_hash))
+                && relay_request_has_intake(request, &proof.forwarding_hash)))
     {
         return Ok(layrs_direct_execution_v1::ExternalEffectObservation::Conflict);
     }
@@ -2803,7 +2907,10 @@ async fn prepare_external_withdrawal(
         })
         .cloned()
     {
-        match custody.settle(&existing, now_unix()).await.map_err(|_| {
+        let outcome = if existing.relay.is_some() {
+            custody.observe_terminal_only(&existing).await
+        } else { custody.settle(&existing, now_unix()).await };
+        match outcome.map_err(|_| {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "CUSTODY_FINALITY_UNAVAILABLE",
@@ -2826,6 +2933,7 @@ async fn prepare_external_withdrawal(
             }
         }
     }
+    validate_new_withdrawal_route(relay_route.as_ref())?;
     if !state.unresolved_external_effects.lock().await.is_empty() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -4048,7 +4156,7 @@ fn start_base_withdrawal_observer(state: AppState) {
             if state.unresolved_external_effects.lock().await.is_empty() { continue; }
             let _guard = state.financial_gate.lock().await;
             let pending: Vec<_> = state.unresolved_external_effects.lock().await.values()
-                .filter(|i| i.chain == "base" && i.asset == "USDC" && i.relay.is_none())
+                .filter(|i| base_withdrawal_observation_supported(i))
                 .cloned().collect();
             for intent in pending {
                 if reconcile_observed_base_withdrawal(&state, &intent).await.is_err() {
@@ -4058,6 +4166,31 @@ fn start_base_withdrawal_observer(state: AppState) {
             }
         }
     });
+}
+
+fn base_withdrawal_observation_supported(intent: &ExternalEffectIntent) -> bool {
+    // Relay intake is a Base pool effect too. Excluding it left the global
+    // fence stuck after a delayed destination result, until owner retry/boot.
+    intent.chain == "base" && intent.asset == "USDC"
+}
+
+fn validate_new_withdrawal_route(relay: Option<&RelayWithdrawalBinding>) -> Result<(), (StatusCode, &'static str)> {
+    // Loading the existing provider credential for historical observation must
+    // not reopen the retired route. Original intent recovery/replay precedes
+    // this guard; no fresh Relay quote, intent, nonce or payout is permitted.
+    if relay.is_some() { return Err((StatusCode::GONE, "RELAY_ROUTE_RETIRED")); }
+    Ok(())
+}
+
+fn observed_terminal_recovery(outcome: ExternalEffectRecovery) -> Result<ExternalEffectRecovery, String> {
+    match outcome {
+        terminal @ (ExternalEffectRecovery::BindFinalized { .. } | ExternalEffectRecovery::BindReverted { .. }
+            | ExternalEffectRecovery::BindRelayFinalized { .. }) => Ok(terminal),
+        // A provider refund/failure label does not prove that paid principal
+        // was returned or exclude late delivery. Retired Relay recovery must
+        // remain fenced until independently certified refund evidence exists.
+        _ => Err("historical custody effect is not authoritatively terminal".into()),
+    }
 }
 
 async fn reconcile_observed_base_withdrawal(state: &AppState, intent: &ExternalEffectIntent) -> io::Result<()> {
@@ -4138,8 +4271,9 @@ async fn recover_external_effect_intents(state: &AppState) -> io::Result<()> {
                 "unresolved external-effect intent does not match committed lineage",
             ));
         }
-        let settled = if historical {
-            // This branch cannot rebroadcast, even inside an old provider
+        let settled = if historical || intent.relay.is_some() {
+            // Retired Relay observation, including an intent at the current
+            // tip, cannot rebroadcast, even inside an old provider
             // idempotency window. Only an existing canonical result can bind.
             match &state.custody {Some(custody)=>Some(custody.observe_terminal_only(&intent).await),None=>None}
         } else if intent.asset == "ZEN" {
@@ -4893,6 +5027,179 @@ mod tests {
             }
         }]});
         (status, details, intake, destination)
+    }
+
+    fn relay_forwarding_fixture() -> (ExternalEffectIntent, Value, Value, String, String, Value, Value, Value) {
+        let intent = relay_intent();
+        let (mut status, mut details, deposit_hash, _) = relay_success_evidence(&intent);
+        let hash = format!("0x{}", "77".repeat(32));
+        status["inTxHashes"] = json!([hash]);
+        details["requests"][0]["depositAddress"]["depositor"] = json!("0x1111111111111111111111111111111111111111");
+        details["requests"][0]["depositAddress"]["depositTxHash"] = json!(deposit_hash);
+        details["requests"][0]["data"]["inTxs"][0]["txHash"] = json!(hash);
+        let block_hash = format!("0x{}", "88".repeat(32));
+        let block = json!({"hash":block_hash,"number":"0x66"});
+        let deposit_block_hash = format!("0x{}", "aa".repeat(32));
+        let deposit = json!({"status":"0x1","transactionHash":deposit_hash,"blockHash":deposit_block_hash,"blockNumber":"0x64","logs":[{
+            "address":BASE_USDC_ADDRESS,"transactionHash":deposit_hash,"blockHash":deposit_block_hash,"removed":false,
+            "topics":[ERC20_TRANSFER_TOPIC,address_topic("0x1111111111111111111111111111111111111111"),address_topic(&intent.relay.as_ref().unwrap().deposit_address)],
+            "data":quantity(5_000_000)
+        }]});
+        let receipt = json!({"status":"0x1","transactionHash":hash,"blockHash":block_hash,"blockNumber":"0x66","logs":[{
+            "address":BASE_USDC_ADDRESS,"transactionHash":hash,"blockHash":block_hash,"removed":false,
+            "topics":[ERC20_TRANSFER_TOPIC,address_topic(&intent.relay.as_ref().unwrap().deposit_address),address_topic("0x9999999999999999999999999999999999999999")],
+            "data":quantity(5_000_000)
+        }]});
+        (intent,status,details,deposit_hash,hash,deposit,receipt,block)
+    }
+
+    fn forwarding_fixture_is_canonical(intent: &ExternalEffectIntent, hash: &str, deposit: &Value, receipt: &Value, block: &Value, head: u128) -> bool {
+        let deposit_block = json!({"hash":format!("0x{}", "aa".repeat(32)),"number":"0x64"});
+        let original = format!("0x{}", "55".repeat(32));
+        relay_forwarding_is_canonical(intent,"0x1111111111111111111111111111111111111111",&original,hash,deposit,&deposit_block,receipt,block,head,20)
+    }
+
+    #[test]
+    fn relay_forwarded_deposit_binds_original_payout_and_terminal_result() {
+        let (intent,status,details,deposit_hash,hash,deposit,receipt,block) = relay_forwarding_fixture();
+        let pool = "0x1111111111111111111111111111111111111111";
+        assert_eq!(relay_forwarding_candidate(&intent,pool,&deposit_hash,&status,&details),Some(hash.clone()));
+        assert!(forwarding_fixture_is_canonical(&intent,&hash,&deposit,&receipt,&block,121));
+        // Provider metadata alone must never enable the alternate intake hash.
+        assert_eq!(classify_relay_destination_finality(&intent,"provider".into(),deposit_hash.clone(),&status,&details).unwrap(),layrs_direct_execution_v1::ExternalEffectObservation::Conflict);
+        let proof = VerifiedRelayForwarding {deposit_hash:deposit_hash.clone(),forwarding_hash:hash};
+        let observation = classify_relay_destination_finality_with_forwarding(&intent,"provider".into(),deposit_hash.clone(),&status,&details,Some(&proof)).unwrap();
+        let terminal = intent.recovery_action(200,observation);
+        let first = request_for_external_effect(&intent,terminal.clone()).unwrap();
+        assert_eq!(first,request_for_external_effect(&intent,terminal).unwrap());
+        assert_eq!(first.request_hash,intent.request_hash);
+        assert!(matches!(first.action,DirectAction::SettleRelayWithdrawal {custody_reference,..} if custody_reference.contains(&deposit_hash) && !custody_reference.contains(&proof.forwarding_hash)));
+    }
+
+    #[test]
+    fn relay_forwarding_metadata_substitution_and_ambiguous_hashes_fail_closed() {
+        let (intent,status,details,deposit_hash,_,_,_,_) = relay_forwarding_fixture();
+        let pool = "0x1111111111111111111111111111111111111111";
+        for key in ["address","depositor","depositTxHash","type"] {
+            let mut changed = details.clone();
+            changed["requests"][0]["depositAddress"][key] = json!("substitution");
+            assert!(relay_forwarding_candidate(&intent,pool,&deposit_hash,&status,&changed).is_none(),"{key}");
+        }
+        let mut changed = status.clone();changed["inTxHashes"] = json!([format!("0x{}","77".repeat(32)),format!("0x{}","99".repeat(32))]);
+        assert!(relay_forwarding_candidate(&intent,pool,&deposit_hash,&changed,&details).is_none());
+        let mut changed = details.clone();changed["requests"][0]["data"]["inTxs"][0]["chainId"] = json!(42161);
+        assert!(relay_forwarding_candidate(&intent,pool,&deposit_hash,&status,&changed).is_none());
+    }
+
+    #[test]
+    fn relay_forwarding_reorg_wrong_token_sender_amount_and_unfinalized_fail_closed() {
+        let (intent,_,_,_,hash,deposit,receipt,block) = relay_forwarding_fixture();
+        for field in ["status","transactionHash","blockHash","blockNumber"] {
+            let mut changed = receipt.clone();changed[field] = json!("0x0");
+            assert!(!forwarding_fixture_is_canonical(&intent,&hash,&deposit,&changed,&block,121),"{field}");
+        }
+        for field in ["address","transactionHash","blockHash","data"] {
+            let mut changed = receipt.clone();changed["logs"][0][field] = json!("0x0");
+            assert!(!forwarding_fixture_is_canonical(&intent,&hash,&deposit,&changed,&block,121),"log {field}");
+        }
+        let mut changed = receipt.clone();changed["logs"][0]["removed"] = json!(true);
+        assert!(!forwarding_fixture_is_canonical(&intent,&hash,&deposit,&changed,&block,121));
+        let mut changed = receipt.clone();changed["logs"][0]["topics"][1] = json!(address_topic("0x9999999999999999999999999999999999999999"));
+        assert!(!forwarding_fixture_is_canonical(&intent,&hash,&deposit,&changed,&block,121));
+        let mut changed = receipt.clone();changed["logs"].as_array_mut().unwrap().push(receipt["logs"][0].clone());
+        assert!(!forwarding_fixture_is_canonical(&intent,&hash,&deposit,&changed,&block,121));
+        assert!(!forwarding_fixture_is_canonical(&intent,&hash,&deposit,&receipt,&block,120));
+        let mut changed = deposit.clone();changed["blockNumber"] = json!("0x67");
+        assert!(!forwarding_fixture_is_canonical(&intent,&hash,&changed,&receipt,&block,121));
+        for field in ["status","transactionHash","blockHash","blockNumber"] {
+            let mut changed = deposit.clone();changed[field] = json!("0x0");
+            assert!(!forwarding_fixture_is_canonical(&intent,&hash,&changed,&receipt,&block,121),"deposit {field}");
+        }
+        for field in ["address","transactionHash","blockHash","data"] {
+            let mut changed = deposit.clone();changed["logs"][0][field] = json!("0x0");
+            assert!(!forwarding_fixture_is_canonical(&intent,&hash,&changed,&receipt,&block,121),"deposit log {field}");
+        }
+    }
+
+    #[test]
+    fn relay_pending_intents_remain_in_background_observation_without_broadcast() {
+        let mut intent = relay_intent();
+        assert!(base_withdrawal_observation_supported(&intent));
+        intent.relay = None;
+        assert!(base_withdrawal_observation_supported(&intent));
+        intent.chain = "horizen".into();
+        assert!(!base_withdrawal_observation_supported(&intent));
+        intent.chain = "base".into();intent.asset = "ZEN".into();
+        assert!(!base_withdrawal_observation_supported(&intent));
+    }
+
+    #[tokio::test]
+    async fn forwarded_relay_transport_only_reads_original_bound_chain_and_provider_evidence() {
+        let (intent,status,details,deposit_hash,hash,deposit,receipt,block) = relay_forwarding_fixture();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let observed = Arc::new(Mutex::new(Vec::<String>::new()));
+        let calls = observed.clone();
+        let original = deposit_hash.clone();
+        let forward = hash.clone();
+        let reference = intent.external_effect_reference.clone();
+        let provider_record = json!({"data":[{"id":"provider","wallet_id":intent.provider_wallet_id,"caip2":"eip155:8453","reference_id":reference,"status":"confirmed","transaction_hash":deposit_hash,"sponsored":false}]});
+        let calldata = pool_withdraw_calldata(&intent.destination,&intent.amount_atomic).unwrap();
+        let app = Router::new()
+            .route("/v1/transactions",get(move |Query(query):Query<BTreeMap<String,String>>| {let v=provider_record.clone();let reference=reference.clone();async move {assert_eq!(query.get("reference_id"),Some(&reference));Json(v)}}))
+            .route("/intents/status/v3",get(move || { let v=status.clone();async move {Json(v)} }))
+            .route("/requests/v3",get(move || {let v=details.clone();async move {Json(v)} }))
+            .route("/rpc",post(move |Json(body):Json<Value>| {
+                let calls=calls.clone();let original=original.clone();let forward=forward.clone();
+                let deposit=deposit.clone();let receipt=receipt.clone();let block=block.clone();
+                let calldata=calldata.clone();
+                async move {
+                    let method=body["method"].as_str().unwrap().to_string();
+                    calls.lock().await.push(method.clone());
+                    let value=match method.as_str() {
+                        "eth_getTransactionByHash" if body["params"][0] == original => json!({"from":"0x4444444444444444444444444444444444444444","to":"0x1111111111111111111111111111111111111111","input":calldata}),
+                        "eth_getTransactionReceipt" if body["params"][0] == original => deposit,
+                        "eth_getTransactionReceipt" if body["params"][0] == forward => receipt,
+                        "eth_getBlockByNumber" if body["params"][0] == "0x64" => json!({"hash":format!("0x{}","aa".repeat(32)),"number":"0x64"}),
+                        "eth_getBlockByNumber" if body["params"][0] == "0x66" => block,
+                        "eth_blockNumber" => json!(quantity(121)),
+                        _ => panic!("unexpected financial submission or substituted chain reference"),
+                    };
+                    Json(json!({"jsonrpc":"2.0","id":body["id"],"result":value}))
+                }
+            }));
+        let server=tokio::spawn(async move {axum::serve(listener,app).await.unwrap()});
+        let custody=PrivyBaseCustodyAdapter {
+            client:reqwest::Client::builder().timeout(Duration::from_secs(2)).build().unwrap(),
+            app_id:"synthetic".into(),app_secret:"synthetic".into(),wallet_id:intent.provider_wallet_id.clone(),
+            wallet_address:"0x4444444444444444444444444444444444444444".into(),authorization_key_pem:"unused".into(),
+            rpc_url:format!("http://{address}/rpc"),pool_address:intent.custody_target.clone(),
+            confirmations:20,api_base_url:format!("http://{address}"),relay_api_key:Some("synthetic".into()),relay_api_base_url:format!("http://{address}"),
+        };
+        for _ in 0..2 {
+            let terminal=custody.observe_terminal_only(&intent).await.unwrap();
+            assert!(matches!(terminal,ExternalEffectRecovery::BindRelayFinalized {..}));
+            let request=request_for_external_effect(&intent,terminal).unwrap();
+            assert_eq!(request.request_hash,intent.request_hash);
+            assert!(matches!(request.action,DirectAction::SettleRelayWithdrawal {custody_reference,..} if custody_reference.contains(&deposit_hash) && !custody_reference.contains(&hash)));
+        }
+        assert_eq!(*observed.lock().await,vec!["eth_getTransactionByHash","eth_getTransactionReceipt","eth_blockNumber","eth_getTransactionReceipt","eth_getBlockByNumber","eth_getTransactionReceipt","eth_getBlockByNumber","eth_blockNumber"].repeat(2));
+        server.abort();
+    }
+
+    #[test]
+    fn historical_observation_does_not_reopen_new_relay_withdrawals() {
+        assert!(validate_new_withdrawal_route(None).is_ok());
+        assert_eq!(validate_new_withdrawal_route(Some(&relay_binding())),Err((StatusCode::GONE,"RELAY_ROUTE_RETIRED")));
+    }
+
+    #[test]
+    fn retired_relay_unknown_or_unproven_refund_never_releases_the_fence() {
+        for outcome in [ExternalEffectRecovery::SubmitWithStableReference,ExternalEffectRecovery::AwaitExternalFinality,ExternalEffectRecovery::FailClosed,
+            ExternalEffectRecovery::BindRelayReverted {provider_transaction_id:"provider".into(),intake_transaction_hash:format!("0x{}","55".repeat(32)),relay_request_id:relay_binding().request_id,terminal_status:"refund".into(),result_hash:"aa".repeat(32)}] {
+            assert!(observed_terminal_recovery(outcome).is_err());
+        }
+        assert!(observed_terminal_recovery(ExternalEffectRecovery::BindReverted {provider_transaction_id:"provider".into(),transaction_hash:format!("0x{}","55".repeat(32))}).is_ok());
     }
 
     #[test]

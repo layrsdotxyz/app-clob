@@ -25,6 +25,8 @@ Parameters:
   DatabaseName: { Type: String, Default: layrsv2 }
   DatabasePort: { Type: Number, Default: 5432 }
   RpcSecretArn: { Type: String }
+  # Read-only historical reconciliation; never enables a fresh Relay route.
+  RelayObservationSecretArn: { Type: String, Default: '' }
   OperationalIdentityKmsKeyArn: { Type: String }
   ExecutionMode:
     Type: String
@@ -71,6 +73,7 @@ Rules:
         AssertDescription: P1 requires the production writer, exact RPC secret, custody address and public link authority.
 Conditions:
   FinancialWriterEnabled: !Equals [!Ref ExecutionMode, production-enabled]
+  RelayObservationConfigured: !Not [!Equals [!Ref RelayObservationSecretArn, '']]
   UsdcCustodyActive: !Equals [!Ref UsdcCustodyEnabled, 'true']
 Resources:
   RuntimeLogGroup:
@@ -140,6 +143,7 @@ Resources:
                   - !Ref DatabaseSecretArn
                   - !Ref DatabaseCaSecretArn
                   - !Ref RpcSecretArn
+                  - !If [RelayObservationConfigured, !Ref RelayObservationSecretArn, !Ref 'AWS::NoValue']
                   - !If [UsdcCustodyActive, !Ref UsdcRpcSecretArn, !Ref 'AWS::NoValue']
               - Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
@@ -274,6 +278,9 @@ Resources:
                     "LAYRS_DIRECT_APPROVED_RUNTIME_BINDING_JSON": runtime_binding,
                 })
             if "${ExecutionMode}" == "production-enabled":
+                if "${RelayObservationSecretArn}":
+                    relay_observation = secret("${RelayObservationSecretArn}")
+                    values["LAYRSV2_RELAY_API_KEY"] = required(relay_observation, "apiKey")
                 values.update({
                     "LAYRS_DIRECT_CUSTODY_PROVIDER": "privy-base-existing-pool-ledger",
                     "LAYRSV2_BASE_POOL_LEDGER_PRIVY_ADDRESS": required(runtime, "basePoolLedgerPrivyAddress"),
