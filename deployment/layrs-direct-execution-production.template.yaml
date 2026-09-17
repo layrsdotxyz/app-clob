@@ -374,6 +374,8 @@ Resources:
       TargetType: instance
       Protocol: TCP
       Port: 8443
+      TargetGroupAttributes:
+        - { Key: load_balancing.cross_zone.enabled, Value: 'true' }
       HealthCheckProtocol: TCP
       HealthCheckPort: '8443'
       HealthyThresholdCount: 3
