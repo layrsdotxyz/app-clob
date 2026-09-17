@@ -140,6 +140,8 @@ struct S3ImmutableArtifactStore {
     // Receipt-only cache built after full encrypted-chain verification. It is
     // never a state-restore input and never contains private ledger plaintext.
     verified_receipt_records: Arc<Mutex<Option<Vec<DirectStateArtifact>>>>,
+    verified_artifact_hashes: Arc<Mutex<Vec<String>>>,
+    checkpoint_refresh_gate: Arc<Mutex<()>>,
 }
 
 /// Direct, synchronous adapter for the existing Base pool-ledger Privy
@@ -1585,7 +1587,51 @@ fn receipt_only_record(artifact:&DirectStateArtifact)->DirectStateArtifact {
     record
 }
 
+/// The checkpoint must cover an exact prefix of the independently listed,
+/// immutable artifact AND head namespaces. A stale checkpoint is valid only
+/// when every later successor is subsequently verified; it is not the tip.
+fn validate_checkpoint_archive(checkpoint: &layrs_direct_execution_v1::DirectCheckpoint, keys: &[String], heads: &[String], prefix: &str) -> Result<usize, String> {
+    let sequence = usize::try_from(checkpoint.artifact.sequence).map_err(|_| "checkpoint sequence overflow")?;
+    if sequence == 0 || sequence > keys.len() || keys.len() != heads.len()
+        || checkpoint.receipt_records.len() != sequence {
+        return Err("checkpoint frontier outside immutable archive".into());
+    }
+    for (index, record) in checkpoint.receipt_records.iter().enumerate() {
+        if record.sequence != index as u64 + 1
+            || checkpoint.artifact_hashes.len() != sequence
+            || keys[index] != format!("{prefix}/artifacts/{:020}-{}.cbor", record.sequence, checkpoint.artifact_hashes[index])
+            || heads[index] != format!("{prefix}/heads/{:020}-{}.cbor", record.sequence, checkpoint.artifact_hashes[index]) {
+            return Err("checkpoint prefix differs from immutable archive".into());
+        }
+    }
+    if receipt_only_record(&checkpoint.artifact) != *checkpoint.receipt_records.last().ok_or("checkpoint head missing")? {
+        return Err("checkpoint terminal head mismatch".into());
+    }
+    Ok(sequence)
+}
+
 impl S3ImmutableArtifactStore {
+    fn checkpoint_key(&self, checkpoint: &layrs_direct_execution_v1::DirectCheckpoint) -> Result<String, String> {
+        let bytes = serde_cbor::to_vec(checkpoint).map_err(|_| "checkpoint encoding failed")?;
+        Ok(format!("{}/checkpoints/{:020}-{}-{}.cbor", self.prefix, checkpoint.artifact.sequence, checkpoint.artifact.state_hash, sha256(&bytes)))
+    }
+    async fn seal_current_checkpoint(&self, state: &AppState) -> Result<(), String> {
+        let records = self.load_committed().await?;
+        let Some(head) = records.last() else { return Ok(()); };
+        let artifact_hashes = self.verified_artifact_hashes.lock().await.clone();
+        let hash = artifact_hashes.last().ok_or("checkpoint archive hashes missing")?;
+        let key = format!("{}/artifacts/{:020}-{hash}.cbor", self.prefix, head.sequence);
+        let artifact: DirectStateArtifact = serde_cbor::from_slice(&self.read(&key).await?)
+            .map_err(|_| "checkpoint head decode failed")?;
+        if receipt_only_record(&artifact) != *head { return Err("checkpoint head mismatch".into()); }
+        let response = exchange(state, RuntimeRequest::SealCheckpoint { artifact, receipt_records: records, artifact_hashes })
+            .await.map_err(|_| "checkpoint seal transport failed")?;
+        let RuntimeResponse::CheckpointSealed { checkpoint } = response else { return Err("checkpoint seal rejected".into()); };
+        let key = self.checkpoint_key(&checkpoint)?;
+        self.write_once(&key, serde_cbor::to_vec(&checkpoint).map_err(|_| "checkpoint encoding failed")?).await?;
+        eprintln!("VERIFIED_ARCHIVE_CHECKPOINT_PERSISTED {}", checkpoint.artifact.sequence);
+        Ok(())
+    }
     async fn from_environment() -> Result<Self, Box<dyn std::error::Error>> {
         let bucket = env::var("LAYRS_DIRECT_ARCHIVE_BUCKET")?;
         let prefix = env::var("LAYRS_DIRECT_ARCHIVE_PREFIX")?;
@@ -1613,6 +1659,8 @@ impl S3ImmutableArtifactStore {
             kms_key_id,
             retention_seconds,
             verified_receipt_records: Arc::new(Mutex::new(None)),
+            verified_artifact_hashes: Arc::new(Mutex::new(Vec::new())),
+            checkpoint_refresh_gate: Arc::new(Mutex::new(())),
         })
     }
     fn artifact_key(&self, artifact: &DirectStateArtifact) -> String {
@@ -1708,6 +1756,7 @@ impl S3ImmutableArtifactStore {
         if let Some(records)=self.verified_receipt_records.lock().await.as_mut() {
             if !records.iter().any(|record|record.sequence==artifact.sequence) {
                 records.push(receipt_only_record(&restored));
+                self.verified_artifact_hashes.lock().await.push(artifact_hash(&restored));
             }
         }
         Ok(restored)
@@ -1728,15 +1777,43 @@ impl S3ImmutableArtifactStore {
         keys.sort();if keys.windows(2).any(|pair|pair[0]==pair[1]){return Err("archive duplicate key".into());}Ok(keys)
     }
     async fn restore_streamed(&self,state:&AppState)->Result<(),String> {
+        if !state.isolated_test && state.governed_bootstrap.as_ref().and_then(|config| config.grant.committed_restore_frontier.as_ref()).is_none() {
+            return Err("governed checkpoint frontier required for production cutover".into());
+        }
         let keys=self.list_restore_keys("artifacts").await?;
         let heads=self.list_restore_keys("heads").await?;
         if keys.len()!=heads.len(){return Err("archive artifact/head count mismatch".into());}
-        let begin=exchange(state,RuntimeRequest::BeginCommittedRestore).await.map_err(|_|"restore begin transport failed")?;
-        let RuntimeResponse::RestoreProgress {recovered_sequence:0,recovered_state_hash:mut root}=begin else {return Err("restore begin rejected".into());};
-        let mut records=Vec::with_capacity(keys.len());
-        for window in restore_prefetch_ranges(keys.len()) {
+        if let Some(frontier) = state.governed_bootstrap.as_ref().and_then(|config| config.grant.committed_restore_frontier.as_ref()) {
+            if !frontier.valid() { return Err("governed checkpoint frontier invalid".into()); }
+            let index = frontier.sequence as usize - 1;
+            if keys.get(index) != Some(&format!("{}/artifacts/{:020}-{}.cbor", self.prefix, frontier.sequence, frontier.artifact_hash))
+                || heads.get(index) != Some(&format!("{}/heads/{:020}-{}.cbor", self.prefix, frontier.sequence, frontier.artifact_hash)) {
+                return Err("immutable archive below governed checkpoint frontier".into());
+            }
+        }
+        let checkpoint_keys = self.list_restore_keys("checkpoints").await?;
+        if checkpoint_keys.is_empty() && !keys.is_empty() && !state.isolated_test {
+            return Err("authenticated checkpoint required for existing production history; genesis fallback forbidden".into());
+        }
+        let (start, mut records, begin) = if let Some(key) = checkpoint_keys.last() {
+            let checkpoint: layrs_direct_execution_v1::DirectCheckpoint = serde_cbor::from_slice(&self.read(key).await?)
+                .map_err(|_| "checkpoint decode failed; genesis fallback forbidden")?;
+            if self.checkpoint_key(&checkpoint)? != *key { return Err("checkpoint content address mismatch".into()); }
+            let start = validate_checkpoint_archive(&checkpoint, &keys, &heads, &self.prefix)?;
+            let records = checkpoint.receipt_records.clone();
+            let begin = exchange(state, RuntimeRequest::BeginCheckpointRestore { checkpoint }).await
+                .map_err(|_| "checkpoint restore transport failed")?;
+            (start, records, begin)
+        } else {
+            (0, Vec::with_capacity(keys.len()), exchange(state,RuntimeRequest::BeginCommittedRestore).await.map_err(|_|"restore begin transport failed")?)
+        };
+        let RuntimeResponse::RestoreProgress {recovered_sequence,recovered_state_hash:mut root}=begin else {return Err("restore begin rejected; genesis fallback forbidden".into());};
+        if recovered_sequence != start as u64 { return Err("restore checkpoint sequence mismatch".into()); }
+        eprintln!("VERIFIED_ARCHIVE_RESTORE_START {start}/{}", keys.len());
+        for window in restore_prefetch_ranges(keys.len()-start) {
             let mut downloads=Vec::with_capacity(window.len());
-            for index in window {
+            for offset in window {
+                let index = start + offset;
                 let store=self.clone();let key=keys[index].clone();let head=heads[index].clone();
                 downloads.push((index,tokio::spawn(async move {
                     let (bytes,head_bytes)=tokio::try_join!(store.read(&key),store.read(&head))?;
@@ -1759,7 +1836,11 @@ impl S3ImmutableArtifactStore {
         let result=exchange(state,RuntimeRequest::FinishCommittedRestore {expected_sequence:keys.len() as u64,expected_state_hash:root.clone()}).await.map_err(|_|"restore finish transport failed")?;
         if !matches!(result,RuntimeResponse::RecoveryComplete {recovered_sequence,recovered_state_hash} if recovered_sequence==keys.len() as u64 && recovered_state_hash==root){return Err("restore final encrypted head rejected".into());}
         *self.verified_receipt_records.lock().await=Some(records);
+        *self.verified_artifact_hashes.lock().await = keys.iter().map(|key| key.rsplit('-').next().unwrap_or("").trim_end_matches(".cbor").to_string()).collect();
         *state.committed_state_root.lock().await=Some(root);
+        // Seed the optimization before allowing this restored writer to serve.
+        // A corrupt existing checkpoint is never silently bypassed above.
+        self.seal_current_checkpoint(state).await?;
         eprintln!("VERIFIED_ARCHIVE_RESTORE_COMPLETE {}",keys.len());Ok(())
     }
     async fn persist_intent_readback(
@@ -4693,7 +4774,7 @@ async fn exchange_direct(state: &AppState, request: DirectRequest) -> io::Result
             "DIRECT_COMMIT_ACK_KEY_NOT_CONFIGURED",
         ));
     }
-    timeout(Duration::from_secs(10), async {
+    let response = timeout(Duration::from_secs(10), async {
         let mut stream =
             VsockStream::connect(VsockAddr::new(state.enclave_cid, ENCLOSURE_PORT)).await?;
         write_frame(
@@ -4735,7 +4816,25 @@ async fn exchange_direct(state: &AppState, request: DirectRequest) -> io::Result
         Ok(terminal)
     })
     .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "enclave timeout"))?
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "enclave timeout"))??;
+    if matches!(response, RuntimeResponse::Execute { .. }) {
+        if let ArchiveStore::S3(store) = store {
+            // This effect already committed: a checkpoint failure must not
+            // turn success into permission for another financial submission.
+            // Coalesce concurrent refreshes, and never hold the committed
+            // financial response hostage to optional checkpoint storage.
+            if let Ok(guard) = Arc::clone(&store.checkpoint_refresh_gate).try_lock_owned() {
+                let store = store.clone(); let state = state.clone();
+                tokio::spawn(async move {
+                    let _guard = guard;
+                    if store.seal_current_checkpoint(&state).await.is_err() {
+                        eprintln!("VERIFIED_ARCHIVE_CHECKPOINT_REFRESH_PENDING");
+                    }
+                });
+            }
+        }
+    }
+    Ok(response)
 }
 fn invalid(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
@@ -4860,6 +4959,28 @@ mod tests {
         }
     }
     #[test]
+    fn checkpoint_archive_requires_exact_prefix_and_retains_unrestored_suffix() {
+        let mut artifacts = nonfinancial_chain();
+        for artifact in &mut artifacts { artifact.ciphertext = vec![1,2,3]; }
+        let hashes: Vec<_> = artifacts.iter().map(artifact_hash).collect();
+        let keys: Vec<_> = artifacts.iter().zip(&hashes).map(|(record,hash)| format!("epoch/artifacts/{:020}-{hash}.cbor",record.sequence)).collect();
+        let heads: Vec<_> = artifacts.iter().zip(&hashes).map(|(record,hash)| format!("epoch/heads/{:020}-{hash}.cbor",record.sequence)).collect();
+        let checkpoint = layrs_direct_execution_v1::DirectCheckpoint { protocol: "layrs.direct-execution.checkpoint.v1".into(), opening_state_hash: "a".repeat(64),
+            artifact: artifacts[1].clone(), receipt_records: artifacts[..2].iter().map(receipt_only_record).collect(), artifact_hashes: hashes[..2].to_vec(), bootstrap_certificate: None, signature: "synthetic".into() };
+        assert_eq!(validate_checkpoint_archive(&checkpoint,&keys,&heads,"epoch").unwrap(), 2);
+        assert_eq!(keys.len()-validate_checkpoint_archive(&checkpoint,&keys,&heads,"epoch").unwrap(),1);
+        assert!(validate_checkpoint_archive(&checkpoint,&keys[..1],&heads[..1],"epoch").is_err());
+        let mut missing = keys.clone(); missing.remove(0);
+        let mut missing_heads = heads.clone(); missing_heads.remove(0);
+        assert!(validate_checkpoint_archive(&checkpoint,&missing,&missing_heads,"epoch").is_err());
+        let mut changed = heads.clone(); changed[0] = "another/head.cbor".into();
+        assert!(validate_checkpoint_archive(&checkpoint,&keys,&changed,"epoch").is_err());
+        let mut changed = checkpoint.clone(); changed.artifact_hashes.pop();
+        assert!(validate_checkpoint_archive(&changed,&keys,&heads,"epoch").is_err());
+        let mut changed = checkpoint; changed.artifact.sequence = 0;
+        assert!(validate_checkpoint_archive(&changed,&keys,&heads,"epoch").is_err());
+    }
+    #[test]
     fn projection_sequence_requires_exact_verified_receipt() {
         let artifact = projection_sequence_fixture();
         assert_eq!(verified_receipt_sequence(&[artifact.clone()], &artifact.receipt).unwrap(), 7);
@@ -4902,7 +5023,7 @@ mod tests {
             }
         });
         let configuration=aws_sdk_s3::config::Builder::new().behavior_version_latest().region(aws_sdk_s3::config::Region::new("us-east-1")).credentials_provider(aws_sdk_s3::config::Credentials::new("unit-test","unit-test",None,None,"local-only")).endpoint_url(format!("http://{address}")).force_path_style(true).build();
-        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None))};
+        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),checkpoint_refresh_gate:Arc::new(Mutex::new(()))};
         assert_eq!(store.read("epoch/immutable.cbor").await.unwrap(),b"complete-opaque-ciphertext");server.await.unwrap();
     }
     #[tokio::test]
@@ -4915,7 +5036,7 @@ mod tests {
             }
         });
         let configuration=aws_sdk_s3::config::Builder::new().behavior_version_latest().region(aws_sdk_s3::config::Region::new("us-east-1")).credentials_provider(aws_sdk_s3::config::Credentials::new("unit-test","unit-test",None,None,"local-only")).endpoint_url(format!("http://{address}")).force_path_style(true).build();
-        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None))};
+        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),checkpoint_refresh_gate:Arc::new(Mutex::new(()))};
         assert_eq!(store.read("epoch/immutable.cbor").await.unwrap_err(),"archive complete read retries exhausted");server.await.unwrap();
     }
     #[tokio::test]
@@ -4933,7 +5054,7 @@ mod tests {
             }
         });
         let configuration=aws_sdk_s3::config::Builder::new().behavior_version_latest().region(aws_sdk_s3::config::Region::new("us-east-1")).credentials_provider(aws_sdk_s3::config::Credentials::new("unit-test","unit-test",None,None,"local-only")).endpoint_url(format!("http://{address}")).force_path_style(true).build();
-        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None))};
+        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),checkpoint_refresh_gate:Arc::new(Mutex::new(()))};
         let keys=store.list_restore_keys("artifacts").await.unwrap();assert_eq!(keys.len(),1250);assert!(keys.first().unwrap().contains("00000000000000000001"));assert!(keys.last().unwrap().contains("00000000000000001250"));server.await.unwrap();
     }
 

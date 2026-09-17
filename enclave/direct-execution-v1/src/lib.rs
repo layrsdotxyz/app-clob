@@ -406,6 +406,10 @@ pub struct WriterGrant {
     /// continuity, not a financial command or ledger state transition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_release_predecessor: Option<KeyReleasePredecessor>,
+    /// Minimum immutable lineage pinned by the governed checkpoint cutover.
+    /// Optional serialization preserves every predecessor grant's bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_restore_frontier: Option<CommittedRestoreFrontier>,
     pub expires_at_unix: u64,
     /// KMS key alias and algorithm are signed fields, not deployment inputs.
     pub governance_key_id: String,
@@ -452,6 +456,7 @@ impl WriterGrant {
                 .key_release_predecessor
                 .as_ref()
                 .is_some_and(|predecessor| !predecessor.valid(&self.activation_id))
+            || self.committed_restore_frontier.as_ref().is_some_and(|frontier| !frontier.valid())
             || self.expires_at_unix <= now_unix
             || self.governance_key_id != GOVERNANCE_KEY_ID
             || self.signing_algorithm != GOVERNANCE_SIGNING_ALGORITHM
@@ -489,6 +494,26 @@ impl WriterGrant {
     ) -> bool {
         self.unsigned_bytes(now_unix, binding)
             .is_some_and(|bytes| self.verify_with_key(verifying_key, &bytes))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CommittedRestoreFrontier {
+    pub sequence: u64,
+    pub state_hash: String,
+    pub artifact_hash: String,
+}
+impl CommittedRestoreFrontier {
+    pub fn valid(&self) -> bool {
+        self.sequence > 0 && self.sequence <= 100_000
+            && [&self.state_hash, &self.artifact_hash].iter().all(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+    }
+    pub fn accepts_checkpoint(&self, checkpoint: &DirectCheckpoint) -> bool {
+        if !self.valid() || checkpoint.artifact.sequence < self.sequence { return false; }
+        let index = self.sequence as usize - 1;
+        checkpoint.receipt_records.get(index).is_some_and(|record| record.sequence == self.sequence && record.state_hash == self.state_hash)
+            && checkpoint.artifact_hashes.get(index) == Some(&self.artifact_hash)
     }
 }
 
@@ -1049,6 +1074,7 @@ struct OrderReservation {
 
 #[derive(Clone)]
 pub struct DirectRuntime {
+    opening_state_hash: String,
     balances: BTreeMap<String, BTreeMap<(String, String), u128>>,
     subject_identities: BTreeMap<String, BTreeSet<String>>,
     subject_wallets: BTreeMap<String, BTreeSet<String>>,
@@ -1089,6 +1115,82 @@ pub struct DirectStateArtifact {
     pub ciphertext: Vec<u8>,
     pub ciphertext_hash: String,
     pub receipt: DirectReceipt,
+}
+
+/// Recovery acceleration only: the original immutable artifacts remain the
+/// financial authority. Issued only from an already-adopted, verified head.
+/// The MAC binds the encrypted snapshot AND the complete compact receipt
+/// lineage, including metadata used by historical payout reconciliation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DirectCheckpoint {
+    pub protocol: String,
+    pub opening_state_hash: String,
+    pub artifact: DirectStateArtifact,
+    pub receipt_records: Vec<DirectStateArtifact>,
+    pub artifact_hashes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_certificate: Option<CheckpointBootstrapCertificate>,
+    pub signature: String,
+}
+
+/// One-time bridge from the already-verified predecessor enclave, which has
+/// no checkpoint endpoint. Uses the EXISTING measured governance public key;
+/// neither a parent-supplied key nor a database snapshot can authorize it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CheckpointBootstrapCertificate {
+    pub protocol: String,
+    pub epoch_id: String,
+    pub opening_state_hash: String,
+    pub sequence: u64,
+    pub state_hash: String,
+    pub artifact_hash: String,
+    pub receipt_records_hash: String,
+    pub artifact_hashes_hash: String,
+    pub governance_key_id: String,
+    pub signing_algorithm: String,
+    pub signature: String,
+}
+
+impl CheckpointBootstrapCertificate {
+    pub fn for_checkpoint(checkpoint: &DirectCheckpoint) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            protocol: "layrs.direct-execution.checkpoint-bootstrap.v1".into(),
+            epoch_id: EPOCH_ID.into(), opening_state_hash: checkpoint.opening_state_hash.clone(),
+            sequence: checkpoint.artifact.sequence, state_hash: checkpoint.artifact.state_hash.clone(),
+            artifact_hash: artifact_hash(&checkpoint.artifact),
+            receipt_records_hash: sha256(&serde_cbor::to_vec(&checkpoint.receipt_records).map_err(|_| RuntimeError::StateArtifact)?),
+            artifact_hashes_hash: sha256(&serde_cbor::to_vec(&checkpoint.artifact_hashes).map_err(|_| RuntimeError::StateArtifact)?),
+            governance_key_id: GOVERNANCE_KEY_ID.into(), signing_algorithm: GOVERNANCE_SIGNING_ALGORITHM.into(),
+            signature: String::new(),
+        })
+    }
+    pub fn unsigned_bytes(&self) -> Result<Vec<u8>, RuntimeError> {
+        let mut unsigned = self.clone(); unsigned.signature.clear();
+        serde_json::to_vec(&unsigned).map_err(|_| RuntimeError::StateArtifact)
+    }
+    fn verify_with_key(&self, checkpoint: &DirectCheckpoint, key: &VerifyingKey) -> bool {
+        let Ok(expected) = Self::for_checkpoint(checkpoint) else { return false; };
+        let mut unsigned = self.clone(); unsigned.signature.clear();
+        if unsigned != expected { return false; }
+        let Ok(der) = STANDARD.decode(&self.signature) else { return false; };
+        let Ok(signature) = Signature::from_der(&der) else { return false; };
+        self.unsigned_bytes().is_ok_and(|bytes| key.verify(&bytes, &signature).is_ok())
+    }
+    pub fn verify(&self, checkpoint: &DirectCheckpoint) -> bool {
+        let Ok(der) = STANDARD.decode(GOVERNANCE_PUBLIC_KEY_DER_BASE64) else { return false; };
+        let Ok(key) = VerifyingKey::from_public_key_der(&der) else { return false; };
+        self.verify_with_key(checkpoint, &key)
+    }
+}
+
+impl DirectCheckpoint {
+    fn signature_bytes(&self) -> Result<Vec<u8>, RuntimeError> {
+        let mut unsigned = self.clone();
+        unsigned.signature.clear();
+        serde_cbor::to_vec(&unsigned).map_err(|_| RuntimeError::StateArtifact)
+    }
 }
 
 /// A parent may acknowledge a candidate only after the immutable artifact has
@@ -1457,7 +1559,8 @@ impl DirectRuntime {
         if receipt_key.len() < 32 {
             return Err(RuntimeError::InvalidRequest);
         }
-        Ok(Self {
+        let mut runtime = Self {
+            opening_state_hash: String::new(),
             balances: epoch.identities,
             subject_identities: epoch.subject_identities,
             subject_wallets: epoch.subject_wallets,
@@ -1478,7 +1581,9 @@ impl DirectRuntime {
             requests: BTreeMap::new(),
             receipt_key,
             mode,
-        })
+        };
+        runtime.opening_state_hash = runtime.state_hash();
+        Ok(runtime)
     }
     pub fn execute(&mut self, request: DirectRequest) -> Result<DirectResult, RuntimeError> {
         if request.account_id.is_empty()
@@ -2165,6 +2270,71 @@ impl DirectRuntime {
             return Err(RuntimeError::StateArtifact);
         }
         Ok(self)
+    }
+    pub fn seal_checkpoint(&self, artifact: DirectStateArtifact, receipt_records: Vec<DirectStateArtifact>, artifact_hashes: Vec<String>, key: &[u8]) -> Result<DirectCheckpoint, RuntimeError> {
+        if self.receipt_key.len() != 32 || artifact.sequence == 0
+            || artifact.sequence != self.committed_sequence()
+            || artifact.state_hash != self.state_hash()
+            || !self.verify_artifact(&artifact, key)? {
+            return Err(RuntimeError::StateArtifact);
+        }
+        let mut checkpoint = DirectCheckpoint {
+            protocol: "layrs.direct-execution.checkpoint.v1".into(),
+            opening_state_hash: self.opening_state_hash.clone(), artifact, receipt_records, artifact_hashes, bootstrap_certificate: None,
+            signature: String::new(),
+        };
+        self.validate_checkpoint_records(&checkpoint)?;
+        checkpoint.signature = sign(&self.receipt_key, &checkpoint.signature_bytes()?);
+        Ok(checkpoint)
+    }
+    /// Starts a private restore candidate at the authenticated checkpoint,
+    /// not at genesis. The caller must prove its exact archived head and then
+    /// append every immutable successor before FinishCommittedRestore.
+    pub fn restore_checkpoint(mut self, checkpoint: &DirectCheckpoint, key: &[u8]) -> Result<Self, RuntimeError> {
+        if self.committed_sequence() != 0 || self.receipt_key.len() != 32
+            || checkpoint.protocol != "layrs.direct-execution.checkpoint.v1"
+            || checkpoint.opening_state_hash != self.state_hash()
+            || !(constant_time_eq(&sign(&self.receipt_key, &checkpoint.signature_bytes()?), &checkpoint.signature)
+                || (checkpoint.signature.is_empty() && checkpoint.bootstrap_certificate.as_ref().is_some_and(|certificate| certificate.verify(checkpoint))))
+            || !self.verify_artifact(&checkpoint.artifact, key)? {
+            return Err(RuntimeError::StateArtifact);
+        }
+        self.apply_artifact(&checkpoint.artifact, key)?;
+        if self.committed_sequence() != checkpoint.artifact.sequence
+            || self.state_hash() != checkpoint.artifact.state_hash {
+            return Err(RuntimeError::StateArtifact);
+        }
+        self.validate_checkpoint_records(checkpoint)?;
+        Ok(self)
+    }
+    fn validate_checkpoint_records(&self, checkpoint: &DirectCheckpoint) -> Result<(), RuntimeError> {
+        if checkpoint.artifact.sequence == 0 || checkpoint.receipt_records.len() > 100_000
+            || checkpoint.receipt_records.len() as u64 != checkpoint.artifact.sequence
+            || checkpoint.artifact_hashes.len() != checkpoint.receipt_records.len()
+            || checkpoint.artifact_hashes.iter().any(|hash| hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+            || checkpoint.artifact_hashes.last() != Some(&artifact_hash(&checkpoint.artifact)) {
+            return Err(RuntimeError::StateArtifact);
+        }
+        let mut root = checkpoint.opening_state_hash.clone();
+        let mut seen = BTreeSet::new();
+        for (index, record) in checkpoint.receipt_records.iter().enumerate() {
+            let receipt = &record.receipt;
+            let request_key = (receipt.account_id.clone(), receipt.request_id.clone());
+            let Some((hash, result)) = self.requests.get(&request_key) else { return Err(RuntimeError::StateArtifact); };
+            if record.epoch_id != EPOCH_ID || record.sequence != index as u64 + 1
+                || record.prior_state_hash != root || !record.ciphertext.is_empty()
+                || record.request_hash != *hash || receipt.request_hash != *hash
+                || result.receipt != *receipt || !verify_receipt(&self.receipt_key, receipt)
+                || !seen.insert(request_key) {
+                return Err(RuntimeError::StateArtifact);
+            }
+            root = record.state_hash.clone();
+        }
+        let mut head = checkpoint.artifact.clone(); head.ciphertext.clear();
+        if root != checkpoint.artifact.state_hash || checkpoint.receipt_records.last() != Some(&head) {
+            return Err(RuntimeError::StateArtifact);
+        }
+        Ok(())
     }
     fn snapshot(&self) -> DirectState {
         DirectState {
@@ -3324,6 +3494,8 @@ pub enum RuntimeRequest {
         artifacts: Vec<DirectStateArtifact>,
     },
     BeginCommittedRestore,
+    BeginCheckpointRestore { checkpoint: DirectCheckpoint },
+    SealCheckpoint { artifact: DirectStateArtifact, receipt_records: Vec<DirectStateArtifact>, artifact_hashes: Vec<String> },
     AppendCommittedRestore { artifact: DirectStateArtifact },
     FinishCommittedRestore { expected_sequence: u64, expected_state_hash: String },
     Balance {
@@ -3377,6 +3549,7 @@ pub enum RuntimeResponse {
         recovered_state_hash: String,
     },
     RestoreProgress { recovered_sequence: u64, recovered_state_hash: String },
+    CheckpointSealed { checkpoint: DirectCheckpoint },
     Balance {
         amount_atomic: String,
     },
@@ -4216,6 +4389,127 @@ mod tests {
         (live,subject,identity,wallet,store)
     }
     const BUS_ID:&str="11111111-2222-4333-8444-555555555555";
+    fn checkpoint_fixture(live: &DirectRuntime, store: &InMemoryDirectStateStore) -> DirectCheckpoint {
+        let artifacts = store.artifacts().unwrap();
+        let records = artifacts.iter().cloned().map(|mut record| { record.ciphertext.clear(); record }).collect();
+        let hashes = artifacts.iter().map(artifact_hash).collect();
+        live.seal_checkpoint(artifacts.last().unwrap().clone(), records, hashes, &[8;32]).unwrap()
+    }
+    #[test]
+    fn checkpoint_4827_resumes_with_4828_without_reexecuting_prior_requests() {
+        // Synthetic compact-prefix fixture: signed requests and the final
+        // encrypted snapshot are real runtime outputs; intermediate roots,
+        // ciphertext/object hashes are placeholders. Archive authentication
+        // is tested separately, not certified by this counter-size fixture.
+        let (mut live, subject, identity, wallet, store) = bus_fixture();
+        let artifacts = store.artifacts().unwrap();
+        let mut records: Vec<_> = artifacts.iter().cloned().map(|mut record| { record.ciphertext = Vec::new(); record }).collect();
+        let mut hashes: Vec<_> = artifacts.iter().map(artifact_hash).collect();
+        let mut last_request = None;
+        while live.committed_sequence() < 4827 {
+            let prior = records.last().unwrap().state_hash.clone();
+            let id = Uuid::from_u128(0x11111111222243338444000000000000 + live.committed_sequence() as u128).to_string();
+            let request = request_for(&subject,&identity,&id,
+                DirectAction::BeginUsdcBusWithdrawal { withdrawal_id: id.clone(), destination: wallet.clone(), amount_atomic: "999999999999999".into() });
+            let result = live.execute(request.clone()).unwrap();
+            let record = DirectStateArtifact { epoch_id: EPOCH_ID.into(), sequence: live.committed_sequence(), prior_state_hash: prior,
+                state_hash: sha256(&live.committed_sequence().to_be_bytes()), request_hash: request.request_hash.clone(), nonce: vec![0;12], ciphertext: Vec::new(), ciphertext_hash: sha256(&[]), receipt: result.receipt };
+            hashes.push(artifact_hash(&record)); records.push(record); last_request = Some(request);
+        }
+        let last = records.last().unwrap();
+        let head = live.seal_artifact(&last.prior_state_hash,&last.request_hash,&[8;32],last.receipt.clone()).unwrap();
+        *hashes.last_mut().unwrap() = artifact_hash(&head);
+        let mut compact = head.clone(); compact.ciphertext = Vec::new(); *records.last_mut().unwrap() = compact;
+        let checkpoint = live.seal_checkpoint(head,records,hashes,&[8;32]).unwrap();
+        assert!(serde_cbor::to_vec(&RuntimeRequest::BeginCheckpointRestore { checkpoint: checkpoint.clone() }).unwrap().len() < 64*1024*1024);
+        let mut recovered = runtime(RuntimeMode::IsolatedTest).restore_checkpoint(&checkpoint,&[8;32]).unwrap();
+        assert_eq!(recovered.committed_sequence(),4827);
+        assert_eq!(recovered.portfolio(&identity).unwrap(),live.portfolio(&identity).unwrap());
+        let before = recovered.committed_state_hash();
+        assert!(recovered.existing_result(&last_request.unwrap()).unwrap().is_some());
+        assert_eq!(recovered.committed_state_hash(),before);
+        let candidate = live.prepare_candidate(bus_begin(&subject,&identity,&wallet,BUS_ID),&[8;32]).unwrap();
+        recovered = recovered.restore_next_committed(&candidate.artifact,&[8;32]).unwrap();
+        assert_eq!(recovered.committed_sequence(),4828);
+        assert_eq!(recovered.committed_state_hash(),candidate.runtime.committed_state_hash());
+    }
+    #[test]
+    fn checkpoint_preserves_money_identity_deduplication_and_pending_bus_holds() {
+        let (mut live, subject, identity, wallet, mut store) = bus_fixture();
+        let reserve = bus_begin(&subject, &identity, &wallet, BUS_ID);
+        let result = live.execute_committed(reserve.clone(), &[8;32], &mut store).unwrap();
+        let checkpoint = checkpoint_fixture(&live, &store);
+        let mut restarted = runtime(RuntimeMode::IsolatedTest).restore_checkpoint(&checkpoint, &[8;32]).unwrap();
+        assert_eq!(restarted.committed_sequence(), 3);
+        assert_eq!(restarted.committed_state_hash(), live.committed_state_hash());
+        assert_eq!(restarted.portfolio(&identity).unwrap(), live.portfolio(&identity).unwrap());
+        assert_eq!(restarted.pending_usdc_bus_withdrawal(&subject, BUS_ID), live.pending_usdc_bus_withdrawal(&subject, BUS_ID));
+        assert_eq!(restarted.execute_committed(reserve, &[8;32], &mut store).unwrap(), result);
+        assert_eq!(store.artifacts().unwrap().len(), 3);
+        assert!(restarted.execute(bus_begin(&subject,&identity,&wallet,"22222222-2222-4333-8444-555555555555")).is_err());
+    }
+    #[test]
+    fn checkpoint_rejects_tampering_missing_receipts_wrong_keys_and_epoch() {
+        let (live, _, _, _, store) = bus_fixture();
+        let checkpoint = checkpoint_fixture(&live, &store);
+        let mut corruptions = Vec::new();
+        let mut changed = checkpoint.clone(); changed.artifact.sequence += 1; corruptions.push(changed);
+        let mut changed = checkpoint.clone(); changed.artifact.ciphertext[0] ^= 1; corruptions.push(changed);
+        let mut changed = checkpoint.clone(); changed.receipt_records.pop(); corruptions.push(changed);
+        let mut changed = checkpoint.clone(); changed.receipt_records[0].receipt.account_id = "b".repeat(64); corruptions.push(changed);
+        let mut changed = checkpoint.clone(); changed.artifact_hashes[0] = "b".repeat(64); corruptions.push(changed);
+        let mut changed = checkpoint.clone(); changed.opening_state_hash = "b".repeat(64); corruptions.push(changed);
+        let mut changed = checkpoint.clone(); changed.artifact.epoch_id = "another-epoch".into(); corruptions.push(changed);
+        let mut changed = checkpoint.clone(); changed.signature.clear(); corruptions.push(changed);
+        for changed in corruptions { assert!(runtime(RuntimeMode::IsolatedTest).restore_checkpoint(&changed, &[8;32]).is_err()); }
+        assert!(runtime(RuntimeMode::IsolatedTest).restore_checkpoint(&checkpoint, &[9;32]).is_err());
+        let other_receipt_key = DirectRuntime::new(SealedEpoch::load(epoch_path()).unwrap(), RuntimeMode::IsolatedTest, vec![9;32]).unwrap();
+        assert!(other_receipt_key.restore_checkpoint(&checkpoint, &[8;32]).is_err());
+        assert!(live.restore_checkpoint(&checkpoint, &[8;32]).is_err());
+    }
+    #[test]
+    fn checkpoint_verifies_only_the_committed_suffix_and_rejects_gaps() {
+        let (mut live, subject, identity, wallet, mut store) = bus_fixture();
+        let checkpoint = checkpoint_fixture(&live, &store);
+        live.execute_committed(bus_begin(&subject,&identity,&wallet,BUS_ID), &[8;32], &mut store).unwrap();
+        let artifact = store.artifacts().unwrap().last().unwrap().clone();
+        let candidate = runtime(RuntimeMode::IsolatedTest).restore_checkpoint(&checkpoint, &[8;32]).unwrap();
+        let mut gap = artifact.clone(); gap.sequence += 1;
+        assert!(candidate.clone().restore_next_committed(&gap, &[8;32]).is_err());
+        let restored = candidate.restore_next_committed(&artifact, &[8;32]).unwrap();
+        assert_eq!(restored.committed_state_hash(), live.committed_state_hash());
+        assert_eq!(restored.committed_sequence(), 3);
+    }
+    #[test]
+    fn checkpoint_frontier_rejects_older_snapshot_or_same_sequence_fork() {
+        let (live, _, _, _, store) = bus_fixture(); let checkpoint = checkpoint_fixture(&live,&store);
+        let frontier = CommittedRestoreFrontier { sequence: checkpoint.artifact.sequence, state_hash: checkpoint.artifact.state_hash.clone(), artifact_hash: artifact_hash(&checkpoint.artifact) };
+        assert!(frontier.accepts_checkpoint(&checkpoint));
+        let mut changed = frontier.clone(); changed.sequence += 1; assert!(!changed.accepts_checkpoint(&checkpoint));
+        let mut changed = frontier.clone(); changed.state_hash = "a".repeat(64); assert!(!changed.accepts_checkpoint(&checkpoint));
+        let mut changed = frontier.clone(); changed.artifact_hash = "a".repeat(64); assert!(!changed.accepts_checkpoint(&checkpoint));
+        let mut changed = frontier; changed.sequence = 0; assert!(!changed.valid()); assert!(!changed.accepts_checkpoint(&checkpoint));
+    }
+    #[test]
+    fn checkpoint_bootstrap_certificate_binds_exact_snapshot_history_and_existing_governance_key() {
+        use p256::ecdsa::{SigningKey, signature::Signer};
+        let (live, _, _, _, store) = bus_fixture();
+        let mut checkpoint = checkpoint_fixture(&live, &store); checkpoint.signature.clear();
+        let signing_key = SigningKey::from_bytes((&[3u8;32]).into()).unwrap();
+        let mut certificate = CheckpointBootstrapCertificate::for_checkpoint(&checkpoint).unwrap();
+        let signature: Signature = signing_key.sign(&certificate.unsigned_bytes().unwrap());
+        certificate.signature = STANDARD.encode(signature.to_der().as_bytes());
+        assert!(certificate.verify_with_key(&checkpoint, signing_key.verifying_key()));
+        assert!(!certificate.verify(&checkpoint)); // test keys NEVER authorize production recovery
+        let mut changed = checkpoint.clone(); changed.receipt_records[0].prior_state_hash = "b".repeat(64);
+        assert!(!certificate.verify_with_key(&changed, signing_key.verifying_key()));
+        let mut changed = checkpoint.clone(); changed.artifact_hashes[0] = "b".repeat(64);
+        assert!(!certificate.verify_with_key(&changed, signing_key.verifying_key()));
+        let mut wrong_domain = certificate.clone(); wrong_domain.protocol = "layrs.direct-execution.writer-grant.v1".into();
+        assert!(!wrong_domain.verify_with_key(&checkpoint, signing_key.verifying_key()));
+        checkpoint.bootstrap_certificate = Some(certificate);
+        assert!(runtime(RuntimeMode::IsolatedTest).restore_checkpoint(&checkpoint, &[8;32]).is_err());
+    }
     #[test]
     fn public_quest_witness_is_owned_read_only_and_stable_after_recovery() {
         let (live,subject,identity,_,store)=bus_fixture();
@@ -5525,6 +5819,7 @@ mod tests {
             old_writer_fence_evidence_sha256: "a".repeat(64),
             key_release_kms_key_id: "arn:aws:kms:us-east-1:111122223333:key/example".into(),
             key_release_predecessor: None,
+            committed_restore_frontier: None,
             expires_at_unix: 200,
             governance_key_id: GOVERNANCE_KEY_ID.into(),
             signing_algorithm: GOVERNANCE_SIGNING_ALGORITHM.into(),
@@ -5582,6 +5877,7 @@ mod tests {
             old_writer_fence_evidence_sha256: "1".repeat(64),
             key_release_kms_key_id: "arn:aws:kms:us-east-1:1:key/test".into(),
             key_release_predecessor: None,
+            committed_restore_frontier: None,
             expires_at_unix: 200,
             governance_key_id: GOVERNANCE_KEY_ID.into(),
             signing_algorithm: GOVERNANCE_SIGNING_ALGORITHM.into(),

@@ -44,6 +44,7 @@ struct EnclaveState {
     commit_ack_key: Vec<u8>,
     recovery_complete: bool,
     restore_candidate: Option<DirectRuntime>,
+    committed_restore_frontier: Option<layrs_direct_execution_v1::CommittedRestoreFrontier>,
     pending_governed_bootstrap: Option<PendingGovernedBootstrap>,
     writer_grant_commitment: Option<String>,
     writer_grant_expires_at_unix: Option<u64>,
@@ -95,6 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         commit_ack_key,
         recovery_complete: false,
         restore_candidate: None,
+        committed_restore_frontier: None,
         pending_governed_bootstrap: None,
         writer_grant_commitment: None,
         writer_grant_expires_at_unix: None,
@@ -169,6 +171,18 @@ where
         },
         RuntimeRequest::RecoverCommitted { artifacts } => recover_committed(state, artifacts).await,
         RuntimeRequest::BeginCommittedRestore => begin_committed_restore(state).await,
+        RuntimeRequest::BeginCheckpointRestore { checkpoint } => begin_checkpoint_restore(state, checkpoint).await,
+        RuntimeRequest::SealCheckpoint { artifact, receipt_records, artifact_hashes } => {
+            let state = state.lock().await;
+            if !state.recovery_complete || state.restore_candidate.is_some() {
+                RuntimeResponse::Error { code: "CHECKPOINT_REQUIRES_VERIFIED_HEAD".into() }
+            } else {
+                match state.runtime.seal_checkpoint(artifact, receipt_records, artifact_hashes, &state.state_key) {
+                    Ok(checkpoint) => RuntimeResponse::CheckpointSealed { checkpoint },
+                    Err(_) => RuntimeResponse::Error { code: "CHECKPOINT_HEAD_INVALID".into() },
+                }
+            }
+        },
         RuntimeRequest::AppendCommittedRestore { artifact } => append_committed_restore(state,artifact).await,
         RuntimeRequest::FinishCommittedRestore { expected_sequence,expected_state_hash } => finish_committed_restore(state,expected_sequence,expected_state_hash).await,
         RuntimeRequest::Balance {
@@ -468,6 +482,7 @@ where
     state.state_key = state_key;
     state.commit_ack_key = commit_ack_key;
     state.writer_grant_expires_at_unix = Some(pending.grant.expires_at_unix);
+    state.committed_restore_frontier = pending.grant.committed_restore_frontier;
     state.writer_grant_commitment = Some(writer_grant_commitment.clone());
     state.key_release_artifact_hash = Some(key_release_artifact_hash);
     RuntimeResponse::GovernedBootstrapComplete {
@@ -568,6 +583,11 @@ async fn recover_committed(
     artifacts: Vec<layrs_direct_execution_v1::DirectStateArtifact>,
 ) -> RuntimeResponse {
     let mut state = state.lock().await;
+    if state.committed_restore_frontier.as_ref().is_some_and(|frontier| !artifacts.iter().any(|artifact|
+        artifact.sequence == frontier.sequence && artifact.state_hash == frontier.state_hash
+        && layrs_direct_execution_v1::artifact_hash(artifact) == frontier.artifact_hash)) {
+        return RuntimeResponse::Error { code: "RESTORE_BELOW_GOVERNED_FRONTIER".into() };
+    }
     let store = match InMemoryDirectStateStore::from_artifacts(artifacts) {
         Ok(store) => store,
         Err(error) => {
@@ -625,15 +645,39 @@ async fn begin_committed_restore(state: Arc<Mutex<EnclaveState>>) -> RuntimeResp
 async fn append_committed_restore(state: Arc<Mutex<EnclaveState>>,artifact:layrs_direct_execution_v1::DirectStateArtifact)->RuntimeResponse {
     let mut state=state.lock().await;
     let Some(candidate)=state.restore_candidate.take() else {return RuntimeResponse::Error {code:"RESTORE_NOT_STARTED".into()};};
+    if state.committed_restore_frontier.as_ref().is_some_and(|frontier|
+        artifact.sequence == frontier.sequence && (artifact.state_hash != frontier.state_hash
+            || layrs_direct_execution_v1::artifact_hash(&artifact) != frontier.artifact_hash)) {
+        return RuntimeResponse::Error { code: "RESTORE_GOVERNED_FRONTIER_MISMATCH".into() };
+    }
     match candidate.restore_next_committed(&artifact,&state.state_key) {
         Ok(candidate)=>{let response=RuntimeResponse::RestoreProgress {recovered_sequence:candidate.committed_sequence(),recovered_state_hash:candidate.committed_state_hash()};state.restore_candidate=Some(candidate);response},
         Err(_)=>RuntimeResponse::Error {code:"RESTORE_SUCCESSOR_INVALID".into()},
+    }
+}
+async fn begin_checkpoint_restore(state: Arc<Mutex<EnclaveState>>, checkpoint: layrs_direct_execution_v1::DirectCheckpoint) -> RuntimeResponse {
+    let mut state = state.lock().await;
+    if state.restore_candidate.is_some() {
+        return RuntimeResponse::Error { code: "CHECKPOINT_RESTORE_STARTUP_ONLY".into() };
+    }
+    if state.committed_restore_frontier.as_ref().is_some_and(|frontier| !frontier.accepts_checkpoint(&checkpoint)) {
+        return RuntimeResponse::Error { code: "CHECKPOINT_BELOW_GOVERNED_FRONTIER".into() };
+    }
+    let candidate = DirectRuntime::new(state.epoch.clone(), state.mode, state.receipt_key.clone())
+        .and_then(|runtime| runtime.restore_checkpoint(&checkpoint, &state.state_key));
+    match candidate {
+        Ok(candidate) => {
+            let response = RuntimeResponse::RestoreProgress { recovered_sequence: candidate.committed_sequence(), recovered_state_hash: candidate.committed_state_hash() };
+            state.restore_candidate = Some(candidate); response
+        },
+        Err(_) => RuntimeResponse::Error { code: "CHECKPOINT_AUTHENTICATION_FAILED".into() },
     }
 }
 async fn finish_committed_restore(state: Arc<Mutex<EnclaveState>>,expected_sequence:u64,expected_state_hash:String)->RuntimeResponse {
     let mut state=state.lock().await;
     let Some(candidate)=state.restore_candidate.take() else {return RuntimeResponse::Error {code:"RESTORE_NOT_STARTED".into()};};
     if candidate.committed_sequence()!=expected_sequence || candidate.committed_state_hash()!=expected_state_hash
+        || state.committed_restore_frontier.as_ref().is_some_and(|frontier| expected_sequence < frontier.sequence)
         || (state.recovery_complete && (candidate.committed_sequence()!=state.runtime.committed_sequence() || candidate.committed_state_hash()!=state.runtime.committed_state_hash())) {
         return RuntimeResponse::Error {code:"RESTORE_FINAL_HEAD_MISMATCH".into()};
     }
@@ -983,6 +1027,7 @@ mod tests {
             commit_ack_key: vec![9; 32],
             recovery_complete: false,
             restore_candidate: None,
+            committed_restore_frontier: None,
             pending_governed_bootstrap: None,
             writer_grant_commitment: None,
             writer_grant_expires_at_unix: None,
@@ -1001,6 +1046,7 @@ mod tests {
             commit_ack_key: vec![0; 32],
             recovery_complete: false,
             restore_candidate: None,
+            committed_restore_frontier: None,
             pending_governed_bootstrap: None,
             writer_grant_commitment: None,
             writer_grant_expires_at_unix: None,
@@ -1092,6 +1138,7 @@ mod tests {
             old_writer_fence_evidence_sha256: "1".repeat(64),
             key_release_kms_key_id: "arn:aws:kms:us-east-1:111122223333:key/direct-runtime".into(),
             key_release_predecessor: None,
+            committed_restore_frontier: None,
             expires_at_unix: 2_000,
             governance_key_id: layrs_direct_execution_v1::GOVERNANCE_KEY_ID.into(),
             signing_algorithm: layrs_direct_execution_v1::GOVERNANCE_SIGNING_ALGORITHM.into(),
@@ -1158,6 +1205,51 @@ mod tests {
         let response = serde_cbor::from_slice(&read_frame(&mut parent).await.unwrap()).unwrap();
         server.await.unwrap().unwrap();
         response
+    }
+    #[tokio::test]
+    async fn checkpoint_restore_starts_at_verified_head_and_adopts_only_after_exact_tip() {
+        let running = state(); let store = FilesystemImmutableArtifactStore::new(artifact_dir());
+        recover(Arc::clone(&running), vec![]).await;
+        for id in ["checkpoint-one", "checkpoint-two", "checkpoint-three"] {
+            assert!(matches!(commit_through_parent_callback(Arc::clone(&running), request(id), &store).await, RuntimeResponse::Execute { .. }));
+        }
+        let artifacts = store.load_committed().unwrap();
+        let records = artifacts.iter().cloned().map(|mut record| { record.ciphertext.clear(); record }).collect();
+        let hashes = artifacts.iter().map(layrs_direct_execution_v1::artifact_hash).collect();
+        let checkpoint = running.lock().await.runtime.seal_checkpoint(artifacts.last().unwrap().clone(), records, hashes, &[8;32]).unwrap();
+        let root = checkpoint.artifact.state_hash.clone();
+        let restarted = state();
+        assert!(matches!(begin_checkpoint_restore(Arc::clone(&restarted), checkpoint.clone()).await, RuntimeResponse::RestoreProgress { recovered_sequence: 3, .. }));
+        assert!(!restarted.lock().await.recovery_complete);
+        assert!(matches!(execute_response(Arc::clone(&restarted), request("checkpoint-one")).await, RuntimeResponse::Error { .. }));
+        assert!(matches!(finish_committed_restore(Arc::clone(&restarted), 4, root.clone()).await, RuntimeResponse::Error { .. }));
+        assert!(!restarted.lock().await.recovery_complete);
+        assert!(matches!(begin_checkpoint_restore(Arc::clone(&restarted), checkpoint.clone()).await, RuntimeResponse::RestoreProgress { recovered_sequence: 3, .. }));
+        assert!(matches!(finish_committed_restore(Arc::clone(&restarted), 3, root.clone()).await, RuntimeResponse::RecoveryComplete { recovered_sequence: 3, .. }));
+        assert_eq!(restarted.lock().await.runtime.committed_state_hash(), running.lock().await.runtime.committed_state_hash());
+        let replay = execute_response(Arc::clone(&restarted), request("checkpoint-one")).await;
+        assert_eq!(replay, execute_response(Arc::clone(&running), request("checkpoint-one")).await);
+        // Reconnecting parent is allowed, but cannot change adopted state.
+        assert!(matches!(begin_checkpoint_restore(Arc::clone(&restarted), checkpoint).await, RuntimeResponse::RestoreProgress { recovered_sequence: 3, .. }));
+        assert!(matches!(finish_committed_restore(Arc::clone(&restarted), 3, root).await, RuntimeResponse::RecoveryComplete { .. }));
+    }
+    #[tokio::test]
+    async fn checkpoint_restore_rejects_rollback_below_governed_frontier_and_corrupt_snapshot() {
+        let running = state(); let store = FilesystemImmutableArtifactStore::new(artifact_dir());
+        recover(Arc::clone(&running), vec![]).await;
+        commit_through_parent_callback(Arc::clone(&running), request("checkpoint-old"), &store).await;
+        let first = store.load_committed().unwrap();
+        let mut compact = first[0].clone(); compact.ciphertext.clear();
+        let checkpoint = running.lock().await.runtime.seal_checkpoint(first[0].clone(), vec![compact], vec![layrs_direct_execution_v1::artifact_hash(&first[0])], &[8;32]).unwrap();
+        let restarted = state();
+        restarted.lock().await.committed_restore_frontier = Some(layrs_direct_execution_v1::CommittedRestoreFrontier { sequence: 2, state_hash: "a".repeat(64), artifact_hash: "b".repeat(64) });
+        assert!(matches!(begin_checkpoint_restore(Arc::clone(&restarted), checkpoint.clone()).await, RuntimeResponse::Error { code } if code == "CHECKPOINT_BELOW_GOVERNED_FRONTIER"));
+        restarted.lock().await.committed_restore_frontier = None;
+        let mut corrupt = checkpoint; corrupt.artifact.ciphertext[0] ^= 1;
+        assert!(matches!(begin_checkpoint_restore(Arc::clone(&restarted), corrupt).await, RuntimeResponse::Error { code } if code == "CHECKPOINT_AUTHENTICATION_FAILED"));
+        assert!(!restarted.lock().await.recovery_complete);
+        assert!(restarted.lock().await.restore_candidate.is_none());
+        assert_eq!(restarted.lock().await.runtime.committed_sequence(), 0);
     }
     #[tokio::test]
     async fn streamed_restore_verifies_every_successor_and_final_head_before_adoption() {
@@ -1289,6 +1381,7 @@ mod tests {
             commit_ack_key: Vec::new(),
             recovery_complete: false,
             restore_candidate: None,
+            committed_restore_frontier: None,
             pending_governed_bootstrap: None,
             writer_grant_commitment: None,
             writer_grant_expires_at_unix: None,
