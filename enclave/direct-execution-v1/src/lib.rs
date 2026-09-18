@@ -859,6 +859,12 @@ pub enum DirectAction {
     CancelOrder {
         order_id: String,
     },
+    /// Releases existing complete-set collateral to its owner. This is a
+    /// balanced claim redemption, without a trade, fee or external inflow.
+    RedeemCompleteSet {
+        market_id: String,
+        quantity_micros: String,
+    },
     ReserveWithdrawal {
         destination: String,
         amount_atomic: String,
@@ -2047,6 +2053,29 @@ impl DirectRuntime {
                 DirectAction::CancelOrder { order_id } => {
                     let value = self.cancel_order(&request.identity_commitment, order_id)?;
                     ("ORDER_CANCELLED".into(), Some(value.to_string()), None)
+                }
+                DirectAction::RedeemCompleteSet { market_id, quantity_micros } => {
+                    let quantity = amount(quantity_micros)?;
+                    if quantity.to_string() != *quantity_micros || self.resolved_markets.contains_key(market_id) {
+                        return Err(RuntimeError::InvalidRequest);
+                    }
+                    let market = self.markets.get(market_id).cloned().ok_or(RuntimeError::InvalidMarket)?;
+                    let value = settlement_atomic(&market, quantity)?;
+                    if value == 0 { return Err(RuntimeError::InvalidRequest); }
+                    let keys = [Outcome::Up, Outcome::Down].map(|outcome| (request.identity_commitment.clone(), market_id.clone(), outcome));
+                    if keys.iter().any(|key| self.positions.get(key).copied().unwrap_or_default() < quantity)
+                        || self.market_collateral.get(market_id).copied().unwrap_or_default() < value {
+                        return Err(RuntimeError::InsufficientAvailable);
+                    }
+                    // Available claims exclude positions reserved in orders.
+                    // Each leg reduces its basis against its own prior total.
+                    for key in &keys {
+                        *self.positions.get_mut(key).ok_or(RuntimeError::InsufficientAvailable)? -= quantity;
+                        self.reduce_position_basis(key, quantity)?;
+                    }
+                    *self.market_collateral.get_mut(market_id).ok_or(RuntimeError::InsufficientAvailable)? -= value;
+                    self.add_asset(&request.identity_commitment, &market.settlement_asset, "USER_AVAILABLE", value)?;
+                    ("COMPLETE_SET_REDEEMED".into(), Some(value.to_string()), None)
                 }
                 DirectAction::ReserveWithdrawal {
                     destination,
@@ -5398,6 +5427,54 @@ mod tests {
         );
     }
 
+    fn complete_set_redemption_fixture() -> (SealedEpoch, DirectRuntime, InMemoryDirectStateStore, String) {
+        let market = "layrs:v5:BTC:USDC:15m:paired-redemption-fixture".to_string();
+        let epoch = SealedEpoch::load(epoch_path()).unwrap();
+        let mut runtime = DirectRuntime::new(epoch.clone(), RuntimeMode::IsolatedTest, vec![7;32]).unwrap();
+        let mut store = InMemoryDirectStateStore::default();
+        runtime.execute_committed(market_registration_request(&market,"paired-market"), &[8;32], &mut store).unwrap();
+        for (i, outcome) in [Outcome::Up,Outcome::Down,Outcome::Down,Outcome::Up].into_iter().enumerate() {
+            let action=DirectAction::PlaceOrder {order_id:Uuid::from_u128(100+i as u128).to_string(),market_id:market.clone(),outcome,action:OrderAction::Buy,price_micros:500_000,quantity_micros:"2000000".into(),time_in_force:TimeInForce::Gtc,expires_at_millis:None,now_millis:1000+i as i64};
+            let command=if i%2==0 {request(&format!("paired-order-{i}"),action)} else {request_for("bae54f222a79c2ea394fa5b087d6a843e4b82562d0f3dfa33b8149b4beea21b3","9bf6b307e41f94a5f5ec4211d2ac9eb5e4f2743b25224573391d7e8903276481",&format!("paired-order-{i}"),action)};
+            runtime.execute_committed(command,&[8;32],&mut store).unwrap();
+        }
+        (epoch,runtime,store,market)
+    }
+    #[test]
+    fn complete_set_redemption_conserves_backing_and_replays_after_restore() {
+        let (epoch,mut runtime,mut store,market)=complete_set_redemption_fixture();
+        let owner="0bafc03d08d4951d769d58284db85c7ac2ee3c79de87ec680f58edc03017c418";
+        let other="9bf6b307e41f94a5f5ec4211d2ac9eb5e4f2743b25224573391d7e8903276481";
+        let before=runtime.balance(owner,"USDC","USER_AVAILABLE");
+        let other_before=runtime.portfolio(other).unwrap();let fees=runtime.fee_revenue_atomic;
+        assert_eq!(runtime.market_collateral.get(&market),Some(&4_000_000));
+        let command=request("paired-redeem",DirectAction::RedeemCompleteSet {market_id:market.clone(),quantity_micros:"2000000".into()});
+        let result=runtime.execute_committed(command.clone(),&[8;32],&mut store).unwrap();
+        assert_eq!(result.effect,"COMPLETE_SET_REDEEMED");assert_eq!(result.receipt.amount_atomic.as_deref(),Some("2000000"));
+        assert_eq!(runtime.balance(owner,"USDC","USER_AVAILABLE"),before+2_000_000);
+        assert_eq!(runtime.market_collateral.get(&market),Some(&2_000_000));assert_eq!(runtime.fee_revenue_atomic,fees);
+        let other_after=runtime.portfolio(other).unwrap();assert_eq!(other_after.balances,other_before.balances);assert_eq!(other_after.positions,other_before.positions);assert_eq!(other_after.open_orders,other_before.open_orders);
+        for outcome in [Outcome::Up,Outcome::Down] {let key=(owner.into(),market.clone(),outcome);assert_eq!(runtime.total_position(&key),0);assert_eq!(runtime.position_cost_basis.get(&key),Some(&0));}
+        let count=store.artifacts().unwrap().len();assert_eq!(runtime.execute_committed(command.clone(),&[8;32],&mut store).unwrap(),result);assert_eq!(store.artifacts().unwrap().len(),count);
+        let mut restored=DirectRuntime::restore_committed(epoch,RuntimeMode::IsolatedTest,vec![7;32],&[8;32],&store).unwrap();assert_eq!(restored.state_hash(),runtime.state_hash());assert_eq!(restored.execute_committed(command,&[8;32],&mut store).unwrap(),result);assert_eq!(store.artifacts().unwrap().len(),count);
+    }
+    #[test]
+    fn complete_set_redemption_rejects_missing_claims_and_invalid_amount_without_effect() {
+        let (_,mut runtime,mut store,market)=complete_set_redemption_fixture();
+        for quantity in ["0","02000000","2000001","-1"] {
+            let hash=runtime.state_hash();let count=store.artifacts().unwrap().len();
+            assert!(runtime.execute_committed(request(&format!("invalid-pair-{quantity}"),DirectAction::RedeemCompleteSet {market_id:market.clone(),quantity_micros:quantity.into()}),&[8;32],&mut store).is_err());
+            assert_eq!(runtime.state_hash(),hash);assert_eq!(store.artifacts().unwrap().len(),count);
+        }
+        runtime.market_collateral.insert(market.clone(),1_999_999);let hash=runtime.state_hash();
+        assert!(runtime.execute_committed(request("underbacked-pair",DirectAction::RedeemCompleteSet {market_id:market,quantity_micros:"2000000".into()}),&[8;32],&mut store).is_err());assert_eq!(runtime.state_hash(),hash);
+    }
+    #[test]
+    fn complete_set_redemption_does_not_consume_claims_held_in_orders() {
+        let (_,mut runtime,mut store,market)=complete_set_redemption_fixture();
+        runtime.execute_committed(request("pair-held-sell",DirectAction::PlaceOrder {order_id:Uuid::from_u128(200).to_string(),market_id:market.clone(),outcome:Outcome::Up,action:OrderAction::Sell,price_micros:900_000,quantity_micros:"2000000".into(),time_in_force:TimeInForce::Gtc,expires_at_millis:None,now_millis:2000}),&[8;32],&mut store).unwrap();
+        let before=runtime.state_hash();let count=store.artifacts().unwrap().len();assert_eq!(runtime.execute_committed(request("held-pair-redeem",DirectAction::RedeemCompleteSet {market_id:market,quantity_micros:"2000000".into()}),&[8;32],&mut store).unwrap_err(),RuntimeError::InsufficientAvailable);assert_eq!(runtime.state_hash(),before);assert_eq!(store.artifacts().unwrap().len(),count);
+    }
     #[test]
     fn native_clob_mint_fill_settles_fees_positions_and_replays_exactly_once_after_restart() {
         const MARKET: &str = "layrs:v5:BTC:USDC:15m:direct-fill-fixture";

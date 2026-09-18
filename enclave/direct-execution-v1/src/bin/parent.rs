@@ -1998,6 +1998,10 @@ enum CustomerAction {
     CancelOrder {
         order_id: String,
     },
+    RedeemCompleteSet {
+        market_id: String,
+        quantity_micros: String,
+    },
     ReserveWithdrawal {
         destination: String,
         amount_atomic: String,
@@ -2536,7 +2540,11 @@ async fn command(
         CustomerAction::CancelOrder { order_id } if !external_effect_pending => {
             DirectAction::CancelOrder { order_id }
         }
-        CustomerAction::PlaceOrder { .. } | CustomerAction::CancelOrder { .. } => {
+        CustomerAction::RedeemCompleteSet { market_id, quantity_micros } if !external_effect_pending => {
+            DirectAction::RedeemCompleteSet { market_id, quantity_micros }
+        }
+        CustomerAction::PlaceOrder { .. } | CustomerAction::CancelOrder { .. }
+        | CustomerAction::RedeemCompleteSet { .. } => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "EXTERNAL_EFFECT_FINALITY_PENDING",
