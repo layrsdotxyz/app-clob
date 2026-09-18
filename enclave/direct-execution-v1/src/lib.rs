@@ -2942,13 +2942,17 @@ impl DirectRuntime {
                 .orders
                 .get(order_id)
                 .ok_or(RuntimeError::UnknownOrder)?;
-            let desired = match reservation.order.action {
+            // Remaining quantity describes the unfilled intent, not an active
+            // entitlement. Terminal orders must never retain cash or positions.
+            let desired = if !matches!(reservation.order.status, OrderStatus::Open | OrderStatus::PartiallyFilled) {
+                0
+            } else { match reservation.order.action {
                 OrderAction::Buy => settlement_atomic(self.markets.get(&reservation.order.market_id).ok_or(RuntimeError::InvalidMarket)?, direct_notional(
                     reservation.order.price_micros,
                     reservation.order.remaining_micros,
                 )?)?,
                 OrderAction::Sell => reservation.order.remaining_micros,
-            };
+            }};
             if reservation.hold_atomic < desired {
                 return Err(RuntimeError::InvalidOrder);
             }
@@ -2996,6 +3000,22 @@ impl DirectRuntime {
             .ok_or(RuntimeError::UnknownOrder)?;
         if reservation.order.private_user_id != identity {
             return Err(RuntimeError::IdentityDenied);
+        }
+        // Governed recovery for predecessor FOK rejections: these orders were
+        // rejected before book insertion, but retained their original hold.
+        // Preserve REJECTED, release only the recorded reservation, and make
+        // subsequent owner requests harmless. Never bypass an active book order.
+        if reservation.order.status == OrderStatus::Rejected
+            && reservation.order.time_in_force == TimeInForce::Fok
+            && reservation.order.filled_micros == 0
+        {
+            let book = self.books.get(&reservation.order.market_id)
+                .ok_or(RuntimeError::InvalidMarket)?;
+            if book.order(reservation.order.order_id).is_some() {
+                return Err(RuntimeError::InvalidOrder);
+            }
+            self.release_excess_order_hold(order_id)?;
+            return Ok(reservation.hold_atomic);
         }
         let mut book = self
             .books
@@ -5790,6 +5810,85 @@ mod tests {
         let restarted = runtime(RuntimeMode::Dormant);
         assert_eq!(restarted.balance(identity, "USDC", "USER_AVAILABLE"), start);
         assert_eq!(restarted.balance(identity, "USDC", "USER_SETTLED"), 0);
+    }
+
+    #[test]
+    fn rejected_fok_releases_cash_and_positions_without_fill_or_fee() {
+        for action in [OrderAction::Buy, OrderAction::Sell] {
+            let (mut live, subject, identity, _, mut store) = bus_fixture();
+            let market = "layrs:v5:BTC:USDC:15m:fok-rejection";
+            live.execute_committed(market_registration_request(market, "fok-market"), &[8;32], &mut store).unwrap();
+            let key = (identity.clone(), market.to_string(), Outcome::Up);
+            if action == OrderAction::Sell { live.positions.insert(key.clone(), 2_000_000); }
+            let start = live.balance(&identity, "USDC", "USER_AVAILABLE");
+            let command = request_for(&subject, &identity, "rejected-fok", DirectAction::PlaceOrder {
+                order_id: BUS_ID.into(), market_id: market.into(), outcome: Outcome::Up, action,
+                price_micros: 500_000, quantity_micros: "2000000".into(), time_in_force: TimeInForce::Fok,
+                expires_at_millis: None, now_millis: 1_000,
+            });
+            let result = live.execute_committed(command.clone(), &[8;32], &mut store).unwrap();
+            let execution = result.receipt.execution.as_ref().unwrap();
+            assert_eq!(execution.status, OrderStatus::Rejected);
+            assert_eq!(execution.executed_quantity_micros, "0");
+            assert!(execution.trades.is_empty());
+            assert_eq!(execution.total_fee_atomic, "0");
+            assert_eq!(live.orders[BUS_ID].hold_atomic, 0);
+            assert_eq!(live.balance(&identity, "USDC", "USER_ORDER_HOLD"), 0);
+            assert_eq!(live.balance(&identity, "USDC", "USER_AVAILABLE"), start);
+            if action == OrderAction::Sell { assert_eq!(live.positions[&key], 2_000_000); }
+            // SELL inventory above is a synthetic in-memory fixture; BUY uses
+            // the genuine committed deposit and exercises the full restore.
+            if action == OrderAction::Sell { continue; }
+            let mut restored = runtime(RuntimeMode::IsolatedTest);
+            let mut artifacts = store.artifacts().unwrap();
+            artifacts.sort_by_key(|artifact| artifact.sequence);
+            for artifact in artifacts {
+                let sequence = artifact.sequence;
+                restored = restored.restore_next_committed(&artifact, &[8;32]).unwrap_or_else(|error| panic!("{action:?} successor {sequence}: {error:?}"));
+            }
+            assert_eq!(restored.orders[BUS_ID].hold_atomic, 0);
+            assert_eq!(restored.execute_committed(command, &[8;32], &mut store).unwrap(), result);
+        }
+    }
+
+    #[test]
+    fn predecessor_rejected_fok_hold_recovers_by_owned_command_once() {
+        let (mut live, subject, identity, _, mut store) = bus_fixture();
+        let market = "layrs:v5:BTC:USDC:15m:fok-recovery";
+        live.execute_committed(market_registration_request(market, "fok-recovery-market"), &[8;32], &mut store).unwrap();
+        live.execute_committed(request_for(&subject, &identity, "old-fok", DirectAction::PlaceOrder {
+            order_id: BUS_ID.into(), market_id: market.into(), outcome: Outcome::Up, action: OrderAction::Buy,
+            price_micros: 500_000, quantity_micros: "2000000".into(), time_in_force: TimeInForce::Fok,
+            expires_at_millis: None, now_millis: 1_000,
+        }), &[8;32], &mut store).unwrap();
+        // Synthetic predecessor snapshot reproduces the known retained hold.
+        live.move_asset_bucket(&identity, "USDC", "USER_AVAILABLE", "USER_ORDER_HOLD", 1_000_000).unwrap();
+        live.orders.get_mut(BUS_ID).unwrap().hold_atomic = 1_000_000;
+        let mut artifacts = store.artifacts().unwrap();
+        artifacts.sort_by_key(|artifact| artifact.sequence);
+        let old = artifacts.pop().unwrap();
+        let predecessor = live.seal_artifact(&old.prior_state_hash, &old.request_hash, &[8;32], old.receipt).unwrap();
+        artifacts.push(predecessor);
+        store = InMemoryDirectStateStore::from_artifacts(artifacts).unwrap();
+        let start = live.balance(&identity, "USDC", "USER_AVAILABLE");
+        assert!(matches!(live.cancel_order("wrong-owner", BUS_ID), Err(RuntimeError::IdentityDenied)));
+        assert_eq!(live.orders[BUS_ID].hold_atomic, 1_000_000);
+        let command = request_for(&subject, &identity, "owned-rejected-fok-recovery", DirectAction::CancelOrder { order_id: BUS_ID.into() });
+        let result = live.execute_committed(command.clone(), &[8;32], &mut store).unwrap();
+        assert_eq!(result.receipt.status, TerminalStatus::Applied);
+        assert_eq!(live.orders[BUS_ID].order.status, OrderStatus::Rejected);
+        assert_eq!(live.balance(&identity, "USDC", "USER_AVAILABLE"), start + 1_000_000);
+        assert_eq!(live.balance(&identity, "USDC", "USER_ORDER_HOLD"), 0);
+        let mut artifacts = store.artifacts().unwrap();
+        artifacts.sort_by_key(|artifact| artifact.sequence);
+        let head = artifacts.last().unwrap().clone();
+        let hashes = artifacts.iter().map(artifact_hash).collect();
+        let records = artifacts.into_iter().map(|mut artifact| { artifact.ciphertext.clear(); artifact }).collect();
+        let checkpoint = live.seal_checkpoint(head, records, hashes, &[8;32]).unwrap();
+        let mut restored = runtime(RuntimeMode::IsolatedTest).restore_checkpoint(&checkpoint, &[8;32]).unwrap();
+        assert_eq!(restored.execute_committed(command, &[8;32], &mut store).unwrap(), result);
+        assert_eq!(restored.cancel_order(&identity, BUS_ID).unwrap(), 0);
+        assert_eq!(restored.balance(&identity, "USDC", "USER_AVAILABLE"), start + 1_000_000);
     }
 
     #[test]
