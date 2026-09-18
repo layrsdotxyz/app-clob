@@ -242,7 +242,7 @@ impl DirectRuntime {
         let kind = match result.effect.as_str() {
             "IDENTITY_ADMITTED" if own => QuestReceiptKind::IdentityAdmission,
             "FINANCIAL_WALLET_LINKED" if own => QuestReceiptKind::WalletLink,
-            "DEPOSIT_CREDITED" if own => QuestReceiptKind::Deposit,
+            "DEPOSIT_CREDITED" | "DEPOSIT_FINALIZED" if own => QuestReceiptKind::Deposit,
             "WITHDRAWAL_SETTLED" if own => QuestReceiptKind::Withdrawal,
             "ORDER_EXECUTED"
                 if filled

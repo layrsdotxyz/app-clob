@@ -93,7 +93,7 @@ mod usdc_wallet_link;
 use usdc_wallet_link::{WalletLinkAuthority,WalletLinkGrant};
 #[path = "../usdc_bus_custody.rs"]
 mod usdc_bus_custody;
-use usdc_bus_custody::{UsdcBusCustodyAdapter,BusWithdrawalProof};
+use usdc_bus_custody::{UsdcBusCustodyAdapter,BusWithdrawalProof,BusDepositProof,BusDepositFinalizationProof};
 #[derive(Clone)]
 struct AppState {
     enclave_cid: u32,
@@ -1978,6 +1978,8 @@ enum CustomerAction {
     },
     CreditZenDeposit { transaction_hash: String, amount_atomic: String },
     CreditHorizenUsdcDeposit { transaction_hash: String, amount_atomic: String },
+    CreditArbitrumUsdcBusDeposit {operation_id:String,amount_atomic:String,proof:BusDepositProof},
+    FinalizeArbitrumUsdcBusDeposit {operation_id:String,amount_atomic:String,proof:BusDepositFinalizationProof},
     BeginUsdcBusWithdrawal { destination: String, amount_atomic: String },
     VerifyUsdcBusWithdrawal {withdrawal_id:String,destination:String,amount_atomic:String,proof:BusWithdrawalProof},
     LinkFinancialWallet {grant:WalletLinkGrant,signature:String},
@@ -2392,6 +2394,31 @@ async fn command(
                 Err((status, code)) => return (status, code).into_response(),
             }
         }
+        CustomerAction::CreditArbitrumUsdcBusDeposit {operation_id,amount_atomic,proof} if !external_effect_pending => {
+            let Some(wallet)=claims.financial_wallet_address.as_deref() else {return (StatusCode::FORBIDDEN,"DIRECT_FINANCIAL_WALLET_REQUIRED").into_response();};
+            if request_id!=format!("usdc-bus-deposit-credit:{operation_id}") {
+                return (StatusCode::BAD_REQUEST,"DEPOSIT_IDEMPOTENCY_KEY_MISMATCH").into_response();
+            }
+            let Some(custody)=&state.usdc_bus_custody else {return (StatusCode::SERVICE_UNAVAILABLE,"USDC_BUS_CUSTODY_NOT_ENABLED").into_response();};
+            match custody.conditional_deposit(wallet,&amount_atomic,&proof).await {
+                Ok(Some(custody_reference))=>DirectAction::CreditArbitrumUsdcBusDeposit {operation_id,amount_atomic,custody_reference},
+                Ok(None)=>return (StatusCode::SERVICE_UNAVAILABLE,"BUS_BOARDING_FINALITY_PENDING").into_response(),
+                Err(_)=>return (StatusCode::CONFLICT,"BUS_BOARDING_PROOF_CONFLICT").into_response(),
+            }
+        }
+        CustomerAction::FinalizeArbitrumUsdcBusDeposit {operation_id,amount_atomic,proof} if !external_effect_pending => {
+            let Some(wallet)=claims.financial_wallet_address.as_deref() else {return (StatusCode::FORBIDDEN,"DIRECT_FINANCIAL_WALLET_REQUIRED").into_response();};
+            if request_id!=format!("usdc-bus-deposit-finalize:{operation_id}") {
+                return (StatusCode::BAD_REQUEST,"DEPOSIT_IDEMPOTENCY_KEY_MISMATCH").into_response();
+            }
+            let Some(custody)=&state.usdc_bus_custody else {return (StatusCode::SERVICE_UNAVAILABLE,"USDC_BUS_CUSTODY_NOT_ENABLED").into_response();};
+            match custody.deposit_finalization(wallet,&amount_atomic,&proof).await {
+                Ok(Some((boarding_reference,custody_reference)))=>DirectAction::FinalizeArbitrumUsdcBusDeposit {operation_id,amount_atomic,boarding_reference,custody_reference},
+                Ok(None)=>return (StatusCode::SERVICE_UNAVAILABLE,"BUS_SETTLEMENT_FINALITY_PENDING").into_response(),
+                Err(_)=>return (StatusCode::CONFLICT,"BUS_SETTLEMENT_PROOF_CONFLICT").into_response(),
+            }
+        }
+        CustomerAction::CreditArbitrumUsdcBusDeposit {..}|CustomerAction::FinalizeArbitrumUsdcBusDeposit {..}=>return (StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING").into_response(),
         CustomerAction::CreditHorizenUsdcDeposit {transaction_hash,amount_atomic} if !external_effect_pending => {
             let Some(source)=claims.financial_wallet_address.as_deref() else {return (StatusCode::FORBIDDEN,"DIRECT_FINANCIAL_WALLET_REQUIRED").into_response();};
             let hash=transaction_hash.to_ascii_lowercase();let reference=format!("horizen-usdc-deposit:{hash}");
@@ -3723,6 +3750,11 @@ fn receipt_wallet_alias(receipt: &DirectReceipt) -> Result<Option<String>, Proje
 
 fn custody_projection_binding(reference: &str) -> (i64, String) {
     let parts = reference.split(':').collect::<Vec<_>>();
+    if parts.first()==Some(&"arbitrum-usdc-bus-deposit") {
+        if let Some(hash)=parts.get(1).filter(|hash|hash.len()==66&&hash.starts_with("0x")&&hash[2..].bytes().all(|byte|byte.is_ascii_hexdigit())) {
+            return (42161,hash.to_ascii_lowercase());
+        }
+    }
     // The trusted receipt identifies the pool-side custody event. A Bus
     // settlement also carries the message GUID and destination hash; neither
     // replaces the Horizen pool transaction in the custody projection.
@@ -3754,7 +3786,7 @@ fn enum_name<T: Serialize>(value: &T) -> Result<String, ProjectionError> {
 fn receipt_custody(receipt: &DirectReceipt) -> (Option<&'static str>, Option<String>) {
     match receipt.effect.as_str() {
         "WITHDRAWAL_SETTLED" => (Some("WITHDRAWAL"), receipt.amount_atomic.clone()),
-        "DEPOSIT_CREDITED" => (Some("DEPOSIT"), receipt.amount_atomic.clone()),
+        "DEPOSIT_CREDITED"|"DEPOSIT_CONDITIONALLY_CREDITED" => (Some("DEPOSIT"), receipt.amount_atomic.clone()),
         _ => (None, None),
     }
 }
