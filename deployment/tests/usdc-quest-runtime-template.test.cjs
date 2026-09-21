@@ -36,6 +36,13 @@ test('P1 adds no resource or ingress and retains the existing ZEN bindings',()=>
   assert.ok(template.includes('"LAYRS_DIRECT_ZEN_CUSTODY_ENABLED": "true"'));
   assert.ok(!template.includes('FromPort: 8081'));
 });
+test('runtime health checks verify the enclave and replace an unhealthy host',()=>{
+  assert.match(template,/HealthCheckType: ELB/);
+  assert.match(template,/HealthCheckGracePeriod: 300/);
+  assert.match(template,/HealthCheckProtocol: HTTP/);
+  assert.match(template,/HealthCheckPath: \/healthz/);
+  assert.match(template,/Matcher: \{ HttpCode: '200-399' \}/);
+});
 test('USDC finality, principal subsidy and native fee bindings are independently explicit',()=>{
   assert.ok(template.includes('ArbitrumConfirmations: { Type: Number, Default: 1, AllowedValues: [1] }'));
   for(const [variable,parameter] of [

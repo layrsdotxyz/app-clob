@@ -369,6 +369,8 @@ Resources:
       MinSize: '0'
       MaxSize: '1'
       DesiredCapacity: !Ref DormantRuntimeDesiredCapacity
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
       TargetGroupARNs: [!Ref ReadOnlyRuntimeTargetGroup]
       Tags: [{ Key: WriterEnabled, Value: !If [FinancialWriterEnabled, 'true', 'false'], PropagateAtLaunch: true }]
   ReadOnlyRuntimeLoadBalancer:
@@ -390,8 +392,10 @@ Resources:
       Port: 8443
       TargetGroupAttributes:
         - { Key: load_balancing.cross_zone.enabled, Value: 'true' }
-      HealthCheckProtocol: TCP
+      HealthCheckProtocol: HTTP
       HealthCheckPort: '8443'
+      HealthCheckPath: /healthz
+      Matcher: { HttpCode: '200-399' }
       HealthyThresholdCount: 3
       UnhealthyThresholdCount: 3
   ReadOnlyRuntimeListener:
