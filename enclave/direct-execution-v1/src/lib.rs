@@ -2744,14 +2744,18 @@ impl DirectRuntime {
         {
             return Err(RuntimeError::InvalidOrder);
         }
+        let position_key = (identity.to_string(), market_id.to_string(), outcome);
+        let existing_position = self.total_position(&position_key);
         let order_notional = direct_notional(price_micros, quantity)?;
-        if order_notional < market.minimum_order_notional_micros
+        let is_exact_full_position_close = action == OrderAction::Sell
+            && quantity > 0
+            && quantity == existing_position;
+        if (order_notional < market.minimum_order_notional_micros
+            && !is_exact_full_position_close)
             || order_notional > market.maximum_order_notional_micros
         {
             return Err(RuntimeError::InvalidOrder);
         }
-        let position_key = (identity.to_string(), market_id.to_string(), outcome);
-        let existing_position = self.total_position(&position_key);
         if action == OrderAction::Buy
             && existing_position
                 .checked_add(quantity)
@@ -4321,6 +4325,83 @@ mod tests {
     }
     fn runtime(mode: RuntimeMode) -> DirectRuntime {
         DirectRuntime::new(SealedEpoch::load(epoch_path()).unwrap(), mode, vec![7; 32]).unwrap()
+    }
+
+    fn runtime_with_one_usdc_minimum_market(
+        market_id: &str,
+        identity: &str,
+        position_quantity: u128,
+    ) -> DirectRuntime {
+        let mut live = runtime(RuntimeMode::IsolatedTest);
+        let mut registration = market_registration_request(market_id, "full-close-market");
+        let DirectAction::RegisterMarket { registration: release, .. } = &mut registration.action else {
+            unreachable!()
+        };
+        release.market.minimum_order_notional_micros = 1_000_000;
+        registration.request_hash = request_hash(&registration);
+        live.execute(registration).unwrap();
+        live.positions.insert(
+            (identity.to_string(), market_id.to_string(), Outcome::Up),
+            position_quantity,
+        );
+        live
+    }
+
+    #[test]
+    fn direct_runtime_allows_only_exact_full_position_sell_below_minimum_notional() {
+        const MARKET: &str = "layrs:v5:BTC:USDC:1h:full-close";
+        const IDENTITY: &str = "full-close-identity";
+        const POSITION: u128 = 1_919_385;
+
+        let mut exact = runtime_with_one_usdc_minimum_market(MARKET, IDENTITY, POSITION);
+        assert!(exact
+            .place_order(
+                IDENTITY,
+                &Uuid::from_u128(1).to_string(),
+                MARKET,
+                Outcome::Up,
+                OrderAction::Sell,
+                490_000,
+                &POSITION.to_string(),
+                TimeInForce::Gtc,
+                None,
+                1_000,
+            )
+            .is_ok());
+
+        let mut partial = runtime_with_one_usdc_minimum_market(MARKET, IDENTITY, POSITION);
+        assert_eq!(
+            partial.place_order(
+                IDENTITY,
+                &Uuid::from_u128(2).to_string(),
+                MARKET,
+                Outcome::Up,
+                OrderAction::Sell,
+                490_000,
+                &(POSITION - 1).to_string(),
+                TimeInForce::Gtc,
+                None,
+                1_000,
+            ),
+            Err(RuntimeError::InvalidOrder)
+        );
+
+        let mut buy = runtime_with_one_usdc_minimum_market(MARKET, IDENTITY, POSITION);
+        assert_eq!(
+            buy.place_order(
+                IDENTITY,
+                &Uuid::from_u128(3).to_string(),
+                MARKET,
+                Outcome::Up,
+                OrderAction::Buy,
+                490_000,
+                &POSITION.to_string(),
+                TimeInForce::Gtc,
+                None,
+                1_000,
+            ),
+            Err(RuntimeError::InvalidOrder)
+        );
     }
 
     #[test]
