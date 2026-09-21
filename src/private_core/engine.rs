@@ -10538,7 +10538,7 @@ impl PrivateTradingCore {
                     .markets
                     .get(&order.market_id)
                     .ok_or_else(|| CoreError::InvalidOrder("unknown market".into()))?;
-                validate_order_for_market(&order, market, now_millis)?;
+                validate_order_for_market(&order, market, &ledger, now_millis)?;
                 match &market.execution {
                     MarketExecution::NativeClob | MarketExecution::NativeExactCondition { .. } => {
                         // GTD deadlines are consensus inputs, but wall-clock
@@ -11047,7 +11047,7 @@ impl PrivateTradingCore {
                 incoming.filled_micros = 0;
                 incoming.remaining_micros = incoming.quantity_micros;
                 incoming.status = OrderStatus::Open;
-                validate_order_for_market(&incoming, market, now_millis)?;
+                validate_order_for_market(&incoming, market, &ledger, now_millis)?;
                 enforce_user_position_limit(
                     &ledger,
                     &books,
@@ -14259,6 +14259,7 @@ pub fn exact_condition_resolution_signing_payload(
 fn validate_order_for_market(
     order: &BookOrder,
     market: &MarketConfig,
+    ledger: &Ledger,
     now_millis: i64,
 ) -> CoreResult<()> {
     if now_millis < market.opens_at_millis || now_millis >= market.closes_at_millis {
@@ -14273,7 +14274,14 @@ fn validate_order_for_market(
         ));
     }
     let order_notional = notional(order.price_micros, order.quantity_micros)?;
-    if order_notional < market.minimum_order_notional_micros
+    let is_full_position_close = order.action == OrderAction::Sell
+        && order.quantity_micros > 0
+        && order.quantity_micros
+            == ledger.total_for_owner_asset(
+                &order.private_user_id,
+                &claim_asset(&order.market_id, order.outcome),
+            );
+    if (order_notional < market.minimum_order_notional_micros && !is_full_position_close)
         || order_notional > market.maximum_order_notional_micros
     {
         return Err(CoreError::InvalidOrder(
@@ -14289,6 +14297,90 @@ fn validate_order_for_market(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod full_position_close_validation_tests {
+    use super::*;
+
+    fn market() -> MarketConfig {
+        MarketConfig {
+            market_id: "layrs:v5:BTC:USDC:1h:2000".into(),
+            settlement_asset: "USDC".into(),
+            settlement_decimals: 6,
+            public_settlement_chain: Some("horizen".into()),
+            opens_at_millis: 1_000,
+            closes_at_millis: 2_000,
+            minimum_quantity_micros: 1,
+            maximum_quantity_micros: 100_000_000,
+            minimum_order_notional_micros: 1_000_000,
+            maximum_order_notional_micros: 100_000_000,
+            maximum_user_position_micros: 250_000_000,
+            maximum_pending_bootstrap_notional_micros: 100_000_000,
+            tick_size_micros: 1_000,
+            oracle_feed_id: 1,
+            fee_profile_id: FeeProfileId::CryptoV1,
+            execution: MarketExecution::NativeClob,
+        }
+    }
+
+    fn sell(quantity_micros: u128) -> BookOrder {
+        BookOrder::new(
+            "usr_full_close",
+            "layrs:v5:BTC:USDC:1h:2000",
+            Outcome::Up,
+            OrderAction::Sell,
+            480_000,
+            quantity_micros,
+            TimeInForce::Fak,
+            None,
+        )
+    }
+
+    #[test]
+    fn exact_full_position_sell_bypasses_only_the_minimum_notional() {
+        let quantity = 1_919_385;
+        let mut ledger = Ledger::default();
+        ledger
+            .seed_balance(
+                claim_position_for("usr_full_close", "layrs:v5:BTC:USDC:1h:2000", Outcome::Up),
+                quantity,
+            )
+            .unwrap();
+
+        assert!(validate_order_for_market(&sell(quantity), &market(), &ledger, 1_500).is_ok());
+    }
+
+    #[test]
+    fn partial_sell_and_buy_cannot_bypass_the_minimum_notional() {
+        let quantity = 1_919_385;
+        let mut ledger = Ledger::default();
+        ledger
+            .seed_balance(
+                claim_position_for("usr_full_close", "layrs:v5:BTC:USDC:1h:2000", Outcome::Up),
+                quantity,
+            )
+            .unwrap();
+        let expected = CoreError::InvalidOrder("order violates the notional limits".into());
+        assert_eq!(
+            validate_order_for_market(&sell(quantity - 1), &market(), &ledger, 1_500),
+            Err(expected.clone())
+        );
+        let buy = BookOrder::new(
+            "usr_full_close",
+            "layrs:v5:BTC:USDC:1h:2000",
+            Outcome::Up,
+            OrderAction::Buy,
+            480_000,
+            quantity,
+            TimeInForce::Fak,
+            None,
+        );
+        assert_eq!(
+            validate_order_for_market(&buy, &market(), &ledger, 1_500),
+            Err(expected)
+        );
+    }
 }
 
 fn checked_sequence(sequence: u64) -> CoreResult<u64> {
@@ -14525,7 +14617,7 @@ fn position_close_order(
         TimeInForce::Fok,
         None,
     );
-    validate_order_for_market(&order, market, now_millis)?;
+    validate_order_for_market(&order, market, ledger, now_millis)?;
     Ok(order)
 }
 
