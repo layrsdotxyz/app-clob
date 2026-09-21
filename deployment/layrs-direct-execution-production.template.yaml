@@ -57,6 +57,9 @@ Parameters:
   UsdcMaximumSubsidyAtomic: { Type: Number, Default: 10000, MinValue: 1, MaxValue: 5000000 }
   UsdcMaximumBridgeFeeWei: { Type: Number, Default: 100000000000000, MinValue: 1 }
   ArbitrumConfirmations: { Type: Number, Default: 1, AllowedValues: [1] }
+  EthereumConfirmations: { Type: Number, Default: 12, MinValue: 1 }
+  PolygonConfirmations: { Type: Number, Default: 128, MinValue: 1 }
+  TempoConfirmations: { Type: Number, Default: 1, MinValue: 1 }
   # A dormant verifier may run to support attestation and health checks, but
   # its process mode remains `dormant` and has no writer authority.
   DormantRuntimeDesiredCapacity: { Type: Number, Default: 1, MinValue: 0, MaxValue: 1 }
@@ -70,6 +73,7 @@ Rules:
           - !Not [!Equals [!Ref UsdcLedgerWalletAddress, '']]
           - !Not [!Equals [!Ref UsdcLedgerWalletAddress, '0x0000000000000000000000000000000000000000']]
           - !Not [!Equals [!Ref UsdcAdministratorPublicKeyDerBase64, '']]
+          - !Not [!Equals [!Ref RelayObservationSecretArn, '']]
         AssertDescription: P1 requires the production writer, exact RPC secret, custody address and public link authority.
 Conditions:
   FinancialWriterEnabled: !Equals [!Ref ExecutionMode, production-enabled]
@@ -309,8 +313,18 @@ Resources:
                         "LAYRS_DIRECT_USDC_CUSTODY_ENABLED": "true",
                         "LAYRSV2_HORIZEN_RPC_URL": required(usdc_rpc, "horizenRpcUrl"),
                         "LAYRSV2_ARBITRUM_RPC_URL": required(usdc_rpc, "arbitrumRpcUrl"),
+                        "LAYRSV2_BASE_RPC_URL": required(usdc_rpc, "baseRpcUrl"),
+                        "LAYRSV2_ETHEREUM_RPC_URL": required(usdc_rpc, "ethereumRpcUrl"),
+                        "LAYRSV2_POLYGON_RPC_URL": required(usdc_rpc, "polygonRpcUrl"),
+                        "LAYRSV2_TEMPO_RPC_URL": required(usdc_rpc, "tempoRpcUrl"),
+                        "LAYRSV2_SOLANA_RPC_URL": required(usdc_rpc, "solanaRpcUrl"),
+                        "LAYRSV2_ROBINHOOD_RPC_URL": required(usdc_rpc, "robinhoodRpcUrl"),
                         "LAYRSV2_HORIZEN_CONFIRMATIONS": "${HorizenConfirmations}",
                         "LAYRSV2_ARBITRUM_CONFIRMATIONS": "${ArbitrumConfirmations}",
+                        "LAYRSV2_BASE_CONFIRMATIONS": "${BaseConfirmations}",
+                        "LAYRSV2_ETHEREUM_CONFIRMATIONS": "${EthereumConfirmations}",
+                        "LAYRSV2_POLYGON_CONFIRMATIONS": "${PolygonConfirmations}",
+                        "LAYRSV2_TEMPO_CONFIRMATIONS": "${TempoConfirmations}",
                         "LAYRS_DIRECT_USDC_LEDGER_WALLET_ADDRESS": "${UsdcLedgerWalletAddress}",
                         "LAYRS_DIRECT_USDC_MAX_SUBSIDY_ATOMIC": "${UsdcMaximumSubsidyAtomic}",
                         "LAYRS_DIRECT_USDC_MAX_BRIDGE_FEE_WEI": "${UsdcMaximumBridgeFeeWei}",

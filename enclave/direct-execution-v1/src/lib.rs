@@ -840,11 +840,11 @@ pub enum DirectAction {
     LinkFinancialWallet { wallet_address: String },
     /// Commit a per-user hold before custody movement. A Bus wait must not
     /// become the legacy global unresolved-external-effect writer fence.
-    BeginUsdcBusWithdrawal { withdrawal_id: String, destination: String, amount_atomic: String },
+    BeginUsdcBusWithdrawal { withdrawal_id: String, destination_chain:String, asset:String, destination: String, amount_atomic: String },
     /// Internal, parent-verified terminal proof; never a public customer action.
-    SettleUsdcBusWithdrawal { withdrawal_id: String, destination: String, amount_atomic: String, custody_reference: String },
+    SettleUsdcBusWithdrawal { withdrawal_id: String, destination_chain:String, asset:String, destination: String, amount_atomic: String, custody_reference: String },
     /// Release only on an independently verified reverted pool transaction.
-    RevertUsdcBusWithdrawal { withdrawal_id: String, destination: String, amount_atomic: String, custody_reference: String },
+    RevertUsdcBusWithdrawal { withdrawal_id: String, destination_chain:String, asset:String, destination: String, amount_atomic: String, custody_reference: String },
     PlaceOrder {
         order_id: String,
         market_id: String,
@@ -1274,6 +1274,8 @@ struct UsdcBusHold {
     account_id: String,
     identity_commitment: String,
     destination: String,
+    destination_chain:String,
+    asset:String,
     amount_atomic: String,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -1367,7 +1369,7 @@ fn validate_conditional_deposits(state: &DirectState, key: &[u8]) -> Result<(), 
 fn reconstruct_bus_holds(state: &DirectState, receipt_key: &[u8]) -> Result<BTreeMap<String, UsdcBusHold>, RuntimeError> {
     let invalid = || RuntimeError::StateArtifact;
     let mut holds = BTreeMap::new();
-    let mut totals = BTreeMap::<String, u128>::new();
+    let mut totals = BTreeMap::<(String,String), u128>::new();
     for ((account, id), (hash, result)) in &state.requests {
         let receipt = &result.receipt;
         let terminal = id.starts_with("usdc-bus-settle:") || id.starts_with("usdc-bus-revert:");
@@ -1392,10 +1394,16 @@ fn reconstruct_bus_holds(state: &DirectState, receipt_key: &[u8]) -> Result<BTre
             continue;
         }
         let reference = receipt.custody_reference.as_deref().ok_or_else(invalid)?;
-        let destination = reference.strip_prefix(&format!("usdc-bus-reservation:{id}:")).ok_or_else(invalid)?;
+        let binding = reference.strip_prefix(&format!("usdc-bus-reservation:{id}:")).ok_or_else(invalid)?;
+        // Pre-route-expansion artifacts contained only the destination and are
+        // therefore the original Arbitrum USDC route. New artifacts bind the
+        // exact route and asset into the immutable receipt.
+        let (destination_chain,asset,destination)=if let Some((chain,rest))=binding.split_once(':') {
+            let (asset,destination)=rest.split_once(':').ok_or_else(invalid)?;(chain,asset,destination)
+        }else {("arbitrum","USDC",binding)};
         let atomic = receipt.amount_atomic.as_deref().ok_or_else(invalid)?;
         let value = amount(atomic).map_err(|_| invalid())?;
-        if !valid_bus_withdrawal_id(id) || !valid_evm_wallet(destination) || destination != destination.to_ascii_lowercase()
+        if !valid_bus_withdrawal_id(id)||!valid_layrs_withdrawal_destination(destination_chain,asset,destination)
             || value.to_string() != atomic { return Err(invalid()); }
         let settled = state.requests.contains_key(&(account.clone(), format!("usdc-bus-settle:{id}")));
         let reverted = state.requests.contains_key(&(account.clone(), format!("usdc-bus-revert:{id}")));
@@ -1403,15 +1411,17 @@ fn reconstruct_bus_holds(state: &DirectState, receipt_key: &[u8]) -> Result<BTre
         if settled || reverted { continue; }
         if holds.values().any(|hold: &UsdcBusHold| hold.identity_commitment == receipt.identity_commitment)
             || holds.insert(id.clone(), UsdcBusHold { account_id: account.clone(), identity_commitment: receipt.identity_commitment.clone(),
-                destination: destination.into(), amount_atomic: atomic.into() }).is_some() { return Err(invalid()); }
-        let total = totals.entry(receipt.identity_commitment.clone()).or_default();
+                destination:destination.into(),destination_chain:destination_chain.into(),asset:asset.into(),amount_atomic:atomic.into() }).is_some() { return Err(invalid()); }
+        let total = totals.entry((receipt.identity_commitment.clone(),asset.into())).or_default();
         *total = total.checked_add(value).ok_or_else(invalid)?;
     }
-    // Legacy withdrawals move through this bucket atomically and leave no
-    // persistent USDC hold. A missing receipt must never unlock held value.
+    // Legacy withdrawals move atomically and leave no persistent hold. A
+    // missing receipt must never unlock either supported ledger asset.
     for (identity, balances) in &state.balances {
-        let actual = balances.get(&("USDC".into(), "USER_WITHDRAWAL_HOLD".into())).copied().unwrap_or_default();
-        if actual != totals.remove(identity).unwrap_or_default() { return Err(invalid()); }
+        for asset in ["USDC","ZEN"] {
+            let actual = balances.get(&(asset.into(), "USER_WITHDRAWAL_HOLD".into())).copied().unwrap_or_default();
+            if actual != totals.remove(&(identity.clone(),asset.into())).unwrap_or_default() { return Err(invalid()); }
+        }
     }
     if !totals.is_empty() { return Err(invalid()); }
     Ok(holds)
@@ -1719,10 +1729,7 @@ impl DirectRuntime {
             DirectAction::ReserveWithdrawal { destination, .. }
             | DirectAction::RecordWithdrawalReverted { destination, .. }
             | DirectAction::ReserveZenWithdrawal { destination, .. }
-            | DirectAction::RecordZenWithdrawalReverted { destination, .. }
-            | DirectAction::BeginUsdcBusWithdrawal { destination, .. }
-            | DirectAction::SettleUsdcBusWithdrawal { destination, .. }
-            | DirectAction::RevertUsdcBusWithdrawal { destination, .. } => {
+            | DirectAction::RecordZenWithdrawalReverted { destination, .. } => {
                 let Some(wallet) = financial_wallet.as_deref() else {
                     return Err(RuntimeError::DestinationDenied);
                 };
@@ -1733,6 +1740,13 @@ impl DirectRuntime {
                 if !valid_evm_wallet(wallet) || !wallet.eq_ignore_ascii_case(destination) {
                     return Err(RuntimeError::DestinationDenied);
                 }
+            }
+            DirectAction::BeginUsdcBusWithdrawal {destination_chain,asset,destination,..}
+            | DirectAction::SettleUsdcBusWithdrawal {destination_chain,asset,destination,..}
+            | DirectAction::RevertUsdcBusWithdrawal {destination_chain,asset,destination,..} => {
+                let Some(wallet)=financial_wallet.as_deref() else {return Err(RuntimeError::DestinationDenied);};
+                if !valid_evm_wallet(wallet)||!self.subject_wallets.get(&request.account_id).is_some_and(|wallets|wallets.contains(wallet))
+                    ||!valid_layrs_withdrawal_destination(destination_chain,asset,destination){return Err(RuntimeError::DestinationDenied);}
             }
             DirectAction::SettleRelayWithdrawal { .. }
             | DirectAction::RecordRelayWithdrawalReverted { .. } => {
@@ -1954,50 +1968,56 @@ impl DirectRuntime {
                     self.subject_wallets.entry(request.account_id.clone()).or_default().insert(wallet.clone());
                     ("FINANCIAL_WALLET_LINKED".into(),None,Some(format!("wallet-link:{wallet}")))
                 }
-                DirectAction::BeginUsdcBusWithdrawal {withdrawal_id,destination,amount_atomic} => {
+                DirectAction::BeginUsdcBusWithdrawal {withdrawal_id,destination_chain,asset,destination,amount_atomic} => {
                     let value=amount(amount_atomic)?;
                     if !valid_bus_withdrawal_id(withdrawal_id)||withdrawal_id!=&request.request_id||value.to_string()!=*amount_atomic {return Err(RuntimeError::InvalidRequest);}
                     if self.usdc_bus_withdrawals.contains_key(withdrawal_id) {return Err(RuntimeError::RequestReuse);}
                     if self.usdc_bus_withdrawals.values().any(|hold|hold.identity_commitment==request.identity_commitment) {
                         return Err(RuntimeError::WithdrawalPending);
                     }
-                    if self.balance(&request.identity_commitment,"USDC","USER_AVAILABLE")<value {
+                    let ledger_asset=if asset=="ZEN" {"ZEN"} else {"USDC"};
+                    if self.balance(&request.identity_commitment,ledger_asset,"USER_AVAILABLE")<value {
                         // Commit a money-free rejection under the original ID.
                         // A future deposit must never turn this refused request
                         // into a delayed payout after the UI cleared it.
                         ("WITHDRAWAL_REJECTED".into(),Some(amount_atomic.clone()),Some(format!("usdc-bus-rejection:{withdrawal_id}:INSUFFICIENT_AVAILABLE")))
                     } else {
-                        self.verify_settled_usdc_withdrawal(&request.identity_commitment,value)?;
-                        self.move_asset_bucket(&request.identity_commitment,"USDC","USER_AVAILABLE","USER_WITHDRAWAL_HOLD",value)?;
+                        if ledger_asset=="USDC" {self.verify_settled_usdc_withdrawal(&request.identity_commitment,value)?;}
+                        self.move_asset_bucket(&request.identity_commitment,ledger_asset,"USER_AVAILABLE","USER_WITHDRAWAL_HOLD",value)?;
                         self.usdc_bus_withdrawals.insert(withdrawal_id.clone(),UsdcBusHold {account_id:request.account_id.clone(),
-                            identity_commitment:request.identity_commitment.clone(),destination:destination.to_ascii_lowercase(),amount_atomic:amount_atomic.clone()});
-                        ("WITHDRAWAL_RESERVED".into(),Some(amount_atomic.clone()),Some(format!("usdc-bus-reservation:{withdrawal_id}:{}",destination.to_ascii_lowercase())))
+                            identity_commitment:request.identity_commitment.clone(),destination:if destination_chain=="solana" {destination.clone()}else{destination.to_ascii_lowercase()},
+                            destination_chain:destination_chain.clone(),asset:asset.clone(),amount_atomic:amount_atomic.clone()});
+                        ("WITHDRAWAL_RESERVED".into(),Some(amount_atomic.clone()),Some(format!("usdc-bus-reservation:{withdrawal_id}:{destination_chain}:{asset}:{}",if destination_chain=="solana" {destination.clone()}else{destination.to_ascii_lowercase()})))
                     }
                 }
-                DirectAction::SettleUsdcBusWithdrawal {withdrawal_id,destination,amount_atomic,custody_reference}
-                | DirectAction::RevertUsdcBusWithdrawal {withdrawal_id,destination,amount_atomic,custody_reference} => {
+                DirectAction::SettleUsdcBusWithdrawal {withdrawal_id,destination_chain,asset,destination,amount_atomic,custody_reference}
+                | DirectAction::RevertUsdcBusWithdrawal {withdrawal_id,destination_chain,asset,destination,amount_atomic,custody_reference} => {
                     let value=amount(amount_atomic)?;
                     let reverted=matches!(&request.action,DirectAction::RevertUsdcBusWithdrawal {..});
                     let expected_request=format!("usdc-bus-{}:{withdrawal_id}",if reverted {"revert"} else {"settle"});
                     let hold=self.usdc_bus_withdrawals.get(withdrawal_id).ok_or(RuntimeError::InvalidRequest)?;
                     if request.request_id!=expected_request || hold.account_id!=request.account_id
-                        ||hold.identity_commitment!=request.identity_commitment||hold.destination!=destination.to_ascii_lowercase()
+                        ||hold.identity_commitment!=request.identity_commitment||hold.destination!=if destination_chain=="solana" {destination.clone()}else{destination.to_ascii_lowercase()}
+                        ||hold.destination_chain!=*destination_chain||hold.asset!=*asset
                         ||hold.amount_atomic!=*amount_atomic||!valid_bus_terminal_reference(custody_reference,reverted) {
                         return Err(RuntimeError::DestinationDenied);
                     }
                     // Existing state field, domain-separated references. No new
                     // always-present schema field breaks a drained fallback.
                     let parts=custody_reference.split(':').collect::<Vec<_>>();
-                    let pool_reference=format!("horizen-usdc-bus-pool:{}",parts[1]);
-                    let delivery_reference=if reverted {None} else {Some(format!("horizen-usdc-bus-delivery:{}:{}",parts[3],parts[5]))};
-                    let seat_reference=if reverted {None} else {Some(format!("horizen-usdc-bus-seat:{}:{}",parts[2],parts[4]))};
+                    let local=!reverted&&parts.first()==Some(&"horizen-usdc-local");
+                    let zen=asset=="ZEN";
+                    let pool_reference=if local||zen {custody_reference.clone()}else{format!("horizen-usdc-bus-pool:{}",parts[1])};
+                    let delivery_reference=if reverted||local||zen {None} else {Some(format!("horizen-usdc-bus-delivery:{}:{}",parts[3],parts[5]))};
+                    let seat_reference=if reverted||local||zen {None} else {Some(format!("horizen-usdc-bus-seat:{}:{}",parts[2],parts[4]))};
                     if self.credited_custody_references.contains(custody_reference)
                         ||self.credited_custody_references.contains(&pool_reference)
                         ||delivery_reference.as_ref().is_some_and(|reference|self.credited_custody_references.contains(reference))
                         ||seat_reference.as_ref().is_some_and(|reference|self.credited_custody_references.contains(reference)) {
                         return Err(RuntimeError::CustodyReferenceReuse);
                     }
-                    self.move_asset_bucket(&request.identity_commitment,"USDC","USER_WITHDRAWAL_HOLD",
+                    let ledger_asset=if hold.asset=="ZEN" {"ZEN"} else {"USDC"};
+                    self.move_asset_bucket(&request.identity_commitment,ledger_asset,"USER_WITHDRAWAL_HOLD",
                         if reverted {"USER_AVAILABLE"} else {"USER_SETTLED"},value)?;
                     self.credited_custody_references.insert(custody_reference.clone());
                     self.credited_custody_references.insert(pool_reference);
@@ -4066,6 +4086,22 @@ fn valid_deposit_custody_reference(reference: &str) -> bool {
 fn valid_bus_withdrawal_id(value:&str)->bool {
     uuid::Uuid::parse_str(value).is_ok_and(|id|id.to_string()==value&&!id.is_nil())
 }
+fn valid_solana_wallet(value:&str)->bool {
+    if !(32..=44).contains(&value.len()) {return false;}
+    let alphabet=b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let mut bytes=Vec::<u8>::new();
+    for character in value.bytes(){let Some(digit)=alphabet.iter().position(|byte|*byte==character) else{return false;};
+        let mut carry=digit as u32;for byte in bytes.iter_mut().rev(){let next=u32::from(*byte)*58+carry;*byte=(next&255) as u8;carry=next>>8;}
+        while carry>0 {bytes.insert(0,(carry&255) as u8);carry>>=8;}}
+    value.bytes().take_while(|byte|*byte==b'1').count()+bytes.len()==32
+}
+pub fn valid_layrs_withdrawal_destination(chain:&str,asset:&str,destination:&str)->bool {
+    match (chain,asset){
+        ("arbitrum"|"base"|"ethereum"|"polygon"|"tempo","USDC")|("horizen","USDC.e")|("robinhood","USDG")=>valid_evm_wallet(destination)&&destination==destination.to_ascii_lowercase(),
+        ("base"|"horizen","ZEN")=>valid_evm_wallet(destination)&&destination==destination.to_ascii_lowercase(),
+        ("solana","USDC")=>valid_solana_wallet(destination),_=>false,
+    }
+}
 fn valid_bus_deposit_reference(value:&str)->bool {
     let parts=value.split(':').collect::<Vec<_>>();
     parts.len()==3&&parts[0]=="arbitrum-usdc-bus-deposit"&&valid_transaction_hash_value(parts[1])
@@ -4073,6 +4109,22 @@ fn valid_bus_deposit_reference(value:&str)->bool {
         &&parts[2].parse::<u128>().ok().is_some_and(|ticket|ticket<(1u128<<72)&&ticket.to_string()==parts[2])
 }
 fn valid_bus_terminal_reference(value:&str,reverted:bool)->bool {
+    if !reverted {
+        if let Some(hash)=value.strip_prefix("horizen-usdc-local:") {return valid_transaction_hash_value(hash)&&hash==hash.to_ascii_lowercase();}
+        if let Some(hash)=value.strip_prefix("horizen-zen-local:").or_else(||value.strip_prefix("horizen-zen-oft:")) {
+            return valid_transaction_hash_value(hash)&&hash==hash.to_ascii_lowercase();
+        }
+        if let Some(rest)=value.strip_prefix("horizen-usdc-relay:") {
+            let parts=rest.split(':').collect::<Vec<_>>();
+            return parts.len()==5&&parts[..4].iter().all(|hash|valid_transaction_hash_value(hash)&&*hash==hash.to_ascii_lowercase())
+                &&(valid_transaction_hash_value(parts[4])&&parts[4]==parts[4].to_ascii_lowercase()
+                    ||(64..=96).contains(&parts[4].len())&&parts[4].bytes().all(|byte|matches!(byte,
+                        b'1'..=b'9'|b'A'..=b'H'|b'J'..=b'N'|b'P'..=b'Z'|b'a'..=b'k'|b'm'..=b'z')));
+        }
+    }
+    if reverted {
+        if let Some(hash)=value.strip_prefix("horizen-zen-reverted:") {return valid_transaction_hash_value(hash)&&hash==hash.to_ascii_lowercase();}
+    }
     let prefix=if reverted {"horizen-usdc-bus-reverted:"} else {"horizen-usdc-bus:"};
     let Some(rest)=value.strip_prefix(prefix) else {return false;};
     let parts=rest.split(':').collect::<Vec<_>>();
@@ -4641,7 +4693,7 @@ mod tests {
         }
     }
     fn checkpoint_fixture(live: &DirectRuntime, store: &InMemoryDirectStateStore) -> DirectCheckpoint {
-        let artifacts = store.artifacts().unwrap();
+        let mut artifacts = store.artifacts().unwrap();artifacts.sort_by_key(|artifact|artifact.sequence);
         let records = artifacts.iter().cloned().map(|mut record| { record.ciphertext.clear(); record }).collect();
         let hashes = artifacts.iter().map(artifact_hash).collect();
         live.seal_checkpoint(artifacts.last().unwrap().clone(), records, hashes, &[8;32]).unwrap()
@@ -4661,7 +4713,7 @@ mod tests {
             let prior = records.last().unwrap().state_hash.clone();
             let id = Uuid::from_u128(0x11111111222243338444000000000000 + live.committed_sequence() as u128).to_string();
             let request = request_for(&subject,&identity,&id,
-                DirectAction::BeginUsdcBusWithdrawal { withdrawal_id: id.clone(), destination: wallet.clone(), amount_atomic: "999999999999999".into() });
+                DirectAction::BeginUsdcBusWithdrawal { withdrawal_id:id.clone(),destination_chain:"arbitrum".into(),asset:"USDC".into(),destination:wallet.clone(),amount_atomic:"999999999999999".into() });
             let result = live.execute(request.clone()).unwrap();
             let record = DirectStateArtifact { epoch_id: EPOCH_ID.into(), sequence: live.committed_sequence(), prior_state_hash: prior,
                 state_hash: sha256(&live.committed_sequence().to_be_bytes()), request_hash: request.request_hash.clone(), nonce: vec![0;12], ciphertext: Vec::new(), ciphertext_hash: sha256(&[]), receipt: result.receipt };
@@ -4723,7 +4775,7 @@ mod tests {
         let (mut live, subject, identity, wallet, mut store) = bus_fixture();
         let checkpoint = checkpoint_fixture(&live, &store);
         live.execute_committed(bus_begin(&subject,&identity,&wallet,BUS_ID), &[8;32], &mut store).unwrap();
-        let artifact = store.artifacts().unwrap().last().unwrap().clone();
+        let artifact = store.artifacts().unwrap().into_iter().max_by_key(|artifact|artifact.sequence).unwrap();
         let candidate = runtime(RuntimeMode::IsolatedTest).restore_checkpoint(&checkpoint, &[8;32]).unwrap();
         let mut gap = artifact.clone(); gap.sequence += 1;
         assert!(candidate.clone().restore_next_committed(&gap, &[8;32]).is_err());
@@ -4839,13 +4891,13 @@ mod tests {
         assert!(verify_public_quest_receipt(&witness,&quest_receipt_public_key(&[7;32]).unwrap()));
     }
     fn bus_begin(subject:&str,identity:&str,wallet:&str,id:&str)->DirectRequest {
-        request_for(subject,identity,id,DirectAction::BeginUsdcBusWithdrawal {withdrawal_id:id.into(),destination:wallet.into(),amount_atomic:"4840000".into()})
+        request_for(subject,identity,id,DirectAction::BeginUsdcBusWithdrawal {withdrawal_id:id.into(),destination_chain:"arbitrum".into(),asset:"USDC".into(),destination:wallet.into(),amount_atomic:"4840000".into()})
     }
     fn bus_terminal(subject:&str,identity:&str,wallet:&str,reverted:bool)->DirectRequest {
         let custody=if reverted {format!("horizen-usdc-bus-reverted:0x{}","ef".repeat(32))}
             else {format!("horizen-usdc-bus:0x{}:0x{}:0x{}:0:1","11".repeat(32),"22".repeat(32),"33".repeat(32))};
-        let action=if reverted {DirectAction::RevertUsdcBusWithdrawal {withdrawal_id:BUS_ID.into(),destination:wallet.into(),amount_atomic:"4840000".into(),custody_reference:custody}}
-            else {DirectAction::SettleUsdcBusWithdrawal {withdrawal_id:BUS_ID.into(),destination:wallet.into(),amount_atomic:"4840000".into(),custody_reference:custody}};
+        let action=if reverted {DirectAction::RevertUsdcBusWithdrawal {withdrawal_id:BUS_ID.into(),destination_chain:"arbitrum".into(),asset:"USDC".into(),destination:wallet.into(),amount_atomic:"4840000".into(),custody_reference:custody}}
+            else {DirectAction::SettleUsdcBusWithdrawal {withdrawal_id:BUS_ID.into(),destination_chain:"arbitrum".into(),asset:"USDC".into(),destination:wallet.into(),amount_atomic:"4840000".into(),custody_reference:custody}};
         request_for(subject,identity,&format!("usdc-bus-{}:{BUS_ID}",if reverted {"revert"} else {"settle"}),action)
     }
     #[test]
@@ -4864,10 +4916,34 @@ mod tests {
         assert_eq!(restarted.execute_committed(begin,&[8;32],&mut store).unwrap(),first);
     }
     #[test]
+    fn zen_egress_uses_the_same_restart_safe_hold_and_exactly_once_terminal_path() {
+        let (mut live,subject,identity,wallet,mut store)=bus_fixture_funded("5000000");
+        let mut deposit=request_for(&subject,&identity,"zen-egress-funding",DirectAction::CreditZenDeposit {
+            amount_atomic:"1000000000000000000".into(),custody_reference:format!("horizen-zen-deposit:0x{}","aa".repeat(32))});
+        deposit.financial_wallet_address=Some(wallet.clone());deposit.request_hash=request_hash(&deposit);
+        live.execute_committed(deposit,&[8;32],&mut store).unwrap();
+        let begin=request_for(&subject,&identity,BUS_ID,DirectAction::BeginUsdcBusWithdrawal {withdrawal_id:BUS_ID.into(),
+            destination_chain:"base".into(),asset:"ZEN".into(),destination:wallet.clone(),amount_atomic:"1000000000000000000".into()});
+        let reserved=live.execute_committed(begin.clone(),&[8;32],&mut store).unwrap();
+        assert_eq!(reserved.effect,"WITHDRAWAL_RESERVED");
+        assert_eq!(live.balance(&identity,"ZEN","USER_AVAILABLE"),0);
+        assert_eq!(live.balance(&identity,"ZEN","USER_WITHDRAWAL_HOLD"),1_000_000_000_000_000_000);
+        let mut restarted=DirectRuntime::restore_committed(SealedEpoch::load(epoch_path()).unwrap(),RuntimeMode::IsolatedTest,vec![7;32],&[8;32],&store).unwrap();
+        assert_eq!(restarted.execute_committed(begin,&[8;32],&mut store).unwrap(),reserved);
+        let terminal=request_for(&subject,&identity,&format!("usdc-bus-settle:{BUS_ID}"),DirectAction::SettleUsdcBusWithdrawal {
+            withdrawal_id:BUS_ID.into(),destination_chain:"base".into(),asset:"ZEN".into(),destination:wallet,
+            amount_atomic:"1000000000000000000".into(),custody_reference:format!("horizen-zen-oft:0x{}","bb".repeat(32))});
+        let settled=restarted.execute_committed(terminal.clone(),&[8;32],&mut store).unwrap();
+        assert_eq!(settled.effect,"WITHDRAWAL_SETTLED");
+        assert_eq!(restarted.balance(&identity,"ZEN","USER_WITHDRAWAL_HOLD"),0);
+        assert_eq!(restarted.balance(&identity,"ZEN","USER_SETTLED"),1_000_000_000_000_000_000);
+        assert_eq!(restarted.execute_committed(terminal,&[8;32],&mut store).unwrap(),settled);
+    }
+    #[test]
     fn refused_usdc_bus_request_cannot_become_a_payout_after_funding_or_restart() {
         let (mut live,subject,identity,wallet,mut store)=bus_fixture_funded("5000000");
         let refused=request_for(&subject,&identity,BUS_ID,DirectAction::BeginUsdcBusWithdrawal {
-            withdrawal_id:BUS_ID.into(),destination:wallet.clone(),amount_atomic:"5100000".into()});
+            withdrawal_id:BUS_ID.into(),destination_chain:"arbitrum".into(),asset:"USDC".into(),destination:wallet.clone(),amount_atomic:"5100000".into()});
         let first=live.execute_committed(refused.clone(),&[8;32],&mut store).unwrap();
         assert_eq!(first.effect,"WITHDRAWAL_REJECTED");
         assert_eq!(first.receipt.custody_reference,Some(format!("usdc-bus-rejection:{BUS_ID}:INSUFFICIENT_AVAILABLE")));
@@ -4916,7 +4992,7 @@ mod tests {
         let (live,subject,identity,wallet,store)=bus_fixture_funded("5000000");
         let shared=Arc::new(Mutex::new((live,store)));
         let begin=|id:&str|request_for(&subject,&identity,id,DirectAction::BeginUsdcBusWithdrawal {
-            withdrawal_id:id.into(),destination:wallet.clone(),amount_atomic:"5000000".into()});
+            withdrawal_id:id.into(),destination_chain:"arbitrum".into(),asset:"USDC".into(),destination:wallet.clone(),amount_atomic:"5000000".into()});
         let original=begin(BUS_ID);
         {let mut locked=shared.lock().unwrap();let (live,store)=&mut *locked;live.execute_committed(original.clone(),&[8;32],store).unwrap();}
         let mut threads=Vec::new();
@@ -4957,11 +5033,12 @@ mod tests {
     }
     #[test]
     fn terminal_bus_proof_cannot_change_destination_amount_or_request_identity() {
-        for changed in ["destination","amount","request","proof"] {
+        for changed in ["destination","chain","asset","amount","request","proof"] {
             let (mut live,subject,identity,wallet,_)=bus_fixture();live.execute(bus_begin(&subject,&identity,&wallet,BUS_ID)).unwrap();
             let root=live.state_hash();let mut terminal=bus_terminal(&subject,&identity,&wallet,false);
-            let DirectAction::SettleUsdcBusWithdrawal {destination,amount_atomic,custody_reference,..}=&mut terminal.action else {unreachable!()};
+            let DirectAction::SettleUsdcBusWithdrawal {destination_chain,asset,destination,amount_atomic,custody_reference,..}=&mut terminal.action else {unreachable!()};
             match changed {"destination"=>*destination="0x3333333333333333333333333333333333333333".into(),
+                "chain"=>*destination_chain="base".into(),"asset"=>*asset="USDG".into(),
                 "amount"=>*amount_atomic="5000000".into(),"request"=>terminal.request_id="other-request".into(),_=>*custody_reference="submitted-but-not-delivered".into()};
             terminal.request_hash=request_hash(&terminal);assert!(live.execute(terminal).is_err());assert_eq!(live.state_hash(),root);
         }
@@ -5026,6 +5103,9 @@ mod tests {
             assert!(!valid_bus_terminal_reference(&format!("{valid}{suffix}"),false));
         }
         assert!(valid_bus_terminal_reference(&format!("{valid}:254:0"),false));
+        let relay=format!("horizen-usdc-relay:0x{}:0x{}:0x{}:0x{}:{}","11".repeat(32),"22".repeat(32),"33".repeat(32),"44".repeat(32),"5".repeat(64));
+        assert!(valid_bus_terminal_reference(&relay,false));
+        assert!(!valid_bus_terminal_reference(&format!("{relay}:extra"),false));
     }
     #[test]
     fn every_bus_state_uses_the_predecessor_schema_and_reconstructs_signed_holds() {

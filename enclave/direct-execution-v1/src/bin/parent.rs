@@ -28,7 +28,7 @@ use chacha20poly1305::{
 };
 use hmac::{Hmac, Mac};
 use layrs_direct_execution_v1::{
-    artifact_hash, identity_commitment_for, reference_for, relay_reference_for, relay_result_hash,
+    artifact_hash, identity_commitment_for, reference_for, relay_reference_for, relay_result_hash,valid_layrs_withdrawal_destination,
     relay_reverted_result_hash, request_hash, sha256, sign, DirectAction, DirectReceipt,
     DirectRequest, DirectResult, DirectStateArtifact, DurabilityAck, ExternalEffectIntent,
     ExternalEffectRecovery, FilesystemImmutableArtifactStore, FilesystemImmutableIntentStore,
@@ -93,7 +93,7 @@ mod usdc_wallet_link;
 use usdc_wallet_link::{WalletLinkAuthority,WalletLinkGrant};
 #[path = "../usdc_bus_custody.rs"]
 mod usdc_bus_custody;
-use usdc_bus_custody::{UsdcBusCustodyAdapter,BusWithdrawalProof,BusDepositProof,BusDepositFinalizationProof};
+use usdc_bus_custody::{UsdcBusCustodyAdapter,BusDepositProof,BusDepositFinalizationProof};
 #[derive(Clone)]
 struct AppState {
     enclave_cid: u32,
@@ -828,7 +828,7 @@ fn relay_forwarding_candidate(intent: &ExternalEffectIntent, pool_address: &str,
         || !deposit.get("depositTxHash")?.as_str()?.eq_ignore_ascii_case(deposit_hash) { return None; }
     let hashes = relay_hashes(status.get("inTxHashes"));
     if hashes.len() != 1 || !valid_transaction_hash(&hashes[0]) || hashes[0].eq_ignore_ascii_case(deposit_hash)
-        || !relay_request_has_intake(request, &hashes[0]) { return None; }
+        || !relay_request_has_intake(request, 8453, &hashes[0]) { return None; }
     Some(hashes[0].clone())
 }
 
@@ -959,10 +959,10 @@ fn classify_relay_destination_finality_with_forwarding(
             .and_then(Value::as_str)
             .is_none_or(|address| !address.eq_ignore_ascii_case(&relay.deposit_address))
         || !relay_route_quote_matches(request, relay, &intent.amount_atomic)
-        || !(relay_request_has_intake(request, &intake_transaction_hash)
+        || !(relay_request_has_intake(request, 8453, &intake_transaction_hash)
             || forwarded && forwarding.is_some_and(|proof| request.pointer("/depositAddress/depositTxHash").and_then(Value::as_str)
                 .is_some_and(|h| h.eq_ignore_ascii_case(&proof.deposit_hash))
-                && relay_request_has_intake(request, &proof.forwarding_hash)))
+                && relay_request_has_intake(request, 8453, &proof.forwarding_hash)))
     {
         return Ok(layrs_direct_execution_v1::ExternalEffectObservation::Conflict);
     }
@@ -1055,13 +1055,13 @@ fn relay_hashes(value: Option<&Value>) -> Vec<String> {
     hashes
 }
 
-fn relay_request_has_intake(request: &Value, intake_transaction_hash: &str) -> bool {
+fn relay_request_has_intake(request: &Value, origin_chain_id:u64, intake_transaction_hash: &str) -> bool {
     request
         .pointer("/data/inTxs")
         .and_then(Value::as_array)
         .is_some_and(|transactions| {
             transactions.iter().any(|transaction| {
-                transaction.get("chainId").and_then(Value::as_u64) == Some(8453)
+                transaction.get("chainId").and_then(Value::as_u64) == Some(origin_chain_id)
                     && transaction.get("status").and_then(Value::as_str) == Some("success")
                     && transaction
                         .get("txHash")
@@ -1980,8 +1980,9 @@ enum CustomerAction {
     CreditHorizenUsdcDeposit { transaction_hash: String, amount_atomic: String },
     CreditArbitrumUsdcBusDeposit {operation_id:String,amount_atomic:String,proof:BusDepositProof},
     FinalizeArbitrumUsdcBusDeposit {operation_id:String,amount_atomic:String,proof:BusDepositFinalizationProof},
-    BeginUsdcBusWithdrawal { destination: String, amount_atomic: String },
-    VerifyUsdcBusWithdrawal {withdrawal_id:String,destination:String,amount_atomic:String,proof:BusWithdrawalProof},
+    BeginUsdcBusWithdrawal { destination_chain:String,asset:String,destination: String, amount_atomic: String },
+    VerifyUsdcBusWithdrawal {withdrawal_id:String,destination_chain:String,asset:String,destination:String,amount_atomic:String,proof:Value},
+    VerifyZenWithdrawal {withdrawal_id:String,destination_chain:String,asset:String,destination:String,amount_atomic:String},
     LinkFinancialWallet {grant:WalletLinkGrant,signature:String},
     ReserveZenWithdrawal { destination_chain: String, destination: String, amount_atomic: String },
     PlaceOrder {
@@ -2361,14 +2362,14 @@ async fn command(
     let _financial_guard = state.financial_gate.lock().await;
     let external_effect_pending = !state.unresolved_external_effects.lock().await.is_empty();
     let action = match body.action {
-        CustomerAction::VerifyUsdcBusWithdrawal {withdrawal_id,destination,amount_atomic,proof} => {
+        CustomerAction::VerifyUsdcBusWithdrawal {withdrawal_id,destination_chain,asset,destination,amount_atomic,proof} => {
             let Some(custody)=&state.usdc_bus_custody else {return (StatusCode::SERVICE_UNAVAILABLE,"USDC_BUS_CUSTODY_NOT_ENABLED").into_response();};
             if request_id!=format!("usdc-bus-settle:{withdrawal_id}")
-                ||usdc_bus_reservation_action(&withdrawal_id,claims.financial_wallet_address.as_deref(),&destination,&amount_atomic).is_err() {
+                ||usdc_bus_reservation_action(&withdrawal_id,claims.financial_wallet_address.as_deref(),&claims.wallet_address,&destination_chain,&asset,&destination,&amount_atomic).is_err() {
                 return (StatusCode::FORBIDDEN,"USDC_BUS_SETTLEMENT_BINDING_DENIED").into_response();
             }
-            match custody.settlement(&destination,&amount_atomic,&proof).await {
-                Ok(Some(reference))=>DirectAction::SettleUsdcBusWithdrawal {withdrawal_id,destination,amount_atomic,custody_reference:reference},
+            match custody.settlement(&destination_chain,&destination,&amount_atomic,&proof).await {
+                Ok(Some(reference))=>DirectAction::SettleUsdcBusWithdrawal {withdrawal_id,destination_chain,asset,destination,amount_atomic,custody_reference:reference},
                 Ok(None)=>return (StatusCode::SERVICE_UNAVAILABLE,"USDC_BUS_DESTINATION_FINALITY_PENDING").into_response(),
                 Err(error)=>return match error.as_str() {
                     "USDC Bus custody proof conflict"=>(StatusCode::CONFLICT,"USDC_BUS_CUSTODY_PROOF_CONFLICT").into_response(),
@@ -2376,6 +2377,18 @@ async fn command(
                     "USDC Bus RPC reorg"=>(StatusCode::SERVICE_UNAVAILABLE,"USDC_BUS_FINALITY_RECHECK_REQUIRED").into_response(),
                     _=>(StatusCode::SERVICE_UNAVAILABLE,"USDC_BUS_CUSTODY_PROOF_UNAVAILABLE").into_response(),
                 },
+            }
+        }
+        CustomerAction::VerifyZenWithdrawal {withdrawal_id,destination_chain,asset,destination,amount_atomic} => {
+            if request_id!=format!("usdc-bus-settle:{withdrawal_id}") || asset!="ZEN"
+                || usdc_bus_reservation_action(&withdrawal_id,claims.financial_wallet_address.as_deref(),&claims.wallet_address,
+                    &destination_chain,&asset,&destination,&amount_atomic).is_err() {
+                return (StatusCode::FORBIDDEN,"ZEN_WITHDRAWAL_SETTLEMENT_BINDING_DENIED").into_response();
+            }
+            match prepare_standard_zen_withdrawal(&state,&claims,&body.identity_commitment,&withdrawal_id,
+                destination_chain,asset,destination,amount_atomic).await {
+                Ok(action)=>action,
+                Err((status,code))=>return (status,code).into_response(),
             }
         }
         CustomerAction::LinkFinancialWallet {grant,signature} => {
@@ -2386,14 +2399,13 @@ async fn command(
                 Err(_)=>return (StatusCode::FORBIDDEN,"USDC_WALLET_LINK_DENIED").into_response(),
             }
         }
-        CustomerAction::BeginUsdcBusWithdrawal { destination, amount_atomic } => {
+        CustomerAction::BeginUsdcBusWithdrawal { destination_chain,asset,destination, amount_atomic } => {
             if external_effect_pending {
                 return (StatusCode::SERVICE_UNAVAILABLE, "EXTERNAL_EFFECT_FINALITY_PENDING").into_response();
             }
-            if state.usdc_custody.is_none() {
-                return (StatusCode::SERVICE_UNAVAILABLE, "USDC_CUSTODY_ADAPTER_NOT_ENABLED").into_response();
-            }
-            match usdc_bus_reservation_action(&request_id, claims.financial_wallet_address.as_deref(), &destination, &amount_atomic) {
+            if asset=="ZEN"&&state.zen_custody.is_none() {return (StatusCode::SERVICE_UNAVAILABLE,"ZEN_CUSTODY_ADAPTER_NOT_ENABLED").into_response();}
+            if asset!="ZEN"&&state.usdc_custody.is_none() {return (StatusCode::SERVICE_UNAVAILABLE,"USDC_CUSTODY_ADAPTER_NOT_ENABLED").into_response();}
+            match usdc_bus_reservation_action(&request_id,claims.financial_wallet_address.as_deref(),&claims.wallet_address,&destination_chain,&asset,&destination,&amount_atomic) {
                 Ok(action) => action,
                 Err((status, code)) => return (status, code).into_response(),
             }
@@ -2894,6 +2906,47 @@ async fn apply_balance_recovery(
     }
 }
 
+async fn prepare_standard_zen_withdrawal(
+    state:&AppState,claims:&SessionClaims,identity:&str,withdrawal_id:&str,
+    destination_chain:String,asset:String,destination:String,amount_atomic:String,
+) -> Result<DirectAction,(StatusCode,&'static str)> {
+    if asset!="ZEN"||!matches!(destination_chain.as_str(),"base"|"horizen")
+        ||canonical_evm_address(&destination).ok().as_deref()!=Some(destination.as_str())
+        ||!amount_atomic.parse::<u128>().is_ok_and(|value|value>0)
+        ||destination_chain=="base"&&!amount_atomic.parse::<u128>().is_ok_and(|value|value%1_000_000_000_000==0) {
+        return Err((StatusCode::BAD_REQUEST,"ZEN_WITHDRAWAL_BINDING_INVALID"));
+    }
+    let custody=state.zen_custody.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE,"ZEN_CUSTODY_ADAPTER_NOT_ENABLED"))?;
+    let store=state.artifact_store.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE,"DIRECT_ARTIFACT_STORE_NOT_CONFIGURED"))?;
+    let intent_request_id=format!("zen-egress:{withdrawal_id}");
+    let intents=store.load_intents().await.map_err(|_|(StatusCode::SERVICE_UNAVAILABLE,"ZEN_WITHDRAWAL_RECOVERY_FAILED"))?;
+    let related=intents.iter().filter(|intent|intent.account_id==claims.subject_hash&&intent.request_id==intent_request_id).collect::<Vec<_>>();
+    if related.len()>1||related.iter().any(|intent|intent.identity_commitment!=identity||intent.asset!="ZEN"||intent.chain!="horizen"
+        ||intent.zen_destination_chain.as_ref()!=Some(&destination_chain)||intent.destination!=destination||intent.amount_atomic!=amount_atomic
+        ||intent.provider_wallet_id!=custody.wallet_id||intent.custody_target!=custody.pool_address) {
+        return Err((StatusCode::CONFLICT,"ZEN_WITHDRAWAL_REPLAY_CONFLICT"));
+    }
+    let intent=if let Some(intent)=related.first(){(*intent).clone()}else{
+        let root=state.committed_state_root.lock().await.clone().ok_or((StatusCode::SERVICE_UNAVAILABLE,"DIRECT_STATE_ROOT_UNAVAILABLE"))?;
+        let (nonce,gas,fee,priority)=custody.transaction_parameters().await.map_err(|_|(StatusCode::SERVICE_UNAVAILABLE,"CUSTODY_TRANSACTION_PARAMETERS_UNAVAILABLE"))?;
+        let binding_hash=sha256(&serde_json::to_vec(&("layrs-standard-zen-egress-v1",withdrawal_id,&claims.subject_hash,identity,
+            &destination_chain,&destination,&amount_atomic)).map_err(|_|(StatusCode::BAD_REQUEST,"ZEN_WITHDRAWAL_BINDING_INVALID"))?);
+        let candidate=ExternalEffectIntent::create_zen_withdrawal(root,intent_request_id,binding_hash,claims.subject_hash.clone(),identity.into(),
+            destination_chain.clone(),destination.clone(),amount_atomic.clone(),custody.wallet_id.clone(),custody.pool_address.clone(),
+            nonce.to_string(),gas.to_string(),fee.to_string(),priority.to_string(),now_unix())
+            .map_err(|_|(StatusCode::BAD_REQUEST,"ZEN_WITHDRAWAL_BINDING_INVALID"))?;
+        store.persist_intent_readback(&candidate).await.map_err(|_|(StatusCode::SERVICE_UNAVAILABLE,"ZEN_WITHDRAWAL_INTENT_PERSISTENCE_FAILED"))?
+    };
+    match custody.settle(&intent,now_unix()).await.map_err(|_|(StatusCode::SERVICE_UNAVAILABLE,"ZEN_WITHDRAWAL_FINALITY_UNAVAILABLE"))? {
+        ExternalEffectRecovery::BindFinalized{transaction_hash,..}=>Ok(DirectAction::SettleUsdcBusWithdrawal {withdrawal_id:withdrawal_id.into(),
+            destination_chain:destination_chain.clone(),asset,destination,amount_atomic,
+            custody_reference:format!("horizen-zen-{}:{transaction_hash}",if destination_chain=="base"{"oft"}else{"local"})}),
+        ExternalEffectRecovery::BindReverted{transaction_hash,..}=>Ok(DirectAction::RevertUsdcBusWithdrawal {withdrawal_id:withdrawal_id.into(),
+            destination_chain,asset,destination,amount_atomic,custody_reference:format!("horizen-zen-reverted:{transaction_hash}")}),
+        _=>Err((StatusCode::SERVICE_UNAVAILABLE,"ZEN_WITHDRAWAL_FINALITY_PENDING")),
+    }
+}
+
 async fn prepare_zen_withdrawal(
     state: &AppState, claims: &SessionClaims, identity: &str, request_id: &str,
     destination_chain: String, destination: String, amount_atomic: String,
@@ -3222,21 +3275,27 @@ fn signed_base_withdrawal_destination_matches(
 /// certified actions, not caller-supplied chain IDs or generic calldata.
 fn usdc_bus_reservation_action(
     request_id: &str,
-    signed_destination: Option<&str>,
+    signed_identity:Option<&str>,expected_identity:&str,
+    destination_chain:&str,
+    asset:&str,
     destination: &str,
     amount_atomic: &str,
 ) -> Result<DirectAction, (StatusCode, &'static str)> {
     if !uuid::Uuid::parse_str(request_id).is_ok_and(|id| id.to_string() == request_id && !id.is_nil()) {
         return Err((StatusCode::BAD_REQUEST, "WITHDRAWAL_ID_INVALID"));
     }
-    if !signed_destination.is_some_and(|signed| signed_base_withdrawal_destination_matches(destination, signed)) {
+    if !signed_identity.is_some_and(|signed|signed.eq_ignore_ascii_case(expected_identity)) {
         return Err((StatusCode::FORBIDDEN, "SIGNED_WITHDRAWAL_DESTINATION_MISMATCH"));
+    }
+    if !valid_layrs_withdrawal_destination(destination_chain,asset,destination) {
+        return Err((StatusCode::BAD_REQUEST,"WITHDRAWAL_ROUTE_INVALID"));
     }
     if !amount_atomic.parse::<u128>().is_ok_and(|amount| amount > 0 && amount.to_string() == amount_atomic) {
         return Err((StatusCode::BAD_REQUEST, "WITHDRAWAL_AMOUNT_INVALID"));
     }
     Ok(DirectAction::BeginUsdcBusWithdrawal {
-        withdrawal_id: request_id.into(), destination: destination.to_ascii_lowercase(), amount_atomic: amount_atomic.into(),
+        withdrawal_id: request_id.into(),destination_chain:destination_chain.into(),asset:asset.into(),
+        destination:if destination_chain=="solana" {destination.into()}else{destination.to_ascii_lowercase()}, amount_atomic: amount_atomic.into(),
     })
 }
 async fn balance(
@@ -3959,6 +4018,14 @@ fn intent_is_committed(intent: &ExternalEffectIntent, artifacts: &[DirectStateAr
     })
 }
 
+fn standard_zen_egress_intent(intent: &ExternalEffectIntent) -> bool {
+    intent.request_id.starts_with("zen-egress:")
+        && intent.chain == "horizen"
+        && intent.asset == "ZEN"
+        && intent.zen_destination_chain.is_some()
+        && intent.relay.is_none()
+}
+
 fn same_external_effect_request(a: &ExternalEffectIntent, b: &ExternalEffectIntent) -> bool {
     a.account_id == b.account_id
         && a.request_id == b.request_id
@@ -4370,6 +4437,13 @@ async fn recover_external_effect_intents(state: &AppState) -> io::Result<()> {
         .await
         .map_err(|error| invalid(format!("direct artifact recovery failed:{error}")))?;
     for intent in intents.iter().cloned() {
+        // Standard ZEN egress is recovered by the withdrawal worker against
+        // the original held withdrawal operation. Its immutable provider
+        // intent uses a separate request id and must never be replayed as the
+        // retired legacy withdrawal command or enter that global fence.
+        if standard_zen_egress_intent(&intent) {
+            continue;
+        }
         if intent_is_committed(&intent, &artifacts) {
             continue;
         }
@@ -4942,22 +5016,36 @@ mod tests {
     #[test]
     fn usdc_bus_reservation_requires_original_id_signed_recipient_and_positive_canonical_amount() {
         let id = "11111111-1111-4111-8111-111111111111";
-        let destination = "0x193a0F49Be79D12957f8a362fff0F43EBfD7527f";
-        let action = usdc_bus_reservation_action(id, Some(destination), destination, "4840000").unwrap();
-        assert!(matches!(action, DirectAction::BeginUsdcBusWithdrawal {withdrawal_id, destination: to, amount_atomic}
-            if withdrawal_id == id && to == destination.to_ascii_lowercase() && amount_atomic == "4840000"));
+        let destination = "0x193a0f49be79d12957f8a362fff0f43ebfd7527f";
+        let action = usdc_bus_reservation_action(id,Some(destination),destination,"arbitrum","USDC",destination,"4840000").unwrap();
+        assert!(matches!(action, DirectAction::BeginUsdcBusWithdrawal {withdrawal_id,destination_chain,asset,destination:to,amount_atomic}
+            if withdrawal_id==id&&destination_chain=="arbitrum"&&asset=="USDC"&&to==destination.to_ascii_lowercase()&&amount_atomic=="4840000"));
+        for chain in ["base","horizen"] {
+            assert!(matches!(usdc_bus_reservation_action(id,Some(destination),destination,chain,"ZEN",destination,"1000000000000000000").unwrap(),
+                DirectAction::BeginUsdcBusWithdrawal {destination_chain,asset,..} if destination_chain==chain&&asset=="ZEN"));
+        }
+        assert!(usdc_bus_reservation_action(id,Some(destination),destination,"arbitrum","ZEN",destination,"1000000000000000000").is_err());
         for invalid_id in ["new", "00000000-0000-0000-0000-000000000000", "11111111-1111-4111-8111-11111111111A"] {
-            assert!(usdc_bus_reservation_action(invalid_id, Some(destination), destination, "5000000").is_err());
+            assert!(usdc_bus_reservation_action(invalid_id,Some(destination),destination,"arbitrum","USDC",destination,"5000000").is_err());
         }
         for amount in ["0", "-1", "5.1", "5e6", "05000000", "0x4c4b40", "340282366920938463463374607431768211456"] {
-            assert!(usdc_bus_reservation_action(id, Some(destination), destination, amount).is_err());
+            assert!(usdc_bus_reservation_action(id,Some(destination),destination,"arbitrum","USDC",destination,amount).is_err());
         }
-        assert!(usdc_bus_reservation_action(id, None, destination, "5000000").is_err());
-        assert!(usdc_bus_reservation_action(id, Some("0x2222222222222222222222222222222222222222"), destination, "5000000").is_err());
+        assert!(usdc_bus_reservation_action(id,None,destination,"arbitrum","USDC",destination,"5000000").is_err());
+        assert!(usdc_bus_reservation_action(id,Some("0x2222222222222222222222222222222222222222"),destination,"arbitrum","USDC",destination,"5000000").is_err());
+        for chain in ["base","ethereum","polygon","tempo"] {
+            assert!(usdc_bus_reservation_action(id,Some(destination),destination,chain,"USDC",destination,"5000000").is_ok());
+        }
+        assert!(usdc_bus_reservation_action(id,Some(destination),destination,"horizen","USDC.e",destination,"5000000").is_ok());
+        assert!(usdc_bus_reservation_action(id,Some(destination),destination,"robinhood","USDG",destination,"5000000").is_ok());
+        assert!(usdc_bus_reservation_action(id,Some(destination),destination,"solana","USDC","11111111111111111111111111111111","5000000").is_ok());
+        for (chain,asset) in [("arbitrum","USDG"),("horizen","USDC"),("robinhood","USDC")] {
+            assert!(usdc_bus_reservation_action(id,Some(destination),destination,chain,asset,destination,"5000000").is_err());
+        }
     }
     #[test]
     fn usdc_bus_public_action_cannot_supply_a_terminal_worker_assertion() {
-        let action = serde_json::json!({"type":"BEGIN_USDC_BUS_WITHDRAWAL","destination":"0x1111111111111111111111111111111111111111","amountAtomic":"5000000"});
+        let action = serde_json::json!({"type":"BEGIN_USDC_BUS_WITHDRAWAL","destinationChain":"arbitrum","asset":"USDC","destination":"0x1111111111111111111111111111111111111111","amountAtomic":"5000000"});
         assert!(serde_json::from_value::<CustomerAction>(action).is_ok());
         for kind in ["SETTLE_USDC_BUS_WITHDRAWAL", "REVERT_USDC_BUS_WITHDRAWAL"] {
             assert!(serde_json::from_value::<CustomerAction>(serde_json::json!({"type":kind,"withdrawalId":"11111111-1111-4111-8111-111111111111", "destination":"0x1111111111111111111111111111111111111111", "amountAtomic":"5000000", "custodyReference":"fake"})).is_err());
@@ -4985,6 +5073,21 @@ mod tests {
     }
     fn reconciled_intent(root: &str) -> ExternalEffectIntent {
         ExternalEffectIntent::create(root.into(),"reconciliation-request".into(),"f".repeat(64),"c".repeat(64),"identity".into(),"base".into(),"USDC".into(),"0x2222222222222222222222222222222222222222".into(),"5000000".into(),"existing-wallet".into(),"0x1111111111111111111111111111111111111111".into(),"1".into(),"180000".into(),"11000000".into(),"1000000".into(),now_unix()).unwrap()
+    }
+    #[test]
+    fn standard_zen_egress_intent_is_owned_by_the_restart_safe_withdrawal_worker() {
+        let standard=ExternalEffectIntent::create_zen_withdrawal(
+            "a".repeat(64),"zen-egress:11111111-1111-4111-8111-111111111111".into(),"b".repeat(64),"c".repeat(64),
+            "identity".into(),"base".into(),"0x2222222222222222222222222222222222222222".into(),"1000000000000000000".into(),
+            "existing-wallet".into(),"0x1111111111111111111111111111111111111111".into(),"1".into(),"180000".into(),
+            "11000000".into(),"1000000".into(),now_unix()).unwrap();
+        assert!(standard_zen_egress_intent(&standard));
+        let legacy=ExternalEffectIntent::create_zen_withdrawal(
+            "a".repeat(64),"legacy-zen-request".into(),"b".repeat(64),"c".repeat(64),"identity".into(),"base".into(),
+            "0x2222222222222222222222222222222222222222".into(),"1000000000000000000".into(),"existing-wallet".into(),
+            "0x1111111111111111111111111111111111111111".into(),"1".into(),"180000".into(),"11000000".into(),
+            "1000000".into(),now_unix()).unwrap();
+        assert!(!standard_zen_egress_intent(&legacy));
     }
     fn nonfinancial_chain() -> Vec<DirectStateArtifact> {
         (0..3).map(|i| { let mut a=projection_sequence_fixture(); a.sequence=i+1; a.prior_state_hash=((b'a'+i as u8) as char).to_string().repeat(64);a.state_hash=((b'b'+i as u8) as char).to_string().repeat(64);a.receipt.account_id="governance".into();a.receipt.request_id=format!("register-{i}");a.receipt.effect="MARKET_REGISTERED".into();a }).collect()

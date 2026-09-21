@@ -9,6 +9,19 @@ const HZ_MESSAGING:&str="0x88853d410299bcbfe5fcc9eef93c03115e908279";
 const ARB_TOKEN:&str="0xaf88d065e77c8cc2239327c5edb3a432268e5831";
 const ARB_BRIDGE:&str="0xe8cdf27acd73a434d661c84887215f7598e7d0d3";
 const ARB_MESSAGING:&str="0x19cfce47ed54a88614648dc3f19a5980097007dd";
+const SOLANA_CHAIN:u64=792_703_809;
+const SOLANA_USDC:&str="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const ROBINHOOD_CHAIN:u64=4_663;
+const ROBINHOOD_USDG:&str="0x5fc5360d0400a0fd4f2af552add042d716f1d168";
+struct DestinationRoute {chain:u128,eid:u128,token:&'static str,bridge:&'static str,mints:bool}
+fn destination_route(chain:&str)->Result<DestinationRoute,String>{Ok(match chain {
+    "arbitrum"=>DestinationRoute {chain:42161,eid:30110,token:ARB_TOKEN,bridge:ARB_BRIDGE,mints:false},
+    "base"=>DestinationRoute {chain:8453,eid:30184,token:"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",bridge:"0x27a16dc786820b16e5c9028b75b99f6f604b5d26",mints:false},
+    "ethereum"=>DestinationRoute {chain:1,eid:30101,token:"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",bridge:"0xc026395860db2d07ee33e05fe50ed7bd583189c7",mints:false},
+    "polygon"=>DestinationRoute {chain:137,eid:30109,token:"0x3c499c542cef5e3811e1192ce70d8cc03d5c3359",bridge:"0x9aa02d4fae7f58b8e8f34c66e756cc734dac7fe4",mints:false},
+    "tempo"=>DestinationRoute {chain:4217,eid:30410,token:"0x20c000000000000000000000b9537d11c60e8b50",bridge:"0x8c76e2f6c5ceda9aa7772e7eff30280226c44392",mints:true},
+    _=>return Err(denied()),
+})}
 const ENTRY_POINT:&str="0x0000000071727de22e5e9d8baf0edac6f37da032";
 const ENTRY_POINT_CODE_HASH:&str="8db5ff695839d655407cc8490bb7a5d82337a86a6b39c3f0258aa6c3b582fc58";
 const ZERO:&str="0x0000000000000000000000000000000000000000";
@@ -18,6 +31,15 @@ pub(super) struct BusWithdrawalProof {
     pub pool_transaction_hash:String,pub boarding_transaction_hash:String,
     pub driving_transaction_hash:String,pub destination_transaction_hash:String,
 }
+#[derive(Clone,Debug,Serialize,Deserialize)]
+#[serde(rename_all="camelCase",deny_unknown_fields)]
+struct RelayBusWithdrawalProof {
+    pool_transaction_hash:String,boarding_transaction_hash:String,driving_transaction_hash:String,
+    destination_transaction_hash:String,relay:RelayWithdrawalBinding,destination_receipt_hash:String,
+}
+#[derive(Clone,Debug,Serialize,Deserialize)]
+#[serde(rename_all="camelCase",deny_unknown_fields)]
+struct LocalUsdcWithdrawalProof {pool_transaction_hash:String}
 #[derive(Clone,Debug,Serialize,Deserialize)]
 #[serde(rename_all="camelCase",deny_unknown_fields)]
 pub(super) struct BusDepositProof {
@@ -32,9 +54,12 @@ pub(super) struct BusDepositFinalizationProof {
 struct VerifiedDepositTicket {reference:String,ticket:u128,received:u128,passenger:String}
 #[derive(Clone)]
 pub(super) struct UsdcBusCustodyAdapter {
-    client:reqwest::Client,horizen_url:String,arbitrum_url:String,horizen_confirmations:u64,arbitrum_confirmations:u64,
+    client:reqwest::Client,horizen_url:String,arbitrum_url:String,base_url:String,ethereum_url:String,polygon_url:String,tempo_url:String,
+    robinhood_url:String,solana_url:String,relay_api_url:String,relay_api_key:String,
+    horizen_confirmations:u64,arbitrum_confirmations:u64,base_confirmations:u64,ethereum_confirmations:u64,polygon_confirmations:u64,tempo_confirmations:u64,
     ledger:String,maximum_subsidy:u128,maximum_native:u128,
 }
+#[derive(Clone)]
 struct Confirmed {receipt:Value,tx:Value}
 fn denied()->String {"USDC Bus custody proof conflict".into()}
 fn topic(value:&str)->String {format!("0x{}",hex::encode(Keccak256::digest(value.as_bytes())))}
@@ -100,8 +125,16 @@ impl UsdcBusCustodyAdapter {
         let positive=|name:&str|->Result<u128,String>{required(name)?.parse().ok().filter(|value|*value>0).ok_or_else(||format!("{name} invalid"))};
         let confirmations=|name:&str|->Result<u64,String>{let value=positive(name)?;if value>10000 {return Err("USDC finality invalid".into());}Ok(value as u64)};
         Ok(Some(Self {client:reqwest::Client::builder().timeout(Duration::from_secs(5)).build().map_err(|_|"USDC RPC client unavailable")?,
-            horizen_url:url("LAYRSV2_HORIZEN_RPC_URL")?,arbitrum_url:url("LAYRSV2_ARBITRUM_RPC_URL")?,
+            horizen_url:url("LAYRSV2_HORIZEN_RPC_URL")?,arbitrum_url:url("LAYRSV2_ARBITRUM_RPC_URL")?,base_url:url("LAYRSV2_BASE_RPC_URL")?,
+            ethereum_url:url("LAYRSV2_ETHEREUM_RPC_URL")?,polygon_url:url("LAYRSV2_POLYGON_RPC_URL")?,tempo_url:url("LAYRSV2_TEMPO_RPC_URL")?,
+            robinhood_url:url("LAYRSV2_ROBINHOOD_RPC_URL")?,solana_url:url("LAYRSV2_SOLANA_RPC_URL")?,
+            relay_api_url:{let value=env::var("LAYRSV2_RELAY_BASE_URL").unwrap_or_else(|_|"https://api.relay.link".into());
+                let parsed=reqwest::Url::parse(&value).map_err(|_|"Relay API configuration invalid")?;
+                if parsed.scheme()!="https"||!parsed.username().is_empty()||parsed.password().is_some(){return Err("Relay API configuration invalid".into());}value.trim_end_matches('/').into()},
+            relay_api_key:required("LAYRSV2_RELAY_API_KEY")?,
             horizen_confirmations:confirmations("LAYRSV2_HORIZEN_CONFIRMATIONS")?,arbitrum_confirmations:confirmations("LAYRSV2_ARBITRUM_CONFIRMATIONS")?,
+            base_confirmations:confirmations("LAYRSV2_BASE_CONFIRMATIONS")?,ethereum_confirmations:confirmations("LAYRSV2_ETHEREUM_CONFIRMATIONS")?,
+            polygon_confirmations:confirmations("LAYRSV2_POLYGON_CONFIRMATIONS")?,tempo_confirmations:confirmations("LAYRSV2_TEMPO_CONFIRMATIONS")?,
             ledger:canonical_evm_address(&required("LAYRS_DIRECT_USDC_LEDGER_WALLET_ADDRESS")?).map_err(|_|"USDC ledger wallet invalid")?,
             maximum_subsidy:positive("LAYRS_DIRECT_USDC_MAX_SUBSIDY_ATOMIC")?,maximum_native:positive("LAYRS_DIRECT_USDC_MAX_BRIDGE_FEE_WEI")?}))
     }
@@ -129,14 +162,115 @@ impl UsdcBusCustodyAdapter {
         let tx=self.rpc(url,"eth_getTransactionByHash",json!([hash])).await?;
         let result=Confirmed {receipt,tx};coherence(&result,chain,hash)?;Ok(Some(result))
     }
-    pub async fn settlement(&self,destination:&str,amount:&str,proof:&BusWithdrawalProof)->Result<Option<String>,String>{
+    async fn confirmed_destination(&self,destination_chain:&str,hash:&str)->Result<Option<Confirmed>,String>{
+        let route=destination_route(destination_chain)?;
+        let (url,confirmations)=match destination_chain {
+            "arbitrum"=>(&self.arbitrum_url,self.arbitrum_confirmations),"base"=>(&self.base_url,self.base_confirmations),
+            "ethereum"=>(&self.ethereum_url,self.ethereum_confirmations),"polygon"=>(&self.polygon_url,self.polygon_confirmations),
+            "tempo"=>(&self.tempo_url,self.tempo_confirmations),_=>return Err(denied()),
+        };
+        self.confirmed_at(url,route.chain,confirmations,hash).await
+    }
+    async fn confirmed_at(&self,url:&str,chain:u128,confirmations:u64,hash:&str)->Result<Option<Confirmed>,String>{
+        if !valid_transaction_hash(hash)||hash!=hash.to_ascii_lowercase() {return Err(denied());}
+        if self.rpc(url,"eth_chainId",json!([])).await?.as_str().and_then(parse_quantity)!=Some(chain) {return Err("USDC Bus RPC chain mismatch".into());}
+        let receipt=self.rpc(url,"eth_getTransactionReceipt",json!([hash])).await?;
+        if receipt.is_null() {return Ok(None);}
+        let number=receipt["blockNumber"].as_str().and_then(parse_quantity).ok_or_else(denied)?;
+        let head=self.rpc(url,"eth_blockNumber",json!([])).await?.as_str().and_then(parse_quantity).ok_or_else(denied)?;
+        if head.checked_sub(number).and_then(|value|value.checked_add(1)).unwrap_or(0)<u128::from(confirmations) {return Ok(None);}
+        let block=self.rpc(url,"eth_getBlockByNumber",json!([quantity(number),false])).await?;
+        if block["hash"]!=receipt["blockHash"] {return Err("USDC Bus RPC reorg".into());}
+        let tx=self.rpc(url,"eth_getTransactionByHash",json!([hash])).await?;
+        let result=Confirmed {receipt,tx};coherence(&result,chain,hash)?;Ok(Some(result))
+    }
+    pub async fn settlement(&self,destination_chain:&str,destination:&str,amount:&str,proof:&Value)->Result<Option<String>,String>{
         let asset=self.rpc(&self.horizen_url,"eth_call",json!([{"to":POOL,"data":selector("asset()")},"latest"])).await?;
         if !eq(&asset,&format!("0x{}",address_word(HZ_TOKEN))) {return Err(denied());}
+        if destination_chain=="horizen" {
+            let proof:LocalUsdcWithdrawalProof=serde_json::from_value(proof.clone()).map_err(|_|denied())?;
+            let Some(pool)=self.confirmed(false,&proof.pool_transaction_hash).await? else {return Ok(None);};
+            return local_terminal_effect(&self.ledger,destination,amount,&proof,&pool).map(Some);
+        }
+        if matches!(destination_chain,"solana"|"robinhood") {
+            let proof:RelayBusWithdrawalProof=serde_json::from_value(proof.clone()).map_err(|_|denied())?;
+            return self.relay_settlement(destination_chain,destination,amount,&proof).await;
+        }
+        let proof:BusWithdrawalProof=serde_json::from_value(proof.clone()).map_err(|_|denied())?;
         let Some(pool)=self.confirmed(false,&proof.pool_transaction_hash).await? else {return Ok(None);};
         let Some(boarding)=self.confirmed(false,&proof.boarding_transaction_hash).await? else {return Ok(None);};
         let Some(driving)=self.confirmed(false,&proof.driving_transaction_hash).await? else {return Ok(None);};
-        let Some(arrival)=self.confirmed(true,&proof.destination_transaction_hash).await? else {return Ok(None);};
-        terminal_effect(&self.ledger,destination,amount,self.maximum_subsidy,self.maximum_native,proof,&pool,&boarding,&driving,&arrival).map(Some)
+        let Some(arrival)=self.confirmed_destination(destination_chain,&proof.destination_transaction_hash).await? else {return Ok(None);};
+        terminal_effect(destination_chain,&self.ledger,destination,amount,self.maximum_subsidy,self.maximum_native,&proof,&pool,&boarding,&driving,&arrival).map(Some)
+    }
+    async fn relay_get(&self,path:&str)->Result<Value,String>{
+        let response=self.client.get(format!("{}{}",self.relay_api_url,path)).header("x-api-key",&self.relay_api_key).header("accept","application/json")
+            .send().await.map_err(|_|"Relay proof unavailable")?.error_for_status().map_err(|_|"Relay proof rejected")?;
+        if response.content_length().is_some_and(|size|size>1_000_000){return Err("Relay proof limit".into());}
+        let bytes=response.bytes().await.map_err(|_|"Relay proof unavailable")?;
+        if bytes.len()>1_000_000{return Err("Relay proof limit".into());}
+        serde_json::from_slice(&bytes).map_err(|_|"Relay proof malformed".into())
+    }
+    async fn relay_settlement(&self,destination_chain:&str,destination:&str,amount:&str,proof:&RelayBusWithdrawalProof)->Result<Option<String>,String>{
+        proof.relay.verify(amount).map_err(|_|denied())?;
+        let (chain,currency)=match destination_chain {"solana"=>(SOLANA_CHAIN,SOLANA_USDC),"robinhood"=>(ROBINHOOD_CHAIN,ROBINHOOD_USDG),_=>return Err(denied())};
+        if proof.relay.destination_chain_id!=chain||!relay_address_eq(&proof.relay.destination_currency,currency,chain)
+            ||!relay_address_eq(&proof.relay.recipient,destination,chain)
+            ||proof.relay.minimum_destination_amount_atomic.parse::<u128>().ok().is_none_or(|value|value<amount.parse::<u128>().unwrap_or(u128::MAX)) {return Err(denied());}
+        let bus=BusWithdrawalProof {pool_transaction_hash:proof.pool_transaction_hash.clone(),boarding_transaction_hash:proof.boarding_transaction_hash.clone(),
+            driving_transaction_hash:proof.driving_transaction_hash.clone(),destination_transaction_hash:proof.destination_transaction_hash.clone()};
+        let Some(pool)=self.confirmed(false,&bus.pool_transaction_hash).await? else{return Ok(None)};
+        let Some(boarding)=self.confirmed(false,&bus.boarding_transaction_hash).await? else{return Ok(None)};
+        let Some(driving)=self.confirmed(false,&bus.driving_transaction_hash).await? else{return Ok(None)};
+        let Some(arrival)=self.confirmed(true,&bus.destination_transaction_hash).await? else{return Ok(None)};
+        terminal_effect("arbitrum",&self.ledger,&proof.relay.deposit_address,amount,self.maximum_subsidy,self.maximum_native,&bus,&pool,&boarding,&driving,&arrival)?;
+        let status=self.relay_get(&format!("/intents/status/v3?requestId={}",proof.relay.request_id)).await?;
+        let details=self.relay_get(&format!("/requests/v3?id={}",proof.relay.request_id)).await?;
+        if status.get("status").and_then(Value::as_str)!=Some("success")
+            ||status.get("requestId").and_then(Value::as_str).is_some_and(|id|!id.eq_ignore_ascii_case(&proof.relay.request_id))
+            ||status.get("originChainId").and_then(Value::as_u64).is_some_and(|value|value!=42161)
+            ||status.get("destinationChainId").and_then(Value::as_u64).is_some_and(|value|value!=chain)
+            ||!relay_hashes(status.get("inTxHashes")).iter().any(|hash|hash.eq_ignore_ascii_case(&proof.destination_transaction_hash)) {return Err(denied());}
+        let requests=details.get("requests").and_then(Value::as_array).filter(|values|values.len()==1).ok_or_else(denied)?;
+        let request=&requests[0];
+        if request.get("id").and_then(Value::as_str).is_none_or(|id|!id.eq_ignore_ascii_case(&proof.relay.request_id))
+            ||request.get("recipient").and_then(Value::as_str).is_none_or(|value|!relay_address_eq(value,destination,chain))
+            ||request.pointer("/depositAddress/address").and_then(Value::as_str).is_none_or(|value|!value.eq_ignore_ascii_case(&proof.relay.deposit_address))
+            ||!relay_request_has_intake(request,42161,&proof.destination_transaction_hash)
+            ||!relay_currency_matches(request.pointer("/data/route/quoted/origin/inputCurrency"),42161,ARB_TOKEN,amount)
+            ||!relay_currency_matches(request.pointer("/data/route/quoted/destination/outputCurrency"),chain,currency,&proof.relay.quoted_destination_amount_atomic)
+            ||request.get("status").and_then(Value::as_str)!=Some("success") {return Err(denied());}
+        let hashes=relay_destination_hashes(request,chain);let status_hashes=relay_hashes(status.get("txHashes"));
+        if hashes.len()!=1||status_hashes.len()!=1||hashes[0]!=status_hashes[0]||hashes[0]!=proof.destination_receipt_hash{return Err(denied());}
+        let actual=relay_actual_destination_amount(request,&proof.relay)?;
+        if actual.parse::<u128>().ok().is_none_or(|value|value<amount.parse::<u128>().unwrap_or(u128::MAX)){return Err(denied());}
+        if chain==ROBINHOOD_CHAIN {
+            let Some(finalized)=self.confirmed_at(&self.robinhood_url,ROBINHOOD_CHAIN.into(),1,&proof.destination_receipt_hash).await? else{return Ok(None)};
+            let delivered=actual.parse::<u128>().map_err(|_|denied())?;
+            if transfer(&finalized.receipt,ROBINHOOD_USDG,ZERO,destination,delivered).is_empty()
+                &&events(&finalized.receipt,ROBINHOOD_USDG,"Transfer(address,address,uint256)").into_iter().filter(|log|log["topics"].as_array().map(Vec::len)==Some(3)
+                    &&eq(&log["topics"][2],&format!("0x{}",address_word(destination)))&&integer(&log["data"],0).ok()==Some(delivered)).count()!=1{return Err(denied());}
+        } else if !self.solana_delivery(destination,&proof.destination_receipt_hash,&actual).await? {return Ok(None)}
+        Ok(Some(format!("horizen-usdc-relay:{}:{}:{}:{}:{}",proof.pool_transaction_hash,
+            driving_guid(&driving)?,proof.destination_transaction_hash,proof.relay.request_id,proof.destination_receipt_hash)))
+    }
+    async fn solana_delivery(&self,recipient:&str,signature:&str,amount:&str)->Result<bool,String>{
+        if !valid_relay_transaction_hash(signature)||signature.starts_with("0x"){return Err(denied());}
+        let statuses=self.rpc(&self.solana_url,"getSignatureStatuses",json!([[signature],{"searchTransactionHistory":true}])).await?;
+        let Some(status)=statuses.pointer("/value/0") else{return Ok(false)};
+        if status.is_null(){return Ok(false)}
+        if !status.get("err").is_some_and(Value::is_null)||status.get("confirmationStatus").and_then(Value::as_str)!=Some("finalized"){return Ok(false)}
+        let tx=self.rpc(&self.solana_url,"getTransaction",json!([signature,{"commitment":"finalized","encoding":"jsonParsed","maxSupportedTransactionVersion":0}])).await?;
+        if tx.is_null(){return Ok(false)}
+        let before=tx.pointer("/meta/preTokenBalances").and_then(Value::as_array).ok_or_else(denied)?;
+        let after=tx.pointer("/meta/postTokenBalances").and_then(Value::as_array).ok_or_else(denied)?;
+        let balance=|values:&Vec<Value>|->Result<u128,String>{
+            let matches=values.iter().filter(|entry|entry.get("mint").and_then(Value::as_str)==Some(SOLANA_USDC)
+                &&entry.get("owner").and_then(Value::as_str)==Some(recipient)).collect::<Vec<_>>();
+            if matches.len()>1{return Err(denied())}Ok(matches.first().and_then(|entry|entry.pointer("/uiTokenAmount/amount")).and_then(Value::as_str)
+                .unwrap_or("0").parse().map_err(|_|denied())?) };
+        let delivered=balance(after)?.checked_sub(balance(before)?).ok_or_else(denied)?;
+        if delivered<amount.parse::<u128>().map_err(|_|denied())?{return Err(denied())}Ok(true)
     }
     async fn deposit_ticket(&self,wallet:&str,amount:&str,proof:&BusDepositProof)->Result<Option<VerifiedDepositTicket>,String>{
         let Some(boarding)=self.confirmed(true,&proof.boarding_transaction_hash).await? else {return Ok(None);};
@@ -162,6 +296,27 @@ impl UsdcBusCustodyAdapter {
         let reference=normal_deposit_finalization(wallet,amount,proof,&ticket,&drive,&arrival,&pool)?;
         Ok(Some((ticket.reference,reference)))
     }
+}
+
+fn driving_guid(driving:&Confirmed)->Result<String,String>{
+    let drives=events(&driving.receipt,HZ_MESSAGING,"BusDriven(uint32,uint72,uint8,bytes32)");
+    if drives.len()!=1{return Err(denied())}Ok(format!("0x{}",at(&drives[0]["data"],3)?))
+}
+
+fn local_terminal_effect(ledger:&str,destination:&str,amount:&str,proof:&LocalUsdcWithdrawalProof,pool:&Confirmed)->Result<String,String>{
+    let recipient=canonical_evm_address(destination).map_err(|_|denied())?;
+    let principal=amount.parse::<u128>().ok().filter(|value|*value>0&&value.to_string()==amount).ok_or_else(denied)?;
+    coherence(pool,26514,&proof.pool_transaction_hash)?;
+    let pool_call=format!("{}{}{}",selector("withdraw(address,uint256)"),address_word(&recipient),word(principal));
+    let withdrawals=events(&pool.receipt,POOL,"Withdrawn(address,uint256,address)");
+    if !eq(&pool.tx["from"],ledger)||!eq(&pool.tx["to"],POOL)||!eq(&pool.tx["input"],&pool_call)
+        ||pool.tx["value"].as_str().and_then(parse_quantity)!=Some(0)||withdrawals.len()!=1
+        ||withdrawals[0]["topics"].as_array().map(Vec::len)!=Some(3)
+        ||!eq(&withdrawals[0]["topics"][1],&format!("0x{}",address_word(&recipient)))
+        ||!eq(&withdrawals[0]["topics"][2],&format!("0x{}",address_word(ledger)))
+        ||!eq(&withdrawals[0]["data"],&format!("0x{}",word(principal)))
+        ||transfer(&pool.receipt,HZ_TOKEN,POOL,&recipient,principal).len()!=1{return Err(denied());}
+    Ok(format!("horizen-usdc-local:{}",proof.pool_transaction_hash))
 }
 
 fn scoped_deposit_boarding(boarding:&Confirmed,proof:&BusDepositProof,wallet:&str,trace:Option<&Value>)->Result<(Value,Value),String>{
@@ -294,12 +449,13 @@ fn normal_deposit_finalization(wallet:&str,amount:&str,proof:&BusDepositFinaliza
     Ok(format!("horizen-usdc-deposit:{}",proof.pool_transaction_hash))
 }
 
-fn terminal_effect(ledger:&str,destination:&str,amount:&str,max_subsidy:u128,max_native:u128,proof:&BusWithdrawalProof,
+fn terminal_effect(destination_chain:&str,ledger:&str,destination:&str,amount:&str,max_subsidy:u128,max_native:u128,proof:&BusWithdrawalProof,
     pool:&Confirmed,boarding:&Confirmed,driving:&Confirmed,arrival:&Confirmed)->Result<String,String>{
+    let route=destination_route(destination_chain)?;
     let recipient=canonical_evm_address(destination).map_err(|_|denied())?;
     let principal=amount.parse::<u128>().ok().filter(|value|*value>0&&value.to_string()==amount).ok_or_else(denied)?;
     coherence(pool,26514,&proof.pool_transaction_hash)?;coherence(boarding,26514,&proof.boarding_transaction_hash)?;
-    coherence(driving,26514,&proof.driving_transaction_hash)?;coherence(arrival,42161,&proof.destination_transaction_hash)?;
+    coherence(driving,26514,&proof.driving_transaction_hash)?;coherence(arrival,route.chain,&proof.destination_transaction_hash)?;
     let pool_call=format!("{}{}{}",selector("withdraw(address,uint256)"),address_word(ledger),word(principal));
     let withdrawals=events(&pool.receipt,POOL,"Withdrawn(address,uint256,address)");
     if !eq(&pool.tx["from"],ledger)||!eq(&pool.tx["to"],POOL)||!eq(&pool.tx["input"],&pool_call)
@@ -313,15 +469,15 @@ fn terminal_effect(ledger:&str,destination:&str,amount:&str,max_subsidy:u128,max
     let rides=events(&boarding.receipt,HZ_MESSAGING,"BusRode(uint32,uint72,uint80,bytes)");
     if sends.len()!=1||rides.len()!=1||sends[0]["topics"].as_array().map(Vec::len)!=Some(3)
         ||!eq(&sends[0]["topics"][1],&format!("0x{}",word(0)))||!eq(&sends[0]["topics"][2],&format!("0x{}",address_word(ledger)))
-        ||integer(&sends[0]["data"],0)?!=30110 {return Err(denied());}
+        ||integer(&sends[0]["data"],0)?!=route.eid {return Err(denied());}
     let gross=integer(&sends[0]["data"],1)?;let received=integer(&sends[0]["data"],2)?;
     let native=boarding.tx["value"].as_str().and_then(parse_quantity).ok_or_else(denied)?;
     if gross<principal||gross-principal>max_subsidy||received<principal||received>u128::from(u64::MAX)||native>max_native {return Err(denied());}
     let passenger=format!("0001{}{:016x}00",address_word(&recipient),received);
     let ticket=integer(&rides[0]["data"],1)?;let fare=integer(&rides[0]["data"],2)?;
-    let ride_data=format!("0x{}{}{}{}{}",word(30110),word(ticket),word(fare),word(128),bytes_argument(&passenger)?);
+    let ride_data=format!("0x{}{}{}{}{}",word(route.eid),word(ticket),word(fare),word(128),bytes_argument(&passenger)?);
     let send_call=format!("{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",selector("sendToken((uint32,bytes32,uint256,uint256,bytes,bytes,bytes),(uint256,uint256),address)"),
-        word(128),word(native),word(0),address_word(ledger),word(30110),address_word(&recipient),word(gross),word(principal),
+        word(128),word(native),word(0),address_word(ledger),word(route.eid),address_word(&recipient),word(gross),word(principal),
         word(224),word(256),word(288),word(0),word(0),word(1),format!("01{}","0".repeat(62)),"");
     if ticket>=1u128<<72||fare>native||!eq(&rides[0]["data"],&ride_data)||rides[0]["topics"].as_array().map(Vec::len)!=Some(1)
         ||!eq(&boarding.tx["from"],ledger)||!eq(&boarding.tx["to"],HZ_BRIDGE)||!eq(&boarding.tx["input"],&send_call)
@@ -335,26 +491,27 @@ fn terminal_effect(ledger:&str,destination:&str,amount:&str,max_subsidy:u128,max
         if index(pulls[0])?>=index(burns[0])?||index(burns[0])?>=index(rides[0])? {return Err(denied());}
     }
     let drives=events(&driving.receipt,HZ_MESSAGING,"BusDriven(uint32,uint72,uint8,bytes32)");
-    if drives.len()!=1||drives[0]["topics"].as_array().map(Vec::len)!=Some(1)||integer(&drives[0]["data"],0)?!=30110 {return Err(denied());}
+    if drives.len()!=1||drives[0]["topics"].as_array().map(Vec::len)!=Some(1)||integer(&drives[0]["data"],0)?!=route.eid {return Err(denied());}
     let start=integer(&drives[0]["data"],1)?;let count=integer(&drives[0]["data"],2)?;
     let guid=format!("0x{}",at(&drives[0]["data"],3)?);
     let seat=ticket.checked_sub(start).filter(|seat|*seat<count).ok_or_else(denied)?;
     if start>=1u128<<72||count==0||count>255||guid==format!("0x{}",word(0))||!eq(&driving.tx["to"],HZ_MESSAGING) {return Err(denied());}
     let input=driving.tx["input"].as_str().ok_or_else(denied)?;
     let tail=input.get(10..).map(|tail|Value::String(format!("0x{tail}"))).ok_or_else(denied)?;
-    if integer(&tail,0)?!=30110||integer(&tail,1)?!=64||integer(&tail,2)?!=count*43 {return Err(denied());}
+    if integer(&tail,0)?!=route.eid||integer(&tail,1)?!=64||integer(&tail,2)?!=count*43 {return Err(denied());}
     let passengers=input.get(10+192..10+192+count as usize*86).ok_or_else(denied)?.to_ascii_lowercase();
-    let drive_call=format!("{}{}{}{}",selector("driveBus(uint32,bytes)"),word(30110),word(64),bytes_argument(&passengers)?);
+    let drive_call=format!("{}{}{}{}",selector("driveBus(uint32,bytes)"),word(route.eid),word(64),bytes_argument(&passengers)?);
     if !eq(&driving.tx["input"],&drive_call)||passengers.get(seat as usize*86..(seat as usize+1)*86)!=Some(passenger.as_str()) {return Err(denied());}
     // Allocate identical receiver/amount passengers by ordered seat outcomes.
     // An explicit cached failure occupies its seat and must not steal another
     // successful passenger's transfer. Exact retry calldata provides the index.
-    let mut receives=events(&arrival.receipt,ARB_BRIDGE,"OFTReceived(bytes32,uint32,address,uint256)").into_iter().filter(|log|
+    let mut receives=events(&arrival.receipt,route.bridge,"OFTReceived(bytes32,uint32,address,uint256)").into_iter().filter(|log|
         log["topics"].as_array().map(Vec::len)==Some(3)&&eq(&log["topics"][1],&guid)
         &&eq(&log["topics"][2],&format!("0x{}",address_word(&recipient)))
         &&integer(&log["data"],0).ok()==Some(30399)&&integer(&log["data"],1).ok()==Some(received)).collect::<Vec<_>>();
     receives.sort_by_key(|log|log["logIndex"].as_str().and_then(parse_quantity).unwrap());
-    let mut transfers=transfer(&arrival.receipt,ARB_TOKEN,ARB_BRIDGE,&recipient,received);
+    let transfer_source=if route.mints {ZERO}else{route.bridge};
+    let mut transfers=transfer(&arrival.receipt,route.token,transfer_source,&recipient,received);
     transfers.sort_by_key(|log|log["logIndex"].as_str().and_then(parse_quantity).unwrap());
     if receives.is_empty()||transfers.len()!=receives.len() {return Err(denied());}
     for (index,receive) in receives.iter().enumerate(){
@@ -365,10 +522,10 @@ fn terminal_effect(ledger:&str,destination:&str,amount:&str,max_subsidy:u128,max
     let retry_selector=selector("retryReceiveToken(bytes32,uint8,uint32,address,uint256,bytes)");
     let selected=if arrival.tx["input"].as_str().is_some_and(|input|input.starts_with(&retry_selector)) {
         let call=format!("{}{}{}{}{}{}{}{}",retry_selector,guid.trim_start_matches("0x"),word(seat),word(30399),address_word(&recipient),word(received),word(192),word(0));
-        if receives.len()!=1||!eq(&arrival.tx["to"],ARB_BRIDGE)||!eq(&arrival.tx["input"],&call) {return Err(denied());}0
+        if receives.len()!=1||!eq(&arrival.tx["to"],route.bridge)||!eq(&arrival.tx["input"],&call) {return Err(denied());}0
     }else{
         let matching=(0..count as usize).filter(|index|passengers.get(index*86..index*86+84)==passenger.get(..84)).collect::<Vec<_>>();
-        let caches=events(&arrival.receipt,ARB_BRIDGE,"UnreceivedTokenCached(bytes32,uint8,uint32,address,uint256,bytes)").into_iter().filter(|log|
+        let caches=events(&arrival.receipt,route.bridge,"UnreceivedTokenCached(bytes32,uint8,uint32,address,uint256,bytes)").into_iter().filter(|log|
             at(&log["data"],0).ok().is_some_and(|hash|format!("0x{hash}")==guid)
             &&integer(&log["data"],2).ok()==Some(30399)&&at(&log["data"],3).ok()==Some(address_word(&recipient))
             &&integer(&log["data"],4).ok()==Some(received)).collect::<Vec<_>>();
@@ -427,8 +584,43 @@ mod tests {
     fn material(value:&Value,name:&str)->Confirmed {Confirmed {receipt:value[name]["receipt"].clone(),tx:value[name]["tx"].clone()}}
     fn verify(value:&Value)->Result<String,String>{
         let proof:BusWithdrawalProof=serde_json::from_value(value["proof"].clone()).unwrap();
-        terminal_effect(value["ledger"].as_str().unwrap(),value["recipient"].as_str().unwrap(),value["amountAtomic"].as_str().unwrap(),10000,1000,&proof,
+        terminal_effect("arbitrum",value["ledger"].as_str().unwrap(),value["recipient"].as_str().unwrap(),value["amountAtomic"].as_str().unwrap(),10000,1000,&proof,
             &material(value,"pool"),&material(value,"boarding"),&material(value,"driving"),&material(value,"arrival"))
+    }
+    fn destination_fixture(chain:&str)->Value {
+        let route=destination_route(chain).unwrap();
+        let text=serde_json::to_string(&fixture()).unwrap()
+            .replace(ARB_BRIDGE,route.bridge)
+            .replace(ARB_BRIDGE.trim_start_matches("0x"),route.bridge.trim_start_matches("0x"))
+            .replace(ARB_TOKEN,route.token)
+            .replace(&word(30110),&word(route.eid)).replace("0xa4b1",&quantity(route.chain));
+        let mut value:Value=serde_json::from_str(&text).unwrap();
+        if route.mints {value["arrival"]["receipt"]["logs"][0]["topics"][1]=json!(format!("0x{}",address_word(ZERO)));}
+        value
+    }
+    #[test]
+    fn every_direct_destination_binds_chain_eid_bridge_token_and_recipient(){
+        for chain in ["arbitrum","base","ethereum","polygon","tempo"] {
+            let value=destination_fixture(chain);let proof:BusWithdrawalProof=serde_json::from_value(value["proof"].clone()).unwrap();
+            assert!(terminal_effect(chain,value["ledger"].as_str().unwrap(),value["recipient"].as_str().unwrap(),value["amountAtomic"].as_str().unwrap(),10000,1000,&proof,
+                &material(&value,"pool"),&material(&value,"boarding"),&material(&value,"driving"),&material(&value,"arrival")).is_ok(),"{chain}");
+            let wrong=if chain=="arbitrum" {"base"}else{"arbitrum"};
+            assert!(terminal_effect(wrong,value["ledger"].as_str().unwrap(),value["recipient"].as_str().unwrap(),value["amountAtomic"].as_str().unwrap(),10000,1000,&proof,
+                &material(&value,"pool"),&material(&value,"boarding"),&material(&value,"driving"),&material(&value,"arrival")).is_err(),"{chain}:wrong route");
+        }
+    }
+    #[test]
+    fn local_horizen_withdrawal_binds_pool_sender_recipient_token_and_amount(){
+        let value=fixture();let ledger=value["ledger"].as_str().unwrap();let recipient=value["recipient"].as_str().unwrap();
+        let proof=LocalUsdcWithdrawalProof {pool_transaction_hash:value["proof"]["poolTransactionHash"].as_str().unwrap().into()};
+        let mut pool=material(&value,"pool");pool.tx["input"]=json!(format!("{}{}{}",selector("withdraw(address,uint256)"),address_word(recipient),word(5_000_000)));
+        pool.receipt["logs"][0]["topics"][2]=json!(format!("0x{}",address_word(recipient)));
+        pool.receipt["logs"][1]["topics"][1]=json!(format!("0x{}",address_word(recipient)));
+        assert_eq!(local_terminal_effect(ledger,recipient,"5000000",&proof,&pool).unwrap(),format!("horizen-usdc-local:{}",proof.pool_transaction_hash));
+        for variant in ["recipient","sender","amount"]{let mut changed=pool.clone();match variant {
+            "recipient"=>changed.receipt["logs"][1]["topics"][1]=json!(format!("0x{}",address_word(ledger))),
+            "sender"=>changed.tx["from"]=json!(recipient),_=>changed.receipt["logs"][1]["data"]=json!(format!("0x{}",word(4_999_999)))}
+            assert!(local_terminal_effect(ledger,recipient,"5000000",&proof,&changed).is_err(),"{variant}");}
     }
     fn duplicate_prefix(value:&mut Value){
         let input=value["driving"]["tx"]["input"].as_str().unwrap();
@@ -491,7 +683,7 @@ mod tests {
             }assert!(verify(&value).is_err(),"{kind}");
         }
         let value=fixture();let proof:BusWithdrawalProof=serde_json::from_value(value["proof"].clone()).unwrap();
-        assert!(terminal_effect(value["ledger"].as_str().unwrap(),value["recipient"].as_str().unwrap(),"5000000",3001,1000,&proof,
+        assert!(terminal_effect("arbitrum",value["ledger"].as_str().unwrap(),value["recipient"].as_str().unwrap(),"5000000",3001,1000,&proof,
             &material(&value,"pool"),&material(&value,"boarding"),&material(&value,"driving"),&material(&value,"arrival")).is_err());
     }
     #[test]
@@ -553,7 +745,9 @@ mod tests {
             let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let url=format!("http://{}/",listener.local_addr().unwrap());
             let server=tokio::spawn(async move {axum::serve(listener,app).await.unwrap();});
             let adapter=UsdcBusCustodyAdapter {client:reqwest::Client::builder().timeout(Duration::from_secs(2)).build().unwrap(),
-                horizen_url:url.clone(),arbitrum_url:url,horizen_confirmations:2,arbitrum_confirmations:2,
+                horizen_url:url.clone(),arbitrum_url:url.clone(),base_url:url.clone(),ethereum_url:url.clone(),polygon_url:url.clone(),tempo_url:url.clone(),
+                robinhood_url:url.clone(),solana_url:url.clone(),relay_api_url:url,relay_api_key:"test".into(),
+                horizen_confirmations:2,arbitrum_confirmations:2,base_confirmations:2,ethereum_confirmations:2,polygon_confirmations:2,tempo_confirmations:2,
                 ledger:fixture["ledger"].as_str().unwrap().into(),maximum_subsidy:10000,maximum_native:1000};
             let result=adapter.confirmed(false,&proof.pool_transaction_hash).await;
             server.abort();

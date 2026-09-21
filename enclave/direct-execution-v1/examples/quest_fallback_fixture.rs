@@ -18,9 +18,9 @@ fn main()->Result<(),Box<dyn std::error::Error>>{
  let replacement="0x2222222222222222222222222222222222222222".to_string();
  runtime.execute_committed(command("fixture-link",DirectAction::LinkFinancialWallet{wallet_address:replacement},None),&[8;32],&mut store)?;
  let id="11111111-2222-4333-8444-555555555555";
- runtime.execute_committed(command(id,DirectAction::BeginUsdcBusWithdrawal{withdrawal_id:id.into(),destination:wallet.clone(),amount_atomic:"4840000".into()},Some(wallet.clone())),&[8;32],&mut store)?;
+ runtime.execute_committed(command(id,DirectAction::BeginUsdcBusWithdrawal{withdrawal_id:id.into(),destination_chain:"arbitrum".into(),asset:"USDC".into(),destination:wallet.clone(),amount_atomic:"4840000".into()},Some(wallet.clone())),&[8;32],&mut store)?;
  if args[3]=="drained"{runtime.execute_committed(command(&format!("usdc-bus-settle:{id}"),DirectAction::SettleUsdcBusWithdrawal{withdrawal_id:id.into(),
-   destination:wallet.clone(),amount_atomic:"4840000".into(),custody_reference:format!("horizen-usdc-bus:0x{}:0x{}:0x{}:0:1","11".repeat(32),"22".repeat(32),"33".repeat(32))},Some(wallet.clone())),&[8;32],&mut store)?;}
+   destination_chain:"arbitrum".into(),asset:"USDC".into(),destination:wallet.clone(),amount_atomic:"4840000".into(),custody_reference:format!("horizen-usdc-bus:0x{}:0x{}:0x{}:0:1","11".repeat(32),"22".repeat(32),"33".repeat(32))},Some(wallet.clone())),&[8;32],&mut store)?;}
  else if args[3]!="pending"{return Err("invalid fixture mode".into());}
  let manifest=serde_json::json!({"stateHash":runtime.committed_state_hash(),"sequence":runtime.committed_sequence(),"account":account,"identity":identity,
    "available":runtime.balance(&identity,"USDC","USER_AVAILABLE").to_string(),"hold":runtime.balance(&identity,"USDC","USER_WITHDRAWAL_HOLD").to_string(),
