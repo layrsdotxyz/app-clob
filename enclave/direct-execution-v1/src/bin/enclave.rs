@@ -10,7 +10,7 @@ use aws_nitro_enclaves_nsm_api::{
 };
 use hmac::{Hmac, Mac};
 use layrs_direct_execution_v1::{
-    runtime_binding, runtime_binding_commitment, DirectRuntime, InMemoryDirectStateStore,
+    runtime_binding, runtime_binding_commitment, quest_receipt_public_key, quest_receipt_attestation_commitment, DirectRuntime, InMemoryDirectStateStore,
     RuntimeMeasurementBinding, RuntimeMode, RuntimeRequest, RuntimeResponse, SealedEpoch,
     WriterGrant, EPOCH_ID, TRANSACTION_MODEL,
 };
@@ -43,6 +43,8 @@ struct EnclaveState {
     state_key: Vec<u8>,
     commit_ack_key: Vec<u8>,
     recovery_complete: bool,
+    restore_candidate: Option<DirectRuntime>,
+    committed_restore_frontier: Option<layrs_direct_execution_v1::CommittedRestoreFrontier>,
     pending_governed_bootstrap: Option<PendingGovernedBootstrap>,
     writer_grant_commitment: Option<String>,
     writer_grant_expires_at_unix: Option<u64>,
@@ -93,6 +95,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state_key,
         commit_ack_key,
         recovery_complete: false,
+        restore_candidate: None,
+        committed_restore_frontier: None,
         pending_governed_bootstrap: None,
         writer_grant_commitment: None,
         writer_grant_expires_at_unix: None,
@@ -116,6 +120,10 @@ where
         serde_cbor::from_slice(&read_frame(&mut stream).await?).map_err(invalid)?;
     let response = match request {
         RuntimeRequest::Attestation { nonce } => attest(&state, nonce).await,
+        RuntimeRequest::QuestReceiptAttestation { nonce } => attest_quest_receipt_key(&state,nonce).await,
+        RuntimeRequest::PublicQuestReceipt { participant_account,receipt_account,request_id,nonce } => {
+            public_quest_receipt(&state,&participant_account,&receipt_account,&request_id,&nonce).await
+        },
         RuntimeRequest::Status => {
             let state = state.lock().await;
             RuntimeResponse::Status {
@@ -162,6 +170,21 @@ where
             code: "UNEXPECTED_DURABILITY_ACK".into(),
         },
         RuntimeRequest::RecoverCommitted { artifacts } => recover_committed(state, artifacts).await,
+        RuntimeRequest::BeginCommittedRestore => begin_committed_restore(state).await,
+        RuntimeRequest::BeginCheckpointRestore { checkpoint } => begin_checkpoint_restore(state, checkpoint).await,
+        RuntimeRequest::SealCheckpoint { artifact, receipt_records, artifact_hashes } => {
+            let state = state.lock().await;
+            if !state.recovery_complete || state.restore_candidate.is_some() {
+                RuntimeResponse::Error { code: "CHECKPOINT_REQUIRES_VERIFIED_HEAD".into() }
+            } else {
+                match state.runtime.seal_checkpoint(artifact, receipt_records, artifact_hashes, &state.state_key) {
+                    Ok(checkpoint) => RuntimeResponse::CheckpointSealed { checkpoint },
+                    Err(_) => RuntimeResponse::Error { code: "CHECKPOINT_HEAD_INVALID".into() },
+                }
+            }
+        },
+        RuntimeRequest::AppendCommittedRestore { artifact } => append_committed_restore(state,artifact).await,
+        RuntimeRequest::FinishCommittedRestore { expected_sequence,expected_state_hash } => finish_committed_restore(state,expected_sequence,expected_state_hash).await,
         RuntimeRequest::Balance {
             account_id,
             identity_commitment,
@@ -459,6 +482,7 @@ where
     state.state_key = state_key;
     state.commit_ack_key = commit_ack_key;
     state.writer_grant_expires_at_unix = Some(pending.grant.expires_at_unix);
+    state.committed_restore_frontier = pending.grant.committed_restore_frontier;
     state.writer_grant_commitment = Some(writer_grant_commitment.clone());
     state.key_release_artifact_hash = Some(key_release_artifact_hash);
     RuntimeResponse::GovernedBootstrapComplete {
@@ -559,6 +583,11 @@ async fn recover_committed(
     artifacts: Vec<layrs_direct_execution_v1::DirectStateArtifact>,
 ) -> RuntimeResponse {
     let mut state = state.lock().await;
+    if state.committed_restore_frontier.as_ref().is_some_and(|frontier| !artifacts.iter().any(|artifact|
+        artifact.sequence == frontier.sequence && artifact.state_hash == frontier.state_hash
+        && layrs_direct_execution_v1::artifact_hash(artifact) == frontier.artifact_hash)) {
+        return RuntimeResponse::Error { code: "RESTORE_BELOW_GOVERNED_FRONTIER".into() };
+    }
     let store = match InMemoryDirectStateStore::from_artifacts(artifacts) {
         Ok(store) => store,
         Err(error) => {
@@ -605,6 +634,57 @@ async fn recover_committed(
     response
 }
 
+async fn begin_committed_restore(state: Arc<Mutex<EnclaveState>>) -> RuntimeResponse {
+    let mut state=state.lock().await;
+    if state.restore_candidate.is_some() { return RuntimeResponse::Error {code:"RESTORE_ALREADY_IN_PROGRESS".into()}; }
+    match DirectRuntime::new(state.epoch.clone(),state.mode,state.receipt_key.clone()) {
+        Ok(runtime)=>{let response=RuntimeResponse::RestoreProgress {recovered_sequence:0,recovered_state_hash:runtime.committed_state_hash()};state.restore_candidate=Some(runtime);response},
+        Err(_)=>RuntimeResponse::Error {code:"RESTORE_BEGIN_FAILED".into()},
+    }
+}
+async fn append_committed_restore(state: Arc<Mutex<EnclaveState>>,artifact:layrs_direct_execution_v1::DirectStateArtifact)->RuntimeResponse {
+    let mut state=state.lock().await;
+    let Some(candidate)=state.restore_candidate.take() else {return RuntimeResponse::Error {code:"RESTORE_NOT_STARTED".into()};};
+    if state.committed_restore_frontier.as_ref().is_some_and(|frontier|
+        artifact.sequence == frontier.sequence && (artifact.state_hash != frontier.state_hash
+            || layrs_direct_execution_v1::artifact_hash(&artifact) != frontier.artifact_hash)) {
+        return RuntimeResponse::Error { code: "RESTORE_GOVERNED_FRONTIER_MISMATCH".into() };
+    }
+    match candidate.restore_next_committed(&artifact,&state.state_key) {
+        Ok(candidate)=>{let response=RuntimeResponse::RestoreProgress {recovered_sequence:candidate.committed_sequence(),recovered_state_hash:candidate.committed_state_hash()};state.restore_candidate=Some(candidate);response},
+        Err(_)=>RuntimeResponse::Error {code:"RESTORE_SUCCESSOR_INVALID".into()},
+    }
+}
+async fn begin_checkpoint_restore(state: Arc<Mutex<EnclaveState>>, checkpoint: layrs_direct_execution_v1::DirectCheckpoint) -> RuntimeResponse {
+    let mut state = state.lock().await;
+    if state.restore_candidate.is_some() {
+        return RuntimeResponse::Error { code: "CHECKPOINT_RESTORE_STARTUP_ONLY".into() };
+    }
+    if state.committed_restore_frontier.as_ref().is_some_and(|frontier| !frontier.accepts_checkpoint(&checkpoint)) {
+        return RuntimeResponse::Error { code: "CHECKPOINT_BELOW_GOVERNED_FRONTIER".into() };
+    }
+    let candidate = DirectRuntime::new(state.epoch.clone(), state.mode, state.receipt_key.clone())
+        .and_then(|runtime| runtime.restore_checkpoint(&checkpoint, &state.state_key));
+    match candidate {
+        Ok(candidate) => {
+            let response = RuntimeResponse::RestoreProgress { recovered_sequence: candidate.committed_sequence(), recovered_state_hash: candidate.committed_state_hash() };
+            state.restore_candidate = Some(candidate); response
+        },
+        Err(_) => RuntimeResponse::Error { code: "CHECKPOINT_AUTHENTICATION_FAILED".into() },
+    }
+}
+async fn finish_committed_restore(state: Arc<Mutex<EnclaveState>>,expected_sequence:u64,expected_state_hash:String)->RuntimeResponse {
+    let mut state=state.lock().await;
+    let Some(candidate)=state.restore_candidate.take() else {return RuntimeResponse::Error {code:"RESTORE_NOT_STARTED".into()};};
+    if candidate.committed_sequence()!=expected_sequence || candidate.committed_state_hash()!=expected_state_hash
+        || state.committed_restore_frontier.as_ref().is_some_and(|frontier| expected_sequence < frontier.sequence)
+        || (state.recovery_complete && (candidate.committed_sequence()!=state.runtime.committed_sequence() || candidate.committed_state_hash()!=state.runtime.committed_state_hash())) {
+        return RuntimeResponse::Error {code:"RESTORE_FINAL_HEAD_MISMATCH".into()};
+    }
+    state.runtime=candidate;state.recovery_complete=true;
+    RuntimeResponse::RecoveryComplete {recovered_sequence:expected_sequence,recovered_state_hash:expected_state_hash}
+}
+
 /// This is the only persistence callback in direct execution.  The mutex is
 /// deliberately held across the bounded request/ACK exchange so two commands
 /// cannot derive competing successors from one committed root.  The candidate
@@ -618,7 +698,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut state = state.lock().await;
-    if !state.recovery_complete {
+    if !state.recovery_complete || state.restore_candidate.is_some() {
         return write_response(
             stream,
             RuntimeResponse::Error {
@@ -725,6 +805,50 @@ async fn attest(state: &Arc<Mutex<EnclaveState>>, nonce: Vec<u8>) -> RuntimeResp
         _ => RuntimeResponse::Error {
             code: "ATTESTATION_FAILED".into(),
         },
+    }
+}
+
+fn quest_evidence_gate(state:&EnclaveState)->Result<(),&'static str> {
+    if !state.recovery_complete||state.restore_candidate.is_some() {return Err("DIRECT_STATE_RECOVERY_REQUIRED");}
+    if !state.runtime.writer_enabled() {return Err("DIRECT_WRITER_DISABLED");}
+    let now=SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|duration|duration.as_secs());
+    if state.mode==RuntimeMode::ProductionEnabled && !state.writer_grant_expires_at_unix.zip(now).is_some_and(|(expiry,now)|expiry>now) {
+        return Err("DIRECT_AUTHORIZATION_EXPIRED");
+    }
+    Ok(())
+}
+async fn public_quest_receipt(state:&Arc<Mutex<EnclaveState>>,participant:&str,owner:&str,request:&str,nonce:&[u8])->RuntimeResponse {
+    let state=state.lock().await;
+    if let Err(code)=quest_evidence_gate(&state) {return RuntimeResponse::Error{code:code.into()};}
+    // Bound lookup frames before consulting private committed state. No
+    // arbitrary payload or caller-selected financial fields are accepted.
+    let hash=|value:&str|value.len()==64&&value.bytes().all(|byte|byte.is_ascii_digit()||(b'a'..=b'f').contains(&byte));
+    if nonce.len()!=32||!hash(participant)||!hash(owner)||request.is_empty()||request.len()>128||!request.bytes().all(|byte|byte.is_ascii_alphanumeric()||b"-_:".contains(&byte)) {
+        return RuntimeResponse::Error{code:"INVALID_PRIVACY_RECEIPT_REQUEST".into()};
+    }
+    match state.runtime.quest_receipt_witness(participant,owner,request,nonce) {
+        Ok(witness)=>RuntimeResponse::PublicQuestReceipt{witness},
+        Err(_)=>RuntimeResponse::Error{code:"PRIVACY_RECEIPT_UNAVAILABLE".into()},
+    }
+}
+async fn attest_quest_receipt_key(state:&Arc<Mutex<EnclaveState>>,nonce:Vec<u8>)->RuntimeResponse {
+    attest_quest_receipt_key_with(state,nonce,|fd,commitment,nonce,key|match nsm_process_request(fd,NsmRequest::Attestation {
+        user_data:Some(commitment.to_vec().into()),nonce:Some(nonce.into()),public_key:Some(key.into()),
+    }) {
+        NsmResponse::Attestation{document}=>Ok(document), _=>Err(()),
+    }).await
+}
+async fn attest_quest_receipt_key_with<F>(state:&Arc<Mutex<EnclaveState>>,nonce:Vec<u8>,attestor:F)->RuntimeResponse
+where F:FnOnce(i32,[u8;32],Vec<u8>,Vec<u8>)->Result<Vec<u8>,()> {
+    if !(16..=512).contains(&nonce.len()) {return RuntimeResponse::Error{code:"INVALID_NONCE".into()};}
+    let state=state.lock().await;
+    if let Err(code)=quest_evidence_gate(&state) {return RuntimeResponse::Error{code:code.into()};}
+    let binding=runtime_binding(state.runtime.identity_count(),state.runtime.writer_enabled(),state.runtime.admission_enabled(),state.writer_grant_commitment.clone(),state.writer_grant_expires_at_unix,state.key_release_artifact_hash.clone());
+    let Ok(public_key)=quest_receipt_public_key(&state.receipt_key) else {return RuntimeResponse::Error{code:"ATTESTATION_FAILED".into()};};
+    let Ok(binding_commitment)=quest_receipt_attestation_commitment(&binding,&public_key) else {return RuntimeResponse::Error{code:"ATTESTATION_FAILED".into()};};
+    match attestor(state.nsm_fd,binding_commitment,nonce,public_key.clone()) {
+        Ok(document) if !document.is_empty()=>RuntimeResponse::QuestReceiptAttestation{document,binding,binding_commitment,public_key},
+        _=>RuntimeResponse::Error{code:"ATTESTATION_FAILED".into()},
     }
 }
 
@@ -902,6 +1026,8 @@ mod tests {
             state_key: vec![8; 32],
             commit_ack_key: vec![9; 32],
             recovery_complete: false,
+            restore_candidate: None,
+            committed_restore_frontier: None,
             pending_governed_bootstrap: None,
             writer_grant_commitment: None,
             writer_grant_expires_at_unix: None,
@@ -919,11 +1045,72 @@ mod tests {
             state_key: vec![0; 32],
             commit_ack_key: vec![0; 32],
             recovery_complete: false,
+            restore_candidate: None,
+            committed_restore_frontier: None,
             pending_governed_bootstrap: None,
             writer_grant_commitment: None,
             writer_grant_expires_at_unix: None,
             key_release_artifact_hash: None,
         }))
+    }
+    #[tokio::test]
+    async fn quest_key_attestation_refuses_invalid_nonce_unrecovered_dormant_and_expired_writer() {
+        let live=state();
+        let forbidden=|_:i32,_:[u8;32],_:Vec<u8>,_:Vec<u8>|->Result<Vec<u8>,()>{panic!("unauthorized attestation invoked NSM");};
+        for nonce in [vec![0;15],vec![0;513]] {
+            assert_eq!(attest_quest_receipt_key_with(&live,nonce,forbidden).await,RuntimeResponse::Error{code:"INVALID_NONCE".into()});
+        }
+        assert_eq!(attest_quest_receipt_key_with(&live,vec![1;16],forbidden).await,RuntimeResponse::Error{code:"DIRECT_STATE_RECOVERY_REQUIRED".into()});
+        let dormant=dormant_state();dormant.lock().await.recovery_complete=true;
+        assert_eq!(attest_quest_receipt_key_with(&dormant,vec![1;16],forbidden).await,RuntimeResponse::Error{code:"DIRECT_WRITER_DISABLED".into()});
+        {let mut state=live.lock().await;state.recovery_complete=true;state.mode=RuntimeMode::ProductionEnabled;state.writer_grant_expires_at_unix=Some(1);}
+        assert_eq!(attest_quest_receipt_key_with(&live,vec![1;16],forbidden).await,RuntimeResponse::Error{code:"DIRECT_AUTHORIZATION_EXPIRED".into()});
+        {let mut state=live.lock().await;state.mode=RuntimeMode::IsolatedTest;state.restore_candidate=Some(state.runtime.clone());}
+        assert_eq!(attest_quest_receipt_key_with(&live,vec![1;16],forbidden).await,RuntimeResponse::Error{code:"DIRECT_STATE_RECOVERY_REQUIRED".into()});
+    }
+    #[tokio::test]
+    async fn quest_key_attestation_binds_only_public_key_and_nonce_without_ledger_mutation() {
+        let live=state();recover(Arc::clone(&live),Vec::new()).await;
+        let before={let state=live.lock().await;(state.runtime.committed_state_hash(),state.runtime.committed_sequence())};
+        let expected_key=quest_receipt_public_key(&[7;32]).unwrap();
+        let nonce=vec![42;32];
+        let result=attest_quest_receipt_key_with(&live,nonce.clone(),|_,commitment,actual_nonce,key| {
+            assert_eq!(key,expected_key);assert_eq!(actual_nonce,nonce);
+            assert_ne!(commitment,runtime_binding_commitment(&runtime_binding(421,true,true,None,None,None)));
+            Ok(b"synthetic-unit-test-attestation-not-a-Nitro-document".to_vec())
+        }).await;
+        let RuntimeResponse::QuestReceiptAttestation{binding,binding_commitment,public_key,..}=result else {panic!("expected receipt-key attestation");};
+        assert_eq!(public_key,expected_key);
+        assert_eq!(binding_commitment,quest_receipt_attestation_commitment(&binding,&public_key).unwrap());
+        let mut changed=binding.clone();changed.writer_enabled=false;
+        assert_ne!(binding_commitment,quest_receipt_attestation_commitment(&changed,&public_key).unwrap());
+        assert_ne!(binding_commitment,quest_receipt_attestation_commitment(&binding,&[0;32]).unwrap());
+        assert_eq!(before,{let state=live.lock().await;(state.runtime.committed_state_hash(),state.runtime.committed_sequence())});
+        assert_eq!(attest_quest_receipt_key_with(&live,vec![1;16],|_,_,_,_|Ok(Vec::new())).await,RuntimeResponse::Error{code:"ATTESTATION_FAILED".into()});
+    }
+    #[tokio::test]
+    async fn vsock_public_receipt_requires_committed_recovered_owned_activity() {
+        let live=state();
+        assert_eq!(public_quest_receipt(&live,SUBJECT,SUBJECT,"new-admission",&[42;32]).await,RuntimeResponse::Error{code:"DIRECT_STATE_RECOVERY_REQUIRED".into()});
+        recover(Arc::clone(&live),Vec::new()).await;
+        let subject="a".repeat(64);let wallet="0x1111111111111111111111111111111111111111";
+        let identity=identity_commitment_for(&subject,wallet);
+        let store=FilesystemImmutableArtifactStore::new(artifact_dir());
+        let admission=request_for(&subject,&identity,"new-admission",DirectAction::AdmitIdentity{wallet_address:wallet.into()});
+        let RuntimeResponse::Execute{..}=commit_through_parent_callback(Arc::clone(&live),admission,&store).await else {panic!("admission was not committed");};
+        let request=RuntimeRequest::PublicQuestReceipt{participant_account:subject.clone(),receipt_account:subject.clone(),request_id:"new-admission".into(),nonce:vec![42;32]};
+        let response=runtime_response(Arc::clone(&live),request.clone()).await;
+        let RuntimeResponse::PublicQuestReceipt{witness}=response.clone() else {panic!("expected owned witness");};
+        let receipt=&witness.receipt;
+        assert_eq!(witness.lookup.participant_account,subject);
+        assert_eq!(witness.lookup.request_id,"new-admission");
+        assert_eq!(witness.lookup.nonce,hex::encode([42;32]));
+        assert!(layrs_direct_execution_v1::verify_public_quest_receipt(&receipt,&quest_receipt_public_key(&[7;32]).unwrap()));
+        assert_eq!(public_quest_receipt(&live,SUBJECT,&subject,"new-admission",&[42;32]).await,RuntimeResponse::Error{code:"PRIVACY_RECEIPT_UNAVAILABLE".into()});
+        assert_eq!(public_quest_receipt(&live,&subject,&subject,&"x".repeat(129),&[42;32]).await,RuntimeResponse::Error{code:"INVALID_PRIVACY_RECEIPT_REQUEST".into()});
+        let restarted=state();recover(Arc::clone(&restarted),store.load_committed().unwrap()).await;
+        assert_eq!(runtime_response(restarted,request).await,response);
+        assert_eq!(store.load_committed().unwrap().len(),1);
     }
     fn measurement_binding() -> RuntimeMeasurementBinding {
         RuntimeMeasurementBinding {
@@ -951,6 +1138,7 @@ mod tests {
             old_writer_fence_evidence_sha256: "1".repeat(64),
             key_release_kms_key_id: "arn:aws:kms:us-east-1:111122223333:key/direct-runtime".into(),
             key_release_predecessor: None,
+            committed_restore_frontier: None,
             expires_at_unix: 2_000,
             governance_key_id: layrs_direct_execution_v1::GOVERNANCE_KEY_ID.into(),
             signing_algorithm: layrs_direct_execution_v1::GOVERNANCE_SIGNING_ALGORITHM.into(),
@@ -1017,6 +1205,78 @@ mod tests {
         let response = serde_cbor::from_slice(&read_frame(&mut parent).await.unwrap()).unwrap();
         server.await.unwrap().unwrap();
         response
+    }
+    #[tokio::test]
+    async fn checkpoint_restore_starts_at_verified_head_and_adopts_only_after_exact_tip() {
+        let running = state(); let store = FilesystemImmutableArtifactStore::new(artifact_dir());
+        recover(Arc::clone(&running), vec![]).await;
+        for id in ["checkpoint-one", "checkpoint-two", "checkpoint-three"] {
+            assert!(matches!(commit_through_parent_callback(Arc::clone(&running), request(id), &store).await, RuntimeResponse::Execute { .. }));
+        }
+        let artifacts = store.load_committed().unwrap();
+        let records = artifacts.iter().cloned().map(|mut record| { record.ciphertext.clear(); record }).collect();
+        let hashes = artifacts.iter().map(layrs_direct_execution_v1::artifact_hash).collect();
+        let checkpoint = running.lock().await.runtime.seal_checkpoint(artifacts.last().unwrap().clone(), records, hashes, &[8;32]).unwrap();
+        let root = checkpoint.artifact.state_hash.clone();
+        let restarted = state();
+        assert!(matches!(begin_checkpoint_restore(Arc::clone(&restarted), checkpoint.clone()).await, RuntimeResponse::RestoreProgress { recovered_sequence: 3, .. }));
+        assert!(!restarted.lock().await.recovery_complete);
+        assert!(matches!(execute_response(Arc::clone(&restarted), request("checkpoint-one")).await, RuntimeResponse::Error { .. }));
+        assert!(matches!(finish_committed_restore(Arc::clone(&restarted), 4, root.clone()).await, RuntimeResponse::Error { .. }));
+        assert!(!restarted.lock().await.recovery_complete);
+        assert!(matches!(begin_checkpoint_restore(Arc::clone(&restarted), checkpoint.clone()).await, RuntimeResponse::RestoreProgress { recovered_sequence: 3, .. }));
+        assert!(matches!(finish_committed_restore(Arc::clone(&restarted), 3, root.clone()).await, RuntimeResponse::RecoveryComplete { recovered_sequence: 3, .. }));
+        assert_eq!(restarted.lock().await.runtime.committed_state_hash(), running.lock().await.runtime.committed_state_hash());
+        let replay = execute_response(Arc::clone(&restarted), request("checkpoint-one")).await;
+        assert_eq!(replay, execute_response(Arc::clone(&running), request("checkpoint-one")).await);
+        // Reconnecting parent is allowed, but cannot change adopted state.
+        assert!(matches!(begin_checkpoint_restore(Arc::clone(&restarted), checkpoint).await, RuntimeResponse::RestoreProgress { recovered_sequence: 3, .. }));
+        assert!(matches!(finish_committed_restore(Arc::clone(&restarted), 3, root).await, RuntimeResponse::RecoveryComplete { .. }));
+    }
+    #[tokio::test]
+    async fn checkpoint_restore_rejects_rollback_below_governed_frontier_and_corrupt_snapshot() {
+        let running = state(); let store = FilesystemImmutableArtifactStore::new(artifact_dir());
+        recover(Arc::clone(&running), vec![]).await;
+        commit_through_parent_callback(Arc::clone(&running), request("checkpoint-old"), &store).await;
+        let first = store.load_committed().unwrap();
+        let mut compact = first[0].clone(); compact.ciphertext.clear();
+        let checkpoint = running.lock().await.runtime.seal_checkpoint(first[0].clone(), vec![compact], vec![layrs_direct_execution_v1::artifact_hash(&first[0])], &[8;32]).unwrap();
+        let restarted = state();
+        restarted.lock().await.committed_restore_frontier = Some(layrs_direct_execution_v1::CommittedRestoreFrontier { sequence: 2, state_hash: "a".repeat(64), artifact_hash: "b".repeat(64) });
+        assert!(matches!(begin_checkpoint_restore(Arc::clone(&restarted), checkpoint.clone()).await, RuntimeResponse::Error { code } if code == "CHECKPOINT_BELOW_GOVERNED_FRONTIER"));
+        restarted.lock().await.committed_restore_frontier = None;
+        let mut corrupt = checkpoint; corrupt.artifact.ciphertext[0] ^= 1;
+        assert!(matches!(begin_checkpoint_restore(Arc::clone(&restarted), corrupt).await, RuntimeResponse::Error { code } if code == "CHECKPOINT_AUTHENTICATION_FAILED"));
+        assert!(!restarted.lock().await.recovery_complete);
+        assert!(restarted.lock().await.restore_candidate.is_none());
+        assert_eq!(restarted.lock().await.runtime.committed_sequence(), 0);
+    }
+    #[tokio::test]
+    async fn streamed_restore_verifies_every_successor_and_final_head_before_adoption() {
+        let running=state();let store=FilesystemImmutableArtifactStore::new(artifact_dir());
+        assert!(matches!(recover(Arc::clone(&running),vec![]).await,RuntimeResponse::RecoveryComplete{..}));
+        for id in ["stream-one","stream-two","stream-three"] {
+            assert!(matches!(commit_through_parent_callback(Arc::clone(&running),request(id),&store).await,RuntimeResponse::Execute{..}));
+        }
+        let artifacts=store.load_committed().unwrap();let expected=artifacts.last().unwrap().state_hash.clone();
+        let restarted=state();assert!(matches!(begin_committed_restore(Arc::clone(&restarted)).await,RuntimeResponse::RestoreProgress{..}));
+        assert!(matches!(execute_response(Arc::clone(&restarted),request("blocked-during-restore")).await,RuntimeResponse::Error{..}));
+        assert!(matches!(append_committed_restore(Arc::clone(&restarted),artifacts[1].clone()).await,RuntimeResponse::Error{..}));
+        assert!(!restarted.lock().await.recovery_complete);
+        assert!(matches!(finish_committed_restore(Arc::clone(&restarted),3,expected.clone()).await,RuntimeResponse::Error{..}));
+        assert!(matches!(begin_committed_restore(Arc::clone(&restarted)).await,RuntimeResponse::RestoreProgress{..}));
+        for artifact in artifacts.iter().cloned(){assert!(matches!(append_committed_restore(Arc::clone(&restarted),artifact).await,RuntimeResponse::RestoreProgress{..}));}
+        assert!(matches!(finish_committed_restore(Arc::clone(&restarted),2,expected.clone()).await,RuntimeResponse::Error{..}));
+        assert!(!restarted.lock().await.recovery_complete);
+        assert!(matches!(begin_committed_restore(Arc::clone(&restarted)).await,RuntimeResponse::RestoreProgress{..}));
+        for artifact in artifacts.iter().cloned(){assert!(matches!(append_committed_restore(Arc::clone(&restarted),artifact).await,RuntimeResponse::RestoreProgress{..}));}
+        assert!(matches!(finish_committed_restore(Arc::clone(&restarted),3,expected.clone()).await,RuntimeResponse::RecoveryComplete{recovered_sequence:3,..}));
+        assert_eq!(restarted.lock().await.runtime.committed_state_hash(),expected);
+        assert!(matches!(execute_response(Arc::clone(&restarted),request("stream-one")).await,RuntimeResponse::Execute{..}));
+        let mut corrupt=artifacts[0].clone();corrupt.ciphertext[0]^=1;
+        assert!(matches!(begin_committed_restore(Arc::clone(&restarted)).await,RuntimeResponse::RestoreProgress{..}));
+        assert!(matches!(append_committed_restore(Arc::clone(&restarted),corrupt).await,RuntimeResponse::Error{..}));
+        assert_eq!(restarted.lock().await.runtime.committed_state_hash(),expected);
     }
     async fn begin(
         state: Arc<Mutex<EnclaveState>>,
@@ -1120,6 +1380,8 @@ mod tests {
             state_key: Vec::new(),
             commit_ack_key: Vec::new(),
             recovery_complete: false,
+            restore_candidate: None,
+            committed_restore_frontier: None,
             pending_governed_bootstrap: None,
             writer_grant_commitment: None,
             writer_grant_expires_at_unix: None,
