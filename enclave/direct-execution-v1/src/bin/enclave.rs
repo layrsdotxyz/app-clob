@@ -28,11 +28,10 @@ use tokio_vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
 use zeroize::Zeroize;
 
 const PORT: u32 = 5_003;
-// Startup recovery carries the verified immutable lineage in one parent-only
-// VSOCK frame. The opening epoch plus several encrypted successors already
-// exceeds 1 MiB; keep a finite 64 MiB ceiling so valid recovery remains
-// possible without turning bootstrap transport into a persisted workflow.
-const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+// Startup recovery and checkpoint sealing carry the verified immutable lineage
+// in finite parent-only VSOCK frames. Keep the transport bounded while leaving
+// headroom for the growing encrypted checkpoint.
+const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 
 struct EnclaveState {
     nsm_fd: i32,
@@ -898,6 +897,22 @@ mod tests {
         symm::Cipher,
         x509::{X509NameBuilder, X509},
     };
+    const TEST_VSOCK_BUFFER_BYTES: usize = 64 * 1024;
+
+    #[tokio::test]
+    async fn frame_limit_round_trips_just_under_and_rejects_just_over() {
+        let expected = vec![0x5a; MAX_FRAME_BYTES - 1];
+        let (mut writer, mut reader) = tokio::io::duplex(TEST_VSOCK_BUFFER_BYTES);
+        let write = tokio::spawn(async move { write_frame(&mut writer, &expected).await });
+        let observed = read_frame(&mut reader).await.unwrap();
+        write.await.unwrap().unwrap();
+        assert_eq!(observed.len(), MAX_FRAME_BYTES - 1);
+        assert!(observed.iter().all(|byte| *byte == 0x5a));
+
+        let (mut writer, mut reader) = tokio::io::duplex(8);
+        writer.write_u32((MAX_FRAME_BYTES + 1) as u32).await.unwrap();
+        assert_eq!(read_frame(&mut reader).await.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
     use std::{
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
@@ -1194,7 +1209,7 @@ mod tests {
         state: Arc<Mutex<EnclaveState>>,
         artifacts: Vec<layrs_direct_execution_v1::DirectStateArtifact>,
     ) -> RuntimeResponse {
-        let (mut parent, enclave) = tokio::io::duplex(MAX_FRAME_BYTES * 2);
+        let (mut parent, enclave) = tokio::io::duplex(TEST_VSOCK_BUFFER_BYTES);
         let server = tokio::spawn(serve(enclave, state));
         write_frame(
             &mut parent,
@@ -1285,7 +1300,7 @@ mod tests {
         tokio::io::DuplexStream,
         tokio::task::JoinHandle<io::Result<()>>,
     ) {
-        let (mut parent, enclave) = tokio::io::duplex(MAX_FRAME_BYTES * 2);
+        let (mut parent, enclave) = tokio::io::duplex(TEST_VSOCK_BUFFER_BYTES);
         let server = tokio::spawn(serve(enclave, state));
         write_frame(
             &mut parent,
@@ -1358,7 +1373,7 @@ mod tests {
         state: Arc<Mutex<EnclaveState>>,
         request: RuntimeRequest,
     ) -> RuntimeResponse {
-        let (mut parent, enclave) = tokio::io::duplex(MAX_FRAME_BYTES * 2);
+        let (mut parent, enclave) = tokio::io::duplex(TEST_VSOCK_BUFFER_BYTES);
         let server = tokio::spawn(serve(enclave, state));
         write_frame(&mut parent, &serde_cbor::to_vec(&request).unwrap())
             .await

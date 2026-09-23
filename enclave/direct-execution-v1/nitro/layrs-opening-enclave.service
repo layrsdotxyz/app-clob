@@ -10,7 +10,7 @@ RemainAfterExit=yes
 # An EIF does not inherit systemd environment variables.  Isolated-only key
 # release is performed once over the existing VSOCK channel by the parent.
 # The image contains no key material.
-ExecStart=/usr/bin/nitro-cli run-enclave --cpu-count 2 --memory 1024 --eif-path /opt/layrs-opening/layrs-direct-execution.eif --enclave-cid 16
+ExecStart=/usr/bin/nitro-cli run-enclave --cpu-count 2 --memory 8192 --eif-path /opt/layrs-opening/layrs-direct-execution.eif --enclave-cid 16
 ExecStop=/usr/bin/nitro-cli terminate-enclave --all
 TimeoutStartSec=120
 

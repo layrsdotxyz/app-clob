@@ -1,0 +1,12 @@
+[Unit]
+Description=Check the Layrs opening epoch Nitro enclave every 30 seconds
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=30
+AccuracySec=2
+Persistent=true
+Unit=layrs-opening-enclave-watchdog.service
+
+[Install]
+WantedBy=timers.target

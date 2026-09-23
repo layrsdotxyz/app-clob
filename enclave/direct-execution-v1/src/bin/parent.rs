@@ -67,7 +67,7 @@ use tokio_postgres::{Client, NoTls};
 use tokio_vsock::{VsockAddr, VsockStream};
 const ENCLOSURE_PORT: u32 = 5_003;
 // Must match the enclave's finite parent-only VSOCK recovery ceiling.
-const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 // Fixed encrypted-download window, not a verification bypass.
 const RESTORE_PREFETCH_WIDTH: usize = 4;
 fn restore_prefetch_ranges(total: usize) -> Vec<std::ops::Range<usize>> {
@@ -2187,7 +2187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     start_base_withdrawal_observer(state.clone());
     let port = env::var("PORT").unwrap_or_else(|_| "8443".into()).parse()?;
     let app = Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(healthz))
         .route("/v1/attestation", get(attestation))
         .route("/v1/privacy/receipt-key-attestation", get(quest_receipt_attestation))
         .route("/v1/runtime/status", get(status))
@@ -2289,6 +2289,15 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
         Ok(RuntimeResponse::Status { status }) => Json(status).into_response(),
         Ok(RuntimeResponse::Error { code }) => (StatusCode::BAD_GATEWAY, code).into_response(),
         _ => (StatusCode::BAD_GATEWAY, "UNEXPECTED_RESPONSE").into_response(),
+    }
+}
+async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
+    match timeout(Duration::from_millis(1_500), exchange(&state, RuntimeRequest::Status)).await {
+        Ok(Ok(RuntimeResponse::Status { .. })) => (StatusCode::OK, "ok"),
+        _ => {
+            eprintln!("ENCLOSURE_TRANSPORT_FAILED");
+            (StatusCode::SERVICE_UNAVAILABLE, "ENCLOSURE_UNAVAILABLE")
+        }
     }
 }
 async fn quest_receipt_attestation(State(state):State<AppState>,Query(query):Query<AttestationQuery>)->impl IntoResponse {
@@ -3943,14 +3952,20 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
             == 0
 }
 async fn exchange(state: &AppState, request: RuntimeRequest) -> io::Result<RuntimeResponse> {
-    timeout(Duration::from_secs(10), async {
+    let response = match timeout(Duration::from_secs(10), async {
         let mut stream =
             VsockStream::connect(VsockAddr::new(state.enclave_cid, ENCLOSURE_PORT)).await?;
         write_frame(&mut stream, &serde_cbor::to_vec(&request).map_err(invalid)?).await?;
         serde_cbor::from_slice(&read_frame(&mut stream).await?).map_err(invalid)
     })
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "enclave timeout"))?
+    .await {
+        Ok(response) => response,
+        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "enclave timeout")),
+    };
+    if response.is_err() {
+        eprintln!("ENCLOSURE_TRANSPORT_FAILED");
+    }
+    response
 }
 
 async fn recover_enclave(state: &AppState) -> io::Result<()> {

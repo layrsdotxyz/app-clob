@@ -1,0 +1,8 @@
+[Unit]
+Description=Layrs opening epoch Nitro enclave watchdog
+After=nitro-enclaves-allocator.service layrs-opening-enclave.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/layrs-opening-enclave-watchdog
+TimeoutStartSec=30
