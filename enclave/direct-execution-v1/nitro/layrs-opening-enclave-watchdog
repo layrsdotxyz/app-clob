@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ! /usr/bin/systemctl is-active --quiet layrs-opening-enclave.service; then
+  exit 0
+fi
+
+description=$(/usr/bin/nitro-cli describe-enclaves)
+if [[ $(/usr/bin/tr -d '[:space:]' <<<"${description}") != '[]' ]]; then
+  exit 0
+fi
+
+echo ENCLAVE_WATCHDOG_RESTART
+/usr/bin/systemctl restart layrs-opening-enclave.service layrs-opening-parent.service

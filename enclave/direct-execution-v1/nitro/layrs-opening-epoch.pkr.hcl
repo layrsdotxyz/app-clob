@@ -6,8 +6,8 @@ packer {
 variable "aws_region" { type = string }
 variable "release_id" { type = string }
 variable "binary_directory" {
-  type = string
-  default = ""
+  type        = string
+  default     = ""
   description = "Explicit release binary directory; empty uses the crate's local target/release."
 }
 locals {
@@ -54,6 +54,18 @@ build {
     destination = "/tmp/layrs-opening-parent.service"
   }
   provisioner "file" {
+    source      = "${path.root}/layrs-opening-enclave-watchdog"
+    destination = "/tmp/layrs-opening-enclave-watchdog"
+  }
+  provisioner "file" {
+    source      = "${path.root}/layrs-opening-enclave-watchdog.service"
+    destination = "/tmp/layrs-opening-enclave-watchdog.service"
+  }
+  provisioner "file" {
+    source      = "${path.root}/layrs-opening-enclave-watchdog.timer"
+    destination = "/tmp/layrs-opening-enclave-watchdog.timer"
+  }
+  provisioner "file" {
     source      = "${path.root}/../../../../../.codex-review-bundles/unified-direct-execution-20260905/new-epoch-20260911/OPENING_EPOCH_STATE_20260911.json"
     destination = "/tmp/OPENING_EPOCH_STATE_20260911.json"
   }
@@ -83,9 +95,12 @@ build {
       "sudo chmod 0640 /opt/layrs-opening/OPENING_EPOCH_STATE_20260911.json /opt/layrs-opening/OPENING_EPOCH_EVIDENCE_MANIFEST_20260911.json",
       "sudo install -m 0644 /tmp/layrs-opening-enclave.service /etc/systemd/system/layrs-opening-enclave.service",
       "sudo install -m 0644 /tmp/layrs-opening-parent.service /etc/systemd/system/layrs-opening-parent.service",
+      "sudo install -m 0755 /tmp/layrs-opening-enclave-watchdog /usr/local/sbin/layrs-opening-enclave-watchdog",
+      "sudo install -m 0644 /tmp/layrs-opening-enclave-watchdog.service /etc/systemd/system/layrs-opening-enclave-watchdog.service",
+      "sudo install -m 0644 /tmp/layrs-opening-enclave-watchdog.timer /etc/systemd/system/layrs-opening-enclave-watchdog.timer",
       "sudo install -d -m 0755 /etc/nitro_enclaves",
-      "printf '%s\\n' '---' 'memory_mib: 1024' 'cpu_count: 2' | sudo tee /etc/nitro_enclaves/allocator.yaml >/dev/null",
-      "sudo systemctl enable nitro-enclaves-allocator.service layrs-opening-enclave.service layrs-opening-parent.service",
+      "printf '%s\\n' '---' 'memory_mib: 8192' 'cpu_count: 2' | sudo tee /etc/nitro_enclaves/allocator.yaml >/dev/null",
+      "sudo systemctl enable nitro-enclaves-allocator.service layrs-opening-enclave.service layrs-opening-parent.service layrs-opening-enclave-watchdog.timer",
       "sudo dnf clean all"
     ]
   }

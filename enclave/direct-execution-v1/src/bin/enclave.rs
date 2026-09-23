@@ -28,13 +28,14 @@ use tokio_vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
 use zeroize::Zeroize;
 
 const PORT: u32 = 5_003;
-// Startup recovery carries the verified immutable lineage in one parent-only
-// VSOCK frame. The opening epoch plus several encrypted successors already
-// exceeds 1 MiB; keep a finite 64 MiB ceiling so valid recovery remains
-// possible without turning bootstrap transport into a persisted workflow.
-const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+// Startup recovery and checkpoint sealing carry the verified immutable lineage
+// in finite parent-only VSOCK frames. Keep the transport bounded while leaving
+// headroom for the growing encrypted checkpoint.
+const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 
 struct EnclaveState {
+    // Serialize state transitions without blocking reads of committed state.
+    transition_gate: Arc<Mutex<()>>,
     nsm_fd: i32,
     runtime: DirectRuntime,
     epoch: SealedEpoch,
@@ -87,6 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state_key = vec![0u8; 32];
     let commit_ack_key = vec![0u8; 32];
     let state = Arc::new(Mutex::new(EnclaveState {
+        transition_gate: Arc::new(Mutex::new(())),
         nsm_fd,
         runtime: DirectRuntime::new(epoch.clone(), mode, receipt_key.clone())?,
         epoch,
@@ -173,15 +175,8 @@ where
         RuntimeRequest::BeginCommittedRestore => begin_committed_restore(state).await,
         RuntimeRequest::BeginCheckpointRestore { checkpoint } => begin_checkpoint_restore(state, checkpoint).await,
         RuntimeRequest::SealCheckpoint { artifact, receipt_records, artifact_hashes } => {
-            let state = state.lock().await;
-            if !state.recovery_complete || state.restore_candidate.is_some() {
-                RuntimeResponse::Error { code: "CHECKPOINT_REQUIRES_VERIFIED_HEAD".into() }
-            } else {
-                match state.runtime.seal_checkpoint(artifact, receipt_records, artifact_hashes, &state.state_key) {
-                    Ok(checkpoint) => RuntimeResponse::CheckpointSealed { checkpoint },
-                    Err(_) => RuntimeResponse::Error { code: "CHECKPOINT_HEAD_INVALID".into() },
-                }
-            }
+            seal_checkpoint_with(&state, move |runtime, key|
+                runtime.seal_checkpoint(artifact, receipt_records, artifact_hashes, key)).await
         },
         RuntimeRequest::AppendCommittedRestore { artifact } => append_committed_restore(state,artifact).await,
         RuntimeRequest::FinishCommittedRestore { expected_sequence,expected_state_hash } => finish_committed_restore(state,expected_sequence,expected_state_hash).await,
@@ -327,6 +322,7 @@ where
         };
     }
     let grant_commitment = grant.commitment();
+    let _transition = transition(&state).await;
     let mut state = state.lock().await;
     if state.writer_grant_commitment.is_some() {
         return RuntimeResponse::Error {
@@ -432,6 +428,7 @@ where
             code: "KEY_RELEASE_RESPONSE_INVALID".into(),
         };
     }
+    let _transition = transition(&state).await;
     let mut state = state.lock().await;
     let Some(pending) = state.pending_governed_bootstrap.take() else {
         return RuntimeResponse::Error {
@@ -535,6 +532,7 @@ async fn bootstrap_isolated(
             code: "INVALID_ISOLATED_BOOTSTRAP".into(),
         };
     }
+    let _transition = transition(&state).await;
     let mut state = state.lock().await;
     // The parent can restart while the enclave keeps running.  Replaying the
     // isolated bootstrap with exactly the same keys is therefore an
@@ -582,6 +580,7 @@ async fn recover_committed(
     state: Arc<Mutex<EnclaveState>>,
     artifacts: Vec<layrs_direct_execution_v1::DirectStateArtifact>,
 ) -> RuntimeResponse {
+    let _transition = transition(&state).await;
     let mut state = state.lock().await;
     if state.committed_restore_frontier.as_ref().is_some_and(|frontier| !artifacts.iter().any(|artifact|
         artifact.sequence == frontier.sequence && artifact.state_hash == frontier.state_hash
@@ -635,6 +634,7 @@ async fn recover_committed(
 }
 
 async fn begin_committed_restore(state: Arc<Mutex<EnclaveState>>) -> RuntimeResponse {
+    let _transition = transition(&state).await;
     let mut state=state.lock().await;
     if state.restore_candidate.is_some() { return RuntimeResponse::Error {code:"RESTORE_ALREADY_IN_PROGRESS".into()}; }
     match DirectRuntime::new(state.epoch.clone(),state.mode,state.receipt_key.clone()) {
@@ -643,6 +643,7 @@ async fn begin_committed_restore(state: Arc<Mutex<EnclaveState>>) -> RuntimeResp
     }
 }
 async fn append_committed_restore(state: Arc<Mutex<EnclaveState>>,artifact:layrs_direct_execution_v1::DirectStateArtifact)->RuntimeResponse {
+    let _transition = transition(&state).await;
     let mut state=state.lock().await;
     let Some(candidate)=state.restore_candidate.take() else {return RuntimeResponse::Error {code:"RESTORE_NOT_STARTED".into()};};
     if state.committed_restore_frontier.as_ref().is_some_and(|frontier|
@@ -656,6 +657,7 @@ async fn append_committed_restore(state: Arc<Mutex<EnclaveState>>,artifact:layrs
     }
 }
 async fn begin_checkpoint_restore(state: Arc<Mutex<EnclaveState>>, checkpoint: layrs_direct_execution_v1::DirectCheckpoint) -> RuntimeResponse {
+    let _transition = transition(&state).await;
     let mut state = state.lock().await;
     if state.restore_candidate.is_some() {
         return RuntimeResponse::Error { code: "CHECKPOINT_RESTORE_STARTUP_ONLY".into() };
@@ -674,6 +676,7 @@ async fn begin_checkpoint_restore(state: Arc<Mutex<EnclaveState>>, checkpoint: l
     }
 }
 async fn finish_committed_restore(state: Arc<Mutex<EnclaveState>>,expected_sequence:u64,expected_state_hash:String)->RuntimeResponse {
+    let _transition = transition(&state).await;
     let mut state=state.lock().await;
     let Some(candidate)=state.restore_candidate.take() else {return RuntimeResponse::Error {code:"RESTORE_NOT_STARTED".into()};};
     if candidate.committed_sequence()!=expected_sequence || candidate.committed_state_hash()!=expected_state_hash
@@ -685,10 +688,30 @@ async fn finish_committed_restore(state: Arc<Mutex<EnclaveState>>,expected_seque
     RuntimeResponse::RecoveryComplete {recovered_sequence:expected_sequence,recovered_state_hash:expected_state_hash}
 }
 
-/// This is the only persistence callback in direct execution.  The mutex is
-/// deliberately held across the bounded request/ACK exchange so two commands
-/// cannot derive competing successors from one committed root.  The candidate
-/// remains a local value until its exact, HMAC-bound acknowledgement verifies.
+async fn seal_checkpoint_with<F>(state: &Arc<Mutex<EnclaveState>>, seal: F) -> RuntimeResponse
+where F: FnOnce(&DirectRuntime, &[u8]) -> Result<layrs_direct_execution_v1::DirectCheckpoint, layrs_direct_execution_v1::RuntimeError> + Send + 'static {
+    let snapshot = {
+        let committed = state.lock().await;
+        if !committed.recovery_complete || committed.restore_candidate.is_some() { None }
+        else { Some((committed.runtime.clone(), zeroize::Zeroizing::new(committed.state_key.clone()))) }
+    };
+    match snapshot {
+        None => RuntimeResponse::Error { code: "CHECKPOINT_REQUIRES_VERIFIED_HEAD".into() },
+        Some((runtime, key)) => match tokio::task::spawn_blocking(move || seal(&runtime, &key)).await {
+            Ok(Ok(checkpoint)) => RuntimeResponse::CheckpointSealed { checkpoint },
+            _ => RuntimeResponse::Error { code: "CHECKPOINT_HEAD_INVALID".into() },
+        },
+    }
+}
+
+async fn transition(state: &Arc<Mutex<EnclaveState>>) -> tokio::sync::OwnedMutexGuard<()> {
+    let gate = Arc::clone(&state.lock().await.transition_gate);
+    gate.lock_owned().await
+}
+
+/// Only the transition gate spans preparation and the immutable-storage ACK.
+/// Readers see the last committed state; the candidate is never exposed before
+/// the exact HMAC-bound acknowledgement and all adoption checks succeed.
 async fn execute_direct<S>(
     stream: &mut S,
     state: Arc<Mutex<EnclaveState>>,
@@ -697,68 +720,50 @@ async fn execute_direct<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut state = state.lock().await;
-    if !state.recovery_complete || state.restore_candidate.is_some() {
-        return write_response(
-            stream,
-            RuntimeResponse::Error {
-                code: "DIRECT_STATE_RECOVERY_REQUIRED".into(),
-            },
-        )
-        .await;
-    }
-    if let Some(result) = state.runtime.existing_result(&request).map_err(invalid)? {
-        return write_response(stream, RuntimeResponse::Execute { result }).await;
-    }
-    let candidate = match state.runtime.prepare_candidate(request, &state.state_key) {
-        Ok(candidate) => candidate,
-        Err(error) => {
-            return write_response(
-                stream,
-                RuntimeResponse::Error {
-                    code: error.to_string(),
-                },
-            )
-            .await
+    let _transition = transition(&state).await;
+    let (mut runtime, state_key, commit_ack_key) = {
+        let committed = state.lock().await;
+        if !committed.recovery_complete || committed.restore_candidate.is_some() {
+            drop(committed);
+            return write_response(stream, RuntimeResponse::Error { code: "DIRECT_STATE_RECOVERY_REQUIRED".into() }).await;
         }
+        if let Some(result) = committed.runtime.existing_result(&request).map_err(invalid)? {
+            drop(committed);
+            return write_response(stream, RuntimeResponse::Execute { result }).await;
+        }
+        (committed.runtime.clone(), zeroize::Zeroizing::new(committed.state_key.clone()),
+            zeroize::Zeroizing::new(committed.commit_ack_key.clone()))
     };
-    write_response(
-        stream,
-        RuntimeResponse::CommitCandidate {
-            artifact: candidate.artifact.clone(),
-        },
-    )
-    .await?;
-    let ack: RuntimeRequest =
-        serde_cbor::from_slice(&read_frame(stream).await?).map_err(invalid)?;
+    let (snapshot, state_key, prepared) = tokio::task::spawn_blocking(move || {
+        let candidate = runtime.prepare_candidate(request, &state_key);
+        (runtime, state_key, candidate)
+    }).await.map_err(invalid)?;
+    runtime = snapshot;
+    let candidate = match prepared {
+        Ok(candidate) => candidate,
+        Err(error) => return write_response(stream, RuntimeResponse::Error { code: error.to_string() }).await,
+    };
+    write_response(stream, RuntimeResponse::CommitCandidate { artifact: candidate.artifact.clone() }).await?;
+    let ack: RuntimeRequest = serde_cbor::from_slice(&read_frame(stream).await?).map_err(invalid)?;
     let RuntimeRequest::DurabilityAck { ack } = ack else {
-        return write_response(
-            stream,
-            RuntimeResponse::Error {
-                code: "DURABILITY_ACK_REQUIRED".into(),
-            },
-        )
-        .await;
+        return write_response(stream, RuntimeResponse::Error { code: "DURABILITY_ACK_REQUIRED".into() }).await;
     };
-    if !ack.verify_for(&candidate.artifact, &state.commit_ack_key) {
-        return write_response(
-            stream,
-            RuntimeResponse::Error {
-                code: "INVALID_DURABILITY_ACK".into(),
-            },
-        )
-        .await;
+    if !ack.verify_for(&candidate.artifact, &commit_ack_key) {
+        return write_response(stream, RuntimeResponse::Error { code: "INVALID_DURABILITY_ACK".into() }).await;
     }
     let result = candidate.result.clone();
-    let state_key = state.state_key.clone();
-    if let Err(error) = state.runtime.adopt_candidate(candidate, &state_key) {
-        return write_response(
-            stream,
-            RuntimeResponse::Error {
-                code: error.to_string(),
-            },
-        )
-        .await;
+    // Adoption still verifies the encrypted candidate; expensive
+    // hashing/decryption happens off the shared read lock and async executor.
+    let adopted = tokio::task::spawn_blocking(move || {
+        runtime.adopt_candidate(candidate, &state_key).map(|()| runtime)
+    }).await.map_err(invalid)?;
+    match adopted {
+        Ok(runtime) => {
+            let previous = { let mut committed = state.lock().await;
+                std::mem::replace(&mut committed.runtime, runtime) };
+            drop(previous);
+        },
+        Err(error) => return write_response(stream, RuntimeResponse::Error { code: error.to_string() }).await,
     }
     write_response(stream, RuntimeResponse::Execute { result }).await
 }
@@ -898,6 +903,22 @@ mod tests {
         symm::Cipher,
         x509::{X509NameBuilder, X509},
     };
+    const TEST_VSOCK_BUFFER_BYTES: usize = 64 * 1024;
+
+    #[tokio::test]
+    async fn frame_limit_round_trips_just_under_and_rejects_just_over() {
+        let expected = vec![0x5a; MAX_FRAME_BYTES - 1];
+        let (mut writer, mut reader) = tokio::io::duplex(TEST_VSOCK_BUFFER_BYTES);
+        let write = tokio::spawn(async move { write_frame(&mut writer, &expected).await });
+        let observed = read_frame(&mut reader).await.unwrap();
+        write.await.unwrap().unwrap();
+        assert_eq!(observed.len(), MAX_FRAME_BYTES - 1);
+        assert!(observed.iter().all(|byte| *byte == 0x5a));
+
+        let (mut writer, mut reader) = tokio::io::duplex(8);
+        writer.write_u32((MAX_FRAME_BYTES + 1) as u32).await.unwrap();
+        assert_eq!(read_frame(&mut reader).await.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
     use std::{
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
@@ -1018,6 +1039,7 @@ mod tests {
         let mode = RuntimeMode::IsolatedTest;
         let receipt_key = vec![7; 32];
         Arc::new(Mutex::new(EnclaveState {
+            transition_gate: Arc::new(Mutex::new(())),
             nsm_fd: -1,
             runtime: DirectRuntime::new(epoch.clone(), mode, receipt_key.clone()).unwrap(),
             epoch,
@@ -1037,6 +1059,7 @@ mod tests {
     fn dormant_state() -> Arc<Mutex<EnclaveState>> {
         let epoch = SealedEpoch::load(epoch_path()).unwrap();
         Arc::new(Mutex::new(EnclaveState {
+            transition_gate: Arc::new(Mutex::new(())),
             nsm_fd: -1,
             runtime: DirectRuntime::new(epoch.clone(), RuntimeMode::Dormant, vec![0; 32]).unwrap(),
             epoch,
@@ -1194,7 +1217,7 @@ mod tests {
         state: Arc<Mutex<EnclaveState>>,
         artifacts: Vec<layrs_direct_execution_v1::DirectStateArtifact>,
     ) -> RuntimeResponse {
-        let (mut parent, enclave) = tokio::io::duplex(MAX_FRAME_BYTES * 2);
+        let (mut parent, enclave) = tokio::io::duplex(TEST_VSOCK_BUFFER_BYTES);
         let server = tokio::spawn(serve(enclave, state));
         write_frame(
             &mut parent,
@@ -1285,7 +1308,7 @@ mod tests {
         tokio::io::DuplexStream,
         tokio::task::JoinHandle<io::Result<()>>,
     ) {
-        let (mut parent, enclave) = tokio::io::duplex(MAX_FRAME_BYTES * 2);
+        let (mut parent, enclave) = tokio::io::duplex(TEST_VSOCK_BUFFER_BYTES);
         let server = tokio::spawn(serve(enclave, state));
         write_frame(
             &mut parent,
@@ -1358,7 +1381,7 @@ mod tests {
         state: Arc<Mutex<EnclaveState>>,
         request: RuntimeRequest,
     ) -> RuntimeResponse {
-        let (mut parent, enclave) = tokio::io::duplex(MAX_FRAME_BYTES * 2);
+        let (mut parent, enclave) = tokio::io::duplex(TEST_VSOCK_BUFFER_BYTES);
         let server = tokio::spawn(serve(enclave, state));
         write_frame(&mut parent, &serde_cbor::to_vec(&request).unwrap())
             .await
@@ -1372,6 +1395,7 @@ mod tests {
     async fn isolated_bootstrap_is_idempotent_only_for_the_same_keys() {
         let epoch = SealedEpoch::load(epoch_path()).unwrap();
         let state = Arc::new(Mutex::new(EnclaveState {
+            transition_gate: Arc::new(Mutex::new(())),
             nsm_fd: -1,
             runtime: DirectRuntime::new(epoch.clone(), RuntimeMode::Dormant, vec![0; 32]).unwrap(),
             epoch,
@@ -1606,9 +1630,11 @@ mod tests {
         ));
         let (mut parent, server) = begin(Arc::clone(&state), request("vsock-success")).await;
         let artifact = candidate(&mut parent).await;
-        // The handler holds the committed-state mutex while it waits; no
-        // observer can see the cloned candidate as authoritative.
-        assert!(state.try_lock().is_err());
+        // Reads remain responsive while storage is pending, but can only see
+        // the original committed balance, never the private candidate.
+        { let committed = state.try_lock().expect("storage wait must not block reads");
+          assert_eq!(committed.runtime.balance(IDENTITY, "USDC", "USER_AVAILABLE"), 5_000_000);
+          assert!(committed.transition_gate.try_lock().is_err()); }
         let store = FilesystemImmutableArtifactStore::new(artifact_dir());
         let restored = store.persist_readback(&artifact).unwrap();
         assert_eq!(restored, artifact);
@@ -1634,6 +1660,61 @@ mod tests {
             state.runtime.balance(IDENTITY, "USDC", "USER_SETTLED"),
             1_000_000
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_sealing_does_not_hold_committed_read_lock_or_block_executor() {
+        let running = state();recover(Arc::clone(&running), vec![]).await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let checkpoint_state = Arc::clone(&running);
+        let sealing = tokio::spawn(async move {
+            seal_checkpoint_with(&checkpoint_state, move |_,_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+                Err(layrs_direct_execution_v1::RuntimeError::StateArtifact)
+            }).await
+        });
+        started_rx.await.unwrap();
+        let response = tokio::time::timeout(std::time::Duration::from_millis(250),
+            runtime_response(Arc::clone(&running), RuntimeRequest::Status)).await;
+        release_tx.send(()).unwrap();
+        assert!(matches!(response.unwrap(), RuntimeResponse::Status { .. }));
+        assert!(matches!(sealing.await.unwrap(), RuntimeResponse::Error { code } if code == "CHECKPOINT_HEAD_INVALID"));
+        assert_eq!(running.lock().await.runtime.committed_sequence(), 0);
+    }
+
+    #[tokio::test]
+    async fn storage_wait_keeps_status_and_balance_responsive_but_serializes_successors() {
+        let running = state();
+        recover(Arc::clone(&running), vec![]).await;
+        let (mut parent, server) = begin(Arc::clone(&running), request("responsive-first")).await;
+        let first = candidate(&mut parent).await;
+        let (mut next, next_server) = begin(Arc::clone(&running), request("responsive-second")).await;
+        // A second write cannot prepare a competing successor before ACK.
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), next.read_u8()).await.is_err());
+        for _ in 0..10 {
+            let response = tokio::time::timeout(std::time::Duration::from_millis(250),
+                runtime_response(Arc::clone(&running), RuntimeRequest::Status)).await.unwrap();
+            assert!(matches!(response, RuntimeResponse::Status { .. }));
+            let response = tokio::time::timeout(std::time::Duration::from_millis(250),
+                runtime_response(Arc::clone(&running), RuntimeRequest::Balance {
+                    account_id: SUBJECT.into(), identity_commitment: IDENTITY.into(), asset: "USDC".into(), bucket: "USER_AVAILABLE".into(),
+                })).await.unwrap();
+            assert!(matches!(response, RuntimeResponse::Balance { amount_atomic } if amount_atomic == "5000000"));
+        }
+        write_frame(&mut parent, &serde_cbor::to_vec(&RuntimeRequest::DurabilityAck {
+            ack: DurabilityAck::issue(&first, &[9; 32]),
+        }).unwrap()).await.unwrap();
+        let terminal: RuntimeResponse = serde_cbor::from_slice(&read_frame(&mut parent).await.unwrap()).unwrap();
+        assert!(matches!(terminal, RuntimeResponse::Execute { .. }));
+        server.await.unwrap().unwrap();
+        let second = candidate(&mut next).await;
+        assert_eq!(second.sequence, first.sequence + 1);
+        assert_eq!(second.prior_state_hash, first.state_hash);
+        drop(next);assert!(next_server.await.unwrap().is_err());
+        assert_eq!(running.lock().await.runtime.committed_sequence(), first.sequence);
+        assert_eq!(running.lock().await.runtime.balance(IDENTITY,"USDC","USER_AVAILABLE"), 4_000_000);
     }
 
     #[tokio::test]

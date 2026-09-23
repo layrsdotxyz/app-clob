@@ -67,7 +67,7 @@ use tokio_postgres::{Client, NoTls};
 use tokio_vsock::{VsockAddr, VsockStream};
 const ENCLOSURE_PORT: u32 = 5_003;
 // Must match the enclave's finite parent-only VSOCK recovery ceiling.
-const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 // Fixed encrypted-download window, not a verification bypass.
 const RESTORE_PREFETCH_WIDTH: usize = 4;
 fn restore_prefetch_ranges(total: usize) -> Vec<std::ops::Range<usize>> {
@@ -141,7 +141,34 @@ struct S3ImmutableArtifactStore {
     // never a state-restore input and never contains private ledger plaintext.
     verified_receipt_records: Arc<Mutex<Option<Vec<DirectStateArtifact>>>>,
     verified_artifact_hashes: Arc<Mutex<Vec<String>>>,
-    checkpoint_refresh_gate: Arc<Mutex<()>>,
+    checkpoint_refresh_gate: Arc<Mutex<CheckpointRefresh>>,
+}
+
+const CHECKPOINT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+#[derive(Default)]
+struct CheckpointRefresh {
+    running: bool,
+    requested: bool,
+    next_start: Option<tokio::time::Instant>,
+}
+impl CheckpointRefresh {
+    fn request(&mut self) -> bool {
+        self.requested = true;
+        if self.running { false } else { self.running = true; true }
+    }
+    fn delay(&self, now: tokio::time::Instant) -> Duration {
+        self.next_start.map(|next| next.saturating_duration_since(now)).unwrap_or_default()
+    }
+    fn begin(&mut self, now: tokio::time::Instant) {
+        self.requested = false;
+        self.next_start = Some(now + CHECKPOINT_REFRESH_INTERVAL);
+    }
+    fn finish(&mut self, success: bool) -> bool {
+        // Retain work arriving during a refresh, and retry a failed refresh
+        // even if trading becomes quiet. Original journals remain authoritative.
+        self.running = self.requested || !success;
+        self.running
+    }
 }
 
 /// Direct, synchronous adapter for the existing Base pool-ledger Privy
@@ -1660,7 +1687,7 @@ impl S3ImmutableArtifactStore {
             retention_seconds,
             verified_receipt_records: Arc::new(Mutex::new(None)),
             verified_artifact_hashes: Arc::new(Mutex::new(Vec::new())),
-            checkpoint_refresh_gate: Arc::new(Mutex::new(())),
+            checkpoint_refresh_gate: Arc::new(Mutex::new(CheckpointRefresh::default())),
         })
     }
     fn artifact_key(&self, artifact: &DirectStateArtifact) -> String {
@@ -2187,7 +2214,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     start_base_withdrawal_observer(state.clone());
     let port = env::var("PORT").unwrap_or_else(|_| "8443".into()).parse()?;
     let app = Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(healthz))
         .route("/v1/attestation", get(attestation))
         .route("/v1/privacy/receipt-key-attestation", get(quest_receipt_attestation))
         .route("/v1/runtime/status", get(status))
@@ -2289,6 +2316,15 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
         Ok(RuntimeResponse::Status { status }) => Json(status).into_response(),
         Ok(RuntimeResponse::Error { code }) => (StatusCode::BAD_GATEWAY, code).into_response(),
         _ => (StatusCode::BAD_GATEWAY, "UNEXPECTED_RESPONSE").into_response(),
+    }
+}
+async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
+    match timeout(Duration::from_millis(1_500), exchange(&state, RuntimeRequest::Status)).await {
+        Ok(Ok(RuntimeResponse::Status { .. })) => (StatusCode::OK, "ok"),
+        _ => {
+            eprintln!("ENCLOSURE_TRANSPORT_FAILED");
+            (StatusCode::SERVICE_UNAVAILABLE, "ENCLOSURE_UNAVAILABLE")
+        }
     }
 }
 async fn quest_receipt_attestation(State(state):State<AppState>,Query(query):Query<AttestationQuery>)->impl IntoResponse {
@@ -3943,14 +3979,20 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
             == 0
 }
 async fn exchange(state: &AppState, request: RuntimeRequest) -> io::Result<RuntimeResponse> {
-    timeout(Duration::from_secs(10), async {
+    let response = match timeout(Duration::from_secs(10), async {
         let mut stream =
             VsockStream::connect(VsockAddr::new(state.enclave_cid, ENCLOSURE_PORT)).await?;
         write_frame(&mut stream, &serde_cbor::to_vec(&request).map_err(invalid)?).await?;
         serde_cbor::from_slice(&read_frame(&mut stream).await?).map_err(invalid)
     })
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "enclave timeout"))?
+    .await {
+        Ok(response) => response,
+        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "enclave timeout")),
+    };
+    if let Err(error) = &response {
+        eprintln!("ENCLOSURE_TRANSPORT_FAILED kind={:?}", error.kind());
+    }
+    response
 }
 
 async fn recover_enclave(state: &AppState) -> io::Result<()> {
@@ -4957,12 +4999,24 @@ async fn exchange_direct(state: &AppState, request: DirectRequest) -> io::Result
             // turn success into permission for another financial submission.
             // Coalesce concurrent refreshes, and never hold the committed
             // financial response hostage to optional checkpoint storage.
-            if let Ok(guard) = Arc::clone(&store.checkpoint_refresh_gate).try_lock_owned() {
+            if store.checkpoint_refresh_gate.lock().await.request() {
                 let store = store.clone(); let state = state.clone();
                 tokio::spawn(async move {
-                    let _guard = guard;
-                    if store.seal_current_checkpoint(&state).await.is_err() {
-                        eprintln!("VERIFIED_ARCHIVE_CHECKPOINT_REFRESH_PENDING");
+                    loop {
+                        let delay = store.checkpoint_refresh_gate.lock().await.delay(tokio::time::Instant::now());
+                        tokio::time::sleep(delay).await;
+                        store.checkpoint_refresh_gate.lock().await.begin(tokio::time::Instant::now());
+                        let result = store.seal_current_checkpoint(&state).await;
+                        if let Err(error) = &result {
+                            let reason = match error.as_str() {
+                                "checkpoint seal transport failed" => "transport",
+                                "checkpoint seal rejected" => "head_validation",
+                                "checkpoint head mismatch" => "archive_head",
+                                _ => "archive_read_or_write",
+                            };
+                            eprintln!("VERIFIED_ARCHIVE_CHECKPOINT_REFRESH_PENDING reason={reason}");
+                        }
+                        if !store.checkpoint_refresh_gate.lock().await.finish(result.is_ok()) { break; }
                     }
                 });
             }
@@ -4992,6 +5046,26 @@ async fn write_frame(stream: &mut VsockStream, bytes: &[u8]) -> io::Result<()> {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn checkpoint_refresh_coalesces_bursts_and_retries_without_new_commits() {
+        let mut refresh = super::CheckpointRefresh::default();
+        let now = tokio::time::Instant::now();
+        assert!(refresh.request());
+        for _ in 0..100 { assert!(!refresh.request()); }
+        assert_eq!(refresh.delay(now), std::time::Duration::ZERO);
+        refresh.begin(now);
+        assert!(!refresh.request()); // a commit while sealing schedules one successor
+        assert!(refresh.finish(true));
+        assert_eq!(refresh.delay(now), super::CHECKPOINT_REFRESH_INTERVAL);
+        refresh.begin(now + super::CHECKPOINT_REFRESH_INTERVAL);
+        assert!(refresh.finish(false)); // failed refresh is not dropped in a quiet market
+        assert_eq!(refresh.delay(now + super::CHECKPOINT_REFRESH_INTERVAL), super::CHECKPOINT_REFRESH_INTERVAL);
+        refresh.begin(now + super::CHECKPOINT_REFRESH_INTERVAL * 2);
+        assert!(!refresh.finish(true));
+        assert!(refresh.request());
+        assert_eq!(refresh.delay(now + super::CHECKPOINT_REFRESH_INTERVAL * 2), super::CHECKPOINT_REFRESH_INTERVAL);
+    }
+
     use super::*;
     #[test]
     fn usdc_preflight_rejects_a_cross_rail_hold_or_insufficient_balance_before_payout() {
@@ -5199,7 +5273,7 @@ mod tests {
             }
         });
         let configuration=aws_sdk_s3::config::Builder::new().behavior_version_latest().region(aws_sdk_s3::config::Region::new("us-east-1")).credentials_provider(aws_sdk_s3::config::Credentials::new("unit-test","unit-test",None,None,"local-only")).endpoint_url(format!("http://{address}")).force_path_style(true).build();
-        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),checkpoint_refresh_gate:Arc::new(Mutex::new(()))};
+        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default()))};
         assert_eq!(store.read("epoch/immutable.cbor").await.unwrap(),b"complete-opaque-ciphertext");server.await.unwrap();
     }
     #[tokio::test]
@@ -5212,7 +5286,7 @@ mod tests {
             }
         });
         let configuration=aws_sdk_s3::config::Builder::new().behavior_version_latest().region(aws_sdk_s3::config::Region::new("us-east-1")).credentials_provider(aws_sdk_s3::config::Credentials::new("unit-test","unit-test",None,None,"local-only")).endpoint_url(format!("http://{address}")).force_path_style(true).build();
-        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),checkpoint_refresh_gate:Arc::new(Mutex::new(()))};
+        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default()))};
         assert_eq!(store.read("epoch/immutable.cbor").await.unwrap_err(),"archive complete read retries exhausted");server.await.unwrap();
     }
     #[tokio::test]
@@ -5230,7 +5304,7 @@ mod tests {
             }
         });
         let configuration=aws_sdk_s3::config::Builder::new().behavior_version_latest().region(aws_sdk_s3::config::Region::new("us-east-1")).credentials_provider(aws_sdk_s3::config::Credentials::new("unit-test","unit-test",None,None,"local-only")).endpoint_url(format!("http://{address}")).force_path_style(true).build();
-        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),checkpoint_refresh_gate:Arc::new(Mutex::new(()))};
+        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default()))};
         let keys=store.list_restore_keys("artifacts").await.unwrap();assert_eq!(keys.len(),1250);assert!(keys.first().unwrap().contains("00000000000000000001"));assert!(keys.last().unwrap().contains("00000000000000001250"));server.await.unwrap();
     }
 
