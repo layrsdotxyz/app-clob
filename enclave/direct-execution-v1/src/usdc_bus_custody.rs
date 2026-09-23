@@ -87,6 +87,14 @@ fn transfer<'a>(receipt:&'a Value,token:&str,from:&str,to:&str,amount:u128)->Vec
             &&eq(&log["topics"][1],&format!("0x{}",address_word(from)))&&eq(&log["topics"][2],&format!("0x{}",address_word(to)))
             &&eq(&log["data"],&format!("0x{}",word(amount)))).collect()
 }
+fn relay_origin_spend(receipt:&Value,deposit:&str,amount:u128)->bool {
+    let outbound=events(receipt,ARB_TOKEN,"Transfer(address,address,uint256)").into_iter().filter(|log|
+        log["topics"].as_array().is_some_and(|topics|topics.len()==3)
+            &&eq(&log["topics"][1],&format!("0x{}",address_word(deposit)))).collect::<Vec<_>>();
+    outbound.len()==1
+        &&!eq(&outbound[0]["topics"][2],&format!("0x{}",address_word(ZERO)))
+        &&eq(&outbound[0]["data"],&format!("0x{}",word(amount)))
+}
 fn bytes_argument(bytes:&str)->Result<String,String>{
     if bytes.len()%2!=0||!bytes.bytes().all(|byte|byte.is_ascii_hexdigit()) {return Err(denied());}
     Ok(format!("{}{:0<width$}",word((bytes.len()/2) as u128),bytes,width=((bytes.len()+63)/64)*64))
@@ -226,17 +234,25 @@ impl UsdcBusCustodyAdapter {
         terminal_effect("arbitrum",&self.ledger,&proof.relay.deposit_address,amount,self.maximum_subsidy,self.maximum_native,&bus,&pool,&boarding,&driving,&arrival)?;
         let status=self.relay_get(&format!("/intents/status/v3?requestId={}",proof.relay.request_id)).await?;
         let details=self.relay_get(&format!("/requests/v3?id={}",proof.relay.request_id)).await?;
+        let intake_hashes=relay_hashes(status.get("inTxHashes"));
         if status.get("status").and_then(Value::as_str)!=Some("success")
             ||status.get("requestId").and_then(Value::as_str).is_some_and(|id|!id.eq_ignore_ascii_case(&proof.relay.request_id))
             ||status.get("originChainId").and_then(Value::as_u64).is_some_and(|value|value!=42161)
             ||status.get("destinationChainId").and_then(Value::as_u64).is_some_and(|value|value!=chain)
-            ||!relay_hashes(status.get("inTxHashes")).iter().any(|hash|hash.eq_ignore_ascii_case(&proof.destination_transaction_hash)) {return Err(denied());}
+            ||intake_hashes.len()!=1 {return Err(denied());}
+        let intake_hash=&intake_hashes[0];
+        let Some(intake)=self.confirmed(true,intake_hash).await? else{return Ok(None)};
+        let arrival_block=arrival.receipt["blockNumber"].as_str().and_then(parse_quantity).ok_or_else(denied)?;
+        let intake_block=intake.receipt["blockNumber"].as_str().and_then(parse_quantity).ok_or_else(denied)?;
+        if intake_block<=arrival_block||!relay_origin_spend(&intake.receipt,&proof.relay.deposit_address,amount.parse().map_err(|_|denied())?) {
+            return Err(denied());
+        }
         let requests=details.get("requests").and_then(Value::as_array).filter(|values|values.len()==1).ok_or_else(denied)?;
         let request=&requests[0];
         if request.get("id").and_then(Value::as_str).is_none_or(|id|!id.eq_ignore_ascii_case(&proof.relay.request_id))
             ||request.get("recipient").and_then(Value::as_str).is_none_or(|value|!relay_address_eq(value,destination,chain))
             ||request.pointer("/depositAddress/address").and_then(Value::as_str).is_none_or(|value|!value.eq_ignore_ascii_case(&proof.relay.deposit_address))
-            ||!relay_request_has_intake(request,42161,&proof.destination_transaction_hash)
+            ||!relay_request_has_intake(request,42161,intake_hash)
             ||!relay_currency_matches(request.pointer("/data/route/quoted/origin/inputCurrency"),42161,ARB_TOKEN,amount)
             ||!relay_currency_matches(request.pointer("/data/route/quoted/destination/outputCurrency"),chain,currency,&proof.relay.quoted_destination_amount_atomic)
             ||request.get("status").and_then(Value::as_str)!=Some("success") {return Err(denied());}
@@ -582,6 +598,22 @@ mod tests {
     }
     fn fixture()->Value {serde_json::from_str(include_str!("../fixtures/usdc-bus-withdrawal-node-golden.json")).unwrap()}
     fn material(value:&Value,name:&str)->Confirmed {Confirmed {receipt:value[name]["receipt"].clone(),tx:value[name]["tx"].clone()}}
+    #[test]
+    fn relay_origin_spend_binds_one_exact_nonzero_outbound_transfer(){
+        let deposit="0x1111111111111111111111111111111111111111";
+        let recipient="0x2222222222222222222222222222222222222222";
+        let log=json!({"address":ARB_TOKEN,"topics":[topic("Transfer(address,address,uint256)"),
+            format!("0x{}",address_word(deposit)),format!("0x{}",address_word(recipient))],
+            "data":format!("0x{}",word(5_000_000))});
+        let receipt=json!({"logs":[log.clone()]});
+        assert!(relay_origin_spend(&receipt,deposit,5_000_000));
+        let mut wrong_amount=receipt.clone();wrong_amount["logs"][0]["data"]=json!(format!("0x{}",word(4_999_999)));
+        assert!(!relay_origin_spend(&wrong_amount,deposit,5_000_000));
+        let mut zero_recipient=receipt.clone();zero_recipient["logs"][0]["topics"][2]=json!(format!("0x{}",address_word(ZERO)));
+        assert!(!relay_origin_spend(&zero_recipient,deposit,5_000_000));
+        let mut duplicate=receipt;duplicate["logs"].as_array_mut().unwrap().push(log);
+        assert!(!relay_origin_spend(&duplicate,deposit,5_000_000));
+    }
     fn verify(value:&Value)->Result<String,String>{
         let proof:BusWithdrawalProof=serde_json::from_value(value["proof"].clone()).unwrap();
         terminal_effect("arbitrum",value["ledger"].as_str().unwrap(),value["recipient"].as_str().unwrap(),value["amountAtomic"].as_str().unwrap(),10000,1000,&proof,
