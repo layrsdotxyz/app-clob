@@ -1614,6 +1614,44 @@ fn receipt_only_record(artifact:&DirectStateArtifact)->DirectStateArtifact {
     record
 }
 
+// Artifact persistence precedes immutable head persistence. A failed candidate
+// can therefore coexist with a different, head-backed artifact at the same
+// sequence. Never replay that candidate or delete it. An unheaded tail, missing
+// canonical artifact, duplicate head, or sequence gap still fails closed.
+fn committed_archive_keys(candidates: &[String], heads: &[String], prefix: &str) -> Result<Vec<String>, String> {
+    fn sequence(key: &str, namespace: &str) -> Result<u64, String> {
+        let name=key.strip_prefix(namespace).and_then(|s|s.strip_suffix(".cbor"))
+            .ok_or("archive key namespace invalid")?;
+        let (seq,hash)=name.split_once('-').ok_or("archive key format invalid")?;
+        if seq.len()!=20 || !seq.bytes().all(|b|b.is_ascii_digit())
+            || hash.len()!=64 || !hash.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)) {
+            return Err("archive key format invalid".into());
+        }
+        seq.parse().map_err(|_|"archive sequence overflow".into())
+    }
+    let artifact_prefix=format!("{prefix}/artifacts/");
+    let head_prefix=format!("{prefix}/heads/");
+    let mut available=HashSet::with_capacity(candidates.len());
+    for key in candidates {
+        let seq=sequence(key,&artifact_prefix)?;
+        if seq==0 || seq>heads.len() as u64 || !available.insert(key.as_str()) {
+            return Err("archive unheaded tail or duplicate candidate".into());
+        }
+    }
+    let mut selected=Vec::with_capacity(heads.len());
+    for (index,head) in heads.iter().enumerate() {
+        if sequence(head,&head_prefix)?!=index as u64+1 {
+            return Err("archive head sequence gap or duplicate".into());
+        }
+        let key=format!("{artifact_prefix}{}",head.strip_prefix(&head_prefix).ok_or("archive head namespace invalid")?);
+        if !available.contains(key.as_str()) {
+            return Err("archive committed artifact missing".into());
+        }
+        selected.push(key);
+    }
+    Ok(selected)
+}
+
 /// The checkpoint must cover an exact prefix of the independently listed,
 /// immutable artifact AND head namespaces. A stale checkpoint is valid only
 /// when every later successor is subsequently verified; it is not the tip.
@@ -1807,9 +1845,9 @@ impl S3ImmutableArtifactStore {
         if !state.isolated_test && state.governed_bootstrap.as_ref().and_then(|config| config.grant.committed_restore_frontier.as_ref()).is_none() {
             return Err("governed checkpoint frontier required for production cutover".into());
         }
-        let keys=self.list_restore_keys("artifacts").await?;
+        let candidates=self.list_restore_keys("artifacts").await?;
         let heads=self.list_restore_keys("heads").await?;
-        if keys.len()!=heads.len(){return Err("archive artifact/head count mismatch".into());}
+        let keys=committed_archive_keys(&candidates,&heads,&self.prefix)?;
         if let Some(frontier) = state.governed_bootstrap.as_ref().and_then(|config| config.grant.committed_restore_frontier.as_ref()) {
             if !frontier.valid() { return Err("governed checkpoint frontier invalid".into()); }
             let index = frontier.sequence as usize - 1;
@@ -5195,6 +5233,31 @@ mod tests {
             receipt: DirectReceipt { receipt_id: "receipt".into(), account_id: "account".into(), identity_commitment: "identity".into(), request_id: "request".into(), request_hash: "c".repeat(64), status: layrs_direct_execution_v1::TerminalStatus::Applied, effect: "BALANCE_READ".into(), amount_atomic: None, custody_reference: None, execution: None, resolution: None, projection_balance_updates: vec![], genesis_ordinal: 0, signature: "signature".into() }
         }
     }
+    #[test]
+    fn archive_recovery_selects_only_head_backed_candidates_without_hiding_missing_history() {
+        let key=|kind:&str,seq:u64,hash:&str|format!("epoch/{kind}/{seq:020}-{}.cbor",hash.repeat(64));
+        let canonical=vec![key("artifacts",1,"a"),key("artifacts",2,"b"),key("artifacts",3,"c")];
+        let heads=vec![key("heads",1,"a"),key("heads",2,"b"),key("heads",3,"c")];
+        let mut candidates=canonical.clone();
+        candidates.extend([key("artifacts",1,"d"),key("artifacts",2,"e")]);
+        candidates.sort();
+        for _ in 0..3 {assert_eq!(committed_archive_keys(&candidates,&heads,"epoch").unwrap(),canonical);}
+        assert_eq!(committed_archive_keys(&canonical,&heads,"epoch").unwrap(),canonical);
+        let mut missing=candidates.clone();missing.retain(|k|k!=&canonical[1]);
+        assert!(committed_archive_keys(&missing,&heads,"epoch").is_err());
+        let mut tail=candidates.clone();tail.push(key("artifacts",4,"f"));
+        assert!(committed_archive_keys(&tail,&heads,"epoch").is_err());
+        assert!(committed_archive_keys(&candidates,&heads[..2],"epoch").is_err());
+        let mut duplicate=heads.clone();duplicate[1]=heads[0].clone();
+        assert!(committed_archive_keys(&candidates,&duplicate,"epoch").is_err());
+        let mut wrong=heads.clone();wrong[1]=key("heads",2,"f");
+        assert!(committed_archive_keys(&candidates,&wrong,"epoch").is_err());
+        let mut malformed=candidates.clone();malformed.push("other/artifacts/not-a-record.cbor".into());
+        assert!(committed_archive_keys(&malformed,&heads,"epoch").is_err());
+        assert!(committed_archive_keys(&candidates,&[],"epoch").is_err());
+        assert!(committed_archive_keys(&[],&[],"epoch").unwrap().is_empty());
+    }
+
     #[test]
     fn checkpoint_archive_requires_exact_prefix_and_retains_unrestored_suffix() {
         let mut artifacts = nonfinancial_chain();
