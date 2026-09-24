@@ -2901,7 +2901,11 @@ impl DirectRuntime {
         taker_fee: u128,
     ) -> Result<(), RuntimeError> {
         let market = self.markets.get(&maker.market_id).cloned().ok_or(RuntimeError::InvalidMarket)?;
-        let notional = settlement_atomic(&market, direct_notional(price_micros, quantity)?)?;
+        let notional = settlement_atomic(&market, if maker.action == OrderAction::Buy {
+            resting_buy_fill_notional(maker, quantity)?
+        } else {
+            direct_notional(price_micros, quantity)?
+        })?;
         let (buyer, seller) = if taker.action == OrderAction::Buy {
             (taker, maker)
         } else {
@@ -2973,7 +2977,10 @@ impl DirectRuntime {
         }
         let market = self.markets.get(&maker.market_id).cloned().ok_or(RuntimeError::InvalidMarket)?;
         let collateral_atomic = settlement_atomic(&market, quantity)?;
-        let maker_amount = settlement_atomic(&market, direct_notional(maker_price_micros, quantity)?)?;
+        if maker_price_micros != maker.price_micros {
+            return Err(RuntimeError::InvalidOrder);
+        }
+        let maker_amount = settlement_atomic(&market, resting_buy_fill_notional(maker, quantity)?)?;
         let taker_amount = collateral_atomic
             .checked_sub(maker_amount)
             .ok_or(RuntimeError::InvalidOrder)?;
@@ -3532,6 +3539,21 @@ fn direct_notional(price_micros: u64, quantity_micros: u128) -> Result<u128, Run
         .checked_mul(quantity_micros)
         .and_then(|value| value.checked_add(PRICE_SCALE - 1))
         .map(|value| value / PRICE_SCALE)
+        .ok_or(RuntimeError::InvalidOrder)
+}
+
+// Spend the difference between the rounded reservations before and after a
+// resting buy fills. Rounding each fill independently can spend one micro that
+// is still required by the remaining order. This telescopes across partial fills
+// and preserves the existing fully backed remaining-hold check.
+fn resting_buy_fill_notional(order: &BookOrder, quantity: u128) -> Result<u128, RuntimeError> {
+    if order.action != OrderAction::Buy || quantity == 0 {
+        return Err(RuntimeError::InvalidOrder);
+    }
+    let remaining = order.remaining_micros.checked_sub(quantity)
+        .ok_or(RuntimeError::InvalidOrder)?;
+    direct_notional(order.price_micros, order.remaining_micros)?
+        .checked_sub(direct_notional(order.price_micros, remaining)?)
         .ok_or(RuntimeError::InvalidOrder)
 }
 
@@ -4345,6 +4367,102 @@ mod tests {
             position_quantity,
         );
         live
+    }
+
+    #[test]
+    fn fractional_partial_buy_fill_preserves_remaining_hold_and_cash_on_mint_and_normal() {
+        const MARKET: &str = "layrs:v5:BTC:USDC:1h:rounding-canary";
+        const MAKER: &str = "0bafc03d08d4951d769d58284db85c7ac2ee3c79de87ec680f58edc03017c418";
+        const TAKER: &str = "9bf6b307e41f94a5f5ec4211d2ac9eb5e4f2743b25224573391d7e8903276481";
+        fn cash(live: &DirectRuntime) -> u128 {
+            live.balances.values().flat_map(|a| a.iter())
+                .filter(|((asset, _), _)| asset == "USDC").map(|(_, v)| *v).sum::<u128>()
+                + live.market_collateral.values().sum::<u128>() + live.fee_revenue_atomic
+        }
+        for normal in [false, true] {
+            let mut live = runtime_with_one_usdc_minimum_market(MARKET, TAKER, 0);
+            live.add_asset(MAKER, "USDC", "USER_AVAILABLE", 5_000_000).unwrap();
+            live.add_asset(TAKER, "USDC", "USER_AVAILABLE", 6_000_000).unwrap();
+            if normal {
+                live.positions.insert((TAKER.into(), MARKET.into(), Outcome::Down), 1_137_656);
+            }
+            let before = cash(&live);
+            let maker_id = Uuid::from_u128(401).to_string();
+            live.place_order(MAKER, &maker_id, MARKET, Outcome::Down, OrderAction::Buy,
+                154_000, "10000000", TimeInForce::Gtc, None, 1_000).unwrap();
+            assert_eq!(live.orders[&maker_id].hold_atomic, 1_540_000);
+            let (outcome, action, price) = if normal {
+                (Outcome::Down, OrderAction::Sell, 154_000)
+            } else {
+                (Outcome::Up, OrderAction::Buy, 879_000)
+            };
+            let result = live.place_order(TAKER, &Uuid::from_u128(402).to_string(), MARKET,
+                outcome, action, price, "1137656", TimeInForce::Fak, None, 1_000).unwrap();
+            assert_eq!(result.trades.len(), 1);
+            assert_eq!(result.executed_quantity_micros, "1137656");
+            let maker = &live.orders[&maker_id];
+            assert_eq!(maker.order.remaining_micros, 8_862_344);
+            assert_eq!(maker.hold_atomic, 1_364_801);
+            assert_eq!(maker.hold_atomic, direct_notional(154_000, maker.order.remaining_micros).unwrap());
+            assert_eq!(cash(&live), before);
+            assert_eq!(live.cancel_order(MAKER, &maker_id).unwrap(), 1_364_801);
+            assert_eq!(live.orders[&maker_id].hold_atomic, 0);
+            assert_eq!(cash(&live), before);
+        }
+    }
+
+    #[test]
+    fn fractional_partial_buy_reservations_telescope_and_reject_overfills() {
+        for price in [100, 154_000, 333_300, 500_000, 846_000, 999_900] {
+            let mut order = BookOrder::with_id(Uuid::from_u128(501), "maker", "market",
+                Outcome::Down, OrderAction::Buy, price, 10_000_000, TimeInForce::Gtc, None);
+            let mut paid = 0;
+            for quantity in [1_137_656, 1, 1_153_847, 2_600_013, 5_108_483] {
+                let debit = resting_buy_fill_notional(&order, quantity).unwrap();
+                assert!(debit <= quantity);
+                paid += debit;
+                order.remaining_micros -= quantity;
+                assert_eq!(paid + direct_notional(price, order.remaining_micros).unwrap(),
+                    direct_notional(price, 10_000_000).unwrap());
+            }
+            assert_eq!(order.remaining_micros, 0);
+            assert_eq!(resting_buy_fill_notional(&order, 1), Err(RuntimeError::InvalidOrder));
+            assert_eq!(resting_buy_fill_notional(&order, 0), Err(RuntimeError::InvalidOrder));
+        }
+    }
+
+    #[test]
+    fn fractional_partial_mint_replays_once_after_restart_with_backed_remaining_order() {
+        const MARKET: &str = "layrs:v5:BTC:USDC:1h:rounding-replay";
+        const TAKER_SUBJECT: &str = "bae54f222a79c2ea394fa5b087d6a843e4b82562d0f3dfa33b8149b4beea21b3";
+        const TAKER: &str = "9bf6b307e41f94a5f5ec4211d2ac9eb5e4f2743b25224573391d7e8903276481";
+        let epoch = SealedEpoch::load(epoch_path()).unwrap();
+        let mut live = DirectRuntime::new(epoch.clone(), RuntimeMode::IsolatedTest, vec![7;32]).unwrap();
+        let mut store = InMemoryDirectStateStore::default();
+        live.execute_committed(market_registration_request(MARKET, "rounding-market"), &[8;32], &mut store).unwrap();
+        let maker_id = Uuid::from_u128(601).to_string();
+        live.execute_committed(request("rounding-maker", DirectAction::PlaceOrder {
+            order_id: maker_id.clone(), market_id: MARKET.into(), outcome: Outcome::Down,
+            action: OrderAction::Buy, price_micros: 154_000, quantity_micros: "10000000".into(),
+            time_in_force: TimeInForce::Gtc, expires_at_millis: None, now_millis: 1_000,
+        }), &[8;32], &mut store).unwrap();
+        let taker = request_for(TAKER_SUBJECT, TAKER, "rounding-taker", DirectAction::PlaceOrder {
+            order_id: Uuid::from_u128(602).to_string(), market_id: MARKET.into(), outcome: Outcome::Up,
+            action: OrderAction::Buy, price_micros: 879_000, quantity_micros: "1137656".into(),
+            time_in_force: TimeInForce::Fak, expires_at_millis: None, now_millis: 2_000,
+        });
+        let result = live.execute_committed(taker.clone(), &[8;32], &mut store).unwrap();
+        assert_eq!(live.orders[&maker_id].hold_atomic, 1_364_801);
+        let hash = live.state_hash();
+        let count = store.artifacts().unwrap().len();
+        let mut restored = DirectRuntime::restore_committed(epoch, RuntimeMode::IsolatedTest,
+            vec![7;32], &[8;32], &store).unwrap();
+        for _ in 0..3 {
+            assert_eq!(restored.execute_committed(taker.clone(), &[8;32], &mut store).unwrap(), result);
+            assert_eq!(restored.state_hash(), hash);
+            assert_eq!(store.artifacts().unwrap().len(), count);
+            assert_eq!(restored.orders[&maker_id].hold_atomic, 1_364_801);
+        }
     }
 
     #[test]
