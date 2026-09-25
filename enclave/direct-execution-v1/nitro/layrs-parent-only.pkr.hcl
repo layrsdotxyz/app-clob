@@ -33,6 +33,10 @@ build {
     source      = "${var.binary_directory}/layrs-direct-parent"
     destination = "/tmp/layrs-direct-parent"
   }
+  provisioner "file" {
+    source      = "${path.root}/layrs-opening-parent.service"
+    destination = "/tmp/layrs-opening-parent.service"
+  }
   provisioner "shell" {
     inline = [
       "set -eu",
@@ -43,6 +47,11 @@ build {
       "test \"$(sha256sum /tmp/layrs-direct-parent | cut -d ' ' -f1)\" = '${var.parent_sha256}'",
       "sudo install -m 0755 /tmp/layrs-direct-parent /opt/layrs-opening/layrs-direct-parent",
       "test \"$(sha256sum /opt/layrs-opening/layrs-direct-parent | cut -d ' ' -f1)\" = '${var.parent_sha256}'",
+      "unit_path=$(systemctl show -p FragmentPath --value layrs-opening-parent.service)",
+      "test -n \"$unit_path\"",
+      "sudo install -m 0644 /tmp/layrs-opening-parent.service \"$unit_path\"",
+      "sudo systemctl daemon-reload",
+      "systemctl cat layrs-opening-parent.service | grep -q 'ExecStopPost=+/bin/sh'",
       "echo PARENT_ONLY_IMAGE_PRESERVES_EXACT_MEASURED_EIF_WITHOUT_RUNTIME_SECRETS"
     ]
   }

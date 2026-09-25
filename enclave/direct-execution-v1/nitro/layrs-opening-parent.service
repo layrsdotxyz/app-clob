@@ -2,6 +2,9 @@
 Description=Layrs opening epoch direct-execution parent
 After=layrs-opening-enclave.service
 Requires=layrs-opening-enclave.service
+# The parent retries indefinitely; a stale enclave is recreated below rather
+# than counted against a start limit.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -16,7 +19,13 @@ Environment=LAYRS_DIRECT_ARTIFACT_DIR=/var/lib/layrs-opening-artifacts
 # The root-owned BFF session key is intentionally absent from the AMI.
 EnvironmentFile=-/etc/layrs-opening/direct-runtime.env
 ExecStart=/opt/layrs-opening/layrs-direct-parent
+# Exit status 3 means the enclave still holds a previous parent's grant or
+# recovered state.  Recreate the enclave (terminate + run) as root before the
+# automatic restart, so the next parent start bootstraps a fresh enclave
+# instead of looping on GOVERNED_BOOTSTRAP_REPLAY_MISMATCH.
+ExecStopPost=+/bin/sh -c 'if [ "$EXIT_STATUS" = "3" ]; then echo ENCLAVE_RESET_FOR_STALE_STATE; /usr/bin/systemctl restart layrs-opening-enclave.service; fi'
 Restart=on-failure
+RestartSec=10
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict

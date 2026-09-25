@@ -7,7 +7,7 @@ use aws_sdk_kms::{
 };
 use aws_sdk_s3::{
     primitives::ByteStream,
-    types::{ObjectLockMode, ServerSideEncryption},
+    types::{CompletedMultipartUpload, CompletedPart, ObjectLockMode, ServerSideEncryption},
     Client as S3Client,
 };
 use aws_smithy_types::{
@@ -75,6 +75,9 @@ use tokio_postgres::{Client, NoTls};
 use tokio_vsock::{VsockAddr, VsockStream};
 const ENCLOSURE_PORT: u32 = 5_003;
 const ENCLOSURE_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Process exit status that tells systemd the enclave holds stale state from a
+/// previous parent and must be recreated before the parent starts again.
+const ENCLAVE_RESET_EXIT_STATUS: i32 = 3;
 const ARCHIVE_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 const WRITE_PATH_STALL_THRESHOLD: Duration = Duration::from_secs(60);
 
@@ -2082,12 +2085,159 @@ impl S3ImmutableArtifactStore {
         }
         Ok(())
     }
+    /// Immutable put of a large artifact as one multipart upload whose parts
+    /// are sent concurrently.  The completed object is still conditional
+    /// (`If-None-Match: *`), KMS-encrypted and Object-Lock protected exactly
+    /// like `write_once`, and it is still read back in full before any
+    /// acknowledgement.  Any failure that is not an existing-object conflict
+    /// falls back to the proven single-put path, so this can only be faster,
+    /// never weaker.  Returns the bytes that were read back.
+    async fn write_once_large(&self, key: &str, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+        const PART_BYTES: usize = 16 * 1024 * 1024;
+        if bytes.len() <= PART_BYTES {
+            self.write_once(key, bytes.clone()).await?;
+            return Ok(bytes);
+        }
+        let until = DateTime::from_secs(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| "clock invalid")?
+                .as_secs() as i64
+                + self.retention_seconds,
+        );
+        eprintln!("FINANCIAL_AWAIT_BEGIN stage=archive_multipart_put bytes={}", bytes.len());
+        let started = std::time::Instant::now();
+        let multipart: Result<(), String> = async {
+            let created = bounded_archive_operation(
+                ARCHIVE_OPERATION_TIMEOUT,
+                self.client
+                    .create_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .server_side_encryption(ServerSideEncryption::AwsKms)
+                    .ssekms_key_id(&self.kms_key_id)
+                    .object_lock_mode(ObjectLockMode::Compliance)
+                    .object_lock_retain_until_date(until)
+                    .send(),
+            )
+            .await?
+            .map_err(|error| format!("archive multipart create failed: {error}"))?;
+            let upload_id = created
+                .upload_id()
+                .ok_or("archive multipart id missing")?
+                .to_string();
+            let abort = |reason: String| {
+                let client = self.client.clone();
+                let bucket = self.bucket.clone();
+                let key = key.to_string();
+                let upload_id = upload_id.clone();
+                async move {
+                    let _ = client
+                        .abort_multipart_upload()
+                        .bucket(bucket)
+                        .key(key)
+                        .upload_id(upload_id)
+                        .send()
+                        .await;
+                    reason
+                }
+            };
+            let mut uploads = Vec::new();
+            for (index, chunk) in bytes.chunks(PART_BYTES).enumerate() {
+                let client = self.client.clone();
+                let bucket = self.bucket.clone();
+                let key = key.to_string();
+                let upload_id = upload_id.clone();
+                let part_number = index as i32 + 1;
+                let body = chunk.to_vec();
+                uploads.push(tokio::spawn(async move {
+                    client
+                        .upload_part()
+                        .bucket(bucket)
+                        .key(key)
+                        .upload_id(upload_id)
+                        .part_number(part_number)
+                        .body(ByteStream::from(body))
+                        .send()
+                        .await
+                        .map_err(|error| format!("archive multipart part {part_number} failed: {error}"))
+                        .and_then(|output| {
+                            output
+                                .e_tag()
+                                .map(|tag| (part_number, tag.to_string()))
+                                .ok_or_else(|| format!("archive multipart part {part_number} etag missing"))
+                        })
+                }));
+            }
+            let mut parts = Vec::with_capacity(uploads.len());
+            for upload in uploads {
+                match bounded_archive_operation(ARCHIVE_OPERATION_TIMEOUT, upload).await {
+                    Ok(Ok(Ok(part))) => parts.push(part),
+                    Ok(Ok(Err(error))) => return Err(abort(error).await),
+                    Ok(Err(_)) => return Err(abort("archive multipart part task failed".into()).await),
+                    Err(error) => return Err(abort(error).await),
+                }
+            }
+            parts.sort_by_key(|(number, _)| *number);
+            let completed = CompletedMultipartUpload::builder()
+                .set_parts(Some(
+                    parts
+                        .into_iter()
+                        .map(|(number, tag)| CompletedPart::builder().part_number(number).e_tag(tag).build())
+                        .collect(),
+                ))
+                .build();
+            let complete = bounded_archive_operation(
+                ARCHIVE_OPERATION_TIMEOUT,
+                self.client
+                    .complete_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .multipart_upload(completed)
+                    .if_none_match("*")
+                    .send(),
+            )
+            .await;
+            match complete {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(error)) => Err(abort(format!("archive multipart complete failed: {error}")).await),
+                Err(error) => Err(abort(error).await),
+            }
+        }
+        .await;
+        eprintln!(
+            "FINANCIAL_AWAIT_END stage=archive_multipart_put elapsed_ms={} ok={}",
+            started.elapsed().as_millis(),
+            multipart.is_ok()
+        );
+        if let Err(error) = &multipart {
+            // Never trust a failed multipart as durable; the fallback single
+            // put is itself conditional and read back, so an object that was
+            // in fact completed is detected as an identical existing object.
+            eprintln!("ARCHIVE_MULTIPART_FALLBACK reason={}", error.replace('\n', " "));
+            self.write_once(key, bytes.clone()).await?;
+            return Ok(bytes);
+        }
+        eprintln!("FINANCIAL_AWAIT_BEGIN stage=archive_readback");
+        let restored = self.read(key).await?;
+        eprintln!("FINANCIAL_AWAIT_END stage=archive_readback");
+        if restored != bytes {
+            return Err("archive readback mismatch".into());
+        }
+        Ok(restored)
+    }
     async fn persist_readback(
         &self,
         artifact: &DirectStateArtifact,
     ) -> Result<DirectStateArtifact, String> {
         let bytes = serde_cbor::to_vec(artifact).map_err(|_| "artifact encoding failed")?;
-        self.write_once(&self.artifact_key(artifact), bytes.clone())
+        // The artifact must be durable before its head exists.  The head is a
+        // few bytes, so it follows the verified artifact read-back directly;
+        // the artifact bytes are decoded from that same read-back rather than
+        // being downloaded a second time.
+        let readback = self
+            .write_once_large(&self.artifact_key(artifact), bytes)
             .await?;
         self.write_once(
             &self.head_key(artifact),
@@ -2095,8 +2245,7 @@ impl S3ImmutableArtifactStore {
         )
         .await?;
         let restored: DirectStateArtifact =
-            serde_cbor::from_slice(&self.read(&self.artifact_key(artifact)).await?)
-                .map_err(|_| "artifact decode failed")?;
+            serde_cbor::from_slice(&readback).map_err(|_| "artifact decode failed")?;
         if restored != *artifact || artifact_hash(&restored) != artifact_hash(artifact) {
             return Err("artifact integrity mismatch".into());
         }
@@ -2724,6 +2873,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // isolated test key material therefore crosses the existing VSOCK channel
     // once, before recovery; production never uses this bootstrap.
     bootstrap_isolated_enclave(&state).await?;
+    // A Nitro enclave keeps its private state across parent restarts.  An
+    // enclave that already carries a writer grant or a completed recovery
+    // belongs to a previous parent process: re-bootstrapping it is a grant
+    // replay and re-restoring it is rejected, so every retry on that host
+    // would fail.  Exit with a dedicated status; the unit's ExecStopPost
+    // restarts the enclave, and the next parent start meets a fresh one.
+    if !state.isolated_test {
+        if let Ok(RuntimeResponse::Status { status }) = exchange(&state, RuntimeRequest::Status).await {
+            if status.writer_grant_commitment.is_some() || status.writer_enabled || status.admission_enabled {
+                eprintln!("ENCLAVE_STALE_STATE_RESET_REQUIRED");
+                std::process::exit(ENCLAVE_RESET_EXIT_STATUS);
+            }
+        }
+    }
     preflight_then_bootstrap(
         async {
             if let Some(store) = state.artifact_store.as_ref() {
@@ -5388,7 +5551,21 @@ async fn verify_recovered_projection(state: &AppState) -> io::Result<()> {
         let encoded: String = row.get(0);
         serde_json::from_str(&encoded).map_err(|_| invalid("projection receipt is malformed"))
     }).collect::<io::Result<_>>()?;
-    verify_projected_receipt_lineage(&records, &receipts).map_err(|_| invalid("projection receipt exceeds or conflicts with recovered immutable history"))?;
+    if let Err(_) = verify_projected_receipt_lineage(&records, &receipts) {
+        // Name the first offending receipt so an operator can tell "another
+        // writer kept committing after this restore listed the archive" from
+        // a genuinely corrupt projection without querying the database.
+        let known: HashSet<&str> = records.iter().map(|record| record.receipt.receipt_id.as_str()).collect();
+        if let Some(extra) = receipts.iter().find(|receipt| !known.contains(receipt.receipt_id.as_str())) {
+            eprintln!(
+                "PROJECTION_LINEAGE_CONFLICT receipt_id={} request_id={} effect={}",
+                extra.receipt_id, extra.request_id, extra.effect
+            );
+        } else {
+            eprintln!("PROJECTION_LINEAGE_CONFLICT reason=receipt_content_differs");
+        }
+        return Err(invalid("projection receipt exceeds or conflicts with recovered immutable history"));
+    }
     for receipt in receipts {
         for update in receipt.projection_balance_updates {
             let key = format!(
