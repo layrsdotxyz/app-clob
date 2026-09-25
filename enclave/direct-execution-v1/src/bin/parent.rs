@@ -98,6 +98,15 @@ where
         .await
         .map_err(|_| "ARCHIVE_TIMEOUT".to_string())
 }
+
+async fn preflight_then_bootstrap<P, B>(preflight: P, bootstrap: B) -> io::Result<()>
+where
+    P: Future<Output = io::Result<()>>,
+    B: Future<Output = io::Result<()>>,
+{
+    preflight.await?;
+    bootstrap.await
+}
 // Must match the enclave's finite parent-only VSOCK recovery ceiling.
 const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 // Fixed encrypted-download window, not a verification bypass.
@@ -225,7 +234,22 @@ struct S3ImmutableArtifactStore {
     // never a state-restore input and never contains private ledger plaintext.
     verified_receipt_records: Arc<Mutex<Option<Vec<DirectStateArtifact>>>>,
     verified_artifact_hashes: Arc<Mutex<Vec<String>>>,
+    prepared_restore: Arc<Mutex<Option<PreparedArchiveRestore>>>,
     checkpoint_refresh_gate: Arc<Mutex<CheckpointRefresh>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ResolvedArchiveHead {
+    key: String,
+    sequence: u64,
+    artifact_hash: String,
+}
+
+#[derive(Clone)]
+struct PreparedArchiveRestore {
+    keys: Vec<String>,
+    heads: Vec<ResolvedArchiveHead>,
+    checkpoint_keys: Vec<String>,
 }
 
 const CHECKPOINT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
@@ -1581,6 +1605,14 @@ impl ArchiveStore {
             Self::S3(store) => store.load_committed().await,
         }
     }
+    async fn prepare_restore_before_grant(&self, state: &AppState) -> Result<(), String> {
+        match self {
+            // Filesystem archives are confined to isolated tests/dormant
+            // packages and do not consume a governed production grant.
+            Self::Filesystem(_) => Ok(()),
+            Self::S3(store) => store.prepare_restore(state).await.map(|_| ()),
+        }
+    }
     async fn receipt_sequence(&self, receipt: &DirectReceipt) -> Result<i64, ProjectionError> {
         match self {
             Self::S3(store) => {
@@ -1690,44 +1722,166 @@ impl ArchiveStore {
     }
 }
 
-fn receipt_only_record(artifact:&DirectStateArtifact)->DirectStateArtifact {
-    let mut record=artifact.clone();
+fn receipt_only_record(artifact: &DirectStateArtifact) -> DirectStateArtifact {
+    let mut record = artifact.clone();
     // clear() leaves the entire snapshot allocation alive. This cache is only
     // receipt metadata; release the encrypted snapshot allocation completely.
-    record.ciphertext=Vec::new();
+    record.ciphertext = Vec::new();
     record
+}
+
+fn archive_head_key(prefix: &str, sequence: u64) -> String {
+    format!("{prefix}/heads/{sequence:020}.cbor")
+}
+
+fn archive_key_sequence(key: &str, namespace: &str, hash_required: bool) -> Result<u64, String> {
+    let name = key
+        .strip_prefix(namespace)
+        .and_then(|s| s.strip_suffix(".cbor"))
+        .ok_or("archive key namespace invalid")?;
+    let (seq, hash) = match name.split_once('-') {
+        Some((seq, hash)) => (seq, Some(hash)),
+        None => (name, None),
+    };
+    if seq.len() != 20
+        || !seq.bytes().all(|b| b.is_ascii_digit())
+        || hash_required && hash.is_none()
+        || hash.is_some_and(|hash| {
+            hash.len() != 64
+                || !hash
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+    {
+        return Err("archive key format invalid".into());
+    }
+    seq.parse().map_err(|_| "archive sequence overflow".into())
+}
+
+/// Resolve legacy duplicate heads by walking backward from the unique tip.
+/// The only admissible twin is the one whose state hash is the canonical
+/// successor's prior-state hash. No timestamp or listing order is authority.
+fn resolve_archive_heads(
+    entries: Vec<(ResolvedArchiveHead, Option<(String, String)>)>,
+) -> Result<(Vec<ResolvedArchiveHead>, Vec<ResolvedArchiveHead>), String> {
+    let mut by_sequence: BTreeMap<u64, Vec<(ResolvedArchiveHead, Option<(String, String)>)>> =
+        BTreeMap::new();
+    for (head, linkage) in entries {
+        if head.sequence == 0 {
+            return Err("archive head content sequence mismatch".into());
+        }
+        by_sequence
+            .entry(head.sequence)
+            .or_default()
+            .push((head, linkage));
+    }
+    if by_sequence.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let last = *by_sequence
+        .keys()
+        .next_back()
+        .ok_or("archive head missing")?;
+    if by_sequence.len() != last as usize || by_sequence.keys().copied().ne(1..=last) {
+        return Err("archive head sequence gap".into());
+    }
+    let mut canonical = Vec::with_capacity(last as usize);
+    let mut orphans = Vec::new();
+    let mut successor: Option<(ResolvedArchiveHead, Option<(String, String)>)> = None;
+    for sequence in (1..=last).rev() {
+        let mut candidates = by_sequence
+            .remove(&sequence)
+            .ok_or("archive head sequence gap")?;
+        let selected = if candidates.len() == 1 {
+            candidates.remove(0)
+        } else if let Some(successor) = &successor {
+            let successor_prior = successor
+                .1
+                .as_ref()
+                .map(|(prior, _)| prior)
+                .ok_or("archive duplicate successor linkage unavailable")?;
+            let matches = candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, linkage))| {
+                    linkage
+                        .as_ref()
+                        .is_some_and(|(_, state)| state == successor_prior)
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            if matches.len() != 1 {
+                return Err("archive duplicate head is not uniquely resolved by successor".into());
+            }
+            candidates.remove(matches[0])
+        } else {
+            return Err("archive terminal duplicate head is unresolvable".into());
+        };
+        orphans.extend(candidates.into_iter().map(|(head, _)| head));
+        successor = Some(selected.clone());
+        canonical.push(selected.0);
+    }
+    canonical.reverse();
+    orphans.sort_by_key(|head| head.sequence);
+    Ok((canonical, orphans))
+}
+
+fn resolved_head_from_artifact(
+    key: String,
+    artifact: DirectStateArtifact,
+    prefix: &str,
+) -> Result<(ResolvedArchiveHead, Option<(String, String)>), String> {
+    let head_prefix = format!("{prefix}/heads/");
+    let sequence = archive_key_sequence(&key, &head_prefix, false)?;
+    if sequence == 0 || artifact.sequence != sequence {
+        return Err("archive head content sequence mismatch".into());
+    }
+    let hash = artifact_hash(&artifact);
+    if let Some(name_hash) = key
+        .strip_prefix(&head_prefix)
+        .and_then(|name| name.strip_suffix(".cbor"))
+        .and_then(|name| name.split_once('-').map(|(_, hash)| hash))
+    {
+        if name_hash != hash {
+            return Err("archive head content address mismatch".into());
+        }
+    }
+    Ok((
+        ResolvedArchiveHead {
+            key,
+            sequence,
+            artifact_hash: hash,
+        },
+        Some((artifact.prior_state_hash, artifact.state_hash)),
+    ))
 }
 
 // Artifact persistence precedes immutable head persistence. A failed candidate
 // can therefore coexist with a different, head-backed artifact at the same
-// sequence. Never replay that candidate or delete it. An unheaded tail, missing
-// canonical artifact, duplicate head, or sequence gap still fails closed.
-fn committed_archive_keys(candidates: &[String], heads: &[String], prefix: &str) -> Result<Vec<String>, String> {
-    fn sequence(key: &str, namespace: &str) -> Result<u64, String> {
-        let name=key.strip_prefix(namespace).and_then(|s|s.strip_suffix(".cbor"))
-            .ok_or("archive key namespace invalid")?;
-        let (seq,hash)=name.split_once('-').ok_or("archive key format invalid")?;
-        if seq.len()!=20 || !seq.bytes().all(|b|b.is_ascii_digit())
-            || hash.len()!=64 || !hash.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)) {
-            return Err("archive key format invalid".into());
-        }
-        seq.parse().map_err(|_|"archive sequence overflow".into())
-    }
-    let artifact_prefix=format!("{prefix}/artifacts/");
-    let head_prefix=format!("{prefix}/heads/");
-    let mut available=HashSet::with_capacity(candidates.len());
+// sequence. Never replay that candidate or delete it. Only the canonical
+// successor-linked heads select committed artifacts.
+fn committed_archive_keys(
+    candidates: &[String],
+    heads: &[ResolvedArchiveHead],
+    prefix: &str,
+) -> Result<Vec<String>, String> {
+    let artifact_prefix = format!("{prefix}/artifacts/");
+    let mut available = HashSet::with_capacity(candidates.len());
     for key in candidates {
-        let seq=sequence(key,&artifact_prefix)?;
-        if seq==0 || seq>heads.len() as u64 || !available.insert(key.as_str()) {
+        let seq = archive_key_sequence(key, &artifact_prefix, true)?;
+        if seq == 0 || seq > heads.len() as u64 || !available.insert(key.as_str()) {
             return Err("archive unheaded tail or duplicate candidate".into());
         }
     }
-    let mut selected=Vec::with_capacity(heads.len());
-    for (index,head) in heads.iter().enumerate() {
-        if sequence(head,&head_prefix)?!=index as u64+1 {
-            return Err("archive head sequence gap or duplicate".into());
+    let mut selected = Vec::with_capacity(heads.len());
+    for (index, head) in heads.iter().enumerate() {
+        if head.sequence != index as u64 + 1 {
+            return Err("archive head sequence gap".into());
         }
-        let key=format!("{artifact_prefix}{}",head.strip_prefix(&head_prefix).ok_or("archive head namespace invalid")?);
+        let key = format!(
+            "{artifact_prefix}{:020}-{}.cbor",
+            head.sequence, head.artifact_hash
+        );
         if !available.contains(key.as_str()) {
             return Err("archive committed artifact missing".into());
         }
@@ -1739,21 +1893,41 @@ fn committed_archive_keys(candidates: &[String], heads: &[String], prefix: &str)
 /// The checkpoint must cover an exact prefix of the independently listed,
 /// immutable artifact AND head namespaces. A stale checkpoint is valid only
 /// when every later successor is subsequently verified; it is not the tip.
-fn validate_checkpoint_archive(checkpoint: &layrs_direct_execution_v1::DirectCheckpoint, keys: &[String], heads: &[String], prefix: &str) -> Result<usize, String> {
-    let sequence = usize::try_from(checkpoint.artifact.sequence).map_err(|_| "checkpoint sequence overflow")?;
-    if sequence == 0 || sequence > keys.len() || keys.len() != heads.len()
-        || checkpoint.receipt_records.len() != sequence {
+fn validate_checkpoint_archive(
+    checkpoint: &layrs_direct_execution_v1::DirectCheckpoint,
+    keys: &[String],
+    heads: &[ResolvedArchiveHead],
+    prefix: &str,
+) -> Result<usize, String> {
+    let sequence = usize::try_from(checkpoint.artifact.sequence)
+        .map_err(|_| "checkpoint sequence overflow")?;
+    if sequence == 0
+        || sequence > keys.len()
+        || keys.len() != heads.len()
+        || checkpoint.receipt_records.len() != sequence
+    {
         return Err("checkpoint frontier outside immutable archive".into());
     }
     for (index, record) in checkpoint.receipt_records.iter().enumerate() {
         if record.sequence != index as u64 + 1
             || checkpoint.artifact_hashes.len() != sequence
-            || keys[index] != format!("{prefix}/artifacts/{:020}-{}.cbor", record.sequence, checkpoint.artifact_hashes[index])
-            || heads[index] != format!("{prefix}/heads/{:020}-{}.cbor", record.sequence, checkpoint.artifact_hashes[index]) {
+            || keys[index]
+                != format!(
+                    "{prefix}/artifacts/{:020}-{}.cbor",
+                    record.sequence, checkpoint.artifact_hashes[index]
+                )
+            || heads[index].sequence != record.sequence
+            || heads[index].artifact_hash != checkpoint.artifact_hashes[index]
+        {
             return Err("checkpoint prefix differs from immutable archive".into());
         }
     }
-    if receipt_only_record(&checkpoint.artifact) != *checkpoint.receipt_records.last().ok_or("checkpoint head missing")? {
+    if receipt_only_record(&checkpoint.artifact)
+        != *checkpoint
+            .receipt_records
+            .last()
+            .ok_or("checkpoint head missing")?
+    {
         return Err("checkpoint terminal head mismatch".into());
     }
     Ok(sequence)
@@ -1818,6 +1992,7 @@ impl S3ImmutableArtifactStore {
             retention_seconds,
             verified_receipt_records: Arc::new(Mutex::new(None)),
             verified_artifact_hashes: Arc::new(Mutex::new(Vec::new())),
+            prepared_restore: Arc::new(Mutex::new(None)),
             checkpoint_refresh_gate: Arc::new(Mutex::new(CheckpointRefresh::default())),
         })
     }
@@ -1830,12 +2005,7 @@ impl S3ImmutableArtifactStore {
         )
     }
     fn head_key(&self, artifact: &DirectStateArtifact) -> String {
-        format!(
-            "{}/heads/{:020}-{}.cbor",
-            self.prefix,
-            artifact.sequence,
-            artifact_hash(artifact)
-        )
+        archive_head_key(&self.prefix, artifact.sequence)
     }
     fn intent_key(&self, intent: &ExternalEffectIntent) -> String {
         format!(
@@ -1898,10 +2068,16 @@ impl S3ImmutableArtifactStore {
         )
         .await?;
         eprintln!("FINANCIAL_AWAIT_END stage=archive_put");
-        if put.is_err() && self.read(key).await? != bytes {
-            return Err("archive immutable write failed".into());
+        let restored = self.read(key).await?;
+        if put.is_err() && restored != bytes {
+            return Err(if key.contains("/heads/") {
+                "ARCHIVE_SEQUENCE_CONFLICT"
+            } else {
+                "archive immutable write failed"
         }
-        if self.read(key).await? != bytes {
+            .into());
+        }
+        if restored != bytes {
             return Err("archive readback mismatch".into());
         }
         Ok(())
@@ -1913,7 +2089,11 @@ impl S3ImmutableArtifactStore {
         let bytes = serde_cbor::to_vec(artifact).map_err(|_| "artifact encoding failed")?;
         self.write_once(&self.artifact_key(artifact), bytes.clone())
             .await?;
-        self.write_once(&self.head_key(artifact), bytes).await?;
+        self.write_once(
+            &self.head_key(artifact),
+            artifact_hash(artifact).into_bytes(),
+        )
+        .await?;
         let restored: DirectStateArtifact =
             serde_cbor::from_slice(&self.read(&self.artifact_key(artifact)).await?)
                 .map_err(|_| "artifact decode failed")?;
@@ -1931,30 +2111,135 @@ impl S3ImmutableArtifactStore {
     async fn load_committed(&self) -> Result<Vec<DirectStateArtifact>, String> {
         self.verified_receipt_records.lock().await.clone().ok_or("verified archive receipt cache unavailable".into())
     }
-    async fn list_restore_keys(&self,namespace:&str)->Result<Vec<String>,String> {
-        let mut token=None;let mut seen_tokens=HashSet::new();let mut keys=Vec::new();
+    async fn list_restore_keys(&self, namespace: &str) -> Result<Vec<String>, String> {
+        let mut token = None;
+        let mut seen_tokens = HashSet::new();
+        let mut keys = Vec::new();
         loop {
-            let page=self.client.list_objects_v2().bucket(&self.bucket).prefix(format!("{}/{namespace}/",self.prefix)).set_continuation_token(token).send().await.map_err(|_|"archive listing failed")?;
-            for object in page.contents(){keys.push(object.key().ok_or("archive object key missing")?.to_string());}
-            if keys.len()>100_000 {return Err("archive exceeds finite restore bound".into());}
-            if !page.is_truncated.unwrap_or(false){break;}
-            let next=page.next_continuation_token().filter(|s|!s.is_empty()).ok_or("archive pagination token missing")?.to_string();
-            if !seen_tokens.insert(next.clone()){return Err("archive pagination token repeated".into());}token=Some(next);
+            let page = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(format!("{}/{namespace}/", self.prefix))
+                .set_continuation_token(token)
+                .send()
+                .await
+                .map_err(|_| "archive listing failed")?;
+            for object in page.contents() {
+                keys.push(
+                    object
+                        .key()
+                        .ok_or("archive object key missing")?
+                        .to_string(),
+                );
+            }
+            if keys.len() > 100_000 {
+                return Err("archive exceeds finite restore bound".into());
+            }
+            if !page.is_truncated.unwrap_or(false) {
+                break;
+            }
+            let next = page
+                .next_continuation_token()
+                .filter(|s| !s.is_empty())
+                .ok_or("archive pagination token missing")?
+                .to_string();
+            if !seen_tokens.insert(next.clone()) {
+                return Err("archive pagination token repeated".into());
+            }
+            token = Some(next);
         }
-        keys.sort();if keys.windows(2).any(|pair|pair[0]==pair[1]){return Err("archive duplicate key".into());}Ok(keys)
+        keys.sort();
+        if keys.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err("archive duplicate key".into());
+        }
+        Ok(keys)
     }
-    async fn restore_streamed(&self,state:&AppState)->Result<(),String> {
-        if !state.isolated_test && state.governed_bootstrap.as_ref().and_then(|config| config.grant.committed_restore_frontier.as_ref()).is_none() {
-            return Err("governed checkpoint frontier required for production cutover".into());
+    async fn prepare_restore(&self, state: &AppState) -> Result<PreparedArchiveRestore, String> {
+        let candidates = self.list_restore_keys("artifacts").await?;
+        let raw_heads = self.list_restore_keys("heads").await?;
+        let head_prefix = format!("{}/heads/", self.prefix);
+        let mut counts: BTreeMap<u64, usize> = BTreeMap::new();
+        for key in &raw_heads {
+            *counts
+                .entry(archive_key_sequence(key, &head_prefix, false)?)
+                .or_default() += 1;
         }
-        let candidates=self.list_restore_keys("artifacts").await?;
-        let heads=self.list_restore_keys("heads").await?;
-        let keys=committed_archive_keys(&candidates,&heads,&self.prefix)?;
-        if let Some(frontier) = state.governed_bootstrap.as_ref().and_then(|config| config.grant.committed_restore_frontier.as_ref()) {
-            if !frontier.valid() { return Err("governed checkpoint frontier invalid".into()); }
+        let mut linkage_sequences = HashSet::new();
+        for (&sequence, &count) in &counts {
+            if count > 1 {
+                linkage_sequences.insert(sequence);
+                if let Some(successor) = sequence.checked_add(1) {
+                    linkage_sequences.insert(successor);
+                }
+            }
+        }
+        let mut entries = Vec::with_capacity(raw_heads.len());
+        for key in raw_heads {
+            let sequence = archive_key_sequence(&key, &head_prefix, false)?;
+            let name = key
+                .strip_prefix(&head_prefix)
+                .and_then(|name| name.strip_suffix(".cbor"))
+                .ok_or("archive head namespace invalid")?;
+            let hash = if let Some((_, hash)) = name.split_once('-') {
+                hash.to_string()
+            } else {
+                let bytes = self.read(&key).await?;
+                let hash = std::str::from_utf8(&bytes)
+                    .map_err(|_| "archive sequence head hash invalid")?
+                    .to_string();
+                if hash.len() != 64
+                    || !hash
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    return Err("archive sequence head hash invalid".into());
+                }
+                hash
+            };
+            let head = ResolvedArchiveHead {
+                key: key.clone(),
+                sequence,
+                artifact_hash: hash.clone(),
+            };
+            if linkage_sequences.contains(&sequence) {
+                let artifact_key = format!("{}/artifacts/{sequence:020}-{hash}.cbor", self.prefix);
+                let artifact: DirectStateArtifact =
+                    serde_cbor::from_slice(&self.read(&artifact_key).await?)
+                        .map_err(|_| "archive head artifact decode failed")?;
+                let (resolved, linkage) = resolved_head_from_artifact(key, artifact, &self.prefix)?;
+                entries.push((resolved, linkage));
+            } else {
+                entries.push((head, None));
+            }
+        }
+        let (heads, orphans) = resolve_archive_heads(entries)?;
+        for orphan in orphans {
+            eprintln!(
+                "ARCHIVE_ORPHAN_HEAD seq={} hash={}",
+                orphan.sequence, orphan.artifact_hash
+            );
+        }
+        let keys = committed_archive_keys(&candidates, &heads, &self.prefix)?;
+        if let Some(frontier) = state
+            .governed_bootstrap
+            .as_ref()
+            .and_then(|config| config.grant.committed_restore_frontier.as_ref())
+        {
+            if !frontier.valid() {
+                return Err("governed checkpoint frontier invalid".into());
+            }
             let index = frontier.sequence as usize - 1;
-            if keys.get(index) != Some(&format!("{}/artifacts/{:020}-{}.cbor", self.prefix, frontier.sequence, frontier.artifact_hash))
-                || heads.get(index) != Some(&format!("{}/heads/{:020}-{}.cbor", self.prefix, frontier.sequence, frontier.artifact_hash)) {
+            if keys.get(index)
+                != Some(&format!(
+                    "{}/artifacts/{:020}-{}.cbor",
+                    self.prefix, frontier.sequence, frontier.artifact_hash
+                ))
+                || heads.get(index).is_none_or(|head| {
+                    head.sequence != frontier.sequence
+                        || head.artifact_hash != frontier.artifact_hash
+                })
+            {
                 return Err("immutable archive below governed checkpoint frontier".into());
             }
         }
@@ -1962,53 +2247,152 @@ impl S3ImmutableArtifactStore {
         if checkpoint_keys.is_empty() && !keys.is_empty() && !state.isolated_test {
             return Err("authenticated checkpoint required for existing production history; genesis fallback forbidden".into());
         }
+        let prepared = PreparedArchiveRestore {
+            keys,
+            heads,
+            checkpoint_keys,
+        };
+        *self.prepared_restore.lock().await = Some(prepared.clone());
+        Ok(prepared)
+    }
+    async fn restore_streamed(&self, state: &AppState) -> Result<(), String> {
+        if !state.isolated_test
+            && state
+                .governed_bootstrap
+                .as_ref()
+                .and_then(|config| config.grant.committed_restore_frontier.as_ref())
+                .is_none()
+        {
+            return Err("governed checkpoint frontier required for production cutover".into());
+        }
+        let prepared = match self.prepared_restore.lock().await.take() {
+            Some(prepared) => prepared,
+            None if state.isolated_test => self.prepare_restore(state).await?,
+            None => {
+                return Err("archive restore was not validated before governed bootstrap".into())
+            }
+        };
+        let PreparedArchiveRestore {
+            keys,
+            heads,
+            checkpoint_keys,
+        } = prepared;
         let (start, mut records, begin) = if let Some(key) = checkpoint_keys.last() {
-            let checkpoint: layrs_direct_execution_v1::DirectCheckpoint = serde_cbor::from_slice(&self.read(key).await?)
-                .map_err(|_| "checkpoint decode failed; genesis fallback forbidden")?;
-            if self.checkpoint_key(&checkpoint)? != *key { return Err("checkpoint content address mismatch".into()); }
+            let checkpoint: layrs_direct_execution_v1::DirectCheckpoint =
+                serde_cbor::from_slice(&self.read(key).await?)
+                    .map_err(|_| "checkpoint decode failed; genesis fallback forbidden")?;
+            if self.checkpoint_key(&checkpoint)? != *key {
+                return Err("checkpoint content address mismatch".into());
+            }
             let start = validate_checkpoint_archive(&checkpoint, &keys, &heads, &self.prefix)?;
             let records = checkpoint.receipt_records.clone();
-            let begin = exchange(state, RuntimeRequest::BeginCheckpointRestore { checkpoint }).await
+            let begin = exchange(state, RuntimeRequest::BeginCheckpointRestore { checkpoint })
+                .await
                 .map_err(|_| "checkpoint restore transport failed")?;
             (start, records, begin)
         } else {
-            (0, Vec::with_capacity(keys.len()), exchange(state,RuntimeRequest::BeginCommittedRestore).await.map_err(|_|"restore begin transport failed")?)
+            (
+                0,
+                Vec::with_capacity(keys.len()),
+                exchange(state, RuntimeRequest::BeginCommittedRestore)
+                    .await
+                    .map_err(|_| "restore begin transport failed")?,
+            )
         };
-        let RuntimeResponse::RestoreProgress {recovered_sequence,recovered_state_hash:mut root}=begin else {return Err("restore begin rejected; genesis fallback forbidden".into());};
-        if recovered_sequence != start as u64 { return Err("restore checkpoint sequence mismatch".into()); }
+        let RuntimeResponse::RestoreProgress {
+            recovered_sequence,
+            recovered_state_hash: mut root,
+        } = begin
+        else {
+            return Err("restore begin rejected; genesis fallback forbidden".into());
+        };
+        if recovered_sequence != start as u64 {
+            return Err("restore checkpoint sequence mismatch".into());
+        }
         eprintln!("VERIFIED_ARCHIVE_RESTORE_START {start}/{}", keys.len());
-        for window in restore_prefetch_ranges(keys.len()-start) {
-            let mut downloads=Vec::with_capacity(window.len());
+        for window in restore_prefetch_ranges(keys.len() - start) {
+            let mut downloads = Vec::with_capacity(window.len());
             for offset in window {
                 let index = start + offset;
-                let store=self.clone();let key=keys[index].clone();let head=heads[index].clone();
-                downloads.push((index,tokio::spawn(async move {
-                    let (bytes,head_bytes)=tokio::try_join!(store.read(&key),store.read(&head))?;
-                    if bytes!=head_bytes {return Err("archive encrypted artifact/head byte mismatch".to_string());}
-                    serde_cbor::from_slice::<DirectStateArtifact>(&bytes).map_err(|_|"artifact decode failed".to_string())
-                })));
+                let store = self.clone();
+                let key = keys[index].clone();
+                let head = heads[index].clone();
+                downloads.push((
+                    index,
+                    tokio::spawn(async move {
+                        let (bytes, head_bytes) =
+                            tokio::try_join!(store.read(&key), store.read(&head.key))?;
+                        let legacy_head = head
+                            .key
+                            .strip_prefix(&format!("{}/heads/", store.prefix))
+                            .and_then(|name| name.strip_suffix(".cbor"))
+                            .is_some_and(|name| name.contains('-'));
+                        if (legacy_head && bytes != head_bytes)
+                            || (!legacy_head && head_bytes != head.artifact_hash.as_bytes())
+                        {
+                            return Err("archive encrypted artifact/head byte mismatch".to_string());
+                        }
+                        serde_cbor::from_slice::<DirectStateArtifact>(&bytes)
+                            .map_err(|_| "artifact decode failed".to_string())
+                    }),
+                ));
             }
             // Await in key order, regardless of download completion order.
             // Each native append must verify before the next append is sent.
-            for (index,download) in downloads {
-                let artifact=download.await.map_err(|_|"bounded archive download failed")??;
-                if artifact.sequence!=index as u64+1 || artifact.prior_state_hash!=root || keys[index]!=self.artifact_key(&artifact) || heads[index]!=self.head_key(&artifact) {return Err("archive encrypted successor/head mismatch".into());}
-                root=artifact.state_hash.clone();let sequence=artifact.sequence;
+            for (index, download) in downloads {
+                let artifact = download
+                    .await
+                    .map_err(|_| "bounded archive download failed")??;
+                if artifact.sequence != index as u64 + 1
+                    || artifact.prior_state_hash != root
+                    || keys[index] != self.artifact_key(&artifact)
+                    || heads[index].sequence != artifact.sequence
+                    || heads[index].artifact_hash != artifact_hash(&artifact)
+                {
+                    return Err("archive encrypted successor/head mismatch".into());
+                }
+                root = artifact.state_hash.clone();
+                let sequence = artifact.sequence;
                 records.push(receipt_only_record(&artifact));
-                let response=exchange(state,RuntimeRequest::AppendCommittedRestore {artifact}).await.map_err(|_|"restore successor transport failed")?;
-                if !matches!(response,RuntimeResponse::RestoreProgress {recovered_sequence,recovered_state_hash} if recovered_sequence==sequence && recovered_state_hash==root){return Err("restore encrypted successor rejected".into());}
-                if sequence%250==0 {eprintln!("VERIFIED_ARCHIVE_RESTORE_PROGRESS {sequence}/{}",keys.len());}
+                let response = exchange(state, RuntimeRequest::AppendCommittedRestore { artifact })
+                    .await
+                    .map_err(|_| "restore successor transport failed")?;
+                if !matches!(response,RuntimeResponse::RestoreProgress {recovered_sequence,recovered_state_hash} if recovered_sequence==sequence && recovered_state_hash==root)
+                {
+                    return Err("restore encrypted successor rejected".into());
+                }
+                if sequence % 250 == 0 {
+                    eprintln!(
+                        "VERIFIED_ARCHIVE_RESTORE_PROGRESS {sequence}/{}",
+                        keys.len()
+                    );
+                }
             }
         }
-        let result=exchange(state,RuntimeRequest::FinishCommittedRestore {expected_sequence:keys.len() as u64,expected_state_hash:root.clone()}).await.map_err(|_|"restore finish transport failed")?;
-        if !matches!(result,RuntimeResponse::RecoveryComplete {recovered_sequence,recovered_state_hash} if recovered_sequence==keys.len() as u64 && recovered_state_hash==root){return Err("restore final encrypted head rejected".into());}
-        *self.verified_receipt_records.lock().await=Some(records);
-        *self.verified_artifact_hashes.lock().await = keys.iter().map(|key| key.rsplit('-').next().unwrap_or("").trim_end_matches(".cbor").to_string()).collect();
-        *state.committed_state_root.lock().await=Some(root);
+        let result = exchange(
+            state,
+            RuntimeRequest::FinishCommittedRestore {
+                expected_sequence: keys.len() as u64,
+                expected_state_hash: root.clone(),
+            },
+        )
+        .await
+        .map_err(|_| "restore finish transport failed")?;
+        if !matches!(result,RuntimeResponse::RecoveryComplete {recovered_sequence,recovered_state_hash} if recovered_sequence==keys.len() as u64 && recovered_state_hash==root)
+        {
+            return Err("restore final encrypted head rejected".into());
+        }
+        *self.verified_receipt_records.lock().await = Some(records);
+        *self.verified_artifact_hashes.lock().await = heads
+            .iter()
+            .map(|head| head.artifact_hash.clone())
+            .collect();
+        *state.committed_state_root.lock().await = Some(root);
         // Seed the optimization before allowing this restored writer to serve.
         // A corrupt existing checkpoint is never silently bypassed above.
         self.seal_current_checkpoint(state).await?;
-        eprintln!("VERIFIED_ARCHIVE_RESTORE_COMPLETE {}",keys.len());Ok(())
+        eprintln!("VERIFIED_ARCHIVE_RESTORE_COMPLETE {}", keys.len());
+        Ok(())
     }
     async fn persist_intent_readback(
         &self,
@@ -2340,7 +2724,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // isolated test key material therefore crosses the existing VSOCK channel
     // once, before recovery; production never uses this bootstrap.
     bootstrap_isolated_enclave(&state).await?;
-    bootstrap_governed_enclave(&state).await?;
+    preflight_then_bootstrap(
+        async {
+            if let Some(store) = state.artifact_store.as_ref() {
+                store
+                    .prepare_restore_before_grant(&state)
+                    .await
+                    .map_err(invalid)?;
+            }
+            Ok(())
+        },
+        bootstrap_governed_enclave(&state),
+    )
+    .await?;
     // The HTTP parent never accepts a financial command until it has supplied
     // the immutable archive's complete, head-verified recovery set and the
     // enclave has independently reconstructed it.  PostgreSQL is excluded.
@@ -2839,6 +3235,11 @@ async fn command(
         Err(CommitTaskError::Projection) => {
             (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE").into_response()
         }
+        Err(CommitTaskError::Enclave(error))
+            if error.to_string().contains("ARCHIVE_SEQUENCE_CONFLICT") =>
+        {
+            (StatusCode::CONFLICT, "ARCHIVE_COMMIT_CONFLICT").into_response()
+        }
         Err(CommitTaskError::Enclave(error)) if error.to_string() == "ARCHIVE_TIMEOUT" => {
             (StatusCode::SERVICE_UNAVAILABLE, "ARCHIVE_TIMEOUT").into_response()
         }
@@ -2889,7 +3290,6 @@ async fn admit_identity(State(state): State<AppState>, headers: HeaderMap) -> im
         },
     };
     request.request_hash = request_hash(&request);
-    if !state.unresolved_external_effects.lock().await.is_empty() { return (StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING").into_response(); }
     let task = tokio::spawn(commit_and_project(
         state.clone(),
         request,
@@ -2909,6 +3309,11 @@ async fn admit_identity(State(state): State<AppState>, headers: HeaderMap) -> im
         }
         Err(CommitTaskError::Projection) => {
             (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE").into_response()
+        }
+        Err(CommitTaskError::Enclave(error))
+            if error.to_string().contains("ARCHIVE_SEQUENCE_CONFLICT") =>
+        {
+            (StatusCode::CONFLICT, "ARCHIVE_COMMIT_CONFLICT").into_response()
         }
         Err(CommitTaskError::Enclave(error)) if error.to_string() == "ARCHIVE_TIMEOUT" => {
             (StatusCode::SERVICE_UNAVAILABLE, "ARCHIVE_TIMEOUT").into_response()
@@ -3591,8 +3996,8 @@ async fn commit_and_project(
     // The guard is deliberately owned by this detached task. If the HTTP
     // client disconnects, adoption and projection of the exact receipt still
     // finish before another financial command can enter.
-    let _guard = guard;
-    let response = exchange_direct(&state, request)
+    let guard = guard;
+    let response = exchange_direct(&state, request, &guard)
         .await
         .map_err(CommitTaskError::Enclave)?;
     let RuntimeResponse::Execute { result } = response else {
@@ -3699,6 +4104,11 @@ fn commit_error_response(error: CommitTaskError) -> axum::response::Response {
         }
         CommitTaskError::Projection => {
             (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE").into_response()
+        }
+        CommitTaskError::Enclave(error)
+            if error.to_string().contains("ARCHIVE_SEQUENCE_CONFLICT") =>
+        {
+            (StatusCode::CONFLICT, "ARCHIVE_COMMIT_CONFLICT").into_response()
         }
         CommitTaskError::Enclave(error) if error.to_string() == "ARCHIVE_TIMEOUT" => {
             (StatusCode::SERVICE_UNAVAILABLE, "ARCHIVE_TIMEOUT").into_response()
@@ -4683,13 +5093,13 @@ fn start_base_withdrawal_observer(state: AppState) {
         loop {
             timer.tick().await;
             if state.unresolved_external_effects.lock().await.is_empty() { continue; }
-            let _guard = state.financial_gate.lock("withdrawal_observer").await;
+            let guard = state.financial_gate.lock("withdrawal_observer").await;
             let pending: Vec<_> = state.unresolved_external_effects.lock().await.values()
                 .filter(|i| base_withdrawal_observation_supported(i))
                 .cloned().collect();
             for intent in pending {
                 eprintln!("FINANCIAL_AWAIT_BEGIN stage=withdrawal_observation");
-                if reconcile_observed_base_withdrawal(&state, &intent).await.is_err() {
+                if reconcile_observed_base_withdrawal(&state, &intent, &guard).await.is_err() {
                     // Stable trace/code only; never raw provider bodies or keys.
                     eprintln!("WITHDRAWAL_OBSERVATION_PENDING request_id={} intent_hash={}", intent.request_id, intent.intent_hash);
                 }
@@ -4724,12 +5134,12 @@ fn observed_terminal_recovery(outcome: ExternalEffectRecovery) -> Result<Externa
     }
 }
 
-async fn reconcile_observed_base_withdrawal(state: &AppState, intent: &ExternalEffectIntent) -> io::Result<()> {
+async fn reconcile_observed_base_withdrawal(state: &AppState, intent: &ExternalEffectIntent, guard: &OwnedMutexGuard<()>) -> io::Result<()> {
     let custody = state.custody.as_ref().ok_or_else(|| invalid("Base custody unavailable"))?;
     // Unlike settle(), this cannot call submit_once even if the index is absent.
     let outcome = custody.observe_terminal_only(intent).await.map_err(invalid)?;
     let request = request_for_external_effect(intent, outcome)?;
-    let RuntimeResponse::Execute { result } = exchange_direct(state, request).await? else {
+    let RuntimeResponse::Execute { result } = exchange_direct(state, request, guard).await? else {
         return Err(invalid("withdrawal observation execution unavailable"));
     };
     if result.receipt.account_id != intent.account_id || result.receipt.identity_commitment != intent.identity_commitment
@@ -4833,7 +5243,8 @@ async fn recover_external_effect_intents(state: &AppState) -> io::Result<()> {
             | ExternalEffectRecovery::BindRelayFinalized { .. }
             | ExternalEffectRecovery::BindRelayReverted { .. }) => {
                 let request = request_for_external_effect(&intent, terminal)?;
-                let response = exchange_direct(state, request).await?;
+                let guard = state.financial_gate.lock("external_effect_recovery").await;
+                let response = exchange_direct(state, request, &guard).await?;
                 let RuntimeResponse::Execute { result } = response else {
                     return Err(invalid("external-effect recovery execution failed"));
                 };
@@ -5299,7 +5710,11 @@ fn governed_bootstrap_status_matches(
 /// One bounded direct request.  The first response is deliberately not a
 /// customer result: it is an opaque encrypted successor that must be stored
 /// immutably and read back before this parent can issue an acknowledgement.
-async fn exchange_direct(state: &AppState, request: DirectRequest) -> io::Result<RuntimeResponse> {
+async fn exchange_direct(
+    state: &AppState,
+    request: DirectRequest,
+    _guard: &OwnedMutexGuard<()>,
+) -> io::Result<RuntimeResponse> {
     let store = state.artifact_store.as_ref().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -5575,50 +5990,217 @@ mod tests {
     }
     #[test]
     fn archive_recovery_selects_only_head_backed_candidates_without_hiding_missing_history() {
-        let key=|kind:&str,seq:u64,hash:&str|format!("epoch/{kind}/{seq:020}-{}.cbor",hash.repeat(64));
-        let canonical=vec![key("artifacts",1,"a"),key("artifacts",2,"b"),key("artifacts",3,"c")];
-        let heads=vec![key("heads",1,"a"),key("heads",2,"b"),key("heads",3,"c")];
-        let mut candidates=canonical.clone();
-        candidates.extend([key("artifacts",1,"d"),key("artifacts",2,"e")]);
+        let key = |kind: &str, seq: u64, hash: &str| {
+            format!("epoch/{kind}/{seq:020}-{}.cbor", hash.repeat(64))
+        };
+        let canonical = vec![
+            key("artifacts", 1, "a"),
+            key("artifacts", 2, "b"),
+            key("artifacts", 3, "c"),
+        ];
+        let heads = (1..=3)
+            .zip(["a", "b", "c"])
+            .map(|(sequence, hash)| ResolvedArchiveHead {
+                key: key("heads", sequence, hash),
+                sequence,
+                artifact_hash: hash.repeat(64),
+            })
+            .collect::<Vec<_>>();
+        let mut candidates = canonical.clone();
+        candidates.extend([key("artifacts", 1, "d"), key("artifacts", 2, "e")]);
         candidates.sort();
-        for _ in 0..3 {assert_eq!(committed_archive_keys(&candidates,&heads,"epoch").unwrap(),canonical);}
-        assert_eq!(committed_archive_keys(&canonical,&heads,"epoch").unwrap(),canonical);
-        let mut missing=candidates.clone();missing.retain(|k|k!=&canonical[1]);
-        assert!(committed_archive_keys(&missing,&heads,"epoch").is_err());
-        let mut tail=candidates.clone();tail.push(key("artifacts",4,"f"));
-        assert!(committed_archive_keys(&tail,&heads,"epoch").is_err());
-        assert!(committed_archive_keys(&candidates,&heads[..2],"epoch").is_err());
-        let mut duplicate=heads.clone();duplicate[1]=heads[0].clone();
-        assert!(committed_archive_keys(&candidates,&duplicate,"epoch").is_err());
-        let mut wrong=heads.clone();wrong[1]=key("heads",2,"f");
-        assert!(committed_archive_keys(&candidates,&wrong,"epoch").is_err());
-        let mut malformed=candidates.clone();malformed.push("other/artifacts/not-a-record.cbor".into());
-        assert!(committed_archive_keys(&malformed,&heads,"epoch").is_err());
-        assert!(committed_archive_keys(&candidates,&[],"epoch").is_err());
-        assert!(committed_archive_keys(&[],&[],"epoch").unwrap().is_empty());
+        for _ in 0..3 {
+            assert_eq!(
+                committed_archive_keys(&candidates, &heads, "epoch").unwrap(),
+                canonical
+            );
+        }
+        assert_eq!(
+            committed_archive_keys(&canonical, &heads, "epoch").unwrap(),
+            canonical
+        );
+        let mut missing = candidates.clone();
+        missing.retain(|k| k != &canonical[1]);
+        assert!(committed_archive_keys(&missing, &heads, "epoch").is_err());
+        let mut tail = candidates.clone();
+        tail.push(key("artifacts", 4, "f"));
+        assert!(committed_archive_keys(&tail, &heads, "epoch").is_err());
+        assert!(committed_archive_keys(&candidates, &heads[..2], "epoch").is_err());
+        let mut duplicate = heads.clone();
+        duplicate[1].sequence = heads[0].sequence;
+        assert!(committed_archive_keys(&candidates, &duplicate, "epoch").is_err());
+        let mut wrong = heads.clone();
+        wrong[1].artifact_hash = "f".repeat(64);
+        assert!(committed_archive_keys(&candidates, &wrong, "epoch").is_err());
+        let mut malformed = candidates.clone();
+        malformed.push("other/artifacts/not-a-record.cbor".into());
+        assert!(committed_archive_keys(&malformed, &heads, "epoch").is_err());
+        assert!(committed_archive_keys(&candidates, &[], "epoch").is_err());
+        assert!(committed_archive_keys(&[], &[], "epoch")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn successor_lineage_resolves_legacy_twins_and_rejects_ambiguous_history() {
+        let mut first = projection_sequence_fixture();
+        first.sequence = 1;
+        first.prior_state_hash = "0".repeat(64);
+        first.state_hash = "1".repeat(64);
+        let mut canonical_twin = first.clone();
+        canonical_twin.sequence = 2;
+        canonical_twin.prior_state_hash = first.state_hash.clone();
+        canonical_twin.state_hash = "2".repeat(64);
+        let mut orphan_twin = canonical_twin.clone();
+        orphan_twin.state_hash = "f".repeat(64);
+        let mut successor = canonical_twin.clone();
+        successor.sequence = 3;
+        successor.prior_state_hash = canonical_twin.state_hash.clone();
+        successor.state_hash = "3".repeat(64);
+        let entry = |artifact: DirectStateArtifact| {
+            let hash = artifact_hash(&artifact);
+            resolved_head_from_artifact(
+                format!("epoch/heads/{:020}-{hash}.cbor", artifact.sequence),
+                artifact,
+                "epoch",
+            )
+            .unwrap()
+        };
+        let canonical_hash = artifact_hash(&canonical_twin);
+        let orphan_hash = artifact_hash(&orphan_twin);
+        let (resolved, orphans) = resolve_archive_heads(vec![
+            entry(first),
+            entry(orphan_twin),
+            entry(canonical_twin),
+            entry(successor),
+        ])
+        .unwrap();
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|head| head.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(resolved[1].artifact_hash, canonical_hash);
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].artifact_hash, orphan_hash);
+
+        let mut terminal = resolved.clone();
+        terminal.push(ResolvedArchiveHead {
+            key: "epoch/heads/00000000000000000003-f.cbor".into(),
+            sequence: 3,
+            artifact_hash: "f".repeat(64),
+        });
+        assert!(
+            resolve_archive_heads(terminal.into_iter().map(|head| (head, None)).collect()).is_err()
+        );
+        assert!(resolve_archive_heads(vec![
+            (resolved[0].clone(), None),
+            (resolved[2].clone(), None)
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn new_archive_head_is_sequence_unique_and_conflicts_are_stable() {
+        assert_eq!(
+            archive_head_key("epoch", 19085),
+            "epoch/heads/00000000000000019085.cbor"
+        );
+        let response = commit_error_response(CommitTaskError::Enclave(io::Error::new(
+            io::ErrorKind::Other,
+            "IMMUTABLE_PERSISTENCE_FAILED:ARCHIVE_SEQUENCE_CONFLICT",
+        )));
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn failed_restore_preflight_does_not_consume_bootstrap_and_retry_can_succeed() {
+        let bootstraps = Arc::new(AtomicU64::new(0));
+        let count = bootstraps.clone();
+        let first = preflight_then_bootstrap(
+            async {
+                Err(invalid(
+                    "archive duplicate head is not uniquely resolved by successor",
+                ))
+            },
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(first.is_err());
+        assert_eq!(bootstraps.load(Ordering::SeqCst), 0);
+
+        let count = bootstraps.clone();
+        preflight_then_bootstrap(async { Ok(()) }, async move {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(bootstraps.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn checkpoint_archive_requires_exact_prefix_and_retains_unrestored_suffix() {
         let mut artifacts = nonfinancial_chain();
-        for artifact in &mut artifacts { artifact.ciphertext = vec![1,2,3]; }
+        for artifact in &mut artifacts {
+            artifact.ciphertext = vec![1, 2, 3];
+        }
         let hashes: Vec<_> = artifacts.iter().map(artifact_hash).collect();
-        let keys: Vec<_> = artifacts.iter().zip(&hashes).map(|(record,hash)| format!("epoch/artifacts/{:020}-{hash}.cbor",record.sequence)).collect();
-        let heads: Vec<_> = artifacts.iter().zip(&hashes).map(|(record,hash)| format!("epoch/heads/{:020}-{hash}.cbor",record.sequence)).collect();
-        let checkpoint = layrs_direct_execution_v1::DirectCheckpoint { protocol: "layrs.direct-execution.checkpoint.v1".into(), opening_state_hash: "a".repeat(64),
-            artifact: artifacts[1].clone(), receipt_records: artifacts[..2].iter().map(receipt_only_record).collect(), artifact_hashes: hashes[..2].to_vec(), bootstrap_certificate: None, signature: "synthetic".into() };
-        assert_eq!(validate_checkpoint_archive(&checkpoint,&keys,&heads,"epoch").unwrap(), 2);
-        assert_eq!(keys.len()-validate_checkpoint_archive(&checkpoint,&keys,&heads,"epoch").unwrap(),1);
-        assert!(validate_checkpoint_archive(&checkpoint,&keys[..1],&heads[..1],"epoch").is_err());
-        let mut missing = keys.clone(); missing.remove(0);
-        let mut missing_heads = heads.clone(); missing_heads.remove(0);
-        assert!(validate_checkpoint_archive(&checkpoint,&missing,&missing_heads,"epoch").is_err());
-        let mut changed = heads.clone(); changed[0] = "another/head.cbor".into();
-        assert!(validate_checkpoint_archive(&checkpoint,&keys,&changed,"epoch").is_err());
-        let mut changed = checkpoint.clone(); changed.artifact_hashes.pop();
-        assert!(validate_checkpoint_archive(&changed,&keys,&heads,"epoch").is_err());
-        let mut changed = checkpoint; changed.artifact.sequence = 0;
-        assert!(validate_checkpoint_archive(&changed,&keys,&heads,"epoch").is_err());
+        let keys: Vec<_> = artifacts
+            .iter()
+            .zip(&hashes)
+            .map(|(record, hash)| format!("epoch/artifacts/{:020}-{hash}.cbor", record.sequence))
+            .collect();
+        let heads: Vec<_> = artifacts
+            .iter()
+            .zip(&hashes)
+            .map(|(record, hash)| ResolvedArchiveHead {
+                key: format!("epoch/heads/{:020}-{hash}.cbor", record.sequence),
+                sequence: record.sequence,
+                artifact_hash: hash.clone(),
+            })
+            .collect();
+        let checkpoint = layrs_direct_execution_v1::DirectCheckpoint {
+            protocol: "layrs.direct-execution.checkpoint.v1".into(),
+            opening_state_hash: "a".repeat(64),
+            artifact: artifacts[1].clone(),
+            receipt_records: artifacts[..2].iter().map(receipt_only_record).collect(),
+            artifact_hashes: hashes[..2].to_vec(),
+            bootstrap_certificate: None,
+            signature: "synthetic".into(),
+        };
+        assert_eq!(
+            validate_checkpoint_archive(&checkpoint, &keys, &heads, "epoch").unwrap(),
+            2
+        );
+        assert_eq!(
+            keys.len() - validate_checkpoint_archive(&checkpoint, &keys, &heads, "epoch").unwrap(),
+            1
+        );
+        assert!(
+            validate_checkpoint_archive(&checkpoint, &keys[..1], &heads[..1], "epoch").is_err()
+        );
+        let mut missing = keys.clone();
+        missing.remove(0);
+        let mut missing_heads = heads.clone();
+        missing_heads.remove(0);
+        assert!(
+            validate_checkpoint_archive(&checkpoint, &missing, &missing_heads, "epoch").is_err()
+        );
+        let mut changed = heads.clone();
+        changed[0].artifact_hash = "f".repeat(64);
+        assert!(validate_checkpoint_archive(&checkpoint, &keys, &changed, "epoch").is_err());
+        let mut changed = checkpoint.clone();
+        changed.artifact_hashes.pop();
+        assert!(validate_checkpoint_archive(&changed, &keys, &heads, "epoch").is_err());
+        let mut changed = checkpoint;
+        changed.artifact.sequence = 0;
+        assert!(validate_checkpoint_archive(&changed, &keys, &heads, "epoch").is_err());
     }
     #[test]
     fn checkpoint_recovery_cannot_hide_an_independently_persisted_balance_free_successor() {
@@ -5827,7 +6409,7 @@ mod tests {
             }
         });
         let configuration=aws_sdk_s3::config::Builder::new().behavior_version_latest().region(aws_sdk_s3::config::Region::new("us-east-1")).credentials_provider(aws_sdk_s3::config::Credentials::new("unit-test","unit-test",None,None,"local-only")).endpoint_url(format!("http://{address}")).force_path_style(true).build();
-        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default()))};
+        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),prepared_restore:Arc::new(Mutex::new(None)),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default()))};
         assert_eq!(store.read("epoch/immutable.cbor").await.unwrap(),b"complete-opaque-ciphertext");server.await.unwrap();
     }
     #[tokio::test]
@@ -5840,7 +6422,7 @@ mod tests {
             }
         });
         let configuration=aws_sdk_s3::config::Builder::new().behavior_version_latest().region(aws_sdk_s3::config::Region::new("us-east-1")).credentials_provider(aws_sdk_s3::config::Credentials::new("unit-test","unit-test",None,None,"local-only")).endpoint_url(format!("http://{address}")).force_path_style(true).build();
-        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default()))};
+        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),prepared_restore:Arc::new(Mutex::new(None)),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default()))};
         assert_eq!(store.read("epoch/immutable.cbor").await.unwrap_err(),"archive complete read retries exhausted");server.await.unwrap();
     }
     #[tokio::test]
@@ -5858,7 +6440,7 @@ mod tests {
             }
         });
         let configuration=aws_sdk_s3::config::Builder::new().behavior_version_latest().region(aws_sdk_s3::config::Region::new("us-east-1")).credentials_provider(aws_sdk_s3::config::Credentials::new("unit-test","unit-test",None,None,"local-only")).endpoint_url(format!("http://{address}")).force_path_style(true).build();
-        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default()))};
+        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),prepared_restore:Arc::new(Mutex::new(None)),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default()))};
         let keys=store.list_restore_keys("artifacts").await.unwrap();assert_eq!(keys.len(),1250);assert!(keys.first().unwrap().contains("00000000000000000001"));assert!(keys.last().unwrap().contains("00000000000000001250"));server.await.unwrap();
     }
 
