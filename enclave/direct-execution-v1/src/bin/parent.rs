@@ -10,7 +10,11 @@ use aws_sdk_s3::{
     types::{ObjectLockMode, ServerSideEncryption},
     Client as S3Client,
 };
-use aws_smithy_types::DateTime;
+use aws_smithy_types::{
+    retry::RetryConfig,
+    timeout::TimeoutConfig,
+    DateTime,
+};
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
@@ -52,20 +56,48 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env,
     fs::{self, OpenOptions},
+    future::Future,
     io,
     net::IpAddr,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex as StdMutex,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::Mutex,
+    sync::{Mutex, OwnedMutexGuard},
     time::timeout,
 };
 use tokio_postgres::{Client, NoTls};
 use tokio_vsock::{VsockAddr, VsockStream};
 const ENCLOSURE_PORT: u32 = 5_003;
+const ENCLOSURE_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+const ARCHIVE_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
+const WRITE_PATH_STALL_THRESHOLD: Duration = Duration::from_secs(60);
+
+async fn bounded_enclave_stage<T, F>(duration: Duration, operation: F) -> io::Result<T>
+where
+    F: Future<Output = io::Result<T>>,
+{
+    timeout(duration, operation)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "ENCLOSURE_TIMEOUT"))?
+}
+
+async fn bounded_archive_operation<T, E, F>(
+    duration: Duration,
+    operation: F,
+) -> Result<Result<T, E>, String>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    timeout(duration, operation)
+        .await
+        .map_err(|_| "ARCHIVE_TIMEOUT".to_string())
+}
 // Must match the enclave's finite parent-only VSOCK recovery ceiling.
 const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 // Fixed encrypted-download window, not a verification bypass.
@@ -110,10 +142,62 @@ struct AppState {
     usdc_bus_custody: Option<UsdcBusCustodyAdapter>,
     /// Serializes only the bounded synchronous request and an unresolved
     /// external intent.  It is process memory, never durable workflow state.
-    financial_gate: Arc<Mutex<()>>,
+    financial_gate: Arc<FinancialGate>,
+    last_commit_at: Arc<AtomicU64>,
     committed_state_root: Arc<Mutex<Option<String>>>,
     unresolved_external_effects: Arc<Mutex<BTreeMap<String, ExternalEffectIntent>>>,
     governed_bootstrap: Option<GovernedBootstrapConfig>,
+}
+
+/// Tracks contention without putting the health endpoint behind the write
+/// mutex it is meant to supervise. Waiting registrations live only for the
+/// duration of `lock`, and the returned owned guard can safely move into a
+/// cancellation-independent task.
+struct FinancialGate {
+    inner: Arc<Mutex<()>>,
+    next_waiter_id: AtomicU64,
+    waiters: StdMutex<BTreeMap<u64, u64>>,
+}
+
+impl FinancialGate {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(())),
+            next_waiter_id: AtomicU64::new(1),
+            waiters: StdMutex::new(BTreeMap::new()),
+        }
+    }
+
+    async fn lock(&self, stage: &'static str) -> OwnedMutexGuard<()> {
+        let waiter_id = self.next_waiter_id.fetch_add(1, Ordering::Relaxed);
+        self.waiters
+            .lock()
+            .expect("financial waiter tracker poisoned")
+            .insert(waiter_id, now_unix());
+        eprintln!("FINANCIAL_GATE_AWAIT stage={stage}");
+        let guard = Arc::clone(&self.inner).lock_owned().await;
+        self.waiters
+            .lock()
+            .expect("financial waiter tracker poisoned")
+            .remove(&waiter_id);
+        eprintln!("FINANCIAL_GATE_ACQUIRED stage={stage}");
+        guard
+    }
+
+    fn snapshot(&self, now: u64) -> (usize, Option<u64>) {
+        let waiters = self
+            .waiters
+            .lock()
+            .expect("financial waiter tracker poisoned");
+        let oldest = waiters.values().min().copied();
+        (waiters.len(), oldest.map(|started| now.saturating_sub(started)))
+    }
+
+    fn stalled(&self, now: u64) -> bool {
+        self.snapshot(now)
+            .1
+            .is_some_and(|age| age >= WRITE_PATH_STALL_THRESHOLD.as_secs())
+    }
 }
 
 #[derive(Clone)]
@@ -1710,8 +1794,17 @@ impl S3ImmutableArtifactStore {
         {
             return Err("invalid immutable archive configuration".into());
         }
-        let client =
-            S3Client::new(&aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await);
+        let timeout_config = TimeoutConfig::builder()
+            .operation_attempt_timeout(ARCHIVE_OPERATION_TIMEOUT)
+            .operation_timeout(ARCHIVE_OPERATION_TIMEOUT)
+            .build();
+        let retry_config = RetryConfig::standard().with_max_attempts(3);
+        let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .timeout_config(timeout_config)
+            .retry_config(retry_config)
+            .load()
+            .await;
+        let client = S3Client::new(&sdk_config);
         client
             .get_object_lock_configuration()
             .bucket(&bucket)
@@ -1757,6 +1850,7 @@ impl S3ImmutableArtifactStore {
         // SDK request retries do not retry a response stream after headers.
         // Discard an incomplete body and GET the same immutable key again;
         // no partial bytes ever reach the encrypted successor verifier.
+        let mut timed_out = false;
         for attempt in 0..5 {
             let result=timeout(Duration::from_secs(60),async {
                 let response=self.client.get_object().bucket(&self.bucket).key(key)
@@ -1767,13 +1861,17 @@ impl S3ImmutableArtifactStore {
                 if bytes.len()!=length as usize {return Err("archive read body length mismatch");}
                 Ok(bytes.to_vec())
             }).await;
-            if let Ok(Ok(bytes))=result {return Ok(bytes);}
+            match result {
+                Ok(Ok(bytes)) => return Ok(bytes),
+                Err(_) => timed_out = true,
+                Ok(Err(_)) => {}
+            }
             if attempt<4 {
                 eprintln!("ARCHIVE_READ_RETRY {}/5",attempt+2);
                 tokio::time::sleep(Duration::from_millis(100u64<<attempt)).await;
             }
         }
-        Err("archive complete read retries exhausted".into())
+        Err(if timed_out { "ARCHIVE_TIMEOUT" } else { "archive complete read retries exhausted" }.into())
     }
     async fn write_once(&self, key: &str, bytes: Vec<u8>) -> Result<(), String> {
         let until = DateTime::from_secs(
@@ -1783,19 +1881,23 @@ impl S3ImmutableArtifactStore {
                 .as_secs() as i64
                 + self.retention_seconds,
         );
-        let put = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(ByteStream::from(bytes.clone()))
-            .if_none_match("*")
-            .server_side_encryption(ServerSideEncryption::AwsKms)
-            .ssekms_key_id(&self.kms_key_id)
-            .object_lock_mode(ObjectLockMode::Compliance)
-            .object_lock_retain_until_date(until)
-            .send()
-            .await;
+        eprintln!("FINANCIAL_AWAIT_BEGIN stage=archive_put");
+        let put = bounded_archive_operation(
+            ARCHIVE_OPERATION_TIMEOUT,
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .body(ByteStream::from(bytes.clone()))
+                .if_none_match("*")
+                .server_side_encryption(ServerSideEncryption::AwsKms)
+                .ssekms_key_id(&self.kms_key_id)
+                .object_lock_mode(ObjectLockMode::Compliance)
+                .object_lock_retain_until_date(until)
+                .send(),
+        )
+        .await?;
+        eprintln!("FINANCIAL_AWAIT_END stage=archive_put");
         if put.is_err() && self.read(key).await? != bytes {
             return Err("archive immutable write failed".into());
         }
@@ -2228,7 +2330,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         usdc_link_authority: if financial_enabled {
             WalletLinkAuthority::from_environment().map_err(|_|"USDC linking authority configuration invalid")?
         } else {None},
-        financial_gate: Arc::new(Mutex::new(())),
+        financial_gate: Arc::new(FinancialGate::new()),
+        last_commit_at: Arc::new(AtomicU64::new(0)),
         committed_state_root: Arc::new(Mutex::new(None)),
         unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
         governed_bootstrap,
@@ -2242,8 +2345,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the immutable archive's complete, head-verified recovery set and the
     // enclave has independently reconstructed it.  PostgreSQL is excluded.
     recover_enclave(&state).await?;
-    // Reconciliation starts only after the old projection is proven equal to
-    // the fully recovered private state, not from database balance guesses.
+    // Reconciliation consumes only the fully verified immutable receipt
+    // lineage, then proves the resulting disposable projection equal to the
+    // recovered private state. PostgreSQL never supplies balance guesses.
+    reconcile_projection_from_archive(&state).await?;
     verify_recovered_projection(&state).await?;
     recover_external_effect_intents(&state).await?;
     verify_recovered_projection(&state).await?;
@@ -2351,12 +2456,33 @@ async fn attestation(
 }
 async fn status(State(state): State<AppState>) -> impl IntoResponse {
     match exchange(&state, RuntimeRequest::Status).await {
-        Ok(RuntimeResponse::Status { status }) => Json(status).into_response(),
+        Ok(RuntimeResponse::Status { status }) => {
+            let now = now_unix();
+            let (lock_waiters, oldest_lock_wait_seconds) = state.financial_gate.snapshot(now);
+            let mut value = match serde_json::to_value(status) {
+                Ok(Value::Object(value)) => value,
+                _ => return (StatusCode::BAD_GATEWAY, "STATUS_ENCODING_FAILED").into_response(),
+            };
+            value.insert(
+                "writePath".into(),
+                json!({
+                    "lastCommitAt": match state.last_commit_at.load(Ordering::Acquire) { 0 => None, value => Some(value) },
+                    "lockWaiters": lock_waiters,
+                    "oldestLockWaitSeconds": oldest_lock_wait_seconds,
+                    "stalled": state.financial_gate.stalled(now),
+                }),
+            );
+            Json(Value::Object(value)).into_response()
+        }
         Ok(RuntimeResponse::Error { code }) => (StatusCode::BAD_GATEWAY, code).into_response(),
         _ => (StatusCode::BAD_GATEWAY, "UNEXPECTED_RESPONSE").into_response(),
     }
 }
 async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
+    if state.financial_gate.stalled(now_unix()) {
+        eprintln!("WRITE_PATH_STALLED");
+        return (StatusCode::SERVICE_UNAVAILABLE, "WRITE_PATH_STALLED");
+    }
     match timeout(Duration::from_millis(1_500), exchange(&state, RuntimeRequest::Status)).await {
         Ok(Ok(RuntimeResponse::Status { .. })) => (StatusCode::OK, "ok"),
         _ => {
@@ -2433,8 +2559,9 @@ async fn command(
     if body.identity_commitment != claims.identity_commitment {
         return (StatusCode::FORBIDDEN, "DIRECT_IDENTITY_BINDING_DENIED").into_response();
     }
-    let _financial_guard = state.financial_gate.lock().await;
+    let _financial_guard = state.financial_gate.lock("customer_command").await;
     let external_effect_pending = !state.unresolved_external_effects.lock().await.is_empty();
+    eprintln!("FINANCIAL_AWAIT_BEGIN stage=command_prepare");
     let action = match body.action {
         CustomerAction::VerifyUsdcBusWithdrawal {withdrawal_id,destination_chain,asset,destination,amount_atomic,proof} => {
             let Some(custody)=&state.usdc_bus_custody else {return (StatusCode::SERVICE_UNAVAILABLE,"USDC_BUS_CUSTODY_NOT_ENABLED").into_response();};
@@ -2685,6 +2812,7 @@ async fn command(
             }
         }
     };
+    eprintln!("FINANCIAL_AWAIT_END stage=command_prepare");
     let mut request = DirectRequest {
         account_id: claims.subject_hash.clone(),
         identity_commitment: body.identity_commitment,
@@ -2694,56 +2822,32 @@ async fn command(
         action,
     };
     request.request_hash = request_hash(&request);
-    match exchange_direct(&state, request).await {
-        Ok(RuntimeResponse::Execute { result }) => {
-            // Session consumption is projection/audit only and happens after
-            // authoritative adoption.  A crash after external submission can
-            // therefore be recovered from the immutable intent rather than a
-            // PostgreSQL session row.
-            if let Some(projection) = &state.projection {
-                if projection
-                    .consume_session(&claims, &result.receipt.request_hash)
-                    .await
-                    .is_err()
-                {
-                    return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE")
-                        .into_response();
-                }
-            } else if !state.isolated_test {
-                return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_NOT_CONFIGURED")
-                    .into_response();
-            } else {
-                let mut used = state.local_used_sessions.lock().await;
-                if used.iter().any(|(session_id, request_hash)| {
-                    session_id == &claims.session_id && request_hash != &result.receipt.request_hash
-                }) {
-                    return (StatusCode::CONFLICT, "SESSION_REPLAY_REJECTED").into_response();
-                }
-                used.insert((
-                    claims.session_id.clone(),
-                    result.receipt.request_hash.clone(),
-                ));
-            }
-            if let Some(projection) = &state.projection {
-                if projection.record_result(&state, &result).await.is_err() {
-                    return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE")
-                        .into_response();
-                }
-            }
-            // Retain both asset gates through private adoption AND atomic
-            // projection; failures cannot open a second payout path.
-            if matches!(result.receipt.effect.as_str(),"WITHDRAWAL_SETTLED"|"WITHDRAWAL_REVERTED") {
-                state.unresolved_external_effects.lock().await.retain(|_, intent| !(intent.account_id == result.receipt.account_id
-                    && intent.identity_commitment == result.receipt.identity_commitment && intent.request_id == result.receipt.request_id
-                    && result.receipt.amount_atomic.as_deref() == Some(intent.amount_atomic.as_str())
-                    && result.receipt.custody_reference.as_deref().is_some_and(|reference| reference.starts_with(&format!("{}:",intent.external_effect_reference)))));
-            }
-            encrypted(&claims, &result)
-        }
-        Ok(RuntimeResponse::Error { code }) => {
+    let task = tokio::spawn(commit_and_project(
+        state.clone(),
+        request,
+        _financial_guard,
+        ProjectionContext::Session(claims.clone()),
+    ));
+    match await_commit_task(task).await {
+        Ok(result) => encrypted(&claims, &result),
+        Err(CommitTaskError::Rejected(code)) => {
             (StatusCode::UNPROCESSABLE_ENTITY, code).into_response()
         }
-        _ => (StatusCode::BAD_GATEWAY, "ENCLOSURE_UNAVAILABLE").into_response(),
+        Err(CommitTaskError::SessionReplay) => {
+            (StatusCode::CONFLICT, "SESSION_REPLAY_REJECTED").into_response()
+        }
+        Err(CommitTaskError::Projection) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE").into_response()
+        }
+        Err(CommitTaskError::Enclave(error)) if error.to_string() == "ARCHIVE_TIMEOUT" => {
+            (StatusCode::SERVICE_UNAVAILABLE, "ARCHIVE_TIMEOUT").into_response()
+        }
+        Err(CommitTaskError::Enclave(error)) if error.kind() == io::ErrorKind::TimedOut => {
+            (StatusCode::SERVICE_UNAVAILABLE, "ENCLOSURE_TIMEOUT").into_response()
+        }
+        Err(CommitTaskError::Enclave(_) | CommitTaskError::Join) => {
+            (StatusCode::BAD_GATEWAY, "ENCLOSURE_UNAVAILABLE").into_response()
+        }
     }
 }
 
@@ -2771,7 +2875,7 @@ async fn admit_identity(State(state): State<AppState>, headers: HeaderMap) -> im
         Some(value) => value.to_string(),
         None => return (StatusCode::BAD_REQUEST, "IDEMPOTENCY_KEY_REQUIRED").into_response(),
     };
-    let _guard = state.financial_gate.lock().await;
+    let _guard = state.financial_gate.lock("write_request").await;
     let mut request = DirectRequest {
         // Admission is also a private-state mutation; its zero balance does
         // not make advancing an outstanding payout's root safe.
@@ -2786,35 +2890,35 @@ async fn admit_identity(State(state): State<AppState>, headers: HeaderMap) -> im
     };
     request.request_hash = request_hash(&request);
     if !state.unresolved_external_effects.lock().await.is_empty() { return (StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING").into_response(); }
-    match exchange_direct(&state, request).await {
-        Ok(RuntimeResponse::Execute { result }) => {
-            let Some(projection) = &state.projection else {
-                return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_NOT_CONFIGURED")
-                    .into_response();
-            };
-            if projection
-                .consume_session(&claims, &result.receipt.request_hash)
-                .await
-                .is_err()
-                || projection.record_result(&state, &result).await.is_err()
-                || projection
-                    .record_identity_admission(
-                        &claims.subject_hash,
-                        &claims.identity_commitment,
-                        &claims.wallet_address,
-                        &result.receipt.receipt_id,
-                    )
-                    .await
-                    .is_err()
-            {
-                return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE").into_response();
-            }
-            encrypted(&claims, &result)
-        }
-        Ok(RuntimeResponse::Error { code }) => {
+    let task = tokio::spawn(commit_and_project(
+        state.clone(),
+        request,
+        _guard,
+        ProjectionContext::Admission {
+            claims: claims.clone(),
+            wallet_address: claims.wallet_address.clone(),
+        },
+    ));
+    match await_commit_task(task).await {
+        Ok(result) => encrypted(&claims, &result),
+        Err(CommitTaskError::Rejected(code)) => {
             (StatusCode::UNPROCESSABLE_ENTITY, code).into_response()
         }
-        _ => (StatusCode::BAD_GATEWAY, "ENCLOSURE_UNAVAILABLE").into_response(),
+        Err(CommitTaskError::SessionReplay) => {
+            (StatusCode::CONFLICT, "SESSION_REPLAY_REJECTED").into_response()
+        }
+        Err(CommitTaskError::Projection) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE").into_response()
+        }
+        Err(CommitTaskError::Enclave(error)) if error.to_string() == "ARCHIVE_TIMEOUT" => {
+            (StatusCode::SERVICE_UNAVAILABLE, "ARCHIVE_TIMEOUT").into_response()
+        }
+        Err(CommitTaskError::Enclave(error)) if error.kind() == io::ErrorKind::TimedOut => {
+            (StatusCode::SERVICE_UNAVAILABLE, "ENCLOSURE_TIMEOUT").into_response()
+        }
+        Err(CommitTaskError::Enclave(_) | CommitTaskError::Join) => {
+            (StatusCode::BAD_GATEWAY, "ENCLOSURE_UNAVAILABLE").into_response()
+        }
     }
 }
 
@@ -2852,23 +2956,10 @@ async fn register_market(
         },
     };
     request.request_hash = request_hash(&request);
-    let _guard = state.financial_gate.lock().await;
+    let _guard = state.financial_gate.lock("write_request").await;
     if !state.unresolved_external_effects.lock().await.is_empty() { return (StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING").into_response(); }
-    match exchange_direct(&state, request).await {
-        Ok(RuntimeResponse::Execute { result }) => {
-            if let Some(projection) = &state.projection {
-                if projection.record_result(&state, &result).await.is_err() {
-                    return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE")
-                        .into_response();
-                }
-            }
-            Json(result).into_response()
-        }
-        Ok(RuntimeResponse::Error { code }) => {
-            (StatusCode::UNPROCESSABLE_ENTITY, code).into_response()
-        }
-        _ => (StatusCode::BAD_GATEWAY, "ENCLOSURE_UNAVAILABLE").into_response(),
-    }
+    operator_commit(state, request, _guard).await
+
 }
 
 async fn market_status(
@@ -2913,26 +3004,10 @@ async fn resolve_market(
         },
     };
     request.request_hash = request_hash(&request);
-    let _guard = state.financial_gate.lock().await;
+    let _guard = state.financial_gate.lock("write_request").await;
     if !state.unresolved_external_effects.lock().await.is_empty() { return (StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING").into_response(); }
-    match exchange_direct(&state, request).await {
-        Ok(RuntimeResponse::Execute { result }) => {
-            if let Some(projection) = &state.projection {
-                if projection.record_result(&state, &result).await.is_err() {
-                    return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE")
-                        .into_response();
-                }
-            } else if !state.isolated_test {
-                return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_NOT_CONFIGURED")
-                    .into_response();
-            }
-            Json(result).into_response()
-        }
-        Ok(RuntimeResponse::Error { code }) => {
-            (StatusCode::UNPROCESSABLE_ENTITY, code).into_response()
-        }
-        _ => (StatusCode::BAD_GATEWAY, "ENCLOSURE_UNAVAILABLE").into_response(),
-    }
+    operator_commit(state, request, _guard).await
+
 }
 
 async fn apply_balance_recovery(
@@ -2958,26 +3033,10 @@ async fn apply_balance_recovery(
         },
     };
     request.request_hash = request_hash(&request);
-    let _guard = state.financial_gate.lock().await;
+    let _guard = state.financial_gate.lock("write_request").await;
     if !state.unresolved_external_effects.lock().await.is_empty() { return (StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING").into_response(); }
-    match exchange_direct(&state, request).await {
-        Ok(RuntimeResponse::Execute { result }) => {
-            if let Some(projection) = &state.projection {
-                if projection.record_result(&state, &result).await.is_err() {
-                    return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE")
-                        .into_response();
-                }
-            } else if !state.isolated_test {
-                return (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_NOT_CONFIGURED")
-                    .into_response();
-            }
-            Json(result).into_response()
-        }
-        Ok(RuntimeResponse::Error { code }) => {
-            (StatusCode::UNPROCESSABLE_ENTITY, code).into_response()
-        }
-        _ => (StatusCode::BAD_GATEWAY, "ENCLOSURE_UNAVAILABLE").into_response(),
-    }
+    operator_commit(state, request, _guard).await
+
 }
 
 async fn prepare_standard_zen_withdrawal(
@@ -3481,6 +3540,193 @@ enum ProjectionError {
     Database,
     SessionReplay,
     OpeningMismatch,
+}
+
+#[derive(Clone)]
+enum ProjectionContext {
+    RecordOnly,
+    Session(SessionClaims),
+    Admission {
+        claims: SessionClaims,
+        wallet_address: String,
+    },
+}
+
+#[derive(Debug)]
+enum CommitTaskError {
+    Enclave(io::Error),
+    Rejected(String),
+    Projection,
+    SessionReplay,
+    Join,
+}
+
+async fn record_result_with_retry(
+    projection: &Projection,
+    state: &AppState,
+    result: &DirectResult,
+) -> Result<(), ProjectionError> {
+    let mut delay = Duration::from_millis(250);
+    for attempt in 0..4 {
+        eprintln!("FINANCIAL_AWAIT_BEGIN stage=projection_record attempt={}", attempt + 1);
+        let recorded = projection.record_result(state, result).await;
+        eprintln!("FINANCIAL_AWAIT_END stage=projection_record attempt={}", attempt + 1);
+        if recorded.is_ok() {
+            return Ok(());
+        }
+        if attempt < 3 {
+            tokio::time::sleep(delay).await;
+            delay = delay.saturating_mul(2);
+        }
+    }
+    Err(ProjectionError::Database)
+}
+
+async fn commit_and_project(
+    state: AppState,
+    request: DirectRequest,
+    guard: OwnedMutexGuard<()>,
+    context: ProjectionContext,
+) -> Result<DirectResult, CommitTaskError> {
+    // The guard is deliberately owned by this detached task. If the HTTP
+    // client disconnects, adoption and projection of the exact receipt still
+    // finish before another financial command can enter.
+    let _guard = guard;
+    let response = exchange_direct(&state, request)
+        .await
+        .map_err(CommitTaskError::Enclave)?;
+    let RuntimeResponse::Execute { result } = response else {
+        return match response {
+            RuntimeResponse::Error { code } => Err(CommitTaskError::Rejected(code)),
+            _ => Err(CommitTaskError::Enclave(invalid("ENCLOSURE_UNAVAILABLE"))),
+        };
+    };
+
+    if let Some(projection) = &state.projection {
+        match &context {
+            ProjectionContext::Session(claims)
+            | ProjectionContext::Admission { claims, .. } => {
+                eprintln!("FINANCIAL_AWAIT_BEGIN stage=projection_session");
+                let consumed = projection
+                    .consume_session(claims, &result.receipt.request_hash)
+                    .await;
+                eprintln!("FINANCIAL_AWAIT_END stage=projection_session");
+                if let Err(error) = consumed {
+                    return Err(match error {
+                        ProjectionError::SessionReplay => CommitTaskError::SessionReplay,
+                        _ => CommitTaskError::Projection,
+                    });
+                }
+            }
+            ProjectionContext::RecordOnly => {}
+        }
+        record_result_with_retry(projection, &state, &result)
+            .await
+            .map_err(|_| CommitTaskError::Projection)?;
+        if let ProjectionContext::Admission {
+            claims,
+            wallet_address,
+        } = &context
+        {
+            eprintln!("FINANCIAL_AWAIT_BEGIN stage=projection_admission");
+            let admitted = projection
+                .record_identity_admission(
+                    &claims.subject_hash,
+                    &claims.identity_commitment,
+                    wallet_address,
+                    &result.receipt.receipt_id,
+                )
+                .await;
+            eprintln!("FINANCIAL_AWAIT_END stage=projection_admission");
+            admitted.map_err(|_| CommitTaskError::Projection)?;
+        }
+    } else if state.isolated_test {
+        if let ProjectionContext::Session(claims)
+        | ProjectionContext::Admission { claims, .. } = &context
+        {
+            let mut used = state.local_used_sessions.lock().await;
+            if used.iter().any(|(session_id, request_hash)| {
+                session_id == &claims.session_id && request_hash != &result.receipt.request_hash
+            }) {
+                return Err(CommitTaskError::SessionReplay);
+            }
+            used.insert((
+                claims.session_id.clone(),
+                result.receipt.request_hash.clone(),
+            ));
+        }
+    } else {
+        return Err(CommitTaskError::Projection);
+    }
+
+    if matches!(
+        result.receipt.effect.as_str(),
+        "WITHDRAWAL_SETTLED" | "WITHDRAWAL_REVERTED"
+    ) {
+        state.unresolved_external_effects.lock().await.retain(|_, intent| {
+            !(intent.account_id == result.receipt.account_id
+                && intent.identity_commitment == result.receipt.identity_commitment
+                && intent.request_id == result.receipt.request_id
+                && result.receipt.amount_atomic.as_deref() == Some(intent.amount_atomic.as_str())
+                && result
+                    .receipt
+                    .custody_reference
+                    .as_deref()
+                    .is_some_and(|reference| {
+                        reference.starts_with(&format!(
+                            "{}:",
+                            intent.external_effect_reference
+                        ))
+                    }))
+        });
+    }
+    Ok(result)
+}
+
+async fn await_commit_task(
+    task: tokio::task::JoinHandle<Result<DirectResult, CommitTaskError>>,
+) -> Result<DirectResult, CommitTaskError> {
+    task.await.map_err(|_| CommitTaskError::Join)?
+}
+
+fn commit_error_response(error: CommitTaskError) -> axum::response::Response {
+    match error {
+        CommitTaskError::Rejected(code) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, code).into_response()
+        }
+        CommitTaskError::SessionReplay => {
+            (StatusCode::CONFLICT, "SESSION_REPLAY_REJECTED").into_response()
+        }
+        CommitTaskError::Projection => {
+            (StatusCode::SERVICE_UNAVAILABLE, "PROJECTION_UNAVAILABLE").into_response()
+        }
+        CommitTaskError::Enclave(error) if error.to_string() == "ARCHIVE_TIMEOUT" => {
+            (StatusCode::SERVICE_UNAVAILABLE, "ARCHIVE_TIMEOUT").into_response()
+        }
+        CommitTaskError::Enclave(error) if error.kind() == io::ErrorKind::TimedOut => {
+            (StatusCode::SERVICE_UNAVAILABLE, "ENCLOSURE_TIMEOUT").into_response()
+        }
+        CommitTaskError::Enclave(_) | CommitTaskError::Join => {
+            (StatusCode::BAD_GATEWAY, "ENCLOSURE_UNAVAILABLE").into_response()
+        }
+    }
+}
+
+async fn operator_commit(
+    state: AppState,
+    request: DirectRequest,
+    guard: OwnedMutexGuard<()>,
+) -> axum::response::Response {
+    let task = tokio::spawn(commit_and_project(
+        state,
+        request,
+        guard,
+        ProjectionContext::RecordOnly,
+    ));
+    match await_commit_task(task).await {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => commit_error_response(error),
+    }
 }
 
 fn verified_receipt_sequence(records: &[DirectStateArtifact], receipt: &DirectReceipt) -> Result<i64, ProjectionError> {
@@ -4017,16 +4263,13 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
             == 0
 }
 async fn exchange(state: &AppState, request: RuntimeRequest) -> io::Result<RuntimeResponse> {
-    let response = match timeout(Duration::from_secs(10), async {
+    let response = bounded_enclave_stage(ENCLOSURE_EXCHANGE_TIMEOUT, async {
         let mut stream =
             VsockStream::connect(VsockAddr::new(state.enclave_cid, ENCLOSURE_PORT)).await?;
         write_frame(&mut stream, &serde_cbor::to_vec(&request).map_err(invalid)?).await?;
         serde_cbor::from_slice(&read_frame(&mut stream).await?).map_err(invalid)
     })
-    .await {
-        Ok(response) => response,
-        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "enclave timeout")),
-    };
+    .await;
     if let Err(error) = &response {
         eprintln!("ENCLOSURE_TRANSPORT_FAILED kind={:?}", error.kind());
     }
@@ -4440,15 +4683,17 @@ fn start_base_withdrawal_observer(state: AppState) {
         loop {
             timer.tick().await;
             if state.unresolved_external_effects.lock().await.is_empty() { continue; }
-            let _guard = state.financial_gate.lock().await;
+            let _guard = state.financial_gate.lock("withdrawal_observer").await;
             let pending: Vec<_> = state.unresolved_external_effects.lock().await.values()
                 .filter(|i| base_withdrawal_observation_supported(i))
                 .cloned().collect();
             for intent in pending {
+                eprintln!("FINANCIAL_AWAIT_BEGIN stage=withdrawal_observation");
                 if reconcile_observed_base_withdrawal(&state, &intent).await.is_err() {
                     // Stable trace/code only; never raw provider bodies or keys.
                     eprintln!("WITHDRAWAL_OBSERVATION_PENDING request_id={} intent_hash={}", intent.request_id, intent.intent_hash);
                 }
+                eprintln!("FINANCIAL_AWAIT_END stage=withdrawal_observation");
             }
         }
     });
@@ -4493,8 +4738,10 @@ async fn reconcile_observed_base_withdrawal(state: &AppState, intent: &ExternalE
         || result.receipt.status != layrs_direct_execution_v1::TerminalStatus::Applied {
         return Err(invalid("withdrawal observation receipt conflict"));
     }
-    state.projection.as_ref().ok_or_else(|| invalid("withdrawal observation projection unavailable"))?
-        .record_result(state, &result).await.map_err(|_| invalid("withdrawal observation projection failed"))?;
+    let projection = state.projection.as_ref().ok_or_else(|| invalid("withdrawal observation projection unavailable"))?;
+    record_result_with_retry(projection, state, &result)
+        .await
+        .map_err(|_| invalid("withdrawal observation projection failed"))?;
     // Remove the gate only AFTER the genuine receipt and atomic projection.
     state.unresolved_external_effects.lock().await.remove(&intent.intent_hash);
     eprintln!("WITHDRAWAL_OBSERVATION_SETTLED request_id={} intent_hash={} receipt_id={}", intent.request_id, intent.intent_hash, result.receipt.receipt_id);
@@ -4591,7 +4838,7 @@ async fn recover_external_effect_intents(state: &AppState) -> io::Result<()> {
                     return Err(invalid("external-effect recovery execution failed"));
                 };
                 if let Some(projection) = &state.projection {
-                    projection.record_result(&state, &result).await.map_err(|_| {
+                    record_result_with_retry(projection, state, &result).await.map_err(|_| {
                         invalid("projection unavailable during external-effect recovery")
                     })?;
                 }
@@ -4609,6 +4856,73 @@ async fn recover_external_effect_intents(state: &AppState) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn missing_projected_receipts(
+    records: &[DirectStateArtifact],
+    existing: &[DirectReceipt],
+) -> Result<Vec<DirectReceipt>, ProjectionError> {
+    verify_projected_receipt_lineage(records, existing)?;
+    let present: HashSet<&str> = existing
+        .iter()
+        .map(|receipt| receipt.receipt_id.as_str())
+        .collect();
+    Ok(records
+        .iter()
+        .filter(|record| !present.contains(record.receipt.receipt_id.as_str()))
+        .map(|record| record.receipt.clone())
+        .collect())
+}
+
+/// Rebuild only missing disposable receipt projections from the verified,
+/// immutable archive. Existing rows must first be proven to be an exact
+/// subset of that lineage; conflicting or extra PostgreSQL history still
+/// fails closed.
+async fn reconcile_projection_from_archive(state: &AppState) -> io::Result<usize> {
+    let Some(projection) = &state.projection else {
+        return Ok(0);
+    };
+    let records = state
+        .artifact_store
+        .as_ref()
+        .ok_or_else(|| invalid("projection archive unavailable"))?
+        .load_committed()
+        .await
+        .map_err(invalid)?;
+    let rows = projection
+        .client
+        .lock()
+        .await
+        .query(
+            "SELECT receipt_json::text FROM direct_execution_receipts WHERE epoch_id=$1",
+            &[&EPOCH_ID],
+        )
+        .await
+        .map_err(|_| invalid("projection receipt reconciliation query failed"))?;
+    let existing: Vec<DirectReceipt> = rows
+        .into_iter()
+        .map(|row| {
+            let encoded: String = row.get(0);
+            serde_json::from_str(&encoded)
+                .map_err(|_| invalid("projection receipt is malformed"))
+        })
+        .collect::<io::Result<_>>()?;
+    let missing = missing_projected_receipts(&records, &existing).map_err(|_| {
+        invalid("projection receipt exceeds or conflicts with recovered immutable history")
+    })?;
+    for receipt in &missing {
+        let result = DirectResult {
+            status: receipt.status.clone(),
+            effect: receipt.effect.clone(),
+            genesis_ordinal: receipt.genesis_ordinal,
+            receipt: receipt.clone(),
+        };
+        record_result_with_retry(projection, state, &result)
+            .await
+            .map_err(|_| invalid("projection archive replay failed"))?;
+    }
+    eprintln!("PROJECTION_RECONCILED n={}", missing.len());
+    Ok(missing.len())
 }
 
 /// Compare the disposable PostgreSQL projection with the private state only
@@ -4767,13 +5081,11 @@ async fn bootstrap_governed_enclave(state: &AppState) -> io::Result<()> {
     if matches!(begin, RuntimeResponse::Error { ref code } if code == "WRITER_GRANT_REPLAY") {
         return match exchange(state, RuntimeRequest::Status).await? {
             RuntimeResponse::Status { status }
-                if status.writer_grant_commitment.as_deref()
-                    == Some(expected_commitment.as_str())
-                    && ((config.requested_mode == "production-enabled"
-                        && status.writer_enabled)
-                        || (config.requested_mode == "admission-enabled"
-                            && status.admission_enabled
-                            && !status.writer_enabled)) =>
+                if governed_bootstrap_status_matches(
+                    &status,
+                    &expected_commitment,
+                    &config.requested_mode,
+                ) =>
             {
                 Ok(())
             }
@@ -4972,6 +5284,18 @@ async fn bootstrap_governed_enclave(state: &AppState) -> io::Result<()> {
     }
 }
 
+fn governed_bootstrap_status_matches(
+    status: &layrs_direct_execution_v1::RuntimeBinding,
+    expected_commitment: &str,
+    requested_mode: &str,
+) -> bool {
+    status.writer_grant_commitment.as_deref() == Some(expected_commitment)
+        && ((requested_mode == "production-enabled" && status.writer_enabled)
+            || (requested_mode == "admission-enabled"
+                && status.admission_enabled
+                && !status.writer_enabled))
+}
+
 /// One bounded direct request.  The first response is deliberately not a
 /// customer result: it is an opaque encrypted successor that must be stored
 /// immutably and read back before this parent can issue an acknowledgement.
@@ -4988,7 +5312,8 @@ async fn exchange_direct(state: &AppState, request: DirectRequest) -> io::Result
             "DIRECT_COMMIT_ACK_KEY_NOT_CONFIGURED",
         ));
     }
-    let response = timeout(Duration::from_secs(10), async {
+    eprintln!("FINANCIAL_AWAIT_BEGIN stage=enclave_candidate");
+    let (mut stream, first) = bounded_enclave_stage(ENCLOSURE_EXCHANGE_TIMEOUT, async {
         let mut stream =
             VsockStream::connect(VsockAddr::new(state.enclave_cid, ENCLOSURE_PORT)).await?;
         write_frame(
@@ -4998,18 +5323,28 @@ async fn exchange_direct(state: &AppState, request: DirectRequest) -> io::Result
         .await?;
         let first: RuntimeResponse =
             serde_cbor::from_slice(&read_frame(&mut stream).await?).map_err(invalid)?;
-        let RuntimeResponse::CommitCandidate { artifact } = first else {
-            return Ok(first);
-        };
+        Ok::<_, io::Error>((stream, first))
+    })
+    .await?;
+    eprintln!("FINANCIAL_AWAIT_END stage=enclave_candidate");
+    let response = match first {
+        RuntimeResponse::CommitCandidate { artifact } => {
         // `persist_readback` uses create_new, fsyncs the write, rereads the
         // opaque bytes, decodes them, and compares the complete artifact plus
         // its CBOR hash before this acknowledgement exists.
+        eprintln!("FINANCIAL_AWAIT_BEGIN stage=archive_persist_readback");
         let restored = store.persist_readback(&artifact).await.map_err(|error| {
+            let code = if error == "ARCHIVE_TIMEOUT" {
+                "ARCHIVE_TIMEOUT".to_string()
+            } else {
+                format!("IMMUTABLE_PERSISTENCE_FAILED:{error}")
+            };
             io::Error::new(
                 io::ErrorKind::Other,
-                format!("IMMUTABLE_PERSISTENCE_FAILED:{error}"),
+                code,
             )
         })?;
+        eprintln!("FINANCIAL_AWAIT_END stage=archive_persist_readback");
         if restored != artifact {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -5017,20 +5352,25 @@ async fn exchange_direct(state: &AppState, request: DirectRequest) -> io::Result
             ));
         }
         let ack = DurabilityAck::issue(&restored, &state.commit_ack_key);
-        write_frame(
-            &mut stream,
-            &serde_cbor::to_vec(&RuntimeRequest::DurabilityAck { ack }).map_err(invalid)?,
-        )
+        eprintln!("FINANCIAL_AWAIT_BEGIN stage=enclave_durability_ack");
+        let terminal = bounded_enclave_stage(ENCLOSURE_EXCHANGE_TIMEOUT, async {
+            write_frame(
+                &mut stream,
+                &serde_cbor::to_vec(&RuntimeRequest::DurabilityAck { ack }).map_err(invalid)?,
+            )
+            .await?;
+            serde_cbor::from_slice(&read_frame(&mut stream).await?).map_err(invalid)
+        })
         .await?;
-        let terminal: RuntimeResponse =
-            serde_cbor::from_slice(&read_frame(&mut stream).await?).map_err(invalid)?;
+        eprintln!("FINANCIAL_AWAIT_END stage=enclave_durability_ack");
         if matches!(terminal, RuntimeResponse::Execute { .. }) {
             *state.committed_state_root.lock().await = Some(restored.state_hash.clone());
+            state.last_commit_at.store(now_unix(), Ordering::Release);
         }
-        Ok(terminal)
-    })
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "enclave timeout"))??;
+        terminal
+        }
+        other => other,
+    };
     if matches!(response, RuntimeResponse::Execute { .. }) {
         if let ArchiveStore::S3(store) = store {
             // This effect already committed: a checkpoint failure must not
@@ -5292,6 +5632,157 @@ mod tests {
         let mut duplicate = records.clone(); duplicate.push(records[0].clone());
         assert!(verify_projected_receipt_lineage(&duplicate,&receipts).is_err());
         assert!(verify_projected_receipt_lineage(&records,&receipts[..2]).is_ok()); // a lost projection reply is not new state authority
+    }
+    #[test]
+    fn startup_reconciliation_selects_exactly_three_missing_verified_receipts_in_order() {
+        let base = projection_sequence_fixture();
+        let records: Vec<_> = (1..=4)
+            .map(|sequence| {
+                let mut record = base.clone();
+                record.sequence = sequence;
+                record.receipt.receipt_id = format!("receipt-{sequence}");
+                record
+            })
+            .collect();
+        let missing = missing_projected_receipts(&records, &[records[0].receipt.clone()]).unwrap();
+        assert_eq!(
+            missing
+                .iter()
+                .map(|receipt| receipt.receipt_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["receipt-2", "receipt-3", "receipt-4"]
+        );
+        let mut conflicting = records[0].receipt.clone();
+        conflicting.request_hash = "f".repeat(64);
+        assert!(missing_projected_receipts(&records, &[conflicting]).is_err());
+    }
+    #[tokio::test]
+    async fn write_path_health_detects_a_waiter_without_blocking_on_the_gate() {
+        let gate = Arc::new(FinancialGate::new());
+        let owner = gate.lock("test-owner").await;
+        let waiting_gate = Arc::clone(&gate);
+        let waiter = tokio::spawn(async move { waiting_gate.lock("test-waiter").await });
+        for _ in 0..50 {
+            if gate.snapshot(now_unix()).0 == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let now = now_unix();
+        let (_, age) = gate.snapshot(now);
+        assert_eq!(age, Some(0));
+        assert!(gate.stalled(now + WRITE_PATH_STALL_THRESHOLD.as_secs()));
+        drop(owner);
+        drop(waiter.await.unwrap());
+        assert_eq!(gate.snapshot(now_unix()).0, 0);
+    }
+    #[tokio::test]
+    async fn hung_enclave_and_archive_stages_return_stable_timeout_codes() {
+        let gate = Arc::new(FinancialGate::new());
+        let guard = gate.lock("timeout-owner").await;
+        let enclave = bounded_enclave_stage(
+            Duration::from_millis(5),
+            std::future::pending::<io::Result<()>>(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(enclave.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(enclave.to_string(), "ENCLOSURE_TIMEOUT");
+        let archive = bounded_archive_operation(
+            Duration::from_millis(5),
+            std::future::pending::<Result<(), ()>>(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(archive, "ARCHIVE_TIMEOUT");
+        drop(guard);
+        let next = timeout(Duration::from_secs(1), gate.lock("after-timeout"))
+            .await
+            .expect("timeout path retained the financial gate");
+        drop(next);
+    }
+    #[tokio::test]
+    async fn detached_commit_owner_survives_the_waiting_client_future() {
+        let gate = Arc::new(FinancialGate::new());
+        let guard = gate.lock("detached-commit-test").await;
+        let recorded_receipt = Arc::new(Mutex::new(None));
+        let task_receipt = Arc::clone(&recorded_receipt);
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            tokio::task::yield_now().await;
+            *task_receipt.lock().await = Some("receipt-after-client-drop".to_string());
+            let _ = completed_tx.send(());
+        });
+        drop(task); // equivalent to an HTTP handler dropping its JoinHandle
+        timeout(Duration::from_secs(1), completed_rx)
+            .await
+            .expect("detached commit task timed out")
+            .expect("detached commit task was cancelled");
+        assert_eq!(
+            recorded_receipt.lock().await.as_deref(),
+            Some("receipt-after-client-drop")
+        );
+        let next = timeout(Duration::from_secs(1), gate.lock("next-request"))
+            .await
+            .expect("financial gate was not released");
+        drop(next);
+    }
+    #[tokio::test]
+    async fn failed_projection_releases_gate_and_verified_receipt_replays_on_restart() {
+        let gate = Arc::new(FinancialGate::new());
+        let guard = gate.lock("projection-outage").await;
+        let artifact = projection_sequence_fixture();
+        let committed_receipt = artifact.receipt.clone();
+
+        // Model an unreachable disposable projection after the immutable
+        // receipt committed. The task fails, drops its owned guard, and the
+        // next request can enter; the verified archive still selects the exact
+        // absent receipt for startup replay.
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            Err::<(), _>(ProjectionError::Database)
+        });
+        assert!(task.await.unwrap().is_err());
+        let next = timeout(Duration::from_secs(1), gate.lock("after-projection-outage"))
+            .await
+            .expect("projection outage retained the financial gate");
+        drop(next);
+        let replay = missing_projected_receipts(&[artifact], &[]).unwrap();
+        assert_eq!(replay, vec![committed_receipt]);
+    }
+    #[test]
+    fn same_host_parent_restart_accepts_only_the_exact_live_governed_enclave() {
+        let mut status = layrs_direct_execution_v1::RuntimeBinding {
+            runtime: "runtime".into(),
+            transaction_model: "model".into(),
+            epoch_state_sha256: "a".repeat(64),
+            evidence_manifest_sha256: "b".repeat(64),
+            genesis_ordinal: 0,
+            writer_enabled: true,
+            admission_enabled: true,
+            identity_count: 0,
+            projection_schema_version: 1,
+            writer_grant_commitment: Some("commitment".into()),
+            writer_grant_expires_at_unix: Some(now_unix() + 60),
+            key_release_artifact_hash: Some("c".repeat(64)),
+        };
+        assert!(governed_bootstrap_status_matches(
+            &status,
+            "commitment",
+            "production-enabled"
+        ));
+        assert!(!governed_bootstrap_status_matches(
+            &status,
+            "different",
+            "production-enabled"
+        ));
+        status.writer_enabled = false;
+        assert!(governed_bootstrap_status_matches(
+            &status,
+            "commitment",
+            "admission-enabled"
+        ));
     }
     #[test]
     fn projection_sequence_requires_exact_verified_receipt() {
@@ -5825,7 +6316,8 @@ mod tests {
             usdc_custody: None,
             usdc_link_authority: None,
             usdc_bus_custody: None,
-            financial_gate: Arc::new(Mutex::new(())),
+        financial_gate: Arc::new(FinancialGate::new()),
+        last_commit_at: Arc::new(AtomicU64::new(0)),
             committed_state_root: Arc::new(Mutex::new(None)),
             unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
             governed_bootstrap: None,
