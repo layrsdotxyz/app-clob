@@ -2735,8 +2735,10 @@ async fn admit_identity(State(state): State<AppState>, headers: HeaderMap) -> im
     };
     let _guard = state.financial_gate.lock().await;
     let mut request = DirectRequest {
-        // Admission is also a private-state mutation; its zero balance does
-        // not make advancing an outstanding payout's root safe.
+        // Admission is a zero-balance identity mutation. Serialize the actual
+        // enclave commit with other writes, but do not place onboarding behind
+        // the long-lived external-effect finality fence: an unrelated user's
+        // on-chain deposit or withdrawal must not block signup.
         account_id: claims.subject_hash.clone(),
         identity_commitment: claims.identity_commitment.clone(),
         request_id,
@@ -2747,7 +2749,6 @@ async fn admit_identity(State(state): State<AppState>, headers: HeaderMap) -> im
         },
     };
     request.request_hash = request_hash(&request);
-    if !state.unresolved_external_effects.lock().await.is_empty() { return (StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING").into_response(); }
     match exchange_direct(&state, request).await {
         Ok(RuntimeResponse::Execute { result }) => {
             let Some(projection) = &state.projection else {
@@ -4123,13 +4124,21 @@ fn extra_payout_evidence(intent: &ExternalEffectIntent, original: &ExternalEffec
 /// verified successor chain with no intervening change to that user's USDC.
 /// Unknown roots, gaps, request collisions and balance changes fail closed.
 fn historical_intent_lineage_safe(intent: &ExternalEffectIntent, artifacts: &[DirectStateArtifact], current_root: &str) -> bool {
-    if intent.chain != "base" || intent.asset != "USDC" || intent.relay.is_some() || intent.zen_destination_chain.is_some() || artifacts.is_empty() || artifacts.last().is_none_or(|a|a.state_hash != current_root) { return false; }
+    if artifacts.is_empty() || artifacts.last().is_none_or(|a|a.state_hash != current_root) { return false; }
     if artifacts.iter().enumerate().any(|(i,a)|a.epoch_id != EPOCH_ID || a.sequence != i as u64+1 || (i>0 && a.prior_state_hash != artifacts[i-1].state_hash)) { return false; }
     let starts = artifacts.iter().enumerate().filter(|(_,a)|a.prior_state_hash == intent.prior_state_hash).map(|(i,_)|i).collect::<Vec<_>>();
     if starts.len()!=1 { return false; }
+    let unrelated_financial_lineage = intent.chain == "base" && intent.asset == "USDC"
+        && intent.relay.is_none() && intent.zen_destination_chain.is_none();
     artifacts[starts[0]..].iter().all(|a| {
         !(a.receipt.account_id == intent.account_id && a.receipt.request_id == intent.request_id)
         && !a.receipt.projection_balance_updates.iter().any(|b|b.identity_commitment == intent.identity_commitment && b.asset == intent.asset)
+        // Admissions are the sole new writer permitted while another user's
+        // external effect is unresolved. They must remain zero-balance state
+        // transitions. All other historical rebasing retains the existing,
+        // narrower direct Base USDC proof.
+        && (unrelated_financial_lineage || a.receipt.effect == "IDENTITY_ADMITTED"
+            && a.receipt.projection_balance_updates.is_empty())
     })
 }
 
@@ -5176,6 +5185,22 @@ mod tests {
         let mut fork=records.clone();fork[1].prior_state_hash="e".repeat(64);assert!(!historical_intent_lineage_safe(&intent,&fork,&"d".repeat(64)));
         let mut collision=records.clone();collision[2].receipt.account_id=intent.account_id.clone();collision[2].receipt.request_id=intent.request_id.clone();assert!(!historical_intent_lineage_safe(&intent,&collision,&"d".repeat(64)));
         let mut changed=records.clone();changed[2].receipt.projection_balance_updates.push(layrs_direct_execution_v1::ProjectionBalanceUpdate {auth_subject_hash:intent.account_id.clone(),identity_commitment:intent.identity_commitment.clone(),asset:"USDC".into(),bucket:"USER_AVAILABLE".into(),amount_atomic:"1".into()});assert!(!historical_intent_lineage_safe(&intent,&changed,&"d".repeat(64)));
+    }
+    #[test]
+    fn identity_admission_is_the_only_cross_route_successor_allowed_during_external_finality() {
+        let mut intent=relay_intent();intent.prior_state_hash="b".repeat(64);
+        let mut admissions=nonfinancial_chain();
+        for artifact in &mut admissions[1..] {
+            artifact.receipt.effect="IDENTITY_ADMITTED".into();
+            artifact.receipt.projection_balance_updates.clear();
+        }
+        assert!(historical_intent_lineage_safe(&intent,&admissions,&"d".repeat(64)));
+        let mut balance_change=admissions.clone();
+        balance_change[2].receipt.projection_balance_updates.push(layrs_direct_execution_v1::ProjectionBalanceUpdate {
+            auth_subject_hash:"new-user".into(),identity_commitment:"new-identity".into(),asset:"USDC".into(),
+            bucket:"USER_AVAILABLE".into(),amount_atomic:"1".into()});
+        assert!(!historical_intent_lineage_safe(&intent,&balance_change,&"d".repeat(64)));
+        assert!(!historical_intent_lineage_safe(&intent,&nonfinancial_chain(),&"d".repeat(64)));
     }
     #[test]
     fn confirmed_extra_payout_never_becomes_a_second_customer_debit() {
