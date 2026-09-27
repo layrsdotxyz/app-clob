@@ -265,6 +265,47 @@ impl Drop for FinancialWaitRegistration<'_> {
     fn drop(&mut self) { self.gate.waiters.lock().expect("financial waiter tracker poisoned").remove(&self.id); }
 }
 
+/// Health is sampled once in the background, never by competing NLB requests.
+/// A successful commit is stronger liveness evidence than a delayed status read.
+#[derive(Default)]
+struct ParentHealth {
+    restored: AtomicBool,
+    last_response_at: AtomicU64,
+}
+const HEALTH_FRESHNESS_SECONDS: u64 = 45;
+
+impl ParentHealth {
+    fn observe(&self, now: u64) { self.last_response_at.store(now, Ordering::Release); }
+    fn check(&self, now: u64, last_commit: u64, stalled_waiter: bool, grant_expired: bool) -> Result<(), &'static str> {
+        if !self.restored.load(Ordering::Acquire) { return Err("DIRECT_STATE_RECOVERY_REQUIRED"); }
+        if grant_expired { return Err("WRITER_AUTHORIZATION_EXPIRED"); }
+        let commit_recent = last_commit != 0 && now.checked_sub(last_commit).is_some_and(|age| age < WRITE_PATH_STALL_THRESHOLD.as_secs());
+        if stalled_waiter && !commit_recent { return Err("WRITE_PATH_STALLED"); }
+        let last = self.last_response_at.load(Ordering::Acquire).max(last_commit);
+        if last == 0 || !now.checked_sub(last).is_some_and(|age| age <= HEALTH_FRESHNESS_SECONDS) {
+            return Err("ENCLOSURE_UNAVAILABLE");
+        }
+        Ok(())
+    }
+}
+
+fn start_health_observer(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            if let Ok(RuntimeResponse::Status { .. }) = exchange(&state, RuntimeRequest::Status).await {
+                state.health.observe(now_unix());
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+}
+
+/// Removes a cancelled lock wait, so it cannot become a permanent false stall.
+struct FinancialWaitRegistration<'a> { gate: &'a FinancialGate, id: u64 }
+impl Drop for FinancialWaitRegistration<'_> {
+    fn drop(&mut self) { self.gate.waiters.lock().expect("financial waiter tracker poisoned").remove(&self.id); }
+}
+
 /// Tracks contention without putting the health endpoint behind the write
 /// mutex it is meant to supervise. Waiting registrations live only for the
 /// duration of `lock`, and the returned owned guard can safely move into a
