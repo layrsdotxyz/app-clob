@@ -170,6 +170,7 @@ struct AppState {
     /// external intent.  It is process memory, never durable workflow state.
     financial_gate: Arc<FinancialGate>,
     last_commit_at: Arc<AtomicU64>,
+    health: Arc<ParentHealth>,
     committed_state_root: Arc<Mutex<Option<String>>>,
     unresolved_external_effects: Arc<Mutex<BTreeMap<String, ExternalEffectIntent>>>,
     governed_bootstrap: Option<GovernedBootstrapConfig>,
@@ -223,6 +224,47 @@ impl AppState {
     }
 }
 
+/// Health is sampled once in the background, never by competing NLB requests.
+/// A successful commit is stronger liveness evidence than a delayed status read.
+#[derive(Default)]
+struct ParentHealth {
+    restored: AtomicBool,
+    last_response_at: AtomicU64,
+}
+const HEALTH_FRESHNESS_SECONDS: u64 = 45;
+
+impl ParentHealth {
+    fn observe(&self, now: u64) { self.last_response_at.store(now, Ordering::Release); }
+    fn check(&self, now: u64, last_commit: u64, stalled_waiter: bool, grant_expired: bool) -> Result<(), &'static str> {
+        if !self.restored.load(Ordering::Acquire) { return Err("DIRECT_STATE_RECOVERY_REQUIRED"); }
+        if grant_expired { return Err("WRITER_AUTHORIZATION_EXPIRED"); }
+        let commit_recent = last_commit != 0 && now.checked_sub(last_commit).is_some_and(|age| age < WRITE_PATH_STALL_THRESHOLD.as_secs());
+        if stalled_waiter && !commit_recent { return Err("WRITE_PATH_STALLED"); }
+        let last = self.last_response_at.load(Ordering::Acquire).max(last_commit);
+        if last == 0 || !now.checked_sub(last).is_some_and(|age| age <= HEALTH_FRESHNESS_SECONDS) {
+            return Err("ENCLOSURE_UNAVAILABLE");
+        }
+        Ok(())
+    }
+}
+
+fn start_health_observer(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            if let Ok(RuntimeResponse::Status { .. }) = exchange(&state, RuntimeRequest::Status).await {
+                state.health.observe(now_unix());
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+}
+
+/// Removes a cancelled lock wait, so it cannot become a permanent false stall.
+struct FinancialWaitRegistration<'a> { gate: &'a FinancialGate, id: u64 }
+impl Drop for FinancialWaitRegistration<'_> {
+    fn drop(&mut self) { self.gate.waiters.lock().expect("financial waiter tracker poisoned").remove(&self.id); }
+}
+
 /// Tracks contention without putting the health endpoint behind the write
 /// mutex it is meant to supervise. Waiting registrations live only for the
 /// duration of `lock`, and the returned owned guard can safely move into a
@@ -249,11 +291,9 @@ impl FinancialGate {
             .expect("financial waiter tracker poisoned")
             .insert(waiter_id, now_unix());
         eprintln!("FINANCIAL_GATE_AWAIT stage={stage}");
+        let waiting = FinancialWaitRegistration { gate: self, id: waiter_id };
         let guard = Arc::clone(&self.inner).lock_owned().await;
-        self.waiters
-            .lock()
-            .expect("financial waiter tracker poisoned")
-            .remove(&waiter_id);
+        drop(waiting);
         eprintln!("FINANCIAL_GATE_ACQUIRED stage={stage}");
         guard
     }
@@ -5023,6 +5063,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {None},
         financial_gate: Arc::new(FinancialGate::new()),
         last_commit_at: Arc::new(AtomicU64::new(0)),
+        health: Arc::new(ParentHealth::default()),
         committed_state_root: Arc::new(Mutex::new(None)),
         unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
         governed_bootstrap,
@@ -5135,6 +5176,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Observe already-admitted Base withdrawals independently of the browser.
     // This observer has no submission capability and shares the financial lock.
+    state.health.restored.store(true, Ordering::Release);
+    // Startup recovery has already verified the enclave and projection. A
+    // bounded initial observation covers the first background probe.
+    state.health.observe(now_unix());
+    start_health_observer(state.clone());
     start_base_withdrawal_observer(state.clone());
     start_v70_rollback_materializer(state.clone());
     let port = env::var("PORT").unwrap_or_else(|_| "8443".into()).parse()?;
@@ -5261,16 +5307,11 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
-    if state.financial_gate.stalled(now_unix()) {
-        eprintln!("WRITE_PATH_STALLED");
-        return (StatusCode::SERVICE_UNAVAILABLE, "WRITE_PATH_STALLED");
-    }
-    match timeout(Duration::from_millis(1_500), exchange(&state, RuntimeRequest::Status)).await {
-        Ok(Ok(RuntimeResponse::Status { .. })) => (StatusCode::OK, "ok"),
-        _ => {
-            eprintln!("ENCLOSURE_TRANSPORT_FAILED");
-            (StatusCode::SERVICE_UNAVAILABLE, "ENCLOSURE_UNAVAILABLE")
-        }
+    let now = now_unix();
+    let expired = state.governed_bootstrap.as_ref().is_some_and(|config| config.grant.expires_at_unix <= now);
+    match state.health.check(now, state.last_commit_at.load(Ordering::Acquire), state.financial_gate.stalled(now), expired) {
+        Ok(()) => (StatusCode::OK, "ok"),
+        Err(code) => (StatusCode::SERVICE_UNAVAILABLE, code),
     }
 }
 async fn quest_receipt_attestation(State(state):State<AppState>,Query(query):Query<AttestationQuery>)->impl IntoResponse {
@@ -10133,6 +10174,36 @@ mod tests {
         conflicting.request_hash = "f".repeat(64);
         assert!(missing_projected_receipts(&records, &[conflicting]).is_err());
     }
+    #[test]
+    fn health_distinguishes_restore_busy_idle_stall_and_expired_authorization() {
+        let health = ParentHealth::default();
+        assert_eq!(health.check(100, 100, false, false), Err("DIRECT_STATE_RECOVERY_REQUIRED"));
+        health.restored.store(true, Ordering::Release);
+        health.observe(100);
+        assert_eq!(health.check(110, 0, false, false), Ok(())); // idle, recent status
+        assert_eq!(health.check(150, 148, true, false), Ok(())); // busy but commits progress
+        assert_eq!(health.check(150, 0, false, false), Err("ENCLOSURE_UNAVAILABLE"));
+        health.observe(160);
+        assert_eq!(health.check(160, 99, true, false), Err("WRITE_PATH_STALLED"));
+        assert_eq!(health.check(160, 160, false, true), Err("WRITER_AUTHORIZATION_EXPIRED"));
+        assert_eq!(health.check(159, 0, false, false), Err("ENCLOSURE_UNAVAILABLE")); // clock regression
+    }
+
+    #[tokio::test]
+    async fn cancelled_gate_wait_does_not_leave_a_false_stall() {
+        let gate = Arc::new(FinancialGate::new());
+        let owner = gate.lock("owner").await;
+        let other = Arc::clone(&gate);
+        let waiter = tokio::spawn(async move { other.lock("cancelled").await });
+        for _ in 0..50 { if gate.snapshot(now_unix()).0 > 0 { break; } tokio::task::yield_now().await; }
+        assert_eq!(gate.snapshot(now_unix()).0, 1);
+        waiter.abort();
+        let _ = waiter.await;
+        assert_eq!(gate.snapshot(now_unix()).0, 0);
+        assert!(!gate.stalled(now_unix() + 120));
+        drop(owner);
+    }
+
     #[tokio::test]
     async fn write_path_health_detects_a_waiter_without_blocking_on_the_gate() {
         let gate = Arc::new(FinancialGate::new());
@@ -10795,6 +10866,7 @@ mod tests {
             usdc_bus_custody: None,
         financial_gate: Arc::new(FinancialGate::new()),
         last_commit_at: Arc::new(AtomicU64::new(0)),
+        health: Arc::new(ParentHealth::default()),
             committed_state_root: Arc::new(Mutex::new(None)),
             unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
             governed_bootstrap: None,
