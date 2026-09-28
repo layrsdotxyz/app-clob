@@ -6623,4 +6623,480 @@ mod tests {
         );
         assert_eq!(store.artifacts().unwrap().len(), 1);
     }
+
+    // v70 persistence baseline (FULL_STATE_JOURNAL_V71_CONTRACT.md). These
+    // tests characterize existing behavior only; they must keep passing
+    // unchanged against v70 artifacts before compaction or journal work.
+    const V70_MARKET: &str = "layrs:v5:BTC:USDC:1h:v70-baseline";
+    const V70_MAKER_IDENTITY: &str =
+        "0bafc03d08d4951d769d58284db85c7ac2ee3c79de87ec680f58edc03017c418";
+
+    struct V70Lineage {
+        live: DirectRuntime,
+        store: InMemoryDirectStateStore,
+        committed: Vec<(DirectRequest, DirectResult)>,
+        subject: String,
+        identity: String,
+        wallet: String,
+        maker_order: String,
+    }
+
+    /// Governance registration, admission, deposit, resting order, and a
+    /// pending bus withdrawal: every persisted family touched by restore.
+    fn v70_lineage() -> V70Lineage {
+        let mut live = runtime(RuntimeMode::IsolatedTest);
+        let mut store = InMemoryDirectStateStore::default();
+        let subject = "a".repeat(64);
+        let wallet = "0x1111111111111111111111111111111111111111".to_string();
+        let identity = identity_commitment_for(&subject, &wallet);
+        let maker_order = Uuid::from_u128(701).to_string();
+        let mut deposit = request_for(
+            &subject,
+            &identity,
+            "v70-deposit",
+            DirectAction::CreditHorizenUsdcDeposit {
+                amount_atomic: "10000000".into(),
+                custody_reference: format!("horizen-usdc-deposit:0x{}", "ab".repeat(32)),
+            },
+        );
+        deposit.financial_wallet_address = Some(wallet.clone());
+        deposit.request_hash = request_hash(&deposit);
+        let commands = vec![
+            market_registration_request(V70_MARKET, "v70-market"),
+            request_for(
+                &subject,
+                &identity,
+                "v70-admission",
+                DirectAction::AdmitIdentity { wallet_address: wallet.clone() },
+            ),
+            deposit,
+            request(
+                "v70-maker",
+                DirectAction::PlaceOrder {
+                    order_id: maker_order.clone(),
+                    market_id: V70_MARKET.into(),
+                    outcome: Outcome::Down,
+                    action: OrderAction::Buy,
+                    price_micros: 154_000,
+                    quantity_micros: "10000000".into(),
+                    time_in_force: TimeInForce::Gtc,
+                    expires_at_millis: None,
+                    now_millis: 1_000,
+                },
+            ),
+            bus_begin(&subject, &identity, &wallet, BUS_ID),
+        ];
+        let mut committed = Vec::new();
+        for command in commands {
+            let result = live
+                .execute_committed(command.clone(), &[8; 32], &mut store)
+                .unwrap();
+            committed.push((command, result));
+        }
+        assert_eq!(live.orders[&maker_order].hold_atomic, 1_540_000);
+        assert!(live.pending_usdc_bus_withdrawal(&subject, BUS_ID).is_some());
+        V70Lineage { live, store, committed, subject, identity, wallet, maker_order }
+    }
+
+    fn v70_sorted_artifacts(store: &InMemoryDirectStateStore) -> Vec<DirectStateArtifact> {
+        let mut artifacts = store.artifacts().unwrap();
+        artifacts.sort_by_key(|artifact| artifact.sequence);
+        artifacts
+    }
+
+    /// Same account and request id, different intent. Only variants used by
+    /// `v70_lineage` are supported.
+    fn v70_conflicting(command: &DirectRequest) -> DirectRequest {
+        let mut conflict = command.clone();
+        match &mut conflict.action {
+            DirectAction::RegisterMarket { registration, .. } => registration.expires_at_unix += 1,
+            DirectAction::AdmitIdentity { wallet_address } => {
+                *wallet_address = "0x3333333333333333333333333333333333333333".into()
+            }
+            DirectAction::CreditHorizenUsdcDeposit { amount_atomic, .. } => {
+                *amount_atomic = "10000001".into()
+            }
+            DirectAction::PlaceOrder { price_micros, .. } => *price_micros += 100,
+            DirectAction::BeginUsdcBusWithdrawal { amount_atomic, .. } => {
+                *amount_atomic = "4840001".into()
+            }
+            _ => unreachable!("not part of the v70 baseline lineage"),
+        }
+        conflict.request_hash = request_hash(&conflict);
+        assert_ne!(conflict.request_hash, command.request_hash);
+        conflict
+    }
+
+    #[test]
+    fn v70_exact_replay_returns_original_terminal_result_without_successor() {
+        let V70Lineage { mut live, mut store, committed, subject, identity, wallet, .. } =
+            v70_lineage();
+        let archived = v70_sorted_artifacts(&store);
+        let head_sequence = live.committed_sequence();
+        let head_hash = live.committed_state_hash();
+        for (command, result) in &committed {
+            assert_eq!(live.existing_result(command).unwrap().as_ref(), Some(result));
+            assert_eq!(live.execute_committed(command.clone(), &[8; 32], &mut store).unwrap(), *result);
+            assert_eq!(live.execute(command.clone()).unwrap(), *result);
+            // A replay candidate re-seals the current head; it is not a successor.
+            let candidate = live.prepare_candidate(command.clone(), &[8; 32]).unwrap();
+            assert_eq!(candidate.result, *result);
+            assert_eq!(candidate.artifact.sequence, head_sequence);
+            assert_eq!(candidate.artifact.prior_state_hash, head_hash);
+            assert_eq!(candidate.artifact.state_hash, head_hash);
+            assert!(live.clone().restore_next_committed(&candidate.artifact, &[8; 32]).is_err());
+            assert_eq!(live.committed_sequence(), head_sequence);
+            assert_eq!(live.committed_state_hash(), head_hash);
+            assert_eq!(v70_sorted_artifacts(&store), archived);
+        }
+
+        // Replay is answered before writer authority is consulted.
+        let mut dormant = DirectRuntime::restore_committed(
+            SealedEpoch::load(epoch_path()).unwrap(),
+            RuntimeMode::Dormant,
+            vec![7; 32],
+            &[8; 32],
+            &store,
+        )
+        .unwrap();
+        for (command, result) in &committed {
+            assert_eq!(dormant.execute_committed(command.clone(), &[8; 32], &mut store).unwrap(), *result);
+        }
+        let fresh = bus_begin(&subject, &identity, &wallet, "22222222-2222-4333-8444-555555555555");
+        assert_eq!(
+            dormant.execute_committed(fresh, &[8; 32], &mut store),
+            Err(RuntimeError::WriterDisabled)
+        );
+        assert_eq!(dormant.committed_state_hash(), head_hash);
+        assert_eq!(v70_sorted_artifacts(&store), archived);
+    }
+
+    #[test]
+    fn v70_conflicting_request_id_reuse_fails_closed() {
+        let V70Lineage { live, mut store, committed, .. } = v70_lineage();
+        let archived = v70_sorted_artifacts(&store);
+        let checkpoint = checkpoint_fixture(&live, &store);
+        let restarted = DirectRuntime::restore_committed(
+            SealedEpoch::load(epoch_path()).unwrap(),
+            RuntimeMode::IsolatedTest,
+            vec![7; 32],
+            &[8; 32],
+            &store,
+        )
+        .unwrap();
+        let checkpointed = runtime(RuntimeMode::IsolatedTest)
+            .restore_checkpoint(&checkpoint, &[8; 32])
+            .unwrap();
+        for mut recovered in [live, restarted, checkpointed] {
+            let head_hash = recovered.committed_state_hash();
+            let head_sequence = recovered.committed_sequence();
+            for (command, result) in &committed {
+                let conflict = v70_conflicting(command);
+                assert_eq!(recovered.existing_result(&conflict), Err(RuntimeError::RequestReuse));
+                assert!(matches!(
+                    recovered.prepare_candidate(conflict.clone(), &[8; 32]),
+                    Err(RuntimeError::RequestReuse)
+                ));
+                assert_eq!(recovered.execute(conflict.clone()), Err(RuntimeError::RequestReuse));
+                assert_eq!(
+                    recovered.execute_committed(conflict, &[8; 32], &mut store),
+                    Err(RuntimeError::RequestReuse)
+                );
+                // The original terminal result remains the only answer.
+                assert_eq!(recovered.existing_result(command).unwrap().as_ref(), Some(result));
+                assert_eq!(recovered.committed_state_hash(), head_hash);
+                assert_eq!(recovered.committed_sequence(), head_sequence);
+                assert_eq!(v70_sorted_artifacts(&store), archived);
+            }
+        }
+    }
+
+    #[test]
+    fn v70_committed_sequence_is_derived_from_request_map_cardinality() {
+        let V70Lineage { mut live, mut store, committed, subject, identity, wallet, .. } =
+            v70_lineage();
+        let artifacts = v70_sorted_artifacts(&store);
+        assert_eq!(artifacts.len(), committed.len());
+        assert_eq!(live.committed_sequence(), live.requests.len() as u64);
+        assert_eq!(live.committed_sequence(), committed.len() as u64);
+
+        let mut replay = runtime(RuntimeMode::IsolatedTest);
+        assert_eq!(replay.committed_sequence(), 0);
+        assert!(replay.requests.is_empty());
+        for (artifact, (command, result)) in artifacts.iter().zip(&committed) {
+            replay = replay.restore_next_committed(artifact, &[8; 32]).unwrap();
+            assert_eq!(replay.committed_sequence(), artifact.sequence);
+            assert_eq!(replay.requests.len() as u64, artifact.sequence);
+            assert_eq!(artifact.request_hash, command.request_hash);
+            assert_eq!(artifact.receipt, result.receipt);
+        }
+
+        // A command that errors records nothing and consumes no sequence.
+        let head = artifacts.last().unwrap();
+        let refused = bus_begin(&subject, &identity, &wallet, "22222222-2222-4333-8444-555555555555");
+        assert_eq!(
+            live.execute_committed(refused, &[8; 32], &mut store),
+            Err(RuntimeError::WithdrawalPending)
+        );
+        assert_eq!(live.committed_sequence(), head.sequence);
+        assert_eq!(live.requests.len() as u64, head.sequence);
+        assert_eq!(v70_sorted_artifacts(&store), artifacts);
+
+        // v70 has no explicit sequence: removing one historical request entry
+        // (a naive compaction) rewinds the sealed sequence and forgets the
+        // deduplication entry. v71 must not inherit this coupling.
+        let (first, _) = &committed[0];
+        let mut compacted = live.clone();
+        compacted
+            .requests
+            .remove(&(first.account_id.clone(), first.request_id.clone()))
+            .unwrap();
+        assert_eq!(compacted.committed_sequence(), head.sequence - 1);
+        assert_eq!(compacted.existing_result(first).unwrap(), None);
+        let resealed = compacted
+            .seal_artifact(&head.state_hash, &head.request_hash, &[8; 32], head.receipt.clone())
+            .unwrap();
+        assert_eq!(resealed.sequence, head.sequence - 1);
+    }
+
+    #[test]
+    fn v70_artifact_restore_preserves_terminal_results_and_financial_state_hash() {
+        let V70Lineage { live, store, committed, subject, identity, maker_order, .. } =
+            v70_lineage();
+        let artifacts = v70_sorted_artifacts(&store);
+        let head = artifacts.last().unwrap();
+        assert_eq!(head.state_hash, live.committed_state_hash());
+        for (artifact, (_, result)) in artifacts.iter().zip(&committed) {
+            assert_eq!(artifact.receipt, result.receipt);
+        }
+
+        let restored = DirectRuntime::restore_committed(
+            SealedEpoch::load(epoch_path()).unwrap(),
+            RuntimeMode::IsolatedTest,
+            vec![7; 32],
+            &[8; 32],
+            &store,
+        )
+        .unwrap();
+        let mut stepwise = runtime(RuntimeMode::IsolatedTest);
+        for artifact in &artifacts {
+            stepwise = stepwise.restore_next_committed(artifact, &[8; 32]).unwrap();
+        }
+        let checkpointed = runtime(RuntimeMode::IsolatedTest)
+            .restore_checkpoint(&checkpoint_fixture(&live, &store), &[8; 32])
+            .unwrap();
+
+        for (path, recovered) in [("full", &restored), ("stepwise", &stepwise), ("checkpoint", &checkpointed)] {
+            assert_eq!(recovered.committed_state_hash(), head.state_hash, "{path}");
+            assert_eq!(recovered.committed_sequence(), head.sequence, "{path}");
+            assert_eq!(recovered.balances, live.balances, "{path}");
+            assert_eq!(recovered.positions, live.positions, "{path}");
+            assert_eq!(recovered.market_collateral, live.market_collateral, "{path}");
+            assert_eq!(recovered.credited_custody_references, live.credited_custody_references, "{path}");
+            assert_eq!(recovered.orders[&maker_order].hold_atomic, live.orders[&maker_order].hold_atomic, "{path}");
+            assert_eq!(recovered.portfolio(&identity).unwrap(), live.portfolio(&identity).unwrap(), "{path}");
+            assert_eq!(
+                recovered.portfolio(V70_MAKER_IDENTITY).unwrap(),
+                live.portfolio(V70_MAKER_IDENTITY).unwrap(),
+                "{path}"
+            );
+            assert_eq!(
+                recovered.pending_usdc_bus_withdrawal(&subject, BUS_ID),
+                live.pending_usdc_bus_withdrawal(&subject, BUS_ID),
+                "{path}"
+            );
+            for (command, result) in &committed {
+                let recovered_result = recovered.existing_result(command).unwrap().unwrap();
+                assert_eq!(&recovered_result, result, "{path}");
+                assert!(verify_receipt(&[7; 32], &recovered_result.receipt), "{path}");
+            }
+        }
+    }
+
+    #[test]
+    fn v70_checkpoint_validation_detects_missing_duplicated_reordered_and_modified_records() {
+        let V70Lineage { live, store, .. } = v70_lineage();
+        let checkpoint = checkpoint_fixture(&live, &store);
+        let records = &checkpoint.receipt_records;
+        assert_eq!(records.len(), 5);
+        assert_eq!(live.validate_checkpoint_records(&checkpoint), Ok(()));
+        assert!(runtime(RuntimeMode::IsolatedTest).restore_checkpoint(&checkpoint, &[8; 32]).is_ok());
+
+        let mut variants: Vec<(&str, DirectCheckpoint)> = Vec::new();
+        let mut changed = checkpoint.clone();
+        changed.receipt_records.remove(1);
+        variants.push(("missing", changed));
+        let mut changed = checkpoint.clone();
+        changed.receipt_records.remove(1);
+        changed.artifact_hashes.remove(1);
+        variants.push(("missing-with-hash", changed));
+        let mut changed = checkpoint.clone();
+        changed.receipt_records.insert(2, records[1].clone());
+        changed.artifact_hashes.insert(2, checkpoint.artifact_hashes[1].clone());
+        variants.push(("duplicated", changed));
+        let mut changed = checkpoint.clone();
+        changed.receipt_records[2] = DirectStateArtifact {
+            sequence: records[2].sequence,
+            prior_state_hash: records[2].prior_state_hash.clone(),
+            state_hash: records[2].state_hash.clone(),
+            ..records[1].clone()
+        };
+        variants.push(("duplicated-rechained", changed));
+        let mut changed = checkpoint.clone();
+        changed.receipt_records.swap(1, 2);
+        variants.push(("reordered", changed));
+        let mut changed = checkpoint.clone();
+        changed.receipt_records[1].receipt.effect = "TAMPERED".into();
+        variants.push(("modified-effect", changed));
+        let mut changed = checkpoint.clone();
+        changed.receipt_records[1].receipt.signature = "0".repeat(64);
+        variants.push(("modified-signature", changed));
+        let mut changed = checkpoint.clone();
+        changed.receipt_records[1].request_hash = "b".repeat(64);
+        variants.push(("modified-request-hash", changed));
+        let mut changed = checkpoint.clone();
+        changed.receipt_records[1].state_hash = "b".repeat(64);
+        variants.push(("modified-root", changed));
+        let mut changed = checkpoint.clone();
+        changed.receipt_records[1].ciphertext = vec![1];
+        variants.push(("modified-ciphertext", changed));
+        let mut changed = checkpoint.clone();
+        changed.receipt_records[4].receipt.amount_atomic = Some("1".into());
+        variants.push(("modified-head", changed));
+
+        for (name, changed) in &variants {
+            assert_eq!(live.validate_checkpoint_records(changed), Err(RuntimeError::StateArtifact), "{name}");
+            assert!(
+                live.seal_checkpoint(
+                    checkpoint.artifact.clone(),
+                    changed.receipt_records.clone(),
+                    changed.artifact_hashes.clone(),
+                    &[8; 32],
+                )
+                .is_err(),
+                "{name}"
+            );
+            assert!(runtime(RuntimeMode::IsolatedTest).restore_checkpoint(changed, &[8; 32]).is_err(), "{name}");
+            // Structural validation fails closed even under a valid MAC.
+            let mut resigned = changed.clone();
+            resigned.signature = sign(&[7; 32], &resigned.signature_bytes().unwrap());
+            assert!(runtime(RuntimeMode::IsolatedTest).restore_checkpoint(&resigned, &[8; 32]).is_err(), "{name}");
+        }
+
+        // Characterization gap: structural validation binds each receipt to
+        // the request map and a contiguous root chain, not to its original
+        // position. A swap re-chained to the original sequences and roots is
+        // rejected only by the checkpoint MAC.
+        let mut rechained = checkpoint.clone();
+        rechained.receipt_records[1] = DirectStateArtifact {
+            sequence: records[1].sequence,
+            prior_state_hash: records[1].prior_state_hash.clone(),
+            state_hash: records[1].state_hash.clone(),
+            ..records[2].clone()
+        };
+        rechained.receipt_records[2] = DirectStateArtifact {
+            sequence: records[2].sequence,
+            prior_state_hash: records[2].prior_state_hash.clone(),
+            state_hash: records[2].state_hash.clone(),
+            ..records[1].clone()
+        };
+        assert_eq!(live.validate_checkpoint_records(&rechained), Ok(()));
+        assert!(runtime(RuntimeMode::IsolatedTest).restore_checkpoint(&rechained, &[8; 32]).is_err());
+    }
+
+    #[derive(Debug)]
+    struct V70StateBytes {
+        total: usize,
+        request_history: usize,
+        sealed_artifact: usize,
+    }
+
+    /// Serialized sizes of the exact v70 encrypted snapshot. The artifact is
+    /// sealed only in memory and is never persisted.
+    fn v70_state_bytes(live: &DirectRuntime) -> V70StateBytes {
+        let state = live.snapshot();
+        let (_, (hash, result)) = live.requests.iter().next_back().unwrap();
+        let artifact = live
+            .seal_artifact(&live.state_hash(), hash, &[8; 32], result.receipt.clone())
+            .unwrap();
+        V70StateBytes {
+            total: serde_cbor::to_vec(&state).unwrap().len(),
+            request_history: serde_cbor::to_vec(&state.requests).unwrap().len(),
+            sealed_artifact: serde_cbor::to_vec(&artifact).unwrap().len(),
+        }
+    }
+
+    /// Money-free terminal rejections grow only the request history.
+    fn v70_append_money_free_rejections(
+        live: &mut DirectRuntime,
+        subject: &str,
+        identity: &str,
+        wallet: &str,
+        count: u64,
+    ) {
+        for _ in 0..count {
+            let id = Uuid::from_u128(0x70707070222243338444000000000000 + live.committed_sequence() as u128)
+                .to_string();
+            let result = live
+                .execute(request_for(
+                    subject,
+                    identity,
+                    &id,
+                    DirectAction::BeginUsdcBusWithdrawal {
+                        withdrawal_id: id.clone(),
+                        destination_chain: "arbitrum".into(),
+                        asset: "USDC".into(),
+                        destination: wallet.into(),
+                        amount_atomic: "999999999999999".into(),
+                    },
+                ))
+                .unwrap();
+            assert_eq!(result.effect, "WITHDRAWAL_REJECTED");
+        }
+    }
+
+    #[test]
+    fn v70_request_history_accounts_for_all_synthetic_state_growth() {
+        let (mut live, subject, identity, wallet, _) = bus_fixture();
+        let before = v70_state_bytes(&live);
+        let sequence = live.committed_sequence();
+        let balances = live.balances.clone();
+        v70_append_money_free_rejections(&mut live, &subject, &identity, &wallet, 64);
+        let after = v70_state_bytes(&live);
+        assert_eq!(live.committed_sequence(), sequence + 64);
+        assert_eq!(live.requests.len() as u64, sequence + 64);
+        assert_eq!(live.balances, balances);
+        assert_eq!(after.total - after.request_history, before.total - before.request_history);
+        assert!(after.request_history > before.request_history);
+        assert!(after.sealed_artifact > after.total);
+    }
+
+    #[test]
+    #[ignore = "local measurement; run with --ignored --nocapture"]
+    fn v70_measure_serialized_state_bytes_by_request_history() {
+        let (mut live, subject, identity, wallet, _) = bus_fixture();
+        let base_sequence = live.committed_sequence();
+        let base = v70_state_bytes(&live);
+        println!(
+            "requests,total_state_bytes,request_history_bytes,non_request_bytes,sealed_artifact_cbor_bytes,incremental_request_bytes,incremental_bytes_per_request"
+        );
+        for target in [base_sequence, 1_000, 10_000, 50_000] {
+            let missing = target - live.committed_sequence();
+            v70_append_money_free_rejections(&mut live, &subject, &identity, &wallet, missing);
+            let bytes = v70_state_bytes(&live);
+            let added = live.committed_sequence() - base_sequence;
+            let incremental = bytes.request_history - base.request_history;
+            assert_eq!(bytes.total - bytes.request_history, base.total - base.request_history);
+            println!(
+                "{},{},{},{},{},{},{}",
+                live.committed_sequence(),
+                bytes.total,
+                bytes.request_history,
+                bytes.total - bytes.request_history,
+                bytes.sealed_artifact,
+                incremental,
+                if added == 0 { 0 } else { incremental as u64 / added },
+            );
+        }
+    }
 }
