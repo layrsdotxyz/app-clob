@@ -3,6 +3,13 @@
 Status: audit only. No Rust, Cargo, parent, enclave-binary, AWS, or deployment
 file was changed. This document does not authorize any rollout.
 
+Codex integration decision after this audit: the never-pruned logical key set
+is represented inside the enclave by the authenticated sparse root implemented
+in `src/request_index.rs`, not by the in-enclave `BTreeMap` sketched in Section
+5. The field and replay requirements below apply to authenticated leaves and
+archive records. This keeps enclave bytes bounded while preserving every
+load-bearing request identity identified by the audit.
+
 - Contract: `FULL_STATE_JOURNAL_V71_CONTRACT.md` ("Compact request history",
   "Existing v70 invariants", "Rollback").
 - Code audited: branch `claude/layrs-v71-compaction-audit-20260928`, HEAD
