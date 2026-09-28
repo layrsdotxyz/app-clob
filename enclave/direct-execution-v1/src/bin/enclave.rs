@@ -38,6 +38,7 @@ struct EnclaveState {
     nsm_fd: i32,
     runtime: DirectRuntime,
     v71_runtime: Option<DirectV71Runtime>,
+    v71_writer_eligible: bool,
     epoch: SealedEpoch,
     mode: RuntimeMode,
     receipt_key: Vec<u8>,
@@ -49,6 +50,7 @@ struct EnclaveState {
     committed_restore_frontier: Option<layrs_direct_execution_v1::CommittedRestoreFrontier>,
     pending_governed_bootstrap: Option<PendingGovernedBootstrap>,
     writer_grant_commitment: Option<String>,
+    old_writer_fence_evidence_sha256: Option<String>,
     writer_grant_expires_at_unix: Option<u64>,
     key_release_artifact_hash: Option<String>,
 }
@@ -93,6 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         nsm_fd,
         runtime: DirectRuntime::new(epoch.clone(), mode, receipt_key.clone())?,
         v71_runtime: None,
+        v71_writer_eligible: false,
         epoch,
         mode,
         receipt_key,
@@ -104,6 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         committed_restore_frontier: None,
         pending_governed_bootstrap: None,
         writer_grant_commitment: None,
+        old_writer_fence_evidence_sha256: None,
         writer_grant_expires_at_unix: None,
         key_release_artifact_hash: None,
     }));
@@ -134,8 +138,12 @@ where
             RuntimeResponse::Status {
                 status: runtime_binding(
                     state.runtime.identity_count(),
-                    state.recovery_complete && state.runtime.writer_enabled(),
-                    state.recovery_complete && state.runtime.admission_enabled(),
+                    state.recovery_complete
+                        && (state.v71_runtime.is_none() || state.v71_writer_eligible)
+                        && state.runtime.writer_enabled(),
+                    state.recovery_complete
+                        && (state.v71_runtime.is_none() || state.v71_writer_eligible)
+                        && state.runtime.admission_enabled(),
                     state.writer_grant_commitment.clone(),
                     state.writer_grant_expires_at_unix,
                     state.key_release_artifact_hash.clone(),
@@ -196,6 +204,7 @@ where
             expected_transition_root,
             expected_request_index_root,
             expected_financial_state_root,
+            writer_fence_evidence_sha256,
         } => {
             finish_journal_restore(
                 state,
@@ -204,6 +213,7 @@ where
                 expected_transition_root,
                 expected_request_index_root,
                 expected_financial_state_root,
+                writer_fence_evidence_sha256,
             )
             .await
         }
@@ -265,7 +275,14 @@ where
                     code: "IDENTITY_DENIED".into(),
                 }
             } else {
-                match state.runtime.portfolio(&identity_commitment) {
+                let portfolio = match &state.v71_runtime {
+                    Some(runtime) => runtime.portfolio(&identity_commitment),
+                    None => state
+                        .runtime
+                        .portfolio(&identity_commitment)
+                        .map_err(Into::into),
+                };
+                match portfolio {
                     Ok(portfolio) => RuntimeResponse::Portfolio { portfolio },
                     Err(_) => RuntimeResponse::Error {
                         code: "IDENTITY_DENIED".into(),
@@ -520,7 +537,11 @@ where
             }
         }
     };
+    let old_writer_fence_evidence_sha256 =
+        pending.grant.old_writer_fence_evidence_sha256.clone();
     state.runtime = runtime;
+    state.v71_runtime = None;
+    state.v71_writer_eligible = false;
     state.mode = pending.requested_mode;
     state.receipt_key = receipt_key;
     state.state_key = state_key;
@@ -528,6 +549,7 @@ where
     state.writer_grant_expires_at_unix = Some(pending.grant.expires_at_unix);
     state.committed_restore_frontier = pending.grant.committed_restore_frontier;
     state.writer_grant_commitment = Some(writer_grant_commitment.clone());
+    state.old_writer_fence_evidence_sha256 = Some(old_writer_fence_evidence_sha256);
     state.key_release_artifact_hash = Some(key_release_artifact_hash);
     RuntimeResponse::GovernedBootstrapComplete {
         writer_grant_commitment,
@@ -616,6 +638,8 @@ async fn bootstrap_isolated(
         }
     };
     state.runtime = runtime;
+    state.v71_runtime = None;
+    state.v71_writer_eligible = false;
     state.mode = RuntimeMode::IsolatedTest;
     state.receipt_key = receipt_key;
     state.state_key = state_key;
@@ -948,6 +972,7 @@ async fn activate_v71_migration(
     }
     state.runtime = runtime.financial_runtime().clone();
     state.v71_runtime = Some(runtime);
+    state.v71_writer_eligible = true;
     response
 }
 
@@ -1004,10 +1029,11 @@ async fn finish_journal_restore(
     expected_transition_root: String,
     expected_request_index_root: String,
     expected_financial_state_root: String,
+    writer_fence_evidence_sha256: Option<String>,
 ) -> RuntimeResponse {
     let _transition = transition(&state).await;
     let mut state = state.lock().await;
-    let Some(candidate) = state.v71_restore_candidate.take() else {
+    let Some(mut candidate) = state.v71_restore_candidate.take() else {
         return RuntimeResponse::Error {
             code: "JOURNAL_RESTORE_NOT_STARTED".into(),
         };
@@ -1030,6 +1056,41 @@ async fn finish_journal_restore(
             code: "JOURNAL_RESTORE_FINAL_HEAD_MISMATCH".into(),
         };
     }
+    let authorized_writer_epoch = match state.mode {
+        RuntimeMode::IsolatedTest => "isolated-writer-1".to_string(),
+        RuntimeMode::AdmissionOnly | RuntimeMode::ProductionEnabled => {
+            let Some(epoch) = state.writer_grant_commitment.clone() else {
+                return RuntimeResponse::Error {
+                    code: "JOURNAL_WRITER_EPOCH_UNAUTHORIZED".into(),
+                };
+            };
+            epoch
+        }
+        RuntimeMode::Dormant => {
+            return RuntimeResponse::Error {
+                code: "JOURNAL_WRITER_EPOCH_UNAUTHORIZED".into(),
+            }
+        }
+    };
+    if candidate.writer_epoch() != authorized_writer_epoch {
+        let fence_matches = writer_fence_evidence_sha256
+            .as_ref()
+            .zip(state.old_writer_fence_evidence_sha256.as_ref())
+            .is_some_and(|(actual, governed)| actual == governed);
+        if !fence_matches {
+            return RuntimeResponse::Error {
+                code: "JOURNAL_WRITER_FENCE_REQUIRED".into(),
+            };
+        }
+        candidate = match candidate.authorize_writer_epoch(authorized_writer_epoch) {
+            Ok(candidate) => candidate,
+            Err(_) => {
+                return RuntimeResponse::Error {
+                    code: "JOURNAL_WRITER_EPOCH_UNAUTHORIZED".into(),
+                }
+            }
+        };
+    }
     if let Some(current) = &state.v71_runtime {
         if current.sequence() != candidate.sequence()
             || current.record_hash() != candidate.record_hash()
@@ -1045,6 +1106,7 @@ async fn finish_journal_restore(
     }
     state.runtime = candidate.financial_runtime().clone();
     state.v71_runtime = Some(candidate);
+    state.v71_writer_eligible = true;
     state.recovery_complete = true;
     RuntimeResponse::JournalRestoreComplete {
         writer_epoch: state
@@ -1067,6 +1129,7 @@ async fn seal_journal_checkpoint(state: Arc<Mutex<EnclaveState>>) -> RuntimeResp
         if !state.recovery_complete
             || state.restore_candidate.is_some()
             || state.v71_restore_candidate.is_some()
+            || !state.v71_writer_eligible
         {
             None
         } else {
@@ -1255,6 +1318,16 @@ where
             )
             .await;
         };
+        if !committed.v71_writer_eligible {
+            drop(committed);
+            return write_response(
+                stream,
+                RuntimeResponse::Error {
+                    code: "JOURNAL_WRITER_NOT_ELIGIBLE".into(),
+                },
+            )
+            .await;
+        }
         let signing_key = derive_journal_signing_key(&committed.state_key).map_err(invalid)?;
         (
             runtime,
@@ -1421,7 +1494,8 @@ async fn attest(state: &Arc<Mutex<EnclaveState>>, nonce: Vec<u8>) -> RuntimeResp
 }
 
 fn quest_evidence_gate(state:&EnclaveState)->Result<(),&'static str> {
-    if !state.recovery_complete||state.restore_candidate.is_some() {return Err("DIRECT_STATE_RECOVERY_REQUIRED");}
+    if !state.recovery_complete||state.restore_candidate.is_some()||state.v71_restore_candidate.is_some() {return Err("DIRECT_STATE_RECOVERY_REQUIRED");}
+    if state.v71_runtime.is_some()&&!state.v71_writer_eligible {return Err("DIRECT_WRITER_DISABLED");}
     if !state.runtime.writer_enabled() {return Err("DIRECT_WRITER_DISABLED");}
     let now=SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|duration|duration.as_secs());
     if state.mode==RuntimeMode::ProductionEnabled && !state.writer_grant_expires_at_unix.zip(now).is_some_and(|(expiry,now)|expiry>now) {
@@ -1655,6 +1729,7 @@ mod tests {
             nsm_fd: -1,
             runtime: DirectRuntime::new(epoch.clone(), mode, receipt_key.clone()).unwrap(),
             v71_runtime: None,
+            v71_writer_eligible: false,
             epoch,
             mode,
             receipt_key,
@@ -1666,6 +1741,7 @@ mod tests {
             committed_restore_frontier: None,
             pending_governed_bootstrap: None,
             writer_grant_commitment: None,
+            old_writer_fence_evidence_sha256: None,
             writer_grant_expires_at_unix: None,
             key_release_artifact_hash: None,
         }))
@@ -1677,6 +1753,7 @@ mod tests {
             nsm_fd: -1,
             runtime: DirectRuntime::new(epoch.clone(), RuntimeMode::Dormant, vec![0; 32]).unwrap(),
             v71_runtime: None,
+            v71_writer_eligible: false,
             epoch,
             mode: RuntimeMode::Dormant,
             receipt_key: vec![0; 32],
@@ -1688,6 +1765,7 @@ mod tests {
             committed_restore_frontier: None,
             pending_governed_bootstrap: None,
             writer_grant_commitment: None,
+            old_writer_fence_evidence_sha256: None,
             writer_grant_expires_at_unix: None,
             key_release_artifact_hash: None,
         }))
@@ -2000,6 +2078,7 @@ mod tests {
         let runtime = DirectV71Runtime::new_empty(state.runtime.clone(), "isolated-writer-1".into())
             .unwrap();
         state.v71_runtime = Some(runtime);
+        state.v71_writer_eligible = true;
         state.recovery_complete = true;
     }
     async fn commit_journal_through_parent_callback(
@@ -2198,6 +2277,7 @@ mod tests {
                 expected_transition_root: transition_root,
                 expected_request_index_root: request_index_root,
                 expected_financial_state_root: financial_state_root,
+                writer_fence_evidence_sha256: None,
             },
         )
         .await;
@@ -2208,6 +2288,84 @@ mod tests {
         let restarted = restarted.lock().await;
         assert!(restarted.recovery_complete);
         assert_eq!(restarted.v71_runtime.as_ref().unwrap().sequence(), 1);
+    }
+
+    #[tokio::test]
+    async fn journal_restore_requires_the_governed_fence_before_writer_epoch_handoff() {
+        let live = state();
+        activate_empty_journal(&live).await;
+        {
+            let mut state = live.lock().await;
+            let runtime = state
+                .v71_runtime
+                .take()
+                .unwrap()
+                .authorize_writer_epoch("retired-writer-epoch".into())
+                .unwrap();
+            state.v71_runtime = Some(runtime);
+        }
+        let sealed = runtime_response(Arc::clone(&live), RuntimeRequest::SealJournalCheckpoint).await;
+        let RuntimeResponse::JournalCheckpointSealed { checkpoint } = sealed else {
+            panic!("journal checkpoint was not sealed");
+        };
+        let finish = |evidence| RuntimeRequest::FinishJournalRestore {
+            expected_sequence: checkpoint.sequence,
+            expected_record_hash: checkpoint.record_hash.clone(),
+            expected_transition_root: checkpoint.transition_root.clone(),
+            expected_request_index_root: checkpoint.request_index_root.clone(),
+            expected_financial_state_root: checkpoint.financial_state_root.clone(),
+            writer_fence_evidence_sha256: evidence,
+        };
+
+        let rejected = state();
+        rejected.lock().await.old_writer_fence_evidence_sha256 = Some("a".repeat(64));
+        assert!(matches!(
+            runtime_response(
+                Arc::clone(&rejected),
+                RuntimeRequest::BeginJournalRestore {
+                    checkpoint: checkpoint.clone(),
+                }
+            )
+            .await,
+            RuntimeResponse::JournalRestoreProgress { .. }
+        ));
+        assert!(matches!(
+            runtime_response(Arc::clone(&rejected), finish(Some("b".repeat(64)))).await,
+            RuntimeResponse::Error { ref code } if code == "JOURNAL_WRITER_FENCE_REQUIRED"
+        ));
+        let rejected = rejected.lock().await;
+        assert!(rejected.v71_runtime.is_none());
+        assert!(!rejected.v71_writer_eligible);
+        drop(rejected);
+
+        let restored = state();
+        restored.lock().await.old_writer_fence_evidence_sha256 = Some("a".repeat(64));
+        assert!(matches!(
+            runtime_response(
+                Arc::clone(&restored),
+                RuntimeRequest::BeginJournalRestore {
+                    checkpoint: checkpoint.clone(),
+                }
+            )
+            .await,
+            RuntimeResponse::JournalRestoreProgress { .. }
+        ));
+        let complete = runtime_response(
+            Arc::clone(&restored),
+            finish(Some("a".repeat(64))),
+        )
+        .await;
+        assert!(matches!(
+            complete,
+            RuntimeResponse::JournalRestoreComplete { ref writer_epoch, .. }
+                if writer_epoch == "isolated-writer-1"
+        ));
+        let restored = restored.lock().await;
+        assert!(restored.v71_writer_eligible);
+        assert_eq!(
+            restored.v71_runtime.as_ref().unwrap().writer_epoch(),
+            "isolated-writer-1"
+        );
     }
 
     #[tokio::test]
@@ -2342,6 +2500,7 @@ mod tests {
             nsm_fd: -1,
             runtime: DirectRuntime::new(epoch.clone(), RuntimeMode::Dormant, vec![0; 32]).unwrap(),
             v71_runtime: None,
+            v71_writer_eligible: false,
             epoch,
             mode: RuntimeMode::Dormant,
             receipt_key: vec![0; 32],
@@ -2353,6 +2512,7 @@ mod tests {
             committed_restore_frontier: None,
             pending_governed_bootstrap: None,
             writer_grant_commitment: None,
+            old_writer_fence_evidence_sha256: None,
             writer_grant_expires_at_unix: None,
             key_release_artifact_hash: None,
         }));

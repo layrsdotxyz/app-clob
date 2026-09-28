@@ -3730,6 +3730,8 @@ pub enum RuntimeRequest {
         expected_transition_root: String,
         expected_request_index_root: String,
         expected_financial_state_root: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        writer_fence_evidence_sha256: Option<String>,
     },
     SealJournalCheckpoint,
     SealV70Migration,

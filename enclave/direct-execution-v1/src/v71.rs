@@ -18,7 +18,7 @@ use crate::{
         financial_state_root, restore_checkpoint, seal_checkpoint, DirectV71Checkpoint,
         V71CheckpointError,
     },
-    DirectRequest, DirectResult, DirectRuntime, RuntimeError,
+    DirectPortfolio, DirectRequest, DirectResult, DirectRuntime, RuntimeError,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -401,7 +401,11 @@ impl DirectV71Runtime {
         journal_verification_key: &[u8],
     ) -> Result<(Self, DirectResult), V71Error> {
         let payload = record.open_successor(
-            &self.writer_epoch,
+            // A retained tail may cross a governed writer handoff. The
+            // record's signed epoch is authoritative for that historical
+            // transition; parent restore separately verifies the matching
+            // immutable fence before writer eligibility.
+            &record.writer_epoch,
             self.sequence
                 .checked_add(1)
                 .ok_or(V71Error::StaleCandidate)?,
@@ -496,6 +500,26 @@ impl DirectV71Runtime {
 
     pub fn financial_runtime(&self) -> &DirectRuntime {
         &self.runtime
+    }
+
+    /// The compact financial runtime intentionally has no historical request
+    /// map, so its v70-derived ordinal is always zero. Public read models must
+    /// expose the authenticated journal head instead.
+    pub fn portfolio(&self, identity: &str) -> Result<DirectPortfolio, V71Error> {
+        let mut portfolio = self.runtime.portfolio(identity)?;
+        portfolio.genesis_ordinal = self.sequence;
+        Ok(portfolio)
+    }
+
+    /// Changes only the authority epoch used by the next record. The caller
+    /// must first authenticate the governed writer fence; financial state and
+    /// every committed head root remain unchanged.
+    pub fn authorize_writer_epoch(mut self, writer_epoch: String) -> Result<Self, V71Error> {
+        if writer_epoch.is_empty() || writer_epoch.len() > 128 {
+            return Err(V71Error::StaleCandidate);
+        }
+        self.writer_epoch = writer_epoch;
+        Ok(self)
     }
 
     pub fn financial_state_root(&self) -> Result<String, V71Error> {
@@ -699,6 +723,52 @@ mod tests {
                 &journal_verifying_key(&[8; 32]).unwrap(),
             )
             .is_err());
+    }
+
+    #[test]
+    fn governed_writer_handoff_preserves_head_and_restores_the_first_successor() {
+        let opening = runtime();
+        let opening_head = (
+            opening.sequence(),
+            opening.record_hash().to_string(),
+            opening.transition_root().to_string(),
+            opening.request_index_root().to_string(),
+            opening.financial_state_root().unwrap(),
+        );
+        let next_writer = opening
+            .clone()
+            .authorize_writer_epoch("writer-epoch-2".into())
+            .unwrap();
+        assert_eq!(
+            opening_head,
+            (
+                next_writer.sequence(),
+                next_writer.record_hash().to_string(),
+                next_writer.transition_root().to_string(),
+                next_writer.request_index_root().to_string(),
+                next_writer.financial_state_root().unwrap(),
+            )
+        );
+        let account = "a".repeat(64);
+        let wallet = "0x1111111111111111111111111111111111111111";
+        let candidate = next_writer
+            .prepare_candidate(
+                admission(&account, "request-1", wallet),
+                &SparseRequestProof::empty_tree(),
+                &[7; 32],
+                &[8; 32],
+            )
+            .unwrap();
+        let record = candidate.record().clone();
+        assert_eq!(record.writer_epoch, "writer-epoch-2");
+
+        let restored = opening
+            .restore_next(&record, &[7; 32], &journal_verifying_key(&[8; 32]).unwrap())
+            .unwrap();
+        assert_eq!(restored.writer_epoch(), "writer-epoch-2");
+        assert_eq!(restored.sequence(), 1);
+        let identity = identity_commitment_for(&account, wallet);
+        assert_eq!(restored.portfolio(&identity).unwrap().genesis_ordinal, 1);
     }
 
     #[test]
