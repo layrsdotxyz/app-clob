@@ -46,6 +46,8 @@ pub struct DirectJournalRecord {
     pub previous_record_hash: String,
     pub previous_transition_root: String,
     pub transition_root: String,
+    pub previous_request_index_root: String,
+    pub request_index_root: String,
     pub account_id: String,
     pub request_id: String,
     pub request_hash: String,
@@ -67,6 +69,8 @@ struct JournalAssociatedData<'a> {
     previous_record_hash: &'a str,
     previous_transition_root: &'a str,
     transition_root: &'a str,
+    previous_request_index_root: &'a str,
+    request_index_root: &'a str,
     account_id: &'a str,
     request_id: &'a str,
     request_hash: &'a str,
@@ -81,6 +85,8 @@ impl DirectJournalRecord {
         sequence: u64,
         previous_record_hash: &str,
         previous_transition_root: &str,
+        previous_request_index_root: &str,
+        request_index_root: &str,
         request: DirectRequest,
         result: DirectResult,
         state_key: &[u8],
@@ -92,6 +98,9 @@ impl DirectJournalRecord {
             || sequence == 0
             || !digest(previous_record_hash)
             || !digest(previous_transition_root)
+            || !digest(previous_request_index_root)
+            || !digest(request_index_root)
+            || previous_request_index_root == request_index_root
             || state_key.len() != 32
             || signing_key_seed.len() != 32
             || receipt_key.len() != 32
@@ -114,6 +123,7 @@ impl DirectJournalRecord {
             sequence,
             &committed_request_hash,
             &result_hash,
+            request_index_root,
         );
         let nonce = journal_nonce(writer_epoch, sequence, &committed_request_hash)?;
         let associated_data = associated_data(
@@ -122,6 +132,8 @@ impl DirectJournalRecord {
             previous_record_hash,
             previous_transition_root,
             &transition_root,
+            previous_request_index_root,
+            request_index_root,
             &account_id,
             &request_id,
             &committed_request_hash,
@@ -147,6 +159,8 @@ impl DirectJournalRecord {
             previous_record_hash: previous_record_hash.into(),
             previous_transition_root: previous_transition_root.into(),
             transition_root,
+            previous_request_index_root: previous_request_index_root.into(),
+            request_index_root: request_index_root.into(),
             account_id,
             request_id,
             request_hash: committed_request_hash,
@@ -168,6 +182,7 @@ impl DirectJournalRecord {
         expected_sequence: u64,
         expected_previous_record_hash: &str,
         expected_previous_transition_root: &str,
+        expected_previous_request_index_root: &str,
         state_key: &[u8],
         verification_key: &[u8],
         receipt_key: &[u8],
@@ -178,6 +193,7 @@ impl DirectJournalRecord {
             || self.sequence != expected_sequence
             || self.previous_record_hash != expected_previous_record_hash
             || self.previous_transition_root != expected_previous_transition_root
+            || self.previous_request_index_root != expected_previous_request_index_root
             || self.nonce.len() != 12
             || state_key.len() != 32
             || verification_key.len() != 32
@@ -186,6 +202,8 @@ impl DirectJournalRecord {
                 self.previous_record_hash.as_str(),
                 self.previous_transition_root.as_str(),
                 self.transition_root.as_str(),
+                self.previous_request_index_root.as_str(),
+                self.request_index_root.as_str(),
                 self.request_hash.as_str(),
                 self.receipt_hash.as_str(),
                 self.result_hash.as_str(),
@@ -201,6 +219,7 @@ impl DirectJournalRecord {
                     self.sequence,
                     &self.request_hash,
                     &self.result_hash,
+                    &self.request_index_root,
                 )
         {
             return Err(JournalError::Invalid);
@@ -212,6 +231,8 @@ impl DirectJournalRecord {
             &self.previous_record_hash,
             &self.previous_transition_root,
             &self.transition_root,
+            &self.previous_request_index_root,
+            &self.request_index_root,
             &self.account_id,
             &self.request_id,
             &self.request_hash,
@@ -259,12 +280,14 @@ pub fn transition_root(
     sequence: u64,
     request_hash: &str,
     result_hash: &str,
+    request_index_root: &str,
 ) -> String {
     let mut bytes = Vec::with_capacity(
         JOURNAL_TRANSITION_DOMAIN.len()
             + previous_transition_root.len()
             + request_hash.len()
             + result_hash.len()
+            + request_index_root.len()
             + 8,
     );
     bytes.extend_from_slice(JOURNAL_TRANSITION_DOMAIN);
@@ -272,6 +295,7 @@ pub fn transition_root(
     bytes.extend_from_slice(&sequence.to_be_bytes());
     bytes.extend_from_slice(request_hash.as_bytes());
     bytes.extend_from_slice(result_hash.as_bytes());
+    bytes.extend_from_slice(request_index_root.as_bytes());
     sha256(&bytes)
 }
 
@@ -281,6 +305,8 @@ fn associated_data(
     previous_record_hash: &str,
     previous_transition_root: &str,
     transition_root: &str,
+    previous_request_index_root: &str,
+    request_index_root: &str,
     account_id: &str,
     request_id: &str,
     request_hash: &str,
@@ -295,6 +321,8 @@ fn associated_data(
         previous_record_hash,
         previous_transition_root,
         transition_root,
+        previous_request_index_root,
+        request_index_root,
         account_id,
         request_id,
         request_hash,
@@ -423,6 +451,8 @@ mod tests {
             1,
             &"a".repeat(64),
             &"b".repeat(64),
+            &"e".repeat(64),
+            &"f".repeat(64),
             request,
             result,
             &[7; 32],
@@ -446,6 +476,7 @@ mod tests {
                 1,
                 &"a".repeat(64),
                 &"b".repeat(64),
+                &"e".repeat(64),
                 &[7; 32],
                 &journal_public_key(),
                 &[9; 32],
@@ -464,6 +495,7 @@ mod tests {
                 2,
                 &"a".repeat(64),
                 &"b".repeat(64),
+                &"e".repeat(64),
                 &[7; 32],
                 &journal_public_key(),
                 &[9; 32],
@@ -476,6 +508,7 @@ mod tests {
                 1,
                 &"d".repeat(64),
                 &"b".repeat(64),
+                &"e".repeat(64),
                 &[7; 32],
                 &journal_public_key(),
                 &[9; 32],
@@ -494,6 +527,7 @@ mod tests {
                 1,
                 &"a".repeat(64),
                 &"b".repeat(64),
+                &"e".repeat(64),
                 &[7; 32],
                 &journal_public_key(),
                 &[9; 32],
@@ -508,6 +542,7 @@ mod tests {
                 1,
                 &"a".repeat(64),
                 &"b".repeat(64),
+                &"e".repeat(64),
                 &[7; 32],
                 &journal_public_key(),
                 &[9; 32],
@@ -532,6 +567,8 @@ mod tests {
             2,
             &first.record_hash().unwrap(),
             &first.transition_root,
+            &first.request_index_root,
+            &"1".repeat(64),
             request,
             result,
             &[7; 32],
@@ -545,6 +582,7 @@ mod tests {
                 2,
                 &first.record_hash().unwrap(),
                 &first.transition_root,
+                &first.request_index_root,
                 &[7; 32],
                 &journal_public_key(),
                 &[9; 32],

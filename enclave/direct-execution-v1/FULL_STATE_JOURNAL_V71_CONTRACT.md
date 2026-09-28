@@ -69,6 +69,13 @@ An exact retry must return the same signed receipt after its archived bytes are
 verified against the retained digest. If those bytes are unavailable or do not
 match, the retry fails closed; it must never execute the command again.
 
+The bounded v71 form retains only an authenticated sparse request-index root in
+the enclave. For a new request, the parent must provide a valid non-membership
+proof against that root; for a retry, it must provide the terminal membership
+proof and the signed encrypted journal record named by the leaf. Missing,
+conflicting, or stale proofs fail closed. The parent cannot turn an existing
+request id into a new command by omitting history.
+
 ## v71 commit record
 
 Each committed mutation is represented by a canonical record containing at
@@ -80,6 +87,7 @@ least:
 - previous and next transition roots, where the next root commits to the
   predecessor, sequence, request, and terminal result without serializing the
   full state;
+- previous and next authenticated request-index roots;
 - account id, request id, and request hash commitments;
 - terminal result and signed receipt commitments;
 - encrypted canonical mutation payload;
@@ -87,7 +95,8 @@ least:
 
 The authenticated encryption associated data binds protocol, epoch, writer
 epoch, sequence, previous record hash, previous transition root, account,
-request id, request hash, signed receipt hash, and terminal result hash.
+request id, request hash, signed receipt hash, terminal result hash, and both
+request-index roots.
 Nonce construction must be unique for the state key and fail closed on any
 sequence reuse.
 
