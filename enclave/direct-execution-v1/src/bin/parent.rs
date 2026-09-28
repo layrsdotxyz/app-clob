@@ -193,6 +193,9 @@ enum PersistenceFormat {
     V70,
     V71,
     V71Hot,
+    /// v70 persistence over a sparse rollback archive that begins at the
+    /// governed grant's exact committed frontier. Never selected implicitly.
+    V70RollbackBaseline,
 }
 
 impl PersistenceFormat {
@@ -201,6 +204,7 @@ impl PersistenceFormat {
             None | Some("v70") => Ok(Self::V70),
             Some("v71") => Ok(Self::V71),
             Some("v71-hot") => Ok(Self::V71Hot),
+            Some("v70-rollback-baseline") => Ok(Self::V70RollbackBaseline),
             Some(_) => Err("invalid direct persistence format"),
         }
     }
@@ -208,12 +212,13 @@ impl PersistenceFormat {
 
 impl AppState {
     fn effective_persistence_format(&self) -> PersistenceFormat {
-        if self.persistence_format == PersistenceFormat::V71
-            || self.hot_v71_enabled.load(Ordering::Acquire)
-        {
-            PersistenceFormat::V71
-        } else {
-            PersistenceFormat::V70
+        match self.persistence_format {
+            PersistenceFormat::V71 => PersistenceFormat::V71,
+            PersistenceFormat::V71Hot if self.hot_v71_enabled.load(Ordering::Acquire) => {
+                PersistenceFormat::V71
+            }
+            PersistenceFormat::V71Hot => PersistenceFormat::V70,
+            other => other,
         }
     }
 }
@@ -1807,9 +1812,22 @@ impl ArchiveStore {
     }
     async fn prepare_restore_before_grant(&self, state: &AppState) -> Result<(), String> {
         match self {
+            Self::Filesystem(_)
+                if state.persistence_format == PersistenceFormat::V70RollbackBaseline =>
+            {
+                Err("v70 rollback baseline requires the S3 archive".into())
+            }
             // Filesystem archives are confined to isolated tests/dormant
             // packages and do not consume a governed production grant.
             Self::Filesystem(_) => Ok(()),
+            Self::S3(store)
+                if state.persistence_format == PersistenceFormat::V70RollbackBaseline =>
+            {
+                store
+                    .prepare_sparse_rollback_restore(sparse_rollback_frontier(state)?)
+                    .await
+                    .map(|_| ())
+            }
             Self::S3(store) => {
                 let journal_ready = match state.persistence_format {
                     PersistenceFormat::V70 => false,
@@ -2488,8 +2506,6 @@ fn validate_checkpoint_archive(
     Ok(sequence)
 }
 
-/// Concurrent create-only writes while materializing a v70 rollback package.
-const V70_ROLLBACK_WRITE_WIDTH: usize = 16;
 /// Room for the request envelope around the bundle and record encodings.
 const V70_ROLLBACK_FRAME_ENVELOPE_BYTES: usize = 4096;
 
@@ -2541,18 +2557,25 @@ fn advance_v70_rollback_frame_bytes(total: usize, next: usize) -> Result<usize, 
         .ok_or("v70 rollback request exceeds frame bound")
 }
 
-/// The enclave-sealed rollback checkpoint must cover exactly `head_sequence`,
-/// its compact lineage must be the parent's authenticated receipt order, every
-/// object must be content-addressed, and the unchanged v70 archive validator
-/// must accept it over the artifact and head keys the package will contain.
-/// Returns those keys.
+/// The enclave-sealed rollback checkpoint must cover exactly `head_sequence`
+/// and its compact lineage must be the parent's authenticated receipt order.
+/// Returns the one full head artifact key, the one head pointer, and the exact
+/// committed frontier that the governed rollback grant must name; the sparse
+/// archive validator must accept the checkpoint over exactly those objects.
 #[cfg_attr(not(test), allow(dead_code))]
 fn validate_v70_rollback_checkpoint(
     checkpoint: &layrs_direct_execution_v1::DirectCheckpoint,
     head_sequence: u64,
     receipts: &[(u64, DirectReceipt)],
     prefix: &str,
-) -> Result<(Vec<String>, Vec<ResolvedArchiveHead>), String> {
+) -> Result<
+    (
+        String,
+        ResolvedArchiveHead,
+        layrs_direct_execution_v1::CommittedRestoreFrontier,
+    ),
+    String,
+> {
     let sequence = usize::try_from(head_sequence).map_err(|_| "v70 rollback sequence overflow")?;
     if sequence == 0
         || sequence > MAX_V70_LINEAGE_RECORDS
@@ -2569,15 +2592,14 @@ fn validate_v70_rollback_checkpoint(
     {
         return Err("v70 rollback checkpoint header invalid".into());
     }
+    let head_hash = artifact_hash(&checkpoint.artifact);
     let mut prior = &checkpoint.opening_state_hash;
-    let mut keys = Vec::with_capacity(sequence);
-    let mut heads = Vec::with_capacity(sequence);
     for (index, (record, (receipt_sequence, receipt))) in
         checkpoint.receipt_records.iter().zip(receipts).enumerate()
     {
         let expected = index as u64 + 1;
         let content_hash = if expected == head_sequence {
-            artifact_hash(&checkpoint.artifact)
+            head_hash.clone()
         } else {
             artifact_hash(record)
         };
@@ -2593,19 +2615,92 @@ fn validate_v70_rollback_checkpoint(
             return Err("v70 rollback checkpoint lineage mismatch".into());
         }
         prior = &record.state_hash;
-        keys.push(format!(
-            "{prefix}/artifacts/{expected:020}-{content_hash}.cbor"
-        ));
-        heads.push(ResolvedArchiveHead {
-            key: archive_head_key(prefix, expected),
-            sequence: expected,
-            artifact_hash: content_hash,
-        });
     }
-    if validate_checkpoint_archive(checkpoint, &keys, &heads, prefix)? != sequence {
+    let frontier = layrs_direct_execution_v1::CommittedRestoreFrontier {
+        sequence: head_sequence,
+        state_hash: checkpoint.artifact.state_hash.clone(),
+        artifact_hash: head_hash.clone(),
+    };
+    let key = format!("{prefix}/artifacts/{head_sequence:020}-{head_hash}.cbor");
+    let head = ResolvedArchiveHead {
+        key: archive_head_key(prefix, head_sequence),
+        sequence: head_sequence,
+        artifact_hash: head_hash,
+    };
+    if validate_sparse_checkpoint_archive(
+        checkpoint,
+        &frontier,
+        std::slice::from_ref(&key),
+        std::slice::from_ref(&head),
+        prefix,
+    )? != 1
+    {
         return Err("v70 rollback checkpoint frontier mismatch".into());
     }
-    Ok((keys, heads))
+    Ok((key, head, frontier))
+}
+
+/// Sparse counterpart of `validate_checkpoint_archive` for an archive that
+/// begins at a governed rollback baseline. The exact committed frontier must
+/// accept the checkpoint, and every sequence from the baseline through the
+/// checkpoint must be backed by the listed artifact and head, which start at
+/// the baseline. Returns how many listed sequences the checkpoint covers.
+fn validate_sparse_checkpoint_archive(
+    checkpoint: &layrs_direct_execution_v1::DirectCheckpoint,
+    frontier: &layrs_direct_execution_v1::CommittedRestoreFrontier,
+    keys: &[String],
+    heads: &[ResolvedArchiveHead],
+    prefix: &str,
+) -> Result<usize, String> {
+    let sequence = checkpoint.artifact.sequence;
+    if !frontier.accepts_checkpoint(checkpoint)
+        || keys.is_empty()
+        || keys.len() != heads.len()
+        || checkpoint.receipt_records.len() as u64 != sequence
+        || checkpoint.artifact_hashes.len() as u64 != sequence
+        || checkpoint.artifact_hashes.last() != Some(&artifact_hash(&checkpoint.artifact))
+    {
+        return Err("sparse checkpoint outside governed baseline".into());
+    }
+    let covered = usize::try_from(sequence - frontier.sequence + 1)
+        .map_err(|_| "checkpoint sequence overflow")?;
+    if covered > keys.len() {
+        return Err("checkpoint frontier outside immutable archive".into());
+    }
+    for offset in 0..covered {
+        let expected = frontier.sequence + offset as u64;
+        let index = expected as usize - 1;
+        let hash = &checkpoint.artifact_hashes[index];
+        if checkpoint.receipt_records[index].sequence != expected
+            || keys[offset] != format!("{prefix}/artifacts/{expected:020}-{hash}.cbor")
+            || heads[offset].sequence != expected
+            || heads[offset].artifact_hash != *hash
+        {
+            return Err("checkpoint prefix differs from immutable archive".into());
+        }
+    }
+    if receipt_only_record(&checkpoint.artifact)
+        != *checkpoint
+            .receipt_records
+            .last()
+            .ok_or("checkpoint head missing")?
+    {
+        return Err("checkpoint terminal head mismatch".into());
+    }
+    Ok(covered)
+}
+
+/// The rollback-baseline mode is usable only with the governed grant's exact
+/// committed frontier. It has no isolated-test or genesis fallback.
+fn sparse_rollback_frontier(
+    state: &AppState,
+) -> Result<&layrs_direct_execution_v1::CommittedRestoreFrontier, String> {
+    state
+        .governed_bootstrap
+        .as_ref()
+        .and_then(|config| config.grant.committed_restore_frontier.as_ref())
+        .filter(|frontier| frontier.valid())
+        .ok_or_else(|| "v70 rollback baseline requires the governed committed frontier".into())
 }
 
 impl S3ImmutableArtifactStore {
@@ -3321,50 +3416,19 @@ impl S3ImmutableArtifactStore {
         }
         Ok((bundle, records))
     }
-    /// Create-only writes with exact readback, `V70_ROLLBACK_WRITE_WIDTH` at
-    /// a time. `object` produces the key and bytes for each index on demand.
-    #[cfg_attr(not(test), allow(dead_code))]
-    async fn write_once_windowed<F>(&self, count: usize, object: F) -> Result<(), String>
-    where
-        F: Fn(usize) -> Result<(String, Vec<u8>), String>,
-    {
-        let mut start = 0;
-        while start < count {
-            let end = count.min(start + V70_ROLLBACK_WRITE_WIDTH);
-            let mut writes = Vec::with_capacity(end - start);
-            for index in start..end {
-                let (key, bytes) = object(index)?;
-                let store = self.clone();
-                writes.push(tokio::spawn(
-                    async move { store.write_once(&key, bytes).await },
-                ));
-            }
-            for write in writes {
-                write
-                    .await
-                    .map_err(|_| "v70 rollback write task failed")??;
-            }
-            start = end;
-        }
-        Ok(())
-    }
-    /// Materializes a validated rollback checkpoint as a retained-v70 archive
-    /// under this store's prefix: every lineage artifact, then every v70 head
-    /// pointer, then the checkpoint, which is the v70 restore discovery
-    /// marker. An interrupted attempt therefore never exposes a checkpoint.
-    /// The final listings must equal the package exactly.
+    /// Materializes a validated rollback checkpoint as a sparse retained-v70
+    /// baseline under this store's prefix: exactly the full encrypted head
+    /// artifact, its head pointer, and then the checkpoint, which is the
+    /// restore discovery marker, so an interrupted attempt never exposes one.
+    /// Each object is create-only with exact readback, and the prefix must
+    /// then list exactly these three objects.
     #[cfg_attr(not(test), allow(dead_code))]
     async fn write_v70_rollback_package(
         &self,
         checkpoint: &layrs_direct_execution_v1::DirectCheckpoint,
-        keys: &[String],
-        heads: &[ResolvedArchiveHead],
+        key: &str,
+        head: &ResolvedArchiveHead,
     ) -> Result<String, String> {
-        let sequence = keys.len();
-        if sequence == 0 || heads.len() != sequence || checkpoint.receipt_records.len() != sequence
-        {
-            return Err("v70 rollback package incomplete".into());
-        }
         let bytes = serde_cbor::to_vec(checkpoint)
             .map_err(|_| "v70 rollback checkpoint encoding failed")?;
         if bytes.len() > MAX_FRAME_BYTES
@@ -3376,30 +3440,13 @@ impl S3ImmutableArtifactStore {
             return Err("v70 rollback checkpoint encoding invalid".into());
         }
         let checkpoint_key = self.checkpoint_key(checkpoint)?;
-        // Compact lineage records; the v70 restore lists but never reads them.
-        self.write_once_windowed(sequence - 1, |index| {
-            serde_cbor::to_vec(&checkpoint.receipt_records[index])
-                .map(|bytes| (keys[index].clone(), bytes))
-                .map_err(|_| "v70 rollback artifact encoding failed".into())
-        })
-        .await?;
-        // The full encrypted head artifact, read by the next v70 checkpoint.
-        let head_bytes = serde_cbor::to_vec(&checkpoint.artifact)
+        let artifact_bytes = serde_cbor::to_vec(&checkpoint.artifact)
             .map_err(|_| "v70 rollback artifact encoding failed")?;
-        if self
-            .write_once_large(&keys[sequence - 1], head_bytes.clone())
-            .await?
-            != head_bytes
-        {
+        if self.write_once_large(key, artifact_bytes.clone()).await? != artifact_bytes {
             return Err("archive readback mismatch".into());
         }
-        self.write_once_windowed(sequence, |index| {
-            Ok((
-                heads[index].key.clone(),
-                heads[index].artifact_hash.clone().into_bytes(),
-            ))
-        })
-        .await?;
+        self.write_once(&head.key, head.artifact_hash.clone().into_bytes())
+            .await?;
         if self
             .write_once_large(&checkpoint_key, bytes.clone())
             .await?
@@ -3407,17 +3454,233 @@ impl S3ImmutableArtifactStore {
         {
             return Err("archive readback mismatch".into());
         }
-        let head_keys = heads
-            .iter()
-            .map(|head| head.key.clone())
-            .collect::<Vec<_>>();
-        if self.list_restore_keys("artifacts").await? != keys
-            || self.list_restore_keys("heads").await? != head_keys
-            || self.list_restore_keys("checkpoints").await? != [checkpoint_key.clone()]
+        let mut expected = vec![key.to_string(), head.key.clone(), checkpoint_key.clone()];
+        expected.sort();
+        if self
+            .list_journal_keys(
+                &format!("{}/", self.prefix),
+                None,
+                3,
+                ARCHIVE_OPERATION_TIMEOUT,
+            )
+            .await?
+            != expected
         {
             return Err("v70 rollback package listing mismatch".into());
         }
         Ok(checkpoint_key)
+    }
+    /// Explicit rollback-baseline restore listing. The archive must begin at
+    /// the exact governed committed frontier with one baseline artifact, head
+    /// pointer, and checkpoint, followed only by contiguous v70 successors
+    /// and their checkpoints. Anything below the baseline, a missing or
+    /// mismatched baseline object, a second baseline object, or a
+    /// noncanonical key fails closed. The normal `prepare_restore` is
+    /// unchanged and still rejects such an archive.
+    async fn prepare_sparse_rollback_restore(
+        &self,
+        frontier: &layrs_direct_execution_v1::CommittedRestoreFrontier,
+    ) -> Result<PreparedArchiveRestore, String> {
+        if !frontier.valid() {
+            return Err("governed checkpoint frontier invalid".into());
+        }
+        let base = frontier.sequence;
+        let candidates = self.list_restore_keys("artifacts").await?;
+        let raw_heads = self.list_restore_keys("heads").await?;
+        let checkpoint_keys = self.list_restore_keys("checkpoints").await?;
+        let mut heads = Vec::with_capacity(raw_heads.len());
+        for (offset, key) in raw_heads.into_iter().enumerate() {
+            let sequence = base
+                .checked_add(offset as u64)
+                .ok_or("archive sequence overflow")?;
+            if key != archive_head_key(&self.prefix, sequence) {
+                return Err("sparse rollback head outside baseline lineage".into());
+            }
+            let hash = String::from_utf8(self.read(&key).await?)
+                .map_err(|_| "archive sequence head hash invalid")?;
+            if hash.len() != 64
+                || !hash
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err("archive sequence head hash invalid".into());
+            }
+            heads.push(ResolvedArchiveHead {
+                key,
+                sequence,
+                artifact_hash: hash,
+            });
+        }
+        let last = heads
+            .last()
+            .ok_or("sparse rollback baseline head missing")?
+            .sequence;
+        if heads[0].artifact_hash != frontier.artifact_hash {
+            return Err("sparse rollback baseline differs from governed frontier".into());
+        }
+        let artifact_prefix = format!("{}/artifacts/", self.prefix);
+        let mut available = HashSet::with_capacity(candidates.len());
+        let mut at_base = 0;
+        for key in &candidates {
+            let sequence = archive_key_sequence(key, &artifact_prefix, true)?;
+            if sequence < base || sequence > last || !available.insert(key.as_str()) {
+                return Err("sparse rollback artifact outside baseline lineage".into());
+            }
+            at_base += usize::from(sequence == base);
+        }
+        let keys = heads
+            .iter()
+            .map(|head| {
+                format!(
+                    "{artifact_prefix}{:020}-{}.cbor",
+                    head.sequence, head.artifact_hash
+                )
+            })
+            .collect::<Vec<_>>();
+        if keys.iter().any(|key| !available.contains(key.as_str())) {
+            return Err("archive committed artifact missing".into());
+        }
+        if at_base != 1 {
+            return Err("sparse rollback artifact outside baseline lineage".into());
+        }
+        let baseline_bytes = self.read(&keys[0]).await?;
+        let baseline: DirectStateArtifact = serde_cbor::from_slice(&baseline_bytes)
+            .map_err(|_| "sparse rollback baseline artifact decode failed")?;
+        if serde_cbor::to_vec(&baseline).ok().as_deref() != Some(baseline_bytes.as_slice())
+            || baseline.epoch_id != EPOCH_ID
+            || baseline.sequence != base
+            || baseline.state_hash != frontier.state_hash
+            || artifact_hash(&baseline) != frontier.artifact_hash
+        {
+            return Err("sparse rollback baseline artifact mismatch".into());
+        }
+        let checkpoint_namespace = format!("{}/checkpoints/", self.prefix);
+        let mut baseline_checkpoints = 0;
+        for key in &checkpoint_keys {
+            let (sequence, state_hash, _) =
+                journal_parent_snapshot_key_parts(key, &checkpoint_namespace)
+                    .map_err(|_| "sparse rollback checkpoint key invalid")?;
+            if sequence < base || sequence > last {
+                return Err("sparse rollback checkpoint outside baseline lineage".into());
+            }
+            if sequence == base {
+                if state_hash != frontier.state_hash {
+                    return Err("sparse rollback checkpoint outside baseline lineage".into());
+                }
+                baseline_checkpoints += 1;
+            }
+        }
+        if baseline_checkpoints != 1 {
+            return Err("sparse rollback baseline checkpoint missing or ambiguous".into());
+        }
+        let prepared = PreparedArchiveRestore {
+            keys,
+            heads,
+            checkpoint_keys,
+        };
+        *self.prepared_restore.lock().await = Some(prepared.clone());
+        Ok(prepared)
+    }
+    /// Rollback-baseline counterpart of `restore_streamed`. The retained v70
+    /// enclave receives the same unchanged checkpoint, append, and finish
+    /// requests; only the parent's archive listing starts at the baseline.
+    /// `exchange` is the enclave transport.
+    async fn restore_sparse_rollback_with<F, Fut>(
+        &self,
+        state: &AppState,
+        frontier: &layrs_direct_execution_v1::CommittedRestoreFrontier,
+        mut exchange: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(RuntimeRequest) -> Fut,
+        Fut: Future<Output = io::Result<RuntimeResponse>>,
+    {
+        let PreparedArchiveRestore {
+            keys,
+            heads,
+            checkpoint_keys,
+        } = self
+            .prepared_restore
+            .lock()
+            .await
+            .take()
+            .ok_or("archive restore was not validated before governed bootstrap")?;
+        let key = checkpoint_keys
+            .last()
+            .ok_or("sparse rollback baseline checkpoint missing or ambiguous")?;
+        let checkpoint: layrs_direct_execution_v1::DirectCheckpoint =
+            serde_cbor::from_slice(&self.read(key).await?)
+                .map_err(|_| "checkpoint decode failed; genesis fallback forbidden")?;
+        if self.checkpoint_key(&checkpoint)? != *key {
+            return Err("checkpoint content address mismatch".into());
+        }
+        let start =
+            validate_sparse_checkpoint_archive(&checkpoint, frontier, &keys, &heads, &self.prefix)?;
+        let mut records = checkpoint.receipt_records.clone();
+        let mut artifact_hashes = checkpoint.artifact_hashes.clone();
+        let checkpoint_sequence = checkpoint.artifact.sequence;
+        let checkpoint_state_hash = checkpoint.artifact.state_hash.clone();
+        let begin = exchange(RuntimeRequest::BeginCheckpointRestore { checkpoint })
+            .await
+            .map_err(|_| "checkpoint restore transport failed")?;
+        let RuntimeResponse::RestoreProgress {
+            recovered_sequence,
+            recovered_state_hash: mut root,
+        } = begin
+        else {
+            return Err("restore begin rejected; genesis fallback forbidden".into());
+        };
+        if recovered_sequence != checkpoint_sequence || root != checkpoint_state_hash {
+            return Err("restore checkpoint sequence mismatch".into());
+        }
+        for index in start..keys.len() {
+            let head = &heads[index];
+            let (bytes, head_bytes) =
+                tokio::try_join!(self.read(&keys[index]), self.read(&head.key))?;
+            if head_bytes != head.artifact_hash.as_bytes() {
+                return Err("archive encrypted artifact/head byte mismatch".into());
+            }
+            let artifact: DirectStateArtifact =
+                serde_cbor::from_slice(&bytes).map_err(|_| "artifact decode failed")?;
+            if artifact.sequence != head.sequence
+                || artifact.prior_state_hash != root
+                || keys[index] != self.artifact_key(&artifact)
+                || head.artifact_hash != artifact_hash(&artifact)
+            {
+                return Err("archive encrypted successor/head mismatch".into());
+            }
+            root = artifact.state_hash.clone();
+            let sequence = artifact.sequence;
+            records.push(receipt_only_record(&artifact));
+            artifact_hashes.push(head.artifact_hash.clone());
+            let response = exchange(RuntimeRequest::AppendCommittedRestore { artifact })
+                .await
+                .map_err(|_| "restore successor transport failed")?;
+            if !matches!(response, RuntimeResponse::RestoreProgress { recovered_sequence, ref recovered_state_hash } if recovered_sequence == sequence && *recovered_state_hash == root)
+            {
+                return Err("restore encrypted successor rejected".into());
+            }
+        }
+        let expected_sequence = heads[heads.len() - 1].sequence;
+        let result = exchange(RuntimeRequest::FinishCommittedRestore {
+            expected_sequence,
+            expected_state_hash: root.clone(),
+        })
+        .await
+        .map_err(|_| "restore finish transport failed")?;
+        if !matches!(result, RuntimeResponse::RecoveryComplete { recovered_sequence, ref recovered_state_hash } if recovered_sequence == expected_sequence && *recovered_state_hash == root)
+        {
+            return Err("restore final encrypted head rejected".into());
+        }
+        *self.verified_receipt_records.lock().await = Some(records);
+        *self.verified_artifact_hashes.lock().await = artifact_hashes;
+        *state.committed_state_root.lock().await = Some(root);
+        self.schedule_restored_checkpoint(state).await;
+        eprintln!(
+            "VERIFIED_SPARSE_ROLLBACK_RESTORE_COMPLETE baseline={} head={expected_sequence}",
+            frontier.sequence
+        );
+        Ok(())
     }
     /// Create-only, content-addressed persistence of an enclave-sealed v71
     /// checkpoint; `write_once` performs the exact readback.
@@ -4706,6 +4969,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         && !matches!(artifact_store, Some(ArchiveStore::S3(_)))
     {
         return Err("v71 persistence requires the S3 Object Lock archive".into());
+    }
+    if persistence_format == PersistenceFormat::V70RollbackBaseline
+        && (!matches!(artifact_store, Some(ArchiveStore::S3(_)))
+            || governed_bootstrap
+                .as_ref()
+                .and_then(|config| config.grant.committed_restore_frontier.as_ref())
+                .is_none())
+    {
+        return Err(
+            "v70 rollback baseline requires the S3 archive and a governed committed frontier"
+                .into(),
+        );
     }
     let state = AppState {
         enclave_cid: env::var("LAYRS_ENCLAVE_CID")
@@ -6917,6 +7192,19 @@ async fn recover_enclave(state: &AppState) -> io::Result<()> {
             "DIRECT_ARTIFACT_STORE_NOT_CONFIGURED",
         )
     })?;
+    if state.persistence_format == PersistenceFormat::V70RollbackBaseline {
+        let ArchiveStore::S3(s3) = store else {
+            return Err(invalid(
+                "DIRECT_STATE_RECOVERY_FAILED:v70 rollback baseline requires the S3 archive",
+            ));
+        };
+        let frontier = sparse_rollback_frontier(state)
+            .map_err(|error| invalid(format!("DIRECT_STATE_RECOVERY_FAILED:{error}")))?;
+        return s3
+            .restore_sparse_rollback_with(state, frontier, |request| exchange(state, request))
+            .await
+            .map_err(|error| invalid(format!("DIRECT_STATE_RECOVERY_FAILED:{error}")));
+    }
     if let ArchiveStore::S3(s3)=store {
         if state.effective_persistence_format() == PersistenceFormat::V71
             && s3.prepared_journal_restore.lock().await.is_some()
@@ -7520,16 +7808,16 @@ where
             _ => return Err("v70 rollback seal unexpected response".into()),
         }
     };
-    let (keys, heads) =
+    let (key, pointer, frontier) =
         validate_v70_rollback_checkpoint(&checkpoint, head.sequence, &receipts, fresh_prefix)?;
     let checkpoint_key = target
-        .write_v70_rollback_package(&checkpoint, &keys, &heads)
+        .write_v70_rollback_package(&checkpoint, &key, &pointer)
         .await?;
     let package = V70RollbackPackage {
         prefix: fresh_prefix.into(),
-        sequence: head.sequence,
-        state_hash: checkpoint.artifact.state_hash.clone(),
-        artifact_hash: heads[heads.len() - 1].artifact_hash.clone(),
+        sequence: frontier.sequence,
+        state_hash: frontier.state_hash,
+        artifact_hash: frontier.artifact_hash,
         checkpoint_key,
     };
     eprintln!(
@@ -8635,7 +8923,9 @@ async fn exchange_direct(
     guard: &OwnedMutexGuard<()>,
 ) -> io::Result<RuntimeResponse> {
     match state.effective_persistence_format() {
-        PersistenceFormat::V70 => exchange_direct_v70(state, request, guard).await,
+        PersistenceFormat::V70 | PersistenceFormat::V70RollbackBaseline => {
+            exchange_direct_v70(state, request, guard).await
+        }
         PersistenceFormat::V71 => exchange_direct_v71(state, request, guard).await,
         PersistenceFormat::V71Hot => unreachable!("effective persistence format is concrete"),
     }
@@ -12841,36 +13131,19 @@ mod tests {
     #[test]
     fn v70_rollback_checkpoint_must_match_head_receipt_order_and_content_addresses() {
         let fixture = v70_rollback_fixture();
-        let checkpoint = fixture
-            .v71
-            .seal_v70_rollback_checkpoint(
-                &fixture.bundle,
-                &fixture.records,
-                &[7; 32],
-                &v70_rollback_journal_key(),
-            )
-            .unwrap();
+        let checkpoint = v70_rollback_checkpoint(&fixture);
         let receipts = ordered_journal_receipts(&fixture.receipts).unwrap();
-        let (keys, heads) =
+        let (key, head, frontier) =
             validate_v70_rollback_checkpoint(&checkpoint, 4, &receipts, "rollback").unwrap();
-        assert_eq!(
-            keys[3],
-            format!(
-                "rollback/artifacts/{:020}-{}.cbor",
-                4,
-                artifact_hash(&checkpoint.artifact)
-            )
-        );
-        assert_eq!(
-            keys[0],
-            format!(
-                "rollback/artifacts/{:020}-{}.cbor",
-                1,
-                artifact_hash(&checkpoint.receipt_records[0])
-            )
-        );
-        assert_eq!(heads[1].key, archive_head_key("rollback", 2));
-        assert_eq!(heads[1].artifact_hash, checkpoint.artifact_hashes[1]);
+        let hash = artifact_hash(&checkpoint.artifact);
+        assert_eq!(key, format!("rollback/artifacts/{:020}-{hash}.cbor", 4));
+        assert_eq!(head.key, archive_head_key("rollback", 4));
+        assert_eq!(head.sequence, 4);
+        assert_eq!(head.artifact_hash, hash);
+        assert_eq!(frontier.sequence, 4);
+        assert_eq!(frontier.state_hash, checkpoint.artifact.state_hash);
+        assert_eq!(frontier.artifact_hash, hash);
+        assert!(frontier.accepts_checkpoint(&checkpoint));
 
         let header = "v70 rollback checkpoint header invalid";
         let lineage = "v70 rollback checkpoint lineage mismatch";
@@ -12943,13 +13216,166 @@ mod tests {
             );
         }
         // The terminal compact record must equal the full head artifact.
-        let mut tampered = checkpoint.clone();
+        let mut tampered = checkpoint;
         tampered.receipt_records[3].nonce = vec![0; 12];
         assert!(validate_v70_rollback_checkpoint(&tampered, 4, &receipts, "rollback").is_err());
     }
 
+    fn v70_rollback_checkpoint(
+        fixture: &V70RollbackFixture,
+    ) -> layrs_direct_execution_v1::DirectCheckpoint {
+        fixture
+            .v71
+            .seal_v70_rollback_checkpoint(
+                &fixture.bundle,
+                &fixture.records,
+                &[7; 32],
+                &v70_rollback_journal_key(),
+            )
+            .unwrap()
+    }
+
+    type V70RollbackEnclave = Arc<StdMutex<Option<layrs_direct_execution_v1::DirectRuntime>>>;
+
+    /// The retained v70 enclave's unchanged BeginCheckpointRestore,
+    /// AppendCommittedRestore, and FinishCommittedRestore rules under a
+    /// governed frontier, served by the library runtime that implements them.
+    /// The adopted runtime is left in the returned cell.
+    fn v70_rollback_enclave(
+        epoch: SealedEpoch,
+        frontier: layrs_direct_execution_v1::CommittedRestoreFrontier,
+    ) -> (
+        V70RollbackEnclave,
+        impl FnMut(RuntimeRequest) -> std::future::Ready<io::Result<RuntimeResponse>>,
+    ) {
+        let adopted = V70RollbackEnclave::default();
+        let cell = adopted.clone();
+        let mut candidate: Option<layrs_direct_execution_v1::DirectRuntime> = None;
+        let error = |code: &str| RuntimeResponse::Error { code: code.into() };
+        let exchange = move |request| {
+            let response = match request {
+                RuntimeRequest::BeginCheckpointRestore { checkpoint } => {
+                    if candidate.is_some() || !frontier.accepts_checkpoint(&checkpoint) {
+                        error("CHECKPOINT_BELOW_GOVERNED_FRONTIER")
+                    } else {
+                        match layrs_direct_execution_v1::DirectRuntime::new(
+                            epoch.clone(),
+                            layrs_direct_execution_v1::RuntimeMode::IsolatedTest,
+                            vec![9; 32],
+                        )
+                        .and_then(|runtime| runtime.restore_checkpoint(&checkpoint, &[7; 32]))
+                        {
+                            Ok(runtime) => {
+                                let response = RuntimeResponse::RestoreProgress {
+                                    recovered_sequence: runtime.committed_sequence(),
+                                    recovered_state_hash: runtime.committed_state_hash(),
+                                };
+                                candidate = Some(runtime);
+                                response
+                            }
+                            Err(_) => error("CHECKPOINT_AUTHENTICATION_FAILED"),
+                        }
+                    }
+                }
+                RuntimeRequest::AppendCommittedRestore { artifact } => match candidate
+                    .take()
+                    .map(|runtime| runtime.restore_next_committed(&artifact, &[7; 32]))
+                {
+                    Some(Ok(runtime)) => {
+                        let response = RuntimeResponse::RestoreProgress {
+                            recovered_sequence: runtime.committed_sequence(),
+                            recovered_state_hash: runtime.committed_state_hash(),
+                        };
+                        candidate = Some(runtime);
+                        response
+                    }
+                    _ => error("RESTORE_SUCCESSOR_REJECTED"),
+                },
+                RuntimeRequest::FinishCommittedRestore {
+                    expected_sequence,
+                    expected_state_hash,
+                } => match candidate.take() {
+                    Some(runtime)
+                        if runtime.committed_sequence() == expected_sequence
+                            && runtime.committed_state_hash() == expected_state_hash
+                            && expected_sequence >= frontier.sequence =>
+                    {
+                        *cell.lock().unwrap() = Some(runtime);
+                        RuntimeResponse::RecoveryComplete {
+                            recovered_sequence: expected_sequence,
+                            recovered_state_hash: expected_state_hash,
+                        }
+                    }
+                    _ => error("RESTORE_FINAL_HEAD_MISMATCH"),
+                },
+                _ => panic!("unexpected enclave request"),
+            };
+            std::future::ready(Ok(response))
+        };
+        (adopted, exchange)
+    }
+
+    fn v70_rollback_frontier(
+        package: &V70RollbackPackage,
+    ) -> layrs_direct_execution_v1::CommittedRestoreFrontier {
+        layrs_direct_execution_v1::CommittedRestoreFrontier {
+            sequence: package.sequence,
+            state_hash: package.state_hash.clone(),
+            artifact_hash: package.artifact_hash.clone(),
+        }
+    }
+
+    /// Materializes the fixture's package under `rollback` and returns it
+    /// with exactly the three objects written there.
+    async fn v70_rollback_package(
+        fixture: &V70RollbackFixture,
+    ) -> (V70RollbackPackage, BTreeMap<String, Vec<u8>>) {
+        let (endpoint, objects, _, server) = v70_rollback_s3(v70_rollback_archive(fixture)).await;
+        let store = v71_store(
+            &endpoint,
+            JournalWriterState::Eligible(fixture.head.clone()),
+            JournalRole::Writer,
+        );
+        let state = v70_rollback_state(Some(store), fixture);
+        let package = materialize_v70_rollback(
+            &state,
+            "rollback",
+            v70_rollback_seal(fixture.v71.clone(), Arc::new(AtomicU64::new(0))),
+        )
+        .await
+        .unwrap();
+        server.abort();
+        let objects = objects
+            .lock()
+            .await
+            .iter()
+            .filter(|(key, _)| key.starts_with("rollback/"))
+            .map(|(key, bytes)| (key.clone(), bytes.clone()))
+            .collect::<BTreeMap<_, _>>();
+        (package, objects)
+    }
+
+    fn v70_rollback_store_at(endpoint: &str, prefix: &str) -> S3ImmutableArtifactStore {
+        let mut store = v71_store(
+            endpoint,
+            JournalWriterState::Unrestored,
+            JournalRole::Writer,
+        );
+        store.prefix = prefix.into();
+        store
+    }
+
+    fn v70_rollback_baseline_state(fixture: &V70RollbackFixture) -> AppState {
+        let mut state = v70_rollback_state(None, fixture);
+        state.persistence_format = PersistenceFormat::V70RollbackBaseline;
+        state.journal_receipts = Arc::new(Mutex::new(None));
+        state.journal_migration = Arc::new(Mutex::new(None));
+        state.committed_state_root = Arc::new(Mutex::new(None));
+        state
+    }
+
     #[tokio::test]
-    async fn v70_rollback_materializes_a_fresh_prefix_package_the_unchanged_v70_restore_accepts() {
+    async fn v70_rollback_materializes_exactly_three_objects_restorable_in_baseline_mode() {
         let fixture = v70_rollback_fixture();
         let authoritative = v70_rollback_archive(&fixture);
         let (endpoint, objects, log, server) = v70_rollback_s3(authoritative.clone()).await;
@@ -12958,7 +13384,7 @@ mod tests {
             JournalWriterState::Eligible(fixture.head.clone()),
             JournalRole::Writer,
         );
-        let state = v70_rollback_state(Some(store.clone()), &fixture);
+        let state = v70_rollback_state(Some(store), &fixture);
         let called = Arc::new(AtomicU64::new(0));
         let package = materialize_v70_rollback(
             &state,
@@ -12970,10 +13396,14 @@ mod tests {
         assert_eq!(called.load(Ordering::SeqCst), 1);
         assert_eq!(package.prefix, "rollback/v70");
         assert_eq!(package.sequence, 4);
+        let artifact_key = format!(
+            "rollback/v70/artifacts/{:020}-{}.cbor",
+            4, package.artifact_hash
+        );
+        let head_key = archive_head_key("rollback/v70", 4);
 
-        // The authoritative archive is only read; the package is 4 artifacts,
-        // 4 head pointers, and 1 checkpoint, each a create-only KMS/Object
-        // Lock PUT under the fresh prefix.
+        // Exactly three create-only KMS/Object Lock PUTs under the fresh
+        // prefix: the head artifact, its pointer, then the checkpoint.
         let stored = objects.lock().await.clone();
         assert_eq!(
             stored
@@ -12983,91 +13413,73 @@ mod tests {
                 .collect::<BTreeMap<_, _>>(),
             authoritative
         );
-        assert_eq!(stored.len(), authoritative.len() + 9);
+        let written = stored
+            .keys()
+            .filter(|key| key.starts_with("rollback/v70/"))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut expected = vec![
+            artifact_key.clone(),
+            head_key.clone(),
+            package.checkpoint_key.clone(),
+        ];
+        expected.sort();
+        assert_eq!(written, expected);
+        assert_eq!(stored.len(), authoritative.len() + 3);
         let puts = v70_rollback_puts(&log.lock().await);
-        assert_eq!(puts.len(), 9);
-        for head in &puts {
-            let key = head
-                .split_whitespace()
-                .nth(1)
-                .unwrap()
-                .trim_start_matches("/unit-test/")
-                .split('?')
-                .next()
-                .unwrap();
-            assert!(key.starts_with("rollback/v70/"), "{key}");
+        assert_eq!(puts.len(), 3);
+        for (head, key) in puts
+            .iter()
+            .zip([&artifact_key, &head_key, &package.checkpoint_key])
+        {
             v71_assert_create_only_put(head, key);
         }
-        // The checkpoint is published only after every artifact and head.
-        assert!(puts
-            .last()
-            .unwrap()
-            .starts_with(&format!("put /unit-test/{}", package.checkpoint_key)));
+        assert_eq!(stored[&head_key], package.artifact_hash.as_bytes());
+        let checkpoint: layrs_direct_execution_v1::DirectCheckpoint =
+            serde_cbor::from_slice(&stored[&package.checkpoint_key]).unwrap();
+        let artifact: DirectStateArtifact = serde_cbor::from_slice(&stored[&artifact_key]).unwrap();
+        assert_eq!(artifact, checkpoint.artifact);
+        assert_eq!(artifact_hash(&artifact), package.artifact_hash);
 
-        // Retained-v70 restore over the fresh prefix: listing, head pointer,
-        // artifact, frontier, and checkpoint validation are the unchanged
-        // `prepare_restore` and `restore_streamed` checkpoint branch.
-        let mut fresh = v71_store(
-            &endpoint,
-            JournalWriterState::Unrestored,
-            JournalRole::Writer,
-        );
-        fresh.prefix = "rollback/v70".into();
-        let mut v70_state = v70_rollback_state(None, &fixture);
-        v70_state.persistence_format = PersistenceFormat::V70;
-        let prepared = fresh.prepare_restore(&v70_state).await.unwrap();
-        assert_eq!(prepared.keys.len(), 4);
+        // The explicit baseline branch restores it through the retained
+        // enclave's unchanged checkpoint rules and exact committed frontier.
+        let fresh = v70_rollback_store_at(&endpoint, "rollback/v70");
+        let frontier = v70_rollback_frontier(&package);
+        let prepared = fresh
+            .prepare_sparse_rollback_restore(&frontier)
+            .await
+            .unwrap();
+        assert_eq!(prepared.keys, vec![artifact_key.clone()]);
         assert_eq!(
             prepared.checkpoint_keys,
             vec![package.checkpoint_key.clone()]
         );
-        let checkpoint: layrs_direct_execution_v1::DirectCheckpoint =
-            serde_cbor::from_slice(&fresh.read(&package.checkpoint_key).await.unwrap()).unwrap();
-        assert_eq!(
-            fresh.checkpoint_key(&checkpoint).unwrap(),
-            package.checkpoint_key
-        );
-        assert_eq!(
-            validate_checkpoint_archive(
-                &checkpoint,
-                &prepared.keys,
-                &prepared.heads,
-                "rollback/v70"
-            ),
-            Ok(4)
-        );
-        for (index, key) in prepared.keys.iter().enumerate() {
-            let artifact: DirectStateArtifact =
-                serde_cbor::from_slice(&fresh.read(key).await.unwrap()).unwrap();
-            assert_eq!(fresh.artifact_key(&artifact), *key);
-            assert_eq!(
-                receipt_only_record(&artifact),
-                checkpoint.receipt_records[index]
-            );
-        }
-        let head_artifact: DirectStateArtifact =
-            serde_cbor::from_slice(&fresh.read(&prepared.keys[3]).await.unwrap()).unwrap();
-        assert_eq!(head_artifact, checkpoint.artifact);
-        assert_eq!(artifact_hash(&head_artifact), package.artifact_hash);
-
-        // The retained enclave's BeginCheckpointRestore under a rollback grant
-        // frontier naming the package head, then exact replay and dedup.
-        let frontier = layrs_direct_execution_v1::CommittedRestoreFrontier {
-            sequence: package.sequence,
-            state_hash: package.state_hash.clone(),
-            artifact_hash: package.artifact_hash.clone(),
-        };
-        assert!(frontier.accepts_checkpoint(&checkpoint));
-        let mut restored = layrs_direct_execution_v1::DirectRuntime::new(
-            fixture.epoch.clone(),
-            layrs_direct_execution_v1::RuntimeMode::IsolatedTest,
-            vec![9; 32],
-        )
-        .unwrap()
-        .restore_checkpoint(&checkpoint, &[7; 32])
-        .unwrap();
+        let baseline_state = v70_rollback_baseline_state(&fixture);
+        let (adopted, enclave) = v70_rollback_enclave(fixture.epoch.clone(), frontier.clone());
+        fresh
+            .restore_sparse_rollback_with(&baseline_state, &frontier, enclave)
+            .await
+            .unwrap();
+        let mut restored = adopted.lock().unwrap().take().unwrap();
         assert_eq!(restored.committed_sequence(), 4);
         assert_eq!(restored.committed_state_hash(), package.state_hash);
+        assert_eq!(
+            *baseline_state.committed_state_root.lock().await,
+            Some(package.state_hash.clone())
+        );
+        assert_eq!(
+            fresh
+                .verified_receipt_records
+                .lock()
+                .await
+                .as_ref()
+                .unwrap(),
+            &checkpoint.receipt_records
+        );
+        assert_eq!(
+            *fresh.verified_artifact_hashes.lock().await,
+            checkpoint.artifact_hashes
+        );
         for (request, result) in &fixture.commands {
             assert_eq!(restored.execute(request.clone()).unwrap(), *result);
         }
@@ -13101,6 +13513,534 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v70_rollback_baseline_restores_contiguous_v70_successors() {
+        let fixture = v70_rollback_fixture();
+        let (package, mut objects) = v70_rollback_package(&fixture).await;
+        let frontier = v70_rollback_frontier(&package);
+        let checkpoint: layrs_direct_execution_v1::DirectCheckpoint =
+            serde_cbor::from_slice(&objects[&package.checkpoint_key]).unwrap();
+        // The rolled-back v70 writer commits sequence 5 as usual.
+        let baseline = layrs_direct_execution_v1::DirectRuntime::new(
+            fixture.epoch.clone(),
+            layrs_direct_execution_v1::RuntimeMode::IsolatedTest,
+            vec![9; 32],
+        )
+        .unwrap()
+        .restore_checkpoint(&checkpoint, &[7; 32])
+        .unwrap();
+        let request = v70_rollback_admission('e', '5');
+        let candidate = baseline
+            .prepare_candidate(request.clone(), &[7; 32])
+            .unwrap();
+        let successor = candidate.artifact.clone();
+        let successor_hash = artifact_hash(&successor);
+        objects.insert(
+            format!("rollback/artifacts/{:020}-{successor_hash}.cbor", 5),
+            serde_cbor::to_vec(&successor).unwrap(),
+        );
+        objects.insert(
+            archive_head_key("rollback", 5),
+            successor_hash.clone().into_bytes(),
+        );
+        let (endpoint, _, _, server) = v70_rollback_s3(objects.clone()).await;
+        let fresh = v70_rollback_store_at(&endpoint, "rollback");
+        let prepared = fresh
+            .prepare_sparse_rollback_restore(&frontier)
+            .await
+            .unwrap();
+        assert_eq!(prepared.keys.len(), 2);
+        let state = v70_rollback_baseline_state(&fixture);
+        let (adopted, enclave) = v70_rollback_enclave(fixture.epoch.clone(), frontier.clone());
+        fresh
+            .restore_sparse_rollback_with(&state, &frontier, enclave)
+            .await
+            .unwrap();
+        let mut restored = adopted.lock().unwrap().take().unwrap();
+        assert_eq!(restored.committed_sequence(), 5);
+        assert_eq!(restored.committed_state_hash(), successor.state_hash);
+        assert_eq!(restored.execute(request).unwrap(), candidate.result);
+        let records = fresh.verified_receipt_records.lock().await.clone().unwrap();
+        assert_eq!(records.len(), 5);
+        assert_eq!(records[4], receipt_only_record(&successor));
+        assert_eq!(
+            fresh.verified_artifact_hashes.lock().await[4],
+            successor_hash
+        );
+        // The normal v70 restore still rejects the baseline-rooted archive.
+        let mut v70_state = v70_rollback_state(None, &fixture);
+        v70_state.persistence_format = PersistenceFormat::V70;
+        assert_eq!(
+            v70_rollback_store_at(&endpoint, "rollback")
+                .prepare_restore(&v70_state)
+                .await
+                .err(),
+            Some("archive head sequence gap".into())
+        );
+        server.abort();
+
+        // A successor whose head points at another artifact, or a tampered
+        // successor body, fails closed.
+        let mut forked = objects.clone();
+        forked.insert(archive_head_key("rollback", 5), "0".repeat(64).into_bytes());
+        let (endpoint, _, _, server) = v70_rollback_s3(forked).await;
+        assert_eq!(
+            v70_rollback_store_at(&endpoint, "rollback")
+                .prepare_sparse_rollback_restore(&frontier)
+                .await
+                .err(),
+            Some("archive committed artifact missing".into())
+        );
+        server.abort();
+        let mut tampered = objects;
+        let mut body = successor.clone();
+        body.prior_state_hash = "0".repeat(64);
+        tampered.insert(
+            format!("rollback/artifacts/{:020}-{successor_hash}.cbor", 5),
+            serde_cbor::to_vec(&body).unwrap(),
+        );
+        let (endpoint, _, _, server) = v70_rollback_s3(tampered).await;
+        let fresh = v70_rollback_store_at(&endpoint, "rollback");
+        fresh
+            .prepare_sparse_rollback_restore(&frontier)
+            .await
+            .unwrap();
+        let (adopted, enclave) = v70_rollback_enclave(fixture.epoch.clone(), frontier.clone());
+        assert_eq!(
+            fresh
+                .restore_sparse_rollback_with(
+                    &v70_rollback_baseline_state(&fixture),
+                    &frontier,
+                    enclave
+                )
+                .await,
+            Err("archive encrypted successor/head mismatch".into())
+        );
+        assert!(adopted.lock().unwrap().is_none());
+        server.abort();
+    }
+
+    /// Runs the explicit baseline prepare and, if it passes, the restore.
+    async fn v70_rollback_try_restore(
+        fixture: &V70RollbackFixture,
+        objects: BTreeMap<String, Vec<u8>>,
+        frontier: &layrs_direct_execution_v1::CommittedRestoreFrontier,
+    ) -> Result<u64, String> {
+        let (endpoint, _, _, server) = v70_rollback_s3(objects).await;
+        let fresh = v70_rollback_store_at(&endpoint, "rollback");
+        let result = async {
+            fresh.prepare_sparse_rollback_restore(frontier).await?;
+            let (adopted, enclave) = v70_rollback_enclave(fixture.epoch.clone(), frontier.clone());
+            fresh
+                .restore_sparse_rollback_with(
+                    &v70_rollback_baseline_state(fixture),
+                    frontier,
+                    enclave,
+                )
+                .await?;
+            let sequence = adopted
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .committed_sequence();
+            Ok(sequence)
+        }
+        .await;
+        server.abort();
+        result
+    }
+
+    #[tokio::test]
+    async fn v70_rollback_baseline_rejects_mutated_missing_or_extra_objects() {
+        let fixture = v70_rollback_fixture();
+        let (package, objects) = v70_rollback_package(&fixture).await;
+        let frontier = v70_rollback_frontier(&package);
+        assert_eq!(objects.len(), 3);
+        assert_eq!(
+            v70_rollback_try_restore(&fixture, objects.clone(), &frontier).await,
+            Ok(4)
+        );
+        let artifact_key = format!(
+            "rollback/artifacts/{:020}-{}.cbor",
+            4, package.artifact_hash
+        );
+        let head_key = archive_head_key("rollback", 4);
+        let checkpoint_key = package.checkpoint_key.clone();
+        let artifact: DirectStateArtifact =
+            serde_cbor::from_slice(&objects[&artifact_key]).unwrap();
+        let checkpoint: layrs_direct_execution_v1::DirectCheckpoint =
+            serde_cbor::from_slice(&objects[&checkpoint_key]).unwrap();
+        let mut mutated_artifact = artifact.clone();
+        mutated_artifact.ciphertext[0] ^= 1;
+        let mut mutated_checkpoint = checkpoint.clone();
+        mutated_checkpoint.signature = "0".repeat(mutated_checkpoint.signature.len());
+        let other_hash = sha256(b"other");
+        let below_checkpoint = format!(
+            "rollback/checkpoints/{:020}-{}-{}.cbor",
+            3,
+            package.state_hash,
+            sha256(b"below")
+        );
+        let twin_checkpoint = format!(
+            "rollback/checkpoints/{:020}-{}-{}.cbor",
+            4,
+            package.state_hash,
+            sha256(b"twin")
+        );
+
+        type Edit = Box<dyn Fn(&mut BTreeMap<String, Vec<u8>>)>;
+        let cases: Vec<(&str, Edit, &str)> = vec![
+            // Mutation.
+            (
+                "head points elsewhere",
+                Box::new({
+                    let key = head_key.clone();
+                    let hash = other_hash.clone();
+                    move |objects| {
+                        objects.insert(key.clone(), hash.clone().into_bytes());
+                    }
+                }),
+                "sparse rollback baseline differs from governed frontier",
+            ),
+            (
+                "head body malformed",
+                Box::new({
+                    let key = head_key.clone();
+                    move |objects| {
+                        objects.insert(key.clone(), b"not-a-hash".to_vec());
+                    }
+                }),
+                "archive sequence head hash invalid",
+            ),
+            (
+                "artifact body mutated",
+                Box::new({
+                    let key = artifact_key.clone();
+                    let bytes = serde_cbor::to_vec(&mutated_artifact).unwrap();
+                    move |objects| {
+                        objects.insert(key.clone(), bytes.clone());
+                    }
+                }),
+                "sparse rollback baseline artifact mismatch",
+            ),
+            (
+                "checkpoint body mutated",
+                Box::new({
+                    let key = checkpoint_key.clone();
+                    let bytes = serde_cbor::to_vec(&mutated_checkpoint).unwrap();
+                    move |objects| {
+                        objects.insert(key.clone(), bytes.clone());
+                    }
+                }),
+                "checkpoint content address mismatch",
+            ),
+            (
+                "checkpoint body corrupt",
+                Box::new({
+                    let key = checkpoint_key.clone();
+                    move |objects| {
+                        objects.insert(key.clone(), b"corrupt".to_vec());
+                    }
+                }),
+                "checkpoint decode failed; genesis fallback forbidden",
+            ),
+            // Missing object.
+            (
+                "artifact missing",
+                Box::new({
+                    let key = artifact_key.clone();
+                    move |objects| {
+                        objects.remove(&key);
+                    }
+                }),
+                "archive committed artifact missing",
+            ),
+            (
+                "head missing",
+                Box::new({
+                    let key = head_key.clone();
+                    move |objects| {
+                        objects.remove(&key);
+                    }
+                }),
+                "sparse rollback baseline head missing",
+            ),
+            (
+                "checkpoint missing",
+                Box::new({
+                    let key = checkpoint_key.clone();
+                    move |objects| {
+                        objects.remove(&key);
+                    }
+                }),
+                "sparse rollback baseline checkpoint missing or ambiguous",
+            ),
+            // Extra object.
+            (
+                "head below baseline",
+                Box::new(|objects| {
+                    objects.insert(archive_head_key("rollback", 3), "a".repeat(64).into_bytes());
+                }),
+                "sparse rollback head outside baseline lineage",
+            ),
+            (
+                "legacy head twin",
+                Box::new({
+                    let hash = package.artifact_hash.clone();
+                    move |objects| {
+                        objects.insert(
+                            format!("rollback/heads/{:020}-{hash}.cbor", 4),
+                            b"legacy".to_vec(),
+                        );
+                    }
+                }),
+                "sparse rollback head outside baseline lineage",
+            ),
+            (
+                "head above baseline without artifact",
+                Box::new(|objects| {
+                    objects.insert(archive_head_key("rollback", 5), "a".repeat(64).into_bytes());
+                }),
+                "archive committed artifact missing",
+            ),
+            (
+                "artifact below baseline",
+                Box::new(|objects| {
+                    objects.insert(
+                        format!("rollback/artifacts/{:020}-{}.cbor", 3, "a".repeat(64)),
+                        b"below".to_vec(),
+                    );
+                }),
+                "sparse rollback artifact outside baseline lineage",
+            ),
+            (
+                "second baseline artifact",
+                Box::new({
+                    let hash = other_hash.clone();
+                    move |objects| {
+                        objects.insert(
+                            format!("rollback/artifacts/{:020}-{hash}.cbor", 4),
+                            b"twin".to_vec(),
+                        );
+                    }
+                }),
+                "sparse rollback artifact outside baseline lineage",
+            ),
+            (
+                "unheaded artifact above baseline",
+                Box::new(|objects| {
+                    objects.insert(
+                        format!("rollback/artifacts/{:020}-{}.cbor", 5, "a".repeat(64)),
+                        b"unheaded".to_vec(),
+                    );
+                }),
+                "sparse rollback artifact outside baseline lineage",
+            ),
+            (
+                "foreign artifact key",
+                Box::new(|objects| {
+                    objects.insert("rollback/artifacts/foreign.cbor".into(), b"x".to_vec());
+                }),
+                "archive key format invalid",
+            ),
+            (
+                "checkpoint below baseline",
+                Box::new({
+                    let key = below_checkpoint.clone();
+                    move |objects| {
+                        objects.insert(key.clone(), b"below".to_vec());
+                    }
+                }),
+                "sparse rollback checkpoint outside baseline lineage",
+            ),
+            (
+                "second baseline checkpoint",
+                Box::new({
+                    let key = twin_checkpoint.clone();
+                    move |objects| {
+                        objects.insert(key.clone(), b"twin".to_vec());
+                    }
+                }),
+                "sparse rollback baseline checkpoint missing or ambiguous",
+            ),
+            (
+                "malformed checkpoint key",
+                Box::new(|objects| {
+                    objects.insert("rollback/checkpoints/foreign.cbor".into(), b"x".to_vec());
+                }),
+                "sparse rollback checkpoint key invalid",
+            ),
+        ];
+        for (name, edit, error) in cases {
+            let mut edited = objects.clone();
+            edit(&mut edited);
+            assert_eq!(
+                v70_rollback_try_restore(&fixture, edited, &frontier).await,
+                Err(error.into()),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn v70_rollback_baseline_requires_the_exact_governed_frontier() {
+        let fixture = v70_rollback_fixture();
+        let (package, objects) = v70_rollback_package(&fixture).await;
+        let frontier = v70_rollback_frontier(&package);
+        let with = |edit: &dyn Fn(&mut layrs_direct_execution_v1::CommittedRestoreFrontier)| {
+            let mut frontier = frontier.clone();
+            edit(&mut frontier);
+            frontier
+        };
+        let cases = [
+            (
+                with(&|f| f.sequence = 3),
+                "sparse rollback head outside baseline lineage",
+            ),
+            (
+                with(&|f| f.sequence = 5),
+                "sparse rollback head outside baseline lineage",
+            ),
+            (
+                with(&|f| f.artifact_hash = sha256(b"other")),
+                "sparse rollback baseline differs from governed frontier",
+            ),
+            (
+                with(&|f| f.state_hash = sha256(b"other")),
+                "sparse rollback baseline artifact mismatch",
+            ),
+            (
+                with(&|f| f.sequence = 0),
+                "governed checkpoint frontier invalid",
+            ),
+            (
+                with(&|f| f.state_hash = "not-hex".into()),
+                "governed checkpoint frontier invalid",
+            ),
+        ];
+        for (wrong, error) in cases {
+            assert_eq!(
+                v70_rollback_try_restore(&fixture, objects.clone(), &wrong).await,
+                Err(error.into()),
+                "{wrong:?}"
+            );
+        }
+
+        // Restore re-checks the checkpoint against the frontier it is given.
+        let (endpoint, _, _, server) = v70_rollback_s3(objects.clone()).await;
+        let fresh = v70_rollback_store_at(&endpoint, "rollback");
+        fresh
+            .prepare_sparse_rollback_restore(&frontier)
+            .await
+            .unwrap();
+        let wrong = with(&|f| f.state_hash = sha256(b"other"));
+        let (adopted, enclave) = v70_rollback_enclave(fixture.epoch.clone(), frontier.clone());
+        assert_eq!(
+            fresh
+                .restore_sparse_rollback_with(
+                    &v70_rollback_baseline_state(&fixture),
+                    &wrong,
+                    enclave
+                )
+                .await,
+            Err("sparse checkpoint outside governed baseline".into())
+        );
+        assert!(adopted.lock().unwrap().is_none());
+        // Restore never runs without a prepared baseline listing.
+        let (_, enclave) = v70_rollback_enclave(fixture.epoch.clone(), frontier.clone());
+        assert_eq!(
+            fresh
+                .restore_sparse_rollback_with(
+                    &v70_rollback_baseline_state(&fixture),
+                    &frontier,
+                    enclave
+                )
+                .await,
+            Err("archive restore was not validated before governed bootstrap".into())
+        );
+        server.abort();
+
+        // The mode is explicit and requires the governed grant's frontier:
+        // without it, neither preparation nor recovery reaches storage or
+        // the enclave.
+        assert_eq!(
+            PersistenceFormat::parse(Some("v70-rollback-baseline")),
+            Ok(PersistenceFormat::V70RollbackBaseline)
+        );
+        assert_eq!(PersistenceFormat::parse(None), Ok(PersistenceFormat::V70));
+        let (endpoint, _, log, server) = v70_rollback_s3(objects).await;
+        let mut state = v70_rollback_baseline_state(&fixture);
+        state.artifact_store = Some(ArchiveStore::S3(v70_rollback_store_at(
+            &endpoint, "rollback",
+        )));
+        assert_eq!(
+            sparse_rollback_frontier(&state),
+            Err("v70 rollback baseline requires the governed committed frontier".into())
+        );
+        assert_eq!(
+            state
+                .artifact_store
+                .as_ref()
+                .unwrap()
+                .prepare_restore_before_grant(&state)
+                .await,
+            Err("v70 rollback baseline requires the governed committed frontier".into())
+        );
+        assert!(recover_enclave(&state)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("requires the governed committed frontier"));
+        assert!(log.lock().await.is_empty());
+        server.abort();
+        let directory = std::env::temp_dir().join(format!(
+            "layrs-v70-rollback-baseline-{}",
+            std::process::id()
+        ));
+        state.artifact_store = Some(ArchiveStore::Filesystem(
+            FilesystemImmutableArtifactStore::new(directory),
+        ));
+        assert_eq!(
+            state
+                .artifact_store
+                .as_ref()
+                .unwrap()
+                .prepare_restore_before_grant(&state)
+                .await,
+            Err("v70 rollback baseline requires the S3 archive".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn v70_rollback_normal_v70_restore_rejects_the_sparse_archive() {
+        let fixture = v70_rollback_fixture();
+        let (_, objects) = v70_rollback_package(&fixture).await;
+        let (endpoint, _, _, server) = v70_rollback_s3(objects).await;
+        let fresh = v70_rollback_store_at(&endpoint, "rollback");
+        for isolated_test in [true, false] {
+            let mut state = v70_rollback_state(None, &fixture);
+            state.persistence_format = PersistenceFormat::V70;
+            state.isolated_test = isolated_test;
+            assert_eq!(
+                fresh.prepare_restore(&state).await.err(),
+                Some("archive head sequence gap".into())
+            );
+            state.artifact_store = Some(ArchiveStore::S3(fresh.clone()));
+            assert_eq!(
+                state
+                    .artifact_store
+                    .as_ref()
+                    .unwrap()
+                    .prepare_restore_before_grant(&state)
+                    .await,
+                Err("archive head sequence gap".into())
+            );
+        }
+        assert!(fresh.prepared_restore.lock().await.is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn v70_rollback_inputs_fail_closed_before_the_enclave_or_any_write() {
         let fixture = v70_rollback_fixture();
         let archive = v70_rollback_archive(&fixture);
@@ -13118,7 +14058,6 @@ mod tests {
         unbounded_head.sequence = MAX_V70_LINEAGE_RECORDS as u64 + 1;
 
         type Edit = Box<dyn Fn(&mut BTreeMap<String, Vec<u8>>)>;
-        let unchanged: Edit = Box::new(|_| {});
         let cases: Vec<(Edit, Option<V70MigrationBundle>, JournalHead, &str)> = vec![
             (
                 Box::new(move |objects| {
@@ -13178,7 +14117,7 @@ mod tests {
                 "journal migration bundle ambiguous",
             ),
             (
-                unchanged,
+                Box::new(|_| {}),
                 Some(other_bundle),
                 fixture.head.clone(),
                 "v70 rollback migration bundle differs from restored lineage",
@@ -13313,20 +14252,25 @@ mod tests {
             );
             assert_eq!(called.load(Ordering::SeqCst), 0);
         }
-        let mut v70_state = v70_rollback_state(
-            Some(v71_store(&endpoint, eligible.clone(), JournalRole::Writer)),
-            &fixture,
-        );
-        v70_state.persistence_format = PersistenceFormat::V70;
-        assert_eq!(
-            materialize_v70_rollback(
-                &v70_state,
-                "rollback",
-                v70_rollback_seal(fixture.v71.clone(), Arc::new(AtomicU64::new(0))),
-            )
-            .await,
-            Err("v70 rollback requires a restored v71 lineage".into())
-        );
+        for format in [
+            PersistenceFormat::V70,
+            PersistenceFormat::V70RollbackBaseline,
+        ] {
+            let mut state = v70_rollback_state(
+                Some(v71_store(&endpoint, eligible.clone(), JournalRole::Writer)),
+                &fixture,
+            );
+            state.persistence_format = format;
+            assert_eq!(
+                materialize_v70_rollback(
+                    &state,
+                    "rollback",
+                    v70_rollback_seal(fixture.v71.clone(), Arc::new(AtomicU64::new(0))),
+                )
+                .await,
+                Err("v70 rollback requires a restored v71 lineage".into())
+            );
+        }
         assert!(log.lock().await.is_empty());
         server.abort();
 
@@ -13407,15 +14351,7 @@ mod tests {
             Some(v71_store(&endpoint, eligible, JournalRole::Writer)),
             &fixture,
         );
-        let mut foreign = fixture
-            .v71
-            .seal_v70_rollback_checkpoint(
-                &fixture.bundle,
-                &fixture.records,
-                &[7; 32],
-                &v70_rollback_journal_key(),
-            )
-            .unwrap();
+        let mut foreign = v70_rollback_checkpoint(&fixture);
         foreign.receipt_records.pop();
         foreign.artifact_hashes.pop();
         assert_eq!(
@@ -13434,21 +14370,13 @@ mod tests {
     #[tokio::test]
     async fn v70_rollback_interrupted_package_never_publishes_its_checkpoint() {
         let fixture = v70_rollback_fixture();
-        let checkpoint = fixture
-            .v71
-            .seal_v70_rollback_checkpoint(
-                &fixture.bundle,
-                &fixture.records,
-                &[7; 32],
-                &v70_rollback_journal_key(),
-            )
-            .unwrap();
+        let checkpoint = v70_rollback_checkpoint(&fixture);
         let receipts = ordered_journal_receipts(&fixture.receipts).unwrap();
-        let (keys, heads) =
+        let (key, head, frontier) =
             validate_v70_rollback_checkpoint(&checkpoint, 4, &receipts, "rollback").unwrap();
-        // A concurrent writer already holds head slot 2 with other bytes.
-        let (endpoint, objects, _, server) = v70_rollback_s3(BTreeMap::from([(
-            archive_head_key("rollback", 2),
+        // A concurrent writer already holds the head slot with other bytes.
+        let (endpoint, objects, log, server) = v70_rollback_s3(BTreeMap::from([(
+            archive_head_key("rollback", 4),
             "0".repeat(64).into_bytes(),
         )]))
         .await;
@@ -13460,30 +14388,50 @@ mod tests {
         .v70_rollback_target("rollback");
         assert_eq!(
             target
-                .write_v70_rollback_package(&checkpoint, &keys, &heads)
+                .write_v70_rollback_package(&checkpoint, &key, &head)
                 .await,
             Err("ARCHIVE_SEQUENCE_CONFLICT".into())
         );
+        assert_eq!(v70_rollback_puts(&log.lock().await).len(), 2);
         assert!(!objects
             .lock()
             .await
             .keys()
             .any(|key| key.starts_with("rollback/checkpoints/")));
-        // The retained v70 restore fails closed over the partial package.
-        let mut fresh = v71_store(
-            &endpoint,
-            JournalWriterState::Unrestored,
-            JournalRole::Writer,
-        );
-        fresh.prefix = "rollback".into();
+        // Neither restore branch accepts the partial package.
+        assert!(v70_rollback_store_at(&endpoint, "rollback")
+            .prepare_sparse_rollback_restore(&frontier)
+            .await
+            .is_err());
         let mut v70_state = v70_rollback_state(None, &fixture);
         v70_state.persistence_format = PersistenceFormat::V70;
-        assert!(fresh.prepare_restore(&v70_state).await.is_err());
+        assert!(v70_rollback_store_at(&endpoint, "rollback")
+            .prepare_restore(&v70_state)
+            .await
+            .is_err());
         // The rollback target can never accept a v71 journal append.
         assert_eq!(
             target.append_journal_record(&fixture.records[0]).await,
             Err("JOURNAL_LATCHED".into())
         );
+        server.abort();
+
+        // An extra object appearing under the prefix fails the exact listing.
+        let (endpoint, objects, _, server) = v70_rollback_s3(BTreeMap::new()).await;
+        objects
+            .lock()
+            .await
+            .insert("rollback/stray.cbor".into(), b"stray".to_vec());
+        let target = v71_store(
+            &endpoint,
+            JournalWriterState::Unrestored,
+            JournalRole::Writer,
+        )
+        .v70_rollback_target("rollback");
+        assert!(target
+            .write_v70_rollback_package(&checkpoint, &key, &head)
+            .await
+            .is_err());
         server.abort();
     }
 }
