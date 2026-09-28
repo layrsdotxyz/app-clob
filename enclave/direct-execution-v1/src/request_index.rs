@@ -101,6 +101,31 @@ pub struct SparseRequestProof {
     pub siblings: Vec<String>,
 }
 
+/// Compact in-memory form of the 256-level sparse tree. Unary paths are
+/// implicit, so storage is O(number of terminal requests), while generated
+/// proofs remain the fixed-format 256-sibling proofs verified by the enclave.
+#[derive(Debug, Clone, Default)]
+pub struct SparseRequestTree {
+    root: Option<Box<PatriciaNode>>,
+    len: usize,
+}
+
+#[derive(Debug, Clone)]
+enum PatriciaNode {
+    Leaf {
+        key: [u8; 32],
+        hash: String,
+        leaf: TerminalRequestLeaf,
+    },
+    Branch {
+        depth: usize,
+        key: [u8; 32],
+        hash: String,
+        left: Box<PatriciaNode>,
+        right: Box<PatriciaNode>,
+    },
+}
+
 impl SparseRequestProof {
     pub fn empty_tree() -> Self {
         Self {
@@ -166,6 +191,213 @@ impl SparseRequestProof {
             None => empty_hashes()[0].clone(),
         };
         root_from_path(&decode_digest(&key)?, &leaf_hash, &self.siblings)
+    }
+}
+
+impl SparseRequestTree {
+    pub fn from_leaves(leaves: &[TerminalRequestLeaf]) -> Result<Self, RequestIndexError> {
+        let mut tree = Self::default();
+        for leaf in leaves {
+            tree.insert(leaf.clone())?;
+        }
+        Ok(tree)
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn root(&self) -> Result<String, RequestIndexError> {
+        match &self.root {
+            Some(root) => root.hash_at_depth(0),
+            None => Ok(empty_request_index_root()),
+        }
+    }
+
+    pub fn proof(
+        &self,
+        account_id: &str,
+        request_id: &str,
+    ) -> Result<SparseRequestProof, RequestIndexError> {
+        if account_id.is_empty() || request_id.is_empty() {
+            return Err(RequestIndexError::Invalid);
+        }
+        let key = decode_digest(&request_index_key(account_id, request_id))?;
+        let mut proof = SparseRequestProof::empty_tree();
+        if let Some(root) = &self.root {
+            proof.leaf = root.prove(&key, &mut proof.siblings)?;
+        }
+        if !proof.verifies(&self.root()?, account_id, request_id) {
+            return Err(RequestIndexError::Proof);
+        }
+        Ok(proof)
+    }
+
+    pub fn insert(&mut self, leaf: TerminalRequestLeaf) -> Result<String, RequestIndexError> {
+        if !leaf.validate() {
+            return Err(RequestIndexError::Invalid);
+        }
+        if !self.is_empty()
+            && self
+                .proof(&leaf.account_id, &leaf.request_id)?
+                .leaf
+                .is_some()
+        {
+            return Err(RequestIndexError::Occupied);
+        }
+        let key = decode_digest(&leaf.key_hash())?;
+        let node = PatriciaNode::Leaf {
+            key,
+            hash: leaf.leaf_hash()?,
+            leaf,
+        };
+        self.root = Some(match self.root.take() {
+            Some(root) => Box::new(root.insert(node)?),
+            None => Box::new(node),
+        });
+        self.len = self.len.checked_add(1).ok_or(RequestIndexError::Invalid)?;
+        self.root()
+    }
+}
+
+impl PatriciaNode {
+    fn depth(&self) -> usize {
+        match self {
+            Self::Leaf { .. } => REQUEST_INDEX_DEPTH,
+            Self::Branch { depth, .. } => *depth,
+        }
+    }
+
+    fn key(&self) -> &[u8; 32] {
+        match self {
+            Self::Leaf { key, .. } | Self::Branch { key, .. } => key,
+        }
+    }
+
+    fn hash(&self) -> &str {
+        match self {
+            Self::Leaf { hash, .. } | Self::Branch { hash, .. } => hash,
+        }
+    }
+
+    fn hash_at_depth(&self, target_depth: usize) -> Result<String, RequestIndexError> {
+        let mut depth = self.depth();
+        if target_depth > depth || depth > REQUEST_INDEX_DEPTH {
+            return Err(RequestIndexError::Invalid);
+        }
+        let mut hash = self.hash().to_string();
+        while depth > target_depth {
+            let parent_depth = depth - 1;
+            let empty = &empty_hashes()[REQUEST_INDEX_DEPTH - depth];
+            hash = if bit(self.key(), parent_depth) == 0 {
+                branch_hash(&hash, empty)?
+            } else {
+                branch_hash(empty, &hash)?
+            };
+            depth = parent_depth;
+        }
+        Ok(hash)
+    }
+
+    fn insert(self: Box<Self>, new: PatriciaNode) -> Result<Self, RequestIndexError> {
+        let divergence = common_prefix_bits(self.key(), new.key());
+        if divergence < self.depth() {
+            return Self::branch(divergence, *self, new);
+        }
+        match *self {
+            Self::Leaf { .. } => Err(RequestIndexError::Occupied),
+            Self::Branch {
+                depth,
+                key: _,
+                hash: _,
+                left,
+                right,
+            } => {
+                let (left, right) = if bit(new.key(), depth) == 0 {
+                    (Box::new(left.insert(new)?), right)
+                } else {
+                    (left, Box::new(right.insert(new)?))
+                };
+                Self::branch_with_children(depth, left, right)
+            }
+        }
+    }
+
+    fn branch(
+        depth: usize,
+        existing: PatriciaNode,
+        new: PatriciaNode,
+    ) -> Result<Self, RequestIndexError> {
+        if depth >= REQUEST_INDEX_DEPTH || bit(existing.key(), depth) == bit(new.key(), depth) {
+            return Err(RequestIndexError::Invalid);
+        }
+        let (left, right) = if bit(existing.key(), depth) == 0 {
+            (Box::new(existing), Box::new(new))
+        } else {
+            (Box::new(new), Box::new(existing))
+        };
+        Self::branch_with_children(depth, left, right)
+    }
+
+    fn branch_with_children(
+        depth: usize,
+        left: Box<PatriciaNode>,
+        right: Box<PatriciaNode>,
+    ) -> Result<Self, RequestIndexError> {
+        if depth >= REQUEST_INDEX_DEPTH
+            || bit(left.key(), depth) != 0
+            || bit(right.key(), depth) != 1
+            || left.depth() <= depth
+            || right.depth() <= depth
+        {
+            return Err(RequestIndexError::Invalid);
+        }
+        let left_hash = left.hash_at_depth(depth + 1)?;
+        let right_hash = right.hash_at_depth(depth + 1)?;
+        Ok(Self::Branch {
+            depth,
+            key: *left.key(),
+            hash: branch_hash(&left_hash, &right_hash)?,
+            left,
+            right,
+        })
+    }
+
+    fn prove(
+        &self,
+        target: &[u8; 32],
+        siblings: &mut [String],
+    ) -> Result<Option<TerminalRequestLeaf>, RequestIndexError> {
+        let divergence = common_prefix_bits(self.key(), target);
+        if divergence < self.depth() {
+            siblings[REQUEST_INDEX_DEPTH - 1 - divergence] = self.hash_at_depth(divergence + 1)?;
+            return Ok(None);
+        }
+        match self {
+            Self::Leaf { key, leaf, .. } => {
+                if key == target {
+                    Ok(Some(leaf.clone()))
+                } else {
+                    Err(RequestIndexError::Invalid)
+                }
+            }
+            Self::Branch {
+                depth, left, right, ..
+            } => {
+                let proof_level = REQUEST_INDEX_DEPTH - 1 - depth;
+                if bit(target, *depth) == 0 {
+                    siblings[proof_level] = right.hash_at_depth(depth + 1)?;
+                    left.prove(target, siblings)
+                } else {
+                    siblings[proof_level] = left.hash_at_depth(depth + 1)?;
+                    right.prove(target, siblings)
+                }
+            }
+        }
     }
 }
 
@@ -260,6 +492,20 @@ fn root_from_path(
         };
     }
     Ok(current)
+}
+
+fn common_prefix_bits(left: &[u8; 32], right: &[u8; 32]) -> usize {
+    for (index, (left, right)) in left.iter().zip(right).enumerate() {
+        let difference = left ^ right;
+        if difference != 0 {
+            return index * 8 + difference.leading_zeros() as usize;
+        }
+    }
+    REQUEST_INDEX_DEPTH
+}
+
+fn bit(key: &[u8; 32], depth: usize) -> u8 {
+    (key[depth / 8] >> (7 - (depth % 8))) & 1
 }
 
 fn empty_hashes() -> &'static Vec<String> {
@@ -395,6 +641,44 @@ mod tests {
         assert_eq!(
             request_index_root(&[terminal.clone(), terminal]),
             Err(RequestIndexError::Invalid)
+        );
+    }
+
+    #[test]
+    fn compact_tree_matches_complete_root_and_proves_membership_and_absence() {
+        let leaves = (0..64)
+            .map(|index| TerminalRequestLeaf {
+                account_id: format!("account-{index}"),
+                request_id: format!("request-{index}"),
+                request_hash: sha256(format!("request-hash-{index}").as_bytes()),
+                result_hash: sha256(format!("result-hash-{index}").as_bytes()),
+                receipt_hash: sha256(format!("receipt-hash-{index}").as_bytes()),
+                locator: TerminalResultLocator::Journal {
+                    writer_epoch: "writer-epoch-1".into(),
+                    sequence: index + 1,
+                },
+            })
+            .collect::<Vec<_>>();
+        let expected = request_index_root(&leaves).unwrap();
+        let mut tree = SparseRequestTree::default();
+        for (index, leaf) in leaves.iter().enumerate() {
+            let before = tree.proof(&leaf.account_id, &leaf.request_id).unwrap();
+            assert!(before.leaf.is_none());
+            tree.insert(leaf.clone()).unwrap();
+            assert_eq!(tree.len(), index + 1);
+        }
+        assert_eq!(tree.root().unwrap(), expected);
+        for leaf in &leaves {
+            let proof = tree.proof(&leaf.account_id, &leaf.request_id).unwrap();
+            assert_eq!(proof.leaf.as_ref(), Some(leaf));
+            assert!(proof.verifies(&expected, &leaf.account_id, &leaf.request_id));
+        }
+        let absent = tree.proof("missing-account", "missing-request").unwrap();
+        assert!(absent.leaf.is_none());
+        assert!(absent.verifies(&expected, "missing-account", "missing-request"));
+        assert_eq!(
+            tree.insert(leaves[0].clone()),
+            Err(RequestIndexError::Occupied)
         );
     }
 }
