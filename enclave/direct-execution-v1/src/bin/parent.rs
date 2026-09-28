@@ -179,6 +179,10 @@ struct AppState {
         Arc<Mutex<Option<BTreeMap<(String, String), (u64, DirectReceipt)>>>>,
     journal_migration: Arc<Mutex<Option<V70MigrationBundle>>>,
     journal_checkpoint_sequence: Arc<AtomicU64>,
+    /// Authenticated v71 transition roots retained for restart-safe intent
+    /// lineage checks. Checkpoints are never sealed with an unresolved effect,
+    /// so checkpoint plus tail always covers every recoverable intent root.
+    journal_transition_roots: Arc<Mutex<Option<BTreeMap<u64, String>>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1714,6 +1718,25 @@ impl ArchiveStore {
             Self::Filesystem(store) => store.load_committed().map_err(|error| error.to_string()),
             Self::S3(store) => store.load_committed().await,
         }
+    }
+    async fn committed_receipts(
+        &self,
+        state: &AppState,
+    ) -> Result<Vec<(u64, DirectReceipt)>, String> {
+        // Presence means v71 restore/cutover completed. On the first v71 boot,
+        // startup intentionally reconciles the v70 lineage before activating
+        // the journal, so the absent cache must still fall back to v70.
+        let cache = state.journal_receipts.lock().await;
+        if let Some(cache) = cache.as_ref() {
+            return ordered_journal_receipts(cache);
+        }
+        drop(cache);
+        self.load_committed().await.map(|records| {
+            records
+                .into_iter()
+                .map(|record| (record.sequence, record.receipt))
+                .collect()
+        })
     }
     async fn prepare_restore_before_grant(&self, state: &AppState) -> Result<(), String> {
         match self {
@@ -3273,6 +3296,10 @@ impl S3ImmutableArtifactStore {
             request_index_root: checkpoint.request_index_root.clone(),
             financial_state_root: checkpoint.financial_state_root.clone(),
         };
+        let mut transition_roots = BTreeMap::from([(
+            checkpoint.sequence,
+            checkpoint.transition_root.clone(),
+        )]);
         for record in tail {
             let response = exchange(
                 state,
@@ -3342,6 +3369,12 @@ impl S3ImmutableArtifactStore {
                 request_index_root: record.request_index_root,
                 financial_state_root: record.financial_state_root,
             };
+            if transition_roots
+                .insert(head.sequence, head.transition_root.clone())
+                .is_some()
+            {
+                return Err("journal restore duplicate transition root sequence".into());
+            }
         }
         let fence = state
             .governed_bootstrap
@@ -3380,6 +3413,7 @@ impl S3ImmutableArtifactStore {
         *state.journal_request_index.lock().await = Some(index);
         *state.journal_receipts.lock().await = Some(receipts);
         *state.journal_migration.lock().await = migration;
+        *state.journal_transition_roots.lock().await = Some(transition_roots);
         state
             .journal_checkpoint_sequence
             .store(checkpoint.sequence, Ordering::Release);
@@ -4185,6 +4219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         journal_receipts: Arc::new(Mutex::new(None)),
         journal_migration: Arc::new(Mutex::new(None)),
         journal_checkpoint_sequence: Arc::new(AtomicU64::new(0)),
+        journal_transition_roots: Arc::new(Mutex::new(None)),
     };
     // A Nitro EIF does not inherit the parent's systemd environment.  The
     // isolated test key material therefore crosses the existing VSOCK channel
@@ -4980,7 +5015,7 @@ async fn prepare_zen_withdrawal(
     let custody=state.zen_custody.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE,"ZEN_CUSTODY_ADAPTER_NOT_ENABLED"))?;
     let store=state.artifact_store.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE,"DIRECT_ARTIFACT_STORE_NOT_CONFIGURED"))?;
     let intents=store.load_intents().await.map_err(|_|(StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_INTENT_RECOVERY_FAILED"))?;
-    let artifacts=store.load_committed().await.map_err(|_|(StatusCode::SERVICE_UNAVAILABLE,"DIRECT_STATE_RECOVERY_FAILED"))?;
+    let receipts=store.committed_receipts(state).await.map_err(|_|(StatusCode::SERVICE_UNAVAILABLE,"DIRECT_STATE_RECOVERY_FAILED"))?;
     let related=intents.iter().filter(|intent|intent.account_id==claims.subject_hash && intent.request_id==request_id).collect::<Vec<_>>();
     if related.iter().any(|intent|intent.identity_commitment!=identity || intent.asset!="ZEN" || intent.chain!="horizen"
         || intent.zen_destination_chain.as_ref()!=Some(&destination_chain) || !intent.destination.eq_ignore_ascii_case(&destination)
@@ -4988,10 +5023,10 @@ async fn prepare_zen_withdrawal(
         return Err((StatusCode::CONFLICT,"EXTERNAL_EFFECT_REPLAY_CONFLICT"));
     }
     for intent in &related {
-        if let Some(artifact)=artifacts.iter().find(|artifact|artifact.receipt.account_id==claims.subject_hash && artifact.receipt.request_id==request_id
-            && artifact.receipt.request_hash==intent.request_hash && artifact.receipt.custody_reference.as_deref().is_some_and(|reference|reference.starts_with(&format!("{}:",intent.external_effect_reference)))) {
-            let reference=artifact.receipt.custody_reference.clone().ok_or((StatusCode::CONFLICT,"EXTERNAL_EFFECT_RESULT_CONFLICT"))?;
-            return match artifact.receipt.effect.as_str() {
+        if let Some(receipt)=receipts.iter().map(|(_, receipt)| receipt).find(|receipt|receipt.account_id==claims.subject_hash && receipt.request_id==request_id
+            && receipt.request_hash==intent.request_hash && receipt.custody_reference.as_deref().is_some_and(|reference|reference.starts_with(&format!("{}:",intent.external_effect_reference)))) {
+            let reference=receipt.custody_reference.clone().ok_or((StatusCode::CONFLICT,"EXTERNAL_EFFECT_RESULT_CONFLICT"))?;
+            return match receipt.effect.as_str() {
                 "WITHDRAWAL_SETTLED"=>Ok(DirectAction::ReserveZenWithdrawal {destination_chain,destination,amount_atomic,custody_reference:reference}),
                 "WITHDRAWAL_REVERTED"=>Ok(DirectAction::RecordZenWithdrawalReverted {destination_chain,destination,amount_atomic,custody_reference:reference}),
                 _=>Err((StatusCode::CONFLICT,"EXTERNAL_EFFECT_RESULT_CONFLICT")),
@@ -5060,7 +5095,7 @@ async fn prepare_external_withdrawal(
             "EXTERNAL_EFFECT_INTENT_RECOVERY_FAILED",
         )
     })?;
-    let committed_artifacts = store.load_committed().await.map_err(|_| {
+    let committed_receipts = store.committed_receipts(state).await.map_err(|_| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             "DIRECT_STATE_RECOVERY_FAILED",
@@ -5068,7 +5103,7 @@ async fn prepare_external_withdrawal(
     })?;
     if let Some(action) = committed_external_effect_action(
         &retained_intents,
-        &committed_artifacts,
+        &committed_receipts,
         &claims.subject_hash,
         identity_commitment,
         request_id,
@@ -5647,6 +5682,25 @@ fn verify_projected_receipt_lineage(records: &[DirectStateArtifact], receipts: &
         if verified.get(receipt.receipt_id.as_str()).copied() != Some(receipt) {
             return Err(ProjectionError::Database);
         }
+    }
+    Ok(())
+}
+
+fn verify_committed_receipt_lineage(
+    records: &[(u64, DirectReceipt)],
+    receipts: &[DirectReceipt],
+) -> Result<(), ProjectionError> {
+    let mut verified = HashMap::with_capacity(records.len());
+    if records.iter().enumerate().any(|(offset, (sequence, receipt))| {
+        *sequence != offset as u64 + 1
+            || verified
+                .insert(receipt.receipt_id.as_str(), receipt)
+                .is_some()
+    }) || receipts
+        .iter()
+        .any(|receipt| verified.get(receipt.receipt_id.as_str()).copied() != Some(receipt))
+    {
+        return Err(ProjectionError::Database);
     }
     Ok(())
 }
@@ -6347,19 +6401,26 @@ async fn activate_v71_from_restored_v70(state: &AppState) -> io::Result<()> {
     *state.journal_request_index.lock().await = Some(index);
     *state.journal_receipts.lock().await = Some(receipts);
     *state.journal_migration.lock().await = Some(bundle);
+    *state.journal_transition_roots.lock().await = Some(BTreeMap::from([(
+        sequence,
+        transition_root.clone(),
+    )]));
     state
         .journal_checkpoint_sequence
         .store(sequence, Ordering::Release);
     *state.committed_state_root.lock().await = Some(transition_root);
+    // A successful cutover must make accidental v70 artifact reads fail
+    // closed. The journal receipt cache above is now the only authoritative
+    // committed lineage for retries, payout deduplication and projection.
+    *store.verified_receipt_records.lock().await = None;
     eprintln!("V71_MIGRATION_CUTOVER_READY sequence={sequence}");
     Ok(())
 }
 
-fn intent_is_committed(intent: &ExternalEffectIntent, artifacts: &[DirectStateArtifact]) -> bool {
+fn intent_is_committed(intent: &ExternalEffectIntent, receipts: &[(u64, DirectReceipt)]) -> bool {
     let prefix = format!("{}:", intent.external_effect_reference);
-    artifacts.iter().any(|artifact| {
-        artifact
-            .receipt
+    receipts.iter().any(|(_, receipt)| {
+        receipt
             .custody_reference
             .as_deref()
             .is_some_and(|value| value.starts_with(&prefix))
@@ -6412,17 +6473,17 @@ struct ExtraPayoutEvidence {
     disposition: String,
 }
 
-fn extra_payout_evidence(intent: &ExternalEffectIntent, original: &ExternalEffectIntent, artifacts: &[DirectStateArtifact], outcome: ExternalEffectRecovery) -> io::Result<Option<ExtraPayoutEvidence>> {
+fn extra_payout_evidence(intent: &ExternalEffectIntent, original: &ExternalEffectIntent, receipts: &[(u64, DirectReceipt)], outcome: ExternalEffectRecovery) -> io::Result<Option<ExtraPayoutEvidence>> {
     intent.verify().map_err(invalid)?;
     original.verify().map_err(invalid)?;
     if !same_external_effect_request(intent, original) || intent.intent_hash == original.intent_hash || intent.chain != "base" || intent.asset != "USDC" || intent.relay.is_some() || intent.zen_destination_chain.is_some() { return Err(invalid("extra payout binding conflict")); }
     let prefix = format!("{}:", original.external_effect_reference);
-    let committed = artifacts.iter().find(|a| a.epoch_id == EPOCH_ID && a.receipt.account_id == original.account_id && a.receipt.request_id == original.request_id && a.receipt.request_hash == original.request_hash && a.receipt.effect == "WITHDRAWAL_SETTLED" && a.receipt.amount_atomic.as_deref() == Some(original.amount_atomic.as_str()) && a.receipt.custody_reference.as_deref().is_some_and(|r|r.starts_with(&prefix))).ok_or_else(|| invalid("original payout is not committed"))?;
-    let original_hash = committed.receipt.custody_reference.as_deref().and_then(|r|r.strip_prefix(&prefix)).filter(|r|valid_transaction_hash(r)).ok_or_else(||invalid("original payout hash invalid"))?;
+    let committed = receipts.iter().map(|(_, receipt)| receipt).find(|receipt| receipt.account_id == original.account_id && receipt.request_id == original.request_id && receipt.request_hash == original.request_hash && receipt.effect == "WITHDRAWAL_SETTLED" && receipt.amount_atomic.as_deref() == Some(original.amount_atomic.as_str()) && receipt.custody_reference.as_deref().is_some_and(|r|r.starts_with(&prefix))).ok_or_else(|| invalid("original payout is not committed"))?;
+    let original_hash = committed.custody_reference.as_deref().and_then(|r|r.strip_prefix(&prefix)).filter(|r|valid_transaction_hash(r)).ok_or_else(||invalid("original payout hash invalid"))?;
     let ExternalEffectRecovery::BindFinalized {provider_transaction_id,transaction_hash} = outcome else {return Err(invalid("extra payout is not canonically finalized"));};
     if !valid_transaction_hash(&transaction_hash) { return Err(invalid("extra payout hash invalid")); }
     if original_hash.eq_ignore_ascii_case(&transaction_hash) { return Ok(None); } // Two references to one tx are not two payments.
-    Ok(Some(ExtraPayoutEvidence {protocol_version:"layrs.external-extra-payout.v1".into(),epoch_id:EPOCH_ID.into(),intent_hash:intent.intent_hash.clone(),original_intent_hash:original.intent_hash.clone(),original_receipt_id:committed.receipt.receipt_id.clone(),original_transaction_hash:original_hash.to_ascii_lowercase(),provider_transaction_id,transaction_hash:transaction_hash.to_ascii_lowercase(),account_id:intent.account_id.clone(),request_id:intent.request_id.clone(),destination:intent.destination.to_ascii_lowercase(),chain:intent.chain.clone(),asset:intent.asset.clone(),amount_atomic:intent.amount_atomic.clone(),customer_debit_atomic:"0".into(),disposition:"PROTOCOL_OVERPAYMENT_UNRECOVERED".into()}))
+    Ok(Some(ExtraPayoutEvidence {protocol_version:"layrs.external-extra-payout.v1".into(),epoch_id:EPOCH_ID.into(),intent_hash:intent.intent_hash.clone(),original_intent_hash:original.intent_hash.clone(),original_receipt_id:committed.receipt_id.clone(),original_transaction_hash:original_hash.to_ascii_lowercase(),provider_transaction_id,transaction_hash:transaction_hash.to_ascii_lowercase(),account_id:intent.account_id.clone(),request_id:intent.request_id.clone(),destination:intent.destination.to_ascii_lowercase(),chain:intent.chain.clone(),asset:intent.asset.clone(),amount_atomic:intent.amount_atomic.clone(),customer_debit_atomic:"0".into(),disposition:"PROTOCOL_OVERPAYMENT_UNRECOVERED".into()}))
 }
 
 /// Rebase ONLY a confirmed direct Base USDC outcome across an independently
@@ -6439,9 +6500,53 @@ fn historical_intent_lineage_safe(intent: &ExternalEffectIntent, artifacts: &[Di
     })
 }
 
+fn historical_journal_intent_lineage_safe(
+    intent: &ExternalEffectIntent,
+    receipts: &[(u64, DirectReceipt)],
+    transition_roots: &BTreeMap<u64, String>,
+    current_root: &str,
+) -> bool {
+    if intent.chain != "base"
+        || intent.asset != "USDC"
+        || intent.relay.is_some()
+        || intent.zen_destination_chain.is_some()
+    {
+        return false;
+    }
+    let Some((&current_sequence, restored_root)) = transition_roots.last_key_value() else {
+        return false;
+    };
+    if restored_root != current_root
+        || receipts.last().map(|(sequence, _)| *sequence) != Some(current_sequence)
+        || transition_roots
+            .keys()
+            .zip(transition_roots.keys().skip(1))
+            .any(|(left, right)| left.checked_add(1) != Some(*right))
+    {
+        return false;
+    }
+    let starts = transition_roots
+        .iter()
+        .filter_map(|(sequence, root)| (root == &intent.prior_state_hash).then_some(*sequence))
+        .collect::<Vec<_>>();
+    if starts.len() != 1 {
+        return false;
+    }
+    receipts
+        .iter()
+        .filter(|(sequence, _)| *sequence > starts[0])
+        .all(|(_, receipt)| {
+            !(receipt.account_id == intent.account_id && receipt.request_id == intent.request_id)
+                && !receipt.projection_balance_updates.iter().any(|balance| {
+                    balance.identity_commitment == intent.identity_commitment
+                        && balance.asset == intent.asset
+                })
+        })
+}
+
 fn committed_external_effect_action(
     intents: &[ExternalEffectIntent],
-    artifacts: &[DirectStateArtifact],
+    receipts: &[(u64, DirectReceipt)],
     account_id: &str,
     identity_commitment: &str,
     request_id: &str,
@@ -6468,25 +6573,23 @@ fn committed_external_effect_action(
     }
     for intent in related {
         let prefix = format!("{}:", intent.external_effect_reference);
-        let Some(artifact) = artifacts.iter().find(|artifact| {
-            artifact.receipt.account_id == account_id
-                && artifact.receipt.identity_commitment == identity_commitment
-                && artifact.receipt.request_id == request_id
-                && artifact.receipt.amount_atomic.as_deref() == Some(amount_atomic)
-                && artifact
-                    .receipt
+        let Some(receipt) = receipts.iter().map(|(_, receipt)| receipt).find(|receipt| {
+            receipt.account_id == account_id
+                && receipt.identity_commitment == identity_commitment
+                && receipt.request_id == request_id
+                && receipt.amount_atomic.as_deref() == Some(amount_atomic)
+                && receipt
                     .custody_reference
                     .as_deref()
                     .is_some_and(|value| value.starts_with(&prefix))
         }) else {
             continue;
         };
-        let custody_reference = artifact
-            .receipt
+        let custody_reference = receipt
             .custody_reference
             .clone()
             .ok_or_else(|| invalid("committed withdrawal is missing custody binding"))?;
-        let action = match (intent.relay.as_ref(), artifact.receipt.effect.as_str()) {
+        let action = match (intent.relay.as_ref(), receipt.effect.as_str()) {
             (Some(relay), "WITHDRAWAL_SETTLED") => DirectAction::SettleRelayWithdrawal {
                 relay: relay.clone(),
                 amount_atomic: amount_atomic.into(),
@@ -6522,7 +6625,7 @@ fn committed_external_effect_action(
         };
         request.request_hash = request_hash(&request);
         if request.request_hash != intent.request_hash
-            || request.request_hash != artifact.receipt.request_hash
+            || request.request_hash != receipt.request_hash
         {
             return Err(invalid("committed external-effect replay hash mismatch"));
         }
@@ -6784,10 +6887,27 @@ async fn recover_external_effect_intents(state: &AppState) -> io::Result<()> {
     if intents.is_empty() {
         return Ok(());
     }
-    let artifacts = store
-        .load_committed()
+    let receipts = store
+        .committed_receipts(state)
         .await
-        .map_err(|error| invalid(format!("direct artifact recovery failed:{error}")))?;
+        .map_err(|error| invalid(format!("direct receipt recovery failed:{error}")))?;
+    let transition_roots = state.journal_transition_roots.lock().await.clone();
+    let artifacts = if transition_roots.is_none() {
+        Some(
+            store
+                .load_committed()
+                .await
+                .map_err(|error| invalid(format!("direct artifact recovery failed:{error}")))?,
+        )
+    } else {
+        None
+    };
+    // Recovery may publish terminal journal records and checkpoint capture
+    // reads these same caches. Hold one gate for the complete pass so neither
+    // a torn cache view nor a checkpoint past an unresolved intent is visible.
+    // Startup has not begun serving requests yet, so this introduces no live
+    // request contention.
+    let guard = state.financial_gate.lock("external_effect_recovery").await;
     for intent in intents.iter().cloned() {
         // Standard ZEN egress is recovered by the withdrawal worker against
         // the original held withdrawal operation. Its immutable provider
@@ -6796,13 +6916,13 @@ async fn recover_external_effect_intents(state: &AppState) -> io::Result<()> {
         if standard_zen_egress_intent(&intent) {
             continue;
         }
-        if intent_is_committed(&intent, &artifacts) {
+        if intent_is_committed(&intent, &receipts) {
             continue;
         }
         if let Some(committed_sibling) = intents.iter().find(|candidate| {
             candidate.account_id == intent.account_id
                 && candidate.request_id == intent.request_id
-                && intent_is_committed(candidate, &artifacts)
+                && intent_is_committed(candidate, &receipts)
         }) {
             if same_external_effect_request(&intent, committed_sibling) {
                 // A second intent is NOT proof that it remained unsubmitted.
@@ -6814,7 +6934,7 @@ async fn recover_external_effect_intents(state: &AppState) -> io::Result<()> {
                     layrs_direct_execution_v1::ExternalEffectObservation::NotFound => return Err(invalid("duplicate custody reference is missing; no-effect cannot be assumed")),
                     finalized @ layrs_direct_execution_v1::ExternalEffectObservation::Finalized { .. } => {
                         let terminal = intent.recovery_action(now_unix(), finalized);
-                        if let Some(evidence) = extra_payout_evidence(&intent, committed_sibling, &artifacts, terminal)? {
+                        if let Some(evidence) = extra_payout_evidence(&intent, committed_sibling, &receipts, terminal)? {
                             store.persist_extra_payout(&evidence).await.map_err(invalid)?;
                             state.projection.as_ref().ok_or_else(|| invalid("extra payout projection unavailable"))?.record_extra_payout(&evidence).await.map_err(|_|invalid("extra payout projection reconciliation failed"))?;
                             eprintln!("VERIFIED_EXTRA_PAYOUT_RECONCILED {} customer_debit=0", evidence.intent_hash);
@@ -6831,7 +6951,18 @@ async fn recover_external_effect_intents(state: &AppState) -> io::Result<()> {
         }
         let root = state.committed_state_root.lock().await.clone();
         let historical = root.as_deref() != Some(intent.prior_state_hash.as_str());
-        if historical && !root.as_deref().is_some_and(|r|historical_intent_lineage_safe(&intent,&artifacts,r)) {
+        let historical_lineage_safe = root.as_deref().is_some_and(|root| {
+            match (&transition_roots, &artifacts) {
+                (Some(roots), _) => {
+                    historical_journal_intent_lineage_safe(&intent, &receipts, roots, root)
+                }
+                (None, Some(artifacts)) => {
+                    historical_intent_lineage_safe(&intent, artifacts, root)
+                }
+                (None, None) => false,
+            }
+        });
+        if historical && !historical_lineage_safe {
             return Err(invalid(
                 "unresolved external-effect intent does not match committed lineage",
             ));
@@ -6858,7 +6989,6 @@ async fn recover_external_effect_intents(state: &AppState) -> io::Result<()> {
             | ExternalEffectRecovery::BindRelayFinalized { .. }
             | ExternalEffectRecovery::BindRelayReverted { .. }) => {
                 let request = request_for_external_effect(&intent, terminal)?;
-                let guard = state.financial_gate.lock("external_effect_recovery").await;
                 let response = exchange_direct(state, request, &guard).await?;
                 let RuntimeResponse::Execute { result } = response else {
                     return Err(invalid("external-effect recovery execution failed"));
@@ -6904,15 +7034,7 @@ fn missing_projected_journal_receipts(
     records: &JournalReceiptCache,
     existing: &[DirectReceipt],
 ) -> Result<Vec<DirectReceipt>, ProjectionError> {
-    let mut ordered = records.values().cloned().collect::<Vec<_>>();
-    ordered.sort_by_key(|(sequence, _)| *sequence);
-    if ordered
-        .iter()
-        .enumerate()
-        .any(|(offset, (sequence, _))| *sequence != offset as u64 + 1)
-    {
-        return Err(ProjectionError::Database);
-    }
+    let ordered = ordered_journal_receipts(records).map_err(|_| ProjectionError::Database)?;
     let by_id = ordered
         .iter()
         .map(|(_, receipt)| (receipt.receipt_id.as_str(), receipt))
@@ -7044,16 +7166,16 @@ async fn verify_recovered_projection(state: &AppState) -> io::Result<()> {
         )
         .await
         .map_err(|_| invalid("projection receipt reconciliation query failed"))?;
-    let records = state.artifact_store.as_ref().ok_or_else(|| invalid("projection archive unavailable"))?.load_committed().await.map_err(invalid)?;
+    let records = state.artifact_store.as_ref().ok_or_else(|| invalid("projection archive unavailable"))?.committed_receipts(state).await.map_err(invalid)?;
     let receipts: Vec<DirectReceipt> = receipts.into_iter().map(|row| {
         let encoded: String = row.get(0);
         serde_json::from_str(&encoded).map_err(|_| invalid("projection receipt is malformed"))
     }).collect::<io::Result<_>>()?;
-    if let Err(_) = verify_projected_receipt_lineage(&records, &receipts) {
+    if let Err(_) = verify_committed_receipt_lineage(&records, &receipts) {
         // Name the first offending receipt so an operator can tell "another
         // writer kept committing after this restore listed the archive" from
         // a genuinely corrupt projection without querying the database.
-        let known: HashSet<&str> = records.iter().map(|record| record.receipt.receipt_id.as_str()).collect();
+        let known: HashSet<&str> = records.iter().map(|(_, receipt)| receipt.receipt_id.as_str()).collect();
         if let Some(extra) = receipts.iter().find(|receipt| !known.contains(receipt.receipt_id.as_str())) {
             eprintln!(
                 "PROJECTION_LINEAGE_CONFLICT receipt_id={} request_id={} effect={}",
@@ -7079,7 +7201,7 @@ async fn verify_recovered_projection(state: &AppState) -> io::Result<()> {
     // was independently compared with the recovered private state above.
     // This changes no financial amount and prevents an old first-time retry
     // from overwriting a newer, already-reconciled projection.
-    let sequence = records.last().map_or(0, |record| record.sequence);
+    let sequence = records.last().map_or(0, |(sequence, _)| *sequence);
     let sequence = i64::try_from(sequence).map_err(|_| invalid("projection sequence overflow"))?;
     let invalid_frontier = projection.client.lock().await.query_one(
         "SELECT EXISTS (SELECT 1 FROM direct_execution_epoch_balances WHERE epoch_id=$1 AND (projection_sequence<0 OR projection_sequence>$2))", &[&EPOCH_ID, &sequence]
@@ -7575,6 +7697,25 @@ async fn archived_terminal_for_leaf(
 
 type JournalReceiptCache = BTreeMap<(String, String), (u64, DirectReceipt)>;
 
+fn ordered_journal_receipts(
+    records: &JournalReceiptCache,
+) -> Result<Vec<(u64, DirectReceipt)>, String> {
+    let mut ordered = records.values().cloned().collect::<Vec<_>>();
+    ordered.sort_by_key(|(sequence, _)| *sequence);
+    let mut receipt_ids = HashSet::with_capacity(ordered.len());
+    if ordered.iter().enumerate().any(|(offset, (sequence, receipt))| {
+        *sequence != offset as u64 + 1
+            || records.get(&(receipt.account_id.clone(), receipt.request_id.clone()))
+                .is_none_or(|(cached_sequence, cached_receipt)| {
+                    cached_sequence != sequence || cached_receipt != receipt
+                })
+            || !receipt_ids.insert(receipt.receipt_id.clone())
+    }) {
+        return Err("journal receipt cache invalid".into());
+    }
+    Ok(ordered)
+}
+
 fn migration_parent_state(
     bundle: &V70MigrationBundle,
     records: &[DirectStateArtifact],
@@ -7833,6 +7974,27 @@ async fn exchange_direct_v71(
         store.latch_journal("JOURNAL_RECEIPT_ADVANCE_FAILED").await;
         return Err(invalid("JOURNAL_RECEIPT_ADVANCE_FAILED"));
     }
+    let transition_advance = state
+        .journal_transition_roots
+        .lock()
+        .await
+        .as_mut()
+        .map(|roots| {
+            let previous = roots.last_key_value();
+            if !matches!(previous, Some((sequence, root))
+                if sequence.checked_add(1) == Some(record.sequence)
+                    && root == &record.previous_transition_root)
+            {
+                return false;
+            }
+            roots
+                .insert(record.sequence, record.transition_root.clone())
+                .is_none()
+        });
+    if transition_advance != Some(true) {
+        store.latch_journal("JOURNAL_TRANSITION_ROOT_ADVANCE_FAILED").await;
+        return Err(invalid("JOURNAL_TRANSITION_ROOT_ADVANCE_FAILED"));
+    }
     *state.committed_state_root.lock().await = Some(record.transition_root);
     state.last_commit_at.store(now_unix(), Ordering::Release);
     store.schedule_journal_checkpoint(state).await;
@@ -7926,6 +8088,41 @@ mod tests {
         assert!(journal_checkpoint_due(10_250, 10_000));
         assert!(!journal_checkpoint_due(9_999, 10_000));
         assert!(V71_CHECKPOINT_INTERVAL_RECORDS * 4 <= MAX_V71_RESTORE_TAIL_RECORDS as u64);
+    }
+
+    #[test]
+    fn v71_ordered_receipt_cache_requires_complete_unique_sequence_and_identity() {
+        let first = projection_sequence_fixture().receipt;
+        let mut second = first.clone();
+        second.receipt_id = "receipt-2".into();
+        second.account_id = "account-2".into();
+        second.request_id = "request-2".into();
+        let cache = BTreeMap::from([
+            ((second.account_id.clone(), second.request_id.clone()), (2, second.clone())),
+            ((first.account_id.clone(), first.request_id.clone()), (1, first.clone())),
+        ]);
+        assert_eq!(
+            ordered_journal_receipts(&cache).unwrap(),
+            vec![(1, first.clone()), (2, second.clone())]
+        );
+        assert!(verify_committed_receipt_lineage(
+            &[(1, first.clone()), (2, second.clone())],
+            &[first.clone()]
+        )
+        .is_ok());
+
+        let mut gap = cache.clone();
+        gap.get_mut(&(second.account_id.clone(), second.request_id.clone()))
+            .unwrap()
+            .0 = 3;
+        assert!(ordered_journal_receipts(&gap).is_err());
+        let mut duplicate_receipt = cache;
+        duplicate_receipt
+            .get_mut(&(second.account_id.clone(), second.request_id.clone()))
+            .unwrap()
+            .1
+            .receipt_id = first.receipt_id;
+        assert!(ordered_journal_receipts(&duplicate_receipt).is_err());
     }
 
     use super::*;
@@ -8040,6 +8237,7 @@ mod tests {
             journal_receipts: Arc::new(Mutex::new(None)),
             journal_migration: Arc::new(Mutex::new(None)),
             journal_checkpoint_sequence: Arc::new(AtomicU64::new(0)),
+            journal_transition_roots: Arc::new(Mutex::new(None)),
         };
         assert_eq!(store.seal_current_checkpoint(&state).await.unwrap_err(), "checkpoint head mismatch");
         // restore_streamed's final step: the same failure is only diagnosed.
@@ -8159,17 +8357,30 @@ mod tests {
         let mut fork=records.clone();fork[1].prior_state_hash="e".repeat(64);assert!(!historical_intent_lineage_safe(&intent,&fork,&"d".repeat(64)));
         let mut collision=records.clone();collision[2].receipt.account_id=intent.account_id.clone();collision[2].receipt.request_id=intent.request_id.clone();assert!(!historical_intent_lineage_safe(&intent,&collision,&"d".repeat(64)));
         let mut changed=records.clone();changed[2].receipt.projection_balance_updates.push(layrs_direct_execution_v1::ProjectionBalanceUpdate {auth_subject_hash:intent.account_id.clone(),identity_commitment:intent.identity_commitment.clone(),asset:"USDC".into(),bucket:"USER_AVAILABLE".into(),amount_atomic:"1".into()});assert!(!historical_intent_lineage_safe(&intent,&changed,&"d".repeat(64)));
+
+        let receipts=records.iter().map(|record|(record.sequence,record.receipt.clone())).collect::<Vec<_>>();
+        let roots=BTreeMap::from([(1,"b".repeat(64)),(2,"c".repeat(64)),(3,"d".repeat(64))]);
+        assert!(historical_journal_intent_lineage_safe(&intent,&receipts,&roots,&"d".repeat(64)));
+        assert!(!historical_journal_intent_lineage_safe(&intent,&receipts,&roots,&"e".repeat(64)));
+        let missing_root=BTreeMap::from([(2,"c".repeat(64)),(3,"d".repeat(64))]);
+        assert!(!historical_journal_intent_lineage_safe(&intent,&receipts,&missing_root,&"d".repeat(64)));
+        let gap=BTreeMap::from([(1,"b".repeat(64)),(3,"d".repeat(64))]);
+        assert!(!historical_journal_intent_lineage_safe(&intent,&receipts,&gap,&"d".repeat(64)));
+        let mut changed_receipts=receipts.clone();
+        changed_receipts[2].1.projection_balance_updates.push(layrs_direct_execution_v1::ProjectionBalanceUpdate {auth_subject_hash:intent.account_id.clone(),identity_commitment:intent.identity_commitment.clone(),asset:"USDC".into(),bucket:"USER_AVAILABLE".into(),amount_atomic:"1".into()});
+        assert!(!historical_journal_intent_lineage_safe(&intent,&changed_receipts,&roots,&"d".repeat(64)));
     }
     #[test]
     fn confirmed_extra_payout_never_becomes_a_second_customer_debit() {
         let original=reconciled_intent(&"a".repeat(64));let extra=reconciled_intent(&"b".repeat(64));let mut committed=projection_sequence_fixture();
         committed.receipt.account_id=original.account_id.clone();committed.receipt.identity_commitment=original.identity_commitment.clone();committed.receipt.request_id=original.request_id.clone();committed.receipt.request_hash=original.request_hash.clone();committed.receipt.effect="WITHDRAWAL_SETTLED".into();committed.receipt.amount_atomic=Some(original.amount_atomic.clone());committed.receipt.custody_reference=Some(format!("{}:0x{}",original.external_effect_reference,"11".repeat(32)));
+        let receipts=vec![(committed.sequence,committed.receipt.clone())];
         let outcome=ExternalEffectRecovery::BindFinalized {provider_transaction_id:"provider-2".into(),transaction_hash:format!("0x{}","22".repeat(32))};
-        let evidence=extra_payout_evidence(&extra,&original,&[committed.clone()],outcome.clone()).unwrap().unwrap();assert_eq!(evidence.amount_atomic,"5000000");assert_eq!(evidence.customer_debit_atomic,"0");assert_eq!(evidence.disposition,"PROTOCOL_OVERPAYMENT_UNRECOVERED");
-        assert_eq!(evidence,extra_payout_evidence(&extra,&original,&[committed.clone()],outcome).unwrap().unwrap());
-        assert!(extra_payout_evidence(&extra,&original,&[committed.clone()],ExternalEffectRecovery::BindFinalized {provider_transaction_id:"alias".into(),transaction_hash:format!("0x{}","11".repeat(32))}).unwrap().is_none());
-        assert!(extra_payout_evidence(&extra,&original,&[committed.clone()],ExternalEffectRecovery::SubmitWithStableReference).is_err());
-        assert!(extra_payout_evidence(&extra,&original,&[committed],ExternalEffectRecovery::BindReverted {provider_transaction_id:"reverted".into(),transaction_hash:format!("0x{}","22".repeat(32))}).is_err());
+        let evidence=extra_payout_evidence(&extra,&original,&receipts,outcome.clone()).unwrap().unwrap();assert_eq!(evidence.amount_atomic,"5000000");assert_eq!(evidence.customer_debit_atomic,"0");assert_eq!(evidence.disposition,"PROTOCOL_OVERPAYMENT_UNRECOVERED");
+        assert_eq!(evidence,extra_payout_evidence(&extra,&original,&receipts,outcome).unwrap().unwrap());
+        assert!(extra_payout_evidence(&extra,&original,&receipts,ExternalEffectRecovery::BindFinalized {provider_transaction_id:"alias".into(),transaction_hash:format!("0x{}","11".repeat(32))}).unwrap().is_none());
+        assert!(extra_payout_evidence(&extra,&original,&receipts,ExternalEffectRecovery::SubmitWithStableReference).is_err());
+        assert!(extra_payout_evidence(&extra,&original,&receipts,ExternalEffectRecovery::BindReverted {provider_transaction_id:"reverted".into(),transaction_hash:format!("0x{}","22".repeat(32))}).is_err());
     }
     fn projection_sequence_fixture() -> DirectStateArtifact {
         DirectStateArtifact {
@@ -9098,6 +9309,7 @@ mod tests {
             journal_receipts: Arc::new(Mutex::new(None)),
             journal_migration: Arc::new(Mutex::new(None)),
             journal_checkpoint_sequence: Arc::new(AtomicU64::new(0)),
+            journal_transition_roots: Arc::new(Mutex::new(None)),
         };
         assert!(authenticated(&headers, &state).is_ok());
 
@@ -9498,7 +9710,7 @@ mod tests {
         };
         let replay = committed_external_effect_action(
             &[committed, duplicate],
-            &[artifact],
+            &[(artifact.sequence,artifact.receipt)],
             &account,
             "identity",
             "request-1",
