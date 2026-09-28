@@ -9479,6 +9479,32 @@ mod tests {
     }
 
     #[test]
+    fn v71_hot_cutover_marker_is_canonical_committed_state_metadata() {
+        let head = super::StagedV71Head {
+            writer_epoch: "shadow-rollout-1".into(),
+            sequence: 35_001,
+            record_hash: "1".repeat(64),
+            transition_root: "2".repeat(64),
+            request_index_root: "3".repeat(64),
+            financial_state_root: "4".repeat(64),
+        };
+        let marker = super::V71CutoverMarker::from_head(&head);
+        assert!(marker.valid());
+        assert_eq!(
+            super::journal_cutover_marker_key("epoch"),
+            "epoch/journal-v71/cutover.cbor"
+        );
+        let encoded = serde_cbor::to_vec(&marker).unwrap();
+        assert_eq!(
+            serde_cbor::from_slice::<super::V71CutoverMarker>(&encoded).unwrap(),
+            marker
+        );
+        let mut invalid = marker;
+        invalid.record_hash = "not-a-digest".into();
+        assert!(!invalid.valid());
+    }
+
+    #[test]
     fn checkpoint_refresh_coalesces_bursts_and_retries_without_new_commits() {
         let mut refresh = super::CheckpointRefresh::default();
         let now = tokio::time::Instant::now();
@@ -13033,6 +13059,7 @@ mod tests {
             unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
             governed_bootstrap: None,
             persistence_format: PersistenceFormat::V71,
+            hot_v71_enabled: Arc::new(AtomicBool::new(false)),
             journal_request_index: Arc::new(Mutex::new(None)),
             journal_receipts: Arc::new(Mutex::new(Some(fixture.receipts.clone()))),
             journal_migration: Arc::new(Mutex::new(Some(fixture.bundle.clone()))),

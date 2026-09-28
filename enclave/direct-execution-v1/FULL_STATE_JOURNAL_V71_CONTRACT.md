@@ -145,11 +145,13 @@ checkpoint-plus-tail restores, and a rehearsed v70 rollback from a
 production-sized copy. The rollout runbook records the exact minimum commit
 count before rollout; a mismatch resets the window and blocks cutover.
 
-Writer handoff uses an explicit fence. Incoming commands remain durably queued
-while dispatch pauses. The old writer completes at head `H`, both runtimes prove
-the same head, the old writer is fenced at `H`, and the new writer may begin at
-`H + 1`. Both writers must never be eligible for the same writer epoch and
-sequence.
+The v70-to-v71 cutover is a same-process promotion; it does not use a durable
+command queue. The existing in-memory financial gate covers only the final
+committed-state delta, immutable cutover marker, and exact enclave promotion.
+The v70 writer and v71 shadow prove the same head `H`, then that same enclave
+promotes v71 before the gate is released for `H + 1`. If the process fails,
+clients retry through the existing idempotency contract; no pending command is
+persisted or replayed by this migration.
 
 ## Rollback
 
