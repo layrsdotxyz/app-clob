@@ -44,9 +44,12 @@ use layrs_direct_execution_v1::{
     WriterGrant, EPOCH_ID, MAX_V70_LINEAGE_RECORDS, POSTGRES_PROJECTION_DDL,
 };
 use layrs_direct_execution_v1::journal::{
-    canonical_receipt_hash, canonical_result_hash, DirectJournalRecord, DIRECT_JOURNAL_PROTOCOL,
+    canonical_receipt_hash, canonical_result_hash, DirectJournalRecord, JournalDurabilityAck,
+    DIRECT_JOURNAL_PROTOCOL,
 };
 use layrs_direct_execution_v1::migration::{V70MigrationBundle, V70_MIGRATION_MANIFEST_PROTOCOL};
+use layrs_direct_execution_v1::request_index::{TerminalRequestLeaf, TerminalResultLocator};
+use layrs_direct_execution_v1::request_index_snapshot::DirectRequestIndexState;
 use layrs_direct_execution_v1::v71_checkpoint::{DirectV71Checkpoint, DIRECT_V71_CHECKPOINT_PROTOCOL};
 use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
@@ -165,6 +168,9 @@ struct AppState {
     unresolved_external_effects: Arc<Mutex<BTreeMap<String, ExternalEffectIntent>>>,
     governed_bootstrap: Option<GovernedBootstrapConfig>,
     persistence_format: PersistenceFormat,
+    journal_request_index: Arc<Mutex<Option<DirectRequestIndexState>>>,
+    journal_receipts:
+        Arc<Mutex<Option<BTreeMap<(String, String), (u64, DirectReceipt)>>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3566,6 +3572,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
         governed_bootstrap,
         persistence_format,
+        journal_request_index: Arc::new(Mutex::new(None)),
+        journal_receipts: Arc::new(Mutex::new(None)),
     };
     // A Nitro EIF does not inherit the parent's systemd environment.  The
     // isolated test key material therefore crosses the existing VSOCK channel
@@ -6595,6 +6603,17 @@ fn governed_bootstrap_status_matches(
 async fn exchange_direct(
     state: &AppState,
     request: DirectRequest,
+    guard: &OwnedMutexGuard<()>,
+) -> io::Result<RuntimeResponse> {
+    match state.persistence_format {
+        PersistenceFormat::V70 => exchange_direct_v70(state, request, guard).await,
+        PersistenceFormat::V71 => exchange_direct_v71(state, request, guard).await,
+    }
+}
+
+async fn exchange_direct_v70(
+    state: &AppState,
+    request: DirectRequest,
     _guard: &OwnedMutexGuard<()>,
 ) -> io::Result<RuntimeResponse> {
     let store = state.artifact_store.as_ref().ok_or_else(|| {
@@ -6684,6 +6703,178 @@ async fn exchange_direct(
         }
     }
     Ok(response)
+}
+
+fn terminal_leaf_matches_record(
+    leaf: &TerminalRequestLeaf,
+    record: &DirectJournalRecord,
+) -> bool {
+    leaf.account_id == record.account_id
+        && leaf.request_id == record.request_id
+        && leaf.request_hash == record.request_hash
+        && leaf.result_hash == record.result_hash
+        && leaf.receipt_hash == record.receipt_hash
+        && leaf.locator
+            == (TerminalResultLocator::Journal {
+                writer_epoch: record.writer_epoch.clone(),
+                sequence: record.sequence,
+            })
+}
+
+/// v71 preserves the same two-phase enclave adoption rule as v70 while the
+/// durable object is only the bounded encrypted successor record. The caller
+/// holds the financial gate, so the proof cache and durable head advance in
+/// one serial order. Any ambiguity after persistence latches the writer until
+/// a fresh authenticated restore rebuilds all parent acceleration state.
+async fn exchange_direct_v71(
+    state: &AppState,
+    request: DirectRequest,
+    _guard: &OwnedMutexGuard<()>,
+) -> io::Result<RuntimeResponse> {
+    let store = match state.artifact_store.as_ref() {
+        Some(ArchiveStore::S3(store)) => store,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "V71_S3_ARCHIVE_REQUIRED",
+            ))
+        }
+    };
+    if state.commit_ack_key.len() != 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "DIRECT_COMMIT_ACK_KEY_NOT_CONFIGURED",
+        ));
+    }
+    let previous_request_index_root;
+    let request_proof = {
+        let index = state.journal_request_index.lock().await;
+        let index = index
+            .as_ref()
+            .ok_or_else(|| invalid("JOURNAL_REQUEST_INDEX_UNRESTORED"))?;
+        previous_request_index_root = index
+            .root()
+            .map_err(|_| invalid("JOURNAL_REQUEST_INDEX_INVALID"))?;
+        let proof = index
+            .proof(&request.account_id, &request.request_id)
+            .map_err(|_| invalid("JOURNAL_REQUEST_PROOF_FAILED"))?;
+        if proof.leaf.is_some() {
+            return Err(invalid("JOURNAL_REPLAY_ARCHIVE_REQUIRED"));
+        }
+        proof
+    };
+    if state.journal_receipts.lock().await.is_none() {
+        return Err(invalid("JOURNAL_RECEIPTS_UNRESTORED"));
+    }
+
+    eprintln!("FINANCIAL_AWAIT_BEGIN stage=enclave_journal_candidate");
+    let (mut stream, first) = bounded_enclave_stage(ENCLOSURE_EXCHANGE_TIMEOUT, async {
+        let mut stream =
+            VsockStream::connect(VsockAddr::new(state.enclave_cid, ENCLOSURE_PORT)).await?;
+        write_frame(
+            &mut stream,
+            &serde_cbor::to_vec(&RuntimeRequest::ExecuteJournal {
+                request,
+                request_proof,
+                archived: None,
+            })
+            .map_err(invalid)?,
+        )
+        .await?;
+        let first: RuntimeResponse =
+            serde_cbor::from_slice(&read_frame(&mut stream).await?).map_err(invalid)?;
+        Ok::<_, io::Error>((stream, first))
+    })
+    .await?;
+    eprintln!("FINANCIAL_AWAIT_END stage=enclave_journal_candidate");
+    let (record, terminal_leaf) = match first {
+        RuntimeResponse::JournalCandidate {
+            record,
+            terminal_leaf,
+        } if record.previous_request_index_root == previous_request_index_root
+            && terminal_leaf_matches_record(&terminal_leaf, &record) =>
+        {
+            (record, terminal_leaf)
+        }
+        RuntimeResponse::Error { code } => {
+            return Ok(RuntimeResponse::Error { code });
+        }
+        _ => {
+            store.latch_journal("JOURNAL_CANDIDATE_INVALID").await;
+            return Err(invalid("JOURNAL_CANDIDATE_INVALID"));
+        }
+    };
+
+    eprintln!("FINANCIAL_AWAIT_BEGIN stage=journal_persist_readback");
+    if let Err(error) = store.append_journal_record(&record).await {
+        eprintln!("FINANCIAL_AWAIT_END stage=journal_persist_readback");
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("IMMUTABLE_JOURNAL_PERSISTENCE_FAILED:{error}"),
+        ));
+    }
+    eprintln!("FINANCIAL_AWAIT_END stage=journal_persist_readback");
+    let ack = JournalDurabilityAck::issue(&record, &state.commit_ack_key)
+        .map_err(|_| invalid("JOURNAL_DURABILITY_ACK_FAILED"))?;
+    eprintln!("FINANCIAL_AWAIT_BEGIN stage=enclave_journal_durability_ack");
+    let terminal = bounded_enclave_stage(ENCLOSURE_EXCHANGE_TIMEOUT, async {
+        write_frame(
+            &mut stream,
+            &serde_cbor::to_vec(&RuntimeRequest::JournalDurabilityAck { ack })
+                .map_err(invalid)?,
+        )
+        .await?;
+        serde_cbor::from_slice(&read_frame(&mut stream).await?).map_err(invalid)
+    })
+    .await;
+    eprintln!("FINANCIAL_AWAIT_END stage=enclave_journal_durability_ack");
+    let terminal = match terminal {
+        Ok(RuntimeResponse::Execute { result })
+            if verify_terminal_matches_record(&result, &record) => result,
+        _ => {
+            store.latch_journal("JOURNAL_TERMINAL_UNVERIFIED").await;
+            return Err(invalid("JOURNAL_TERMINAL_UNVERIFIED"));
+        }
+    };
+
+    let cache_advance = {
+        let mut index = state.journal_request_index.lock().await;
+        index
+            .as_mut()
+            .ok_or(())
+            .and_then(|index| {
+                index
+                    .insert(
+                        terminal_leaf,
+                        &previous_request_index_root,
+                        &record.request_index_root,
+                    )
+                    .map_err(|_| ())
+            })
+    };
+    if cache_advance.is_err() {
+        store.latch_journal("JOURNAL_REQUEST_INDEX_ADVANCE_FAILED").await;
+        return Err(invalid("JOURNAL_REQUEST_INDEX_ADVANCE_FAILED"));
+    }
+    let receipt_key = (
+        terminal.receipt.account_id.clone(),
+        terminal.receipt.request_id.clone(),
+    );
+    let receipt_advance = state
+        .journal_receipts
+        .lock()
+        .await
+        .as_mut()
+        .map(|receipts| {
+            receipts.insert(receipt_key, (record.sequence, terminal.receipt.clone()))
+        });
+    if !matches!(receipt_advance, Some(None)) {
+        store.latch_journal("JOURNAL_RECEIPT_ADVANCE_FAILED").await;
+        return Err(invalid("JOURNAL_RECEIPT_ADVANCE_FAILED"));
+    }
+    *state.committed_state_root.lock().await = Some(record.transition_root);
+    state.last_commit_at.store(now_unix(), Ordering::Release);
+    Ok(RuntimeResponse::Execute { result: terminal })
 }
 fn invalid(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
@@ -6871,6 +7062,8 @@ mod tests {
             unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
             governed_bootstrap: None,
             persistence_format: PersistenceFormat::V70,
+            journal_request_index: Arc::new(Mutex::new(None)),
+            journal_receipts: Arc::new(Mutex::new(None)),
         };
         assert_eq!(store.seal_current_checkpoint(&state).await.unwrap_err(), "checkpoint head mismatch");
         // restore_streamed's final step: the same failure is only diagnosed.
@@ -7925,6 +8118,8 @@ mod tests {
             unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
             governed_bootstrap: None,
             persistence_format: PersistenceFormat::V70,
+            journal_request_index: Arc::new(Mutex::new(None)),
+            journal_receipts: Arc::new(Mutex::new(None)),
         };
         assert!(authenticated(&headers, &state).is_ok());
 
@@ -8653,6 +8848,24 @@ mod tests {
     fn v71_terminal_must_match_record_result_receipt_and_request_hashes() {
         let (result, record) = v71_candidate();
         assert!(verify_terminal_matches_record(&result, &record));
+        let leaf = TerminalRequestLeaf {
+            account_id: record.account_id.clone(),
+            request_id: record.request_id.clone(),
+            request_hash: record.request_hash.clone(),
+            result_hash: record.result_hash.clone(),
+            receipt_hash: record.receipt_hash.clone(),
+            locator: TerminalResultLocator::Journal {
+                writer_epoch: record.writer_epoch.clone(),
+                sequence: record.sequence,
+            },
+        };
+        assert!(terminal_leaf_matches_record(&leaf, &record));
+        let mut other_leaf = leaf;
+        other_leaf.locator = TerminalResultLocator::Journal {
+            writer_epoch: record.writer_epoch.clone(),
+            sequence: record.sequence + 1,
+        };
+        assert!(!terminal_leaf_matches_record(&other_leaf, &record));
 
         let mut other = result.clone();
         other.effect = "IDENTITY_REJECTED".into();
