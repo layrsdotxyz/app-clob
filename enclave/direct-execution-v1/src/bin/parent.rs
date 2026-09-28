@@ -2488,6 +2488,126 @@ fn validate_checkpoint_archive(
     Ok(sequence)
 }
 
+/// Concurrent create-only writes while materializing a v70 rollback package.
+const V70_ROLLBACK_WRITE_WIDTH: usize = 16;
+/// Room for the request envelope around the bundle and record encodings.
+const V70_ROLLBACK_FRAME_ENVELOPE_BYTES: usize = 4096;
+
+/// Descriptor of a materialized v70 rollback package. A governed rollback
+/// grant's committed restore frontier must name exactly this head.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct V70RollbackPackage {
+    prefix: String,
+    sequence: u64,
+    state_hash: String,
+    artifact_hash: String,
+    checkpoint_key: String,
+}
+
+/// The rollback prefix is supplied explicitly and must be canonical and
+/// disjoint from the authoritative archive, never nested in either direction.
+#[cfg_attr(not(test), allow(dead_code))]
+fn validate_v70_rollback_prefix(authoritative: &str, fresh: &str) -> Result<(), &'static str> {
+    if fresh.is_empty()
+        || fresh.len() > 512
+        || !fresh
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/'))
+        || fresh
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err("v70 rollback prefix invalid");
+    }
+    if fresh == authoritative
+        || fresh.starts_with(&format!("{authoritative}/"))
+        || authoritative.starts_with(&format!("{fresh}/"))
+    {
+        return Err("v70 rollback prefix overlaps authoritative archive");
+    }
+    Ok(())
+}
+
+/// The complete seal request must fit one enclave frame.
+#[cfg_attr(not(test), allow(dead_code))]
+fn advance_v70_rollback_frame_bytes(total: usize, next: usize) -> Result<usize, &'static str> {
+    total
+        .checked_add(next)
+        .filter(|sum| {
+            sum.checked_add(V70_ROLLBACK_FRAME_ENVELOPE_BYTES)
+                .is_some_and(|framed| framed <= MAX_FRAME_BYTES)
+        })
+        .ok_or("v70 rollback request exceeds frame bound")
+}
+
+/// The enclave-sealed rollback checkpoint must cover exactly `head_sequence`,
+/// its compact lineage must be the parent's authenticated receipt order, every
+/// object must be content-addressed, and the unchanged v70 archive validator
+/// must accept it over the artifact and head keys the package will contain.
+/// Returns those keys.
+#[cfg_attr(not(test), allow(dead_code))]
+fn validate_v70_rollback_checkpoint(
+    checkpoint: &layrs_direct_execution_v1::DirectCheckpoint,
+    head_sequence: u64,
+    receipts: &[(u64, DirectReceipt)],
+    prefix: &str,
+) -> Result<(Vec<String>, Vec<ResolvedArchiveHead>), String> {
+    let sequence = usize::try_from(head_sequence).map_err(|_| "v70 rollback sequence overflow")?;
+    if sequence == 0
+        || sequence > MAX_V70_LINEAGE_RECORDS
+        || checkpoint.protocol != "layrs.direct-execution.checkpoint.v1"
+        || checkpoint.bootstrap_certificate.is_some()
+        || checkpoint.signature.is_empty()
+        || checkpoint.artifact.epoch_id != EPOCH_ID
+        || checkpoint.artifact.sequence != head_sequence
+        || checkpoint.artifact.ciphertext.is_empty()
+        || checkpoint.artifact.ciphertext_hash != sha256(&checkpoint.artifact.ciphertext)
+        || checkpoint.receipt_records.len() != sequence
+        || checkpoint.artifact_hashes.len() != sequence
+        || receipts.len() != sequence
+    {
+        return Err("v70 rollback checkpoint header invalid".into());
+    }
+    let mut prior = &checkpoint.opening_state_hash;
+    let mut keys = Vec::with_capacity(sequence);
+    let mut heads = Vec::with_capacity(sequence);
+    for (index, (record, (receipt_sequence, receipt))) in
+        checkpoint.receipt_records.iter().zip(receipts).enumerate()
+    {
+        let expected = index as u64 + 1;
+        let content_hash = if expected == head_sequence {
+            artifact_hash(&checkpoint.artifact)
+        } else {
+            artifact_hash(record)
+        };
+        if record.epoch_id != EPOCH_ID
+            || record.sequence != expected
+            || record.prior_state_hash != *prior
+            || !record.ciphertext.is_empty()
+            || record.request_hash != record.receipt.request_hash
+            || *receipt_sequence != expected
+            || record.receipt != *receipt
+            || checkpoint.artifact_hashes[index] != content_hash
+        {
+            return Err("v70 rollback checkpoint lineage mismatch".into());
+        }
+        prior = &record.state_hash;
+        keys.push(format!(
+            "{prefix}/artifacts/{expected:020}-{content_hash}.cbor"
+        ));
+        heads.push(ResolvedArchiveHead {
+            key: archive_head_key(prefix, expected),
+            sequence: expected,
+            artifact_hash: content_hash,
+        });
+    }
+    if validate_checkpoint_archive(checkpoint, &keys, &heads, prefix)? != sequence {
+        return Err("v70 rollback checkpoint frontier mismatch".into());
+    }
+    Ok((keys, heads))
+}
+
 impl S3ImmutableArtifactStore {
     fn checkpoint_key(&self, checkpoint: &layrs_direct_execution_v1::DirectCheckpoint) -> Result<String, String> {
         let bytes = serde_cbor::to_vec(checkpoint).map_err(|_| "checkpoint encoding failed")?;
@@ -3093,6 +3213,211 @@ impl S3ImmutableArtifactStore {
             return Err("journal replay record invalid".into());
         }
         Ok(record)
+    }
+    /// A separate store over the same bucket, KMS key, and retention for a
+    /// rollback prefix. Its journal is permanently latched, so no v71 append
+    /// can ever target it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn v70_rollback_target(&self, prefix: &str) -> Self {
+        Self {
+            client: self.client.clone(),
+            bucket: self.bucket.clone(),
+            prefix: prefix.into(),
+            kms_key_id: self.kms_key_id.clone(),
+            retention_seconds: self.retention_seconds,
+            verified_receipt_records: Arc::new(Mutex::new(None)),
+            verified_artifact_hashes: Arc::new(Mutex::new(Vec::new())),
+            prepared_restore: Arc::new(Mutex::new(None)),
+            prepared_journal_restore: Arc::new(Mutex::new(None)),
+            checkpoint_refresh_gate: Arc::new(Mutex::new(CheckpointRefresh::default())),
+            journal: Arc::new(Mutex::new(JournalWriterState::Latched(
+                "V70_ROLLBACK_TARGET",
+            ))),
+            journal_role: JournalRole::Writer,
+        }
+    }
+    /// Read-only: the exact migration bundle and every canonical v71 record
+    /// from the migration source through `head`. A gap, an extra record past
+    /// the head, a noncanonical body, broken linkage, a head mismatch, or a
+    /// count or frame overflow fails closed.
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn load_v70_rollback_inputs(
+        &self,
+        head: &JournalHead,
+        restored: &V70MigrationBundle,
+    ) -> Result<(V70MigrationBundle, Vec<DirectJournalRecord>), String> {
+        let bundle = self
+            .load_v70_migration_bundle()
+            .await?
+            .ok_or("v70 rollback migration bundle missing")?;
+        if bundle != *restored {
+            return Err("v70 rollback migration bundle differs from restored lineage".into());
+        }
+        let source = bundle.manifest.source_sequence;
+        if source == 0 || source > head.sequence || head.sequence > MAX_V70_LINEAGE_RECORDS as u64 {
+            return Err("v70 rollback lineage outside bound".into());
+        }
+        let count = usize::try_from(head.sequence - source)
+            .map_err(|_| "v70 rollback lineage outside bound")?;
+        let mut frame_bytes = advance_v70_rollback_frame_bytes(
+            0,
+            serde_cbor::to_vec(&bundle)
+                .map_err(|_| "v70 rollback migration bundle encoding failed")?
+                .len(),
+        )?;
+        // A record past the head exceeds `count` and fails the listing.
+        let keys = self
+            .list_journal_keys(
+                &format!("{}/heads/", self.prefix),
+                Some(&journal_record_key(&self.prefix, source)),
+                count,
+                ARCHIVE_OPERATION_TIMEOUT,
+            )
+            .await?;
+        let keys = validate_journal_tail_keys(&keys, &self.prefix, source, count)?;
+        if keys.len() != count {
+            return Err("v70 rollback journal incomplete".into());
+        }
+        let mut previous_record_hash = bundle
+            .manifest
+            .manifest_hash()
+            .map_err(|_| "v70 rollback migration manifest hash failed")?;
+        let mut previous_request_index_root = bundle.manifest.request_index_root.clone();
+        let mut previous_transition_root = None;
+        let mut records = Vec::with_capacity(count);
+        for (sequence, _) in keys {
+            let record = self.load_journal_record(sequence).await?;
+            frame_bytes = advance_v70_rollback_frame_bytes(
+                frame_bytes,
+                serde_cbor::to_vec(&record)
+                    .map_err(|_| "v70 rollback record encoding failed")?
+                    .len(),
+            )?;
+            // The enclave authenticates the migration anchor's transition
+            // root; every later link is also checked here.
+            if record.previous_record_hash != previous_record_hash
+                || record.previous_request_index_root != previous_request_index_root
+                || previous_transition_root
+                    .as_ref()
+                    .is_some_and(|root| record.previous_transition_root != *root)
+            {
+                return Err("v70 rollback record predecessor mismatch".into());
+            }
+            previous_record_hash = record
+                .record_hash()
+                .map_err(|_| "v70 rollback record hash failed")?;
+            previous_request_index_root = record.request_index_root.clone();
+            previous_transition_root = Some(record.transition_root.clone());
+            records.push(record);
+        }
+        if previous_record_hash != head.record_hash
+            || previous_request_index_root != head.request_index_root
+            || records.last().is_some_and(|record| {
+                record.transition_root != head.transition_root
+                    || record.financial_state_root != head.financial_state_root
+            })
+        {
+            return Err("v70 rollback journal head mismatch".into());
+        }
+        Ok((bundle, records))
+    }
+    /// Create-only writes with exact readback, `V70_ROLLBACK_WRITE_WIDTH` at
+    /// a time. `object` produces the key and bytes for each index on demand.
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn write_once_windowed<F>(&self, count: usize, object: F) -> Result<(), String>
+    where
+        F: Fn(usize) -> Result<(String, Vec<u8>), String>,
+    {
+        let mut start = 0;
+        while start < count {
+            let end = count.min(start + V70_ROLLBACK_WRITE_WIDTH);
+            let mut writes = Vec::with_capacity(end - start);
+            for index in start..end {
+                let (key, bytes) = object(index)?;
+                let store = self.clone();
+                writes.push(tokio::spawn(
+                    async move { store.write_once(&key, bytes).await },
+                ));
+            }
+            for write in writes {
+                write
+                    .await
+                    .map_err(|_| "v70 rollback write task failed")??;
+            }
+            start = end;
+        }
+        Ok(())
+    }
+    /// Materializes a validated rollback checkpoint as a retained-v70 archive
+    /// under this store's prefix: every lineage artifact, then every v70 head
+    /// pointer, then the checkpoint, which is the v70 restore discovery
+    /// marker. An interrupted attempt therefore never exposes a checkpoint.
+    /// The final listings must equal the package exactly.
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn write_v70_rollback_package(
+        &self,
+        checkpoint: &layrs_direct_execution_v1::DirectCheckpoint,
+        keys: &[String],
+        heads: &[ResolvedArchiveHead],
+    ) -> Result<String, String> {
+        let sequence = keys.len();
+        if sequence == 0 || heads.len() != sequence || checkpoint.receipt_records.len() != sequence
+        {
+            return Err("v70 rollback package incomplete".into());
+        }
+        let bytes = serde_cbor::to_vec(checkpoint)
+            .map_err(|_| "v70 rollback checkpoint encoding failed")?;
+        if bytes.len() > MAX_FRAME_BYTES
+            || serde_cbor::from_slice::<layrs_direct_execution_v1::DirectCheckpoint>(&bytes)
+                .ok()
+                .as_ref()
+                != Some(checkpoint)
+        {
+            return Err("v70 rollback checkpoint encoding invalid".into());
+        }
+        let checkpoint_key = self.checkpoint_key(checkpoint)?;
+        // Compact lineage records; the v70 restore lists but never reads them.
+        self.write_once_windowed(sequence - 1, |index| {
+            serde_cbor::to_vec(&checkpoint.receipt_records[index])
+                .map(|bytes| (keys[index].clone(), bytes))
+                .map_err(|_| "v70 rollback artifact encoding failed".into())
+        })
+        .await?;
+        // The full encrypted head artifact, read by the next v70 checkpoint.
+        let head_bytes = serde_cbor::to_vec(&checkpoint.artifact)
+            .map_err(|_| "v70 rollback artifact encoding failed")?;
+        if self
+            .write_once_large(&keys[sequence - 1], head_bytes.clone())
+            .await?
+            != head_bytes
+        {
+            return Err("archive readback mismatch".into());
+        }
+        self.write_once_windowed(sequence, |index| {
+            Ok((
+                heads[index].key.clone(),
+                heads[index].artifact_hash.clone().into_bytes(),
+            ))
+        })
+        .await?;
+        if self
+            .write_once_large(&checkpoint_key, bytes.clone())
+            .await?
+            != bytes
+        {
+            return Err("archive readback mismatch".into());
+        }
+        let head_keys = heads
+            .iter()
+            .map(|head| head.key.clone())
+            .collect::<Vec<_>>();
+        if self.list_restore_keys("artifacts").await? != keys
+            || self.list_restore_keys("heads").await? != head_keys
+            || self.list_restore_keys("checkpoints").await? != [checkpoint_key.clone()]
+        {
+            return Err("v70 rollback package listing mismatch".into());
+        }
+        Ok(checkpoint_key)
     }
     /// Create-only, content-addressed persistence of an enclave-sealed v71
     /// checkpoint; `write_once` performs the exact readback.
@@ -7108,6 +7433,110 @@ async fn stage_and_promote_v71_shadow(state: AppState, run_id: String) -> Result
         );
         return Ok(());
     }
+}
+
+/// Materializes the exact v70 rollback package for the restored v71 head
+/// under the explicitly supplied fresh prefix. The authoritative archive is
+/// only read. `seal` performs the enclave exchange; production passes
+/// `|request| exchange_with_timeout(state, request, CHECKPOINT_EXCHANGE_TIMEOUT)`.
+/// Operators must pause dispatch first: commits after the captured head are
+/// not in the package, and a commit before the seal fails it closed.
+#[cfg_attr(not(test), allow(dead_code))]
+async fn materialize_v70_rollback<F, Fut>(
+    state: &AppState,
+    fresh_prefix: &str,
+    seal: F,
+) -> Result<V70RollbackPackage, String>
+where
+    F: FnOnce(RuntimeRequest) -> Fut,
+    Fut: Future<Output = io::Result<RuntimeResponse>>,
+{
+    if state.persistence_format != PersistenceFormat::V71 {
+        return Err("v70 rollback requires a restored v71 lineage".into());
+    }
+    let store = match state.artifact_store.as_ref() {
+        Some(ArchiveStore::S3(store)) if store.journal_role == JournalRole::Writer => store,
+        _ => return Err("v70 rollback requires the authoritative S3 archive".into()),
+    };
+    validate_v70_rollback_prefix(&store.prefix, fresh_prefix)?;
+    let head = match &*store.journal.lock().await {
+        JournalWriterState::Eligible(head) => head.clone(),
+        JournalWriterState::Unrestored | JournalWriterState::Latched(_) => {
+            return Err("v70 rollback requires an eligible v71 head".into())
+        }
+    };
+    let restored = state
+        .journal_migration
+        .lock()
+        .await
+        .clone()
+        .ok_or("v70 rollback migration lineage unavailable")?;
+    let target = store.v70_rollback_target(fresh_prefix);
+    target
+        .list_journal_keys(
+            &format!("{fresh_prefix}/"),
+            None,
+            0,
+            ARCHIVE_OPERATION_TIMEOUT,
+        )
+        .await
+        .map_err(|_| "v70 rollback prefix not fresh")?;
+    let (migration, journal_records) = store.load_v70_rollback_inputs(&head, &restored).await?;
+    let (checkpoint, receipts) = {
+        let _guard = state.financial_gate.lock("v70_rollback_capture").await;
+        if !state.unresolved_external_effects.lock().await.is_empty() {
+            return Err("v70 rollback external effect pending".into());
+        }
+        if !matches!(&*store.journal.lock().await, JournalWriterState::Eligible(current) if *current == head)
+        {
+            return Err("v70 rollback head advanced".into());
+        }
+        let receipts = ordered_journal_receipts(
+            state
+                .journal_receipts
+                .lock()
+                .await
+                .as_ref()
+                .ok_or("v70 rollback receipts unavailable")?,
+        )?;
+        let response = seal(RuntimeRequest::SealV70RollbackCheckpoint {
+            migration,
+            journal_records,
+        })
+        .await
+        .map_err(|error| {
+            if frame_oversized(&error) {
+                "v70 rollback frame oversized"
+            } else {
+                "v70 rollback seal transport failed"
+            }
+        })?;
+        match response {
+            RuntimeResponse::CheckpointSealed { checkpoint } => (checkpoint, receipts),
+            RuntimeResponse::Error { code } if code == CHECKPOINT_FRAME_OVERSIZED => {
+                return Err("v70 rollback frame oversized".into())
+            }
+            RuntimeResponse::Error { .. } => return Err("v70 rollback seal rejected".into()),
+            _ => return Err("v70 rollback seal unexpected response".into()),
+        }
+    };
+    let (keys, heads) =
+        validate_v70_rollback_checkpoint(&checkpoint, head.sequence, &receipts, fresh_prefix)?;
+    let checkpoint_key = target
+        .write_v70_rollback_package(&checkpoint, &keys, &heads)
+        .await?;
+    let package = V70RollbackPackage {
+        prefix: fresh_prefix.into(),
+        sequence: head.sequence,
+        state_hash: checkpoint.artifact.state_hash.clone(),
+        artifact_hash: heads[heads.len() - 1].artifact_hash.clone(),
+        checkpoint_key,
+    };
+    eprintln!(
+        "V70_ROLLBACK_PACKAGE_MATERIALIZED sequence={} state_hash={} artifact_hash={}",
+        package.sequence, package.state_hash, package.artifact_hash
+    );
+    Ok(package)
 }
 
 fn intent_is_committed(intent: &ExternalEffectIntent, receipts: &[(u64, DirectReceipt)]) -> bool {
@@ -12049,5 +12478,1012 @@ mod tests {
             assert_eq!(store.load_journal_tail(&checkpoint).await, Err(error.into()), "{error}");
             server.abort();
         }
+    }
+
+    // v70 rollback materialization (FULL_STATE_JOURNAL_V71_CONTRACT.md,
+    // "Rollback"). Loopback S3 and in-process library sealing only.
+
+    type V70RollbackObjects = Arc<Mutex<BTreeMap<String, Vec<u8>>>>;
+
+    fn v70_rollback_percent_decode(value: &str) -> String {
+        let bytes = value.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'%' && index + 2 < bytes.len() {
+                decoded.push(u8::from_str_radix(&value[index + 1..index + 3], 16).unwrap());
+                index += 3;
+            } else {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+        String::from_utf8(decoded).unwrap()
+    }
+
+    /// Stateful loopback S3: create-only PUT (412 on an existing key), GET,
+    /// and one-page ListObjectsV2 honoring `prefix` and `start-after`. Each
+    /// connection is served concurrently and logged as `(lowercased head, body)`.
+    async fn v70_rollback_s3(
+        objects: BTreeMap<String, Vec<u8>>,
+    ) -> (
+        String,
+        V70RollbackObjects,
+        V71RequestLog,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let objects = Arc::new(Mutex::new(objects));
+        let log = V71RequestLog::default();
+        let (stored, recorded) = (objects.clone(), log.clone());
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (stored, recorded) = (stored.clone(), recorded.clone());
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buffer = [0u8; 8192];
+                    let (head, body) = loop {
+                        let size = socket.read(&mut buffer).await.unwrap();
+                        if size == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buffer[..size]);
+                        let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                            continue;
+                        };
+                        let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .map_or(0, |value| value.trim().parse::<usize>().unwrap());
+                        if request.len() >= end + 4 + length {
+                            break (head, request[end + 4..end + 4 + length].to_vec());
+                        }
+                    };
+                    recorded.lock().await.push((head.clone(), body.clone()));
+                    let target = head.split_whitespace().nth(1).unwrap().to_string();
+                    let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
+                    let params = query
+                        .split('&')
+                        .filter_map(|pair| pair.split_once('='))
+                        .map(|(name, value)| (name.to_string(), v70_rollback_percent_decode(value)))
+                        .collect::<BTreeMap<_, _>>();
+                    let key = v70_rollback_percent_decode(
+                        path.trim_start_matches("/unit-test")
+                            .trim_start_matches('/'),
+                    );
+                    let response = if head.starts_with("put ") {
+                        let mut stored = stored.lock().await;
+                        if head.contains("\r\nif-none-match: *") && stored.contains_key(&key) {
+                            v71_s3_error(412, "PreconditionFailed")
+                        } else {
+                            stored.insert(key, body);
+                            v71_http_with_etag("mock")
+                        }
+                    } else if params.get("list-type").map(String::as_str) == Some("2") {
+                        let prefix = params.get("prefix").cloned().unwrap_or_default();
+                        let after = params.get("start-after").cloned().unwrap_or_default();
+                        let keys = stored
+                            .lock()
+                            .await
+                            .keys()
+                            .filter(|key| key.starts_with(&prefix) && key.as_str() > after.as_str())
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        v71_listing(&keys)
+                    } else if let Some(bytes) = stored.lock().await.get(&key) {
+                        v71_http(200, bytes)
+                    } else {
+                        v71_s3_error(404, "NoSuchKey")
+                    };
+                    socket.write_all(&response).await.unwrap();
+                });
+            }
+        });
+        (endpoint, objects, log, server)
+    }
+
+    struct V70RollbackFixture {
+        epoch: SealedEpoch,
+        v71: layrs_direct_execution_v1::v71::DirectV71Runtime,
+        bundle: V70MigrationBundle,
+        records: Vec<DirectJournalRecord>,
+        commands: Vec<(DirectRequest, DirectResult)>,
+        receipts: JournalReceiptCache,
+        head: JournalHead,
+    }
+
+    fn v70_rollback_admission(seed: char, wallet_digit: char) -> DirectRequest {
+        let subject = seed.to_string().repeat(64);
+        let wallet = format!("0x{}", wallet_digit.to_string().repeat(40));
+        let mut request = DirectRequest {
+            account_id: subject.clone(),
+            identity_commitment: identity_commitment_for(&subject, &wallet),
+            request_id: format!("rollback-admission-{seed}"),
+            request_hash: String::new(),
+            financial_wallet_address: None,
+            action: DirectAction::AdmitIdentity {
+                wallet_address: wallet,
+            },
+        };
+        request.request_hash = request_hash(&request);
+        request
+    }
+
+    fn v70_rollback_journal_key() -> [u8; 32] {
+        layrs_direct_execution_v1::journal::journal_verifying_key(&[8; 32]).unwrap()
+    }
+
+    /// Two v70 commits migrated at source sequence 2, then two v71 journal
+    /// commits: head 4. Keys: state [7; 32], journal [8; 32], receipt [9; 32].
+    fn v70_rollback_fixture() -> V70RollbackFixture {
+        let epoch = SealedEpoch::load(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../../.codex-review-bundles/unified-direct-execution-20260905/new-epoch-20260911/OPENING_EPOCH_STATE_20260911.json",
+        ))
+        .unwrap();
+        let mut v70 = layrs_direct_execution_v1::DirectRuntime::new(
+            epoch.clone(),
+            layrs_direct_execution_v1::RuntimeMode::IsolatedTest,
+            vec![9; 32],
+        )
+        .unwrap();
+        let mut commands = Vec::new();
+        let mut receipts = JournalReceiptCache::new();
+        for (seed, wallet) in [('a', '1'), ('b', '2')] {
+            let request = v70_rollback_admission(seed, wallet);
+            let result = v70.execute(request.clone()).unwrap();
+            receipts.insert(
+                (request.account_id.clone(), request.request_id.clone()),
+                (v70.committed_sequence(), result.receipt.clone()),
+            );
+            commands.push((request, result));
+        }
+        let bundle = V70MigrationBundle::seal(&v70, &[7; 32], &[8; 32]).unwrap();
+        let mut v71 = layrs_direct_execution_v1::v71::DirectV71Runtime::from_v70_migration(
+            v70,
+            &bundle,
+            "writer-epoch-2".into(),
+            &[7; 32],
+            &v70_rollback_journal_key(),
+        )
+        .unwrap();
+        let mut tree = layrs_direct_execution_v1::request_index::SparseRequestTree::from_leaves(
+            &bundle.leaves,
+        )
+        .unwrap();
+        let mut records = Vec::new();
+        for (seed, wallet) in [('c', '3'), ('d', '4')] {
+            let request = v70_rollback_admission(seed, wallet);
+            let proof = tree
+                .proof(&request.account_id, &request.request_id)
+                .unwrap();
+            let candidate = v71
+                .prepare_candidate(request.clone(), &proof, &[7; 32], &[8; 32])
+                .unwrap();
+            tree.insert(candidate.terminal_leaf().clone()).unwrap();
+            records.push(candidate.record().clone());
+            let result = v71.adopt_candidate(candidate).unwrap();
+            receipts.insert(
+                (request.account_id.clone(), request.request_id.clone()),
+                (v71.sequence(), result.receipt.clone()),
+            );
+            commands.push((request, result));
+        }
+        let head = JournalHead {
+            writer_epoch: v71.writer_epoch().into(),
+            sequence: v71.sequence(),
+            record_hash: v71.record_hash().into(),
+            transition_root: v71.transition_root().into(),
+            request_index_root: v71.request_index_root().into(),
+            financial_state_root: v71.financial_state_root().unwrap(),
+        };
+        assert_eq!(head.sequence, 4);
+        V70RollbackFixture {
+            epoch,
+            v71,
+            bundle,
+            records,
+            commands,
+            receipts,
+            head,
+        }
+    }
+
+    /// The authoritative prefix `epoch`: the migration bundle, v70 head
+    /// pointers (plus a legacy twin) through the source, then v71 records.
+    fn v70_rollback_archive(fixture: &V70RollbackFixture) -> BTreeMap<String, Vec<u8>> {
+        let source = fixture.bundle.manifest.source_sequence;
+        let bundle = serde_cbor::to_vec(&fixture.bundle).unwrap();
+        let mut objects =
+            BTreeMap::from([(journal_migration_key("epoch", source, &bundle), bundle)]);
+        for sequence in 1..=source {
+            objects.insert(
+                archive_head_key("epoch", sequence),
+                sha256(format!("v70-{sequence}").as_bytes()).into_bytes(),
+            );
+        }
+        objects.insert(
+            format!("epoch/heads/{source:020}-{}.cbor", "e".repeat(64)),
+            b"legacy".to_vec(),
+        );
+        for record in &fixture.records {
+            objects.insert(
+                journal_record_key("epoch", record.sequence),
+                serde_cbor::to_vec(record).unwrap(),
+            );
+        }
+        objects
+    }
+
+    fn v70_rollback_state(
+        store: Option<S3ImmutableArtifactStore>,
+        fixture: &V70RollbackFixture,
+    ) -> AppState {
+        AppState {
+            enclave_cid: 16,
+            session_key: vec![7; 32],
+            isolated_test: true,
+            projection: None,
+            local_used_sessions: Arc::new(Mutex::new(HashSet::new())),
+            artifact_store: store.map(ArchiveStore::S3),
+            commit_ack_key: Vec::new(),
+            custody: None,
+            zen_custody: None,
+            usdc_custody: None,
+            usdc_link_authority: None,
+            usdc_bus_custody: None,
+            financial_gate: Arc::new(FinancialGate::new()),
+            last_commit_at: Arc::new(AtomicU64::new(0)),
+            committed_state_root: Arc::new(Mutex::new(Some(fixture.head.transition_root.clone()))),
+            unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
+            governed_bootstrap: None,
+            persistence_format: PersistenceFormat::V71,
+            journal_request_index: Arc::new(Mutex::new(None)),
+            journal_receipts: Arc::new(Mutex::new(Some(fixture.receipts.clone()))),
+            journal_migration: Arc::new(Mutex::new(Some(fixture.bundle.clone()))),
+            journal_checkpoint_sequence: Arc::new(AtomicU64::new(0)),
+            journal_transition_roots: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Stands in for the enclave exchange with the library's own
+    /// `seal_v70_rollback_checkpoint`, recording that it was reached.
+    fn v70_rollback_seal(
+        v71: layrs_direct_execution_v1::v71::DirectV71Runtime,
+        called: Arc<AtomicU64>,
+    ) -> impl FnOnce(RuntimeRequest) -> std::future::Ready<io::Result<RuntimeResponse>> {
+        move |request| {
+            called.fetch_add(1, Ordering::SeqCst);
+            let RuntimeRequest::SealV70RollbackCheckpoint {
+                migration,
+                journal_records,
+            } = request
+            else {
+                panic!("unexpected enclave request");
+            };
+            std::future::ready(Ok(
+                match v71.seal_v70_rollback_checkpoint(
+                    &migration,
+                    &journal_records,
+                    &[7; 32],
+                    &v70_rollback_journal_key(),
+                ) {
+                    Ok(checkpoint) => RuntimeResponse::CheckpointSealed { checkpoint },
+                    Err(_) => RuntimeResponse::Error {
+                        code: "V70_ROLLBACK_ARCHIVE_INVALID".into(),
+                    },
+                },
+            ))
+        }
+    }
+
+    fn v70_rollback_puts(log: &[(String, Vec<u8>)]) -> Vec<String> {
+        log.iter()
+            .filter(|(head, _)| head.starts_with("put "))
+            .map(|(head, _)| head.clone())
+            .collect()
+    }
+
+    #[test]
+    fn v70_rollback_prefix_must_be_canonical_and_disjoint_from_the_authoritative_archive() {
+        assert_eq!(
+            validate_v70_rollback_prefix("epoch", "rollback/v70-2026.09_28"),
+            Ok(())
+        );
+        assert_eq!(
+            validate_v70_rollback_prefix("epoch", "epoch-rollback"),
+            Ok(())
+        );
+        for fresh in ["epoch", "epoch/rollback", "epoch/shadow-v71/run"] {
+            assert_eq!(
+                validate_v70_rollback_prefix("epoch", fresh),
+                Err("v70 rollback prefix overlaps authoritative archive"),
+                "{fresh}"
+            );
+        }
+        assert_eq!(
+            validate_v70_rollback_prefix("layrs/epoch", "layrs"),
+            Err("v70 rollback prefix overlaps authoritative archive")
+        );
+        for fresh in [
+            "",
+            "/rollback",
+            "rollback/",
+            "roll//back",
+            "rollback/../epoch",
+            "./rollback",
+            "roll back",
+            "rollback?x=1",
+            &"r".repeat(513),
+        ] {
+            assert_eq!(
+                validate_v70_rollback_prefix("epoch", fresh),
+                Err("v70 rollback prefix invalid"),
+                "{fresh}"
+            );
+        }
+    }
+
+    #[test]
+    fn v70_rollback_request_frame_bound_is_exact() {
+        let limit = MAX_FRAME_BYTES - V70_ROLLBACK_FRAME_ENVELOPE_BYTES;
+        assert_eq!(advance_v70_rollback_frame_bytes(limit - 1, 1), Ok(limit));
+        assert_eq!(
+            advance_v70_rollback_frame_bytes(limit, 1),
+            Err("v70 rollback request exceeds frame bound")
+        );
+        assert!(advance_v70_rollback_frame_bytes(usize::MAX, 1).is_err());
+        assert!(advance_v70_rollback_frame_bytes(MAX_FRAME_BYTES, 0).is_err());
+    }
+
+    #[test]
+    fn v70_rollback_checkpoint_must_match_head_receipt_order_and_content_addresses() {
+        let fixture = v70_rollback_fixture();
+        let checkpoint = fixture
+            .v71
+            .seal_v70_rollback_checkpoint(
+                &fixture.bundle,
+                &fixture.records,
+                &[7; 32],
+                &v70_rollback_journal_key(),
+            )
+            .unwrap();
+        let receipts = ordered_journal_receipts(&fixture.receipts).unwrap();
+        let (keys, heads) =
+            validate_v70_rollback_checkpoint(&checkpoint, 4, &receipts, "rollback").unwrap();
+        assert_eq!(
+            keys[3],
+            format!(
+                "rollback/artifacts/{:020}-{}.cbor",
+                4,
+                artifact_hash(&checkpoint.artifact)
+            )
+        );
+        assert_eq!(
+            keys[0],
+            format!(
+                "rollback/artifacts/{:020}-{}.cbor",
+                1,
+                artifact_hash(&checkpoint.receipt_records[0])
+            )
+        );
+        assert_eq!(heads[1].key, archive_head_key("rollback", 2));
+        assert_eq!(heads[1].artifact_hash, checkpoint.artifact_hashes[1]);
+
+        let header = "v70 rollback checkpoint header invalid";
+        let lineage = "v70 rollback checkpoint lineage mismatch";
+        assert_eq!(
+            validate_v70_rollback_checkpoint(&checkpoint, 3, &receipts, "rollback"),
+            Err(header.into())
+        );
+        assert_eq!(
+            validate_v70_rollback_checkpoint(&checkpoint, 4, &receipts[..3], "rollback"),
+            Err(header.into())
+        );
+        let mut reordered = receipts.clone();
+        reordered.swap(2, 3);
+        assert_eq!(
+            validate_v70_rollback_checkpoint(&checkpoint, 4, &reordered, "rollback"),
+            Err(lineage.into())
+        );
+        let mut foreign_receipt = receipts.clone();
+        foreign_receipt[0].1.signature = "0".repeat(64);
+        assert_eq!(
+            validate_v70_rollback_checkpoint(&checkpoint, 4, &foreign_receipt, "rollback"),
+            Err(lineage.into())
+        );
+        let mutations: Vec<(
+            Box<dyn Fn(&mut layrs_direct_execution_v1::DirectCheckpoint)>,
+            &str,
+        )> =
+            vec![
+                (Box::new(|c| c.protocol = "other".into()), header),
+                (Box::new(|c| c.signature.clear()), header),
+                (
+                    Box::new(|c| {
+                        c.bootstrap_certificate = Some(
+                        layrs_direct_execution_v1::CheckpointBootstrapCertificate::for_checkpoint(c)
+                            .unwrap(),
+                    )
+                    }),
+                    header,
+                ),
+                (Box::new(|c| c.artifact.ciphertext[0] ^= 1), header),
+                (Box::new(|c| c.artifact.epoch_id = "other".into()), header),
+                (Box::new(|c| c.artifact_hashes[0] = "0".repeat(64)), lineage),
+                (Box::new(|c| c.artifact_hashes[3] = "0".repeat(64)), lineage),
+                (
+                    Box::new(|c| c.receipt_records[1].state_hash = "0".repeat(64)),
+                    lineage,
+                ),
+                (
+                    Box::new(|c| c.receipt_records[0].prior_state_hash = "0".repeat(64)),
+                    lineage,
+                ),
+                (
+                    Box::new(|c| c.receipt_records[2].ciphertext = vec![1]),
+                    lineage,
+                ),
+                (Box::new(|c| c.receipt_records.swap(0, 1)), lineage),
+                (Box::new(|c| c.opening_state_hash = "0".repeat(64)), lineage),
+                (
+                    Box::new(|c| c.receipt_records[3].request_hash = "0".repeat(64)),
+                    lineage,
+                ),
+            ];
+        for (index, (mutate, error)) in mutations.iter().enumerate() {
+            let mut tampered = checkpoint.clone();
+            mutate(&mut tampered);
+            assert_eq!(
+                validate_v70_rollback_checkpoint(&tampered, 4, &receipts, "rollback"),
+                Err((*error).into()),
+                "mutation {index}"
+            );
+        }
+        // The terminal compact record must equal the full head artifact.
+        let mut tampered = checkpoint.clone();
+        tampered.receipt_records[3].nonce = vec![0; 12];
+        assert!(validate_v70_rollback_checkpoint(&tampered, 4, &receipts, "rollback").is_err());
+    }
+
+    #[tokio::test]
+    async fn v70_rollback_materializes_a_fresh_prefix_package_the_unchanged_v70_restore_accepts() {
+        let fixture = v70_rollback_fixture();
+        let authoritative = v70_rollback_archive(&fixture);
+        let (endpoint, objects, log, server) = v70_rollback_s3(authoritative.clone()).await;
+        let store = v71_store(
+            &endpoint,
+            JournalWriterState::Eligible(fixture.head.clone()),
+            JournalRole::Writer,
+        );
+        let state = v70_rollback_state(Some(store.clone()), &fixture);
+        let called = Arc::new(AtomicU64::new(0));
+        let package = materialize_v70_rollback(
+            &state,
+            "rollback/v70",
+            v70_rollback_seal(fixture.v71.clone(), called.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(called.load(Ordering::SeqCst), 1);
+        assert_eq!(package.prefix, "rollback/v70");
+        assert_eq!(package.sequence, 4);
+
+        // The authoritative archive is only read; the package is 4 artifacts,
+        // 4 head pointers, and 1 checkpoint, each a create-only KMS/Object
+        // Lock PUT under the fresh prefix.
+        let stored = objects.lock().await.clone();
+        assert_eq!(
+            stored
+                .iter()
+                .filter(|(key, _)| key.starts_with("epoch/"))
+                .map(|(key, bytes)| (key.clone(), bytes.clone()))
+                .collect::<BTreeMap<_, _>>(),
+            authoritative
+        );
+        assert_eq!(stored.len(), authoritative.len() + 9);
+        let puts = v70_rollback_puts(&log.lock().await);
+        assert_eq!(puts.len(), 9);
+        for head in &puts {
+            let key = head
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .trim_start_matches("/unit-test/")
+                .split('?')
+                .next()
+                .unwrap();
+            assert!(key.starts_with("rollback/v70/"), "{key}");
+            v71_assert_create_only_put(head, key);
+        }
+        // The checkpoint is published only after every artifact and head.
+        assert!(puts
+            .last()
+            .unwrap()
+            .starts_with(&format!("put /unit-test/{}", package.checkpoint_key)));
+
+        // Retained-v70 restore over the fresh prefix: listing, head pointer,
+        // artifact, frontier, and checkpoint validation are the unchanged
+        // `prepare_restore` and `restore_streamed` checkpoint branch.
+        let mut fresh = v71_store(
+            &endpoint,
+            JournalWriterState::Unrestored,
+            JournalRole::Writer,
+        );
+        fresh.prefix = "rollback/v70".into();
+        let mut v70_state = v70_rollback_state(None, &fixture);
+        v70_state.persistence_format = PersistenceFormat::V70;
+        let prepared = fresh.prepare_restore(&v70_state).await.unwrap();
+        assert_eq!(prepared.keys.len(), 4);
+        assert_eq!(
+            prepared.checkpoint_keys,
+            vec![package.checkpoint_key.clone()]
+        );
+        let checkpoint: layrs_direct_execution_v1::DirectCheckpoint =
+            serde_cbor::from_slice(&fresh.read(&package.checkpoint_key).await.unwrap()).unwrap();
+        assert_eq!(
+            fresh.checkpoint_key(&checkpoint).unwrap(),
+            package.checkpoint_key
+        );
+        assert_eq!(
+            validate_checkpoint_archive(
+                &checkpoint,
+                &prepared.keys,
+                &prepared.heads,
+                "rollback/v70"
+            ),
+            Ok(4)
+        );
+        for (index, key) in prepared.keys.iter().enumerate() {
+            let artifact: DirectStateArtifact =
+                serde_cbor::from_slice(&fresh.read(key).await.unwrap()).unwrap();
+            assert_eq!(fresh.artifact_key(&artifact), *key);
+            assert_eq!(
+                receipt_only_record(&artifact),
+                checkpoint.receipt_records[index]
+            );
+        }
+        let head_artifact: DirectStateArtifact =
+            serde_cbor::from_slice(&fresh.read(&prepared.keys[3]).await.unwrap()).unwrap();
+        assert_eq!(head_artifact, checkpoint.artifact);
+        assert_eq!(artifact_hash(&head_artifact), package.artifact_hash);
+
+        // The retained enclave's BeginCheckpointRestore under a rollback grant
+        // frontier naming the package head, then exact replay and dedup.
+        let frontier = layrs_direct_execution_v1::CommittedRestoreFrontier {
+            sequence: package.sequence,
+            state_hash: package.state_hash.clone(),
+            artifact_hash: package.artifact_hash.clone(),
+        };
+        assert!(frontier.accepts_checkpoint(&checkpoint));
+        let mut restored = layrs_direct_execution_v1::DirectRuntime::new(
+            fixture.epoch.clone(),
+            layrs_direct_execution_v1::RuntimeMode::IsolatedTest,
+            vec![9; 32],
+        )
+        .unwrap()
+        .restore_checkpoint(&checkpoint, &[7; 32])
+        .unwrap();
+        assert_eq!(restored.committed_sequence(), 4);
+        assert_eq!(restored.committed_state_hash(), package.state_hash);
+        for (request, result) in &fixture.commands {
+            assert_eq!(restored.execute(request.clone()).unwrap(), *result);
+        }
+        let mut conflicting = fixture.commands[3].0.clone();
+        conflicting.action = DirectAction::AdmitIdentity {
+            wallet_address: "0x5555555555555555555555555555555555555555".into(),
+        };
+        conflicting.request_hash = request_hash(&conflicting);
+        assert!(restored.execute(conflicting).is_err());
+        assert_eq!(restored.committed_sequence(), 4);
+        let identity = &fixture.commands[3].0.identity_commitment;
+        assert_eq!(
+            restored.portfolio(identity).unwrap(),
+            fixture.v71.portfolio(identity).unwrap()
+        );
+
+        // A used prefix is never reused, and nothing reaches the enclave.
+        let before = log.lock().await.len();
+        assert_eq!(
+            materialize_v70_rollback(
+                &state,
+                "rollback/v70",
+                v70_rollback_seal(fixture.v71.clone(), called.clone()),
+            )
+            .await,
+            Err("v70 rollback prefix not fresh".into())
+        );
+        assert_eq!(called.load(Ordering::SeqCst), 1);
+        assert!(v70_rollback_puts(&log.lock().await[before..]).is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn v70_rollback_inputs_fail_closed_before_the_enclave_or_any_write() {
+        let fixture = v70_rollback_fixture();
+        let archive = v70_rollback_archive(&fixture);
+        let record = |sequence| journal_record_key("epoch", sequence);
+        let mut noncanonical = serde_cbor::to_vec(&fixture.records[0]).unwrap();
+        noncanonical.push(0);
+        let mut forked = fixture.records[1].clone();
+        forked.previous_record_hash = "0".repeat(64);
+        let mut other_bundle = fixture.bundle.clone();
+        other_bundle.manifest.migration_id = "other-migration".into();
+        let other_bundle_bytes = serde_cbor::to_vec(&other_bundle).unwrap();
+        let mut stale_head = fixture.head.clone();
+        stale_head.record_hash = "0".repeat(64);
+        let mut unbounded_head = fixture.head.clone();
+        unbounded_head.sequence = MAX_V70_LINEAGE_RECORDS as u64 + 1;
+
+        type Edit = Box<dyn Fn(&mut BTreeMap<String, Vec<u8>>)>;
+        let unchanged: Edit = Box::new(|_| {});
+        let cases: Vec<(Edit, Option<V70MigrationBundle>, JournalHead, &str)> = vec![
+            (
+                Box::new(move |objects| {
+                    objects.remove(&record(4));
+                }),
+                None,
+                fixture.head.clone(),
+                "v70 rollback journal incomplete",
+            ),
+            (
+                Box::new(move |objects| {
+                    objects.remove(&record(3));
+                }),
+                None,
+                fixture.head.clone(),
+                "journal tail sequence gap",
+            ),
+            (
+                {
+                    let bytes = serde_cbor::to_vec(&fixture.records[1]).unwrap();
+                    Box::new(move |objects| {
+                        objects.insert(record(5), bytes.clone());
+                    })
+                },
+                None,
+                fixture.head.clone(),
+                "journal listing exceeds bound",
+            ),
+            (
+                Box::new(move |objects| {
+                    objects.insert(record(3), noncanonical.clone());
+                }),
+                None,
+                fixture.head.clone(),
+                "journal replay record decode failed",
+            ),
+            (
+                {
+                    let bytes = serde_cbor::to_vec(&forked).unwrap();
+                    Box::new(move |objects| {
+                        objects.insert(record(4), bytes.clone());
+                    })
+                },
+                None,
+                fixture.head.clone(),
+                "v70 rollback record predecessor mismatch",
+            ),
+            (
+                Box::new(move |objects| {
+                    objects.insert(
+                        journal_migration_key("epoch", 2, &other_bundle_bytes),
+                        other_bundle_bytes.clone(),
+                    );
+                }),
+                None,
+                fixture.head.clone(),
+                "journal migration bundle ambiguous",
+            ),
+            (
+                unchanged,
+                Some(other_bundle),
+                fixture.head.clone(),
+                "v70 rollback migration bundle differs from restored lineage",
+            ),
+            (
+                Box::new(|_| {}),
+                None,
+                stale_head,
+                "v70 rollback journal head mismatch",
+            ),
+            (
+                Box::new(|_| {}),
+                None,
+                unbounded_head,
+                "v70 rollback lineage outside bound",
+            ),
+        ];
+        for (edit, restored, head, error) in cases {
+            let mut objects = archive.clone();
+            edit(&mut objects);
+            let (endpoint, stored, log, server) = v70_rollback_s3(objects.clone()).await;
+            let store = v71_store(
+                &endpoint,
+                JournalWriterState::Eligible(head),
+                JournalRole::Writer,
+            );
+            let state = v70_rollback_state(Some(store), &fixture);
+            if let Some(restored) = restored {
+                *state.journal_migration.lock().await = Some(restored);
+            }
+            let called = Arc::new(AtomicU64::new(0));
+            assert_eq!(
+                materialize_v70_rollback(
+                    &state,
+                    "rollback",
+                    v70_rollback_seal(fixture.v71.clone(), called.clone()),
+                )
+                .await,
+                Err(error.into()),
+                "{error}"
+            );
+            assert_eq!(called.load(Ordering::SeqCst), 0, "{error}");
+            assert!(v70_rollback_puts(&log.lock().await).is_empty(), "{error}");
+            assert_eq!(*stored.lock().await, objects, "{error}");
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn v70_rollback_refuses_ineligible_overlapping_pending_or_rejected_state_without_writes()
+    {
+        let fixture = v70_rollback_fixture();
+        let archive = v70_rollback_archive(&fixture);
+
+        // Refused before any storage access.
+        let (endpoint, _, log, server) = v70_rollback_s3(archive.clone()).await;
+        let eligible = JournalWriterState::Eligible(fixture.head.clone());
+        let cases = [
+            (
+                v70_rollback_state(
+                    Some(v71_store(
+                        &endpoint,
+                        JournalWriterState::Unrestored,
+                        JournalRole::Writer,
+                    )),
+                    &fixture,
+                ),
+                "rollback",
+                "v70 rollback requires an eligible v71 head",
+            ),
+            (
+                v70_rollback_state(
+                    Some(v71_store(
+                        &endpoint,
+                        JournalWriterState::Latched("JOURNAL_WRITER_FENCED"),
+                        JournalRole::Writer,
+                    )),
+                    &fixture,
+                ),
+                "rollback",
+                "v70 rollback requires an eligible v71 head",
+            ),
+            (
+                v70_rollback_state(
+                    Some(v71_store(&endpoint, eligible.clone(), JournalRole::Shadow)),
+                    &fixture,
+                ),
+                "rollback",
+                "v70 rollback requires the authoritative S3 archive",
+            ),
+            (
+                v70_rollback_state(None, &fixture),
+                "rollback",
+                "v70 rollback requires the authoritative S3 archive",
+            ),
+            (
+                v70_rollback_state(
+                    Some(v71_store(&endpoint, eligible.clone(), JournalRole::Writer)),
+                    &fixture,
+                ),
+                "epoch",
+                "v70 rollback prefix overlaps authoritative archive",
+            ),
+            (
+                v70_rollback_state(
+                    Some(v71_store(&endpoint, eligible.clone(), JournalRole::Writer)),
+                    &fixture,
+                ),
+                "epoch/v70-rollback",
+                "v70 rollback prefix overlaps authoritative archive",
+            ),
+            (
+                v70_rollback_state(
+                    Some(v71_store(&endpoint, eligible.clone(), JournalRole::Writer)),
+                    &fixture,
+                ),
+                "../rollback",
+                "v70 rollback prefix invalid",
+            ),
+        ];
+        for (state, prefix, error) in cases {
+            let called = Arc::new(AtomicU64::new(0));
+            assert_eq!(
+                materialize_v70_rollback(
+                    &state,
+                    prefix,
+                    v70_rollback_seal(fixture.v71.clone(), called.clone()),
+                )
+                .await,
+                Err(error.into()),
+                "{error}"
+            );
+            assert_eq!(called.load(Ordering::SeqCst), 0);
+        }
+        let mut v70_state = v70_rollback_state(
+            Some(v71_store(&endpoint, eligible.clone(), JournalRole::Writer)),
+            &fixture,
+        );
+        v70_state.persistence_format = PersistenceFormat::V70;
+        assert_eq!(
+            materialize_v70_rollback(
+                &v70_state,
+                "rollback",
+                v70_rollback_seal(fixture.v71.clone(), Arc::new(AtomicU64::new(0))),
+            )
+            .await,
+            Err("v70 rollback requires a restored v71 lineage".into())
+        );
+        assert!(log.lock().await.is_empty());
+        server.abort();
+
+        // An unresolved external effect blocks the seal: it could not be
+        // recovered from the fresh prefix.
+        let (endpoint, _, log, server) = v70_rollback_s3(archive.clone()).await;
+        let state = v70_rollback_state(
+            Some(v71_store(&endpoint, eligible.clone(), JournalRole::Writer)),
+            &fixture,
+        );
+        let intent = reconciled_intent(&fixture.head.transition_root);
+        state
+            .unresolved_external_effects
+            .lock()
+            .await
+            .insert(intent.intent_hash.clone(), intent);
+        let called = Arc::new(AtomicU64::new(0));
+        assert_eq!(
+            materialize_v70_rollback(
+                &state,
+                "rollback",
+                v70_rollback_seal(fixture.v71.clone(), called.clone()),
+            )
+            .await,
+            Err("v70 rollback external effect pending".into())
+        );
+        assert_eq!(called.load(Ordering::SeqCst), 0);
+        assert!(v70_rollback_puts(&log.lock().await).is_empty());
+        server.abort();
+
+        // Enclave refusal, oversize, transport failure, or a foreign response
+        // never writes the package.
+        let responses: Vec<(io::Result<RuntimeResponse>, &str)> = vec![
+            (
+                Ok(RuntimeResponse::Error {
+                    code: "V70_ROLLBACK_ARCHIVE_INVALID".into(),
+                }),
+                "v70 rollback seal rejected",
+            ),
+            (
+                Ok(RuntimeResponse::Error {
+                    code: CHECKPOINT_FRAME_OVERSIZED.into(),
+                }),
+                "v70 rollback frame oversized",
+            ),
+            (
+                Err(io::Error::new(io::ErrorKind::InvalidData, FrameOversized)),
+                "v70 rollback frame oversized",
+            ),
+            (
+                Err(io::Error::new(io::ErrorKind::TimedOut, "ENCLAVE_TIMEOUT")),
+                "v70 rollback seal transport failed",
+            ),
+            (
+                Ok(RuntimeResponse::BootstrapComplete),
+                "v70 rollback seal unexpected response",
+            ),
+        ];
+        for (response, error) in responses {
+            let (endpoint, _, log, server) = v70_rollback_s3(archive.clone()).await;
+            let state = v70_rollback_state(
+                Some(v71_store(&endpoint, eligible.clone(), JournalRole::Writer)),
+                &fixture,
+            );
+            assert_eq!(
+                materialize_v70_rollback(&state, "rollback", move |_| std::future::ready(response))
+                    .await,
+                Err(error.into()),
+                "{error}"
+            );
+            assert!(v70_rollback_puts(&log.lock().await).is_empty(), "{error}");
+            server.abort();
+        }
+
+        // A checkpoint for another head is rejected before any write.
+        let (endpoint, _, log, server) = v70_rollback_s3(archive).await;
+        let state = v70_rollback_state(
+            Some(v71_store(&endpoint, eligible, JournalRole::Writer)),
+            &fixture,
+        );
+        let mut foreign = fixture
+            .v71
+            .seal_v70_rollback_checkpoint(
+                &fixture.bundle,
+                &fixture.records,
+                &[7; 32],
+                &v70_rollback_journal_key(),
+            )
+            .unwrap();
+        foreign.receipt_records.pop();
+        foreign.artifact_hashes.pop();
+        assert_eq!(
+            materialize_v70_rollback(&state, "rollback", move |_| std::future::ready(Ok(
+                RuntimeResponse::CheckpointSealed {
+                    checkpoint: foreign
+                }
+            )))
+            .await,
+            Err("v70 rollback checkpoint header invalid".into())
+        );
+        assert!(v70_rollback_puts(&log.lock().await).is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn v70_rollback_interrupted_package_never_publishes_its_checkpoint() {
+        let fixture = v70_rollback_fixture();
+        let checkpoint = fixture
+            .v71
+            .seal_v70_rollback_checkpoint(
+                &fixture.bundle,
+                &fixture.records,
+                &[7; 32],
+                &v70_rollback_journal_key(),
+            )
+            .unwrap();
+        let receipts = ordered_journal_receipts(&fixture.receipts).unwrap();
+        let (keys, heads) =
+            validate_v70_rollback_checkpoint(&checkpoint, 4, &receipts, "rollback").unwrap();
+        // A concurrent writer already holds head slot 2 with other bytes.
+        let (endpoint, objects, _, server) = v70_rollback_s3(BTreeMap::from([(
+            archive_head_key("rollback", 2),
+            "0".repeat(64).into_bytes(),
+        )]))
+        .await;
+        let target = v71_store(
+            &endpoint,
+            JournalWriterState::Unrestored,
+            JournalRole::Writer,
+        )
+        .v70_rollback_target("rollback");
+        assert_eq!(
+            target
+                .write_v70_rollback_package(&checkpoint, &keys, &heads)
+                .await,
+            Err("ARCHIVE_SEQUENCE_CONFLICT".into())
+        );
+        assert!(!objects
+            .lock()
+            .await
+            .keys()
+            .any(|key| key.starts_with("rollback/checkpoints/")));
+        // The retained v70 restore fails closed over the partial package.
+        let mut fresh = v71_store(
+            &endpoint,
+            JournalWriterState::Unrestored,
+            JournalRole::Writer,
+        );
+        fresh.prefix = "rollback".into();
+        let mut v70_state = v70_rollback_state(None, &fixture);
+        v70_state.persistence_format = PersistenceFormat::V70;
+        assert!(fresh.prepare_restore(&v70_state).await.is_err());
+        // The rollback target can never accept a v71 journal append.
+        assert_eq!(
+            target.append_journal_record(&fixture.records[0]).await,
+            Err("JOURNAL_LATCHED".into())
+        );
+        server.abort();
     }
 }
