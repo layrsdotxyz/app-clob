@@ -13,7 +13,11 @@ use crate::{
     request_index::{
         RequestIndexError, SparseRequestProof, TerminalRequestLeaf, TerminalResultLocator,
     },
-    sha256, DirectRequest, DirectResult, DirectRuntime, RuntimeError,
+    sha256,
+    v71_checkpoint::{
+        restore_checkpoint, seal_checkpoint, DirectV71Checkpoint, V71CheckpointError,
+    },
+    DirectRequest, DirectResult, DirectRuntime, RuntimeError,
 };
 
 const GENESIS_RECORD_DOMAIN: &[u8] = b"layrs.direct-execution.journal-genesis.v71\0";
@@ -29,6 +33,8 @@ pub enum V71Error {
     Journal(#[from] JournalError),
     #[error(transparent)]
     Migration(#[from] MigrationError),
+    #[error(transparent)]
+    Checkpoint(#[from] V71CheckpointError),
     #[error("an authenticated archived result is required for exact replay")]
     ReplayProofRequired,
     #[error("candidate does not succeed the current v71 head")]
@@ -307,6 +313,42 @@ impl DirectV71Runtime {
             .map_err(Into::into)
     }
 
+    pub fn seal_checkpoint(
+        &self,
+        state_key: &[u8],
+        checkpoint_signing_key: &[u8],
+    ) -> Result<DirectV71Checkpoint, V71Error> {
+        seal_checkpoint(
+            &self.runtime,
+            &self.writer_epoch,
+            self.sequence,
+            &self.record_hash,
+            &self.transition_root,
+            &self.request_index_root,
+            state_key,
+            checkpoint_signing_key,
+        )
+        .map_err(Into::into)
+    }
+
+    pub fn restore_checkpoint(
+        runtime: DirectRuntime,
+        checkpoint: &DirectV71Checkpoint,
+        state_key: &[u8],
+        checkpoint_verification_key: &[u8],
+    ) -> Result<Self, V71Error> {
+        let runtime =
+            restore_checkpoint(runtime, checkpoint, state_key, checkpoint_verification_key)?;
+        Ok(Self {
+            runtime,
+            writer_epoch: checkpoint.writer_epoch.clone(),
+            sequence: checkpoint.sequence,
+            record_hash: checkpoint.record_hash.clone(),
+            transition_root: checkpoint.transition_root.clone(),
+            request_index_root: checkpoint.request_index_root.clone(),
+        })
+    }
+
     /// Adoption is called only after the parent has durably appended and read
     /// back the exact journal record. A stale concurrent candidate cannot be
     /// adopted after another head has won.
@@ -554,6 +596,157 @@ mod tests {
                 )
                 .unwrap(),
             expected
+        );
+    }
+
+    #[test]
+    fn bounded_checkpoint_restores_financial_state_head_and_migrated_replay() {
+        let empty_epoch = || SealedEpoch {
+            identities: BTreeMap::new(),
+            identity_subjects: BTreeMap::new(),
+            subject_identities: BTreeMap::new(),
+            subject_wallets: BTreeMap::<String, BTreeSet<String>>::new(),
+        };
+        let mut v70 =
+            DirectRuntime::new(empty_epoch(), RuntimeMode::IsolatedTest, vec![9; 32]).unwrap();
+        let account = "a".repeat(64);
+        let wallet = "0x1111111111111111111111111111111111111111";
+        let request = admission(&account, "request-1", wallet);
+        let expected = v70.execute(request.clone()).unwrap();
+        let bundle = V70MigrationBundle::seal(&v70, &[7; 32], &[8; 32]).unwrap();
+        let proof = SparseRequestProof {
+            leaf: Some(bundle.leaves[0].clone()),
+            siblings: SparseRequestProof::empty_tree().siblings,
+        };
+        let record = bundle.records[0].clone();
+        let migrated = DirectV71Runtime::from_v70_migration(
+            v70,
+            &bundle,
+            "writer-epoch-2".into(),
+            &[7; 32],
+            &journal_verifying_key(&[8; 32]).unwrap(),
+        )
+        .unwrap();
+        let checkpoint = migrated.seal_checkpoint(&[7; 32], &[8; 32]).unwrap();
+        assert!(serde_cbor::to_vec(&checkpoint).unwrap().len() < 64 * 1024);
+
+        let restored = DirectV71Runtime::restore_checkpoint(
+            DirectRuntime::new(empty_epoch(), RuntimeMode::IsolatedTest, vec![9; 32]).unwrap(),
+            &checkpoint,
+            &[7; 32],
+            &journal_verifying_key(&[8; 32]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored.sequence(), migrated.sequence());
+        assert_eq!(restored.record_hash(), migrated.record_hash());
+        assert_eq!(restored.transition_root(), migrated.transition_root());
+        assert_eq!(restored.request_index_root(), migrated.request_index_root());
+        assert!(restored
+            .financial_runtime()
+            .owns(&account, &identity_commitment_for(&account, wallet)));
+        assert_eq!(
+            restored
+                .replay_migrated(
+                    &request,
+                    &proof,
+                    &record,
+                    &[7; 32],
+                    &journal_verifying_key(&[8; 32]).unwrap(),
+                )
+                .unwrap(),
+            expected
+        );
+
+        let mut tampered = checkpoint;
+        tampered.ciphertext[0] ^= 1;
+        assert!(DirectV71Runtime::restore_checkpoint(
+            DirectRuntime::new(empty_epoch(), RuntimeMode::IsolatedTest, vec![9; 32],).unwrap(),
+            &tampered,
+            &[7; 32],
+            &journal_verifying_key(&[8; 32]).unwrap(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn bounded_checkpoint_preserves_active_withdrawal_without_request_history() {
+        let empty_epoch = || SealedEpoch {
+            identities: BTreeMap::new(),
+            identity_subjects: BTreeMap::new(),
+            subject_identities: BTreeMap::new(),
+            subject_wallets: BTreeMap::<String, BTreeSet<String>>::new(),
+        };
+        let mut v70 =
+            DirectRuntime::new(empty_epoch(), RuntimeMode::IsolatedTest, vec![9; 32]).unwrap();
+        let account = "a".repeat(64);
+        let wallet = "0x1111111111111111111111111111111111111111";
+        let identity = identity_commitment_for(&account, wallet);
+        v70.execute(admission(&account, "request-1", wallet))
+            .unwrap();
+
+        let mut credit = DirectRequest {
+            account_id: account.clone(),
+            identity_commitment: identity.clone(),
+            request_id: "request-2".into(),
+            request_hash: String::new(),
+            financial_wallet_address: Some(wallet.into()),
+            action: DirectAction::CreditHorizenUsdcDeposit {
+                amount_atomic: "5000000".into(),
+                custody_reference: format!("horizen-usdc-deposit:0x{}", "ab".repeat(32)),
+            },
+        };
+        credit.request_hash = request_hash(&credit);
+        v70.execute(credit).unwrap();
+        let withdrawal_id = "11111111-2222-4333-8444-555555555555";
+        let mut withdraw = DirectRequest {
+            account_id: account.clone(),
+            identity_commitment: identity.clone(),
+            request_id: withdrawal_id.into(),
+            request_hash: String::new(),
+            financial_wallet_address: Some(wallet.into()),
+            action: DirectAction::BeginUsdcBusWithdrawal {
+                withdrawal_id: withdrawal_id.into(),
+                destination_chain: "arbitrum".into(),
+                asset: "USDC".into(),
+                destination: wallet.into(),
+                amount_atomic: "4840000".into(),
+            },
+        };
+        withdraw.request_hash = request_hash(&withdraw);
+        v70.execute(withdraw).unwrap();
+
+        let bundle = V70MigrationBundle::seal(&v70, &[7; 32], &[8; 32]).unwrap();
+        let migrated = DirectV71Runtime::from_v70_migration(
+            v70,
+            &bundle,
+            "writer-epoch-2".into(),
+            &[7; 32],
+            &journal_verifying_key(&[8; 32]).unwrap(),
+        )
+        .unwrap();
+        assert!(migrated.financial_runtime().requests.is_empty());
+        assert!(migrated
+            .financial_runtime()
+            .has_pending_usdc_bus_withdrawals());
+        let checkpoint = migrated.seal_checkpoint(&[7; 32], &[8; 32]).unwrap();
+        let restored = DirectV71Runtime::restore_checkpoint(
+            DirectRuntime::new(empty_epoch(), RuntimeMode::IsolatedTest, vec![9; 32]).unwrap(),
+            &checkpoint,
+            &[7; 32],
+            &journal_verifying_key(&[8; 32]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            restored
+                .financial_runtime()
+                .pending_usdc_bus_withdrawal(&account, withdrawal_id),
+            Some((wallet.into(), "4840000".into()))
+        );
+        assert_eq!(
+            restored
+                .financial_runtime()
+                .balance(&identity, "USDC", "USER_WITHDRAWAL_HOLD"),
+            4_840_000
         );
     }
 }
