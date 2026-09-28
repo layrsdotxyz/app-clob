@@ -32,6 +32,24 @@ Parameters:
     Type: String
     Default: dormant
     AllowedValues: [dormant, admission-enabled, production-enabled]
+  # Persistence remains v70 unless the rollout explicitly selects the
+  # restart-compatible hot path or the governed sparse rollback baseline.
+  PersistenceFormat:
+    Type: String
+    Default: v70
+    AllowedValues: [v70, v71-hot, v70-rollback-baseline]
+  V71ShadowRunId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(?:|[a-z0-9][a-z0-9-]{0,62})$'
+  V71AutoPromote:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  V70RollbackPrefix:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(?:|[A-Za-z0-9!_.*''()/-]+)$'
   WriterGrantBase64:
     Type: String
     Default: ''
@@ -242,6 +260,7 @@ Resources:
             )
             values = {
                 "LAYRS_DIRECT_EXECUTION_MODE": "${ExecutionMode}",
+                "LAYRS_DIRECT_PERSISTENCE_FORMAT": "${PersistenceFormat}",
                 # This guarded VPC listener serves only signed, encrypted
                 # balance reads from the dedicated BFF.  The enclave remains
                 # dormant and the parent rejects every financial command.
@@ -262,6 +281,12 @@ Resources:
                     required(runtime, "receiptShareHmacSecret").encode("utf-8")
                 ).hexdigest(),
             }
+            if "${V71ShadowRunId}":
+                values["LAYRS_DIRECT_V71_SHADOW_RUN_ID"] = "${V71ShadowRunId}"
+            if "${V71AutoPromote}" == "true":
+                values["LAYRS_DIRECT_V71_AUTO_PROMOTE"] = "true"
+            if "${V70RollbackPrefix}":
+                values["LAYRS_DIRECT_V70_ROLLBACK_PREFIX"] = "${V70RollbackPrefix}"
             if "${ExecutionMode}" in ("admission-enabled", "production-enabled"):
                 # EnvironmentFile cannot preserve pretty-printed JSON record
                 # separators: escaped newlines outside JSON strings are not

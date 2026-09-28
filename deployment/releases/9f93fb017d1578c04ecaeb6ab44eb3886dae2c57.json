@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "built-verified-not-authorized-for-production",
+  "releaseId": "v71-prep-9f93fb0-20260928",
+  "sourceCommit": "9f93fb017d1578c04ecaeb6ab44eb3886dae2c57",
+  "sourceBranch": "codex/layrs-v71-integration-20260928",
+  "region": "us-east-1",
+  "candidate": {
+    "amiId": "ami-09a85e9808a6da50e",
+    "amiName": "layrs-opening-epoch-v71-prep-9f93fb0-20260928",
+    "amiSnapshotId": "snap-0d97f6fbc5ff3964b",
+    "amiEncrypted": true,
+    "amiDeregistrationProtection": "enabled-without-cooldown",
+    "parentSizeBytes": 46835040,
+    "parentSha256": "a52c57f3b9f6afcbac24f2b5134ada6036ecc4c4ab4dd425c01ddb9ade79a2ea",
+    "enclaveSizeBytes": 14814304,
+    "enclaveSha256": "2c550442d9105f8d60d33fc82d4b439d6fce13efd33262e05fb1e8db84213ac7",
+    "eifSha256": "00af4c138d35c8b7efaeaaac1e92e3b15d2f0568f6a43bc9f2fe79f0aed8ce18",
+    "measurements": {
+      "hashAlgorithm": "SHA384",
+      "pcr0": "d7ee4c71e109ca62a676a6460a2f0c790eaf6a8e73ba36ef624ea744d7ebaa7215bc7ce4b3483cc4d98f73bc54f980e5",
+      "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+      "pcr2": "5f5b11b872fd76984dd780163d7048db4711c583a4f25fe50317f4b7d748bd34e95f3dcecf1f9777067375d374b3d305"
+    }
+  },
+  "retainedV70Rollback": {
+    "amiId": "ami-093fabb94cc52931e",
+    "amiName": "layrs-opening-epoch-v70-rollback-parent-9f93fb0-20260928",
+    "amiSnapshotId": "snap-09594809d65330880",
+    "amiEncrypted": true,
+    "amiDeregistrationProtection": "enabled-without-cooldown",
+    "parentSha256": "a52c57f3b9f6afcbac24f2b5134ada6036ecc4c4ab4dd425c01ddb9ade79a2ea",
+    "enclaveSha256": "a133d806cd893d357cc722bf5f70b27d7096dd828785cd122af4263b80f94fe4",
+    "eifSha256": "ff165914950152093be4b8088aec45d853ef32a68935b85ee710a85e57cb7ade",
+    "measurements": {
+      "hashAlgorithm": "SHA384",
+      "pcr0": "ddc56e079110c40b0f5014ae07645279b9e59d9f8a6c9cea2e56398f259c43758a293caa8b48562541a9ce23167fc721",
+      "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+      "pcr2": "6204f86cccc410f4643f1190e2c6f67ef6b325ca08ca26cc979047ecdc74f9587f9cc9a2e4baef893f44359ad4c754ac"
+    }
+  },
+  "verification": {
+    "libraryTests": "110 passed, 3 ignored",
+    "enclaveTests": "33 passed",
+    "parentTests": "119 passed",
+    "v71CommitBenchmark": "35000-history p50 4.904 ms, p95 6.970 ms, p99 7.603 ms, 36081-byte maximum journal record, 346096 KiB peak RSS",
+    "v70BridgeBenchmark": "200000-record checkpoint 688466676 bytes, 3506420 KiB peak RSS, exact restore",
+    "isolatedImageInspection": "both AMIs had no runtime environment and zero local artifact files; temporary instances and security group were removed"
+  },
+  "activation": null,
+  "candidateWriterGrantCommitment": null,
+  "rollbackWriterGrantCommitment": null,
+  "signature": null,
+  "signatureNote": "No production authorization is embedded. Activation requires current-head fencing, distinct candidate and rollback grants, exact public measurement-manifest rotation, and the five-minute soft and ten-minute hard abort gates. Durable Commands are not part of this release."
+}

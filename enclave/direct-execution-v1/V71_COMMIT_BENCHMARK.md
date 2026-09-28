@@ -31,11 +31,16 @@ RSS measurement excludes the compiler.
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Conservative cargo run | 137.610 s | 36,081 B | 8.348 ms | 15.362 ms | 19.528 ms | compiler included |
 | Direct release binary | 152.050 s | 36,081 B | 4.907 ms | 7.430 ms | 8.505 ms | 345,304 KiB |
+| Release candidate `9f93fb0` | 105.328 s | 36,081 B | 4.904 ms | 6.970 ms | 7.603 ms | 346,096 KiB |
 
 The second setup was slower because another isolated worktree was compiling at
 the same time; the timed commit percentiles still remained far below one
 second. Both runs asserted a 35,000-sequence migration, an empty v71 full
 request map, exact final sequence, and a journal record below 64 KiB.
+
+The release-candidate run was executed after integrating the parent-health
+change currently deployed in production. It used the exact optimized test
+binary built from `9f93fb0` with `Cargo.lock` enforced.
 
 ## Interpretation and remaining gate
 
