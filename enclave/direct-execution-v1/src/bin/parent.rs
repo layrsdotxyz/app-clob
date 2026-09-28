@@ -178,6 +178,7 @@ struct AppState {
     journal_receipts:
         Arc<Mutex<Option<BTreeMap<(String, String), (u64, DirectReceipt)>>>>,
     journal_migration: Arc<Mutex<Option<V70MigrationBundle>>>,
+    journal_checkpoint_sequence: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -356,6 +357,9 @@ fn checkpoint_seal_reason(error: &str) -> &'static str {
         "checkpoint seal transport failed" => "transport",
         "checkpoint seal rejected" => "head_validation",
         "checkpoint head mismatch" => "archive_head",
+        "journal checkpoint external effect pending" => "external_effect_pending",
+        "journal checkpoint head unavailable" => "journal_head",
+        "journal checkpoint cache unavailable" => "journal_cache",
         _ => "archive_read_or_write",
     }
 }
@@ -2037,6 +2041,13 @@ fn journal_parent_snapshot_key_parts(
 /// tail fails closed; it never falls back to an older checkpoint or genesis.
 #[cfg_attr(not(test), allow(dead_code))]
 const MAX_V71_RESTORE_TAIL_RECORDS: usize = 1000;
+/// Checkpoint often enough that three consecutive failed intervals still leave
+/// room below the bounded 1,000-record restore tail.
+const V71_CHECKPOINT_INTERVAL_RECORDS: u64 = 250;
+
+fn journal_checkpoint_due(sequence: u64, last_checkpoint: u64) -> bool {
+    sequence.saturating_sub(last_checkpoint) >= V71_CHECKPOINT_INTERVAL_RECORDS
+}
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn journal_migration_key(prefix: &str, source_sequence: u64, bytes: &[u8]) -> String {
@@ -2393,6 +2404,110 @@ impl S3ImmutableArtifactStore {
         self.write_once(&key, serde_cbor::to_vec(&checkpoint).map_err(|_| "checkpoint encoding failed")?).await?;
         eprintln!("VERIFIED_ARCHIVE_CHECKPOINT_PERSISTED {}", checkpoint.artifact.sequence);
         Ok(())
+    }
+    /// Captures one exact v71 head under the financial gate, then releases the
+    /// gate before immutable storage I/O. Parent acceleration snapshots are
+    /// written first; the enclave-authenticated checkpoint is the publication
+    /// marker, so a crash can leave only harmless orphan snapshots.
+    async fn seal_current_journal_checkpoint(&self, state: &AppState) -> Result<(), String> {
+        let guard = state
+            .financial_gate
+            .lock("journal_checkpoint_capture")
+            .await;
+        if !state.unresolved_external_effects.lock().await.is_empty() {
+            return Err("journal checkpoint external effect pending".into());
+        }
+        let head = match &*self.journal.lock().await {
+            JournalWriterState::Eligible(head) => head.clone(),
+            JournalWriterState::Unrestored | JournalWriterState::Latched(_) => {
+                return Err("journal checkpoint head unavailable".into())
+            }
+        };
+        let last_checkpoint = state.journal_checkpoint_sequence.load(Ordering::Acquire);
+        if !journal_checkpoint_due(head.sequence, last_checkpoint) {
+            return Ok(());
+        }
+        let response = exchange_with_timeout(
+            state,
+            RuntimeRequest::SealJournalCheckpoint,
+            CHECKPOINT_EXCHANGE_TIMEOUT,
+        )
+        .await
+        .map_err(|_| "journal checkpoint seal transport failed")?;
+        let checkpoint = match response {
+            RuntimeResponse::JournalCheckpointSealed { checkpoint }
+                if checkpoint.writer_epoch == head.writer_epoch
+                    && checkpoint.sequence == head.sequence
+                    && checkpoint.record_hash == head.record_hash
+                    && checkpoint.transition_root == head.transition_root
+                    && checkpoint.request_index_root == head.request_index_root
+                    && checkpoint.financial_state_root == head.financial_state_root =>
+            {
+                checkpoint
+            }
+            RuntimeResponse::Error { .. } => {
+                return Err("journal checkpoint seal rejected".into())
+            }
+            _ => return Err("journal checkpoint seal mismatch".into()),
+        };
+        let index = state
+            .journal_request_index
+            .lock()
+            .await
+            .as_ref()
+            .cloned()
+            .ok_or("journal checkpoint cache unavailable")?;
+        let receipts = state
+            .journal_receipts
+            .lock()
+            .await
+            .as_ref()
+            .cloned()
+            .ok_or("journal checkpoint cache unavailable")?;
+        drop(guard);
+
+        let index_snapshot = index
+            .snapshot(checkpoint.sequence, &checkpoint.request_index_root)
+            .map_err(|_| "journal checkpoint request index invalid")?;
+        let receipt_snapshot = DirectReceiptSnapshot::from_receipts(
+            &index_snapshot,
+            receipts.into_values(),
+        )
+        .map_err(|_| "journal checkpoint receipts invalid")?;
+        self.publish_journal_checkpoint(&checkpoint, &index_snapshot, &receipt_snapshot)
+            .await?;
+        state
+            .journal_checkpoint_sequence
+            .fetch_max(checkpoint.sequence, Ordering::AcqRel);
+        eprintln!(
+            "VERIFIED_JOURNAL_CHECKPOINT_PERSISTED {}",
+            checkpoint.sequence
+        );
+        Ok(())
+    }
+
+    async fn schedule_journal_checkpoint(&self, state: &AppState) {
+        let sequence = match &*self.journal.lock().await {
+            JournalWriterState::Eligible(head) => head.sequence,
+            JournalWriterState::Unrestored | JournalWriterState::Latched(_) => return,
+        };
+        if !journal_checkpoint_due(
+            sequence,
+            state.journal_checkpoint_sequence.load(Ordering::Acquire),
+        ) {
+            return;
+        }
+        if self.checkpoint_refresh_gate.lock().await.request() {
+            let store = self.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                let (store, state) = (&store, &state);
+                refresh_checkpoints(&store.checkpoint_refresh_gate, move || {
+                    store.seal_current_journal_checkpoint(state)
+                })
+                .await;
+            });
+        }
     }
     /// Runs only after the final encrypted head is verified and adopted. The
     /// immutable archive stays authoritative and the prior checkpoint stays in
@@ -2817,6 +2932,19 @@ impl S3ImmutableArtifactStore {
             return Err("journal receipt snapshot readback mismatch".into());
         }
         Ok((index_key, receipt_key))
+    }
+    /// Publish the authenticated checkpoint only after both disposable parent
+    /// snapshots are durable. The checkpoint object is the sole restore
+    /// discovery marker; orphan snapshots from an interrupted attempt are safe.
+    async fn publish_journal_checkpoint(
+        &self,
+        checkpoint: &DirectV71Checkpoint,
+        index: &DirectRequestIndexSnapshot,
+        receipts: &DirectReceiptSnapshot,
+    ) -> Result<String, String> {
+        self.persist_journal_parent_snapshots(checkpoint, index, receipts)
+            .await?;
+        self.persist_journal_checkpoint(checkpoint).await
     }
     /// Paginated listing of `namespace` (a full key prefix ending in `/`),
     /// optionally strictly after `start_after`, of at most `max` keys. Each
@@ -3252,6 +3380,9 @@ impl S3ImmutableArtifactStore {
         *state.journal_request_index.lock().await = Some(index);
         *state.journal_receipts.lock().await = Some(receipts);
         *state.journal_migration.lock().await = migration;
+        state
+            .journal_checkpoint_sequence
+            .store(checkpoint.sequence, Ordering::Release);
         *state.committed_state_root.lock().await = Some(head.transition_root);
         eprintln!("VERIFIED_JOURNAL_RESTORE_COMPLETE {}", head.sequence);
         Ok(())
@@ -4053,6 +4184,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         journal_request_index: Arc::new(Mutex::new(None)),
         journal_receipts: Arc::new(Mutex::new(None)),
         journal_migration: Arc::new(Mutex::new(None)),
+        journal_checkpoint_sequence: Arc::new(AtomicU64::new(0)),
     };
     // A Nitro EIF does not inherit the parent's systemd environment.  The
     // isolated test key material therefore crosses the existing VSOCK channel
@@ -6198,17 +6330,9 @@ async fn activate_v71_from_restored_v70(state: &AppState) -> io::Result<()> {
         _ => return Err(invalid("V71_CHECKPOINT_SEAL_MISMATCH")),
     };
     store
-        .persist_journal_checkpoint(&checkpoint)
+        .publish_journal_checkpoint(&checkpoint, &index_snapshot, &receipt_snapshot)
         .await
-        .map_err(|error| invalid(format!("V71_CHECKPOINT_PERSISTENCE_FAILED:{error}")))?;
-    store
-        .persist_journal_parent_snapshots(
-            &checkpoint,
-            &index_snapshot,
-            &receipt_snapshot,
-        )
-        .await
-        .map_err(|error| invalid(format!("V71_PARENT_SNAPSHOT_PERSISTENCE_FAILED:{error}")))?;
+        .map_err(|error| invalid(format!("V71_CHECKPOINT_PUBLICATION_FAILED:{error}")))?;
     store
         .establish_journal_head(JournalHead {
             writer_epoch,
@@ -6223,6 +6347,9 @@ async fn activate_v71_from_restored_v70(state: &AppState) -> io::Result<()> {
     *state.journal_request_index.lock().await = Some(index);
     *state.journal_receipts.lock().await = Some(receipts);
     *state.journal_migration.lock().await = Some(bundle);
+    state
+        .journal_checkpoint_sequence
+        .store(sequence, Ordering::Release);
     *state.committed_state_root.lock().await = Some(transition_root);
     eprintln!("V71_MIGRATION_CUTOVER_READY sequence={sequence}");
     Ok(())
@@ -7708,6 +7835,7 @@ async fn exchange_direct_v71(
     }
     *state.committed_state_root.lock().await = Some(record.transition_root);
     state.last_commit_at.store(now_unix(), Ordering::Release);
+    store.schedule_journal_checkpoint(state).await;
     Ok(RuntimeResponse::Execute { result: terminal })
 }
 fn invalid(error: impl std::fmt::Display) -> io::Error {
@@ -7786,6 +7914,18 @@ mod tests {
         assert!(!refresh.finish(super::CheckpointRefreshOutcome::Persisted));
         assert!(refresh.request());
         assert_eq!(refresh.delay(now + super::CHECKPOINT_REFRESH_INTERVAL * 2), super::CHECKPOINT_REFRESH_INTERVAL);
+    }
+
+    #[test]
+    fn v71_checkpoint_cadence_leaves_three_retry_intervals_inside_restore_bound() {
+        assert_eq!(V71_CHECKPOINT_INTERVAL_RECORDS, 250);
+        assert_eq!(MAX_V71_RESTORE_TAIL_RECORDS, 1000);
+        assert!(!journal_checkpoint_due(249, 0));
+        assert!(journal_checkpoint_due(250, 0));
+        assert!(!journal_checkpoint_due(10_249, 10_000));
+        assert!(journal_checkpoint_due(10_250, 10_000));
+        assert!(!journal_checkpoint_due(9_999, 10_000));
+        assert!(V71_CHECKPOINT_INTERVAL_RECORDS * 4 <= MAX_V71_RESTORE_TAIL_RECORDS as u64);
     }
 
     use super::*;
@@ -7899,6 +8039,7 @@ mod tests {
             journal_request_index: Arc::new(Mutex::new(None)),
             journal_receipts: Arc::new(Mutex::new(None)),
             journal_migration: Arc::new(Mutex::new(None)),
+            journal_checkpoint_sequence: Arc::new(AtomicU64::new(0)),
         };
         assert_eq!(store.seal_current_checkpoint(&state).await.unwrap_err(), "checkpoint head mismatch");
         // restore_streamed's final step: the same failure is only diagnosed.
@@ -8956,6 +9097,7 @@ mod tests {
             journal_request_index: Arc::new(Mutex::new(None)),
             journal_receipts: Arc::new(Mutex::new(None)),
             journal_migration: Arc::new(Mutex::new(None)),
+            journal_checkpoint_sequence: Arc::new(AtomicU64::new(0)),
         };
         assert!(authenticated(&headers, &state).is_ok());
 
@@ -10211,6 +10353,33 @@ mod tests {
         }
     }
 
+    fn v71_checkpoint_publication_fixture() -> (
+        DirectV71Checkpoint,
+        DirectRequestIndexSnapshot,
+        DirectReceiptSnapshot,
+    ) {
+        let (result, record) = v71_candidate();
+        let leaf = TerminalRequestLeaf {
+            account_id: record.account_id,
+            request_id: record.request_id,
+            request_hash: record.request_hash,
+            result_hash: record.result_hash,
+            receipt_hash: record.receipt_hash,
+            locator: TerminalResultLocator::Journal {
+                writer_epoch: "writer-epoch-1".into(),
+                sequence: 1,
+            },
+        };
+        let root = layrs_direct_execution_v1::request_index::request_index_root(&[leaf.clone()])
+            .unwrap();
+        let index = DirectRequestIndexSnapshot::from_leaves(1, &root, [leaf]).unwrap();
+        let receipts =
+            DirectReceiptSnapshot::from_receipts(&index, [(1, result.receipt)]).unwrap();
+        let mut checkpoint = v71_checkpoint(1);
+        checkpoint.request_index_root = root;
+        (checkpoint, index, receipts)
+    }
+
     fn v71_migration_bundle(migration_id: String) -> V70MigrationBundle {
         V70MigrationBundle {
             manifest: layrs_direct_execution_v1::migration::V70MigrationManifest {
@@ -10521,6 +10690,39 @@ mod tests {
         }
         server.abort();
         assert!(log.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v71_checkpoint_publication_writes_parent_snapshots_before_discovery_marker() {
+        let (checkpoint, index, receipts) = v71_checkpoint_publication_fixture();
+        let index_bytes = serde_cbor::to_vec(&index).unwrap();
+        let receipt_bytes = serde_cbor::to_vec(&receipts).unwrap();
+        let checkpoint_bytes = serde_cbor::to_vec(&checkpoint).unwrap();
+        let checkpoint_key = journal_checkpoint_key("epoch", 1, &checkpoint_bytes);
+        let (endpoint, log, server) = v71_mock_s3(vec![
+            v71_http(200, b""),
+            v71_http(200, &index_bytes),
+            v71_http(200, b""),
+            v71_http(200, &receipt_bytes),
+            v71_http(200, b""),
+            v71_http(200, &checkpoint_bytes),
+        ])
+        .await;
+        let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Writer);
+        assert_eq!(
+            store
+                .publish_journal_checkpoint(&checkpoint, &index, &receipts)
+                .await,
+            Ok(checkpoint_key.clone())
+        );
+        server.abort();
+        let log = log.lock().await;
+        assert_eq!(log.len(), 6);
+        assert!(log[0].0.contains("journal-v71/request-index/"));
+        assert!(log[2].0.contains("journal-v71/receipts/"));
+        assert!(log[4]
+            .0
+            .starts_with(&format!("put /unit-test/{checkpoint_key}")));
     }
 
     #[tokio::test]
