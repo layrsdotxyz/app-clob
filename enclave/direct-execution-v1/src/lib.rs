@@ -3751,6 +3751,13 @@ pub enum RuntimeRequest {
     VerifyJournalCheckpoint {
         checkpoint: v71_checkpoint::DirectV71Checkpoint,
     },
+    /// Starts a non-authoritative v71 mirror from an instantaneous clone of
+    /// the recovered v70 head. Migration sealing and bounded catch-up happen
+    /// in the background while v70 remains the only writer.
+    BeginV71Shadow {
+        run_id: String,
+    },
+    V71ShadowStatus,
     SealV70Migration,
     SealV70RollbackCheckpoint {
         migration: migration::V70MigrationBundle,
@@ -3846,6 +3853,14 @@ pub enum RuntimeResponse {
         transition_root: String,
         request_index_root: String,
         financial_state_root: String,
+    },
+    V71ShadowStatus {
+        run_id: String,
+        phase: String,
+        source_sequence: u64,
+        sequence: u64,
+        consecutive_matches: u64,
+        observed_effects: Vec<String>,
     },
     V70MigrationSealed {
         bundle: migration::V70MigrationBundle,

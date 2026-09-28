@@ -809,6 +809,16 @@ impl DirectV71Runtime {
     pub fn financial_state_root(&self) -> Result<String, V71Error> {
         financial_state_root(&self.runtime).map_err(Into::into)
     }
+
+    pub fn verify_shadow_head(&self, authoritative: &DirectRuntime) -> Result<(), V71Error> {
+        if self.sequence != authoritative.committed_sequence()
+            || self.financial_state_root()?
+                != financial_state_root_ignoring_history(authoritative)?
+        {
+            return Err(V71Error::ShadowMismatch);
+        }
+        Ok(())
+    }
 }
 
 fn insert_rollback_result(

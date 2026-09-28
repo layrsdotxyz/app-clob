@@ -4298,6 +4298,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     verify_recovered_projection(&state).await?;
     recover_external_effect_intents(&state).await?;
     verify_recovered_projection(&state).await?;
+    if let Ok(run_id) = env::var("LAYRS_DIRECT_V71_SHADOW_RUN_ID") {
+        if state.persistence_format != PersistenceFormat::V70 {
+            eprintln!("V71_SHADOW_NOT_STARTED reason=AUTHORITATIVE_FORMAT_NOT_V70");
+        } else {
+            match exchange(
+                &state,
+                RuntimeRequest::BeginV71Shadow {
+                    run_id: run_id.clone(),
+                },
+            )
+            .await
+            {
+                Ok(RuntimeResponse::V71ShadowStatus {
+                    phase,
+                    source_sequence,
+                    ..
+                }) if phase == "PENDING" => {
+                    eprintln!(
+                        "V71_SHADOW_STARTED run_id={} source_sequence={}",
+                        run_id, source_sequence
+                    );
+                }
+                Ok(RuntimeResponse::Error { code }) => {
+                    eprintln!("V71_SHADOW_NOT_STARTED reason={code}");
+                }
+                Ok(_) => eprintln!("V71_SHADOW_NOT_STARTED reason=UNEXPECTED_RESPONSE"),
+                Err(_) => eprintln!("V71_SHADOW_NOT_STARTED reason=TRANSPORT_FAILED"),
+            }
+        }
+    }
     if state.persistence_format == PersistenceFormat::V71
         && state.journal_request_index.lock().await.is_none()
     {

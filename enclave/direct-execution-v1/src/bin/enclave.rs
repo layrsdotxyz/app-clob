@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     env, io,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -12,8 +13,10 @@ use hmac::{Hmac, Mac};
 use layrs_direct_execution_v1::{
     direct_frame::{CHECKPOINT_FRAME_OVERSIZED, MAX_FRAME_BYTES},
     journal::{derive_journal_signing_key, journal_verifying_key},
+    request_index::SparseRequestTree,
     runtime_binding, runtime_binding_commitment, quest_receipt_public_key, quest_receipt_attestation_commitment, DirectRuntime, InMemoryDirectStateStore,
-    RuntimeMeasurementBinding, RuntimeMode, RuntimeRequest, RuntimeResponse, SealedEpoch,
+    DirectRequest, DirectResult, RuntimeMeasurementBinding, RuntimeMode, RuntimeRequest,
+    RuntimeResponse, SealedEpoch,
     v71::DirectV71Runtime,
     WriterGrant, EPOCH_ID, TRANSACTION_MODEL,
 };
@@ -31,6 +34,35 @@ use tokio_vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
 use zeroize::Zeroize;
 
 const PORT: u32 = 5_003;
+const MAX_V71_SHADOW_CATCH_UP: usize = 1_000;
+
+#[derive(Clone)]
+struct V71ShadowObservation {
+    request: DirectRequest,
+    result: DirectResult,
+}
+
+enum V71ShadowState {
+    Disabled,
+    Pending {
+        run_id: String,
+        source_sequence: u64,
+        observations: Vec<V71ShadowObservation>,
+    },
+    Active {
+        run_id: String,
+        source_sequence: u64,
+        runtime: DirectV71Runtime,
+        tree: SparseRequestTree,
+        consecutive_matches: u64,
+        observed_effects: BTreeSet<String>,
+    },
+    Latched {
+        run_id: String,
+        source_sequence: u64,
+        reason: &'static str,
+    },
+}
 
 struct EnclaveState {
     // Serialize state transitions without blocking reads of committed state.
@@ -39,6 +71,7 @@ struct EnclaveState {
     runtime: DirectRuntime,
     v71_runtime: Option<DirectV71Runtime>,
     v71_writer_eligible: bool,
+    v71_shadow: V71ShadowState,
     epoch: SealedEpoch,
     mode: RuntimeMode,
     receipt_key: Vec<u8>,
@@ -96,6 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         runtime: DirectRuntime::new(epoch.clone(), mode, receipt_key.clone())?,
         v71_runtime: None,
         v71_writer_eligible: false,
+        v71_shadow: V71ShadowState::Disabled,
         epoch,
         mode,
         receipt_key,
@@ -242,6 +276,8 @@ where
         RuntimeRequest::VerifyJournalCheckpoint { checkpoint } => {
             verify_journal_checkpoint(state, checkpoint).await
         }
+        RuntimeRequest::BeginV71Shadow { run_id } => begin_v71_shadow(state, run_id).await,
+        RuntimeRequest::V71ShadowStatus => v71_shadow_status(&state).await,
         RuntimeRequest::SealV70Migration => seal_v70_migration(state).await,
         RuntimeRequest::SealV70RollbackCheckpoint { migration, journal_records } => {
             let bytes = match seal_v70_rollback_checkpoint(state, migration, journal_records).await {
@@ -571,6 +607,7 @@ where
     state.runtime = runtime;
     state.v71_runtime = None;
     state.v71_writer_eligible = false;
+    state.v71_shadow = V71ShadowState::Disabled;
     state.mode = pending.requested_mode;
     state.receipt_key = receipt_key;
     state.state_key = state_key;
@@ -669,6 +706,7 @@ async fn bootstrap_isolated(
     state.runtime = runtime;
     state.v71_runtime = None;
     state.v71_writer_eligible = false;
+    state.v71_shadow = V71ShadowState::Disabled;
     state.mode = RuntimeMode::IsolatedTest;
     state.receipt_key = receipt_key;
     state.state_key = state_key;
@@ -854,6 +892,284 @@ async fn begin_journal_restore(
         Err(_) => RuntimeResponse::Error {
             code: "JOURNAL_CHECKPOINT_AUTHENTICATION_FAILED".into(),
         },
+    }
+}
+
+fn valid_v71_shadow_run_id(run_id: &str) -> bool {
+    !run_id.is_empty()
+        && run_id.len() <= 64
+        && run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn latch_v71_shadow(
+    shadow: &mut V71ShadowState,
+    run_id: String,
+    source_sequence: u64,
+    reason: &'static str,
+) {
+    *shadow = V71ShadowState::Latched {
+        run_id,
+        source_sequence,
+        reason,
+    };
+    eprintln!("V71_SHADOW_LATCHED reason={reason}");
+}
+
+async fn v71_shadow_status(state: &Arc<Mutex<EnclaveState>>) -> RuntimeResponse {
+    let state = state.lock().await;
+    match &state.v71_shadow {
+        V71ShadowState::Disabled => RuntimeResponse::V71ShadowStatus {
+            run_id: String::new(),
+            phase: "DISABLED".into(),
+            source_sequence: 0,
+            sequence: 0,
+            consecutive_matches: 0,
+            observed_effects: Vec::new(),
+        },
+        V71ShadowState::Pending {
+            run_id,
+            source_sequence,
+            observations,
+        } => RuntimeResponse::V71ShadowStatus {
+            run_id: run_id.clone(),
+            phase: "PENDING".into(),
+            source_sequence: *source_sequence,
+            sequence: source_sequence.saturating_add(observations.len() as u64),
+            consecutive_matches: 0,
+            observed_effects: observations
+                .iter()
+                .map(|observation| observation.result.effect.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+        },
+        V71ShadowState::Active {
+            run_id,
+            source_sequence,
+            runtime,
+            consecutive_matches,
+            observed_effects,
+            ..
+        } => RuntimeResponse::V71ShadowStatus {
+            run_id: run_id.clone(),
+            phase: "ACTIVE".into(),
+            source_sequence: *source_sequence,
+            sequence: runtime.sequence(),
+            consecutive_matches: *consecutive_matches,
+            observed_effects: observed_effects.iter().cloned().collect(),
+        },
+        V71ShadowState::Latched {
+            run_id,
+            source_sequence,
+            reason,
+        } => RuntimeResponse::V71ShadowStatus {
+            run_id: run_id.clone(),
+            phase: format!("LATCHED:{reason}"),
+            source_sequence: *source_sequence,
+            sequence: *source_sequence,
+            consecutive_matches: 0,
+            observed_effects: Vec::new(),
+        },
+    }
+}
+
+fn build_v71_shadow(
+    source_runtime: DirectRuntime,
+    bundle: layrs_direct_execution_v1::migration::V70MigrationBundle,
+    observations: Vec<V71ShadowObservation>,
+    authoritative: DirectRuntime,
+    run_id: String,
+    state_key: &[u8],
+    signing_key: &[u8],
+    verification_key: &[u8],
+) -> Result<
+    (DirectV71Runtime, SparseRequestTree, u64, BTreeSet<String>),
+    layrs_direct_execution_v1::v71::V71Error,
+> {
+    let mut runtime = DirectV71Runtime::from_v70_migration(
+        source_runtime,
+        &bundle,
+        format!("shadow-{run_id}"),
+        state_key,
+        verification_key,
+    )?;
+    let mut tree = SparseRequestTree::from_leaves(&bundle.leaves)?;
+    let mut effects = BTreeSet::new();
+    for observation in &observations {
+        let proof = tree.proof(
+            &observation.request.account_id,
+            &observation.request.request_id,
+        )?;
+        let candidate = runtime.prepare_candidate(
+            observation.request.clone(),
+            &proof,
+            state_key,
+            signing_key,
+        )?;
+        if candidate.result() != &observation.result {
+            return Err(layrs_direct_execution_v1::v71::V71Error::ShadowMismatch);
+        }
+        let root = tree.insert(candidate.terminal_leaf().clone())?;
+        if root != candidate.record().request_index_root {
+            return Err(layrs_direct_execution_v1::v71::V71Error::ShadowMismatch);
+        }
+        effects.insert(observation.result.effect.clone());
+        runtime.adopt_candidate(candidate)?;
+    }
+    runtime.verify_shadow_head(&authoritative)?;
+    Ok((runtime, tree, observations.len() as u64, effects))
+}
+
+async fn begin_v71_shadow(
+    state: Arc<Mutex<EnclaveState>>,
+    run_id: String,
+) -> RuntimeResponse {
+    if !valid_v71_shadow_run_id(&run_id) {
+        return RuntimeResponse::Error {
+            code: "V71_SHADOW_RUN_ID_INVALID".into(),
+        };
+    }
+    let _transition = transition(&state).await;
+    let (runtime, state_key, source_sequence) = {
+        let mut state = state.lock().await;
+        if !state.recovery_complete
+            || state.v71_runtime.is_some()
+            || state.restore_candidate.is_some()
+            || state.v71_restore_candidate.is_some()
+            || matches!(state.v71_shadow, V71ShadowState::Pending { .. } | V71ShadowState::Active { .. })
+        {
+            return RuntimeResponse::Error {
+                code: "V71_SHADOW_START_UNAVAILABLE".into(),
+            };
+        }
+        let runtime = state.runtime.clone();
+        let source_sequence = runtime.committed_sequence();
+        state.v71_shadow = V71ShadowState::Pending {
+            run_id: run_id.clone(),
+            source_sequence,
+            observations: Vec::new(),
+        };
+        (
+            runtime,
+            zeroize::Zeroizing::new(state.state_key.clone()),
+            source_sequence,
+        )
+    };
+
+    let task_state = Arc::clone(&state);
+    let task_run_id = run_id.clone();
+    tokio::spawn(async move {
+        let sealed = tokio::task::spawn_blocking(move || {
+            let signing_key = derive_journal_signing_key(&state_key).map_err(|_| ())?;
+            let bundle = layrs_direct_execution_v1::migration::V70MigrationBundle::seal(
+                &runtime,
+                &state_key,
+                &signing_key,
+            )
+            .map_err(|_| ())?;
+            Ok::<_, ()>((
+                runtime,
+                state_key,
+                signing_key,
+                bundle,
+            ))
+        })
+        .await;
+        let Ok(Ok((source_runtime, state_key, signing_key, bundle))) = sealed else {
+            let _transition = transition(&task_state).await;
+            let mut state = task_state.lock().await;
+            if matches!(&state.v71_shadow, V71ShadowState::Pending { run_id, source_sequence: sequence, .. }
+                if run_id == &task_run_id && *sequence == source_sequence)
+            {
+                latch_v71_shadow(
+                    &mut state.v71_shadow,
+                    task_run_id,
+                    source_sequence,
+                    "V71_SHADOW_MIGRATION_FAILED",
+                );
+            }
+            return;
+        };
+
+        // This brief gate covers only the small catch-up tail accumulated
+        // while the production-sized migration bundle was sealed.
+        let _transition = transition(&task_state).await;
+        let (observations, authoritative) = {
+            let mut state = task_state.lock().await;
+            let V71ShadowState::Pending {
+                run_id,
+                source_sequence: pending_source,
+                observations,
+            } = &mut state.v71_shadow
+            else {
+                return;
+            };
+            if run_id != &task_run_id || *pending_source != source_sequence {
+                return;
+            }
+            (std::mem::take(observations), state.runtime.clone())
+        };
+        let verification_key = match journal_verifying_key(&signing_key) {
+            Ok(key) => key,
+            Err(_) => {
+                let mut state = task_state.lock().await;
+                latch_v71_shadow(
+                    &mut state.v71_shadow,
+                    task_run_id,
+                    source_sequence,
+                    "V71_SHADOW_KEY_INVALID",
+                );
+                return;
+            }
+        };
+        let build_run_id = task_run_id.clone();
+        let built = tokio::task::spawn_blocking(move || {
+            build_v71_shadow(
+                source_runtime,
+                bundle,
+                observations,
+                authoritative,
+                build_run_id,
+                &state_key,
+                &signing_key,
+                &verification_key,
+            )
+        })
+        .await;
+        let mut state = task_state.lock().await;
+        match built {
+            Ok(Ok((runtime, tree, consecutive_matches, observed_effects))) => {
+                state.v71_shadow = V71ShadowState::Active {
+                    run_id: task_run_id.clone(),
+                    source_sequence,
+                    runtime,
+                    tree,
+                    consecutive_matches,
+                    observed_effects,
+                };
+                eprintln!(
+                    "V71_SHADOW_ACTIVE run_id={} source_sequence={} caught_up={}",
+                    task_run_id, source_sequence, consecutive_matches
+                );
+            }
+            _ => latch_v71_shadow(
+                &mut state.v71_shadow,
+                task_run_id,
+                source_sequence,
+                "V71_SHADOW_CATCH_UP_MISMATCH",
+            ),
+        }
+    });
+
+    RuntimeResponse::V71ShadowStatus {
+        run_id,
+        phase: "PENDING".into(),
+        source_sequence,
+        sequence: source_sequence,
+        consecutive_matches: 0,
+        observed_effects: Vec::new(),
     }
 }
 
@@ -1366,6 +1682,143 @@ async fn transition(state: &Arc<Mutex<EnclaveState>>) -> tokio::sync::OwnedMutex
     gate.lock_owned().await
 }
 
+/// Mirrors one already-adopted v70 transition. Shadow failure is deliberately
+/// isolated: it latches the comparison window but never changes or rejects the
+/// authoritative result.
+async fn observe_v71_shadow_commit(
+    state: &Arc<Mutex<EnclaveState>>,
+    request: DirectRequest,
+    result: DirectResult,
+) {
+    let active = {
+        let mut state = state.lock().await;
+        let authoritative_sequence = state.runtime.committed_sequence();
+        match &mut state.v71_shadow {
+            V71ShadowState::Disabled | V71ShadowState::Latched { .. } => return,
+            V71ShadowState::Pending {
+                run_id,
+                source_sequence,
+                observations,
+            } => {
+                let expected = source_sequence
+                    .checked_add(observations.len() as u64)
+                    .and_then(|sequence| sequence.checked_add(1));
+                if observations.len() >= MAX_V71_SHADOW_CATCH_UP
+                    || expected != Some(authoritative_sequence)
+                {
+                    let run_id = run_id.clone();
+                    let source_sequence = *source_sequence;
+                    latch_v71_shadow(
+                        &mut state.v71_shadow,
+                        run_id,
+                        source_sequence,
+                        "V71_SHADOW_CATCH_UP_OVERFLOW",
+                    );
+                } else {
+                    observations.push(V71ShadowObservation { request, result });
+                }
+                return;
+            }
+            V71ShadowState::Active {
+                run_id,
+                source_sequence,
+                runtime,
+                tree,
+                consecutive_matches,
+                observed_effects,
+            } => Some((
+                run_id.clone(),
+                *source_sequence,
+                runtime.clone(),
+                tree.clone(),
+                *consecutive_matches,
+                observed_effects.clone(),
+                state.runtime.clone(),
+            )),
+        }
+    };
+    let Some((
+        run_id,
+        source_sequence,
+        mut runtime,
+        mut tree,
+        consecutive_matches,
+        mut observed_effects,
+        authoritative,
+    )) = active
+    else {
+        return;
+    };
+    let state_key = {
+        let state = state.lock().await;
+        zeroize::Zeroizing::new(state.state_key.clone())
+    };
+    let signing_key = match derive_journal_signing_key(&state_key) {
+        Ok(key) => zeroize::Zeroizing::new(key),
+        Err(_) => {
+            let mut state = state.lock().await;
+            latch_v71_shadow(
+                &mut state.v71_shadow,
+                run_id,
+                source_sequence,
+                "V71_SHADOW_KEY_INVALID",
+            );
+            return;
+        }
+    };
+    let prior_sequence = runtime.sequence();
+    let advanced = tokio::task::spawn_blocking(move || {
+        let proof = tree.proof(&request.account_id, &request.request_id)?;
+        let candidate = runtime.prepare_candidate(
+            request,
+            &proof,
+            &state_key,
+            signing_key.as_ref(),
+        )?;
+        candidate.verify_shadow_match(&authoritative, &result)?;
+        let root = tree.insert(candidate.terminal_leaf().clone())?;
+        if root != candidate.record().request_index_root {
+            return Err(layrs_direct_execution_v1::v71::V71Error::ShadowMismatch);
+        }
+        observed_effects.insert(result.effect);
+        runtime.adopt_candidate(candidate)?;
+        Ok::<_, layrs_direct_execution_v1::v71::V71Error>((
+            runtime,
+            tree,
+            observed_effects,
+        ))
+    })
+    .await;
+    let mut state = state.lock().await;
+    match advanced {
+        Ok(Ok((runtime, tree, observed_effects)))
+            if matches!(&state.v71_shadow, V71ShadowState::Active { run_id: current, runtime: current_runtime, .. }
+                if current == &run_id && current_runtime.sequence() == prior_sequence) =>
+        {
+            let next_matches = consecutive_matches.saturating_add(1);
+            let sequence = runtime.sequence();
+            state.v71_shadow = V71ShadowState::Active {
+                run_id: run_id.clone(),
+                source_sequence,
+                runtime,
+                tree,
+                consecutive_matches: next_matches,
+                observed_effects,
+            };
+            eprintln!(
+                "V71_SHADOW_MATCH run_id={} sequence={} consecutive_matches={}",
+                run_id, sequence, next_matches
+            );
+        }
+        _ => latch_v71_shadow(
+            &mut state.v71_shadow,
+            run_id,
+            source_sequence,
+            "V71_SHADOW_LIVE_MISMATCH",
+        ),
+    }
+}
+
 /// Only the transition gate spans preparation and the immutable-storage ACK.
 /// Readers see the last committed state; the candidate is never exposed before
 /// the exact HMAC-bound acknowledgement and all adoption checks succeed.
@@ -1378,6 +1831,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let _transition = transition(&state).await;
+    let shadow_request = request.clone();
     let (mut runtime, state_key, commit_ack_key) = {
         let committed = state.lock().await;
         if !committed.recovery_complete
@@ -1426,6 +1880,7 @@ where
             let previous = { let mut committed = state.lock().await;
                 std::mem::replace(&mut committed.runtime, runtime) };
             drop(previous);
+            observe_v71_shadow_commit(&state, shadow_request, result.clone()).await;
         },
         Err(error) => return write_response(stream, RuntimeResponse::Error { code: error.to_string() }).await,
     }
@@ -1918,6 +2373,7 @@ mod tests {
             runtime: DirectRuntime::new(epoch.clone(), mode, receipt_key.clone()).unwrap(),
             v71_runtime: None,
             v71_writer_eligible: false,
+            v71_shadow: V71ShadowState::Disabled,
             epoch,
             mode,
             receipt_key,
@@ -1942,6 +2398,7 @@ mod tests {
             runtime: DirectRuntime::new(epoch.clone(), RuntimeMode::Dormant, vec![0; 32]).unwrap(),
             v71_runtime: None,
             v71_writer_eligible: false,
+            v71_shadow: V71ShadowState::Disabled,
             epoch,
             mode: RuntimeMode::Dormant,
             receipt_key: vec![0; 32],
@@ -2781,6 +3238,168 @@ mod tests {
         response
     }
 
+    fn shadow_admission(seed: char, request_id: &str) -> DirectRequest {
+        let subject = seed.to_string().repeat(64);
+        let wallet = format!("0x{}", seed.to_string().repeat(40));
+        request_for(
+            &subject,
+            &identity_commitment_for(&subject, &wallet),
+            request_id,
+            DirectAction::AdmitIdentity {
+                wallet_address: wallet,
+            },
+        )
+    }
+
+    #[test]
+    fn v71_shadow_catch_up_replays_every_observation_and_matches_final_v70_head() {
+        let epoch = SealedEpoch::load(epoch_path()).unwrap();
+        let mut source =
+            DirectRuntime::new(epoch, RuntimeMode::IsolatedTest, vec![7; 32]).unwrap();
+        source
+            .execute(shadow_admission('a', "shadow-source"))
+            .unwrap();
+        let signing_key = derive_journal_signing_key(&[8; 32]).unwrap();
+        let verification_key = journal_verifying_key(&signing_key).unwrap();
+        let bundle = layrs_direct_execution_v1::migration::V70MigrationBundle::seal(
+            &source,
+            &[8; 32],
+            &signing_key,
+        )
+        .unwrap();
+        let mut authoritative = source.clone();
+        let observations = ['b', 'c']
+            .into_iter()
+            .enumerate()
+            .map(|(index, seed)| {
+                let request = shadow_admission(seed, &format!("shadow-catch-up-{index}"));
+                let result = authoritative.execute(request.clone()).unwrap();
+                V71ShadowObservation { request, result }
+            })
+            .collect::<Vec<_>>();
+        let (runtime, tree, matched, effects) = build_v71_shadow(
+            source.clone(),
+            bundle.clone(),
+            observations.clone(),
+            authoritative.clone(),
+            "run-catch-up".into(),
+            &[8; 32],
+            &signing_key,
+            &verification_key,
+        )
+        .unwrap();
+        assert_eq!(runtime.sequence(), 3);
+        assert_eq!(tree.root().unwrap(), runtime.request_index_root());
+        assert_eq!(matched, 2);
+        assert_eq!(effects, BTreeSet::from(["IDENTITY_ADMITTED".into()]));
+
+        let mut tampered = observations;
+        tampered[0].result.effect = "TAMPERED".into();
+        assert!(build_v71_shadow(
+            source,
+            bundle,
+            tampered,
+            authoritative,
+            "run-catch-up".into(),
+            &[8; 32],
+            &signing_key,
+            &verification_key,
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn v71_shadow_starts_without_blocking_v70_and_latches_only_its_own_mismatch() {
+        let state = state();
+        {
+            let mut committed = state.lock().await;
+            committed.recovery_complete = true;
+            committed
+                .runtime
+                .execute(shadow_admission('a', "shadow-source"))
+                .unwrap();
+        }
+        assert!(matches!(
+            begin_v71_shadow(Arc::clone(&state), "run-1".into()).await,
+            RuntimeResponse::V71ShadowStatus {
+                phase,
+                source_sequence: 1,
+                ..
+            } if phase == "PENDING"
+        ));
+        let active = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let status = v71_shadow_status(&state).await;
+                if matches!(&status, RuntimeResponse::V71ShadowStatus { phase, .. } if phase == "ACTIVE") {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            active,
+            RuntimeResponse::V71ShadowStatus {
+                source_sequence: 1,
+                sequence: 1,
+                consecutive_matches: 0,
+                ..
+            }
+        ));
+
+        let request = shadow_admission('b', "shadow-live-1");
+        let result = state.lock().await.runtime.execute(request.clone()).unwrap();
+        observe_v71_shadow_commit(&state, request, result).await;
+        assert!(matches!(
+            v71_shadow_status(&state).await,
+            RuntimeResponse::V71ShadowStatus {
+                phase,
+                sequence: 2,
+                consecutive_matches: 1,
+                observed_effects,
+                ..
+            } if phase == "ACTIVE" && observed_effects == vec!["IDENTITY_ADMITTED".to_string()]
+        ));
+
+        let request = shadow_admission('c', "shadow-live-2");
+        let mut wrong = state.lock().await.runtime.execute(request.clone()).unwrap();
+        wrong.effect = "TAMPERED".into();
+        observe_v71_shadow_commit(&state, request, wrong).await;
+        assert!(matches!(
+            v71_shadow_status(&state).await,
+            RuntimeResponse::V71ShadowStatus { phase, consecutive_matches: 0, .. }
+                if phase == "LATCHED:V71_SHADOW_LIVE_MISMATCH"
+        ));
+        assert_eq!(state.lock().await.runtime.committed_sequence(), 3);
+    }
+
+    #[tokio::test]
+    async fn v71_shadow_rejects_invalid_or_parallel_runs_without_changing_v70() {
+        let state = state();
+        state.lock().await.recovery_complete = true;
+        for run_id in [
+            String::new(),
+            "UPPER".into(),
+            "slash/run".into(),
+            "a".repeat(65),
+        ] {
+            assert!(matches!(
+                begin_v71_shadow(Arc::clone(&state), run_id).await,
+                RuntimeResponse::Error { code } if code == "V71_SHADOW_RUN_ID_INVALID"
+            ));
+        }
+        assert!(matches!(
+            begin_v71_shadow(Arc::clone(&state), "run-2".into()).await,
+            RuntimeResponse::V71ShadowStatus { .. }
+        ));
+        assert!(matches!(
+            begin_v71_shadow(Arc::clone(&state), "run-3".into()).await,
+            RuntimeResponse::Error { code } if code == "V71_SHADOW_START_UNAVAILABLE"
+        ));
+        assert_eq!(state.lock().await.runtime.committed_sequence(), 0);
+    }
+
     #[tokio::test]
     async fn isolated_bootstrap_is_idempotent_only_for_the_same_keys() {
         let epoch = SealedEpoch::load(epoch_path()).unwrap();
@@ -2790,6 +3409,7 @@ mod tests {
             runtime: DirectRuntime::new(epoch.clone(), RuntimeMode::Dormant, vec![0; 32]).unwrap(),
             v71_runtime: None,
             v71_writer_eligible: false,
+            v71_shadow: V71ShadowState::Disabled,
             epoch,
             mode: RuntimeMode::Dormant,
             receipt_key: vec![0; 32],
