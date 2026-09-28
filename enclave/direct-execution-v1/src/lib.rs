@@ -3718,6 +3718,24 @@ pub enum RuntimeRequest {
     JournalDurabilityAck {
         ack: journal::JournalDurabilityAck,
     },
+    BeginJournalRestore {
+        checkpoint: v71_checkpoint::DirectV71Checkpoint,
+    },
+    AppendJournalRestore {
+        record: journal::DirectJournalRecord,
+    },
+    FinishJournalRestore {
+        expected_sequence: u64,
+        expected_record_hash: String,
+        expected_transition_root: String,
+        expected_request_index_root: String,
+        expected_financial_state_root: String,
+    },
+    SealJournalCheckpoint,
+    SealV70Migration,
+    ActivateV71Migration {
+        bundle: migration::V70MigrationBundle,
+    },
     /// Startup-only handoff of immutable encrypted artifacts from the parent.
     /// The enclave reconstructs and verifies private state itself; PostgreSQL
     /// is never part of this input.
@@ -3778,6 +3796,36 @@ pub enum RuntimeResponse {
     JournalCandidate {
         record: journal::DirectJournalRecord,
         terminal_leaf: request_index::TerminalRequestLeaf,
+    },
+    JournalRestoreProgress {
+        sequence: u64,
+        record_hash: String,
+        transition_root: String,
+        request_index_root: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receipt: Option<DirectReceipt>,
+    },
+    JournalRestoreComplete {
+        writer_epoch: String,
+        sequence: u64,
+        record_hash: String,
+        transition_root: String,
+        request_index_root: String,
+        financial_state_root: String,
+    },
+    JournalCheckpointSealed {
+        checkpoint: v71_checkpoint::DirectV71Checkpoint,
+    },
+    V70MigrationSealed {
+        bundle: migration::V70MigrationBundle,
+    },
+    V71MigrationActivated {
+        writer_epoch: String,
+        sequence: u64,
+        record_hash: String,
+        transition_root: String,
+        request_index_root: String,
+        financial_state_root: String,
     },
     RecoveryComplete {
         recovered_sequence: u64,

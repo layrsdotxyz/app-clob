@@ -45,6 +45,7 @@ struct EnclaveState {
     commit_ack_key: Vec<u8>,
     recovery_complete: bool,
     restore_candidate: Option<DirectRuntime>,
+    v71_restore_candidate: Option<DirectV71Runtime>,
     committed_restore_frontier: Option<layrs_direct_execution_v1::CommittedRestoreFrontier>,
     pending_governed_bootstrap: Option<PendingGovernedBootstrap>,
     writer_grant_commitment: Option<String>,
@@ -99,6 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         commit_ack_key,
         recovery_complete: false,
         restore_candidate: None,
+        v71_restore_candidate: None,
         committed_restore_frontier: None,
         pending_governed_bootstrap: None,
         writer_grant_commitment: None,
@@ -182,6 +184,36 @@ where
         RuntimeRequest::JournalDurabilityAck { .. } => RuntimeResponse::Error {
             code: "UNEXPECTED_JOURNAL_DURABILITY_ACK".into(),
         },
+        RuntimeRequest::BeginJournalRestore { checkpoint } => {
+            begin_journal_restore(state, checkpoint).await
+        }
+        RuntimeRequest::AppendJournalRestore { record } => {
+            append_journal_restore(state, record).await
+        }
+        RuntimeRequest::FinishJournalRestore {
+            expected_sequence,
+            expected_record_hash,
+            expected_transition_root,
+            expected_request_index_root,
+            expected_financial_state_root,
+        } => {
+            finish_journal_restore(
+                state,
+                expected_sequence,
+                expected_record_hash,
+                expected_transition_root,
+                expected_request_index_root,
+                expected_financial_state_root,
+            )
+            .await
+        }
+        RuntimeRequest::SealJournalCheckpoint => {
+            seal_journal_checkpoint(state).await
+        }
+        RuntimeRequest::SealV70Migration => seal_v70_migration(state).await,
+        RuntimeRequest::ActivateV71Migration { bundle } => {
+            activate_v71_migration(state, bundle).await
+        }
         RuntimeRequest::RecoverCommitted { artifacts } => recover_committed(state, artifacts).await,
         RuntimeRequest::BeginCommittedRestore => begin_committed_restore(state).await,
         RuntimeRequest::BeginCheckpointRestore { checkpoint } => begin_checkpoint_restore(state, checkpoint).await,
@@ -597,6 +629,11 @@ async fn recover_committed(
 ) -> RuntimeResponse {
     let _transition = transition(&state).await;
     let mut state = state.lock().await;
+    if state.v71_runtime.is_some() || state.v71_restore_candidate.is_some() {
+        return RuntimeResponse::Error {
+            code: "JOURNAL_FORMAT_MISMATCH".into(),
+        };
+    }
     if state.committed_restore_frontier.as_ref().is_some_and(|frontier| !artifacts.iter().any(|artifact|
         artifact.sequence == frontier.sequence && artifact.state_hash == frontier.state_hash
         && layrs_direct_execution_v1::artifact_hash(artifact) == frontier.artifact_hash)) {
@@ -651,7 +688,12 @@ async fn recover_committed(
 async fn begin_committed_restore(state: Arc<Mutex<EnclaveState>>) -> RuntimeResponse {
     let _transition = transition(&state).await;
     let mut state=state.lock().await;
-    if state.restore_candidate.is_some() { return RuntimeResponse::Error {code:"RESTORE_ALREADY_IN_PROGRESS".into()}; }
+    if state.restore_candidate.is_some() || state.v71_restore_candidate.is_some() {
+        return RuntimeResponse::Error {code:"RESTORE_ALREADY_IN_PROGRESS".into()};
+    }
+    if state.v71_runtime.is_some() {
+        return RuntimeResponse::Error { code: "JOURNAL_FORMAT_MISMATCH".into() };
+    }
     match DirectRuntime::new(state.epoch.clone(),state.mode,state.receipt_key.clone()) {
         Ok(runtime)=>{let response=RuntimeResponse::RestoreProgress {recovered_sequence:0,recovered_state_hash:runtime.committed_state_hash()};state.restore_candidate=Some(runtime);response},
         Err(_)=>RuntimeResponse::Error {code:"RESTORE_BEGIN_FAILED".into()},
@@ -674,8 +716,11 @@ async fn append_committed_restore(state: Arc<Mutex<EnclaveState>>,artifact:layrs
 async fn begin_checkpoint_restore(state: Arc<Mutex<EnclaveState>>, checkpoint: layrs_direct_execution_v1::DirectCheckpoint) -> RuntimeResponse {
     let _transition = transition(&state).await;
     let mut state = state.lock().await;
-    if state.restore_candidate.is_some() {
+    if state.restore_candidate.is_some() || state.v71_restore_candidate.is_some() {
         return RuntimeResponse::Error { code: "CHECKPOINT_RESTORE_STARTUP_ONLY".into() };
+    }
+    if state.v71_runtime.is_some() {
+        return RuntimeResponse::Error { code: "JOURNAL_FORMAT_MISMATCH".into() };
     }
     if state.committed_restore_frontier.as_ref().is_some_and(|frontier| !frontier.accepts_checkpoint(&checkpoint)) {
         return RuntimeResponse::Error { code: "CHECKPOINT_BELOW_GOVERNED_FRONTIER".into() };
@@ -703,11 +748,370 @@ async fn finish_committed_restore(state: Arc<Mutex<EnclaveState>>,expected_seque
     RuntimeResponse::RecoveryComplete {recovered_sequence:expected_sequence,recovered_state_hash:expected_state_hash}
 }
 
+async fn begin_journal_restore(
+    state: Arc<Mutex<EnclaveState>>,
+    checkpoint: layrs_direct_execution_v1::v71_checkpoint::DirectV71Checkpoint,
+) -> RuntimeResponse {
+    let _transition = transition(&state).await;
+    let mut state = state.lock().await;
+    if state.restore_candidate.is_some() || state.v71_restore_candidate.is_some() {
+        return RuntimeResponse::Error {
+            code: "RESTORE_ALREADY_IN_PROGRESS".into(),
+        };
+    }
+    let signing_key = match derive_journal_signing_key(&state.state_key) {
+        Ok(key) => key,
+        Err(_) => {
+            return RuntimeResponse::Error {
+                code: "JOURNAL_KEY_INVALID".into(),
+            }
+        }
+    };
+    let verification_key = match journal_verifying_key(&signing_key) {
+        Ok(key) => key,
+        Err(_) => {
+            return RuntimeResponse::Error {
+                code: "JOURNAL_KEY_INVALID".into(),
+            }
+        }
+    };
+    let restored = DirectRuntime::new(state.epoch.clone(), state.mode, state.receipt_key.clone())
+        .map_err(|_| ())
+        .and_then(|runtime| {
+            DirectV71Runtime::restore_checkpoint(
+                runtime,
+                &checkpoint,
+                &state.state_key,
+                &verification_key,
+            )
+            .map_err(|_| ())
+        });
+    match restored {
+        Ok(candidate) => {
+            let response = RuntimeResponse::JournalRestoreProgress {
+                sequence: candidate.sequence(),
+                record_hash: candidate.record_hash().into(),
+                transition_root: candidate.transition_root().into(),
+                request_index_root: candidate.request_index_root().into(),
+                receipt: None,
+            };
+            state.v71_restore_candidate = Some(candidate);
+            response
+        }
+        Err(_) => RuntimeResponse::Error {
+            code: "JOURNAL_CHECKPOINT_AUTHENTICATION_FAILED".into(),
+        },
+    }
+}
+
+async fn seal_v70_migration(state: Arc<Mutex<EnclaveState>>) -> RuntimeResponse {
+    let snapshot = {
+        let state = state.lock().await;
+        if !state.recovery_complete
+            || state.v71_runtime.is_some()
+            || state.restore_candidate.is_some()
+            || state.v71_restore_candidate.is_some()
+        {
+            None
+        } else {
+            Some((
+                state.runtime.clone(),
+                zeroize::Zeroizing::new(state.state_key.clone()),
+            ))
+        }
+    };
+    let Some((runtime, state_key)) = snapshot else {
+        return RuntimeResponse::Error {
+            code: "V70_MIGRATION_REQUIRES_VERIFIED_HEAD".into(),
+        };
+    };
+    let signing_key = match derive_journal_signing_key(&state_key) {
+        Ok(key) => zeroize::Zeroizing::new(key),
+        Err(_) => {
+            return RuntimeResponse::Error {
+                code: "JOURNAL_KEY_INVALID".into(),
+            }
+        }
+    };
+    match tokio::task::spawn_blocking(move || {
+        layrs_direct_execution_v1::migration::V70MigrationBundle::seal(
+            &runtime,
+            &state_key,
+            signing_key.as_ref(),
+        )
+    })
+    .await
+    {
+        Ok(Ok(bundle)) => RuntimeResponse::V70MigrationSealed { bundle },
+        _ => RuntimeResponse::Error {
+            code: "V70_MIGRATION_SEAL_FAILED".into(),
+        },
+    }
+}
+
+async fn activate_v71_migration(
+    state: Arc<Mutex<EnclaveState>>,
+    bundle: layrs_direct_execution_v1::migration::V70MigrationBundle,
+) -> RuntimeResponse {
+    let _transition = transition(&state).await;
+    // Hold only the transition gate while authenticating the potentially
+    // large migration bundle. Read-only portfolio/status calls continue to
+    // observe the verified v70 head until the final constant-time swap.
+    let (runtime, state_key, writer_epoch) = {
+        let state = state.lock().await;
+        if !state.recovery_complete
+            || state.v71_runtime.is_some()
+            || state.restore_candidate.is_some()
+            || state.v71_restore_candidate.is_some()
+        {
+            return RuntimeResponse::Error {
+                code: "V71_MIGRATION_ACTIVATION_UNAVAILABLE".into(),
+            };
+        }
+        let writer_epoch = if state.mode == RuntimeMode::IsolatedTest {
+            "isolated-writer-1".to_string()
+        } else {
+            match state.writer_grant_commitment.clone() {
+                Some(epoch) => epoch,
+                None => {
+                    return RuntimeResponse::Error {
+                        code: "V71_WRITER_EPOCH_UNAUTHORIZED".into(),
+                    }
+                }
+            }
+        };
+        (
+            state.runtime.clone(),
+            zeroize::Zeroizing::new(state.state_key.clone()),
+            writer_epoch,
+        )
+    };
+    let signing_key = match derive_journal_signing_key(&state_key) {
+        Ok(key) => key,
+        Err(_) => {
+            return RuntimeResponse::Error {
+                code: "JOURNAL_KEY_INVALID".into(),
+            }
+        }
+    };
+    let verification_key = match journal_verifying_key(&signing_key) {
+        Ok(key) => key,
+        Err(_) => {
+            return RuntimeResponse::Error {
+                code: "JOURNAL_KEY_INVALID".into(),
+            }
+        }
+    };
+    let migrated = tokio::task::spawn_blocking(move || {
+        DirectV71Runtime::from_v70_migration(
+            runtime,
+            &bundle,
+            writer_epoch,
+            &state_key,
+            &verification_key,
+        )
+    })
+    .await;
+    let runtime = match migrated {
+        Ok(Ok(runtime)) => runtime,
+        _ => {
+            return RuntimeResponse::Error {
+                code: "V71_MIGRATION_AUTHENTICATION_FAILED".into(),
+            }
+        }
+    };
+    let financial_state_root = match runtime.financial_state_root() {
+        Ok(root) => root,
+        Err(_) => {
+            return RuntimeResponse::Error {
+                code: "V71_MIGRATION_STATE_INVALID".into(),
+            }
+        }
+    };
+    let response = RuntimeResponse::V71MigrationActivated {
+        writer_epoch: runtime.writer_epoch().into(),
+        sequence: runtime.sequence(),
+        record_hash: runtime.record_hash().into(),
+        transition_root: runtime.transition_root().into(),
+        request_index_root: runtime.request_index_root().into(),
+        financial_state_root,
+    };
+    let mut state = state.lock().await;
+    if !state.recovery_complete
+        || state.v71_runtime.is_some()
+        || state.restore_candidate.is_some()
+        || state.v71_restore_candidate.is_some()
+    {
+        return RuntimeResponse::Error {
+            code: "V71_MIGRATION_ACTIVATION_UNAVAILABLE".into(),
+        };
+    }
+    state.runtime = runtime.financial_runtime().clone();
+    state.v71_runtime = Some(runtime);
+    response
+}
+
+async fn append_journal_restore(
+    state: Arc<Mutex<EnclaveState>>,
+    record: layrs_direct_execution_v1::journal::DirectJournalRecord,
+) -> RuntimeResponse {
+    let _transition = transition(&state).await;
+    let mut state = state.lock().await;
+    let Some(candidate) = state.v71_restore_candidate.take() else {
+        return RuntimeResponse::Error {
+            code: "JOURNAL_RESTORE_NOT_STARTED".into(),
+        };
+    };
+    let signing_key = match derive_journal_signing_key(&state.state_key) {
+        Ok(key) => key,
+        Err(_) => {
+            return RuntimeResponse::Error {
+                code: "JOURNAL_KEY_INVALID".into(),
+            }
+        }
+    };
+    let verification_key = match journal_verifying_key(&signing_key) {
+        Ok(key) => key,
+        Err(_) => {
+            return RuntimeResponse::Error {
+                code: "JOURNAL_KEY_INVALID".into(),
+            }
+        }
+    };
+    match candidate.restore_next_with_result(&record, &state.state_key, &verification_key) {
+        Ok((candidate, result)) => {
+            let response = RuntimeResponse::JournalRestoreProgress {
+                sequence: candidate.sequence(),
+                record_hash: candidate.record_hash().into(),
+                transition_root: candidate.transition_root().into(),
+                request_index_root: candidate.request_index_root().into(),
+                receipt: Some(result.receipt),
+            };
+            state.v71_restore_candidate = Some(candidate);
+            response
+        }
+        Err(_) => RuntimeResponse::Error {
+            code: "JOURNAL_SUCCESSOR_INVALID".into(),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_journal_restore(
+    state: Arc<Mutex<EnclaveState>>,
+    expected_sequence: u64,
+    expected_record_hash: String,
+    expected_transition_root: String,
+    expected_request_index_root: String,
+    expected_financial_state_root: String,
+) -> RuntimeResponse {
+    let _transition = transition(&state).await;
+    let mut state = state.lock().await;
+    let Some(candidate) = state.v71_restore_candidate.take() else {
+        return RuntimeResponse::Error {
+            code: "JOURNAL_RESTORE_NOT_STARTED".into(),
+        };
+    };
+    let financial_state_root = match candidate.financial_state_root() {
+        Ok(root) => root,
+        Err(_) => {
+            return RuntimeResponse::Error {
+                code: "JOURNAL_RESTORE_FINAL_HEAD_MISMATCH".into(),
+            }
+        }
+    };
+    if candidate.sequence() != expected_sequence
+        || candidate.record_hash() != expected_record_hash
+        || candidate.transition_root() != expected_transition_root
+        || candidate.request_index_root() != expected_request_index_root
+        || financial_state_root != expected_financial_state_root
+    {
+        return RuntimeResponse::Error {
+            code: "JOURNAL_RESTORE_FINAL_HEAD_MISMATCH".into(),
+        };
+    }
+    if let Some(current) = &state.v71_runtime {
+        if current.sequence() != candidate.sequence()
+            || current.record_hash() != candidate.record_hash()
+            || current.transition_root() != candidate.transition_root()
+            || current.request_index_root() != candidate.request_index_root()
+            || current.financial_state_root().ok().as_deref()
+                != Some(financial_state_root.as_str())
+        {
+            return RuntimeResponse::Error {
+                code: "JOURNAL_STATE_RECOVERY_MISMATCH".into(),
+            };
+        }
+    }
+    state.runtime = candidate.financial_runtime().clone();
+    state.v71_runtime = Some(candidate);
+    state.recovery_complete = true;
+    RuntimeResponse::JournalRestoreComplete {
+        writer_epoch: state
+            .v71_runtime
+            .as_ref()
+            .expect("journal runtime was installed")
+            .writer_epoch()
+            .into(),
+        sequence: expected_sequence,
+        record_hash: expected_record_hash,
+        transition_root: expected_transition_root,
+        request_index_root: expected_request_index_root,
+        financial_state_root,
+    }
+}
+
+async fn seal_journal_checkpoint(state: Arc<Mutex<EnclaveState>>) -> RuntimeResponse {
+    let snapshot = {
+        let state = state.lock().await;
+        if !state.recovery_complete
+            || state.restore_candidate.is_some()
+            || state.v71_restore_candidate.is_some()
+        {
+            None
+        } else {
+            state.v71_runtime.clone().map(|runtime| {
+                (
+                    runtime,
+                    zeroize::Zeroizing::new(state.state_key.clone()),
+                )
+            })
+        }
+    };
+    let Some((runtime, state_key)) = snapshot else {
+        return RuntimeResponse::Error {
+            code: "JOURNAL_CHECKPOINT_REQUIRES_VERIFIED_HEAD".into(),
+        };
+    };
+    let signing_key = match derive_journal_signing_key(&state_key) {
+        Ok(key) => zeroize::Zeroizing::new(key),
+        Err(_) => {
+            return RuntimeResponse::Error {
+                code: "JOURNAL_KEY_INVALID".into(),
+            }
+        }
+    };
+    match tokio::task::spawn_blocking(move || {
+        runtime.seal_checkpoint(&state_key, signing_key.as_ref())
+    })
+    .await
+    {
+        Ok(Ok(checkpoint)) => RuntimeResponse::JournalCheckpointSealed { checkpoint },
+        _ => RuntimeResponse::Error {
+            code: "JOURNAL_CHECKPOINT_HEAD_INVALID".into(),
+        },
+    }
+}
+
 async fn seal_checkpoint_with<F>(state: &Arc<Mutex<EnclaveState>>, seal: F) -> RuntimeResponse
 where F: FnOnce(&DirectRuntime, &[u8]) -> Result<layrs_direct_execution_v1::DirectCheckpoint, layrs_direct_execution_v1::RuntimeError> + Send + 'static {
     let snapshot = {
         let committed = state.lock().await;
-        if !committed.recovery_complete || committed.restore_candidate.is_some() { None }
+        if !committed.recovery_complete
+            || committed.restore_candidate.is_some()
+            || committed.v71_restore_candidate.is_some()
+            || committed.v71_runtime.is_some()
+        { None }
         else { Some((committed.runtime.clone(), zeroize::Zeroizing::new(committed.state_key.clone()))) }
     };
     match snapshot {
@@ -763,7 +1167,10 @@ where
     let _transition = transition(&state).await;
     let (mut runtime, state_key, commit_ack_key) = {
         let committed = state.lock().await;
-        if !committed.recovery_complete || committed.restore_candidate.is_some() {
+        if !committed.recovery_complete
+            || committed.restore_candidate.is_some()
+            || committed.v71_restore_candidate.is_some()
+        {
             drop(committed);
             return write_response(stream, RuntimeResponse::Error { code: "DIRECT_STATE_RECOVERY_REQUIRED".into() }).await;
         }
@@ -825,7 +1232,10 @@ where
     let _transition = transition(&state).await;
     let (mut runtime, state_key, commit_ack_key, signing_key) = {
         let committed = state.lock().await;
-        if !committed.recovery_complete || committed.restore_candidate.is_some() {
+        if !committed.recovery_complete
+            || committed.restore_candidate.is_some()
+            || committed.v71_restore_candidate.is_some()
+        {
             drop(committed);
             return write_response(
                 stream,
@@ -1252,6 +1662,7 @@ mod tests {
             commit_ack_key: vec![9; 32],
             recovery_complete: false,
             restore_candidate: None,
+            v71_restore_candidate: None,
             committed_restore_frontier: None,
             pending_governed_bootstrap: None,
             writer_grant_commitment: None,
@@ -1273,6 +1684,7 @@ mod tests {
             commit_ack_key: vec![0; 32],
             recovery_complete: false,
             restore_candidate: None,
+            v71_restore_candidate: None,
             committed_restore_frontier: None,
             pending_governed_bootstrap: None,
             writer_grant_commitment: None,
@@ -1735,6 +2147,160 @@ mod tests {
         assert_eq!(retry, first);
         assert!(matches!(terminal, RuntimeResponse::Execute { .. }));
     }
+
+    #[tokio::test]
+    async fn journal_checkpoint_plus_tail_restores_exact_head_before_adoption() {
+        let live = state();
+        activate_empty_journal(&live).await;
+        let sealed = runtime_response(Arc::clone(&live), RuntimeRequest::SealJournalCheckpoint).await;
+        let RuntimeResponse::JournalCheckpointSealed { checkpoint } = sealed else {
+            panic!("journal checkpoint was not sealed");
+        };
+        let command = request("journal-restored-tail");
+        let proof = layrs_direct_execution_v1::request_index::SparseRequestProof::empty_tree();
+        let (terminal, record, _) =
+            commit_journal_through_parent_callback(Arc::clone(&live), command, proof).await;
+        assert!(matches!(terminal, RuntimeResponse::Execute { .. }));
+        let (sequence, record_hash, transition_root, request_index_root, financial_state_root) = {
+            let state = live.lock().await;
+            let runtime = state.v71_runtime.as_ref().unwrap();
+            (
+                runtime.sequence(),
+                runtime.record_hash().to_string(),
+                runtime.transition_root().to_string(),
+                runtime.request_index_root().to_string(),
+                runtime.financial_state_root().unwrap(),
+            )
+        };
+
+        let restarted = state();
+        assert!(matches!(
+            runtime_response(
+                Arc::clone(&restarted),
+                RuntimeRequest::BeginJournalRestore { checkpoint }
+            )
+            .await,
+            RuntimeResponse::JournalRestoreProgress { sequence: 0, receipt: None, .. }
+        ));
+        assert!(matches!(
+            runtime_response(
+                Arc::clone(&restarted),
+                RuntimeRequest::AppendJournalRestore { record }
+            )
+            .await,
+            RuntimeResponse::JournalRestoreProgress { sequence: 1, receipt: Some(_), .. }
+        ));
+        let complete = runtime_response(
+            Arc::clone(&restarted),
+            RuntimeRequest::FinishJournalRestore {
+                expected_sequence: sequence,
+                expected_record_hash: record_hash,
+                expected_transition_root: transition_root,
+                expected_request_index_root: request_index_root,
+                expected_financial_state_root: financial_state_root,
+            },
+        )
+        .await;
+        assert!(matches!(
+            complete,
+            RuntimeResponse::JournalRestoreComplete { sequence: 1, .. }
+        ));
+        let restarted = restarted.lock().await;
+        assert!(restarted.recovery_complete);
+        assert_eq!(restarted.v71_runtime.as_ref().unwrap().sequence(), 1);
+    }
+
+    #[tokio::test]
+    async fn v70_migration_rejects_tampering_then_activates_and_replays_exact_result() {
+        let live = state();
+        recover(Arc::clone(&live), Vec::new()).await;
+        let subject = "a".repeat(64);
+        let wallet = "0x1111111111111111111111111111111111111111";
+        let identity = identity_commitment_for(&subject, wallet);
+        let command = request_for(
+            &subject,
+            &identity,
+            "migration-admission",
+            DirectAction::AdmitIdentity {
+                wallet_address: wallet.into(),
+            },
+        );
+        let store = FilesystemImmutableArtifactStore::new(artifact_dir());
+        let expected =
+            commit_through_parent_callback(Arc::clone(&live), command.clone(), &store).await;
+        assert!(matches!(expected, RuntimeResponse::Execute { .. }));
+        let source = {
+            let state = live.lock().await;
+            (
+                state.runtime.committed_sequence(),
+                state.runtime.committed_state_hash(),
+            )
+        };
+
+        let sealed = runtime_response(Arc::clone(&live), RuntimeRequest::SealV70Migration).await;
+        let RuntimeResponse::V70MigrationSealed { bundle } = sealed else {
+            panic!("v70 migration was not sealed");
+        };
+        assert_eq!(bundle.manifest.source_sequence, source.0);
+        assert_eq!(bundle.manifest.source_state_hash, source.1);
+
+        let mut tampered = bundle.clone();
+        tampered.manifest.signature = "0".repeat(128);
+        assert!(matches!(
+            runtime_response(
+                Arc::clone(&live),
+                RuntimeRequest::ActivateV71Migration { bundle: tampered }
+            )
+            .await,
+            RuntimeResponse::Error { ref code }
+                if code == "V71_MIGRATION_AUTHENTICATION_FAILED"
+        ));
+        {
+            let state = live.lock().await;
+            assert_eq!(state.runtime.committed_sequence(), source.0);
+            assert_eq!(state.runtime.committed_state_hash(), source.1);
+            assert!(state.v71_runtime.is_none());
+        }
+
+        let activated = runtime_response(
+            Arc::clone(&live),
+            RuntimeRequest::ActivateV71Migration {
+                bundle: bundle.clone(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            activated,
+            RuntimeResponse::V71MigrationActivated { sequence: 1, .. }
+        ));
+        {
+            let state = live.lock().await;
+            assert_eq!(state.runtime.committed_sequence(), 0);
+            assert_eq!(state.v71_runtime.as_ref().unwrap().sequence(), 1);
+        }
+
+        let tree = layrs_direct_execution_v1::request_index::SparseRequestTree::from_leaves(
+            &bundle.leaves,
+        )
+        .unwrap();
+        let proof = tree.proof(&command.account_id, &command.request_id).unwrap();
+        let replay = runtime_response(
+            Arc::clone(&live),
+            RuntimeRequest::ExecuteJournal {
+                request: command,
+                request_proof: proof,
+                archived: Some(
+                    layrs_direct_execution_v1::v71::ArchivedTerminalRecord::Migration {
+                        record: bundle.records[0].clone(),
+                    },
+                ),
+            },
+        )
+        .await;
+        assert_eq!(replay, expected);
+        assert_eq!(live.lock().await.v71_runtime.as_ref().unwrap().sequence(), 1);
+    }
+
     async fn execute_without_ack(
         state: Arc<Mutex<EnclaveState>>,
         request: DirectRequest,
@@ -1783,6 +2349,7 @@ mod tests {
             commit_ack_key: Vec::new(),
             recovery_complete: false,
             restore_candidate: None,
+            v71_restore_candidate: None,
             committed_restore_frontier: None,
             pending_governed_bootstrap: None,
             writer_grant_commitment: None,

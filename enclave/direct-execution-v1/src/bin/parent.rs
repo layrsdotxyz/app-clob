@@ -7919,13 +7919,29 @@ mod tests {
             receipt,
         };
         let head = v71_head();
+        let proof = layrs_direct_execution_v1::request_index::SparseRequestProof::empty_tree();
+        let previous_index =
+            layrs_direct_execution_v1::request_index::empty_request_index_root();
+        let leaf = layrs_direct_execution_v1::request_index::TerminalRequestLeaf {
+            account_id: request.account_id.clone(),
+            request_id: request.request_id.clone(),
+            request_hash: request.request_hash.clone(),
+            result_hash: canonical_result_hash(&result).unwrap(),
+            receipt_hash: canonical_receipt_hash(&result).unwrap(),
+            locator: layrs_direct_execution_v1::request_index::TerminalResultLocator::Journal {
+                writer_epoch: head.writer_epoch.clone(),
+                sequence: head.sequence + 1,
+            },
+        };
+        let next_index = proof.insert(&previous_index, &leaf).unwrap();
         let record = DirectJournalRecord::seal(
             &head.writer_epoch,
             head.sequence + 1,
             &head.record_hash,
             &head.transition_root,
-            &"e".repeat(64),
-            &"f".repeat(64),
+            &previous_index,
+            &next_index,
+            proof,
             request,
             result.clone(),
             &[7; 32],

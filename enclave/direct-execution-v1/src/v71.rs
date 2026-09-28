@@ -15,7 +15,8 @@ use crate::{
     },
     sha256,
     v71_checkpoint::{
-        restore_checkpoint, seal_checkpoint, DirectV71Checkpoint, V71CheckpointError,
+        financial_state_root, restore_checkpoint, seal_checkpoint, DirectV71Checkpoint,
+        V71CheckpointError,
     },
     DirectRequest, DirectResult, DirectRuntime, RuntimeError,
 };
@@ -215,6 +216,7 @@ impl DirectV71Runtime {
             &self.transition_root,
             &self.request_index_root,
             &next_request_index_root,
+            request_proof.clone(),
             request,
             result.clone(),
             state_key,
@@ -382,6 +384,73 @@ impl DirectV71Runtime {
         })
     }
 
+    pub fn restore_next(
+        &self,
+        record: &DirectJournalRecord,
+        state_key: &[u8],
+        journal_verification_key: &[u8],
+    ) -> Result<Self, V71Error> {
+        self.restore_next_with_result(record, state_key, journal_verification_key)
+            .map(|(runtime, _)| runtime)
+    }
+
+    pub fn restore_next_with_result(
+        &self,
+        record: &DirectJournalRecord,
+        state_key: &[u8],
+        journal_verification_key: &[u8],
+    ) -> Result<(Self, DirectResult), V71Error> {
+        let payload = record.open_successor(
+            &self.writer_epoch,
+            self.sequence
+                .checked_add(1)
+                .ok_or(V71Error::StaleCandidate)?,
+            &self.record_hash,
+            &self.transition_root,
+            &self.request_index_root,
+            state_key,
+            journal_verification_key,
+            &self.runtime.receipt_key,
+        )?;
+        let mut next_runtime = self.runtime.clone();
+        // Restore replays an already-authenticated transition and must not be
+        // blocked merely because the replacement enclave remains dormant
+        // until the parent proves the exact durable tip. Production command
+        // validation still runs under ProductionEnabled; isolated fixtures
+        // retain their isolated governance rules.
+        let restored_mode = next_runtime.mode;
+        if restored_mode == crate::RuntimeMode::Dormant {
+            next_runtime.mode = crate::RuntimeMode::ProductionEnabled;
+        }
+        let result = next_runtime.execute(payload.request.clone())?;
+        next_runtime.mode = restored_mode;
+        let removed = next_runtime
+            .requests
+            .remove(&(
+                payload.request.account_id.clone(),
+                payload.request.request_id.clone(),
+            ))
+            .ok_or(V71Error::StaleCandidate)?;
+        if removed.0 != payload.request.request_hash
+            || removed.1 != payload.result
+            || result != payload.result
+            || !next_runtime.requests.is_empty()
+        {
+            return Err(V71Error::StaleCandidate);
+        }
+        Ok((
+            Self {
+                runtime: next_runtime,
+                writer_epoch: record.writer_epoch.clone(),
+                sequence: record.sequence,
+                record_hash: record.record_hash()?,
+                transition_root: record.transition_root.clone(),
+                request_index_root: record.request_index_root.clone(),
+            },
+            result,
+        ))
+    }
+
     /// Adoption is called only after the parent has durably appended and read
     /// back the exact journal record. A stale concurrent candidate cannot be
     /// adopted after another head has won.
@@ -409,6 +478,10 @@ impl DirectV71Runtime {
         self.sequence
     }
 
+    pub fn writer_epoch(&self) -> &str {
+        &self.writer_epoch
+    }
+
     pub fn record_hash(&self) -> &str {
         &self.record_hash
     }
@@ -423,6 +496,10 @@ impl DirectV71Runtime {
 
     pub fn financial_runtime(&self) -> &DirectRuntime {
         &self.runtime
+    }
+
+    pub fn financial_state_root(&self) -> Result<String, V71Error> {
+        financial_state_root(&self.runtime).map_err(Into::into)
     }
 }
 
@@ -483,7 +560,8 @@ mod tests {
                 &[8; 32],
             )
             .unwrap();
-        assert!(serde_cbor::to_vec(candidate.record()).unwrap().len() < 32 * 1024);
+        let record_bytes = serde_cbor::to_vec(candidate.record()).unwrap().len();
+        assert!(record_bytes < 64 * 1024, "record bytes: {record_bytes}");
         assert_eq!(runtime.sequence(), 0);
         assert_eq!(runtime.record_hash(), opening_record);
         assert_eq!(runtime.request_index_root(), opening_index);
@@ -578,6 +656,49 @@ mod tests {
             Err(V71Error::StaleCandidate)
         );
         assert_eq!(runtime.sequence(), 1);
+    }
+
+    #[test]
+    fn journal_restore_reexecutes_and_verifies_the_authenticated_index_transition() {
+        let opening = runtime();
+        let request = admission(
+            &"a".repeat(64),
+            "request-1",
+            "0x1111111111111111111111111111111111111111",
+        );
+        let candidate = opening
+            .prepare_candidate(
+                request,
+                &SparseRequestProof::empty_tree(),
+                &[7; 32],
+                &[8; 32],
+            )
+            .unwrap();
+        let record = candidate.record().clone();
+        let mut adopted = opening.clone();
+        adopted.adopt_candidate(candidate).unwrap();
+
+        let restored = opening
+            .restore_next(&record, &[7; 32], &journal_verifying_key(&[8; 32]).unwrap())
+            .unwrap();
+        assert_eq!(restored.sequence(), adopted.sequence());
+        assert_eq!(restored.record_hash(), adopted.record_hash());
+        assert_eq!(restored.transition_root(), adopted.transition_root());
+        assert_eq!(restored.request_index_root(), adopted.request_index_root());
+        assert_eq!(
+            restored.financial_runtime().committed_state_hash(),
+            adopted.financial_runtime().committed_state_hash()
+        );
+
+        let mut changed = record;
+        changed.request_index_root = "d".repeat(64);
+        assert!(opening
+            .restore_next(
+                &changed,
+                &[7; 32],
+                &journal_verifying_key(&[8; 32]).unwrap(),
+            )
+            .is_err());
     }
 
     #[test]

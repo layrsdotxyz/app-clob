@@ -229,6 +229,17 @@ pub(crate) fn restore_checkpoint(
     Ok(runtime)
 }
 
+pub(crate) fn financial_state_root(runtime: &DirectRuntime) -> Result<String, V71CheckpointError> {
+    if !runtime.requests.is_empty() {
+        return Err(V71CheckpointError::Invalid);
+    }
+    let state = V71FinancialState::from_runtime(runtime);
+    state.validate()?;
+    serde_cbor::to_vec(&state)
+        .map(|bytes| sha256(&bytes))
+        .map_err(|_| V71CheckpointError::Invalid)
+}
+
 impl V71FinancialState {
     fn from_runtime(runtime: &DirectRuntime) -> Self {
         Self {

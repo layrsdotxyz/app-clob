@@ -16,8 +16,9 @@ use sha2::Sha256;
 use thiserror::Error;
 
 use crate::{
-    constant_time_eq, request_hash, sha256, sign as hmac_sign, verify_receipt, DirectRequest,
-    DirectResult, EPOCH_ID,
+    constant_time_eq, request_hash,
+    request_index::{SparseRequestProof, TerminalRequestLeaf, TerminalResultLocator},
+    sha256, sign as hmac_sign, verify_receipt, DirectRequest, DirectResult, EPOCH_ID,
 };
 
 pub const DIRECT_JOURNAL_PROTOCOL: &str = "layrs.direct-execution.journal.v71";
@@ -39,6 +40,7 @@ pub enum JournalError {
 pub struct DirectJournalPayload {
     pub request: DirectRequest,
     pub result: DirectResult,
+    pub request_proof: SparseRequestProof,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -110,6 +112,7 @@ impl DirectJournalRecord {
         previous_transition_root: &str,
         previous_request_index_root: &str,
         request_index_root: &str,
+        request_proof: SparseRequestProof,
         request: DirectRequest,
         result: DirectResult,
         state_key: &[u8],
@@ -141,6 +144,26 @@ impl DirectJournalRecord {
         let committed_request_hash = request.request_hash.clone();
         let receipt_hash = canonical_hash(&result.receipt)?;
         let result_hash = canonical_hash(&result)?;
+        let terminal_leaf = TerminalRequestLeaf {
+            account_id: account_id.clone(),
+            request_id: request_id.clone(),
+            request_hash: committed_request_hash.clone(),
+            result_hash: result_hash.clone(),
+            receipt_hash: receipt_hash.clone(),
+            locator: TerminalResultLocator::Journal {
+                writer_epoch: writer_epoch.into(),
+                sequence,
+            },
+        };
+        if request_proof.leaf.is_some()
+            || request_proof
+                .insert(previous_request_index_root, &terminal_leaf)
+                .ok()
+                .as_deref()
+                != Some(request_index_root)
+        {
+            return Err(JournalError::Invalid);
+        }
         let transition_root = transition_root(
             previous_transition_root,
             sequence,
@@ -162,8 +185,12 @@ impl DirectJournalRecord {
             &receipt_hash,
             &result_hash,
         )?;
-        let plaintext = serde_cbor::to_vec(&DirectJournalPayload { request, result })
-            .map_err(|_| JournalError::Invalid)?;
+        let plaintext = serde_cbor::to_vec(&DirectJournalPayload {
+            request,
+            result,
+            request_proof,
+        })
+        .map_err(|_| JournalError::Invalid)?;
         // A writer crash can cause the same sequence to be prepared again
         // against a different predecessor or result.  Bind the nonce to all
         // authenticated metadata and plaintext so those competing candidates
@@ -321,6 +348,17 @@ impl DirectJournalRecord {
             .map_err(|_| JournalError::Decryption)?;
         let payload: DirectJournalPayload =
             serde_cbor::from_slice(&plaintext).map_err(|_| JournalError::Invalid)?;
+        let terminal_leaf = TerminalRequestLeaf {
+            account_id: self.account_id.clone(),
+            request_id: self.request_id.clone(),
+            request_hash: self.request_hash.clone(),
+            result_hash: self.result_hash.clone(),
+            receipt_hash: self.receipt_hash.clone(),
+            locator: TerminalResultLocator::Journal {
+                writer_epoch: self.writer_epoch.clone(),
+                sequence: self.sequence,
+            },
+        };
         if self.nonce != journal_nonce(state_key, &associated_data, &plaintext)?
             || payload.request.account_id != self.account_id
             || payload.request.request_id != self.request_id
@@ -330,6 +368,13 @@ impl DirectJournalRecord {
             || canonical_hash(&payload.result)? != self.result_hash
             || !result_matches_request(&payload.result, &payload.request)
             || !verify_receipt(receipt_key, &payload.result.receipt)
+            || payload.request_proof.leaf.is_some()
+            || payload
+                .request_proof
+                .insert(&self.previous_request_index_root, &terminal_leaf)
+                .ok()
+                .as_deref()
+                != Some(self.request_index_root.as_str())
         {
             return Err(JournalError::Authentication);
         }
@@ -503,8 +548,8 @@ pub fn derive_journal_signing_key(state_key: &[u8]) -> Result<[u8; 32], JournalE
     if state_key.len() != 32 {
         return Err(JournalError::Invalid);
     }
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(state_key)
-        .map_err(|_| JournalError::Invalid)?;
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(state_key).map_err(|_| JournalError::Invalid)?;
     mac.update(b"layrs.direct-execution.journal-signing-key.v1\0");
     mac.update(EPOCH_ID.as_bytes());
     Ok(mac.finalize().into_bytes().into())
@@ -581,15 +626,43 @@ mod tests {
         (request, result)
     }
 
+    fn terminal_leaf(
+        writer_epoch: &str,
+        sequence: u64,
+        request: &DirectRequest,
+        result: &DirectResult,
+    ) -> TerminalRequestLeaf {
+        TerminalRequestLeaf {
+            account_id: request.account_id.clone(),
+            request_id: request.request_id.clone(),
+            request_hash: request.request_hash.clone(),
+            result_hash: canonical_result_hash(result).unwrap(),
+            receipt_hash: canonical_receipt_hash(result).unwrap(),
+            locator: TerminalResultLocator::Journal {
+                writer_epoch: writer_epoch.into(),
+                sequence,
+            },
+        }
+    }
+
     fn record() -> DirectJournalRecord {
         let (request, result) = payload();
+        let proof = SparseRequestProof::empty_tree();
+        let previous_index = crate::request_index::empty_request_index_root();
+        let next_index = proof
+            .insert(
+                &previous_index,
+                &terminal_leaf("writer-epoch-1", 1, &request, &result),
+            )
+            .unwrap();
         DirectJournalRecord::seal(
             "writer-epoch-1",
             1,
             &"a".repeat(64),
             &"b".repeat(64),
-            &"e".repeat(64),
-            &"f".repeat(64),
+            &previous_index,
+            &next_index,
+            proof,
             request,
             result,
             &[7; 32],
@@ -606,14 +679,14 @@ mod tests {
     #[test]
     fn journal_round_trip_is_bounded_and_authenticated() {
         let record = record();
-        assert!(serde_cbor::to_vec(&record).unwrap().len() < 16 * 1024);
+        assert!(serde_cbor::to_vec(&record).unwrap().len() < 64 * 1024);
         let payload = record
             .open_successor(
                 "writer-epoch-1",
                 1,
                 &"a".repeat(64),
                 &"b".repeat(64),
-                &"e".repeat(64),
+                &record.previous_request_index_root,
                 &[7; 32],
                 &journal_public_key(),
                 &[9; 32],
@@ -626,13 +699,22 @@ mod tests {
     #[test]
     fn nonce_is_stable_for_an_identical_record_but_changes_with_the_candidate() {
         let (request, result) = payload();
+        let proof = SparseRequestProof::empty_tree();
+        let previous_index = crate::request_index::empty_request_index_root();
+        let next_index = proof
+            .insert(
+                &previous_index,
+                &terminal_leaf("writer-epoch-1", 1, &request, &result),
+            )
+            .unwrap();
         let first = DirectJournalRecord::seal(
             "writer-epoch-1",
             1,
             &"a".repeat(64),
             &"b".repeat(64),
-            &"e".repeat(64),
-            &"f".repeat(64),
+            &previous_index,
+            &next_index,
+            proof.clone(),
             request.clone(),
             result.clone(),
             &[7; 32],
@@ -645,8 +727,9 @@ mod tests {
             1,
             &"a".repeat(64),
             &"b".repeat(64),
-            &"e".repeat(64),
-            &"f".repeat(64),
+            &previous_index,
+            &next_index,
+            proof.clone(),
             request.clone(),
             result.clone(),
             &[7; 32],
@@ -659,8 +742,9 @@ mod tests {
             1,
             &"c".repeat(64),
             &"d".repeat(64),
-            &"e".repeat(64),
-            &"f".repeat(64),
+            &previous_index,
+            &next_index,
+            proof,
             request,
             result,
             &[7; 32],
@@ -683,7 +767,7 @@ mod tests {
                 2,
                 &"a".repeat(64),
                 &"b".repeat(64),
-                &"e".repeat(64),
+                &record.previous_request_index_root,
                 &[7; 32],
                 &journal_public_key(),
                 &[9; 32],
@@ -696,7 +780,7 @@ mod tests {
                 1,
                 &"d".repeat(64),
                 &"b".repeat(64),
-                &"e".repeat(64),
+                &record.previous_request_index_root,
                 &[7; 32],
                 &journal_public_key(),
                 &[9; 32],
@@ -715,7 +799,7 @@ mod tests {
                 1,
                 &"a".repeat(64),
                 &"b".repeat(64),
-                &"e".repeat(64),
+                &tampered_ciphertext.previous_request_index_root,
                 &[7; 32],
                 &journal_public_key(),
                 &[9; 32],
@@ -730,7 +814,7 @@ mod tests {
                 1,
                 &"a".repeat(64),
                 &"b".repeat(64),
-                &"e".repeat(64),
+                &tampered_signature.previous_request_index_root,
                 &[7; 32],
                 &journal_public_key(),
                 &[9; 32],
@@ -750,13 +834,35 @@ mod tests {
         result.receipt.request_hash = request.request_hash.clone();
         result.receipt.receipt_id = "d".repeat(64);
         result.receipt.signature = receipt_signature(&[9; 32], &result.receipt);
+        let first_leaf = TerminalRequestLeaf {
+            account_id: first.account_id.clone(),
+            request_id: first.request_id.clone(),
+            request_hash: first.request_hash.clone(),
+            result_hash: first.result_hash.clone(),
+            receipt_hash: first.receipt_hash.clone(),
+            locator: TerminalResultLocator::Journal {
+                writer_epoch: first.writer_epoch.clone(),
+                sequence: first.sequence,
+            },
+        };
+        let tree = crate::request_index::SparseRequestTree::from_leaves(&[first_leaf]).unwrap();
+        let proof = tree
+            .proof(&request.account_id, &request.request_id)
+            .unwrap();
+        let next_index = proof
+            .insert(
+                &first.request_index_root,
+                &terminal_leaf("writer-epoch-1", 2, &request, &result),
+            )
+            .unwrap();
         let second = DirectJournalRecord::seal(
             "writer-epoch-1",
             2,
             &first.record_hash().unwrap(),
             &first.transition_root,
             &first.request_index_root,
-            &"1".repeat(64),
+            &next_index,
+            proof,
             request,
             result,
             &[7; 32],
