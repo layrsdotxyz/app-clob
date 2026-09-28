@@ -162,6 +162,23 @@ struct AppState {
     committed_state_root: Arc<Mutex<Option<String>>>,
     unresolved_external_effects: Arc<Mutex<BTreeMap<String, ExternalEffectIntent>>>,
     governed_bootstrap: Option<GovernedBootstrapConfig>,
+    persistence_format: PersistenceFormat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistenceFormat {
+    V70,
+    V71,
+}
+
+impl PersistenceFormat {
+    fn parse(value: Option<&str>) -> Result<Self, &'static str> {
+        match value {
+            None | Some("v70") => Ok(Self::V70),
+            Some("v71") => Ok(Self::V71),
+            Some(_) => Err("invalid direct persistence format"),
+        }
+    }
 }
 
 /// Tracks contention without putting the health endpoint behind the write
@@ -1841,6 +1858,7 @@ struct JournalHead {
     sequence: u64,
     record_hash: String,
     transition_root: String,
+    request_index_root: String,
 }
 
 /// In-process v71 append eligibility. Only `Eligible` may PUT, and a latch is
@@ -1941,6 +1959,9 @@ fn precheck_journal_candidate(
     }
     if record.previous_transition_root != head.transition_root {
         return Err("journal candidate previous transition root mismatch");
+    }
+    if record.previous_request_index_root != head.request_index_root {
+        return Err("journal candidate previous request index root mismatch");
     }
     let bytes = serde_cbor::to_vec(record).map_err(|_| "journal candidate encoding failed")?;
     if bytes.len() > MAX_JOURNAL_RECORD_BYTES {
@@ -2444,6 +2465,7 @@ impl S3ImmutableArtifactStore {
             sequence: record.sequence,
             record_hash,
             transition_root: record.transition_root.clone(),
+            request_index_root: record.request_index_root.clone(),
         };
         *journal = JournalWriterState::Eligible(next.clone());
         Ok(next)
@@ -3135,6 +3157,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let execution_mode = env::var("LAYRS_DIRECT_EXECUTION_MODE").ok();
     let dormant = matches!(execution_mode.as_deref(), None | Some("dormant"));
     let financial_enabled = execution_mode.as_deref() == Some("production-enabled");
+    let persistence_format = PersistenceFormat::parse(
+        env::var("LAYRS_DIRECT_PERSISTENCE_FORMAT").ok().as_deref(),
+    )?;
     let projection = match env::var("LAYRS_DIRECT_PROJECTION_DATABASE_URL") {
         Ok(url) => Some(Projection::connect(&url, &epoch, isolated_test).await?),
         // This is restricted to a named isolated-package fixture.  It permits
@@ -3191,6 +3216,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    let artifact_store = ArchiveStore::from_environment(isolated_test || dormant).await?;
+    if persistence_format == PersistenceFormat::V71
+        && !matches!(artifact_store, Some(ArchiveStore::S3(_)))
+    {
+        return Err("v71 persistence requires the S3 Object Lock archive".into());
+    }
     let state = AppState {
         enclave_cid: env::var("LAYRS_ENCLAVE_CID")
             .unwrap_or_else(|_| "16".into())
@@ -3202,7 +3233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Filesystem storage is accepted only for an explicitly isolated test
         // or a dormant package.  The production-enabled path remains S3 with
         // Object Lock and KMS only.
-        artifact_store: ArchiveStore::from_environment(isolated_test || dormant).await?,
+        artifact_store,
         commit_ack_key: env::var("LAYRS_DIRECT_COMMIT_ACK_KEY_HEX")
             .ok()
             .and_then(|value| hex::decode(value).ok())
@@ -3232,6 +3263,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         committed_state_root: Arc::new(Mutex::new(None)),
         unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
         governed_bootstrap,
+        persistence_format,
     };
     // A Nitro EIF does not inherit the parent's systemd environment.  The
     // isolated test key material therefore crosses the existing VSOCK channel
@@ -6391,6 +6423,25 @@ async fn write_frame<S: tokio::io::AsyncWrite + Unpin>(stream: &mut S, bytes: &[
 #[cfg(test)]
 mod tests {
     #[test]
+    fn persistence_format_defaults_to_v70_and_rejects_unknown_values() {
+        assert_eq!(
+            super::PersistenceFormat::parse(None),
+            Ok(super::PersistenceFormat::V70)
+        );
+        assert_eq!(
+            super::PersistenceFormat::parse(Some("v70")),
+            Ok(super::PersistenceFormat::V70)
+        );
+        assert_eq!(
+            super::PersistenceFormat::parse(Some("v71")),
+            Ok(super::PersistenceFormat::V71)
+        );
+        for invalid in ["", "V71", "shadow", "v72", " v71"] {
+            assert!(super::PersistenceFormat::parse(Some(invalid)).is_err());
+        }
+    }
+
+    #[test]
     fn checkpoint_refresh_coalesces_bursts_and_retries_without_new_commits() {
         let mut refresh = super::CheckpointRefresh::default();
         let now = tokio::time::Instant::now();
@@ -6517,6 +6568,7 @@ mod tests {
             committed_state_root: Arc::new(Mutex::new(Some(head.state_hash.clone()))),
             unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
             governed_bootstrap: None,
+            persistence_format: PersistenceFormat::V70,
         };
         assert_eq!(store.seal_current_checkpoint(&state).await.unwrap_err(), "checkpoint head mismatch");
         // restore_streamed's final step: the same failure is only diagnosed.
@@ -7570,6 +7622,7 @@ mod tests {
             committed_state_root: Arc::new(Mutex::new(None)),
             unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
             governed_bootstrap: None,
+            persistence_format: PersistenceFormat::V70,
         };
         assert!(authenticated(&headers, &state).is_ok());
 
@@ -8030,6 +8083,8 @@ mod tests {
             sequence: 41,
             record_hash: "a".repeat(64),
             transition_root: "b".repeat(64),
+            request_index_root:
+                layrs_direct_execution_v1::request_index::empty_request_index_root(),
         }
     }
 
@@ -8199,6 +8254,10 @@ mod tests {
         reject(
             &|r| r.previous_transition_root = "d".repeat(64),
             "journal candidate previous transition root mismatch",
+        );
+        reject(
+            &|r| r.previous_request_index_root = "d".repeat(64),
+            "journal candidate previous request index root mismatch",
         );
         reject(
             &|r| r.ciphertext = vec![0; MAX_JOURNAL_RECORD_BYTES],
@@ -8420,6 +8479,7 @@ mod tests {
             sequence: 42,
             record_hash: record.record_hash().unwrap(),
             transition_root: record.transition_root.clone(),
+            request_index_root: record.request_index_root.clone(),
         }
     }
 
