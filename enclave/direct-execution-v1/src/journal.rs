@@ -187,17 +187,62 @@ impl DirectJournalRecord {
         verification_key: &[u8],
         receipt_key: &[u8],
     ) -> Result<DirectJournalPayload, JournalError> {
-        if self.protocol != DIRECT_JOURNAL_PROTOCOL
-            || self.epoch_id != EPOCH_ID
-            || self.writer_epoch != expected_writer_epoch
+        if self.writer_epoch != expected_writer_epoch
             || self.sequence != expected_sequence
             || self.previous_record_hash != expected_previous_record_hash
             || self.previous_transition_root != expected_previous_transition_root
             || self.previous_request_index_root != expected_previous_request_index_root
+        {
+            return Err(JournalError::Invalid);
+        }
+        self.open_authenticated(state_key, verification_key, receipt_key)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_replay(
+        &self,
+        expected_writer_epoch: &str,
+        expected_sequence: u64,
+        expected_account_id: &str,
+        expected_request_id: &str,
+        expected_request_hash: &str,
+        expected_result_hash: &str,
+        expected_receipt_hash: &str,
+        state_key: &[u8],
+        verification_key: &[u8],
+        receipt_key: &[u8],
+    ) -> Result<DirectJournalPayload, JournalError> {
+        if self.writer_epoch != expected_writer_epoch
+            || self.sequence != expected_sequence
+            || self.account_id != expected_account_id
+            || self.request_id != expected_request_id
+            || self.request_hash != expected_request_hash
+            || self.result_hash != expected_result_hash
+            || self.receipt_hash != expected_receipt_hash
+        {
+            return Err(JournalError::Invalid);
+        }
+        self.open_authenticated(state_key, verification_key, receipt_key)
+    }
+
+    fn open_authenticated(
+        &self,
+        state_key: &[u8],
+        verification_key: &[u8],
+        receipt_key: &[u8],
+    ) -> Result<DirectJournalPayload, JournalError> {
+        if self.protocol != DIRECT_JOURNAL_PROTOCOL
+            || self.epoch_id != EPOCH_ID
+            || self.writer_epoch.is_empty()
+            || self.writer_epoch.len() > 128
+            || self.sequence == 0
+            || self.account_id.is_empty()
+            || self.request_id.is_empty()
             || self.nonce.len() != 12
             || state_key.len() != 32
             || verification_key.len() != 32
             || receipt_key.len() != 32
+            || self.previous_request_index_root == self.request_index_root
             || ![
                 self.previous_record_hash.as_str(),
                 self.previous_transition_root.as_str(),
@@ -354,6 +399,14 @@ fn canonical_hash<T: Serialize>(value: &T) -> Result<String, JournalError> {
     serde_cbor::to_vec(value)
         .map(|bytes| sha256(&bytes))
         .map_err(|_| JournalError::Invalid)
+}
+
+pub fn canonical_result_hash(result: &DirectResult) -> Result<String, JournalError> {
+    canonical_hash(result)
+}
+
+pub fn canonical_receipt_hash(result: &DirectResult) -> Result<String, JournalError> {
+    canonical_hash(&result.receipt)
 }
 
 fn result_matches_request(result: &DirectResult, request: &DirectRequest) -> bool {
