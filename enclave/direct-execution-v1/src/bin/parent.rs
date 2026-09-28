@@ -49,7 +49,10 @@ use layrs_direct_execution_v1::journal::{
 };
 use layrs_direct_execution_v1::migration::{V70MigrationBundle, V70_MIGRATION_MANIFEST_PROTOCOL};
 use layrs_direct_execution_v1::request_index::{TerminalRequestLeaf, TerminalResultLocator};
-use layrs_direct_execution_v1::request_index_snapshot::DirectRequestIndexState;
+use layrs_direct_execution_v1::receipt_snapshot::DirectReceiptSnapshot;
+use layrs_direct_execution_v1::request_index_snapshot::{
+    DirectRequestIndexSnapshot, DirectRequestIndexState,
+};
 use layrs_direct_execution_v1::v71_checkpoint::{DirectV71Checkpoint, DIRECT_V71_CHECKPOINT_PROTOCOL};
 use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
@@ -1939,6 +1942,19 @@ fn journal_checkpoint_key(prefix: &str, sequence: u64, bytes: &[u8]) -> String {
     )
 }
 
+fn journal_parent_snapshot_key(
+    prefix: &str,
+    namespace: &str,
+    sequence: u64,
+    request_index_root: &str,
+    bytes: &[u8],
+) -> String {
+    format!(
+        "{prefix}/journal-v71/{namespace}/{sequence:020}-{request_index_root}-{}.cbor",
+        sha256(bytes)
+    )
+}
+
 /// Most journal records a restore may replay after its checkpoint. A longer
 /// tail fails closed; it never falls back to an older checkpoint or genesis.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2485,6 +2501,27 @@ impl S3ImmutableArtifactStore {
     async fn latch_journal(&self, code: &'static str) {
         latch_journal_state(&mut *self.journal.lock().await, code);
     }
+    async fn establish_journal_head(&self, head: JournalHead) -> Result<(), String> {
+        if self.journal_role != JournalRole::Writer {
+            return Err("JOURNAL_SHADOW_WRITE_UNSUPPORTED".into());
+        }
+        if self.writer_fenced(&head.writer_epoch).await? {
+            self.latch_journal("JOURNAL_WRITER_FENCED").await;
+            return Err("JOURNAL_WRITER_FENCED".into());
+        }
+        let mut journal = self.journal.lock().await;
+        match &*journal {
+            JournalWriterState::Unrestored => {
+                *journal = JournalWriterState::Eligible(head);
+                Ok(())
+            }
+            JournalWriterState::Eligible(existing) if existing == &head => Ok(()),
+            JournalWriterState::Eligible(_) | JournalWriterState::Latched(_) => {
+                latch_journal_state(&mut journal, "JOURNAL_HEAD_ESTABLISHMENT_CONFLICT");
+                Err("JOURNAL_HEAD_ESTABLISHMENT_CONFLICT".into())
+            }
+        }
+    }
     /// Plan section 4 steps 1-6. The journal lock is held from the eligibility
     /// check through the post-PUT fence listing, so nothing else can PUT or
     /// advance the head meanwhile. Only an exact readback followed by an empty,
@@ -2599,6 +2636,54 @@ impl S3ImmutableArtifactStore {
         let key = journal_checkpoint_key(&self.prefix, checkpoint.sequence, &bytes);
         self.write_once(&key, bytes).await?;
         Ok(key)
+    }
+    async fn persist_journal_parent_snapshots(
+        &self,
+        checkpoint: &DirectV71Checkpoint,
+        index: &DirectRequestIndexSnapshot,
+        receipts: &DirectReceiptSnapshot,
+    ) -> Result<(String, String), String> {
+        if self.journal_role != JournalRole::Writer {
+            return Err("JOURNAL_SHADOW_WRITE_UNSUPPORTED".into());
+        }
+        index
+            .verify(checkpoint.sequence, &checkpoint.request_index_root)
+            .map_err(|_| "journal request index snapshot invalid")?;
+        receipts
+            .verify(index)
+            .map_err(|_| "journal receipt snapshot invalid")?;
+        let index_bytes = serde_cbor::to_vec(index)
+            .map_err(|_| "journal request index snapshot encoding failed")?;
+        let receipt_bytes = serde_cbor::to_vec(receipts)
+            .map_err(|_| "journal receipt snapshot encoding failed")?;
+        if index_bytes.len() > MAX_FRAME_BYTES || receipt_bytes.len() > MAX_FRAME_BYTES {
+            return Err("journal parent snapshot oversized".into());
+        }
+        let index_key = journal_parent_snapshot_key(
+            &self.prefix,
+            "request-index",
+            checkpoint.sequence,
+            &checkpoint.request_index_root,
+            &index_bytes,
+        );
+        let receipt_key = journal_parent_snapshot_key(
+            &self.prefix,
+            "receipts",
+            checkpoint.sequence,
+            &checkpoint.request_index_root,
+            &receipt_bytes,
+        );
+        let index_readback = self.write_once_large(&index_key, index_bytes.clone()).await?;
+        if index_readback != index_bytes {
+            return Err("journal request index snapshot readback mismatch".into());
+        }
+        let receipt_readback = self
+            .write_once_large(&receipt_key, receipt_bytes.clone())
+            .await?;
+        if receipt_readback != receipt_bytes {
+            return Err("journal receipt snapshot readback mismatch".into());
+        }
+        Ok((index_key, receipt_key))
     }
     /// Paginated listing of `namespace` (a full key prefix ending in `/`),
     /// optionally strictly after `start_after`, of at most `max` keys. Each
@@ -3617,6 +3702,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     verify_recovered_projection(&state).await?;
     recover_external_effect_intents(&state).await?;
     verify_recovered_projection(&state).await?;
+    if state.persistence_format == PersistenceFormat::V71 {
+        activate_v71_from_restored_v70(&state).await?;
+    }
     // Observe already-admitted Base withdrawals independently of the browser.
     // This observer has no submission capability and shares the financial lock.
     start_base_withdrawal_observer(state.clone());
@@ -5616,6 +5704,124 @@ async fn recover_enclave(state: &AppState) -> io::Result<()> {
     }
 }
 
+async fn activate_v71_from_restored_v70(state: &AppState) -> io::Result<()> {
+    if !state.unresolved_external_effects.lock().await.is_empty() {
+        return Err(invalid("V71_CUTOVER_EXTERNAL_EFFECT_PENDING"));
+    }
+    let store = match state.artifact_store.as_ref() {
+        Some(ArchiveStore::S3(store)) => store,
+        _ => return Err(invalid("V71_S3_ARCHIVE_REQUIRED")),
+    };
+    let bundle = match exchange(state, RuntimeRequest::SealV70Migration).await? {
+        RuntimeResponse::V70MigrationSealed { bundle } => bundle,
+        RuntimeResponse::Error { code } => {
+            return Err(invalid(format!("V70_MIGRATION_SEAL_FAILED:{code}")))
+        }
+        _ => return Err(invalid("V70_MIGRATION_SEAL_UNEXPECTED_RESPONSE")),
+    };
+    let restored_root = state
+        .committed_state_root
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| invalid("DIRECT_STATE_ROOT_UNAVAILABLE"))?;
+    if bundle.manifest.source_state_hash != restored_root {
+        return Err(invalid("V70_MIGRATION_SOURCE_HEAD_MISMATCH"));
+    }
+    let records = store
+        .verified_receipt_records
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| invalid("V70_MIGRATION_RECEIPTS_UNAVAILABLE"))?;
+    let (index, receipts, index_snapshot, receipt_snapshot) =
+        migration_parent_state(&bundle, &records).map_err(invalid)?;
+
+    store
+        .persist_v70_migration_bundle(&bundle)
+        .await
+        .map_err(|error| invalid(format!("V70_MIGRATION_PERSISTENCE_FAILED:{error}")))?;
+    let activated = exchange(
+        state,
+        RuntimeRequest::ActivateV71Migration {
+            bundle: bundle.clone(),
+        },
+    )
+    .await?;
+    let (
+        writer_epoch,
+        sequence,
+        record_hash,
+        transition_root,
+        request_index_root,
+        financial_state_root,
+    ) = match activated {
+        RuntimeResponse::V71MigrationActivated {
+            writer_epoch,
+            sequence,
+            record_hash,
+            transition_root,
+            request_index_root,
+            financial_state_root,
+        } if sequence == bundle.manifest.source_sequence
+            && request_index_root == bundle.manifest.request_index_root =>
+        {
+            (
+                writer_epoch,
+                sequence,
+                record_hash,
+                transition_root,
+                request_index_root,
+                financial_state_root,
+            )
+        }
+        RuntimeResponse::Error { code } => {
+            return Err(invalid(format!("V71_MIGRATION_ACTIVATION_FAILED:{code}")))
+        }
+        _ => return Err(invalid("V71_MIGRATION_ACTIVATION_MISMATCH")),
+    };
+    let checkpoint = match exchange(state, RuntimeRequest::SealJournalCheckpoint).await? {
+        RuntimeResponse::JournalCheckpointSealed { checkpoint }
+            if checkpoint.writer_epoch == writer_epoch
+                && checkpoint.sequence == sequence
+                && checkpoint.record_hash == record_hash
+                && checkpoint.transition_root == transition_root
+                && checkpoint.request_index_root == request_index_root
+                && checkpoint.financial_state_root == financial_state_root => checkpoint,
+        RuntimeResponse::Error { code } => {
+            return Err(invalid(format!("V71_CHECKPOINT_SEAL_FAILED:{code}")))
+        }
+        _ => return Err(invalid("V71_CHECKPOINT_SEAL_MISMATCH")),
+    };
+    store
+        .persist_journal_checkpoint(&checkpoint)
+        .await
+        .map_err(|error| invalid(format!("V71_CHECKPOINT_PERSISTENCE_FAILED:{error}")))?;
+    store
+        .persist_journal_parent_snapshots(
+            &checkpoint,
+            &index_snapshot,
+            &receipt_snapshot,
+        )
+        .await
+        .map_err(|error| invalid(format!("V71_PARENT_SNAPSHOT_PERSISTENCE_FAILED:{error}")))?;
+    store
+        .establish_journal_head(JournalHead {
+            writer_epoch,
+            sequence,
+            record_hash,
+            transition_root: transition_root.clone(),
+            request_index_root,
+        })
+        .await
+        .map_err(|error| invalid(format!("V71_WRITER_HEAD_FAILED:{error}")))?;
+    *state.journal_request_index.lock().await = Some(index);
+    *state.journal_receipts.lock().await = Some(receipts);
+    *state.committed_state_root.lock().await = Some(transition_root);
+    eprintln!("V71_MIGRATION_CUTOVER_READY sequence={sequence}");
+    Ok(())
+}
+
 fn intent_is_committed(intent: &ExternalEffectIntent, artifacts: &[DirectStateArtifact]) -> bool {
     let prefix = format!("{}:", intent.external_effect_reference);
     artifacts.iter().any(|artifact| {
@@ -6719,6 +6925,63 @@ fn terminal_leaf_matches_record(
                 writer_epoch: record.writer_epoch.clone(),
                 sequence: record.sequence,
             })
+}
+
+type JournalReceiptCache = BTreeMap<(String, String), (u64, DirectReceipt)>;
+
+fn migration_parent_state(
+    bundle: &V70MigrationBundle,
+    records: &[DirectStateArtifact],
+) -> Result<
+    (
+        DirectRequestIndexState,
+        JournalReceiptCache,
+        DirectRequestIndexSnapshot,
+        DirectReceiptSnapshot,
+    ),
+    String,
+> {
+    if records.len() as u64 != bundle.manifest.source_sequence
+        || bundle.records.len() as u64 != bundle.manifest.record_count
+        || bundle.leaves.len() != bundle.records.len()
+        || bundle.leaves.len() as u64 != bundle.manifest.source_sequence
+    {
+        return Err("journal migration receipt lineage incomplete".into());
+    }
+    let index_snapshot = DirectRequestIndexSnapshot::from_leaves(
+        bundle.manifest.source_sequence,
+        &bundle.manifest.request_index_root,
+        bundle.leaves.clone(),
+    )
+    .map_err(|_| "journal migration request index invalid")?;
+    let receipt_snapshot = DirectReceiptSnapshot::from_receipts(
+        &index_snapshot,
+        records.iter().map(|record| record.receipt.clone()),
+    )
+    .map_err(|_| "journal migration receipts do not match request index")?;
+    let mut receipts = BTreeMap::new();
+    for (offset, record) in records.iter().enumerate() {
+        if record.sequence != offset as u64 + 1
+            || receipts
+                .insert(
+                    (
+                        record.receipt.account_id.clone(),
+                        record.receipt.request_id.clone(),
+                    ),
+                    (record.sequence, record.receipt.clone()),
+                )
+                .is_some()
+        {
+            return Err("journal migration receipt lineage invalid".into());
+        }
+    }
+    let index = DirectRequestIndexState::from_snapshot(
+        index_snapshot.clone(),
+        bundle.manifest.source_sequence,
+        &bundle.manifest.request_index_root,
+    )
+    .map_err(|_| "journal migration request index invalid")?;
+    Ok((index, receipts, index_snapshot, receipt_snapshot))
 }
 
 /// v71 preserves the same two-phase enclave adoption rule as v70 while the
@@ -8886,6 +9149,77 @@ mod tests {
         let mut other = record.clone();
         other.receipt_hash = "d".repeat(64);
         assert!(!verify_terminal_matches_record(&result, &other));
+    }
+
+    #[test]
+    fn v71_migration_parent_state_requires_complete_receipt_index_equivalence() {
+        let (result, _) = v71_candidate();
+        let migration_id = sha256(b"migration-fixture");
+        let leaf = TerminalRequestLeaf {
+            account_id: result.receipt.account_id.clone(),
+            request_id: result.receipt.request_id.clone(),
+            request_hash: result.receipt.request_hash.clone(),
+            result_hash: canonical_result_hash(&result).unwrap(),
+            receipt_hash: canonical_receipt_hash(&result).unwrap(),
+            locator: TerminalResultLocator::Migration {
+                migration_id: migration_id.clone(),
+                ordinal: 1,
+            },
+        };
+        let root = layrs_direct_execution_v1::request_index::request_index_root(&[leaf.clone()])
+            .unwrap();
+        let bundle = V70MigrationBundle {
+            manifest: layrs_direct_execution_v1::migration::V70MigrationManifest {
+                protocol: V70_MIGRATION_MANIFEST_PROTOCOL.into(),
+                epoch_id: EPOCH_ID.into(),
+                migration_id: migration_id.clone(),
+                source_sequence: 1,
+                source_state_hash: "a".repeat(64),
+                record_count: 1,
+                records_root: "b".repeat(64),
+                request_index_root: root,
+                signature: "c".repeat(128),
+            },
+            records: vec![layrs_direct_execution_v1::migration::MigratedTerminalRecord {
+                protocol: "layrs.direct-execution.migrated-result.v71".into(),
+                epoch_id: EPOCH_ID.into(),
+                migration_id,
+                source_sequence: 1,
+                source_state_hash: "a".repeat(64),
+                ordinal: 1,
+                account_id: leaf.account_id.clone(),
+                request_id: leaf.request_id.clone(),
+                request_hash: leaf.request_hash.clone(),
+                result_hash: leaf.result_hash.clone(),
+                receipt_hash: leaf.receipt_hash.clone(),
+                nonce: vec![0; 12],
+                ciphertext: vec![1],
+                ciphertext_hash: sha256(&[1]),
+                signature: "d".repeat(128),
+            }],
+            leaves: vec![leaf],
+        };
+        let artifact = DirectStateArtifact {
+            epoch_id: EPOCH_ID.into(),
+            sequence: 1,
+            prior_state_hash: "e".repeat(64),
+            state_hash: "f".repeat(64),
+            request_hash: result.receipt.request_hash.clone(),
+            nonce: vec![0; 12],
+            ciphertext: vec![1],
+            ciphertext_hash: sha256(&[1]),
+            receipt: result.receipt.clone(),
+        };
+        let (index, receipts, index_snapshot, receipt_snapshot) =
+            migration_parent_state(&bundle, &[artifact.clone()]).unwrap();
+        assert_eq!(index.len(), 1);
+        assert_eq!(receipts.len(), 1);
+        assert!(receipt_snapshot.verify(&index_snapshot).is_ok());
+
+        let mut changed = artifact;
+        changed.receipt.effect = "TAMPERED".into();
+        assert!(migration_parent_state(&bundle, &[changed]).is_err());
+        assert!(migration_parent_state(&bundle, &[]).is_err());
     }
 
     fn v71_http(status: u16, body: &[u8]) -> Vec<u8> {
