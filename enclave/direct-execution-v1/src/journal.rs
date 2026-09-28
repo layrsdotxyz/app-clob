@@ -10,7 +10,9 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use thiserror::Error;
 
 use crate::{request_hash, sha256, verify_receipt, DirectRequest, DirectResult, EPOCH_ID};
@@ -125,7 +127,6 @@ impl DirectJournalRecord {
             &result_hash,
             request_index_root,
         );
-        let nonce = journal_nonce(writer_epoch, sequence, &committed_request_hash)?;
         let associated_data = associated_data(
             writer_epoch,
             sequence,
@@ -142,6 +143,11 @@ impl DirectJournalRecord {
         )?;
         let plaintext = serde_cbor::to_vec(&DirectJournalPayload { request, result })
             .map_err(|_| JournalError::Invalid)?;
+        // A writer crash can cause the same sequence to be prepared again
+        // against a different predecessor or result.  Bind the nonce to all
+        // authenticated metadata and plaintext so those competing candidates
+        // cannot reuse a ChaCha20-Poly1305 nonce under the same state key.
+        let nonce = journal_nonce(state_key, &associated_data, &plaintext)?;
         let ciphertext = ChaCha20Poly1305::new(Key::from_slice(state_key))
             .encrypt(
                 Nonce::from_slice(&nonce),
@@ -257,7 +263,6 @@ impl DirectJournalRecord {
             .into_iter()
             .all(digest)
             || self.ciphertext_hash != sha256(&self.ciphertext)
-            || self.nonce != journal_nonce(&self.writer_epoch, self.sequence, &self.request_hash)?
             || self.transition_root
                 != transition_root(
                     &self.previous_transition_root,
@@ -295,7 +300,8 @@ impl DirectJournalRecord {
             .map_err(|_| JournalError::Decryption)?;
         let payload: DirectJournalPayload =
             serde_cbor::from_slice(&plaintext).map_err(|_| JournalError::Invalid)?;
-        if payload.request.account_id != self.account_id
+        if self.nonce != journal_nonce(state_key, &associated_data, &plaintext)?
+            || payload.request.account_id != self.account_id
             || payload.request.request_id != self.request_id
             || payload.request.request_hash != self.request_hash
             || request_hash(&payload.request) != self.request_hash
@@ -378,21 +384,21 @@ fn associated_data(
 }
 
 fn journal_nonce(
-    writer_epoch: &str,
-    sequence: u64,
-    request_hash: &str,
+    state_key: &[u8],
+    associated_data: &[u8],
+    plaintext: &[u8],
 ) -> Result<Vec<u8>, JournalError> {
-    if writer_epoch.is_empty() || sequence == 0 || !digest(request_hash) {
+    if state_key.len() != 32 || associated_data.is_empty() || plaintext.is_empty() {
         return Err(JournalError::Invalid);
     }
-    let mut bytes = Vec::with_capacity(
-        JOURNAL_NONCE_DOMAIN.len() + writer_epoch.len() + request_hash.len() + 8,
-    );
-    bytes.extend_from_slice(JOURNAL_NONCE_DOMAIN);
-    bytes.extend_from_slice(writer_epoch.as_bytes());
-    bytes.extend_from_slice(&sequence.to_be_bytes());
-    bytes.extend_from_slice(request_hash.as_bytes());
-    hex::decode(&sha256(&bytes)[..24]).map_err(|_| JournalError::Invalid)
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(state_key)
+        .map_err(|_| JournalError::Invalid)?;
+    mac.update(JOURNAL_NONCE_DOMAIN);
+    mac.update(&(associated_data.len() as u64).to_be_bytes());
+    mac.update(associated_data);
+    mac.update(&(plaintext.len() as u64).to_be_bytes());
+    mac.update(plaintext);
+    Ok(mac.finalize().into_bytes()[..12].to_vec())
 }
 
 fn canonical_hash<T: Serialize>(value: &T) -> Result<String, JournalError> {
@@ -537,6 +543,57 @@ mod tests {
             .unwrap();
         assert_eq!(payload.request.request_id, "request-1");
         assert_eq!(payload.result.effect, "IDENTITY_ADMITTED");
+    }
+
+    #[test]
+    fn nonce_is_stable_for_an_identical_record_but_changes_with_the_candidate() {
+        let (request, result) = payload();
+        let first = DirectJournalRecord::seal(
+            "writer-epoch-1",
+            1,
+            &"a".repeat(64),
+            &"b".repeat(64),
+            &"e".repeat(64),
+            &"f".repeat(64),
+            request.clone(),
+            result.clone(),
+            &[7; 32],
+            &[8; 32],
+            &[9; 32],
+        )
+        .unwrap();
+        let identical = DirectJournalRecord::seal(
+            "writer-epoch-1",
+            1,
+            &"a".repeat(64),
+            &"b".repeat(64),
+            &"e".repeat(64),
+            &"f".repeat(64),
+            request.clone(),
+            result.clone(),
+            &[7; 32],
+            &[8; 32],
+            &[9; 32],
+        )
+        .unwrap();
+        let competing = DirectJournalRecord::seal(
+            "writer-epoch-1",
+            1,
+            &"c".repeat(64),
+            &"d".repeat(64),
+            &"e".repeat(64),
+            &"f".repeat(64),
+            request,
+            result,
+            &[7; 32],
+            &[8; 32],
+            &[9; 32],
+        )
+        .unwrap();
+
+        assert_eq!(first, identical);
+        assert_ne!(first.nonce, competing.nonce);
+        assert_ne!(first.ciphertext, competing.ciphertext);
     }
 
     #[test]
