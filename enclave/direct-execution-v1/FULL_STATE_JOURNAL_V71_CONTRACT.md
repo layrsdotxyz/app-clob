@@ -72,16 +72,24 @@ least:
 - protocol and epoch id;
 - writer epoch and sequence;
 - previous record hash;
-- previous and next financial state roots;
+- previous and next transition roots, where the next root commits to the
+  predecessor, sequence, request, and terminal result without serializing the
+  full state;
 - account id, request id, and request hash commitments;
 - terminal result and signed receipt commitments;
 - encrypted canonical mutation payload;
 - ciphertext hash, nonce, and enclave signature.
 
 The authenticated encryption associated data binds protocol, epoch, writer
-epoch, sequence, previous record hash, previous state root, and request hash.
+epoch, sequence, previous record hash, previous transition root, account,
+request id, request hash, signed receipt hash, and terminal result hash.
 Nonce construction must be unique for the state key and fail closed on any
 sequence reuse.
+
+The transition root is not described as a full financial-state hash. The
+authenticated checkpoint binds the canonical full-state hash; journal replay
+must reproduce and validate that checkpoint hash. This distinction prevents a
+hidden full-state serialization from remaining on every commit.
 
 The parent is untrusted storage. It may persist bytes but cannot authorize a
 sequence, manufacture a state transition, or alter a receipt. Durable append is
@@ -90,18 +98,20 @@ reported committed until that append is durably acknowledged.
 
 ## Checkpoint and restore
 
-A v71 checkpoint binds an exact epoch, writer epoch, sequence, record hash, and
-financial state root. Checkpoint creation must not serialize a mutable state
-while commands continue changing that state. Implementations must use an
+A v71 checkpoint binds an exact epoch, writer epoch, sequence, record hash,
+transition root, and canonical full-state hash. Checkpoint creation must not
+serialize a mutable state while commands continue changing that state.
+Implementations must use an
 immutable generation, copy-on-write view, or another proven consistent view.
 
 Restore performs:
 
 1. checkpoint authentication and full invariant validation;
 2. strict replay of the subsequent journal records;
-3. previous-record, sequence, request, receipt, and state-root verification for
-   every record;
-4. exact final-head comparison before writer eligibility.
+3. previous-record, sequence, request, receipt, and transition-root
+   verification for every record;
+4. exact final-head and checkpoint full-state-hash comparison before writer
+   eligibility.
 
 The retained journal tail is bounded by policy. Missing, duplicate, reordered,
 or corrupted records fail closed. Genesis fallback remains forbidden when a
@@ -111,11 +121,15 @@ committed lineage exists.
 
 Shadow mode has no writer authority and cannot publish financial effects. It
 consumes the authoritative command order and compares terminal result, receipt,
-fills, financial state, sequence, and state root after every command.
+fills, financial state, sequence, and transition root after every command.
 
-Production eligibility requires at least 10,000 consecutive matching commits,
-24 hours without a mismatch, successful checkpoint-plus-tail restores, and a
-rehearsed v70 rollback from a production-sized copy.
+There is no separate offline or 24-hour pre-cutover soak. Shadow verification
+runs non-disruptively in production while v70 remains authoritative and users
+continue trading. Cutover eligibility requires a consecutive live-match window
+covering every financial action class observed in the window, successful
+checkpoint-plus-tail restores, and a rehearsed v70 rollback from a
+production-sized copy. The rollout runbook records the exact minimum commit
+count before rollout; a mismatch resets the window and blocks cutover.
 
 Writer handoff uses an explicit fence. Incoming commands remain durably queued
 while dispatch pauses. The old writer completes at head `H`, both runtimes prove

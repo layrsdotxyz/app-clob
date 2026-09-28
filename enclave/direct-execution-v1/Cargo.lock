@@ -3419,6 +3419,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chacha20poly1305",
+ "ed25519-dalek",
  "hex",
  "hmac 0.12.1",
  "layrs-clob-service",

@@ -31,6 +31,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod external_effect;
+pub mod journal;
 mod quest_receipts;
 pub use quest_receipts::{PublicQuestReceipt,QuestReceiptPayload,QuestReceiptKind,QuestReceiptWitness,QuestReceiptLookupPayload,quest_public_receipt_hash,QUEST_RECEIPT_PROTOCOL,
     quest_receipt_public_key,canonical_quest_receipt_payload,quest_receipt_attestation_commitment,verify_public_quest_receipt};

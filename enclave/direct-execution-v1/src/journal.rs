@@ -1,0 +1,554 @@
+//! Canonical, encrypted successor records for the v71 persistence path.
+//!
+//! This module is deliberately independent of the active v70 commit path. It
+//! defines and verifies the bounded record that will replace a full encrypted
+//! state snapshot after every command; wiring it into writer authority is a
+//! separate, explicitly tested migration step.
+
+use chacha20poly1305::{
+    aead::{Aead, KeyInit, Payload},
+    ChaCha20Poly1305, Key, Nonce,
+};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::{request_hash, sha256, verify_receipt, DirectRequest, DirectResult, EPOCH_ID};
+
+pub const DIRECT_JOURNAL_PROTOCOL: &str = "layrs.direct-execution.journal.v71";
+const JOURNAL_NONCE_DOMAIN: &[u8] = b"layrs.direct-execution.journal-nonce.v1\0";
+const JOURNAL_TRANSITION_DOMAIN: &[u8] = b"layrs.direct-execution.transition-root.v1\0";
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum JournalError {
+    #[error("journal input is invalid")]
+    Invalid,
+    #[error("journal authentication failed")]
+    Authentication,
+    #[error("journal payload could not be decrypted")]
+    Decryption,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DirectJournalPayload {
+    pub request: DirectRequest,
+    pub result: DirectResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DirectJournalRecord {
+    pub protocol: String,
+    pub epoch_id: String,
+    pub writer_epoch: String,
+    pub sequence: u64,
+    pub previous_record_hash: String,
+    pub previous_transition_root: String,
+    pub transition_root: String,
+    pub account_id: String,
+    pub request_id: String,
+    pub request_hash: String,
+    pub receipt_hash: String,
+    pub result_hash: String,
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+    pub ciphertext_hash: String,
+    pub signature: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JournalAssociatedData<'a> {
+    protocol: &'a str,
+    epoch_id: &'a str,
+    writer_epoch: &'a str,
+    sequence: u64,
+    previous_record_hash: &'a str,
+    previous_transition_root: &'a str,
+    transition_root: &'a str,
+    account_id: &'a str,
+    request_id: &'a str,
+    request_hash: &'a str,
+    receipt_hash: &'a str,
+    result_hash: &'a str,
+}
+
+impl DirectJournalRecord {
+    #[allow(clippy::too_many_arguments)]
+    pub fn seal(
+        writer_epoch: &str,
+        sequence: u64,
+        previous_record_hash: &str,
+        previous_transition_root: &str,
+        request: DirectRequest,
+        result: DirectResult,
+        state_key: &[u8],
+        signing_key_seed: &[u8],
+        receipt_key: &[u8],
+    ) -> Result<Self, JournalError> {
+        if writer_epoch.is_empty()
+            || writer_epoch.len() > 128
+            || sequence == 0
+            || !digest(previous_record_hash)
+            || !digest(previous_transition_root)
+            || state_key.len() != 32
+            || signing_key_seed.len() != 32
+            || receipt_key.len() != 32
+            || request.account_id.is_empty()
+            || request.request_id.is_empty()
+            || request.request_hash != request_hash(&request)
+            || !result_matches_request(&result, &request)
+            || !verify_receipt(receipt_key, &result.receipt)
+        {
+            return Err(JournalError::Invalid);
+        }
+
+        let account_id = request.account_id.clone();
+        let request_id = request.request_id.clone();
+        let committed_request_hash = request.request_hash.clone();
+        let receipt_hash = canonical_hash(&result.receipt)?;
+        let result_hash = canonical_hash(&result)?;
+        let transition_root = transition_root(
+            previous_transition_root,
+            sequence,
+            &committed_request_hash,
+            &result_hash,
+        );
+        let nonce = journal_nonce(writer_epoch, sequence, &committed_request_hash)?;
+        let associated_data = associated_data(
+            writer_epoch,
+            sequence,
+            previous_record_hash,
+            previous_transition_root,
+            &transition_root,
+            &account_id,
+            &request_id,
+            &committed_request_hash,
+            &receipt_hash,
+            &result_hash,
+        )?;
+        let plaintext = serde_cbor::to_vec(&DirectJournalPayload { request, result })
+            .map_err(|_| JournalError::Invalid)?;
+        let ciphertext = ChaCha20Poly1305::new(Key::from_slice(state_key))
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &plaintext,
+                    aad: &associated_data,
+                },
+            )
+            .map_err(|_| JournalError::Invalid)?;
+        let mut record = Self {
+            protocol: DIRECT_JOURNAL_PROTOCOL.into(),
+            epoch_id: EPOCH_ID.into(),
+            writer_epoch: writer_epoch.into(),
+            sequence,
+            previous_record_hash: previous_record_hash.into(),
+            previous_transition_root: previous_transition_root.into(),
+            transition_root,
+            account_id,
+            request_id,
+            request_hash: committed_request_hash,
+            receipt_hash,
+            result_hash,
+            nonce,
+            ciphertext_hash: sha256(&ciphertext),
+            ciphertext,
+            signature: String::new(),
+        };
+        record.signature = sign(signing_key_seed, &record.signature_bytes()?)?;
+        Ok(record)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_successor(
+        &self,
+        expected_writer_epoch: &str,
+        expected_sequence: u64,
+        expected_previous_record_hash: &str,
+        expected_previous_transition_root: &str,
+        state_key: &[u8],
+        verification_key: &[u8],
+        receipt_key: &[u8],
+    ) -> Result<DirectJournalPayload, JournalError> {
+        if self.protocol != DIRECT_JOURNAL_PROTOCOL
+            || self.epoch_id != EPOCH_ID
+            || self.writer_epoch != expected_writer_epoch
+            || self.sequence != expected_sequence
+            || self.previous_record_hash != expected_previous_record_hash
+            || self.previous_transition_root != expected_previous_transition_root
+            || self.nonce.len() != 12
+            || state_key.len() != 32
+            || verification_key.len() != 32
+            || receipt_key.len() != 32
+            || ![
+                self.previous_record_hash.as_str(),
+                self.previous_transition_root.as_str(),
+                self.transition_root.as_str(),
+                self.request_hash.as_str(),
+                self.receipt_hash.as_str(),
+                self.result_hash.as_str(),
+                self.ciphertext_hash.as_str(),
+            ]
+            .into_iter()
+            .all(digest)
+            || self.ciphertext_hash != sha256(&self.ciphertext)
+            || self.nonce != journal_nonce(&self.writer_epoch, self.sequence, &self.request_hash)?
+            || self.transition_root
+                != transition_root(
+                    &self.previous_transition_root,
+                    self.sequence,
+                    &self.request_hash,
+                    &self.result_hash,
+                )
+        {
+            return Err(JournalError::Invalid);
+        }
+        verify_signature(verification_key, &self.signature_bytes()?, &self.signature)?;
+        let associated_data = associated_data(
+            &self.writer_epoch,
+            self.sequence,
+            &self.previous_record_hash,
+            &self.previous_transition_root,
+            &self.transition_root,
+            &self.account_id,
+            &self.request_id,
+            &self.request_hash,
+            &self.receipt_hash,
+            &self.result_hash,
+        )?;
+        let plaintext = ChaCha20Poly1305::new(Key::from_slice(state_key))
+            .decrypt(
+                Nonce::from_slice(&self.nonce),
+                Payload {
+                    msg: &self.ciphertext,
+                    aad: &associated_data,
+                },
+            )
+            .map_err(|_| JournalError::Decryption)?;
+        let payload: DirectJournalPayload =
+            serde_cbor::from_slice(&plaintext).map_err(|_| JournalError::Invalid)?;
+        if payload.request.account_id != self.account_id
+            || payload.request.request_id != self.request_id
+            || payload.request.request_hash != self.request_hash
+            || request_hash(&payload.request) != self.request_hash
+            || canonical_hash(&payload.result.receipt)? != self.receipt_hash
+            || canonical_hash(&payload.result)? != self.result_hash
+            || !result_matches_request(&payload.result, &payload.request)
+            || !verify_receipt(receipt_key, &payload.result.receipt)
+        {
+            return Err(JournalError::Authentication);
+        }
+        Ok(payload)
+    }
+
+    pub fn record_hash(&self) -> Result<String, JournalError> {
+        canonical_hash(self)
+    }
+
+    fn signature_bytes(&self) -> Result<Vec<u8>, JournalError> {
+        let mut unsigned = self.clone();
+        unsigned.signature.clear();
+        serde_cbor::to_vec(&unsigned).map_err(|_| JournalError::Invalid)
+    }
+}
+
+pub fn transition_root(
+    previous_transition_root: &str,
+    sequence: u64,
+    request_hash: &str,
+    result_hash: &str,
+) -> String {
+    let mut bytes = Vec::with_capacity(
+        JOURNAL_TRANSITION_DOMAIN.len()
+            + previous_transition_root.len()
+            + request_hash.len()
+            + result_hash.len()
+            + 8,
+    );
+    bytes.extend_from_slice(JOURNAL_TRANSITION_DOMAIN);
+    bytes.extend_from_slice(previous_transition_root.as_bytes());
+    bytes.extend_from_slice(&sequence.to_be_bytes());
+    bytes.extend_from_slice(request_hash.as_bytes());
+    bytes.extend_from_slice(result_hash.as_bytes());
+    sha256(&bytes)
+}
+
+fn associated_data(
+    writer_epoch: &str,
+    sequence: u64,
+    previous_record_hash: &str,
+    previous_transition_root: &str,
+    transition_root: &str,
+    account_id: &str,
+    request_id: &str,
+    request_hash: &str,
+    receipt_hash: &str,
+    result_hash: &str,
+) -> Result<Vec<u8>, JournalError> {
+    serde_cbor::to_vec(&JournalAssociatedData {
+        protocol: DIRECT_JOURNAL_PROTOCOL,
+        epoch_id: EPOCH_ID,
+        writer_epoch,
+        sequence,
+        previous_record_hash,
+        previous_transition_root,
+        transition_root,
+        account_id,
+        request_id,
+        request_hash,
+        receipt_hash,
+        result_hash,
+    })
+    .map_err(|_| JournalError::Invalid)
+}
+
+fn journal_nonce(
+    writer_epoch: &str,
+    sequence: u64,
+    request_hash: &str,
+) -> Result<Vec<u8>, JournalError> {
+    if writer_epoch.is_empty() || sequence == 0 || !digest(request_hash) {
+        return Err(JournalError::Invalid);
+    }
+    let mut bytes = Vec::with_capacity(
+        JOURNAL_NONCE_DOMAIN.len() + writer_epoch.len() + request_hash.len() + 8,
+    );
+    bytes.extend_from_slice(JOURNAL_NONCE_DOMAIN);
+    bytes.extend_from_slice(writer_epoch.as_bytes());
+    bytes.extend_from_slice(&sequence.to_be_bytes());
+    bytes.extend_from_slice(request_hash.as_bytes());
+    hex::decode(&sha256(&bytes)[..24]).map_err(|_| JournalError::Invalid)
+}
+
+fn canonical_hash<T: Serialize>(value: &T) -> Result<String, JournalError> {
+    serde_cbor::to_vec(value)
+        .map(|bytes| sha256(&bytes))
+        .map_err(|_| JournalError::Invalid)
+}
+
+fn result_matches_request(result: &DirectResult, request: &DirectRequest) -> bool {
+    result.status == result.receipt.status
+        && result.effect == result.receipt.effect
+        && result.genesis_ordinal == result.receipt.genesis_ordinal
+        && result.receipt.account_id == request.account_id
+        && result.receipt.identity_commitment == request.identity_commitment
+        && result.receipt.request_id == request.request_id
+        && result.receipt.request_hash == request.request_hash
+}
+
+pub fn journal_verifying_key(signing_key_seed: &[u8]) -> Result<[u8; 32], JournalError> {
+    let seed: [u8; 32] = signing_key_seed
+        .try_into()
+        .map_err(|_| JournalError::Invalid)?;
+    Ok(SigningKey::from_bytes(&seed).verifying_key().to_bytes())
+}
+
+fn sign(signing_key_seed: &[u8], bytes: &[u8]) -> Result<String, JournalError> {
+    let seed: [u8; 32] = signing_key_seed
+        .try_into()
+        .map_err(|_| JournalError::Invalid)?;
+    Ok(hex::encode(
+        SigningKey::from_bytes(&seed).sign(bytes).to_bytes(),
+    ))
+}
+
+fn verify_signature(key: &[u8], bytes: &[u8], signature: &str) -> Result<(), JournalError> {
+    let key: [u8; 32] = key.try_into().map_err(|_| JournalError::Authentication)?;
+    let signature: [u8; 64] = hex::decode(signature)
+        .map_err(|_| JournalError::Authentication)?
+        .try_into()
+        .map_err(|_| JournalError::Authentication)?;
+    VerifyingKey::from_bytes(&key)
+        .map_err(|_| JournalError::Authentication)?
+        .verify(bytes, &Signature::from_bytes(&signature))
+        .map_err(|_| JournalError::Authentication)
+}
+
+fn digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{receipt_signature, DirectAction, DirectReceipt, TerminalStatus};
+
+    fn payload() -> (DirectRequest, DirectResult) {
+        let mut request = DirectRequest {
+            account_id: "account".into(),
+            identity_commitment: "identity".into(),
+            request_id: "request-1".into(),
+            request_hash: String::new(),
+            financial_wallet_address: None,
+            action: DirectAction::AdmitIdentity {
+                wallet_address: "0x1111111111111111111111111111111111111111".into(),
+            },
+        };
+        request.request_hash = request_hash(&request);
+        let mut receipt = DirectReceipt {
+            receipt_id: "c".repeat(64),
+            account_id: request.account_id.clone(),
+            identity_commitment: request.identity_commitment.clone(),
+            request_id: request.request_id.clone(),
+            request_hash: request.request_hash.clone(),
+            status: TerminalStatus::Applied,
+            effect: "IDENTITY_ADMITTED".into(),
+            amount_atomic: None,
+            custody_reference: None,
+            execution: None,
+            resolution: None,
+            projection_balance_updates: vec![],
+            genesis_ordinal: 0,
+            signature: String::new(),
+        };
+        receipt.signature = receipt_signature(&[9; 32], &receipt);
+        let result = DirectResult {
+            status: receipt.status.clone(),
+            effect: receipt.effect.clone(),
+            genesis_ordinal: receipt.genesis_ordinal,
+            receipt,
+        };
+        (request, result)
+    }
+
+    fn record() -> DirectJournalRecord {
+        let (request, result) = payload();
+        DirectJournalRecord::seal(
+            "writer-epoch-1",
+            1,
+            &"a".repeat(64),
+            &"b".repeat(64),
+            request,
+            result,
+            &[7; 32],
+            &[8; 32],
+            &[9; 32],
+        )
+        .unwrap()
+    }
+
+    fn journal_public_key() -> [u8; 32] {
+        journal_verifying_key(&[8; 32]).unwrap()
+    }
+
+    #[test]
+    fn journal_round_trip_is_bounded_and_authenticated() {
+        let record = record();
+        assert!(serde_cbor::to_vec(&record).unwrap().len() < 16 * 1024);
+        let payload = record
+            .open_successor(
+                "writer-epoch-1",
+                1,
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &[7; 32],
+                &journal_public_key(),
+                &[9; 32],
+            )
+            .unwrap();
+        assert_eq!(payload.request.request_id, "request-1");
+        assert_eq!(payload.result.effect, "IDENTITY_ADMITTED");
+    }
+
+    #[test]
+    fn journal_rejects_wrong_sequence_and_predecessor() {
+        let record = record();
+        assert_eq!(
+            record.open_successor(
+                "writer-epoch-1",
+                2,
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &[7; 32],
+                &journal_public_key(),
+                &[9; 32],
+            ),
+            Err(JournalError::Invalid)
+        );
+        assert_eq!(
+            record.open_successor(
+                "writer-epoch-1",
+                1,
+                &"d".repeat(64),
+                &"b".repeat(64),
+                &[7; 32],
+                &journal_public_key(),
+                &[9; 32],
+            ),
+            Err(JournalError::Invalid)
+        );
+    }
+
+    #[test]
+    fn journal_rejects_modified_ciphertext_and_signature() {
+        let mut tampered_ciphertext = record();
+        tampered_ciphertext.ciphertext[0] ^= 1;
+        assert!(tampered_ciphertext
+            .open_successor(
+                "writer-epoch-1",
+                1,
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &[7; 32],
+                &journal_public_key(),
+                &[9; 32],
+            )
+            .is_err());
+
+        let mut tampered_signature = record();
+        tampered_signature.signature.replace_range(..2, "00");
+        assert_eq!(
+            tampered_signature.open_successor(
+                "writer-epoch-1",
+                1,
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &[7; 32],
+                &journal_public_key(),
+                &[9; 32],
+            ),
+            Err(JournalError::Authentication)
+        );
+    }
+
+    #[test]
+    fn journal_chain_uses_the_complete_previous_record() {
+        let first = record();
+        let (mut request, result) = payload();
+        request.request_id = "request-2".into();
+        request.request_hash = request_hash(&request);
+        let mut result = result;
+        result.receipt.request_id = request.request_id.clone();
+        result.receipt.request_hash = request.request_hash.clone();
+        result.receipt.receipt_id = "d".repeat(64);
+        result.receipt.signature = receipt_signature(&[9; 32], &result.receipt);
+        let second = DirectJournalRecord::seal(
+            "writer-epoch-1",
+            2,
+            &first.record_hash().unwrap(),
+            &first.transition_root,
+            request,
+            result,
+            &[7; 32],
+            &[8; 32],
+            &[9; 32],
+        )
+        .unwrap();
+        assert!(second
+            .open_successor(
+                "writer-epoch-1",
+                2,
+                &first.record_hash().unwrap(),
+                &first.transition_root,
+                &[7; 32],
+                &journal_public_key(),
+                &[9; 32],
+            )
+            .is_ok());
+    }
+}
