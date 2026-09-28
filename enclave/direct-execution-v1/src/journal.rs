@@ -15,7 +15,10 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use thiserror::Error;
 
-use crate::{request_hash, sha256, verify_receipt, DirectRequest, DirectResult, EPOCH_ID};
+use crate::{
+    constant_time_eq, request_hash, sha256, sign as hmac_sign, verify_receipt, DirectRequest,
+    DirectResult, EPOCH_ID,
+};
 
 pub const DIRECT_JOURNAL_PROTOCOL: &str = "layrs.direct-execution.journal.v71";
 const JOURNAL_NONCE_DOMAIN: &[u8] = b"layrs.direct-execution.journal-nonce.v1\0";
@@ -58,6 +61,24 @@ pub struct DirectJournalRecord {
     pub nonce: Vec<u8>,
     pub ciphertext: Vec<u8>,
     pub ciphertext_hash: String,
+    pub signature: String,
+}
+
+/// Parent acknowledgement issued only after the exact journal record has been
+/// durably created and read back. The HMAC prevents an untrusted process from
+/// adopting an unpersisted or different candidate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JournalDurabilityAck {
+    pub epoch_id: String,
+    pub writer_epoch: String,
+    pub sequence: u64,
+    pub previous_record_hash: String,
+    pub record_hash: String,
+    pub transition_root: String,
+    pub request_index_root: String,
+    pub request_hash: String,
+    pub result_hash: String,
     pub signature: String,
 }
 
@@ -320,6 +341,52 @@ impl DirectJournalRecord {
     }
 
     fn signature_bytes(&self) -> Result<Vec<u8>, JournalError> {
+        let mut unsigned = self.clone();
+        unsigned.signature.clear();
+        serde_cbor::to_vec(&unsigned).map_err(|_| JournalError::Invalid)
+    }
+}
+
+impl JournalDurabilityAck {
+    pub fn issue(record: &DirectJournalRecord, key: &[u8]) -> Result<Self, JournalError> {
+        if key.len() < 32 {
+            return Err(JournalError::Invalid);
+        }
+        let mut ack = Self {
+            epoch_id: record.epoch_id.clone(),
+            writer_epoch: record.writer_epoch.clone(),
+            sequence: record.sequence,
+            previous_record_hash: record.previous_record_hash.clone(),
+            record_hash: record.record_hash()?,
+            transition_root: record.transition_root.clone(),
+            request_index_root: record.request_index_root.clone(),
+            request_hash: record.request_hash.clone(),
+            result_hash: record.result_hash.clone(),
+            signature: String::new(),
+        };
+        ack.signature = hmac_sign(key, &ack.unsigned_bytes()?);
+        Ok(ack)
+    }
+
+    pub fn verify_for(&self, record: &DirectJournalRecord, key: &[u8]) -> bool {
+        key.len() >= 32
+            && record
+                .record_hash()
+                .is_ok_and(|hash| hash == self.record_hash)
+            && self.epoch_id == record.epoch_id
+            && self.writer_epoch == record.writer_epoch
+            && self.sequence == record.sequence
+            && self.previous_record_hash == record.previous_record_hash
+            && self.transition_root == record.transition_root
+            && self.request_index_root == record.request_index_root
+            && self.request_hash == record.request_hash
+            && self.result_hash == record.result_hash
+            && self
+                .unsigned_bytes()
+                .is_ok_and(|bytes| constant_time_eq(&self.signature, &hmac_sign(key, &bytes)))
+    }
+
+    fn unsigned_bytes(&self) -> Result<Vec<u8>, JournalError> {
         let mut unsigned = self.clone();
         unsigned.signature.clear();
         serde_cbor::to_vec(&unsigned).map_err(|_| JournalError::Invalid)
@@ -698,5 +765,20 @@ mod tests {
                 &[9; 32],
             )
             .is_ok());
+    }
+
+    #[test]
+    fn durability_ack_is_bound_to_the_exact_journal_candidate() {
+        let record = record();
+        let ack = JournalDurabilityAck::issue(&record, &[6; 32]).unwrap();
+        assert!(ack.verify_for(&record, &[6; 32]));
+        assert!(!ack.verify_for(&record, &[5; 32]));
+
+        let mut changed = record;
+        changed.request_index_root = "d".repeat(64);
+        assert!(!ack.verify_for(&changed, &[6; 32]));
+        let mut changed_ack = ack;
+        changed_ack.sequence += 1;
+        assert!(!changed_ack.verify_for(&changed, &[6; 32]));
     }
 }
