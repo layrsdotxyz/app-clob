@@ -30,6 +30,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod direct_frame;
 mod external_effect;
 pub mod journal;
 mod quest_receipts;
@@ -50,6 +51,10 @@ pub const EVIDENCE_MANIFEST_SHA256: &str =
     "70e579f630c759258728d91cb957fa84e200674aeebd3eae5997430a62203957";
 pub const TRANSACTION_MODEL: &str = "layrs.direct-execution.v1";
 pub const PROJECTION_SCHEMA_VERSION: u32 = 1;
+/// v70 bridge bound for archived successors and compact checkpoint receipts.
+/// The transport byte ceiling remains the tighter production bound; this
+/// count guard prevents adversarial tiny-record expansion during decoding.
+pub const MAX_V70_LINEAGE_RECORDS: usize = 250_000;
 /// Domain separator for the browser-verifiable commitment carried in Nitro
 /// attestation `user_data`.  The commitment is fixed-width so it remains well
 /// below Nitro's 512-byte user-data limit even when governed runtime metadata
@@ -507,7 +512,7 @@ pub struct CommittedRestoreFrontier {
 }
 impl CommittedRestoreFrontier {
     pub fn valid(&self) -> bool {
-        self.sequence > 0 && self.sequence <= 100_000
+        self.sequence > 0 && self.sequence <= MAX_V70_LINEAGE_RECORDS as u64
             && [&self.state_hash, &self.artifact_hash].iter().all(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
     }
     pub fn accepts_checkpoint(&self, checkpoint: &DirectCheckpoint) -> bool {
@@ -2465,7 +2470,7 @@ impl DirectRuntime {
         Ok(self)
     }
     fn validate_checkpoint_records(&self, checkpoint: &DirectCheckpoint) -> Result<(), RuntimeError> {
-        if checkpoint.artifact.sequence == 0 || checkpoint.receipt_records.len() > 100_000
+        if checkpoint.artifact.sequence == 0 || checkpoint.receipt_records.len() > MAX_V70_LINEAGE_RECORDS
             || checkpoint.receipt_records.len() as u64 != checkpoint.artifact.sequence
             || checkpoint.artifact_hashes.len() != checkpoint.receipt_records.len()
             || checkpoint.artifact_hashes.iter().any(|hash| hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
@@ -4992,6 +4997,11 @@ mod tests {
         let mut changed = frontier.clone(); changed.state_hash = "a".repeat(64); assert!(!changed.accepts_checkpoint(&checkpoint));
         let mut changed = frontier.clone(); changed.artifact_hash = "a".repeat(64); assert!(!changed.accepts_checkpoint(&checkpoint));
         let mut changed = frontier; changed.sequence = 0; assert!(!changed.valid()); assert!(!changed.accepts_checkpoint(&checkpoint));
+        let mut boundary = changed;
+        boundary.sequence = MAX_V70_LINEAGE_RECORDS as u64;
+        assert!(boundary.valid());
+        boundary.sequence += 1;
+        assert!(!boundary.valid());
     }
     #[test]
     fn checkpoint_bootstrap_certificate_binds_exact_snapshot_history_and_existing_governance_key() {
@@ -7098,5 +7108,150 @@ mod tests {
                 if added == 0 { 0 } else { incremental as u64 / added },
             );
         }
+    }
+
+    fn process_high_water_kib() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status.lines().find_map(|line| {
+                    line.strip_prefix("VmHWM:")?
+                        .split_whitespace()
+                        .next()?
+                        .parse()
+                        .ok()
+                })
+            })
+            .unwrap_or_default()
+    }
+
+    /// Conservative local RSS benchmark for the v70 frame bridge. It holds
+    /// the source runtime while measuring candidate commit, checkpoint seal,
+    /// checkpoint encoding, and restore, matching the enclave's worst overlap
+    /// more closely than measuring serialized bytes alone.
+    #[test]
+    #[ignore = "local memory benchmark; set LAYRS_BRIDGE_BENCH_RECORDS"]
+    fn v70_bridge_commit_checkpoint_and_restore_memory_benchmark() {
+        let target: u64 = std::env::var("LAYRS_BRIDGE_BENCH_RECORDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(10_000);
+        assert!(target >= 3 && target <= MAX_V70_LINEAGE_RECORDS as u64);
+
+        let started = std::time::Instant::now();
+        let (mut live, subject, identity, wallet, store) = bus_fixture();
+        let mut records = v70_sorted_artifacts(&store)
+            .into_iter()
+            .map(|mut artifact| {
+                artifact.ciphertext.clear();
+                artifact
+            })
+            .collect::<Vec<_>>();
+        let mut root = records.last().unwrap().state_hash.clone();
+        while live.committed_sequence() < target {
+            let sequence = live.committed_sequence() + 1;
+            let id = Uuid::from_u128(0x71717171222243338444000000000000 + sequence as u128)
+                .to_string();
+            let request = request_for(
+                &subject,
+                &identity,
+                &id,
+                DirectAction::BeginUsdcBusWithdrawal {
+                    withdrawal_id: id.clone(),
+                    destination_chain: "arbitrum".into(),
+                    asset: "USDC".into(),
+                    destination: wallet.clone(),
+                    amount_atomic: "999999999999999".into(),
+                },
+            );
+            let result = live.execute(request.clone()).unwrap();
+            assert_eq!(result.effect, "WITHDRAWAL_REJECTED");
+            let next_root = sha256(format!("v70-bridge-benchmark:{sequence}").as_bytes());
+            records.push(DirectStateArtifact {
+                epoch_id: EPOCH_ID.into(),
+                sequence,
+                prior_state_hash: root,
+                state_hash: next_root.clone(),
+                request_hash: request.request_hash,
+                nonce: Vec::new(),
+                ciphertext: Vec::new(),
+                ciphertext_hash: String::new(),
+                receipt: result.receipt,
+            });
+            root = next_root;
+        }
+        eprintln!(
+            "BRIDGE_MEMORY stage=fixture records={target} elapsed_ms={} vmhwm_kib={}",
+            started.elapsed().as_millis(),
+            process_high_water_kib()
+        );
+
+        let next_sequence = live.committed_sequence() + 1;
+        let next_id = Uuid::from_u128(
+            0x72727272222243338444000000000000 + next_sequence as u128,
+        )
+        .to_string();
+        let next = request_for(
+            &subject,
+            &identity,
+            &next_id,
+            DirectAction::BeginUsdcBusWithdrawal {
+                withdrawal_id: next_id.clone(),
+                destination_chain: "arbitrum".into(),
+                asset: "USDC".into(),
+                destination: wallet.clone(),
+                amount_atomic: "999999999999999".into(),
+            },
+        );
+        let commit_started = std::time::Instant::now();
+        let candidate = live.prepare_candidate(next, &[8; 32]).unwrap();
+        assert_eq!(candidate.artifact.sequence, next_sequence);
+        eprintln!(
+            "BRIDGE_MEMORY stage=commit elapsed_ms={} artifact_bytes={} vmhwm_kib={}",
+            commit_started.elapsed().as_millis(),
+            serde_cbor::to_vec(&candidate.artifact).unwrap().len(),
+            process_high_water_kib()
+        );
+        drop(candidate);
+
+        let last = records.pop().unwrap();
+        let artifact = live
+            .seal_artifact(
+                &last.prior_state_hash,
+                &last.request_hash,
+                &[8; 32],
+                last.receipt,
+            )
+            .unwrap();
+        let mut compact_head = artifact.clone();
+        compact_head.ciphertext.clear();
+        records.push(compact_head);
+        let mut artifact_hashes = vec!["a".repeat(64); records.len()];
+        *artifact_hashes.last_mut().unwrap() = artifact_hash(&artifact);
+
+        let checkpoint_started = std::time::Instant::now();
+        let checkpoint = live
+            .seal_checkpoint(artifact, records, artifact_hashes, &[8; 32])
+            .unwrap();
+        let checkpoint_bytes = serde_cbor::to_vec(&checkpoint).unwrap().len();
+        assert!(checkpoint_bytes < crate::direct_frame::MAX_FRAME_BYTES);
+        eprintln!(
+            "BRIDGE_MEMORY stage=checkpoint elapsed_ms={} checkpoint_bytes={} vmhwm_kib={}",
+            checkpoint_started.elapsed().as_millis(),
+            checkpoint_bytes,
+            process_high_water_kib()
+        );
+
+        let restore_started = std::time::Instant::now();
+        let restored = runtime(RuntimeMode::IsolatedTest)
+            .restore_checkpoint(&checkpoint, &[8; 32])
+            .unwrap();
+        assert_eq!(restored.committed_sequence(), target);
+        assert_eq!(restored.committed_state_hash(), live.committed_state_hash());
+        eprintln!(
+            "BRIDGE_MEMORY stage=restore elapsed_ms={} vmhwm_kib={}",
+            restore_started.elapsed().as_millis(),
+            process_high_water_kib()
+        );
     }
 }

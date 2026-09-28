@@ -32,6 +32,7 @@ use chacha20poly1305::{
 };
 use hmac::{Hmac, Mac};
 use layrs_direct_execution_v1::{
+    direct_frame::{CHECKPOINT_FRAME_OVERSIZED, MAX_FRAME_BYTES},
     artifact_hash, identity_commitment_for, reference_for, relay_reference_for, relay_result_hash,valid_layrs_withdrawal_destination,
     relay_reverted_result_hash, request_hash, sha256, sign, DirectAction, DirectReceipt,
     DirectRequest, DirectResult, DirectStateArtifact, DurabilityAck, ExternalEffectIntent,
@@ -40,7 +41,7 @@ use layrs_direct_execution_v1::{
     GovernedMarketResolution, ImmutableExternalEffectIntentStore, OrderAction, Outcome,
     ProjectionBalanceRow, ProjectionIdentityRow, ProjectionWalletRow, RelayWithdrawalBinding,
     RuntimeMeasurementBinding, RuntimeRequest, RuntimeResponse, SealedEpoch, TimeInForce,
-    WriterGrant, EPOCH_ID, POSTGRES_PROJECTION_DDL,
+    WriterGrant, EPOCH_ID, MAX_V70_LINEAGE_RECORDS, POSTGRES_PROJECTION_DDL,
 };
 use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
@@ -75,6 +76,7 @@ use tokio_postgres::{Client, NoTls};
 use tokio_vsock::{VsockAddr, VsockStream};
 const ENCLOSURE_PORT: u32 = 5_003;
 const ENCLOSURE_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+const CHECKPOINT_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Process exit status that tells systemd the enclave holds stale state from a
 /// previous parent and must be recreated before the parent starts again.
 const ENCLAVE_RESET_EXIT_STATUS: i32 = 3;
@@ -110,10 +112,6 @@ where
     preflight.await?;
     bootstrap.await
 }
-// The enclave's finite parent-only VSOCK recovery ceiling, from the same file.
-#[path = "../direct_frame.rs"]
-mod direct_frame;
-use direct_frame::{CHECKPOINT_FRAME_OVERSIZED, MAX_FRAME_BYTES};
 // Fixed encrypted-download window, not a verification bypass.
 const RESTORE_PREFETCH_WIDTH: usize = 4;
 fn restore_prefetch_ranges(total: usize) -> Vec<std::ops::Range<usize>> {
@@ -269,10 +267,12 @@ enum CheckpointRefreshOutcome {
 struct CheckpointRefresh {
     running: bool,
     requested: bool,
+    disabled: bool,
     next_start: Option<tokio::time::Instant>,
 }
 impl CheckpointRefresh {
     fn request(&mut self) -> bool {
+        if self.disabled { return false; }
         self.requested = true;
         if self.running { false } else { self.running = true; true }
     }
@@ -293,6 +293,7 @@ impl CheckpointRefresh {
             // a later commit may request one more interval-spaced attempt.
             CheckpointRefreshOutcome::Skipped => {
                 self.requested = false;
+                self.disabled = true;
                 false
             }
         };
@@ -2003,7 +2004,7 @@ impl S3ImmutableArtifactStore {
         let artifact: DirectStateArtifact = serde_cbor::from_slice(&self.read(&key).await?)
             .map_err(|_| "checkpoint head decode failed")?;
         if receipt_only_record(&artifact) != *head { return Err("checkpoint head mismatch".into()); }
-        let response = exchange(state, RuntimeRequest::SealCheckpoint { artifact, receipt_records: records, artifact_hashes })
+        let response = exchange_with_timeout(state, RuntimeRequest::SealCheckpoint { artifact, receipt_records: records, artifact_hashes }, CHECKPOINT_EXCHANGE_TIMEOUT)
             .await.map_err(|error| if frame_oversized(&error) { CHECKPOINT_OVERSIZED } else { "checkpoint seal transport failed" })?;
         let checkpoint = match response {
             RuntimeResponse::CheckpointSealed { checkpoint } => checkpoint,
@@ -2018,10 +2019,17 @@ impl S3ImmutableArtifactStore {
     /// Runs only after the final encrypted head is verified and adopted. The
     /// immutable archive stays authoritative and the prior checkpoint stays in
     /// place, so a failed seal is diagnosed but never fails the restore.
-    async fn seed_restored_checkpoint(&self, state: &AppState) {
-        if let Err(error) = self.seal_current_checkpoint(state).await {
-            let reason = checkpoint_seal_reason(&error);
-            eprintln!("VERIFIED_ARCHIVE_RESTORE_CHECKPOINT_SKIPPED reason={reason}");
+    async fn schedule_restored_checkpoint(&self, state: &AppState) {
+        if self.checkpoint_refresh_gate.lock().await.request() {
+            let store = self.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                let (store, state) = (&store, &state);
+                refresh_checkpoints(&store.checkpoint_refresh_gate, move || {
+                    store.seal_current_checkpoint(state)
+                })
+                .await;
+            });
         }
     }
     async fn from_environment() -> Result<Self, Box<dyn std::error::Error>> {
@@ -2348,7 +2356,7 @@ impl S3ImmutableArtifactStore {
                         .to_string(),
                 );
             }
-            if keys.len() > 100_000 {
+            if keys.len() > MAX_V70_LINEAGE_RECORDS {
                 return Err("archive exceeds finite restore bound".into());
             }
             if !page.is_truncated.unwrap_or(false) {
@@ -2603,9 +2611,10 @@ impl S3ImmutableArtifactStore {
             .map(|head| head.artifact_hash.clone())
             .collect();
         *state.committed_state_root.lock().await = Some(root);
-        // Seed the optimization before allowing this restored writer to serve.
-        // A corrupt existing checkpoint is never silently bypassed above.
-        self.seed_restored_checkpoint(state).await;
+        // Seed the optimization without delaying restored service. A corrupt
+        // existing checkpoint is never silently bypassed above; only creation
+        // of a fresh recovery optimization is detached and non-fatal.
+        self.schedule_restored_checkpoint(state).await;
         eprintln!("VERIFIED_ARCHIVE_RESTORE_COMPLETE {}", keys.len());
         Ok(())
     }
@@ -4902,7 +4911,14 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
             == 0
 }
 async fn exchange(state: &AppState, request: RuntimeRequest) -> io::Result<RuntimeResponse> {
-    let response = bounded_enclave_stage(ENCLOSURE_EXCHANGE_TIMEOUT, async {
+    exchange_with_timeout(state, request, ENCLOSURE_EXCHANGE_TIMEOUT).await
+}
+async fn exchange_with_timeout(
+    state: &AppState,
+    request: RuntimeRequest,
+    duration: Duration,
+) -> io::Result<RuntimeResponse> {
+    let response = bounded_enclave_stage(duration, async {
         let mut stream =
             VsockStream::connect(VsockAddr::new(state.enclave_cid, ENCLOSURE_PORT)).await?;
         write_frame(&mut stream, &serde_cbor::to_vec(&request).map_err(invalid)?).await?;
@@ -6115,9 +6131,10 @@ mod tests {
         assert!(!refresh.request()); // commit coalesced into the running refresh
         assert!(!refresh.finish(CheckpointRefreshOutcome::Skipped));
         assert!(!refresh.running && !refresh.requested);
-        // A later commit may start one more attempt, spaced by the interval.
-        assert!(refresh.request());
-        assert_eq!(refresh.delay(now), CHECKPOINT_REFRESH_INTERVAL);
+        assert!(refresh.disabled);
+        // State can only grow after a proven frame overflow. Do not consume
+        // CPU retrying on every later commit; restart or upgrade resets it.
+        assert!(!refresh.request());
     }
     #[tokio::test]
     async fn background_refresh_seals_an_oversized_checkpoint_once_then_exits() {
@@ -6133,7 +6150,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), refresh).await.expect("oversized refresh must not retry");
         assert_eq!(attempts, 1);
         let state = gate.lock().await;
-        assert!(!state.running && !state.requested);
+        assert!(!state.running && !state.requested && state.disabled);
     }
     #[tokio::test]
     async fn background_refresh_retries_other_failures_only_after_the_interval() {
@@ -6158,7 +6175,7 @@ mod tests {
     }
     #[tokio::test]
     async fn parent_frame_limit_matches_enclave_and_marks_oversized_frames() {
-        assert_eq!(MAX_FRAME_BYTES, 512 * 1024 * 1024);
+        assert_eq!(MAX_FRAME_BYTES, 768 * 1024 * 1024);
         let (mut writer, mut reader) = tokio::io::duplex(64);
         write_frame(&mut writer, b"bounded").await.unwrap();
         assert_eq!(read_frame(&mut reader).await.unwrap(), b"bounded");
@@ -6214,7 +6231,7 @@ mod tests {
         };
         assert_eq!(store.seal_current_checkpoint(&state).await.unwrap_err(), "checkpoint head mismatch");
         // restore_streamed's final step: the same failure is only diagnosed.
-        let _: () = store.seed_restored_checkpoint(&state).await;
+        store.schedule_restored_checkpoint(&state).await;
         server.await.unwrap();
         // The verified restore adoption is untouched by the failed seal.
         assert_eq!(store.verified_receipt_records.lock().await.as_deref(), Some(&[head.clone()][..]));

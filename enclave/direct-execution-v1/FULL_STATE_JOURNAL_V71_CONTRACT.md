@@ -46,6 +46,11 @@ The bridge keeps every v70 artifact and checkpoint byte-compatible. It may:
 - replace the fixed 100,000-record validation limit only with a bounded,
   memory-benchmarked limit or a streaming-equivalent validation path.
 
+The implemented bridge uses one shared 768 MiB parent/enclave frame ceiling
+and a 250,000-record lineage guard. The byte ceiling remains tighter for normal
+records. `V70_BRIDGE_BENCHMARK.md` records the synthetic 200,000-record memory,
+commit, checkpoint, and restore measurements used to accept those bounds.
+
 It may not make artifact validation, lineage validation, receipt signature
 validation, or committed-head validation optional.
 

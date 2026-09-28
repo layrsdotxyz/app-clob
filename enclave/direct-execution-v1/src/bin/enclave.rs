@@ -10,6 +10,7 @@ use aws_nitro_enclaves_nsm_api::{
 };
 use hmac::{Hmac, Mac};
 use layrs_direct_execution_v1::{
+    direct_frame::{CHECKPOINT_FRAME_OVERSIZED, MAX_FRAME_BYTES},
     runtime_binding, runtime_binding_commitment, quest_receipt_public_key, quest_receipt_attestation_commitment, DirectRuntime, InMemoryDirectStateStore,
     RuntimeMeasurementBinding, RuntimeMode, RuntimeRequest, RuntimeResponse, SealedEpoch,
     WriterGrant, EPOCH_ID, TRANSACTION_MODEL,
@@ -26,10 +27,6 @@ use tokio::{
 };
 use tokio_vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
 use zeroize::Zeroize;
-
-#[path = "../direct_frame.rs"]
-mod direct_frame;
-use direct_frame::{CHECKPOINT_FRAME_OVERSIZED, MAX_FRAME_BYTES};
 
 const PORT: u32 = 5_003;
 
@@ -936,7 +933,7 @@ mod tests {
 
     #[tokio::test]
     async fn frame_limit_round_trips_exact_limit_and_rejects_one_over() {
-        assert_eq!(MAX_FRAME_BYTES, 512 * 1024 * 1024);
+        assert_eq!(MAX_FRAME_BYTES, 768 * 1024 * 1024);
         let expected = vec![0x5a; MAX_FRAME_BYTES];
         let (mut writer, mut reader) = tokio::io::duplex(TEST_VSOCK_BUFFER_BYTES);
         let write = tokio::spawn(async move { write_frame(&mut writer, &expected).await });
