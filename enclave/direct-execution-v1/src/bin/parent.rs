@@ -43,6 +43,9 @@ use layrs_direct_execution_v1::{
     RuntimeMeasurementBinding, RuntimeRequest, RuntimeResponse, SealedEpoch, TimeInForce,
     WriterGrant, EPOCH_ID, MAX_V70_LINEAGE_RECORDS, POSTGRES_PROJECTION_DDL,
 };
+use layrs_direct_execution_v1::journal::{
+    canonical_receipt_hash, canonical_result_hash, DirectJournalRecord, DIRECT_JOURNAL_PROTOCOL,
+};
 use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
     pkcs8::DecodePrivateKey,
@@ -1813,6 +1816,142 @@ fn archive_key_sequence(key: &str, namespace: &str, hash_required: bool) -> Resu
         return Err("archive key format invalid".into());
     }
     seq.parse().map_err(|_| "archive sequence overflow".into())
+}
+
+// v71 parent journal helpers (V71_PARENT_JOURNAL_PLAN.md section 3.3). Pure and
+// I/O-free; nothing on the v70 path calls them until the v71 append/restore
+// path is wired.
+
+/// Parent-side cap on one encoded journal record. A single create-only PUT
+/// carries it, so it stays well below the 16 MiB bound and the VSOCK frame.
+#[cfg_attr(not(test), allow(dead_code))]
+const MAX_JOURNAL_RECORD_BYTES: usize = 8 * 1024 * 1024;
+const _: () = assert!(MAX_JOURNAL_RECORD_BYTES < 16 * 1024 * 1024);
+const _: () = assert!(MAX_JOURNAL_RECORD_BYTES <= MAX_FRAME_BYTES);
+
+/// Last durable journal record as proven by restore or the preceding commit.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct JournalHead {
+    writer_epoch: String,
+    sequence: u64,
+    record_hash: String,
+    transition_root: String,
+}
+
+/// v71 records occupy the v70 head slot so both formats contend for one
+/// create-only key per sequence.
+#[cfg_attr(not(test), allow(dead_code))]
+fn journal_record_key(prefix: &str, sequence: u64) -> String {
+    archive_head_key(prefix, sequence)
+}
+
+/// Strict inverse of `journal_record_key`. Legacy `{seq}-{hash}` head names,
+/// unpadded, foreign, overflowing, zero, or otherwise noncanonical keys are
+/// never valid journal records.
+#[cfg_attr(not(test), allow(dead_code))]
+fn journal_record_key_sequence(key: &str, prefix: &str) -> Result<u64, String> {
+    let namespace = format!("{prefix}/heads/");
+    if key
+        .strip_prefix(namespace.as_str())
+        .is_some_and(|name| name.contains('-'))
+    {
+        return Err("journal record key legacy suffix".into());
+    }
+    let sequence = archive_key_sequence(key, &namespace, false)?;
+    if sequence == 0 || journal_record_key(prefix, sequence) != key {
+        return Err("journal record key noncanonical".into());
+    }
+    Ok(sequence)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn journal_checkpoint_key(prefix: &str, sequence: u64, bytes: &[u8]) -> String {
+    format!(
+        "{prefix}/journal-v71/checkpoints/{sequence:020}-{}.cbor",
+        sha256(bytes)
+    )
+}
+
+/// Plan section 4 step 2: the candidate must extend `head` exactly. Returns
+/// the canonical CBOR bytes to PUT. Any failure must not touch storage.
+#[cfg_attr(not(test), allow(dead_code))]
+fn precheck_journal_candidate(
+    head: &JournalHead,
+    record: &DirectJournalRecord,
+) -> Result<Vec<u8>, &'static str> {
+    if record.protocol != DIRECT_JOURNAL_PROTOCOL {
+        return Err("journal candidate protocol invalid");
+    }
+    if record.epoch_id != EPOCH_ID {
+        return Err("journal candidate epoch invalid");
+    }
+    if record.writer_epoch != head.writer_epoch {
+        return Err("journal candidate writer epoch mismatch");
+    }
+    let next = head
+        .sequence
+        .checked_add(1)
+        .ok_or("journal candidate sequence overflow")?;
+    if record.sequence != next {
+        return Err("journal candidate sequence mismatch");
+    }
+    if record.previous_record_hash != head.record_hash {
+        return Err("journal candidate previous record mismatch");
+    }
+    if record.previous_transition_root != head.transition_root {
+        return Err("journal candidate previous transition root mismatch");
+    }
+    let bytes = serde_cbor::to_vec(record).map_err(|_| "journal candidate encoding failed")?;
+    if bytes.len() > MAX_JOURNAL_RECORD_BYTES {
+        return Err("journal candidate oversized");
+    }
+    let decoded: DirectJournalRecord =
+        serde_cbor::from_slice(&bytes).map_err(|_| "journal candidate encoding failed")?;
+    if decoded != *record {
+        return Err("journal candidate encoding noncanonical");
+    }
+    Ok(bytes)
+}
+
+/// Tail keys listed after `after` must be canonical record keys for exactly
+/// `after+1..=after+n`, with no gap or duplicate, and `n <= max`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn validate_journal_tail_keys(
+    keys: &[String],
+    prefix: &str,
+    after: u64,
+    max: usize,
+) -> Result<Vec<(u64, String)>, String> {
+    if keys.len() > max {
+        return Err("journal tail exceeds bound".into());
+    }
+    let mut tail = Vec::with_capacity(keys.len());
+    let mut previous = after;
+    for key in keys {
+        let sequence = journal_record_key_sequence(key, prefix)?;
+        let expected = previous
+            .checked_add(1)
+            .ok_or("journal tail sequence overflow")?;
+        if sequence == previous {
+            return Err("journal tail duplicate key".into());
+        }
+        if sequence != expected {
+            return Err("journal tail sequence gap".into());
+        }
+        tail.push((sequence, key.clone()));
+        previous = sequence;
+    }
+    Ok(tail)
+}
+
+/// The enclave terminal after a durable append must be the exact result the
+/// record committed to, under the same canonical hashes the journal uses.
+#[cfg_attr(not(test), allow(dead_code))]
+fn verify_terminal_matches_record(result: &DirectResult, record: &DirectJournalRecord) -> bool {
+    canonical_result_hash(result).is_ok_and(|hash| hash == record.result_hash)
+        && canonical_receipt_hash(result).is_ok_and(|hash| hash == record.receipt_hash)
+        && result.receipt.request_hash == record.request_hash
 }
 
 /// Resolve legacy duplicate heads by walking backward from the unique tip.
@@ -7732,5 +7871,269 @@ mod tests {
             "0x0000000000000000000000000000000000000000",
             "0x0000000000000000000000000000000000000000"
         ));
+    }
+
+
+    fn v71_head() -> JournalHead {
+        JournalHead {
+            writer_epoch: "writer-epoch-1".into(),
+            sequence: 41,
+            record_hash: "a".repeat(64),
+            transition_root: "b".repeat(64),
+        }
+    }
+
+    fn v71_candidate() -> (DirectResult, DirectJournalRecord) {
+        let mut request = DirectRequest {
+            account_id: "account".into(),
+            identity_commitment: "identity".into(),
+            request_id: "request-42".into(),
+            request_hash: String::new(),
+            financial_wallet_address: None,
+            action: DirectAction::AdmitIdentity {
+                wallet_address: "0x1111111111111111111111111111111111111111".into(),
+            },
+        };
+        request.request_hash = request_hash(&request);
+        let mut receipt = DirectReceipt {
+            receipt_id: "c".repeat(64),
+            account_id: request.account_id.clone(),
+            identity_commitment: request.identity_commitment.clone(),
+            request_id: request.request_id.clone(),
+            request_hash: request.request_hash.clone(),
+            status: layrs_direct_execution_v1::TerminalStatus::Applied,
+            effect: "IDENTITY_ADMITTED".into(),
+            amount_atomic: None,
+            custody_reference: None,
+            execution: None,
+            resolution: None,
+            projection_balance_updates: vec![],
+            genesis_ordinal: 0,
+            signature: String::new(),
+        };
+        receipt.signature = layrs_direct_execution_v1::receipt_signature(&[9; 32], &receipt);
+        let result = DirectResult {
+            status: receipt.status.clone(),
+            effect: receipt.effect.clone(),
+            genesis_ordinal: receipt.genesis_ordinal,
+            receipt,
+        };
+        let head = v71_head();
+        let record = DirectJournalRecord::seal(
+            &head.writer_epoch,
+            head.sequence + 1,
+            &head.record_hash,
+            &head.transition_root,
+            &"e".repeat(64),
+            &"f".repeat(64),
+            request,
+            result.clone(),
+            &[7; 32],
+            &[8; 32],
+            &[9; 32],
+        )
+        .unwrap();
+        (result, record)
+    }
+
+    #[test]
+    fn v71_record_key_shares_v70_head_slot_and_parser_rejects_legacy_and_foreign_keys() {
+        let prefix = "archive/epoch";
+        for sequence in [1, 42, u64::MAX] {
+            let key = journal_record_key(prefix, sequence);
+            assert_eq!(key, archive_head_key(prefix, sequence));
+            assert_eq!(journal_record_key_sequence(&key, prefix), Ok(sequence));
+        }
+        assert_eq!(
+            journal_record_key(prefix, 42),
+            "archive/epoch/heads/00000000000000000042.cbor"
+        );
+
+        let legacy = format!(
+            "{prefix}/heads/00000000000000000042-{}.cbor",
+            "d".repeat(64)
+        );
+        // The v70 parser admits the legacy name; the journal parser never does.
+        assert_eq!(
+            archive_key_sequence(&legacy, &format!("{prefix}/heads/"), false),
+            Ok(42)
+        );
+        for key in [
+            legacy,
+            format!("{prefix}/heads/00000000000000000042-.cbor"),
+            format!("{prefix}/heads/42.cbor"),
+            format!("{prefix}/heads/0000000000000000042.cbor"),
+            format!("{prefix}/heads/000000000000000000042.cbor"),
+            format!("{prefix}/heads/+0000000000000000042.cbor"),
+            format!("{prefix}/heads/0000000000000000004a.cbor"),
+            format!("{prefix}/heads/00000000000000000000.cbor"),
+            format!("{prefix}/heads/18446744073709551616.cbor"),
+            format!("{prefix}/heads/99999999999999999999.cbor"),
+            format!("{prefix}/heads/00000000000000000042.CBOR"),
+            format!("{prefix}/heads/00000000000000000042.cbor.tmp"),
+            format!("{prefix}/heads/nested/00000000000000000042.cbor"),
+            format!("{prefix}/artifacts/00000000000000000042.cbor"),
+            format!("{prefix}/journal-v71/checkpoints/00000000000000000042.cbor"),
+            format!("other/heads/00000000000000000042.cbor"),
+            format!("{prefix}-other/heads/00000000000000000042.cbor"),
+            format!("/{prefix}/heads/00000000000000000042.cbor"),
+            String::new(),
+        ] {
+            assert!(journal_record_key_sequence(&key, prefix).is_err(), "{key}");
+        }
+
+        let checkpoint = journal_checkpoint_key(prefix, 42, b"checkpoint");
+        assert_eq!(
+            checkpoint,
+            format!(
+                "{prefix}/journal-v71/checkpoints/00000000000000000042-{}.cbor",
+                sha256(b"checkpoint")
+            )
+        );
+        assert_ne!(
+            checkpoint,
+            journal_checkpoint_key(prefix, 42, b"checkpoint2")
+        );
+        assert!(journal_record_key_sequence(&checkpoint, prefix).is_err());
+    }
+
+    #[test]
+    fn v71_precheck_rejects_wrong_epoch_sequence_predecessor_root_protocol_and_size() {
+        let head = v71_head();
+        let (_, record) = v71_candidate();
+        assert_eq!(
+            precheck_journal_candidate(&head, &record),
+            Ok(serde_cbor::to_vec(&record).unwrap())
+        );
+
+        let reject = |mutate: &dyn Fn(&mut DirectJournalRecord), expected: &str| {
+            let mut candidate = record.clone();
+            mutate(&mut candidate);
+            assert_eq!(precheck_journal_candidate(&head, &candidate), Err(expected));
+        };
+        reject(
+            &|r| r.protocol = "layrs.direct-execution.journal.v70".into(),
+            "journal candidate protocol invalid",
+        );
+        reject(
+            &|r| r.epoch_id = "other-epoch".into(),
+            "journal candidate epoch invalid",
+        );
+        reject(
+            &|r| r.writer_epoch = "writer-epoch-2".into(),
+            "journal candidate writer epoch mismatch",
+        );
+        reject(&|r| r.sequence = 41, "journal candidate sequence mismatch");
+        reject(&|r| r.sequence = 43, "journal candidate sequence mismatch");
+        reject(&|r| r.sequence = 0, "journal candidate sequence mismatch");
+        reject(
+            &|r| r.previous_record_hash = "d".repeat(64),
+            "journal candidate previous record mismatch",
+        );
+        reject(
+            &|r| r.previous_transition_root = "d".repeat(64),
+            "journal candidate previous transition root mismatch",
+        );
+        reject(
+            &|r| r.ciphertext = vec![0; MAX_JOURNAL_RECORD_BYTES],
+            "journal candidate oversized",
+        );
+
+        let mut exhausted = head.clone();
+        exhausted.sequence = u64::MAX;
+        let mut candidate = record.clone();
+        candidate.sequence = u64::MAX;
+        assert_eq!(
+            precheck_journal_candidate(&exhausted, &candidate),
+            Err("journal candidate sequence overflow")
+        );
+    }
+
+    #[test]
+    fn v71_tail_keys_reject_gap_duplicate_legacy_overflow_and_bound() {
+        let prefix = "archive/epoch";
+        let keys = |sequences: &[u64]| -> Vec<String> {
+            sequences
+                .iter()
+                .map(|s| journal_record_key(prefix, *s))
+                .collect()
+        };
+        assert_eq!(validate_journal_tail_keys(&[], prefix, 7, 0), Ok(vec![]));
+        assert_eq!(
+            validate_journal_tail_keys(&keys(&[8, 9, 10]), prefix, 7, 3),
+            Ok(vec![
+                (8, journal_record_key(prefix, 8)),
+                (9, journal_record_key(prefix, 9)),
+                (10, journal_record_key(prefix, 10)),
+            ])
+        );
+        assert_eq!(
+            validate_journal_tail_keys(&keys(&[8, 9, 10]), prefix, 7, 2),
+            Err("journal tail exceeds bound".into())
+        );
+        assert_eq!(
+            validate_journal_tail_keys(&keys(&[9]), prefix, 7, 3),
+            Err("journal tail sequence gap".into())
+        );
+        assert_eq!(
+            validate_journal_tail_keys(&keys(&[7, 8]), prefix, 7, 3),
+            Err("journal tail duplicate key".into())
+        );
+        assert_eq!(
+            validate_journal_tail_keys(&keys(&[8, 8]), prefix, 7, 3),
+            Err("journal tail duplicate key".into())
+        );
+        assert_eq!(
+            validate_journal_tail_keys(&keys(&[8, 10, 9]), prefix, 7, 3),
+            Err("journal tail sequence gap".into())
+        );
+        assert_eq!(
+            validate_journal_tail_keys(&keys(&[u64::MAX]), prefix, u64::MAX, 1),
+            Err("journal tail sequence overflow".into())
+        );
+        let mut legacy = keys(&[8]);
+        legacy.push(format!(
+            "{prefix}/heads/00000000000000000009-{}.cbor",
+            "d".repeat(64)
+        ));
+        assert_eq!(
+            validate_journal_tail_keys(&legacy, prefix, 7, 3),
+            Err("journal record key legacy suffix".into())
+        );
+        let mut foreign = keys(&[8]);
+        foreign.push(format!("other/heads/{:020}.cbor", 9));
+        assert!(validate_journal_tail_keys(&foreign, prefix, 7, 3).is_err());
+        let mut overflow = keys(&[8]);
+        overflow.push(format!("{prefix}/heads/99999999999999999999.cbor"));
+        assert_eq!(
+            validate_journal_tail_keys(&overflow, prefix, 7, 3),
+            Err("archive sequence overflow".into())
+        );
+    }
+
+    #[test]
+    fn v71_terminal_must_match_record_result_receipt_and_request_hashes() {
+        let (result, record) = v71_candidate();
+        assert!(verify_terminal_matches_record(&result, &record));
+
+        let mut other = result.clone();
+        other.effect = "IDENTITY_REJECTED".into();
+        assert!(!verify_terminal_matches_record(&other, &record));
+
+        let mut other = result.clone();
+        other.receipt.receipt_id = "d".repeat(64);
+        assert!(!verify_terminal_matches_record(&other, &record));
+
+        let mut other = result.clone();
+        other.receipt.request_hash = "d".repeat(64);
+        assert!(!verify_terminal_matches_record(&other, &record));
+
+        let mut other = record.clone();
+        other.request_hash = "d".repeat(64);
+        assert!(!verify_terminal_matches_record(&result, &other));
+
+        let mut other = record.clone();
+        other.receipt_hash = "d".repeat(64);
+        assert!(!verify_terminal_matches_record(&result, &other));
     }
 }
