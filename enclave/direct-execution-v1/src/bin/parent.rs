@@ -5136,6 +5136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Observe already-admitted Base withdrawals independently of the browser.
     // This observer has no submission capability and shares the financial lock.
     start_base_withdrawal_observer(state.clone());
+    start_v70_rollback_materializer(state.clone());
     let port = env::var("PORT").unwrap_or_else(|_| "8443".into()).parse()?;
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -7740,7 +7741,7 @@ where
     F: FnOnce(RuntimeRequest) -> Fut,
     Fut: Future<Output = io::Result<RuntimeResponse>>,
 {
-    if state.persistence_format != PersistenceFormat::V71 {
+    if state.effective_persistence_format() != PersistenceFormat::V71 {
         return Err("v70 rollback requires a restored v71 lineage".into());
     }
     let store = match state.artifact_store.as_ref() {
@@ -7826,6 +7827,50 @@ where
         package.sequence, package.state_hash, package.artifact_hash
     );
     Ok(package)
+}
+
+/// Explicit opt-in operator hook for producing the retained-v70 package. It
+/// waits for a hot promotion to become authoritative, then captures committed
+/// state only. It never stores or replays a pending command.
+fn start_v70_rollback_materializer(state: AppState) {
+    let Ok(prefix) = env::var("LAYRS_DIRECT_V70_ROLLBACK_PREFIX") else {
+        return;
+    };
+    tokio::spawn(async move {
+        let started = tokio::time::Instant::now();
+        let mut soft_abort_logged = false;
+        while state.effective_persistence_format() != PersistenceFormat::V71 {
+            let elapsed = started.elapsed();
+            if !soft_abort_logged && elapsed >= Duration::from_secs(5 * 60) {
+                eprintln!("V70_ROLLBACK_MATERIALIZER_SOFT_ABORT elapsed_seconds=300");
+                soft_abort_logged = true;
+            }
+            if elapsed >= Duration::from_secs(10 * 60) {
+                eprintln!("V70_ROLLBACK_MATERIALIZER_ABORTED reason=V71_NOT_AUTHORITATIVE");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let seal_state = state.clone();
+        match materialize_v70_rollback(&state, &prefix, move |request| {
+            let seal_state = seal_state.clone();
+            async move {
+                exchange_with_timeout(&seal_state, request, CHECKPOINT_EXCHANGE_TIMEOUT).await
+            }
+        })
+        .await
+        {
+            Ok(package) => eprintln!(
+                "V70_ROLLBACK_MATERIALIZER_COMPLETE prefix={} sequence={} state_hash={} artifact_hash={} checkpoint_key={}",
+                package.prefix,
+                package.sequence,
+                package.state_hash,
+                package.artifact_hash,
+                package.checkpoint_key
+            ),
+            Err(reason) => eprintln!("V70_ROLLBACK_MATERIALIZER_ABORTED reason={reason}"),
+        }
+    });
 }
 
 fn intent_is_committed(intent: &ExternalEffectIntent, receipts: &[(u64, DirectReceipt)]) -> bool {
@@ -13412,7 +13457,11 @@ mod tests {
             JournalWriterState::Eligible(fixture.head.clone()),
             JournalRole::Writer,
         );
-        let state = v70_rollback_state(Some(store), &fixture);
+        // The operator hook runs after a same-process v71-hot promotion, so
+        // exercise that effective mode rather than only a cold v71 restart.
+        let mut state = v70_rollback_state(Some(store), &fixture);
+        state.persistence_format = PersistenceFormat::V71Hot;
+        state.hot_v71_enabled.store(true, Ordering::Release);
         let called = Arc::new(AtomicU64::new(0));
         let package = materialize_v70_rollback(
             &state,

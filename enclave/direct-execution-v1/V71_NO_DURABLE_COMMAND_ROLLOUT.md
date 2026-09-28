@@ -41,12 +41,20 @@ The bridge keeps today's behavior by default. The hot path is opt-in:
 LAYRS_DIRECT_PERSISTENCE_FORMAT=v71-hot
 LAYRS_DIRECT_V71_SHADOW_RUN_ID=<lowercase rollout id>
 LAYRS_DIRECT_V71_AUTO_PROMOTE=true
+LAYRS_DIRECT_V70_ROLLBACK_PREFIX=<fresh rollback prefix>
 ```
 
 `v71-hot` starts on v70 when the immutable cutover marker is absent. It starts
 on v71 only when `journal-v71/cutover.cbor` exists and exactly matches the
 cryptographically verified checkpoint-plus-tail head. Pre-staged migration,
 checkpoint, snapshot, or journal objects cannot select v71 by themselves.
+
+`LAYRS_DIRECT_V70_ROLLBACK_PREFIX` is an explicit, one-shot operator hook. If
+set, the parent waits until v71 is authoritative, captures committed state
+through the existing financial gate, and writes the three-object rollback
+baseline. Leave it unset until the production-copy seal duration has been
+measured and the fresh prefix and rollback grant have been verified. It does
+not capture, queue, or replay pending commands.
 
 Rollback restore is explicit and never inferred:
 
