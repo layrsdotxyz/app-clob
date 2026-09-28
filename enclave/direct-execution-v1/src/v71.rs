@@ -871,6 +871,26 @@ mod tests {
         request
     }
 
+    fn relink_wallet(
+        subject: &str,
+        identity: &str,
+        request_id: &str,
+        wallet: &str,
+    ) -> DirectRequest {
+        let mut request = DirectRequest {
+            account_id: subject.into(),
+            identity_commitment: identity.into(),
+            request_id: request_id.into(),
+            request_hash: String::new(),
+            financial_wallet_address: None,
+            action: DirectAction::LinkFinancialWallet {
+                wallet_address: wallet.into(),
+            },
+        };
+        request.request_hash = request_hash(&request);
+        request
+    }
+
     #[test]
     fn candidate_is_bounded_and_adopted_only_after_explicit_ack_boundary() {
         let mut runtime = runtime();
@@ -1401,5 +1421,106 @@ mod tests {
             rollback_restored.balance(&identity, "USDC", "USER_WITHDRAWAL_HOLD"),
             4_840_000
         );
+    }
+
+    /// Local CPU/memory-side gate for the production-sized compact commit
+    /// path. It deliberately excludes S3/VSOCK latency; the durable-store
+    /// p50/p95/p99 gate must be measured in the rollout environment. Run with:
+    ///
+    /// `LAYRS_V71_BENCH_HISTORY=35000 LAYRS_V71_BENCH_SAMPLES=250 cargo test
+    ///  --release v71_production_sized_commit_latency_benchmark -- --ignored --nocapture`
+    #[test]
+    #[ignore = "local production-sized latency benchmark"]
+    fn v71_production_sized_commit_latency_benchmark() {
+        let history = std::env::var("LAYRS_V71_BENCH_HISTORY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(35_000);
+        let samples = std::env::var("LAYRS_V71_BENCH_SAMPLES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(250);
+        assert!((1..=100_000).contains(&history));
+        assert!((10..=10_000).contains(&samples));
+
+        let epoch = SealedEpoch {
+            identities: BTreeMap::new(),
+            identity_subjects: BTreeMap::new(),
+            subject_identities: BTreeMap::new(),
+            subject_wallets: BTreeMap::<String, BTreeSet<String>>::new(),
+        };
+        let subject = "a".repeat(64);
+        let wallet = "0x1111111111111111111111111111111111111111";
+        let setup_started = std::time::Instant::now();
+        let mut v70 =
+            DirectRuntime::new(epoch, RuntimeMode::IsolatedTest, vec![9; 32]).unwrap();
+        let identity = identity_commitment_for(&subject, wallet);
+        v70.execute(admission(&subject, "history-admission", wallet))
+            .unwrap();
+        // Re-linking the account's existing wallet produces a valid terminal
+        // result without changing financial state. It isolates historical
+        // request-map growth from unrelated market/order/identity growth.
+        for ordinal in 1..history {
+            v70.execute(relink_wallet(
+                &subject,
+                &identity,
+                &format!("history-{ordinal:06}"),
+                wallet,
+            ))
+            .unwrap();
+        }
+        let migration = V70MigrationBundle::seal(&v70, &[7; 32], &[8; 32]).unwrap();
+        let mut tree = SparseRequestTree::from_leaves(&migration.leaves).unwrap();
+        let mut v71 = DirectV71Runtime::from_v70_migration(
+            v70,
+            &migration,
+            "benchmark-writer-epoch".into(),
+            &[7; 32],
+            &journal_verifying_key(&[8; 32]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v71.sequence(), history as u64);
+        assert!(v71.financial_runtime().requests.is_empty());
+        let setup_elapsed = setup_started.elapsed();
+
+        let mut elapsed_micros = Vec::with_capacity(samples);
+        let mut max_record_bytes = 0usize;
+        for ordinal in 0..samples {
+            let request = relink_wallet(
+                &subject,
+                &identity,
+                &format!("measured-{ordinal:06}"),
+                wallet,
+            );
+            let started = std::time::Instant::now();
+            let proof = tree.proof(&request.account_id, &request.request_id).unwrap();
+            let candidate = v71
+                .prepare_candidate(request, &proof, &[7; 32], &[8; 32])
+                .unwrap();
+            max_record_bytes = max_record_bytes.max(
+                serde_cbor::to_vec(candidate.record()).unwrap().len(),
+            );
+            tree.insert(candidate.terminal_leaf().clone()).unwrap();
+            v71.adopt_candidate(candidate).unwrap();
+            elapsed_micros.push(started.elapsed().as_micros() as u64);
+        }
+        elapsed_micros.sort_unstable();
+        let percentile = |numerator: usize| {
+            let index = (elapsed_micros.len() * numerator).div_ceil(100) - 1;
+            elapsed_micros[index]
+        };
+        eprintln!(
+            "V71_COMMIT_BENCH history={} samples={} setup_ms={} record_bytes_max={} p50_us={} p95_us={} p99_us={}",
+            history,
+            samples,
+            setup_elapsed.as_millis(),
+            max_record_bytes,
+            percentile(50),
+            percentile(95),
+            percentile(99),
+        );
+        assert_eq!(v71.sequence(), (history + samples) as u64);
+        assert!(v71.financial_runtime().requests.is_empty());
+        assert!(max_record_bytes < 64 * 1024);
     }
 }
