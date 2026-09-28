@@ -4473,12 +4473,58 @@ fn quest_receipt_frame(claims:&SessionClaims,query:QuestReceiptQuery)->Result<Ru
         ||!query.request_id.bytes().all(|byte|byte.is_ascii_alphanumeric()||b"-_:".contains(&byte)) {return Err(());}
     Ok(RuntimeRequest::PublicQuestReceipt{participant_account:claims.subject_hash.clone(),receipt_account:query.receipt_account_id,request_id:query.request_id,nonce:hex::decode(query.nonce).map_err(|_|())?})
 }
+async fn journal_quest_receipt_frame(
+    state:&AppState,
+    request:RuntimeRequest,
+)->Result<(RuntimeRequest,OwnedMutexGuard<()>),(StatusCode,&'static str)> {
+    let RuntimeRequest::PublicQuestReceipt {participant_account,receipt_account,request_id,nonce}=request else {
+        return Err((StatusCode::BAD_REQUEST,"INVALID_PRIVACY_RECEIPT_REQUEST"));
+    };
+    let store=match state.artifact_store.as_ref() {
+        Some(ArchiveStore::S3(store))=>store,
+        _=>return Err((StatusCode::SERVICE_UNAVAILABLE,"JOURNAL_RECEIPT_UNAVAILABLE")),
+    };
+    // Locate and fetch immutable history before taking the financial gate. A
+    // later commit can extend the tree but cannot replace this terminal leaf.
+    let leaf={
+        let index=state.journal_request_index.lock().await;
+        let index=index.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE,"JOURNAL_RECEIPT_UNAVAILABLE"))?;
+        index.proof(&receipt_account,&request_id)
+            .map_err(|_|(StatusCode::SERVICE_UNAVAILABLE,"JOURNAL_RECEIPT_UNAVAILABLE"))?
+            .leaf.ok_or((StatusCode::FORBIDDEN,"PRIVACY_RECEIPT_UNAVAILABLE"))?
+    };
+    let archived=archived_terminal_for_leaf(state,store,&leaf).await
+        .map_err(|_|(StatusCode::SERVICE_UNAVAILABLE,"JOURNAL_RECEIPT_UNAVAILABLE"))?;
+    // Rebuild the proof at the exact enclave head and hold only for the
+    // bounded in-memory proof plus enclave read. S3 latency never blocks a
+    // trade, while a concurrent commit cannot make the proof stale.
+    let guard=state.financial_gate.lock("quest_receipt_journal").await;
+    let request_proof={
+        let index=state.journal_request_index.lock().await;
+        let index=index.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE,"JOURNAL_RECEIPT_UNAVAILABLE"))?;
+        let proof=index.proof(&receipt_account,&request_id)
+            .map_err(|_|(StatusCode::SERVICE_UNAVAILABLE,"JOURNAL_RECEIPT_UNAVAILABLE"))?;
+        if proof.leaf.as_ref()!=Some(&leaf) {
+            return Err((StatusCode::SERVICE_UNAVAILABLE,"JOURNAL_RECEIPT_UNAVAILABLE"));
+        }
+        proof
+    };
+    Ok((RuntimeRequest::PublicQuestReceiptJournal {
+        participant_account,receipt_account,request_id,nonce,request_proof,archived,
+    },guard))
+}
 async fn quest_receipt(State(state):State<AppState>,headers:HeaderMap,Json(query):Json<QuestReceiptQuery>)->impl IntoResponse {
     let claims=match authenticated(&headers,&state) {Ok(claims)=>claims,Err(response)=>return response};
     // Participant identity is always taken from the verified short-lived BFF
     // session. An affected maker may witness a taker's committed fill only if
     // the enclave's signed projection proves that participant was affected.
     let request=match quest_receipt_frame(&claims,query) {Ok(request)=>request,Err(_)=>return (StatusCode::BAD_REQUEST,"INVALID_PRIVACY_RECEIPT_REQUEST").into_response()};
+    let (request,_journal_guard)=if state.persistence_format==PersistenceFormat::V71 {
+        match journal_quest_receipt_frame(&state,request).await {
+            Ok((request,guard))=>(request,Some(guard)),
+            Err((status,code))=>return (status,code).into_response(),
+        }
+    } else {(request,None)};
     match exchange(&state,request).await {
         Ok(RuntimeResponse::PublicQuestReceipt{witness})=>encrypted_quest_witness(&claims,&witness),
         Ok(RuntimeResponse::Error{code})=>(StatusCode::FORBIDDEN,code).into_response(),
