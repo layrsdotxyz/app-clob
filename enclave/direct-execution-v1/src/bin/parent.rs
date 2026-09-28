@@ -2508,6 +2508,7 @@ impl S3ImmutableArtifactStore {
             receipts.into_values(),
         )
         .map_err(|_| "journal checkpoint receipts invalid")?;
+        verify_journal_checkpoint_non_writer(state, &checkpoint).await?;
         self.publish_journal_checkpoint(&checkpoint, &index_snapshot, &receipt_snapshot)
             .await?;
         state
@@ -6317,6 +6318,51 @@ async fn exchange_with_timeout(
     response
 }
 
+fn journal_checkpoint_verification_matches(
+    checkpoint: &DirectV71Checkpoint,
+    response: &RuntimeResponse,
+) -> bool {
+    matches!(
+        response,
+        RuntimeResponse::JournalCheckpointVerified {
+            writer_epoch,
+            sequence,
+            record_hash,
+            transition_root,
+            request_index_root,
+            financial_state_root,
+        } if writer_epoch == &checkpoint.writer_epoch
+            && sequence == &checkpoint.sequence
+            && record_hash == &checkpoint.record_hash
+            && transition_root == &checkpoint.transition_root
+            && request_index_root == &checkpoint.request_index_root
+            && financial_state_root == &checkpoint.financial_state_root
+    )
+}
+
+async fn verify_journal_checkpoint_non_writer(
+    state: &AppState,
+    checkpoint: &DirectV71Checkpoint,
+) -> Result<(), String> {
+    let response = exchange_with_timeout(
+        state,
+        RuntimeRequest::VerifyJournalCheckpoint {
+            checkpoint: checkpoint.clone(),
+        },
+        CHECKPOINT_EXCHANGE_TIMEOUT,
+    )
+    .await
+    .map_err(|_| "journal checkpoint verification transport failed")?;
+    if !journal_checkpoint_verification_matches(checkpoint, &response) {
+        return Err("journal checkpoint verification mismatch".into());
+    }
+    eprintln!(
+        "VERIFIED_JOURNAL_CHECKPOINT_NON_WRITER_RESTORE {}",
+        checkpoint.sequence
+    );
+    Ok(())
+}
+
 async fn recover_enclave(state: &AppState) -> io::Result<()> {
     let store = state.artifact_store.as_ref().ok_or_else(|| {
         io::Error::new(
@@ -6468,6 +6514,9 @@ async fn activate_v71_from_restored_v70(state: &AppState) -> io::Result<()> {
         }
         _ => return Err(invalid("V71_CHECKPOINT_SEAL_MISMATCH")),
     };
+    verify_journal_checkpoint_non_writer(state, &checkpoint)
+        .await
+        .map_err(|error| invalid(format!("V71_CHECKPOINT_VERIFICATION_FAILED:{error}")))?;
     store
         .publish_journal_checkpoint(&checkpoint, &index_snapshot, &receipt_snapshot)
         .await
@@ -10652,6 +10701,60 @@ mod tests {
             ciphertext_hash: "e".repeat(64),
             signature: "f".repeat(128),
         }
+    }
+
+    #[test]
+    fn v71_non_writer_checkpoint_verification_requires_every_authenticated_head_field() {
+        let checkpoint = v71_checkpoint(41);
+        let verified = RuntimeResponse::JournalCheckpointVerified {
+            writer_epoch: checkpoint.writer_epoch.clone(),
+            sequence: checkpoint.sequence,
+            record_hash: checkpoint.record_hash.clone(),
+            transition_root: checkpoint.transition_root.clone(),
+            request_index_root: checkpoint.request_index_root.clone(),
+            financial_state_root: checkpoint.financial_state_root.clone(),
+        };
+        assert!(journal_checkpoint_verification_matches(
+            &checkpoint,
+            &verified
+        ));
+
+        for mutated in [
+            DirectV71Checkpoint {
+                writer_epoch: "other-writer".into(),
+                ..checkpoint.clone()
+            },
+            DirectV71Checkpoint {
+                sequence: checkpoint.sequence + 1,
+                ..checkpoint.clone()
+            },
+            DirectV71Checkpoint {
+                record_hash: "0".repeat(64),
+                ..checkpoint.clone()
+            },
+            DirectV71Checkpoint {
+                transition_root: "0".repeat(64),
+                ..checkpoint.clone()
+            },
+            DirectV71Checkpoint {
+                request_index_root: "0".repeat(64),
+                ..checkpoint.clone()
+            },
+            DirectV71Checkpoint {
+                financial_state_root: "0".repeat(64),
+                ..checkpoint.clone()
+            },
+        ] {
+            assert!(!journal_checkpoint_verification_matches(
+                &mutated, &verified
+            ));
+        }
+        assert!(!journal_checkpoint_verification_matches(
+            &checkpoint,
+            &RuntimeResponse::Error {
+                code: "CHECKPOINT_REJECTED".into()
+            }
+        ));
     }
 
     fn v71_checkpoint_publication_fixture() -> (
