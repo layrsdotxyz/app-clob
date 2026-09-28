@@ -18,8 +18,8 @@ use crate::{
     },
     sha256,
     v71_checkpoint::{
-        financial_state_root, restore_checkpoint, seal_checkpoint, DirectV71Checkpoint,
-        V71CheckpointError,
+        financial_state_root, financial_state_root_ignoring_history, restore_checkpoint,
+        seal_checkpoint, DirectV71Checkpoint, V71CheckpointError,
     },
     DirectCheckpoint, DirectPortfolio, DirectRequest, DirectResult, DirectRuntime,
     DirectStateArtifact, QuestReceiptWitness, RuntimeError, EPOCH_ID,
@@ -52,6 +52,8 @@ pub enum V71Error {
     ReplayProofRequired,
     #[error("candidate does not succeed the current v71 head")]
     StaleCandidate,
+    #[error("v71 shadow candidate differs from the authoritative v70 commit")]
+    ShadowMismatch,
 }
 
 #[derive(Clone)]
@@ -82,6 +84,25 @@ impl DirectV71Candidate {
 
     pub fn result(&self) -> &DirectResult {
         &self.result
+    }
+
+    /// A shadow may advance only when the complete terminal result, explicit
+    /// sequence and canonical financial state all equal the already committed
+    /// v70 transition. The v70 full-state hash intentionally differs because
+    /// it also commits the unbounded historical request map.
+    pub fn verify_shadow_match(
+        &self,
+        authoritative: &DirectRuntime,
+        authoritative_result: &DirectResult,
+    ) -> Result<(), V71Error> {
+        if &self.result != authoritative_result
+            || self.record.sequence != authoritative.committed_sequence()
+            || self.record.financial_state_root
+                != financial_state_root_ignoring_history(authoritative)?
+        {
+            return Err(V71Error::ShadowMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -1167,6 +1188,87 @@ mod tests {
             &witness.receipt,
             &crate::quest_receipt_public_key(&[9; 32]).unwrap(),
         ));
+    }
+
+    #[test]
+    fn shadow_match_requires_exact_result_sequence_and_financial_state() {
+        let epoch = SealedEpoch {
+            identities: BTreeMap::new(),
+            identity_subjects: BTreeMap::new(),
+            subject_identities: BTreeMap::new(),
+            subject_wallets: BTreeMap::<String, BTreeSet<String>>::new(),
+        };
+        let mut authoritative =
+            DirectRuntime::new(epoch, RuntimeMode::IsolatedTest, vec![9; 32]).unwrap();
+        authoritative
+            .execute(admission(
+                &"a".repeat(64),
+                "request-1",
+                "0x1111111111111111111111111111111111111111",
+            ))
+            .unwrap();
+        let source = authoritative.clone();
+        let bundle = V70MigrationBundle::seal(&source, &[7; 32], &[8; 32]).unwrap();
+        let mut shadow = DirectV71Runtime::from_v70_migration(
+            source.clone(),
+            &bundle,
+            "shadow-run-1".into(),
+            &[7; 32],
+            &journal_verifying_key(&[8; 32]).unwrap(),
+        )
+        .unwrap();
+        let tree = SparseRequestTree::from_leaves(&bundle.leaves).unwrap();
+        let request = admission(
+            &"b".repeat(64),
+            "request-2",
+            "0x2222222222222222222222222222222222222222",
+        );
+        let proof = tree
+            .proof(&request.account_id, &request.request_id)
+            .unwrap();
+        let expected = authoritative.execute(request.clone()).unwrap();
+        let candidate = shadow
+            .prepare_candidate(request, &proof, &[7; 32], &[8; 32])
+            .unwrap();
+        assert_eq!(
+            candidate.verify_shadow_match(&authoritative, &expected),
+            Ok(())
+        );
+
+        let mut wrong_result = expected.clone();
+        wrong_result.effect = "TAMPERED".into();
+        assert_eq!(
+            candidate.verify_shadow_match(&authoritative, &wrong_result),
+            Err(V71Error::ShadowMismatch)
+        );
+        assert_eq!(
+            candidate.verify_shadow_match(&source, &expected),
+            Err(V71Error::ShadowMismatch)
+        );
+
+        let mut wrong_state = source;
+        wrong_state
+            .execute(admission(
+                &"c".repeat(64),
+                "request-3",
+                "0x3333333333333333333333333333333333333333",
+            ))
+            .unwrap();
+        assert_eq!(
+            wrong_state.committed_sequence(),
+            authoritative.committed_sequence()
+        );
+        assert_eq!(
+            candidate.verify_shadow_match(&wrong_state, &expected),
+            Err(V71Error::ShadowMismatch)
+        );
+
+        assert_eq!(shadow.adopt_candidate(candidate).unwrap(), expected);
+        assert_eq!(shadow.sequence(), authoritative.committed_sequence());
+        assert_eq!(
+            shadow.financial_state_root().unwrap(),
+            financial_state_root_ignoring_history(&authoritative).unwrap()
+        );
     }
 
     #[test]

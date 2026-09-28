@@ -233,6 +233,15 @@ pub(crate) fn financial_state_root(runtime: &DirectRuntime) -> Result<String, V7
     if !runtime.requests.is_empty() {
         return Err(V71CheckpointError::Invalid);
     }
+    financial_state_root_ignoring_history(runtime)
+}
+
+/// Canonical v71 financial state for comparison with a live v70 runtime. The
+/// v70 request map is deliberately excluded: its authenticated replacement is
+/// the v71 sparse request-index root.
+pub(crate) fn financial_state_root_ignoring_history(
+    runtime: &DirectRuntime,
+) -> Result<String, V71CheckpointError> {
     let state = V71FinancialState::from_runtime(runtime);
     state.validate()?;
     serde_cbor::to_vec(&state)
