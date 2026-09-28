@@ -55,6 +55,7 @@ pub struct DirectJournalRecord {
     pub transition_root: String,
     pub previous_request_index_root: String,
     pub request_index_root: String,
+    pub financial_state_root: String,
     pub account_id: String,
     pub request_id: String,
     pub request_hash: String,
@@ -79,6 +80,7 @@ pub struct JournalDurabilityAck {
     pub record_hash: String,
     pub transition_root: String,
     pub request_index_root: String,
+    pub financial_state_root: String,
     pub request_hash: String,
     pub result_hash: String,
     pub signature: String,
@@ -96,6 +98,7 @@ struct JournalAssociatedData<'a> {
     transition_root: &'a str,
     previous_request_index_root: &'a str,
     request_index_root: &'a str,
+    financial_state_root: &'a str,
     account_id: &'a str,
     request_id: &'a str,
     request_hash: &'a str,
@@ -112,6 +115,7 @@ impl DirectJournalRecord {
         previous_transition_root: &str,
         previous_request_index_root: &str,
         request_index_root: &str,
+        financial_state_root: &str,
         request_proof: SparseRequestProof,
         request: DirectRequest,
         result: DirectResult,
@@ -126,6 +130,7 @@ impl DirectJournalRecord {
             || !digest(previous_transition_root)
             || !digest(previous_request_index_root)
             || !digest(request_index_root)
+            || !digest(financial_state_root)
             || previous_request_index_root == request_index_root
             || state_key.len() != 32
             || signing_key_seed.len() != 32
@@ -170,6 +175,7 @@ impl DirectJournalRecord {
             &committed_request_hash,
             &result_hash,
             request_index_root,
+            financial_state_root,
         );
         let associated_data = associated_data(
             writer_epoch,
@@ -179,6 +185,7 @@ impl DirectJournalRecord {
             &transition_root,
             previous_request_index_root,
             request_index_root,
+            financial_state_root,
             &account_id,
             &request_id,
             &committed_request_hash,
@@ -215,6 +222,7 @@ impl DirectJournalRecord {
             transition_root,
             previous_request_index_root: previous_request_index_root.into(),
             request_index_root: request_index_root.into(),
+            financial_state_root: financial_state_root.into(),
             account_id,
             request_id,
             request_hash: committed_request_hash,
@@ -303,6 +311,7 @@ impl DirectJournalRecord {
                 self.transition_root.as_str(),
                 self.previous_request_index_root.as_str(),
                 self.request_index_root.as_str(),
+                self.financial_state_root.as_str(),
                 self.request_hash.as_str(),
                 self.receipt_hash.as_str(),
                 self.result_hash.as_str(),
@@ -318,6 +327,7 @@ impl DirectJournalRecord {
                     &self.request_hash,
                     &self.result_hash,
                     &self.request_index_root,
+                    &self.financial_state_root,
                 )
         {
             return Err(JournalError::Invalid);
@@ -331,6 +341,7 @@ impl DirectJournalRecord {
             &self.transition_root,
             &self.previous_request_index_root,
             &self.request_index_root,
+            &self.financial_state_root,
             &self.account_id,
             &self.request_id,
             &self.request_hash,
@@ -405,6 +416,7 @@ impl JournalDurabilityAck {
             record_hash: record.record_hash()?,
             transition_root: record.transition_root.clone(),
             request_index_root: record.request_index_root.clone(),
+            financial_state_root: record.financial_state_root.clone(),
             request_hash: record.request_hash.clone(),
             result_hash: record.result_hash.clone(),
             signature: String::new(),
@@ -424,6 +436,7 @@ impl JournalDurabilityAck {
             && self.previous_record_hash == record.previous_record_hash
             && self.transition_root == record.transition_root
             && self.request_index_root == record.request_index_root
+            && self.financial_state_root == record.financial_state_root
             && self.request_hash == record.request_hash
             && self.result_hash == record.result_hash
             && self
@@ -444,6 +457,7 @@ pub fn transition_root(
     request_hash: &str,
     result_hash: &str,
     request_index_root: &str,
+    financial_state_root: &str,
 ) -> String {
     let mut bytes = Vec::with_capacity(
         JOURNAL_TRANSITION_DOMAIN.len()
@@ -451,6 +465,7 @@ pub fn transition_root(
             + request_hash.len()
             + result_hash.len()
             + request_index_root.len()
+            + financial_state_root.len()
             + 8,
     );
     bytes.extend_from_slice(JOURNAL_TRANSITION_DOMAIN);
@@ -459,6 +474,7 @@ pub fn transition_root(
     bytes.extend_from_slice(request_hash.as_bytes());
     bytes.extend_from_slice(result_hash.as_bytes());
     bytes.extend_from_slice(request_index_root.as_bytes());
+    bytes.extend_from_slice(financial_state_root.as_bytes());
     sha256(&bytes)
 }
 
@@ -470,6 +486,7 @@ fn associated_data(
     transition_root: &str,
     previous_request_index_root: &str,
     request_index_root: &str,
+    financial_state_root: &str,
     account_id: &str,
     request_id: &str,
     request_hash: &str,
@@ -486,6 +503,7 @@ fn associated_data(
         transition_root,
         previous_request_index_root,
         request_index_root,
+        financial_state_root,
         account_id,
         request_id,
         request_hash,
@@ -662,6 +680,7 @@ mod tests {
             &"b".repeat(64),
             &previous_index,
             &next_index,
+            &"f".repeat(64),
             proof,
             request,
             result,
@@ -714,6 +733,7 @@ mod tests {
             &"b".repeat(64),
             &previous_index,
             &next_index,
+            &"f".repeat(64),
             proof.clone(),
             request.clone(),
             result.clone(),
@@ -729,6 +749,7 @@ mod tests {
             &"b".repeat(64),
             &previous_index,
             &next_index,
+            &"f".repeat(64),
             proof.clone(),
             request.clone(),
             result.clone(),
@@ -744,6 +765,7 @@ mod tests {
             &"d".repeat(64),
             &previous_index,
             &next_index,
+            &"f".repeat(64),
             proof,
             request,
             result,
@@ -862,6 +884,7 @@ mod tests {
             &first.transition_root,
             &first.request_index_root,
             &next_index,
+            &"e".repeat(64),
             proof,
             request,
             result,

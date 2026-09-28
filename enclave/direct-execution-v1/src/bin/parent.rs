@@ -269,6 +269,7 @@ struct S3ImmutableArtifactStore {
     verified_receipt_records: Arc<Mutex<Option<Vec<DirectStateArtifact>>>>,
     verified_artifact_hashes: Arc<Mutex<Vec<String>>>,
     prepared_restore: Arc<Mutex<Option<PreparedArchiveRestore>>>,
+    prepared_journal_restore: Arc<Mutex<Option<PreparedJournalRestore>>>,
     checkpoint_refresh_gate: Arc<Mutex<CheckpointRefresh>>,
     // v71 append eligibility. Always `Unrestored` until the v71 restore path
     // exists; live v70 never reads or advances it.
@@ -288,6 +289,14 @@ struct PreparedArchiveRestore {
     keys: Vec<String>,
     heads: Vec<ResolvedArchiveHead>,
     checkpoint_keys: Vec<String>,
+}
+
+#[derive(Clone)]
+struct PreparedJournalRestore {
+    checkpoint: DirectV71Checkpoint,
+    tail: Vec<DirectJournalRecord>,
+    index_snapshot: DirectRequestIndexSnapshot,
+    receipt_snapshot: DirectReceiptSnapshot,
 }
 
 const CHECKPOINT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
@@ -1702,10 +1711,34 @@ impl ArchiveStore {
             // Filesystem archives are confined to isolated tests/dormant
             // packages and do not consume a governed production grant.
             Self::Filesystem(_) => Ok(()),
-            Self::S3(store) => store.prepare_restore(state).await.map(|_| ()),
+            Self::S3(store) => {
+                if state.persistence_format == PersistenceFormat::V71
+                    && store.prepare_journal_restore().await?
+                {
+                    Ok(())
+                } else {
+                    store.prepare_restore(state).await.map(|_| ())
+                }
+            }
         }
     }
-    async fn receipt_sequence(&self, receipt: &DirectReceipt) -> Result<i64, ProjectionError> {
+    async fn receipt_sequence(
+        &self,
+        state: &AppState,
+        receipt: &DirectReceipt,
+    ) -> Result<i64, ProjectionError> {
+        if state.persistence_format == PersistenceFormat::V71 {
+            let cache = state.journal_receipts.lock().await;
+            let cache = cache.as_ref().ok_or(ProjectionError::Database)?;
+            let mut matching = cache
+                .values()
+                .filter(|(_, candidate)| candidate.receipt_id == receipt.receipt_id);
+            let (sequence, candidate) = matching.next().ok_or(ProjectionError::Database)?;
+            if matching.next().is_some() || candidate != receipt {
+                return Err(ProjectionError::Database);
+            }
+            return i64::try_from(*sequence).map_err(|_| ProjectionError::Database);
+        }
         match self {
             Self::S3(store) => {
                 let records = store.verified_receipt_records.lock().await;
@@ -1870,6 +1903,7 @@ struct JournalHead {
     record_hash: String,
     transition_root: String,
     request_index_root: String,
+    financial_state_root: String,
 }
 
 /// In-process v71 append eligibility. Only `Eligible` may PUT, and a latch is
@@ -1953,6 +1987,45 @@ fn journal_parent_snapshot_key(
         "{prefix}/journal-v71/{namespace}/{sequence:020}-{request_index_root}-{}.cbor",
         sha256(bytes)
     )
+}
+
+fn journal_parent_snapshot_key_parts(
+    key: &str,
+    namespace: &str,
+) -> Result<(u64, String, String), String> {
+    let name = key
+        .strip_prefix(namespace)
+        .and_then(|name| name.strip_suffix(".cbor"))
+        .ok_or("journal parent snapshot key format invalid")?;
+    let mut parts = name.split('-');
+    let sequence = parts
+        .next()
+        .ok_or("journal parent snapshot key format invalid")?;
+    let root = parts
+        .next()
+        .ok_or("journal parent snapshot key format invalid")?;
+    let hash = parts
+        .next()
+        .ok_or("journal parent snapshot key format invalid")?;
+    if parts.next().is_some()
+        || sequence.len() != 20
+        || !sequence.bytes().all(|byte| byte.is_ascii_digit())
+        || ![root, hash].into_iter().all(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    {
+        return Err("journal parent snapshot key format invalid".into());
+    }
+    let sequence = sequence
+        .parse::<u64>()
+        .map_err(|_| "journal parent snapshot key sequence overflow")?;
+    if !name.starts_with(&format!("{sequence:020}-")) {
+        return Err("journal parent snapshot key format invalid".into());
+    }
+    Ok((sequence, root.into(), hash.into()))
 }
 
 /// Most journal records a restore may replay after its checkpoint. A longer
@@ -2370,6 +2443,7 @@ impl S3ImmutableArtifactStore {
             verified_receipt_records: Arc::new(Mutex::new(None)),
             verified_artifact_hashes: Arc::new(Mutex::new(Vec::new())),
             prepared_restore: Arc::new(Mutex::new(None)),
+            prepared_journal_restore: Arc::new(Mutex::new(None)),
             checkpoint_refresh_gate: Arc::new(Mutex::new(CheckpointRefresh::default())),
             journal: Arc::new(Mutex::new(JournalWriterState::Unrestored)),
             journal_role: JournalRole::Writer,
@@ -2587,6 +2661,7 @@ impl S3ImmutableArtifactStore {
             record_hash,
             transition_root: record.transition_root.clone(),
             request_index_root: record.request_index_root.clone(),
+            financial_state_root: record.financial_state_root.clone(),
         };
         *journal = JournalWriterState::Eligible(next.clone());
         Ok(next)
@@ -2862,6 +2937,248 @@ impl S3ImmutableArtifactStore {
             records.push(record);
         }
         Ok(records)
+    }
+    async fn load_journal_parent_snapshot_bytes(
+        &self,
+        namespace_name: &str,
+        checkpoint: &DirectV71Checkpoint,
+    ) -> Result<Vec<u8>, String> {
+        let namespace = format!("{}/journal-v71/{namespace_name}/", self.prefix);
+        let exact_prefix = format!(
+            "{namespace}{:020}-{}-",
+            checkpoint.sequence, checkpoint.request_index_root
+        );
+        let keys = self
+            .list_journal_keys(
+                &exact_prefix,
+                None,
+                2,
+                ARCHIVE_OPERATION_TIMEOUT,
+            )
+            .await?;
+        if keys.len() != 1 {
+            return Err("journal parent snapshot missing or ambiguous".into());
+        }
+        let (sequence, root, content_hash) =
+            journal_parent_snapshot_key_parts(&keys[0], &namespace)?;
+        if sequence != checkpoint.sequence || root != checkpoint.request_index_root {
+            return Err("journal parent snapshot checkpoint mismatch".into());
+        }
+        let bytes = self.read(&keys[0]).await?;
+        if sha256(&bytes) != content_hash {
+            return Err("journal parent snapshot content address mismatch".into());
+        }
+        Ok(bytes)
+    }
+    async fn prepare_journal_restore(&self) -> Result<bool, String> {
+        let Some((_, checkpoint)) = self.load_newest_journal_checkpoint().await? else {
+            return Ok(false);
+        };
+        let tail = self.load_journal_tail(&checkpoint).await?;
+        let index_bytes = self
+            .load_journal_parent_snapshot_bytes("request-index", &checkpoint)
+            .await?;
+        let index_snapshot: DirectRequestIndexSnapshot = serde_cbor::from_slice(&index_bytes)
+            .map_err(|_| "journal request index snapshot decode failed")?;
+        if serde_cbor::to_vec(&index_snapshot).ok().as_deref() != Some(index_bytes.as_slice()) {
+            return Err("journal request index snapshot noncanonical".into());
+        }
+        index_snapshot
+            .verify(checkpoint.sequence, &checkpoint.request_index_root)
+            .map_err(|_| "journal request index snapshot invalid")?;
+        let receipt_bytes = self
+            .load_journal_parent_snapshot_bytes("receipts", &checkpoint)
+            .await?;
+        let receipt_snapshot: DirectReceiptSnapshot = serde_cbor::from_slice(&receipt_bytes)
+            .map_err(|_| "journal receipt snapshot decode failed")?;
+        if serde_cbor::to_vec(&receipt_snapshot).ok().as_deref()
+            != Some(receipt_bytes.as_slice())
+        {
+            return Err("journal receipt snapshot noncanonical".into());
+        }
+        receipt_snapshot
+            .verify(&index_snapshot)
+            .map_err(|_| "journal receipt snapshot invalid")?;
+        *self.prepared_journal_restore.lock().await = Some(PreparedJournalRestore {
+            checkpoint,
+            tail,
+            index_snapshot,
+            receipt_snapshot,
+        });
+        Ok(true)
+    }
+    async fn restore_journal_streamed(&self, state: &AppState) -> Result<(), String> {
+        let prepared = self
+            .prepared_journal_restore
+            .lock()
+            .await
+            .take()
+            .ok_or("journal restore was not validated before governed bootstrap")?;
+        let PreparedJournalRestore {
+            checkpoint,
+            tail,
+            index_snapshot,
+            receipt_snapshot,
+        } = prepared;
+        let mut index = DirectRequestIndexState::from_snapshot(
+            index_snapshot.clone(),
+            checkpoint.sequence,
+            &checkpoint.request_index_root,
+        )
+        .map_err(|_| "journal request index snapshot invalid")?;
+        let mut receipts = receipt_snapshot
+            .clone()
+            .into_receipts(&index_snapshot)
+            .map_err(|_| "journal receipt snapshot invalid")?
+            .into_iter()
+            .map(|record| {
+                (
+                    (
+                        record.receipt.account_id.clone(),
+                        record.receipt.request_id.clone(),
+                    ),
+                    (record.sequence, record.receipt),
+                )
+            })
+            .collect::<JournalReceiptCache>();
+        let begin = exchange(
+            state,
+            RuntimeRequest::BeginJournalRestore {
+                checkpoint: checkpoint.clone(),
+            },
+        )
+        .await
+        .map_err(|_| "journal restore begin transport failed")?;
+        if !matches!(begin, RuntimeResponse::JournalRestoreProgress {
+            sequence,
+            ref record_hash,
+            ref transition_root,
+            ref request_index_root,
+            receipt: None,
+        } if sequence == checkpoint.sequence
+            && record_hash == &checkpoint.record_hash
+            && transition_root == &checkpoint.transition_root
+            && request_index_root == &checkpoint.request_index_root)
+        {
+            return Err("journal restore begin rejected".into());
+        }
+        let mut head = JournalHead {
+            writer_epoch: checkpoint.writer_epoch.clone(),
+            sequence: checkpoint.sequence,
+            record_hash: checkpoint.record_hash.clone(),
+            transition_root: checkpoint.transition_root.clone(),
+            request_index_root: checkpoint.request_index_root.clone(),
+            financial_state_root: checkpoint.financial_state_root.clone(),
+        };
+        for record in tail {
+            let response = exchange(
+                state,
+                RuntimeRequest::AppendJournalRestore {
+                    record: record.clone(),
+                },
+            )
+            .await
+            .map_err(|_| "journal restore successor transport failed")?;
+            let receipt = match response {
+                RuntimeResponse::JournalRestoreProgress {
+                    sequence,
+                    record_hash,
+                    transition_root,
+                    request_index_root,
+                    receipt: Some(receipt),
+                } if sequence == record.sequence
+                    && record_hash
+                        == record
+                            .record_hash()
+                            .map_err(|_| "journal restore record hash failed")?
+                    && transition_root == record.transition_root
+                    && request_index_root == record.request_index_root
+                    && receipt.account_id == record.account_id
+                    && receipt.request_id == record.request_id
+                    && receipt.request_hash == record.request_hash
+                    && sha256(
+                        &serde_cbor::to_vec(&receipt)
+                            .map_err(|_| "journal restore receipt encoding failed")?,
+                    ) == record.receipt_hash => receipt,
+                _ => return Err("journal restore successor rejected".into()),
+            };
+            let leaf = TerminalRequestLeaf {
+                account_id: record.account_id.clone(),
+                request_id: record.request_id.clone(),
+                request_hash: record.request_hash.clone(),
+                result_hash: record.result_hash.clone(),
+                receipt_hash: record.receipt_hash.clone(),
+                locator: TerminalResultLocator::Journal {
+                    writer_epoch: record.writer_epoch.clone(),
+                    sequence: record.sequence,
+                },
+            };
+            index
+                .insert(
+                    leaf,
+                    &record.previous_request_index_root,
+                    &record.request_index_root,
+                )
+                .map_err(|_| "journal restore request index advance failed")?;
+            if receipts
+                .insert(
+                    (receipt.account_id.clone(), receipt.request_id.clone()),
+                    (record.sequence, receipt),
+                )
+                .is_some()
+            {
+                return Err("journal restore duplicate receipt".into());
+            }
+            head = JournalHead {
+                writer_epoch: record.writer_epoch.clone(),
+                sequence: record.sequence,
+                record_hash: record
+                    .record_hash()
+                    .map_err(|_| "journal restore record hash failed")?,
+                transition_root: record.transition_root,
+                request_index_root: record.request_index_root,
+                financial_state_root: record.financial_state_root,
+            };
+        }
+        let fence = state
+            .governed_bootstrap
+            .as_ref()
+            .map(|config| config.grant.old_writer_fence_evidence_sha256.clone());
+        let finish = exchange(
+            state,
+            RuntimeRequest::FinishJournalRestore {
+                expected_sequence: head.sequence,
+                expected_record_hash: head.record_hash.clone(),
+                expected_transition_root: head.transition_root.clone(),
+                expected_request_index_root: head.request_index_root.clone(),
+                expected_financial_state_root: head.financial_state_root.clone(),
+                writer_fence_evidence_sha256: fence,
+            },
+        )
+        .await
+        .map_err(|_| "journal restore finish transport failed")?;
+        let writer_epoch = match finish {
+            RuntimeResponse::JournalRestoreComplete {
+                writer_epoch,
+                sequence,
+                record_hash,
+                transition_root,
+                request_index_root,
+                financial_state_root,
+            } if sequence == head.sequence
+                && record_hash == head.record_hash
+                && transition_root == head.transition_root
+                && request_index_root == head.request_index_root
+                && financial_state_root == head.financial_state_root => writer_epoch,
+            _ => return Err("journal restore final head rejected".into()),
+        };
+        head.writer_epoch = writer_epoch;
+        self.establish_journal_head(head.clone()).await?;
+        *state.journal_request_index.lock().await = Some(index);
+        *state.journal_receipts.lock().await = Some(receipts);
+        *state.committed_state_root.lock().await = Some(head.transition_root);
+        eprintln!("VERIFIED_JOURNAL_RESTORE_COMPLETE {}", head.sequence);
+        Ok(())
     }
     /// Immutable put of a large artifact as one multipart upload whose parts
     /// are sent concurrently.  The completed object is still conditional
@@ -3702,7 +4019,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     verify_recovered_projection(&state).await?;
     recover_external_effect_intents(&state).await?;
     verify_recovered_projection(&state).await?;
-    if state.persistence_format == PersistenceFormat::V71 {
+    if state.persistence_format == PersistenceFormat::V71
+        && state.journal_request_index.lock().await.is_none()
+    {
         activate_v71_from_restored_v70(&state).await?;
     }
     // Observe already-admitted Base withdrawals independently of the browser.
@@ -5332,7 +5651,7 @@ impl Projection {
         let receipt = &result.receipt;
         // Ordering is bound to the fully verified immutable artifact, never a
         // user-supplied sequence or PostgreSQL's disposable receipt ordering.
-        let sequence = state.artifact_store.as_ref().ok_or(ProjectionError::Database)?.receipt_sequence(receipt).await?;
+        let sequence = state.artifact_store.as_ref().ok_or(ProjectionError::Database)?.receipt_sequence(state, receipt).await?;
         let mut client = self.client.lock().await;
         let transaction = client.transaction().await.map_err(|_| ProjectionError::Database)?;
         transaction.execute(
@@ -5657,7 +5976,15 @@ async fn recover_enclave(state: &AppState) -> io::Result<()> {
             "DIRECT_ARTIFACT_STORE_NOT_CONFIGURED",
         )
     })?;
-    if let ArchiveStore::S3(s3)=store {return s3.restore_streamed(state).await.map_err(|error|invalid(format!("DIRECT_STATE_RECOVERY_FAILED:{error}")));}
+    if let ArchiveStore::S3(s3)=store {
+        if state.persistence_format == PersistenceFormat::V71
+            && s3.prepared_journal_restore.lock().await.is_some()
+        {
+            return s3.restore_journal_streamed(state).await
+                .map_err(|error| invalid(format!("DIRECT_JOURNAL_RECOVERY_FAILED:{error}")));
+        }
+        return s3.restore_streamed(state).await.map_err(|error|invalid(format!("DIRECT_STATE_RECOVERY_FAILED:{error}")));
+    }
     let artifacts = store.load_committed().await.map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -5812,6 +6139,7 @@ async fn activate_v71_from_restored_v70(state: &AppState) -> io::Result<()> {
             record_hash,
             transition_root: transition_root.clone(),
             request_index_root,
+            financial_state_root,
         })
         .await
         .map_err(|error| invalid(format!("V71_WRITER_HEAD_FAILED:{error}")))?;
@@ -6367,6 +6695,41 @@ fn missing_projected_receipts(
         .collect())
 }
 
+fn missing_projected_journal_receipts(
+    records: &JournalReceiptCache,
+    existing: &[DirectReceipt],
+) -> Result<Vec<DirectReceipt>, ProjectionError> {
+    let mut ordered = records.values().cloned().collect::<Vec<_>>();
+    ordered.sort_by_key(|(sequence, _)| *sequence);
+    if ordered
+        .iter()
+        .enumerate()
+        .any(|(offset, (sequence, _))| *sequence != offset as u64 + 1)
+    {
+        return Err(ProjectionError::Database);
+    }
+    let by_id = ordered
+        .iter()
+        .map(|(_, receipt)| (receipt.receipt_id.as_str(), receipt))
+        .collect::<HashMap<_, _>>();
+    if by_id.len() != ordered.len()
+        || existing
+            .iter()
+            .any(|receipt| by_id.get(receipt.receipt_id.as_str()).copied() != Some(receipt))
+    {
+        return Err(ProjectionError::Database);
+    }
+    let present = existing
+        .iter()
+        .map(|receipt| receipt.receipt_id.as_str())
+        .collect::<HashSet<_>>();
+    Ok(ordered
+        .into_iter()
+        .filter(|(_, receipt)| !present.contains(receipt.receipt_id.as_str()))
+        .map(|(_, receipt)| receipt)
+        .collect())
+}
+
 /// Rebuild only missing disposable receipt projections from the verified,
 /// immutable archive. Existing rows must first be proven to be an exact
 /// subset of that lineage; conflicting or extra PostgreSQL history still
@@ -6375,13 +6738,6 @@ async fn reconcile_projection_from_archive(state: &AppState) -> io::Result<usize
     let Some(projection) = &state.projection else {
         return Ok(0);
     };
-    let records = state
-        .artifact_store
-        .as_ref()
-        .ok_or_else(|| invalid("projection archive unavailable"))?
-        .load_committed()
-        .await
-        .map_err(invalid)?;
     let rows = projection
         .client
         .lock()
@@ -6400,7 +6756,25 @@ async fn reconcile_projection_from_archive(state: &AppState) -> io::Result<usize
                 .map_err(|_| invalid("projection receipt is malformed"))
         })
         .collect::<io::Result<_>>()?;
-    let missing = missing_projected_receipts(&records, &existing).map_err(|_| {
+    let missing = if state.persistence_format == PersistenceFormat::V71
+        && state.journal_receipts.lock().await.is_some()
+    {
+        let records = state.journal_receipts.lock().await;
+        missing_projected_journal_receipts(
+            records.as_ref().ok_or_else(|| invalid("projection journal unavailable"))?,
+            &existing,
+        )
+    } else {
+        let records = state
+            .artifact_store
+            .as_ref()
+            .ok_or_else(|| invalid("projection archive unavailable"))?
+            .load_committed()
+            .await
+            .map_err(invalid)?;
+        missing_projected_receipts(&records, &existing)
+    }
+    .map_err(|_| {
         invalid("projection receipt exceeds or conflicts with recovered immutable history")
     })?;
     for receipt in &missing {
@@ -6956,7 +7330,9 @@ fn migration_parent_state(
     .map_err(|_| "journal migration request index invalid")?;
     let receipt_snapshot = DirectReceiptSnapshot::from_receipts(
         &index_snapshot,
-        records.iter().map(|record| record.receipt.clone()),
+        records
+            .iter()
+            .map(|record| (record.sequence, record.receipt.clone())),
     )
     .map_err(|_| "journal migration receipts do not match request index")?;
     let mut receipts = BTreeMap::new();
@@ -7305,7 +7681,7 @@ mod tests {
             }
         });
         let configuration=aws_sdk_s3::config::Builder::new().behavior_version_latest().region(aws_sdk_s3::config::Region::new("us-east-1")).credentials_provider(aws_sdk_s3::config::Credentials::new("unit-test","unit-test",None,None,"local-only")).endpoint_url(format!("http://{address}")).force_path_style(true).build();
-        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(Some(vec![head.clone()]))),verified_artifact_hashes:Arc::new(Mutex::new(vec![hash.clone()])),prepared_restore:Arc::new(Mutex::new(None)),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default())),journal:Arc::new(Mutex::new(JournalWriterState::Unrestored)),journal_role:JournalRole::Writer};
+        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(Some(vec![head.clone()]))),verified_artifact_hashes:Arc::new(Mutex::new(vec![hash.clone()])),prepared_restore:Arc::new(Mutex::new(None)),prepared_journal_restore:Arc::new(Mutex::new(None)),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default())),journal:Arc::new(Mutex::new(JournalWriterState::Unrestored)),journal_role:JournalRole::Writer};
         let state = AppState {
             enclave_cid: 16,
             session_key: vec![7; 32],
@@ -7886,7 +8262,7 @@ mod tests {
             }
         });
         let configuration=aws_sdk_s3::config::Builder::new().behavior_version_latest().region(aws_sdk_s3::config::Region::new("us-east-1")).credentials_provider(aws_sdk_s3::config::Credentials::new("unit-test","unit-test",None,None,"local-only")).endpoint_url(format!("http://{address}")).force_path_style(true).build();
-        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),prepared_restore:Arc::new(Mutex::new(None)),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default())),journal:Arc::new(Mutex::new(JournalWriterState::Unrestored)),journal_role:JournalRole::Writer};
+        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),prepared_restore:Arc::new(Mutex::new(None)),prepared_journal_restore:Arc::new(Mutex::new(None)),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default())),journal:Arc::new(Mutex::new(JournalWriterState::Unrestored)),journal_role:JournalRole::Writer};
         assert_eq!(store.read("epoch/immutable.cbor").await.unwrap(),b"complete-opaque-ciphertext");server.await.unwrap();
     }
     #[tokio::test]
@@ -7899,7 +8275,7 @@ mod tests {
             }
         });
         let configuration=aws_sdk_s3::config::Builder::new().behavior_version_latest().region(aws_sdk_s3::config::Region::new("us-east-1")).credentials_provider(aws_sdk_s3::config::Credentials::new("unit-test","unit-test",None,None,"local-only")).endpoint_url(format!("http://{address}")).force_path_style(true).build();
-        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),prepared_restore:Arc::new(Mutex::new(None)),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default())),journal:Arc::new(Mutex::new(JournalWriterState::Unrestored)),journal_role:JournalRole::Writer};
+        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),prepared_restore:Arc::new(Mutex::new(None)),prepared_journal_restore:Arc::new(Mutex::new(None)),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default())),journal:Arc::new(Mutex::new(JournalWriterState::Unrestored)),journal_role:JournalRole::Writer};
         assert_eq!(store.read("epoch/immutable.cbor").await.unwrap_err(),"archive complete read retries exhausted");server.await.unwrap();
     }
     #[tokio::test]
@@ -7917,7 +8293,7 @@ mod tests {
             }
         });
         let configuration=aws_sdk_s3::config::Builder::new().behavior_version_latest().region(aws_sdk_s3::config::Region::new("us-east-1")).credentials_provider(aws_sdk_s3::config::Credentials::new("unit-test","unit-test",None,None,"local-only")).endpoint_url(format!("http://{address}")).force_path_style(true).build();
-        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),prepared_restore:Arc::new(Mutex::new(None)),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default())),journal:Arc::new(Mutex::new(JournalWriterState::Unrestored)),journal_role:JournalRole::Writer};
+        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),prepared_restore:Arc::new(Mutex::new(None)),prepared_journal_restore:Arc::new(Mutex::new(None)),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default())),journal:Arc::new(Mutex::new(JournalWriterState::Unrestored)),journal_role:JournalRole::Writer};
         let keys=store.list_restore_keys("artifacts").await.unwrap();assert_eq!(keys.len(),1250);assert!(keys.first().unwrap().contains("00000000000000000001"));assert!(keys.last().unwrap().contains("00000000000000001250"));server.await.unwrap();
     }
 
@@ -8845,6 +9221,7 @@ mod tests {
             transition_root: "b".repeat(64),
             request_index_root:
                 layrs_direct_execution_v1::request_index::empty_request_index_root(),
+            financial_state_root: "f".repeat(64),
         }
     }
 
@@ -8917,6 +9294,7 @@ mod tests {
             &head.transition_root,
             &previous_index,
             &next_index,
+            &"f".repeat(64),
             proof,
             request,
             result.clone(),
@@ -9327,6 +9705,7 @@ mod tests {
             verified_receipt_records: Arc::new(Mutex::new(None)),
             verified_artifact_hashes: Arc::new(Mutex::new(Vec::new())),
             prepared_restore: Arc::new(Mutex::new(None)),
+            prepared_journal_restore: Arc::new(Mutex::new(None)),
             checkpoint_refresh_gate: Arc::new(Mutex::new(CheckpointRefresh::default())),
             journal: Arc::new(Mutex::new(state)),
             journal_role: role,
@@ -9340,6 +9719,7 @@ mod tests {
             record_hash: record.record_hash().unwrap(),
             transition_root: record.transition_root.clone(),
             request_index_root: record.request_index_root.clone(),
+            financial_state_root: record.financial_state_root.clone(),
         }
     }
 

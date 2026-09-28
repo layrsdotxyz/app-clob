@@ -214,6 +214,7 @@ impl DirectV71Runtime {
         };
         let next_request_index_root =
             request_proof.insert(&self.request_index_root, &terminal_leaf)?;
+        let next_financial_state_root = financial_state_root(&next_runtime)?;
         let record = DirectJournalRecord::seal(
             &self.writer_epoch,
             sequence,
@@ -221,6 +222,7 @@ impl DirectV71Runtime {
             &self.transition_root,
             &self.request_index_root,
             &next_request_index_root,
+            &next_financial_state_root,
             request_proof.clone(),
             request,
             result.clone(),
@@ -698,6 +700,7 @@ impl DirectV71Runtime {
             || removed.1 != payload.result
             || result != payload.result
             || !next_runtime.requests.is_empty()
+            || financial_state_root(&next_runtime)? != record.financial_state_root
         {
             return Err(V71Error::StaleCandidate);
         }
@@ -729,6 +732,7 @@ impl DirectV71Runtime {
             || candidate.runtime.record_hash != candidate.record.record_hash()?
             || candidate.runtime.transition_root != candidate.record.transition_root
             || candidate.runtime.request_index_root != candidate.record.request_index_root
+            || candidate.runtime.financial_state_root()? != candidate.record.financial_state_root
         {
             return Err(V71Error::StaleCandidate);
         }

@@ -34,24 +34,35 @@ pub struct DirectReceiptSnapshot {
     pub epoch_id: String,
     pub sequence: u64,
     pub request_index_root: String,
-    pub receipts: Vec<DirectReceipt>,
+    pub records: Vec<DirectReceiptSnapshotRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DirectReceiptSnapshotRecord {
+    pub sequence: u64,
+    pub receipt: DirectReceipt,
 }
 
 impl DirectReceiptSnapshot {
     pub fn from_receipts(
         index: &DirectRequestIndexSnapshot,
-        receipts: impl IntoIterator<Item = DirectReceipt>,
+        receipts: impl IntoIterator<Item = (u64, DirectReceipt)>,
     ) -> Result<Self, ReceiptSnapshotError> {
-        let mut receipts = receipts.into_iter().collect::<Vec<_>>();
-        receipts.sort_by(|left, right| {
-            (&left.account_id, &left.request_id).cmp(&(&right.account_id, &right.request_id))
+        let mut records = receipts
+            .into_iter()
+            .map(|(sequence, receipt)| DirectReceiptSnapshotRecord { sequence, receipt })
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            (&left.receipt.account_id, &left.receipt.request_id)
+                .cmp(&(&right.receipt.account_id, &right.receipt.request_id))
         });
         let snapshot = Self {
             protocol: DIRECT_RECEIPT_SNAPSHOT_PROTOCOL.into(),
             epoch_id: EPOCH_ID.into(),
             sequence: index.sequence,
             request_index_root: index.request_index_root.clone(),
-            receipts,
+            records,
         };
         snapshot.verify(index)?;
         Ok(snapshot)
@@ -66,8 +77,8 @@ impl DirectReceiptSnapshot {
             || self.sequence == 0
             || self.sequence != index.sequence
             || self.request_index_root != index.request_index_root
-            || self.receipts.len() != index.leaves.len()
-            || self.receipts.len() > MAX_REQUEST_INDEX_SNAPSHOT_LEAVES
+            || self.records.len() != index.leaves.len()
+            || self.records.len() > MAX_REQUEST_INDEX_SNAPSHOT_LEAVES
         {
             return Err(ReceiptSnapshotError::Invalid);
         }
@@ -77,9 +88,15 @@ impl DirectReceiptSnapshot {
             .map(|leaf| ((leaf.account_id.as_str(), leaf.request_id.as_str()), leaf))
             .collect::<BTreeMap<_, _>>();
         let mut prior: Option<(&str, &str)> = None;
-        for receipt in &self.receipts {
+        let mut sequences = std::collections::BTreeSet::new();
+        for record in &self.records {
+            let receipt = &record.receipt;
             let identity = (receipt.account_id.as_str(), receipt.request_id.as_str());
-            if prior.is_some_and(|prior| prior >= identity) {
+            if record.sequence == 0
+                || record.sequence > self.sequence
+                || !sequences.insert(record.sequence)
+                || prior.is_some_and(|prior| prior >= identity)
+            {
                 return Err(ReceiptSnapshotError::Invalid);
             }
             let leaf = leaves
@@ -99,9 +116,9 @@ impl DirectReceiptSnapshot {
     pub fn into_receipts(
         self,
         index: &DirectRequestIndexSnapshot,
-    ) -> Result<Vec<DirectReceipt>, ReceiptSnapshotError> {
+    ) -> Result<Vec<DirectReceiptSnapshotRecord>, ReceiptSnapshotError> {
         self.verify(index)?;
-        Ok(self.receipts)
+        Ok(self.records)
     }
 }
 
@@ -164,26 +181,32 @@ mod tests {
     #[test]
     fn receipt_snapshot_sorts_and_matches_every_authenticated_leaf() {
         let (index, receipts) = fixtures();
-        let snapshot = DirectReceiptSnapshot::from_receipts(&index, receipts).unwrap();
-        assert_eq!(snapshot.receipts[0].account_id, "a".repeat(64));
+        let snapshot = DirectReceiptSnapshot::from_receipts(
+            &index,
+            receipts.into_iter().enumerate().map(|(index, receipt)| (index as u64 + 1, receipt)),
+        ).unwrap();
+        assert_eq!(snapshot.records[0].receipt.account_id, "a".repeat(64));
         assert_eq!(snapshot.clone().into_receipts(&index).unwrap().len(), 2);
     }
 
     #[test]
     fn receipt_snapshot_rejects_missing_reordered_and_modified_receipts() {
         let (index, receipts) = fixtures();
-        let snapshot = DirectReceiptSnapshot::from_receipts(&index, receipts).unwrap();
+        let snapshot = DirectReceiptSnapshot::from_receipts(
+            &index,
+            receipts.into_iter().enumerate().map(|(index, receipt)| (index as u64 + 1, receipt)),
+        ).unwrap();
 
         let mut changed = snapshot.clone();
-        changed.receipts.pop();
+        changed.records.pop();
         assert_eq!(changed.verify(&index), Err(ReceiptSnapshotError::Invalid));
 
         let mut changed = snapshot.clone();
-        changed.receipts.swap(0, 1);
+        changed.records.swap(0, 1);
         assert_eq!(changed.verify(&index), Err(ReceiptSnapshotError::Invalid));
 
         let mut changed = snapshot;
-        changed.receipts[0].effect = "TAMPERED".into();
+        changed.records[0].receipt.effect = "TAMPERED".into();
         assert_eq!(
             changed.verify(&index),
             Err(ReceiptSnapshotError::IndexMismatch)
