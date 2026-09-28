@@ -2064,12 +2064,23 @@ fn journal_parent_snapshot_key_parts(
 /// tail fails closed; it never falls back to an older checkpoint or genesis.
 #[cfg_attr(not(test), allow(dead_code))]
 const MAX_V71_RESTORE_TAIL_RECORDS: usize = 1000;
+/// Aggregate ciphertext retained by the parent while preparing one restore.
+/// The record-count bound alone permits 1,000 individually valid 8 MiB
+/// records, which can exhaust an 8 GiB host before enclave replay starts.
+const MAX_V71_RESTORE_TAIL_BYTES: usize = 256 * 1024 * 1024;
 /// Checkpoint often enough that three consecutive failed intervals still leave
 /// room below the bounded 1,000-record restore tail.
 const V71_CHECKPOINT_INTERVAL_RECORDS: u64 = 250;
 
 fn journal_checkpoint_due(sequence: u64, last_checkpoint: u64) -> bool {
     sequence.saturating_sub(last_checkpoint) >= V71_CHECKPOINT_INTERVAL_RECORDS
+}
+
+fn advance_journal_tail_bytes(total: usize, next: usize) -> Result<usize, &'static str> {
+    total
+        .checked_add(next)
+        .filter(|sum| *sum <= MAX_V71_RESTORE_TAIL_BYTES)
+        .ok_or("journal tail exceeds byte bound")
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2530,6 +2541,27 @@ impl S3ImmutableArtifactStore {
                 })
                 .await;
             });
+        }
+    }
+    /// Before opening the listener, collapse a restored tail that has reached
+    /// checkpoint cadence. One synchronous attempt prevents the next commit
+    /// from crossing the restore bound. Failure remains non-fatal and starts
+    /// the existing 30-second background retry, so availability is preserved.
+    async fn catch_up_restored_journal_checkpoint(&self, state: &AppState) {
+        let sequence = match &*self.journal.lock().await {
+            JournalWriterState::Eligible(head) => head.sequence,
+            JournalWriterState::Unrestored | JournalWriterState::Latched(_) => return,
+        };
+        if !journal_checkpoint_due(
+            sequence,
+            state.journal_checkpoint_sequence.load(Ordering::Acquire),
+        ) {
+            return;
+        }
+        if let Err(error) = self.seal_current_journal_checkpoint(state).await {
+            let reason = checkpoint_seal_reason(&error);
+            eprintln!("VERIFIED_JOURNAL_STARTUP_CHECKPOINT_PENDING reason={reason}");
+            self.schedule_journal_checkpoint(state).await;
         }
     }
     /// Runs only after the final encrypted head is verified and adopted. The
@@ -3116,11 +3148,13 @@ impl S3ImmutableArtifactStore {
         let mut previous_transition_root = checkpoint.transition_root.clone();
         let mut previous_request_index_root = checkpoint.request_index_root.clone();
         let mut records = Vec::with_capacity(keys.len());
+        let mut total_bytes = 0usize;
         for (sequence, key) in keys {
             let bytes = self.read(&key).await?;
             if bytes.len() > MAX_JOURNAL_RECORD_BYTES {
                 return Err("journal tail record oversized".into());
             }
+            total_bytes = advance_journal_tail_bytes(total_bytes, bytes.len())?;
             let record: DirectJournalRecord = serde_cbor::from_slice(&bytes)
                 .map_err(|_| "journal tail record decode failed")?;
             if serde_cbor::to_vec(&record).ok().as_deref() != Some(bytes.as_slice()) {
@@ -4267,6 +4301,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         && state.journal_request_index.lock().await.is_none()
     {
         activate_v71_from_restored_v70(&state).await?;
+    }
+    if let Some(ArchiveStore::S3(store)) = state.artifact_store.as_ref() {
+        if state.persistence_format == PersistenceFormat::V71 {
+            store.catch_up_restored_journal_checkpoint(&state).await;
+        }
     }
     // Observe already-admitted Base withdrawals independently of the browser.
     // This observer has no submission capability and shares the financial lock.
@@ -8082,12 +8121,16 @@ mod tests {
     fn v71_checkpoint_cadence_leaves_three_retry_intervals_inside_restore_bound() {
         assert_eq!(V71_CHECKPOINT_INTERVAL_RECORDS, 250);
         assert_eq!(MAX_V71_RESTORE_TAIL_RECORDS, 1000);
+        assert_eq!(MAX_V71_RESTORE_TAIL_BYTES, 256 * 1024 * 1024);
         assert!(!journal_checkpoint_due(249, 0));
         assert!(journal_checkpoint_due(250, 0));
         assert!(!journal_checkpoint_due(10_249, 10_000));
         assert!(journal_checkpoint_due(10_250, 10_000));
         assert!(!journal_checkpoint_due(9_999, 10_000));
         assert!(V71_CHECKPOINT_INTERVAL_RECORDS * 4 <= MAX_V71_RESTORE_TAIL_RECORDS as u64);
+        assert_eq!(advance_journal_tail_bytes(MAX_V71_RESTORE_TAIL_BYTES - 1, 1), Ok(MAX_V71_RESTORE_TAIL_BYTES));
+        assert_eq!(advance_journal_tail_bytes(MAX_V71_RESTORE_TAIL_BYTES, 1), Err("journal tail exceeds byte bound"));
+        assert_eq!(advance_journal_tail_bytes(usize::MAX, 1), Err("journal tail exceeds byte bound"));
     }
 
     #[test]
