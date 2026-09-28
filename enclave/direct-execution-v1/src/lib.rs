@@ -36,6 +36,7 @@ pub mod journal;
 pub mod migration;
 mod quest_receipts;
 pub mod request_index;
+pub mod request_index_snapshot;
 pub mod v71;
 pub mod v71_checkpoint;
 pub use quest_receipts::{PublicQuestReceipt,QuestReceiptPayload,QuestReceiptKind,QuestReceiptWitness,QuestReceiptLookupPayload,quest_public_receipt_hash,QUEST_RECEIPT_PROTOCOL,
