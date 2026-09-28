@@ -110,8 +110,10 @@ where
     preflight.await?;
     bootstrap.await
 }
-// Must match the enclave's finite parent-only VSOCK recovery ceiling.
-const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
+// The enclave's finite parent-only VSOCK recovery ceiling, from the same file.
+#[path = "../direct_frame.rs"]
+mod direct_frame;
+use direct_frame::{CHECKPOINT_FRAME_OVERSIZED, MAX_FRAME_BYTES};
 // Fixed encrypted-download window, not a verification bypass.
 const RESTORE_PREFETCH_WIDTH: usize = 4;
 fn restore_prefetch_ranges(total: usize) -> Vec<std::ops::Range<usize>> {
@@ -256,6 +258,13 @@ struct PreparedArchiveRestore {
 }
 
 const CHECKPOINT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const CHECKPOINT_OVERSIZED: &str = "checkpoint frame oversized";
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckpointRefreshOutcome {
+    Persisted,
+    Failed,
+    Skipped,
+}
 #[derive(Default)]
 struct CheckpointRefresh {
     running: bool,
@@ -274,11 +283,55 @@ impl CheckpointRefresh {
         self.requested = false;
         self.next_start = Some(now + CHECKPOINT_REFRESH_INTERVAL);
     }
-    fn finish(&mut self, success: bool) -> bool {
-        // Retain work arriving during a refresh, and retry a failed refresh
-        // even if trading becomes quiet. Original journals remain authoritative.
-        self.running = self.requested || !success;
+    fn finish(&mut self, outcome: CheckpointRefreshOutcome) -> bool {
+        self.running = match outcome {
+            // Retain work arriving during a refresh, and retry a failed refresh
+            // even if trading becomes quiet. Original journals remain authoritative.
+            CheckpointRefreshOutcome::Persisted => self.requested,
+            CheckpointRefreshOutcome::Failed => true,
+            // Retrying cannot shrink an oversized checkpoint. Return to idle;
+            // a later commit may request one more interval-spaced attempt.
+            CheckpointRefreshOutcome::Skipped => {
+                self.requested = false;
+                false
+            }
+        };
         self.running
+    }
+}
+/// Finite diagnostic label; storage and transport error text is never echoed.
+fn checkpoint_seal_reason(error: &str) -> &'static str {
+    match error {
+        CHECKPOINT_OVERSIZED => "oversized",
+        "checkpoint seal transport failed" => "transport",
+        "checkpoint seal rejected" => "head_validation",
+        "checkpoint head mismatch" => "archive_head",
+        _ => "archive_read_or_write",
+    }
+}
+/// Background checkpoint refresh. Exits when idle; never gates a commit.
+async fn refresh_checkpoints<F, Fut>(gate: &Mutex<CheckpointRefresh>, mut seal: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    loop {
+        let delay = gate.lock().await.delay(tokio::time::Instant::now());
+        tokio::time::sleep(delay).await;
+        gate.lock().await.begin(tokio::time::Instant::now());
+        let outcome = match seal().await {
+            Ok(()) => CheckpointRefreshOutcome::Persisted,
+            Err(error) if error == CHECKPOINT_OVERSIZED => {
+                eprintln!("VERIFIED_ARCHIVE_CHECKPOINT_REFRESH_SKIPPED reason=oversized");
+                CheckpointRefreshOutcome::Skipped
+            }
+            Err(error) => {
+                let reason = checkpoint_seal_reason(&error);
+                eprintln!("VERIFIED_ARCHIVE_CHECKPOINT_REFRESH_PENDING reason={reason}");
+                CheckpointRefreshOutcome::Failed
+            }
+        };
+        if !gate.lock().await.finish(outcome) { break; }
     }
 }
 
@@ -1951,12 +2004,25 @@ impl S3ImmutableArtifactStore {
             .map_err(|_| "checkpoint head decode failed")?;
         if receipt_only_record(&artifact) != *head { return Err("checkpoint head mismatch".into()); }
         let response = exchange(state, RuntimeRequest::SealCheckpoint { artifact, receipt_records: records, artifact_hashes })
-            .await.map_err(|_| "checkpoint seal transport failed")?;
-        let RuntimeResponse::CheckpointSealed { checkpoint } = response else { return Err("checkpoint seal rejected".into()); };
+            .await.map_err(|error| if frame_oversized(&error) { CHECKPOINT_OVERSIZED } else { "checkpoint seal transport failed" })?;
+        let checkpoint = match response {
+            RuntimeResponse::CheckpointSealed { checkpoint } => checkpoint,
+            RuntimeResponse::Error { code } if code == CHECKPOINT_FRAME_OVERSIZED => return Err(CHECKPOINT_OVERSIZED.into()),
+            _ => return Err("checkpoint seal rejected".into()),
+        };
         let key = self.checkpoint_key(&checkpoint)?;
         self.write_once(&key, serde_cbor::to_vec(&checkpoint).map_err(|_| "checkpoint encoding failed")?).await?;
         eprintln!("VERIFIED_ARCHIVE_CHECKPOINT_PERSISTED {}", checkpoint.artifact.sequence);
         Ok(())
+    }
+    /// Runs only after the final encrypted head is verified and adopted. The
+    /// immutable archive stays authoritative and the prior checkpoint stays in
+    /// place, so a failed seal is diagnosed but never fails the restore.
+    async fn seed_restored_checkpoint(&self, state: &AppState) {
+        if let Err(error) = self.seal_current_checkpoint(state).await {
+            let reason = checkpoint_seal_reason(&error);
+            eprintln!("VERIFIED_ARCHIVE_RESTORE_CHECKPOINT_SKIPPED reason={reason}");
+        }
     }
     async fn from_environment() -> Result<Self, Box<dyn std::error::Error>> {
         let bucket = env::var("LAYRS_DIRECT_ARCHIVE_BUCKET")?;
@@ -2539,7 +2605,7 @@ impl S3ImmutableArtifactStore {
         *state.committed_state_root.lock().await = Some(root);
         // Seed the optimization before allowing this restored writer to serve.
         // A corrupt existing checkpoint is never silently bypassed above.
-        self.seal_current_checkpoint(state).await?;
+        self.seed_restored_checkpoint(state).await;
         eprintln!("VERIFIED_ARCHIVE_RESTORE_COMPLETE {}", keys.len());
         Ok(())
     }
@@ -5972,22 +6038,8 @@ async fn exchange_direct(
             if store.checkpoint_refresh_gate.lock().await.request() {
                 let store = store.clone(); let state = state.clone();
                 tokio::spawn(async move {
-                    loop {
-                        let delay = store.checkpoint_refresh_gate.lock().await.delay(tokio::time::Instant::now());
-                        tokio::time::sleep(delay).await;
-                        store.checkpoint_refresh_gate.lock().await.begin(tokio::time::Instant::now());
-                        let result = store.seal_current_checkpoint(&state).await;
-                        if let Err(error) = &result {
-                            let reason = match error.as_str() {
-                                "checkpoint seal transport failed" => "transport",
-                                "checkpoint seal rejected" => "head_validation",
-                                "checkpoint head mismatch" => "archive_head",
-                                _ => "archive_read_or_write",
-                            };
-                            eprintln!("VERIFIED_ARCHIVE_CHECKPOINT_REFRESH_PENDING reason={reason}");
-                        }
-                        if !store.checkpoint_refresh_gate.lock().await.finish(result.is_ok()) { break; }
-                    }
+                    let (store, state) = (&store, &state);
+                    refresh_checkpoints(&store.checkpoint_refresh_gate, move || store.seal_current_checkpoint(state)).await;
                 });
             }
         }
@@ -5997,17 +6049,34 @@ async fn exchange_direct(
 fn invalid(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
-async fn read_frame(stream: &mut VsockStream) -> io::Result<Vec<u8>> {
+#[derive(Debug)]
+struct FrameOversized;
+impl std::fmt::Display for FrameOversized {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("frame exceeds direct-execution limit")
+    }
+}
+impl std::error::Error for FrameOversized {}
+fn frame_oversized(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|inner| inner.is::<FrameOversized>())
+}
+async fn read_frame<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> io::Result<Vec<u8>> {
     let length = stream.read_u32().await? as usize;
-    if length == 0 || length > MAX_FRAME_BYTES {
+    if length > MAX_FRAME_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, FrameOversized));
+    }
+    if length == 0 {
         return Err(invalid("invalid frame"));
     }
     let mut bytes = vec![0; length];
     stream.read_exact(&mut bytes).await?;
     Ok(bytes)
 }
-async fn write_frame(stream: &mut VsockStream, bytes: &[u8]) -> io::Result<()> {
-    if bytes.is_empty() || bytes.len() > MAX_FRAME_BYTES {
+async fn write_frame<S: tokio::io::AsyncWrite + Unpin>(stream: &mut S, bytes: &[u8]) -> io::Result<()> {
+    if bytes.len() > MAX_FRAME_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, FrameOversized));
+    }
+    if bytes.is_empty() {
         return Err(invalid("invalid frame"));
     }
     stream.write_u32(bytes.len() as u32).await?;
@@ -6025,18 +6094,133 @@ mod tests {
         assert_eq!(refresh.delay(now), std::time::Duration::ZERO);
         refresh.begin(now);
         assert!(!refresh.request()); // a commit while sealing schedules one successor
-        assert!(refresh.finish(true));
+        assert!(refresh.finish(super::CheckpointRefreshOutcome::Persisted));
         assert_eq!(refresh.delay(now), super::CHECKPOINT_REFRESH_INTERVAL);
         refresh.begin(now + super::CHECKPOINT_REFRESH_INTERVAL);
-        assert!(refresh.finish(false)); // failed refresh is not dropped in a quiet market
+        assert!(refresh.finish(super::CheckpointRefreshOutcome::Failed)); // failed refresh is not dropped in a quiet market
         assert_eq!(refresh.delay(now + super::CHECKPOINT_REFRESH_INTERVAL), super::CHECKPOINT_REFRESH_INTERVAL);
         refresh.begin(now + super::CHECKPOINT_REFRESH_INTERVAL * 2);
-        assert!(!refresh.finish(true));
+        assert!(!refresh.finish(super::CheckpointRefreshOutcome::Persisted));
         assert!(refresh.request());
         assert_eq!(refresh.delay(now + super::CHECKPOINT_REFRESH_INTERVAL * 2), super::CHECKPOINT_REFRESH_INTERVAL);
     }
 
     use super::*;
+    #[test]
+    fn oversized_checkpoint_refresh_returns_to_idle_even_with_a_coalesced_commit() {
+        let mut refresh = CheckpointRefresh::default();
+        let now = tokio::time::Instant::now();
+        assert!(refresh.request());
+        refresh.begin(now);
+        assert!(!refresh.request()); // commit coalesced into the running refresh
+        assert!(!refresh.finish(CheckpointRefreshOutcome::Skipped));
+        assert!(!refresh.running && !refresh.requested);
+        // A later commit may start one more attempt, spaced by the interval.
+        assert!(refresh.request());
+        assert_eq!(refresh.delay(now), CHECKPOINT_REFRESH_INTERVAL);
+    }
+    #[tokio::test]
+    async fn background_refresh_seals_an_oversized_checkpoint_once_then_exits() {
+        let gate = Mutex::new(CheckpointRefresh::default());
+        assert!(gate.lock().await.request());
+        let mut attempts = 0;
+        let shared = &gate;
+        let refresh = refresh_checkpoints(&gate, || {
+            attempts += 1;
+            // A commit lands while the oversized seal is in flight.
+            async move { assert!(!shared.lock().await.request()); Err(CHECKPOINT_OVERSIZED.to_string()) }
+        });
+        tokio::time::timeout(Duration::from_secs(5), refresh).await.expect("oversized refresh must not retry");
+        assert_eq!(attempts, 1);
+        let state = gate.lock().await;
+        assert!(!state.running && !state.requested);
+    }
+    #[tokio::test]
+    async fn background_refresh_retries_other_failures_only_after_the_interval() {
+        let gate = Mutex::new(CheckpointRefresh::default());
+        assert!(gate.lock().await.request());
+        let mut attempts = 0;
+        let refresh = refresh_checkpoints(&gate, || {
+            attempts += 1;
+            async { Err("checkpoint seal transport failed".to_string()) }
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(200), refresh).await.is_err());
+        assert_eq!(attempts, 1);
+        assert!(gate.lock().await.running);
+    }
+    #[test]
+    fn checkpoint_seal_reasons_are_finite_labels() {
+        assert_eq!(checkpoint_seal_reason(CHECKPOINT_OVERSIZED), "oversized");
+        assert_eq!(checkpoint_seal_reason("checkpoint seal transport failed"), "transport");
+        assert_eq!(checkpoint_seal_reason("checkpoint seal rejected"), "head_validation");
+        assert_eq!(checkpoint_seal_reason("checkpoint head mismatch"), "archive_head");
+        assert_eq!(checkpoint_seal_reason("s3://bucket/secret-key AccessDenied"), "archive_read_or_write");
+    }
+    #[tokio::test]
+    async fn parent_frame_limit_matches_enclave_and_marks_oversized_frames() {
+        assert_eq!(MAX_FRAME_BYTES, 512 * 1024 * 1024);
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        write_frame(&mut writer, b"bounded").await.unwrap();
+        assert_eq!(read_frame(&mut reader).await.unwrap(), b"bounded");
+        // Zeroed and never read: rejected before any byte reaches the stream.
+        let oversized = vec![0u8; MAX_FRAME_BYTES + 1];
+        let error = write_frame(&mut writer, &oversized).await.unwrap_err();
+        assert!(frame_oversized(&error));
+        writer.write_u32((MAX_FRAME_BYTES + 1) as u32).await.unwrap();
+        assert!(frame_oversized(&read_frame(&mut reader).await.unwrap_err()));
+        writer.write_u32(0).await.unwrap();
+        let empty = read_frame(&mut reader).await.unwrap_err();
+        assert_eq!(empty.kind(), io::ErrorKind::InvalidData);
+        assert!(!frame_oversized(&empty));
+    }
+    #[tokio::test]
+    async fn restore_completes_when_the_post_restore_checkpoint_seal_fails() {
+        // Serves a head artifact that disagrees with the verified receipt
+        // cache, so the post-restore seal fails before contacting the enclave.
+        let head = projection_sequence_fixture();
+        let hash = "e".repeat(64);
+        let mut divergent = head.clone(); divergent.state_hash = "f".repeat(64);
+        let body = serde_cbor::to_vec(&divergent).unwrap();
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
+        let expected_path = format!("/unit-test/epoch/artifacts/{:020}-{hash}.cbor", head.sequence);
+        let server=tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket,_)=listener.accept().await.unwrap();let mut buffer=vec![0;8192];let size=socket.read(&mut buffer).await.unwrap();
+                assert!(String::from_utf8_lossy(&buffer[..size]).contains(&expected_path));
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+            }
+        });
+        let configuration=aws_sdk_s3::config::Builder::new().behavior_version_latest().region(aws_sdk_s3::config::Region::new("us-east-1")).credentials_provider(aws_sdk_s3::config::Credentials::new("unit-test","unit-test",None,None,"local-only")).endpoint_url(format!("http://{address}")).force_path_style(true).build();
+        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(Some(vec![head.clone()]))),verified_artifact_hashes:Arc::new(Mutex::new(vec![hash.clone()])),prepared_restore:Arc::new(Mutex::new(None)),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default()))};
+        let state = AppState {
+            enclave_cid: 16,
+            session_key: vec![7; 32],
+            isolated_test: true,
+            projection: None,
+            local_used_sessions: Arc::new(Mutex::new(HashSet::new())),
+            artifact_store: None,
+            commit_ack_key: Vec::new(),
+            custody: None,
+            zen_custody: None,
+            usdc_custody: None,
+            usdc_link_authority: None,
+            usdc_bus_custody: None,
+            financial_gate: Arc::new(FinancialGate::new()),
+            last_commit_at: Arc::new(AtomicU64::new(0)),
+            committed_state_root: Arc::new(Mutex::new(Some(head.state_hash.clone()))),
+            unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
+            governed_bootstrap: None,
+        };
+        assert_eq!(store.seal_current_checkpoint(&state).await.unwrap_err(), "checkpoint head mismatch");
+        // restore_streamed's final step: the same failure is only diagnosed.
+        let _: () = store.seed_restored_checkpoint(&state).await;
+        server.await.unwrap();
+        // The verified restore adoption is untouched by the failed seal.
+        assert_eq!(store.verified_receipt_records.lock().await.as_deref(), Some(&[head.clone()][..]));
+        assert_eq!(*store.verified_artifact_hashes.lock().await, vec![hash]);
+        assert_eq!(*state.committed_state_root.lock().await, Some(head.state_hash));
+    }
     #[test]
     fn usdc_preflight_rejects_a_cross_rail_hold_or_insufficient_balance_before_payout() {
         let balance=|amount:&str|RuntimeResponse::Balance {amount_atomic:amount.into()};

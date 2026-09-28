@@ -27,11 +27,11 @@ use tokio::{
 use tokio_vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
 use zeroize::Zeroize;
 
+#[path = "../direct_frame.rs"]
+mod direct_frame;
+use direct_frame::{CHECKPOINT_FRAME_OVERSIZED, MAX_FRAME_BYTES};
+
 const PORT: u32 = 5_003;
-// Startup recovery and checkpoint sealing carry the verified immutable lineage
-// in finite parent-only VSOCK frames. Keep the transport bounded while leaving
-// headroom for the growing encrypted checkpoint.
-const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 
 struct EnclaveState {
     // Serialize state transitions without blocking reads of committed state.
@@ -175,8 +175,12 @@ where
         RuntimeRequest::BeginCommittedRestore => begin_committed_restore(state).await,
         RuntimeRequest::BeginCheckpointRestore { checkpoint } => begin_checkpoint_restore(state, checkpoint).await,
         RuntimeRequest::SealCheckpoint { artifact, receipt_records, artifact_hashes } => {
-            seal_checkpoint_with(&state, move |runtime, key|
-                runtime.seal_checkpoint(artifact, receipt_records, artifact_hashes, key)).await
+            let bytes = match seal_checkpoint_with(&state, move |runtime, key|
+                runtime.seal_checkpoint(artifact, receipt_records, artifact_hashes, key)).await {
+                RuntimeResponse::CheckpointSealed { checkpoint } => checkpoint_sealed_frame(checkpoint, MAX_FRAME_BYTES)?,
+                other => serde_cbor::to_vec(&other).map_err(invalid)?,
+            };
+            return write_frame(&mut stream, &bytes).await;
         },
         RuntimeRequest::AppendCommittedRestore { artifact } => append_committed_restore(state,artifact).await,
         RuntimeRequest::FinishCommittedRestore { expected_sequence,expected_state_hash } => finish_committed_restore(state,expected_sequence,expected_state_hash).await,
@@ -704,6 +708,31 @@ where F: FnOnce(&DirectRuntime, &[u8]) -> Result<layrs_direct_execution_v1::Dire
     }
 }
 
+/// Returns a sealed checkpoint only when it also fits the startup
+/// BeginCheckpointRestore frame, which is larger than this response. A
+/// persisted checkpoint that restart cannot carry would fail recovery closed.
+fn checkpoint_sealed_frame(checkpoint: layrs_direct_execution_v1::DirectCheckpoint, limit: usize) -> io::Result<Vec<u8>> {
+    let oversized = || serde_cbor::to_vec(&RuntimeResponse::Error { code: CHECKPOINT_FRAME_OVERSIZED.into() }).map_err(invalid);
+    let restore = RuntimeRequest::BeginCheckpointRestore { checkpoint };
+    let mut restore_bytes = ByteCount(0);
+    serde_cbor::to_writer(&mut restore_bytes, &restore).map_err(invalid)?;
+    if restore_bytes.0 > limit { return oversized(); }
+    let RuntimeRequest::BeginCheckpointRestore { checkpoint } = restore else { return Err(invalid("checkpoint frame")); };
+    let bytes = serde_cbor::to_vec(&RuntimeResponse::CheckpointSealed { checkpoint }).map_err(invalid)?;
+    if bytes.len() > limit { return oversized(); }
+    Ok(bytes)
+}
+
+/// Measures an encoding without allocating a second copy of the checkpoint.
+struct ByteCount(usize);
+impl io::Write for ByteCount {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
+
 async fn transition(state: &Arc<Mutex<EnclaveState>>) -> tokio::sync::OwnedMutexGuard<()> {
     let gate = Arc::clone(&state.lock().await.transition_gate);
     gate.lock_owned().await
@@ -906,18 +935,23 @@ mod tests {
     const TEST_VSOCK_BUFFER_BYTES: usize = 64 * 1024;
 
     #[tokio::test]
-    async fn frame_limit_round_trips_just_under_and_rejects_just_over() {
-        let expected = vec![0x5a; MAX_FRAME_BYTES - 1];
+    async fn frame_limit_round_trips_exact_limit_and_rejects_one_over() {
+        assert_eq!(MAX_FRAME_BYTES, 512 * 1024 * 1024);
+        let expected = vec![0x5a; MAX_FRAME_BYTES];
         let (mut writer, mut reader) = tokio::io::duplex(TEST_VSOCK_BUFFER_BYTES);
         let write = tokio::spawn(async move { write_frame(&mut writer, &expected).await });
         let observed = read_frame(&mut reader).await.unwrap();
         write.await.unwrap().unwrap();
-        assert_eq!(observed.len(), MAX_FRAME_BYTES - 1);
+        assert_eq!(observed.len(), MAX_FRAME_BYTES);
         assert!(observed.iter().all(|byte| *byte == 0x5a));
 
         let (mut writer, mut reader) = tokio::io::duplex(8);
         writer.write_u32((MAX_FRAME_BYTES + 1) as u32).await.unwrap();
         assert_eq!(read_frame(&mut reader).await.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        // Zeroed and never read: rejected before any byte reaches the stream.
+        let oversized = vec![0u8; MAX_FRAME_BYTES + 1];
+        let (mut writer, _reader) = tokio::io::duplex(8);
+        assert_eq!(write_frame(&mut writer, &oversized).await.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
     use std::{
         path::PathBuf,
@@ -1273,6 +1307,27 @@ mod tests {
         assert!(!restarted.lock().await.recovery_complete);
         assert!(restarted.lock().await.restore_candidate.is_none());
         assert_eq!(restarted.lock().await.runtime.committed_sequence(), 0);
+    }
+    #[tokio::test]
+    async fn sealed_checkpoint_is_refused_unless_its_restore_frame_fits() {
+        let running = state(); let store = FilesystemImmutableArtifactStore::new(artifact_dir());
+        recover(Arc::clone(&running), vec![]).await;
+        commit_through_parent_callback(Arc::clone(&running), request("checkpoint-frame"), &store).await;
+        let first = store.load_committed().unwrap();
+        let mut compact = first[0].clone(); compact.ciphertext.clear();
+        let checkpoint = running.lock().await.runtime.seal_checkpoint(first[0].clone(), vec![compact], vec![layrs_direct_execution_v1::artifact_hash(&first[0])], &[8;32]).unwrap();
+        let restore = serde_cbor::to_vec(&RuntimeRequest::BeginCheckpointRestore { checkpoint: checkpoint.clone() }).unwrap().len();
+        let sealed = serde_cbor::to_vec(&RuntimeResponse::CheckpointSealed { checkpoint: checkpoint.clone() }).unwrap().len();
+        // The restart frame is the binding constraint, not the seal response.
+        assert!(sealed < restore);
+
+        let fits: RuntimeResponse = serde_cbor::from_slice(&checkpoint_sealed_frame(checkpoint.clone(), restore).unwrap()).unwrap();
+        assert_eq!(fits, RuntimeResponse::CheckpointSealed { checkpoint: checkpoint.clone() });
+        let refused: RuntimeResponse = serde_cbor::from_slice(&checkpoint_sealed_frame(checkpoint, restore - 1).unwrap()).unwrap();
+        assert_eq!(refused, RuntimeResponse::Error { code: CHECKPOINT_FRAME_OVERSIZED.into() });
+        // Refusal is transport-only; committed state is unchanged.
+        assert!(running.lock().await.recovery_complete);
+        assert_eq!(running.lock().await.runtime.committed_sequence(), 1);
     }
     #[tokio::test]
     async fn streamed_restore_verifies_every_successor_and_final_head_before_adoption() {
