@@ -239,6 +239,9 @@ where
         RuntimeRequest::SealJournalCheckpoint => {
             seal_journal_checkpoint(state).await
         }
+        RuntimeRequest::VerifyJournalCheckpoint { checkpoint } => {
+            verify_journal_checkpoint(state, checkpoint).await
+        }
         RuntimeRequest::SealV70Migration => seal_v70_migration(state).await,
         RuntimeRequest::SealV70RollbackCheckpoint { migration, journal_records } => {
             let bytes = match seal_v70_rollback_checkpoint(state, migration, journal_records).await {
@@ -1242,6 +1245,73 @@ async fn seal_journal_checkpoint(state: Arc<Mutex<EnclaveState>>) -> RuntimeResp
         Ok(Ok(checkpoint)) => RuntimeResponse::JournalCheckpointSealed { checkpoint },
         _ => RuntimeResponse::Error {
             code: "JOURNAL_CHECKPOINT_HEAD_INVALID".into(),
+        },
+    }
+}
+
+/// Authenticate, decrypt and invariant-check one checkpoint in a disposable
+/// runtime. The restored value is never attached to `EnclaveState`, so this
+/// verification path has no writer eligibility and cannot execute a commit.
+async fn verify_journal_checkpoint(
+    state: Arc<Mutex<EnclaveState>>,
+    checkpoint: layrs_direct_execution_v1::v71_checkpoint::DirectV71Checkpoint,
+) -> RuntimeResponse {
+    let snapshot = {
+        let state = state.lock().await;
+        if !state.recovery_complete
+            || state.restore_candidate.is_some()
+            || state.v71_restore_candidate.is_some()
+        {
+            None
+        } else {
+            state.v71_runtime.as_ref().map(|runtime| {
+                (
+                    runtime.financial_runtime().clone(),
+                    zeroize::Zeroizing::new(state.state_key.clone()),
+                )
+            })
+        }
+    };
+    let Some((runtime, state_key)) = snapshot else {
+        return RuntimeResponse::Error {
+            code: "JOURNAL_CHECKPOINT_VERIFY_UNAVAILABLE".into(),
+        };
+    };
+    let verification_key = match derive_journal_signing_key(&state_key)
+        .and_then(|key| journal_verifying_key(&key))
+    {
+        Ok(key) => key,
+        Err(_) => {
+            return RuntimeResponse::Error {
+                code: "JOURNAL_KEY_INVALID".into(),
+            }
+        }
+    };
+    match tokio::task::spawn_blocking(move || {
+        DirectV71Runtime::restore_checkpoint(
+            runtime,
+            &checkpoint,
+            &state_key,
+            &verification_key,
+        )
+    })
+    .await
+    {
+        Ok(Ok(restored)) => match restored.financial_state_root() {
+            Ok(financial_state_root) => RuntimeResponse::JournalCheckpointVerified {
+                writer_epoch: restored.writer_epoch().into(),
+                sequence: restored.sequence(),
+                record_hash: restored.record_hash().into(),
+                transition_root: restored.transition_root().into(),
+                request_index_root: restored.request_index_root().into(),
+                financial_state_root,
+            },
+            Err(_) => RuntimeResponse::Error {
+                code: "JOURNAL_CHECKPOINT_VERIFY_FAILED".into(),
+            },
+        },
+        _ => RuntimeResponse::Error {
+            code: "JOURNAL_CHECKPOINT_VERIFY_FAILED".into(),
         },
     }
 }
@@ -2552,6 +2622,55 @@ mod tests {
         {
             let state = live.lock().await;
             assert_eq!(state.runtime.committed_sequence(), 0);
+            assert_eq!(state.v71_runtime.as_ref().unwrap().sequence(), 1);
+        }
+
+        let sealed_checkpoint = runtime_response(
+            Arc::clone(&live),
+            RuntimeRequest::SealJournalCheckpoint,
+        )
+        .await;
+        let RuntimeResponse::JournalCheckpointSealed { checkpoint } = sealed_checkpoint else {
+            panic!("expected v71 checkpoint");
+        };
+        let verified = runtime_response(
+            Arc::clone(&live),
+            RuntimeRequest::VerifyJournalCheckpoint {
+                checkpoint: checkpoint.clone(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            verified,
+            RuntimeResponse::JournalCheckpointVerified {
+                sequence: 1,
+                ref writer_epoch,
+                ref record_hash,
+                ref transition_root,
+                ref request_index_root,
+                ref financial_state_root,
+            } if writer_epoch == &checkpoint.writer_epoch
+                && record_hash == &checkpoint.record_hash
+                && transition_root == &checkpoint.transition_root
+                && request_index_root == &checkpoint.request_index_root
+                && financial_state_root == &checkpoint.financial_state_root
+        ));
+        let mut corrupted = checkpoint;
+        corrupted.ciphertext[0] ^= 1;
+        assert!(matches!(
+            runtime_response(
+                Arc::clone(&live),
+                RuntimeRequest::VerifyJournalCheckpoint {
+                    checkpoint: corrupted,
+                },
+            )
+            .await,
+            RuntimeResponse::Error { ref code }
+                if code == "JOURNAL_CHECKPOINT_VERIFY_FAILED"
+        ));
+        {
+            let state = live.lock().await;
+            assert!(state.v71_writer_eligible);
             assert_eq!(state.v71_runtime.as_ref().unwrap().sequence(), 1);
         }
 

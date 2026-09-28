@@ -3744,6 +3744,13 @@ pub enum RuntimeRequest {
         writer_fence_evidence_sha256: Option<String>,
     },
     SealJournalCheckpoint,
+    /// Restores an authenticated checkpoint into a disposable runtime that is
+    /// never installed as the writer. Parents use this before publishing each
+    /// checkpoint; exact immutable readback then proves the published bytes
+    /// are the bytes this non-writer restore accepted.
+    VerifyJournalCheckpoint {
+        checkpoint: v71_checkpoint::DirectV71Checkpoint,
+    },
     SealV70Migration,
     SealV70RollbackCheckpoint {
         migration: migration::V70MigrationBundle,
@@ -3831,6 +3838,14 @@ pub enum RuntimeResponse {
     },
     JournalCheckpointSealed {
         checkpoint: v71_checkpoint::DirectV71Checkpoint,
+    },
+    JournalCheckpointVerified {
+        writer_epoch: String,
+        sequence: u64,
+        record_hash: String,
+        transition_root: String,
+        request_index_root: String,
+        financial_state_root: String,
     },
     V70MigrationSealed {
         bundle: migration::V70MigrationBundle,
