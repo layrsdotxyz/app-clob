@@ -165,6 +165,44 @@ impl DirectRuntime {
             return Err(RuntimeError::InvalidRequest);
         }
         let receipt = self.public_quest_receipt(participant, owner, request)?;
+        self.bind_quest_receipt_lookup(participant, owner, request, nonce, receipt)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn quest_receipt_witness_for_terminal(
+        &self,
+        participant: &str,
+        owner: &str,
+        request: &str,
+        nonce: &[u8],
+        request_hash: &str,
+        result: &DirectResult,
+        enclave_sequence: u64,
+        state_root: &str,
+    ) -> Result<QuestReceiptWitness, RuntimeError> {
+        if nonce.len() != 32 {
+            return Err(RuntimeError::InvalidRequest);
+        }
+        let receipt = self.public_quest_receipt_for_terminal(
+            participant,
+            owner,
+            request,
+            request_hash,
+            result,
+            enclave_sequence,
+            state_root,
+        )?;
+        self.bind_quest_receipt_lookup(participant, owner, request, nonce, receipt)
+    }
+
+    fn bind_quest_receipt_lookup(
+        &self,
+        participant: &str,
+        owner: &str,
+        request: &str,
+        nonce: &[u8],
+        receipt: PublicQuestReceipt,
+    ) -> Result<QuestReceiptWitness, RuntimeError> {
         let lookup = QuestReceiptLookupPayload {
             protocol: "layrs.direct-receipt-lookup.v1".into(),
             participant_account: participant.into(),
@@ -205,21 +243,49 @@ impl DirectRuntime {
         if !self.writer_enabled() {
             return Err(RuntimeError::WriterDisabled);
         }
-        let identities = self
-            .subject_identities
-            .get(participant_account)
-            .ok_or(RuntimeError::IdentityDenied)?;
         let (request_hash, result) = self
             .requests
             .get(&(receipt_account.into(), request_id.into()))
             .ok_or(RuntimeError::InvalidRequest)?;
+        self.public_quest_receipt_for_terminal(
+            participant_account,
+            receipt_account,
+            request_id,
+            request_hash,
+            result,
+            self.committed_sequence(),
+            &self.committed_state_hash(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn public_quest_receipt_for_terminal(
+        &self,
+        participant_account: &str,
+        receipt_account: &str,
+        request_id: &str,
+        request_hash: &str,
+        result: &DirectResult,
+        enclave_sequence: u64,
+        state_root: &str,
+    ) -> Result<PublicQuestReceipt, RuntimeError> {
+        if !self.writer_enabled() {
+            return Err(RuntimeError::WriterDisabled);
+        }
+        if enclave_sequence == 0 || !valid_hex32(state_root) {
+            return Err(RuntimeError::StateArtifact);
+        }
+        let identities = self
+            .subject_identities
+            .get(participant_account)
+            .ok_or(RuntimeError::IdentityDenied)?;
         let receipt = &result.receipt;
         if result.status != TerminalStatus::Applied
             || receipt.status != result.status
             || receipt.effect != result.effect
             || receipt.account_id != receipt_account
             || receipt.request_id != request_id
-            || receipt.request_hash != *request_hash
+            || receipt.request_hash != request_hash
             || !verify_receipt(&self.receipt_key, receipt)
         {
             return Err(RuntimeError::StateArtifact);
@@ -288,8 +354,8 @@ impl DirectRuntime {
             receipt_id,
             participant_commitment,
             kind,
-            enclave_sequence: self.committed_sequence().to_string(),
-            state_root: self.committed_state_hash(),
+            enclave_sequence: enclave_sequence.to_string(),
+            state_root: state_root.into(),
             command_commitment,
         };
         let key = signing_key(&self.receipt_key)?;

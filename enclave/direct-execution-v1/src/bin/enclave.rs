@@ -133,6 +133,25 @@ where
         RuntimeRequest::PublicQuestReceipt { participant_account,receipt_account,request_id,nonce } => {
             public_quest_receipt(&state,&participant_account,&receipt_account,&request_id,&nonce).await
         },
+        RuntimeRequest::PublicQuestReceiptJournal {
+            participant_account,
+            receipt_account,
+            request_id,
+            nonce,
+            request_proof,
+            archived,
+        } => {
+            public_quest_receipt_journal(
+                &state,
+                participant_account,
+                receipt_account,
+                request_id,
+                nonce,
+                request_proof,
+                archived,
+            )
+            .await
+        }
         RuntimeRequest::Status => {
             let state = state.lock().await;
             RuntimeResponse::Status {
@@ -1503,18 +1522,56 @@ fn quest_evidence_gate(state:&EnclaveState)->Result<(),&'static str> {
     }
     Ok(())
 }
+fn valid_privacy_receipt_request(participant:&str,owner:&str,request:&str,nonce:&[u8])->bool {
+    let hash=|value:&str|value.len()==64&&value.bytes().all(|byte|byte.is_ascii_digit()||(b'a'..=b'f').contains(&byte));
+    nonce.len()==32&&hash(participant)&&hash(owner)&&!request.is_empty()&&request.len()<=128
+        &&request.bytes().all(|byte|byte.is_ascii_alphanumeric()||byte==b'-'||byte==b'_'||byte==b':')
+}
 async fn public_quest_receipt(state:&Arc<Mutex<EnclaveState>>,participant:&str,owner:&str,request:&str,nonce:&[u8])->RuntimeResponse {
     let state=state.lock().await;
     if let Err(code)=quest_evidence_gate(&state) {return RuntimeResponse::Error{code:code.into()};}
     // Bound lookup frames before consulting private committed state. No
     // arbitrary payload or caller-selected financial fields are accepted.
-    let hash=|value:&str|value.len()==64&&value.bytes().all(|byte|byte.is_ascii_digit()||(b'a'..=b'f').contains(&byte));
-    if nonce.len()!=32||!hash(participant)||!hash(owner)||request.is_empty()||request.len()>128||!request.bytes().all(|byte|byte.is_ascii_alphanumeric()||b"-_:".contains(&byte)) {
+    if !valid_privacy_receipt_request(participant,owner,request,nonce) {
         return RuntimeResponse::Error{code:"INVALID_PRIVACY_RECEIPT_REQUEST".into()};
     }
     match state.runtime.quest_receipt_witness(participant,owner,request,nonce) {
         Ok(witness)=>RuntimeResponse::PublicQuestReceipt{witness},
         Err(_)=>RuntimeResponse::Error{code:"PRIVACY_RECEIPT_UNAVAILABLE".into()},
+    }
+}
+#[allow(clippy::too_many_arguments)]
+async fn public_quest_receipt_journal(
+    state:&Arc<Mutex<EnclaveState>>,
+    participant:String,
+    owner:String,
+    request_id:String,
+    nonce:Vec<u8>,
+    request_proof:layrs_direct_execution_v1::request_index::SparseRequestProof,
+    archived:layrs_direct_execution_v1::v71::ArchivedTerminalRecord,
+)->RuntimeResponse {
+    if !valid_privacy_receipt_request(&participant,&owner,&request_id,&nonce) {
+        return RuntimeResponse::Error{code:"INVALID_PRIVACY_RECEIPT_REQUEST".into()};
+    }
+    let (runtime,state_key,verification_key)={
+        let state=state.lock().await;
+        if let Err(code)=quest_evidence_gate(&state) {return RuntimeResponse::Error{code:code.into()};}
+        let Some(runtime)=state.v71_runtime.clone() else {
+            return RuntimeResponse::Error{code:"JOURNAL_FORMAT_MISMATCH".into()};
+        };
+        let Ok(signing_key)=derive_journal_signing_key(&state.state_key) else {
+            return RuntimeResponse::Error{code:"JOURNAL_KEY_INVALID".into()};
+        };
+        let Ok(verification_key)=journal_verifying_key(&signing_key) else {
+            return RuntimeResponse::Error{code:"JOURNAL_KEY_INVALID".into()};
+        };
+        (runtime,zeroize::Zeroizing::new(state.state_key.clone()),verification_key)
+    };
+    match tokio::task::spawn_blocking(move||runtime.quest_receipt_witness(
+        &participant,&owner,&request_id,&nonce,&request_proof,&archived,&state_key,&verification_key,
+    )).await {
+        Ok(Ok(witness))=>RuntimeResponse::PublicQuestReceipt{witness},
+        _=>RuntimeResponse::Error{code:"PRIVACY_RECEIPT_UNAVAILABLE".into()},
     }
 }
 async fn attest_quest_receipt_key(state:&Arc<Mutex<EnclaveState>>,nonce:Vec<u8>)->RuntimeResponse {
@@ -2445,8 +2502,8 @@ mod tests {
         let replay = runtime_response(
             Arc::clone(&live),
             RuntimeRequest::ExecuteJournal {
-                request: command,
-                request_proof: proof,
+                request: command.clone(),
+                request_proof: proof.clone(),
                 archived: Some(
                     layrs_direct_execution_v1::v71::ArchivedTerminalRecord::Migration {
                         record: bundle.records[0].clone(),
@@ -2457,6 +2514,28 @@ mod tests {
         .await;
         assert_eq!(replay, expected);
         assert_eq!(live.lock().await.v71_runtime.as_ref().unwrap().sequence(), 1);
+        let receipt = runtime_response(
+            Arc::clone(&live),
+            RuntimeRequest::PublicQuestReceiptJournal {
+                participant_account: subject.clone(),
+                receipt_account: subject,
+                request_id: command.request_id.clone(),
+                nonce: vec![42; 32],
+                request_proof: proof,
+                archived: layrs_direct_execution_v1::v71::ArchivedTerminalRecord::Migration {
+                    record: bundle.records[0].clone(),
+                },
+            },
+        )
+        .await;
+        let RuntimeResponse::PublicQuestReceipt { witness } = receipt else {
+            panic!("expected archived public quest receipt");
+        };
+        assert_eq!(witness.receipt.payload.enclave_sequence, "1");
+        assert!(layrs_direct_execution_v1::verify_public_quest_receipt(
+            &witness.receipt,
+            &layrs_direct_execution_v1::quest_receipt_public_key(&[7; 32]).unwrap(),
+        ));
     }
 
     async fn execute_without_ack(

@@ -3668,6 +3668,14 @@ pub enum RuntimeRequest {
     /// financial HMAC receipts retain their original protocol and bytes.
     QuestReceiptAttestation { nonce: Vec<u8> },
     PublicQuestReceipt { participant_account: String, receipt_account: String, request_id: String, nonce: Vec<u8> },
+    PublicQuestReceiptJournal {
+        participant_account: String,
+        receipt_account: String,
+        request_id: String,
+        nonce: Vec<u8>,
+        request_proof: request_index::SparseRequestProof,
+        archived: v71::ArchivedTerminalRecord,
+    },
     Status,
     /// First half of the production startup authorization. The enclave
     /// verifies the governed grant before creating an NSM-attested ephemeral

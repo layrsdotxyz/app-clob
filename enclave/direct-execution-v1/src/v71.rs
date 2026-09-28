@@ -18,7 +18,7 @@ use crate::{
         financial_state_root, restore_checkpoint, seal_checkpoint, DirectV71Checkpoint,
         V71CheckpointError,
     },
-    DirectPortfolio, DirectRequest, DirectResult, DirectRuntime, RuntimeError,
+    DirectPortfolio, DirectRequest, DirectResult, DirectRuntime, QuestReceiptWitness, RuntimeError,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -346,6 +346,98 @@ impl DirectV71Runtime {
                 archive_verification_key,
             ),
         }
+    }
+
+    pub fn archived_terminal_result(
+        &self,
+        account_id: &str,
+        request_id: &str,
+        request_proof: &SparseRequestProof,
+        archived: &ArchivedTerminalRecord,
+        state_key: &[u8],
+        archive_verification_key: &[u8],
+    ) -> Result<(String, DirectResult), V71Error> {
+        let terminal = request_proof.terminal_leaf(
+            &self.request_index_root,
+            account_id,
+            request_id,
+        )?;
+        let result = match (archived, &terminal.locator) {
+            (
+                ArchivedTerminalRecord::Journal { record },
+                TerminalResultLocator::Journal {
+                    writer_epoch,
+                    sequence,
+                },
+            ) => record
+                .open_replay(
+                    writer_epoch,
+                    *sequence,
+                    &terminal.account_id,
+                    &terminal.request_id,
+                    &terminal.request_hash,
+                    &terminal.result_hash,
+                    &terminal.receipt_hash,
+                    state_key,
+                    archive_verification_key,
+                    &self.runtime.receipt_key,
+                )?
+                .result,
+            (
+                ArchivedTerminalRecord::Migration { record },
+                TerminalResultLocator::Migration {
+                    migration_id,
+                    ordinal,
+                },
+            ) => record.open_replay(
+                migration_id,
+                *ordinal,
+                &terminal.account_id,
+                &terminal.request_id,
+                &terminal.request_hash,
+                &terminal.result_hash,
+                &terminal.receipt_hash,
+                state_key,
+                archive_verification_key,
+                &self.runtime.receipt_key,
+            )?,
+            _ => return Err(V71Error::ReplayProofRequired),
+        };
+        Ok((terminal.request_hash.clone(), result))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn quest_receipt_witness(
+        &self,
+        participant_account: &str,
+        receipt_account: &str,
+        request_id: &str,
+        nonce: &[u8],
+        request_proof: &SparseRequestProof,
+        archived: &ArchivedTerminalRecord,
+        state_key: &[u8],
+        archive_verification_key: &[u8],
+    ) -> Result<QuestReceiptWitness, V71Error> {
+        let (request_hash, result) = self.archived_terminal_result(
+            receipt_account,
+            request_id,
+            request_proof,
+            archived,
+            state_key,
+            archive_verification_key,
+        )?;
+        self.runtime
+            .quest_receipt_witness_for_terminal(
+                participant_account,
+                receipt_account,
+                request_id,
+                nonce,
+                &request_hash,
+                &result,
+                self.sequence,
+                &self.transition_root,
+            )
+            .map_err(Into::into)
     }
 
     pub fn seal_checkpoint(
@@ -821,6 +913,24 @@ mod tests {
                 .unwrap(),
             expected
         );
+        let witness = migrated
+            .quest_receipt_witness(
+                &request.account_id,
+                &request.account_id,
+                &request.request_id,
+                &[42; 32],
+                &proof,
+                &ArchivedTerminalRecord::Migration { record },
+                &[7; 32],
+                &journal_verifying_key(&[8; 32]).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(witness.receipt.payload.enclave_sequence, "1");
+        assert_eq!(witness.receipt.payload.state_root, migrated.transition_root());
+        assert!(crate::verify_public_quest_receipt(
+            &witness.receipt,
+            &crate::quest_receipt_public_key(&[9; 32]).unwrap(),
+        ));
     }
 
     #[test]
