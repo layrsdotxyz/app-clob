@@ -76,7 +76,7 @@ use std::{
     net::IpAddr,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex as StdMutex,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -174,6 +174,9 @@ struct AppState {
     unresolved_external_effects: Arc<Mutex<BTreeMap<String, ExternalEffectIntent>>>,
     governed_bootstrap: Option<GovernedBootstrapConfig>,
     persistence_format: PersistenceFormat,
+    /// Set only after a verified v71 restore or same-process shadow promotion.
+    /// This is a format selector, not command/workflow persistence.
+    hot_v71_enabled: Arc<AtomicBool>,
     journal_request_index: Arc<Mutex<Option<DirectRequestIndexState>>>,
     journal_receipts:
         Arc<Mutex<Option<BTreeMap<(String, String), (u64, DirectReceipt)>>>>,
@@ -189,6 +192,7 @@ struct AppState {
 enum PersistenceFormat {
     V70,
     V71,
+    V71Hot,
 }
 
 impl PersistenceFormat {
@@ -196,7 +200,20 @@ impl PersistenceFormat {
         match value {
             None | Some("v70") => Ok(Self::V70),
             Some("v71") => Ok(Self::V71),
+            Some("v71-hot") => Ok(Self::V71Hot),
             Some(_) => Err("invalid direct persistence format"),
+        }
+    }
+}
+
+impl AppState {
+    fn effective_persistence_format(&self) -> PersistenceFormat {
+        if self.persistence_format == PersistenceFormat::V71
+            || self.hot_v71_enabled.load(Ordering::Acquire)
+        {
+            PersistenceFormat::V71
+        } else {
+            PersistenceFormat::V70
         }
     }
 }
@@ -307,6 +324,56 @@ struct PreparedJournalRestore {
     index_snapshot: DirectRequestIndexSnapshot,
     receipt_snapshot: DirectReceiptSnapshot,
     migration: Option<V70MigrationBundle>,
+}
+
+const V71_CUTOVER_MARKER_PROTOCOL: &str = "layrs.direct-execution.v71-cutover.v1";
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct V71CutoverMarker {
+    protocol: String,
+    epoch_id: String,
+    writer_epoch: String,
+    sequence: u64,
+    record_hash: String,
+    transition_root: String,
+    request_index_root: String,
+    financial_state_root: String,
+}
+
+impl V71CutoverMarker {
+    fn from_head(head: &StagedV71Head) -> Self {
+        Self {
+            protocol: V71_CUTOVER_MARKER_PROTOCOL.into(),
+            epoch_id: EPOCH_ID.into(),
+            writer_epoch: head.writer_epoch.clone(),
+            sequence: head.sequence,
+            record_hash: head.record_hash.clone(),
+            transition_root: head.transition_root.clone(),
+            request_index_root: head.request_index_root.clone(),
+            financial_state_root: head.financial_state_root.clone(),
+        }
+    }
+
+    fn valid(&self) -> bool {
+        self.protocol == V71_CUTOVER_MARKER_PROTOCOL
+            && self.epoch_id == EPOCH_ID
+            && !self.writer_epoch.is_empty()
+            && self.sequence > 0
+            && [
+                &self.record_hash,
+                &self.transition_root,
+                &self.request_index_root,
+                &self.financial_state_root,
+            ]
+            .into_iter()
+            .all(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+    }
 }
 
 const CHECKPOINT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
@@ -1744,9 +1811,13 @@ impl ArchiveStore {
             // packages and do not consume a governed production grant.
             Self::Filesystem(_) => Ok(()),
             Self::S3(store) => {
-                if state.persistence_format == PersistenceFormat::V71
-                    && store.prepare_journal_restore().await?
-                {
+                let journal_ready = match state.persistence_format {
+                    PersistenceFormat::V70 => false,
+                    PersistenceFormat::V71 => store.prepare_journal_restore().await?,
+                    PersistenceFormat::V71Hot => store.prepare_hot_journal_restore().await?,
+                };
+                if journal_ready {
+                    state.hot_v71_enabled.store(true, Ordering::Release);
                     Ok(())
                 } else {
                     store.prepare_restore(state).await.map(|_| ())
@@ -1759,7 +1830,7 @@ impl ArchiveStore {
         state: &AppState,
         receipt: &DirectReceipt,
     ) -> Result<i64, ProjectionError> {
-        if state.persistence_format == PersistenceFormat::V71 {
+        if state.effective_persistence_format() == PersistenceFormat::V71 {
             let cache = state.journal_receipts.lock().await;
             let cache = cache.as_ref().ok_or(ProjectionError::Database)?;
             let mut matching = cache
@@ -1979,6 +2050,10 @@ fn journal_fence_prefix(prefix: &str, writer_epoch: &str) -> String {
 #[cfg_attr(not(test), allow(dead_code))]
 fn journal_record_key(prefix: &str, sequence: u64) -> String {
     archive_head_key(prefix, sequence)
+}
+
+fn journal_cutover_marker_key(prefix: &str) -> String {
+    format!("{prefix}/journal-v71/cutover.cbor")
 }
 
 /// Strict inverse of `journal_record_key`. Legacy `{seq}-{hash}` head names,
@@ -2841,6 +2916,102 @@ impl S3ImmutableArtifactStore {
         };
         *journal = JournalWriterState::Eligible(next.clone());
         Ok(next)
+    }
+    async fn persist_v71_cutover_marker(
+        &self,
+        head: &StagedV71Head,
+    ) -> Result<(), String> {
+        if self.journal_role != JournalRole::Writer {
+            return Err("JOURNAL_SHADOW_WRITE_UNSUPPORTED".into());
+        }
+        let marker = V71CutoverMarker::from_head(head);
+        if !marker.valid() {
+            return Err("V71_CUTOVER_MARKER_INVALID".into());
+        }
+        let bytes = serde_cbor::to_vec(&marker)
+            .map_err(|_| "V71_CUTOVER_MARKER_ENCODING_FAILED")?;
+        self.write_once(&journal_cutover_marker_key(&self.prefix), bytes)
+            .await
+    }
+
+    async fn load_v71_cutover_marker(&self) -> Result<Option<V71CutoverMarker>, String> {
+        let key = journal_cutover_marker_key(&self.prefix);
+        let page = bounded_archive_operation(
+            ARCHIVE_OPERATION_TIMEOUT,
+            self.client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&key)
+                .max_keys(2)
+                .send(),
+        )
+        .await?
+        .map_err(|_| "V71_CUTOVER_MARKER_LIST_FAILED")?;
+        let contents = page.contents();
+        if page.is_truncated.unwrap_or(false)
+            || contents.len() > 1
+            || page
+                .key_count
+                .is_some_and(|count| usize::try_from(count).ok() != Some(contents.len()))
+        {
+            return Err("V71_CUTOVER_MARKER_LIST_AMBIGUOUS".into());
+        }
+        if contents.is_empty() {
+            return Ok(None);
+        }
+        if contents[0].key() != Some(key.as_str()) {
+            return Err("V71_CUTOVER_MARKER_KEY_INVALID".into());
+        }
+        let marker: V71CutoverMarker = serde_cbor::from_slice(&self.read(&key).await?)
+            .map_err(|_| "V71_CUTOVER_MARKER_DECODE_FAILED")?;
+        if !marker.valid() {
+            return Err("V71_CUTOVER_MARKER_INVALID".into());
+        }
+        Ok(Some(marker))
+    }
+
+    async fn prepare_hot_journal_restore(&self) -> Result<bool, String> {
+        let Some(marker) = self.load_v71_cutover_marker().await? else {
+            return Ok(false);
+        };
+        if !self.prepare_journal_restore().await? {
+            return Err("V71_CUTOVER_MARKER_WITHOUT_JOURNAL".into());
+        }
+        let prepared = self.prepared_journal_restore.lock().await;
+        let prepared = prepared
+            .as_ref()
+            .ok_or("V71_CUTOVER_JOURNAL_UNPREPARED")?;
+        let (writer_epoch, sequence, record_hash, transition_root, request_index_root, financial_state_root) =
+            match prepared.tail.last() {
+                Some(record) => (
+                    record.writer_epoch.as_str(),
+                    record.sequence,
+                    record
+                        .record_hash()
+                        .map_err(|_| "V71_CUTOVER_TAIL_HASH_INVALID")?,
+                    record.transition_root.as_str(),
+                    record.request_index_root.as_str(),
+                    record.financial_state_root.as_str(),
+                ),
+                None => (
+                    prepared.checkpoint.writer_epoch.as_str(),
+                    prepared.checkpoint.sequence,
+                    prepared.checkpoint.record_hash.clone(),
+                    prepared.checkpoint.transition_root.as_str(),
+                    prepared.checkpoint.request_index_root.as_str(),
+                    prepared.checkpoint.financial_state_root.as_str(),
+                ),
+            };
+        if marker.writer_epoch != writer_epoch
+            || marker.sequence != sequence
+            || marker.record_hash != record_hash
+            || marker.transition_root != transition_root
+            || marker.request_index_root != request_index_root
+            || marker.financial_state_root != financial_state_root
+        {
+            return Err("V71_CUTOVER_MARKER_HEAD_MISMATCH".into());
+        }
+        Ok(true)
     }
     /// Create-only, content-addressed persistence of an enclave-sealed v70
     /// migration bundle. The bundle may be production-sized, so it uses the
@@ -4203,7 +4374,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let artifact_store = ArchiveStore::from_environment(isolated_test || dormant).await?;
-    if persistence_format == PersistenceFormat::V71
+    if matches!(
+        persistence_format,
+        PersistenceFormat::V71 | PersistenceFormat::V71Hot
+    )
         && !matches!(artifact_store, Some(ArchiveStore::S3(_)))
     {
         return Err("v71 persistence requires the S3 Object Lock archive".into());
@@ -4250,6 +4424,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
         governed_bootstrap,
         persistence_format,
+        hot_v71_enabled: Arc::new(AtomicBool::new(false)),
         journal_request_index: Arc::new(Mutex::new(None)),
         journal_receipts: Arc::new(Mutex::new(None)),
         journal_migration: Arc::new(Mutex::new(None)),
@@ -4299,7 +4474,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     recover_external_effect_intents(&state).await?;
     verify_recovered_projection(&state).await?;
     if let Ok(run_id) = env::var("LAYRS_DIRECT_V71_SHADOW_RUN_ID") {
-        if state.persistence_format != PersistenceFormat::V70 {
+        if state.effective_persistence_format() != PersistenceFormat::V70 {
             eprintln!("V71_SHADOW_NOT_STARTED reason=AUTHORITATIVE_FORMAT_NOT_V70");
         } else {
             match exchange(
@@ -4328,13 +4503,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    if state.persistence_format == PersistenceFormat::V71Hot
+        && state.effective_persistence_format() == PersistenceFormat::V70
+        && env::var("LAYRS_DIRECT_V71_AUTO_PROMOTE").as_deref() == Ok("true")
+    {
+        if let Ok(run_id) = env::var("LAYRS_DIRECT_V71_SHADOW_RUN_ID") {
+            let promotion_state = state.clone();
+            tokio::spawn(async move {
+                if let Err(reason) =
+                    stage_and_promote_v71_shadow(promotion_state, run_id).await
+                {
+                    eprintln!("V71_HOT_PROMOTION_ABORTED reason={reason}");
+                }
+            });
+        } else {
+            eprintln!("V71_HOT_PROMOTION_NOT_STARTED reason=SHADOW_RUN_ID_MISSING");
+        }
+    }
     if state.persistence_format == PersistenceFormat::V71
         && state.journal_request_index.lock().await.is_none()
     {
         activate_v71_from_restored_v70(&state).await?;
     }
     if let Some(ArchiveStore::S3(store)) = state.artifact_store.as_ref() {
-        if state.persistence_format == PersistenceFormat::V71 {
+        if state.effective_persistence_format() == PersistenceFormat::V71 {
             store.catch_up_restored_journal_checkpoint(&state).await;
         }
     }
@@ -4550,7 +4742,7 @@ async fn quest_receipt(State(state):State<AppState>,headers:HeaderMap,Json(query
     // session. An affected maker may witness a taker's committed fill only if
     // the enclave's signed projection proves that participant was affected.
     let request=match quest_receipt_frame(&claims,query) {Ok(request)=>request,Err(_)=>return (StatusCode::BAD_REQUEST,"INVALID_PRIVACY_RECEIPT_REQUEST").into_response()};
-    let (request,_journal_guard)=if state.persistence_format==PersistenceFormat::V71 {
+    let (request,_journal_guard)=if state.effective_persistence_format()==PersistenceFormat::V71 {
         match journal_quest_receipt_frame(&state,request).await {
             Ok((request,guard))=>(request,Some(guard)),
             Err((status,code))=>return (status,code).into_response(),
@@ -6401,7 +6593,7 @@ async fn recover_enclave(state: &AppState) -> io::Result<()> {
         )
     })?;
     if let ArchiveStore::S3(s3)=store {
-        if state.persistence_format == PersistenceFormat::V71
+        if state.effective_persistence_format() == PersistenceFormat::V71
             && s3.prepared_journal_restore.lock().await.is_some()
         {
             return s3.restore_journal_streamed(state).await
@@ -6579,6 +6771,343 @@ async fn activate_v71_from_restored_v70(state: &AppState) -> io::Result<()> {
     *store.verified_receipt_records.lock().await = None;
     eprintln!("V71_MIGRATION_CUTOVER_READY sequence={sequence}");
     Ok(())
+}
+
+#[derive(Clone)]
+struct StagedV71Head {
+    writer_epoch: String,
+    sequence: u64,
+    record_hash: String,
+    transition_root: String,
+    request_index_root: String,
+    financial_state_root: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn append_shadow_export(
+    store: &S3ImmutableArtifactStore,
+    index: &mut DirectRequestIndexState,
+    receipts: &mut JournalReceiptCache,
+    transition_roots: &mut BTreeMap<u64, String>,
+    head: &mut StagedV71Head,
+    records: Vec<DirectJournalRecord>,
+    terminal_leaves: Vec<TerminalRequestLeaf>,
+    results: Vec<DirectResult>,
+    exported: &StagedV71Head,
+) -> Result<(), String> {
+    if records.len() != terminal_leaves.len() || records.len() != results.len() {
+        return Err("V71_SHADOW_EXPORT_CARDINALITY_MISMATCH".into());
+    }
+    for ((record, leaf), result) in records
+        .into_iter()
+        .zip(terminal_leaves)
+        .zip(results)
+    {
+        if record.writer_epoch != head.writer_epoch
+            || record.sequence != head.sequence.saturating_add(1)
+            || record.previous_record_hash != head.record_hash
+            || record.previous_transition_root != head.transition_root
+            || record.previous_request_index_root != head.request_index_root
+            || !terminal_leaf_matches_record(&leaf, &record)
+            || !verify_terminal_matches_record(&result, &record)
+        {
+            return Err("V71_SHADOW_EXPORT_LINEAGE_MISMATCH".into());
+        }
+        store.append_journal_record(&record).await?;
+        index
+            .insert(
+                leaf,
+                &record.previous_request_index_root,
+                &record.request_index_root,
+            )
+            .map_err(|_| "V71_SHADOW_INDEX_ADVANCE_FAILED")?;
+        if receipts
+            .insert(
+                (result.receipt.account_id.clone(), result.receipt.request_id.clone()),
+                (record.sequence, result.receipt),
+            )
+            .is_some()
+        {
+            return Err("V71_SHADOW_RECEIPT_DUPLICATE".into());
+        }
+        head.sequence = record.sequence;
+        head.record_hash = record
+            .record_hash()
+            .map_err(|_| "V71_SHADOW_RECORD_HASH_INVALID")?;
+        head.transition_root = record.transition_root.clone();
+        head.request_index_root = record.request_index_root.clone();
+        head.financial_state_root = record.financial_state_root;
+        if transition_roots
+            .insert(head.sequence, head.transition_root.clone())
+            .is_some()
+        {
+            return Err("V71_SHADOW_TRANSITION_DUPLICATE".into());
+        }
+    }
+    if head.sequence != exported.sequence
+        || head.writer_epoch != exported.writer_epoch
+        || head.record_hash != exported.record_hash
+        || head.transition_root != exported.transition_root
+        || head.request_index_root != exported.request_index_root
+        || head.financial_state_root != exported.financial_state_root
+    {
+        return Err("V71_SHADOW_EXPORT_HEAD_MISMATCH".into());
+    }
+    Ok(())
+}
+
+async fn export_shadow_after(
+    state: &AppState,
+    run_id: &str,
+    after_sequence: u64,
+    include_migration: bool,
+) -> Result<
+    (
+        StagedV71Head,
+        Option<V70MigrationBundle>,
+        Option<DirectV71Checkpoint>,
+        Vec<DirectJournalRecord>,
+        Vec<TerminalRequestLeaf>,
+        Vec<DirectResult>,
+        u64,
+    ),
+    String,
+> {
+    match exchange_with_timeout(
+        state,
+        RuntimeRequest::ExportV71Shadow {
+            run_id: run_id.into(),
+            after_sequence,
+            include_migration,
+        },
+        CHECKPOINT_EXCHANGE_TIMEOUT,
+    )
+    .await
+    .map_err(|_| "V71_SHADOW_EXPORT_TRANSPORT_FAILED")?
+    {
+        RuntimeResponse::V71ShadowExport {
+            run_id: returned_run_id,
+            source_sequence,
+            writer_epoch,
+            sequence,
+            record_hash,
+            transition_root,
+            request_index_root,
+            financial_state_root,
+            migration,
+            base_checkpoint,
+            records,
+            terminal_leaves,
+            results,
+        } if returned_run_id == run_id => Ok((
+            StagedV71Head {
+                writer_epoch,
+                sequence,
+                record_hash,
+                transition_root,
+                request_index_root,
+                financial_state_root,
+            },
+            migration,
+            base_checkpoint,
+            records,
+            terminal_leaves,
+            results,
+            source_sequence,
+        )),
+        RuntimeResponse::Error { code } => Err(format!("V71_SHADOW_EXPORT_FAILED:{code}")),
+        _ => Err("V71_SHADOW_EXPORT_UNEXPECTED_RESPONSE".into()),
+    }
+}
+
+/// Stages only committed v71 state while v70 keeps serving traffic, then takes
+/// the existing in-memory financial gate for one final bounded delta and an
+/// atomic enclave promotion. No command is ever stored or queued by this path.
+async fn stage_and_promote_v71_shadow(state: AppState, run_id: String) -> Result<(), String> {
+    let store = match state.artifact_store.as_ref() {
+        Some(ArchiveStore::S3(store)) => store,
+        _ => return Err("V71_S3_ARCHIVE_REQUIRED".into()),
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10 * 60);
+    let shadow_source_sequence = loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("V71_SHADOW_PROMOTION_ABORT_10_MINUTES".into());
+        }
+        match exchange(&state, RuntimeRequest::V71ShadowStatus).await {
+            Ok(RuntimeResponse::V71ShadowStatus {
+                phase,
+                source_sequence,
+                consecutive_matches,
+                ..
+            }) if phase == "ACTIVE" && consecutive_matches >= 1 => break source_sequence,
+            Ok(RuntimeResponse::V71ShadowStatus { phase, .. })
+                if phase.starts_with("LATCHED:") =>
+            {
+                return Err(format!("V71_SHADOW_PROMOTION_ABORT:{phase}"));
+            }
+            Ok(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+            Err(_) => return Err("V71_SHADOW_STATUS_TRANSPORT_FAILED".into()),
+        }
+    };
+
+    let (exported, migration, base_checkpoint, records, leaves, results, source_sequence) =
+        export_shadow_after(
+            &state,
+            &run_id,
+            shadow_source_sequence,
+            true,
+        )
+        .await?;
+    let migration = migration.ok_or("V71_SHADOW_MIGRATION_MISSING")?;
+    let base_checkpoint = base_checkpoint.ok_or("V71_SHADOW_BASE_CHECKPOINT_MISSING")?;
+    if migration.manifest.source_sequence != source_sequence
+        || base_checkpoint.sequence != source_sequence
+        || base_checkpoint.writer_epoch != exported.writer_epoch
+    {
+        return Err("V71_SHADOW_BASE_MISMATCH".into());
+    }
+    let source_len = usize::try_from(source_sequence)
+        .map_err(|_| "V71_SHADOW_SOURCE_SEQUENCE_INVALID")?;
+    let v70_records = store
+        .verified_receipt_records
+        .lock()
+        .await
+        .clone()
+        .ok_or("V71_SHADOW_V70_RECEIPTS_UNAVAILABLE")?;
+    let source_records = v70_records
+        .get(..source_len)
+        .ok_or("V71_SHADOW_V70_RECEIPTS_INCOMPLETE")?;
+    let (mut index, mut receipts, index_snapshot, receipt_snapshot) =
+        migration_parent_state(&migration, source_records)?;
+
+    store.persist_v70_migration_bundle(&migration).await?;
+    verify_journal_checkpoint_non_writer(&state, &base_checkpoint).await?;
+    store
+        .publish_journal_checkpoint(&base_checkpoint, &index_snapshot, &receipt_snapshot)
+        .await?;
+    let mut head = StagedV71Head {
+        writer_epoch: base_checkpoint.writer_epoch.clone(),
+        sequence: base_checkpoint.sequence,
+        record_hash: base_checkpoint.record_hash.clone(),
+        transition_root: base_checkpoint.transition_root.clone(),
+        request_index_root: base_checkpoint.request_index_root.clone(),
+        financial_state_root: base_checkpoint.financial_state_root.clone(),
+    };
+    store
+        .establish_journal_head(JournalHead {
+            writer_epoch: head.writer_epoch.clone(),
+            sequence: head.sequence,
+            record_hash: head.record_hash.clone(),
+            transition_root: head.transition_root.clone(),
+            request_index_root: head.request_index_root.clone(),
+            financial_state_root: head.financial_state_root.clone(),
+        })
+        .await?;
+    let mut transition_roots = BTreeMap::from([(
+        head.sequence,
+        head.transition_root.clone(),
+    )]);
+    append_shadow_export(
+        store,
+        &mut index,
+        &mut receipts,
+        &mut transition_roots,
+        &mut head,
+        records,
+        leaves,
+        results,
+        &exported,
+    )
+    .await?;
+
+    // Catch up without blocking traffic. Once a read is current, take the
+    // ordinary in-memory writer gate and persist only the final small delta.
+    loop {
+        let (next, _, _, records, leaves, results, _) =
+            export_shadow_after(&state, &run_id, head.sequence, false).await?;
+        append_shadow_export(
+            store,
+            &mut index,
+            &mut receipts,
+            &mut transition_roots,
+            &mut head,
+            records,
+            leaves,
+            results,
+            &next,
+        )
+        .await?;
+        let guard = state.financial_gate.lock("v71_hot_promotion").await;
+        let (final_head, _, _, records, leaves, results, _) =
+            export_shadow_after(&state, &run_id, head.sequence, false).await?;
+        append_shadow_export(
+            store,
+            &mut index,
+            &mut receipts,
+            &mut transition_roots,
+            &mut head,
+            records,
+            leaves,
+            results,
+            &final_head,
+        )
+        .await?;
+        if !state.unresolved_external_effects.lock().await.is_empty() {
+            drop(guard);
+            return Err("V71_CUTOVER_EXTERNAL_EFFECT_PENDING".into());
+        }
+        // This immutable marker is the restart decision point. It describes
+        // only the exact committed journal head staged above; it contains no
+        // command or pending-work payload. If the following transport is
+        // ambiguous, restart deterministically restores this v71 frontier.
+        store.persist_v71_cutover_marker(&head).await?;
+        let promoted = exchange(
+            &state,
+            RuntimeRequest::PromoteV71Shadow {
+                run_id: run_id.clone(),
+                expected_sequence: head.sequence,
+                expected_record_hash: head.record_hash.clone(),
+                expected_transition_root: head.transition_root.clone(),
+                expected_request_index_root: head.request_index_root.clone(),
+                expected_financial_state_root: head.financial_state_root.clone(),
+            },
+        )
+        .await
+        .map_err(|_| "V71_SHADOW_PROMOTION_TRANSPORT_FAILED")?;
+        if !matches!(promoted, RuntimeResponse::V71ShadowPromoted {
+            ref writer_epoch,
+            sequence,
+            ref record_hash,
+            ref transition_root,
+            ref request_index_root,
+            ref financial_state_root,
+        } if writer_epoch == &head.writer_epoch
+            && sequence == head.sequence
+            && record_hash == &head.record_hash
+            && transition_root == &head.transition_root
+            && request_index_root == &head.request_index_root
+            && financial_state_root == &head.financial_state_root)
+        {
+            drop(guard);
+            return Err("V71_SHADOW_PROMOTION_MISMATCH".into());
+        }
+        *state.journal_request_index.lock().await = Some(index);
+        *state.journal_receipts.lock().await = Some(receipts);
+        *state.journal_migration.lock().await = Some(migration);
+        *state.journal_transition_roots.lock().await = Some(transition_roots);
+        state
+            .journal_checkpoint_sequence
+            .store(source_sequence, Ordering::Release);
+        *state.committed_state_root.lock().await = Some(head.transition_root.clone());
+        *store.verified_receipt_records.lock().await = None;
+        state.hot_v71_enabled.store(true, Ordering::Release);
+        drop(guard);
+        eprintln!(
+            "V71_HOT_PROMOTION_COMPLETE run_id={} sequence={}",
+            run_id, head.sequence
+        );
+        return Ok(());
+    }
 }
 
 fn intent_is_committed(intent: &ExternalEffectIntent, receipts: &[(u64, DirectReceipt)]) -> bool {
@@ -7247,7 +7776,7 @@ async fn reconcile_projection_from_archive(state: &AppState) -> io::Result<usize
                 .map_err(|_| invalid("projection receipt is malformed"))
         })
         .collect::<io::Result<_>>()?;
-    let missing = if state.persistence_format == PersistenceFormat::V71
+    let missing = if state.effective_persistence_format() == PersistenceFormat::V71
         && state.journal_receipts.lock().await.is_some()
     {
         let records = state.journal_receipts.lock().await;
@@ -7676,9 +8205,10 @@ async fn exchange_direct(
     request: DirectRequest,
     guard: &OwnedMutexGuard<()>,
 ) -> io::Result<RuntimeResponse> {
-    match state.persistence_format {
+    match state.effective_persistence_format() {
         PersistenceFormat::V70 => exchange_direct_v70(state, request, guard).await,
         PersistenceFormat::V71 => exchange_direct_v71(state, request, guard).await,
+        PersistenceFormat::V71Hot => unreachable!("effective persistence format is concrete"),
     }
 }
 
@@ -8217,6 +8747,10 @@ mod tests {
             super::PersistenceFormat::parse(Some("v71")),
             Ok(super::PersistenceFormat::V71)
         );
+        assert_eq!(
+            super::PersistenceFormat::parse(Some("v71-hot")),
+            Ok(super::PersistenceFormat::V71Hot)
+        );
         for invalid in ["", "V71", "shadow", "v72", " v71"] {
             assert!(super::PersistenceFormat::parse(Some(invalid)).is_err());
         }
@@ -8401,6 +8935,7 @@ mod tests {
             unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
             governed_bootstrap: None,
             persistence_format: PersistenceFormat::V70,
+            hot_v71_enabled: Arc::new(AtomicBool::new(false)),
             journal_request_index: Arc::new(Mutex::new(None)),
             journal_receipts: Arc::new(Mutex::new(None)),
             journal_migration: Arc::new(Mutex::new(None)),
@@ -9473,6 +10008,7 @@ mod tests {
             unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
             governed_bootstrap: None,
             persistence_format: PersistenceFormat::V70,
+            hot_v71_enabled: Arc::new(AtomicBool::new(false)),
             journal_request_index: Arc::new(Mutex::new(None)),
             journal_receipts: Arc::new(Mutex::new(None)),
             journal_migration: Arc::new(Mutex::new(None)),

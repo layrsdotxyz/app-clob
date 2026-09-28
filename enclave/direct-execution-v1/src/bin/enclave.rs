@@ -42,6 +42,13 @@ struct V71ShadowObservation {
     result: DirectResult,
 }
 
+#[derive(Clone)]
+struct V71ShadowCommit {
+    record: layrs_direct_execution_v1::journal::DirectJournalRecord,
+    terminal_leaf: layrs_direct_execution_v1::request_index::TerminalRequestLeaf,
+    result: DirectResult,
+}
+
 enum V71ShadowState {
     Disabled,
     Pending {
@@ -54,6 +61,9 @@ enum V71ShadowState {
         source_sequence: u64,
         runtime: DirectV71Runtime,
         tree: SparseRequestTree,
+        migration: Arc<layrs_direct_execution_v1::migration::V70MigrationBundle>,
+        base_checkpoint: layrs_direct_execution_v1::v71_checkpoint::DirectV71Checkpoint,
+        commits: Vec<V71ShadowCommit>,
         consecutive_matches: u64,
         observed_effects: BTreeSet<String>,
     },
@@ -278,6 +288,30 @@ where
         }
         RuntimeRequest::BeginV71Shadow { run_id } => begin_v71_shadow(state, run_id).await,
         RuntimeRequest::V71ShadowStatus => v71_shadow_status(&state).await,
+        RuntimeRequest::ExportV71Shadow {
+            run_id,
+            after_sequence,
+            include_migration,
+        } => export_v71_shadow(&state, run_id, after_sequence, include_migration).await,
+        RuntimeRequest::PromoteV71Shadow {
+            run_id,
+            expected_sequence,
+            expected_record_hash,
+            expected_transition_root,
+            expected_request_index_root,
+            expected_financial_state_root,
+        } => {
+            promote_v71_shadow(
+                state,
+                run_id,
+                expected_sequence,
+                expected_record_hash,
+                expected_transition_root,
+                expected_request_index_root,
+                expected_financial_state_root,
+            )
+            .await
+        }
         RuntimeRequest::SealV70Migration => seal_v70_migration(state).await,
         RuntimeRequest::SealV70RollbackCheckpoint { migration, journal_records } => {
             let bytes = match seal_v70_rollback_checkpoint(state, migration, journal_records).await {
@@ -975,6 +1009,156 @@ async fn v71_shadow_status(state: &Arc<Mutex<EnclaveState>>) -> RuntimeResponse 
     }
 }
 
+async fn export_v71_shadow(
+    state: &Arc<Mutex<EnclaveState>>,
+    requested_run_id: String,
+    after_sequence: u64,
+    include_migration: bool,
+) -> RuntimeResponse {
+    let snapshot = {
+        let state = state.lock().await;
+        let V71ShadowState::Active {
+            run_id,
+            source_sequence,
+            runtime,
+            migration,
+            base_checkpoint,
+            commits,
+            ..
+        } = &state.v71_shadow
+        else {
+            return RuntimeResponse::Error {
+                code: "V71_SHADOW_EXPORT_UNAVAILABLE".into(),
+            };
+        };
+        if run_id != &requested_run_id
+            || after_sequence < *source_sequence
+            || after_sequence > runtime.sequence()
+        {
+            return RuntimeResponse::Error {
+                code: "V71_SHADOW_EXPORT_FRONTIER_INVALID".into(),
+            };
+        }
+        let first = after_sequence.saturating_sub(*source_sequence) as usize;
+        if first > commits.len()
+            || commits
+                .get(first)
+                .is_some_and(|commit| commit.record.sequence != after_sequence + 1)
+        {
+            return RuntimeResponse::Error {
+                code: "V71_SHADOW_EXPORT_FRONTIER_INVALID".into(),
+            };
+        }
+        let selected = commits[first..].to_vec();
+        let financial_state_root = match runtime.financial_state_root() {
+            Ok(root) => root,
+            Err(_) => {
+                return RuntimeResponse::Error {
+                    code: "V71_SHADOW_EXPORT_HEAD_INVALID".into(),
+                }
+            }
+        };
+        (
+            run_id.clone(),
+            *source_sequence,
+            runtime.writer_epoch().to_string(),
+            runtime.sequence(),
+            runtime.record_hash().to_string(),
+            runtime.transition_root().to_string(),
+            runtime.request_index_root().to_string(),
+            financial_state_root,
+            Arc::clone(migration),
+            base_checkpoint.clone(),
+            selected,
+        )
+    };
+    let (
+        run_id,
+        source_sequence,
+        writer_epoch,
+        sequence,
+        record_hash,
+        transition_root,
+        request_index_root,
+        financial_state_root,
+        migration,
+        base_checkpoint,
+        commits,
+    ) = snapshot;
+    RuntimeResponse::V71ShadowExport {
+        run_id,
+        source_sequence,
+        writer_epoch,
+        sequence,
+        record_hash,
+        transition_root,
+        request_index_root,
+        financial_state_root,
+        migration: include_migration.then(|| migration.as_ref().clone()),
+        base_checkpoint: include_migration.then_some(base_checkpoint),
+        records: commits.iter().map(|commit| commit.record.clone()).collect(),
+        terminal_leaves: commits
+            .iter()
+            .map(|commit| commit.terminal_leaf.clone())
+            .collect(),
+        results: commits.into_iter().map(|commit| commit.result).collect(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn promote_v71_shadow(
+    state: Arc<Mutex<EnclaveState>>,
+    requested_run_id: String,
+    expected_sequence: u64,
+    expected_record_hash: String,
+    expected_transition_root: String,
+    expected_request_index_root: String,
+    expected_financial_state_root: String,
+) -> RuntimeResponse {
+    let _transition = transition(&state).await;
+    let mut state = state.lock().await;
+    let valid = match &state.v71_shadow {
+        V71ShadowState::Active {
+            run_id, runtime, ..
+        } => {
+            run_id == &requested_run_id
+                && runtime.sequence() == expected_sequence
+                && runtime.record_hash() == expected_record_hash
+                && runtime.transition_root() == expected_transition_root
+                && runtime.request_index_root() == expected_request_index_root
+                && runtime.financial_state_root().ok().as_deref()
+                    == Some(expected_financial_state_root.as_str())
+                && runtime.verify_shadow_head(&state.runtime).is_ok()
+        }
+        _ => false,
+    };
+    if !valid || state.v71_runtime.is_some() {
+        return RuntimeResponse::Error {
+            code: "V71_SHADOW_PROMOTION_HEAD_MISMATCH".into(),
+        };
+    }
+    let V71ShadowState::Active { runtime, .. } =
+        std::mem::replace(&mut state.v71_shadow, V71ShadowState::Disabled)
+    else {
+        unreachable!();
+    };
+    let writer_epoch = runtime.writer_epoch().to_string();
+    state.v71_runtime = Some(runtime);
+    state.v71_writer_eligible = true;
+    eprintln!(
+        "V71_SHADOW_PROMOTED run_id={} sequence={}",
+        requested_run_id, expected_sequence
+    );
+    RuntimeResponse::V71ShadowPromoted {
+        writer_epoch,
+        sequence: expected_sequence,
+        record_hash: expected_record_hash,
+        transition_root: expected_transition_root,
+        request_index_root: expected_request_index_root,
+        financial_state_root: expected_financial_state_root,
+    }
+}
+
 fn build_v71_shadow(
     source_runtime: DirectRuntime,
     bundle: layrs_direct_execution_v1::migration::V70MigrationBundle,
@@ -985,7 +1169,15 @@ fn build_v71_shadow(
     signing_key: &[u8],
     verification_key: &[u8],
 ) -> Result<
-    (DirectV71Runtime, SparseRequestTree, u64, BTreeSet<String>),
+    (
+        DirectV71Runtime,
+        SparseRequestTree,
+        Arc<layrs_direct_execution_v1::migration::V70MigrationBundle>,
+        layrs_direct_execution_v1::v71_checkpoint::DirectV71Checkpoint,
+        Vec<V71ShadowCommit>,
+        u64,
+        BTreeSet<String>,
+    ),
     layrs_direct_execution_v1::v71::V71Error,
 > {
     let mut runtime = DirectV71Runtime::from_v70_migration(
@@ -995,7 +1187,10 @@ fn build_v71_shadow(
         state_key,
         verification_key,
     )?;
+    let base_checkpoint = runtime.seal_checkpoint(state_key, signing_key)?;
     let mut tree = SparseRequestTree::from_leaves(&bundle.leaves)?;
+    let migration = Arc::new(bundle);
+    let mut commits = Vec::with_capacity(observations.len());
     let mut effects = BTreeSet::new();
     for observation in &observations {
         let proof = tree.proof(
@@ -1015,11 +1210,24 @@ fn build_v71_shadow(
         if root != candidate.record().request_index_root {
             return Err(layrs_direct_execution_v1::v71::V71Error::ShadowMismatch);
         }
+        commits.push(V71ShadowCommit {
+            record: candidate.record().clone(),
+            terminal_leaf: candidate.terminal_leaf().clone(),
+            result: candidate.result().clone(),
+        });
         effects.insert(observation.result.effect.clone());
         runtime.adopt_candidate(candidate)?;
     }
     runtime.verify_shadow_head(&authoritative)?;
-    Ok((runtime, tree, observations.len() as u64, effects))
+    Ok((
+        runtime,
+        tree,
+        migration,
+        base_checkpoint,
+        commits,
+        observations.len() as u64,
+        effects,
+    ))
 }
 
 async fn begin_v71_shadow(
@@ -1140,12 +1348,23 @@ async fn begin_v71_shadow(
         .await;
         let mut state = task_state.lock().await;
         match built {
-            Ok(Ok((runtime, tree, consecutive_matches, observed_effects))) => {
+            Ok(Ok((
+                runtime,
+                tree,
+                migration,
+                base_checkpoint,
+                commits,
+                consecutive_matches,
+                observed_effects,
+            ))) => {
                 state.v71_shadow = V71ShadowState::Active {
                     run_id: task_run_id.clone(),
                     source_sequence,
                     runtime,
                     tree,
+                    migration,
+                    base_checkpoint,
+                    commits,
                     consecutive_matches,
                     observed_effects,
                 };
@@ -1724,13 +1943,16 @@ async fn observe_v71_shadow_commit(
                 source_sequence,
                 runtime,
                 tree,
+                commits,
                 consecutive_matches,
                 observed_effects,
+                ..
             } => Some((
                 run_id.clone(),
                 *source_sequence,
                 runtime.clone(),
                 tree.clone(),
+                commits.clone(),
                 *consecutive_matches,
                 observed_effects.clone(),
                 state.runtime.clone(),
@@ -1742,6 +1964,7 @@ async fn observe_v71_shadow_commit(
         source_sequence,
         mut runtime,
         mut tree,
+        mut commits,
         consecutive_matches,
         mut observed_effects,
         authoritative,
@@ -1766,6 +1989,16 @@ async fn observe_v71_shadow_commit(
             return;
         }
     };
+    if commits.len() >= MAX_V71_SHADOW_CATCH_UP {
+        let mut state = state.lock().await;
+        latch_v71_shadow(
+            &mut state.v71_shadow,
+            run_id,
+            source_sequence,
+            "V71_SHADOW_EXPORT_WINDOW_EXCEEDED",
+        );
+        return;
+    }
     let prior_sequence = runtime.sequence();
     let advanced = tokio::task::spawn_blocking(move || {
         let proof = tree.proof(&request.account_id, &request.request_id)?;
@@ -1780,28 +2013,56 @@ async fn observe_v71_shadow_commit(
         if root != candidate.record().request_index_root {
             return Err(layrs_direct_execution_v1::v71::V71Error::ShadowMismatch);
         }
+        commits.push(V71ShadowCommit {
+            record: candidate.record().clone(),
+            terminal_leaf: candidate.terminal_leaf().clone(),
+            result: candidate.result().clone(),
+        });
         observed_effects.insert(result.effect);
         runtime.adopt_candidate(candidate)?;
         Ok::<_, layrs_direct_execution_v1::v71::V71Error>((
             runtime,
             tree,
+            commits,
             observed_effects,
         ))
     })
     .await;
     let mut state = state.lock().await;
     match advanced {
-        Ok(Ok((runtime, tree, observed_effects)))
+        Ok(Ok((runtime, tree, commits, observed_effects)))
             if matches!(&state.v71_shadow, V71ShadowState::Active { run_id: current, runtime: current_runtime, .. }
                 if current == &run_id && current_runtime.sequence() == prior_sequence) =>
         {
             let next_matches = consecutive_matches.saturating_add(1);
             let sequence = runtime.sequence();
+            let (migration, base_checkpoint, current_commit_count) =
+                match &state.v71_shadow {
+                    V71ShadowState::Active {
+                        migration,
+                        base_checkpoint,
+                        commits,
+                        ..
+                    } => (Arc::clone(migration), base_checkpoint.clone(), commits.len()),
+                    _ => return,
+                };
+            if current_commit_count != commits.len().saturating_sub(1) {
+                latch_v71_shadow(
+                    &mut state.v71_shadow,
+                    run_id,
+                    source_sequence,
+                    "V71_SHADOW_LIVE_RACE",
+                );
+                return;
+            }
             state.v71_shadow = V71ShadowState::Active {
                 run_id: run_id.clone(),
                 source_sequence,
                 runtime,
                 tree,
+                migration,
+                base_checkpoint,
+                commits,
                 consecutive_matches: next_matches,
                 observed_effects,
             };
@@ -3277,7 +3538,7 @@ mod tests {
                 V71ShadowObservation { request, result }
             })
             .collect::<Vec<_>>();
-        let (runtime, tree, matched, effects) = build_v71_shadow(
+        let (runtime, tree, migration, base_checkpoint, commits, matched, effects) = build_v71_shadow(
             source.clone(),
             bundle.clone(),
             observations.clone(),
@@ -3290,6 +3551,11 @@ mod tests {
         .unwrap();
         assert_eq!(runtime.sequence(), 3);
         assert_eq!(tree.root().unwrap(), runtime.request_index_root());
+        assert_eq!(migration.as_ref(), &bundle);
+        assert_eq!(base_checkpoint.sequence, 1);
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].record.sequence, 2);
+        assert_eq!(commits[1].record.sequence, 3);
         assert_eq!(matched, 2);
         assert_eq!(effects, BTreeSet::from(["IDENTITY_ADMITTED".into()]));
 
@@ -3372,6 +3638,97 @@ mod tests {
                 if phase == "LATCHED:V71_SHADOW_LIVE_MISMATCH"
         ));
         assert_eq!(state.lock().await.runtime.committed_sequence(), 3);
+    }
+
+    #[tokio::test]
+    async fn v71_shadow_exports_committed_delta_and_promotes_only_the_exact_head() {
+        let state = state();
+        {
+            let mut committed = state.lock().await;
+            committed.recovery_complete = true;
+            committed
+                .runtime
+                .execute(shadow_admission('a', "shadow-source"))
+                .unwrap();
+        }
+        begin_v71_shadow(Arc::clone(&state), "run-promote".into()).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(v71_shadow_status(&state).await,
+                    RuntimeResponse::V71ShadowStatus { ref phase, .. } if phase == "ACTIVE")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let request = shadow_admission('b', "shadow-live-promote");
+        let result = state.lock().await.runtime.execute(request.clone()).unwrap();
+        observe_v71_shadow_commit(&state, request, result.clone()).await;
+
+        let export = export_v71_shadow(&state, "run-promote".into(), 1, true).await;
+        let RuntimeResponse::V71ShadowExport {
+            writer_epoch,
+            sequence,
+            record_hash,
+            transition_root,
+            request_index_root,
+            financial_state_root,
+            migration,
+            base_checkpoint,
+            records,
+            terminal_leaves,
+            results,
+            ..
+        } = export
+        else {
+            panic!("expected shadow export");
+        };
+        assert!(migration.is_some());
+        assert_eq!(base_checkpoint.as_ref().map(|value| value.sequence), Some(1));
+        assert_eq!(records.len(), 1);
+        assert_eq!(terminal_leaves.len(), 1);
+        assert_eq!(results, vec![result]);
+
+        assert!(matches!(
+            promote_v71_shadow(
+                Arc::clone(&state),
+                "run-promote".into(),
+                sequence,
+                "0".repeat(64),
+                transition_root.clone(),
+                request_index_root.clone(),
+                financial_state_root.clone(),
+            )
+            .await,
+            RuntimeResponse::Error { code }
+                if code == "V71_SHADOW_PROMOTION_HEAD_MISMATCH"
+        ));
+        assert!(state.lock().await.v71_runtime.is_none());
+
+        assert!(matches!(
+            promote_v71_shadow(
+                Arc::clone(&state),
+                "run-promote".into(),
+                sequence,
+                record_hash.clone(),
+                transition_root.clone(),
+                request_index_root.clone(),
+                financial_state_root.clone(),
+            )
+            .await,
+            RuntimeResponse::V71ShadowPromoted {
+                writer_epoch: promoted_epoch,
+                sequence: 2,
+                ..
+            } if promoted_epoch == writer_epoch
+        ));
+        let promoted = state.lock().await;
+        assert!(promoted.v71_writer_eligible);
+        assert_eq!(promoted.v71_runtime.as_ref().map(DirectV71Runtime::sequence), Some(2));
+        assert!(matches!(promoted.v71_shadow, V71ShadowState::Disabled));
     }
 
     #[tokio::test]

@@ -3758,6 +3758,24 @@ pub enum RuntimeRequest {
         run_id: String,
     },
     V71ShadowStatus,
+    /// Exports only already-committed shadow transitions. This is migration
+    /// state, never a pending-command queue. The parent may durably stage it
+    /// while v70 remains authoritative, then request a bounded final delta.
+    ExportV71Shadow {
+        run_id: String,
+        after_sequence: u64,
+        include_migration: bool,
+    },
+    /// Atomically promotes an exact, fully persisted shadow head inside the
+    /// existing writer. No process restart or command buffering is involved.
+    PromoteV71Shadow {
+        run_id: String,
+        expected_sequence: u64,
+        expected_record_hash: String,
+        expected_transition_root: String,
+        expected_request_index_root: String,
+        expected_financial_state_root: String,
+    },
     SealV70Migration,
     SealV70RollbackCheckpoint {
         migration: migration::V70MigrationBundle,
@@ -3861,6 +3879,31 @@ pub enum RuntimeResponse {
         sequence: u64,
         consecutive_matches: u64,
         observed_effects: Vec<String>,
+    },
+    V71ShadowExport {
+        run_id: String,
+        source_sequence: u64,
+        writer_epoch: String,
+        sequence: u64,
+        record_hash: String,
+        transition_root: String,
+        request_index_root: String,
+        financial_state_root: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        migration: Option<migration::V70MigrationBundle>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_checkpoint: Option<v71_checkpoint::DirectV71Checkpoint>,
+        records: Vec<journal::DirectJournalRecord>,
+        terminal_leaves: Vec<request_index::TerminalRequestLeaf>,
+        results: Vec<DirectResult>,
+    },
+    V71ShadowPromoted {
+        writer_epoch: String,
+        sequence: u64,
+        record_hash: String,
+        transition_root: String,
+        request_index_root: String,
+        financial_state_root: String,
     },
     V70MigrationSealed {
         bundle: migration::V70MigrationBundle,
