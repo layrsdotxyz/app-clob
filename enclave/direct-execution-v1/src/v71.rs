@@ -4,9 +4,12 @@
 //! v70 writer. Financial state is cloned for rollback safety, but historical
 //! request results are absent; idempotency is committed by one sparse root.
 
+use std::collections::BTreeMap;
+
 use thiserror::Error;
 
 use crate::{
+    artifact_hash,
     journal::{canonical_receipt_hash, canonical_result_hash, DirectJournalRecord, JournalError},
     migration::{MigratedTerminalRecord, MigrationError, V70MigrationBundle},
     request_hash,
@@ -18,7 +21,8 @@ use crate::{
         financial_state_root, restore_checkpoint, seal_checkpoint, DirectV71Checkpoint,
         V71CheckpointError,
     },
-    DirectPortfolio, DirectRequest, DirectResult, DirectRuntime, QuestReceiptWitness, RuntimeError,
+    DirectCheckpoint, DirectPortfolio, DirectRequest, DirectResult, DirectRuntime,
+    DirectStateArtifact, QuestReceiptWitness, RuntimeError, EPOCH_ID,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -30,6 +34,7 @@ pub enum ArchivedTerminalRecord {
 
 const GENESIS_RECORD_DOMAIN: &[u8] = b"layrs.direct-execution.journal-genesis.v71\0";
 const MIGRATION_TRANSITION_DOMAIN: &[u8] = b"layrs.direct-execution.migration-transition.v71\0";
+const ROLLBACK_LINEAGE_DOMAIN: &[u8] = b"layrs.direct-execution.rollback-lineage.v71\0";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum V71Error {
@@ -357,11 +362,8 @@ impl DirectV71Runtime {
         state_key: &[u8],
         archive_verification_key: &[u8],
     ) -> Result<(String, DirectResult), V71Error> {
-        let terminal = request_proof.terminal_leaf(
-            &self.request_index_root,
-            account_id,
-            request_id,
-        )?;
+        let terminal =
+            request_proof.terminal_leaf(&self.request_index_root, account_id, request_id)?;
         let result = match (archived, &terminal.locator) {
             (
                 ArchivedTerminalRecord::Journal { record },
@@ -369,20 +371,22 @@ impl DirectV71Runtime {
                     writer_epoch,
                     sequence,
                 },
-            ) => record
-                .open_replay(
-                    writer_epoch,
-                    *sequence,
-                    &terminal.account_id,
-                    &terminal.request_id,
-                    &terminal.request_hash,
-                    &terminal.result_hash,
-                    &terminal.receipt_hash,
-                    state_key,
-                    archive_verification_key,
-                    &self.runtime.receipt_key,
-                )?
-                .result,
+            ) => {
+                record
+                    .open_replay(
+                        writer_epoch,
+                        *sequence,
+                        &terminal.account_id,
+                        &terminal.request_id,
+                        &terminal.request_hash,
+                        &terminal.result_hash,
+                        &terminal.receipt_hash,
+                        state_key,
+                        archive_verification_key,
+                        &self.runtime.receipt_key,
+                    )?
+                    .result
+            }
             (
                 ArchivedTerminalRecord::Migration { record },
                 TerminalResultLocator::Migration {
@@ -456,6 +460,169 @@ impl DirectV71Runtime {
             checkpoint_signing_key,
         )
         .map_err(Into::into)
+    }
+
+    /// Emits a complete v70 checkpoint at the current v71 head for a governed
+    /// rollback to the retained bridge EIF. This is intentionally expensive
+    /// and is never part of the commit path: every archived terminal result is
+    /// authenticated before the full v70 request map is reconstructed.
+    pub fn seal_v70_rollback_checkpoint(
+        &self,
+        migration: &V70MigrationBundle,
+        journal_records: &[DirectJournalRecord],
+        state_key: &[u8],
+        archive_verification_key: &[u8],
+    ) -> Result<DirectCheckpoint, V71Error> {
+        if self.sequence == 0
+            || migration.manifest.source_sequence > self.sequence
+            || journal_records.len() as u64 != self.sequence - migration.manifest.source_sequence
+        {
+            return Err(V71Error::StaleCandidate);
+        }
+        migration.verify_complete(
+            state_key,
+            archive_verification_key,
+            &self.runtime.receipt_key,
+        )?;
+
+        let mut requests = BTreeMap::new();
+        let mut ordered = Vec::with_capacity(self.sequence as usize);
+        for (index, (record, leaf)) in migration.records.iter().zip(&migration.leaves).enumerate() {
+            let ordinal = index as u64 + 1;
+            let result = record.open_replay(
+                &migration.manifest.migration_id,
+                ordinal,
+                &leaf.account_id,
+                &leaf.request_id,
+                &leaf.request_hash,
+                &leaf.result_hash,
+                &leaf.receipt_hash,
+                state_key,
+                archive_verification_key,
+                &self.runtime.receipt_key,
+            )?;
+            insert_rollback_result(
+                &mut requests,
+                &mut ordered,
+                leaf.account_id.clone(),
+                leaf.request_id.clone(),
+                leaf.request_hash.clone(),
+                result,
+            )?;
+        }
+
+        let mut record_hash = migration.manifest.manifest_hash()?;
+        let mut transition = Vec::with_capacity(
+            MIGRATION_TRANSITION_DOMAIN.len()
+                + record_hash.len()
+                + migration.manifest.source_state_hash.len()
+                + migration.manifest.request_index_root.len(),
+        );
+        transition.extend_from_slice(MIGRATION_TRANSITION_DOMAIN);
+        transition.extend_from_slice(record_hash.as_bytes());
+        transition.extend_from_slice(migration.manifest.source_state_hash.as_bytes());
+        transition.extend_from_slice(migration.manifest.request_index_root.as_bytes());
+        let mut transition_root = sha256(&transition);
+        let mut request_index_root = migration.manifest.request_index_root.clone();
+        let mut expected_sequence = migration.manifest.source_sequence;
+
+        for record in journal_records {
+            expected_sequence = expected_sequence
+                .checked_add(1)
+                .ok_or(V71Error::StaleCandidate)?;
+            let payload = record.open_successor(
+                &record.writer_epoch,
+                expected_sequence,
+                &record_hash,
+                &transition_root,
+                &request_index_root,
+                state_key,
+                archive_verification_key,
+                &self.runtime.receipt_key,
+            )?;
+            insert_rollback_result(
+                &mut requests,
+                &mut ordered,
+                payload.request.account_id,
+                payload.request.request_id,
+                payload.request.request_hash,
+                payload.result,
+            )?;
+            record_hash = record.record_hash()?;
+            transition_root = record.transition_root.clone();
+            request_index_root = record.request_index_root.clone();
+        }
+
+        if expected_sequence != self.sequence
+            || record_hash != self.record_hash
+            || transition_root != self.transition_root
+            || request_index_root != self.request_index_root
+            || ordered.len() as u64 != self.sequence
+        {
+            return Err(V71Error::StaleCandidate);
+        }
+
+        let mut rollback = self.runtime.clone();
+        if !rollback.requests.is_empty() {
+            return Err(V71Error::StaleCandidate);
+        }
+        rollback.requests = requests;
+        let mut receipt_records = Vec::with_capacity(ordered.len());
+        let mut artifact_hashes = Vec::with_capacity(ordered.len());
+        let mut prior_state_hash = rollback.opening_state_hash.clone();
+        for (index, (_, _, request_hash, result)) in ordered.iter().enumerate() {
+            if index + 1 == ordered.len() {
+                break;
+            }
+            let sequence = index as u64 + 1;
+            let state_hash = rollback_lineage_hash(
+                &prior_state_hash,
+                sequence,
+                request_hash,
+                &result.receipt.receipt_id,
+            );
+            let compact_record = DirectStateArtifact {
+                epoch_id: EPOCH_ID.into(),
+                sequence,
+                prior_state_hash: prior_state_hash.clone(),
+                state_hash: state_hash.clone(),
+                request_hash: request_hash.clone(),
+                nonce: Vec::new(),
+                ciphertext: Vec::new(),
+                ciphertext_hash: sha256(&[]),
+                receipt: result.receipt.clone(),
+            };
+            artifact_hashes.push(artifact_hash(&compact_record));
+            receipt_records.push(compact_record);
+            prior_state_hash = state_hash;
+        }
+        let (_, _, last_request_hash, last_result) =
+            ordered.last().ok_or(V71Error::StaleCandidate)?;
+        let artifact = rollback.seal_artifact(
+            &prior_state_hash,
+            last_request_hash,
+            state_key,
+            last_result.receipt.clone(),
+        )?;
+        let mut compact_head = artifact.clone();
+        compact_head.ciphertext.clear();
+        receipt_records.push(compact_head);
+        artifact_hashes.push(artifact_hash(&artifact));
+        let checkpoint =
+            rollback.seal_checkpoint(artifact, receipt_records, artifact_hashes, state_key)?;
+        // Exercise the retained-v70 artifact decryption/application path
+        // before returning the package. In particular, v70 reconstructs
+        // active bus holds from the restored request map; compare that
+        // reconstructed financial state to the authoritative compact v71
+        // runtime before permitting rollback. The fresh-genesis checkpoint
+        // entry path is covered independently by the rollback tests.
+        let mut restored = self.runtime.clone();
+        restored.apply_artifact(&checkpoint.artifact, state_key)?;
+        restored.requests.clear();
+        if financial_state_root(&restored)? != financial_state_root(&self.runtime)? {
+            return Err(V71Error::StaleCandidate);
+        }
+        Ok(checkpoint)
     }
 
     pub fn restore_checkpoint(
@@ -619,14 +786,56 @@ impl DirectV71Runtime {
     }
 }
 
+fn insert_rollback_result(
+    requests: &mut BTreeMap<(String, String), (String, DirectResult)>,
+    ordered: &mut Vec<(String, String, String, DirectResult)>,
+    account_id: String,
+    request_id: String,
+    request_hash: String,
+    result: DirectResult,
+) -> Result<(), V71Error> {
+    if requests
+        .insert(
+            (account_id.clone(), request_id.clone()),
+            (request_hash.clone(), result.clone()),
+        )
+        .is_some()
+    {
+        return Err(V71Error::StaleCandidate);
+    }
+    ordered.push((account_id, request_id, request_hash, result));
+    Ok(())
+}
+
+fn rollback_lineage_hash(
+    prior_state_hash: &str,
+    sequence: u64,
+    request_hash: &str,
+    discriminator: &str,
+) -> String {
+    let mut bytes = Vec::with_capacity(
+        ROLLBACK_LINEAGE_DOMAIN.len()
+            + prior_state_hash.len()
+            + request_hash.len()
+            + discriminator.len()
+            + 8,
+    );
+    bytes.extend_from_slice(ROLLBACK_LINEAGE_DOMAIN);
+    bytes.extend_from_slice(prior_state_hash.as_bytes());
+    bytes.extend_from_slice(&sequence.to_be_bytes());
+    bytes.extend_from_slice(request_hash.as_bytes());
+    bytes.extend_from_slice(discriminator.as_bytes());
+    sha256(&bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::*;
     use crate::{
-        identity_commitment_for, journal::journal_verifying_key, DirectAction, RuntimeMode,
-        SealedEpoch,
+        identity_commitment_for, journal::journal_verifying_key, request_index::SparseRequestTree,
+        DirectAction, RuntimeMode, SealedEpoch,
     };
 
     fn runtime() -> DirectV71Runtime {
@@ -926,11 +1135,95 @@ mod tests {
             )
             .unwrap();
         assert_eq!(witness.receipt.payload.enclave_sequence, "1");
-        assert_eq!(witness.receipt.payload.state_root, migrated.transition_root());
+        assert_eq!(
+            witness.receipt.payload.state_root,
+            migrated.transition_root()
+        );
         assert!(crate::verify_public_quest_receipt(
             &witness.receipt,
             &crate::quest_receipt_public_key(&[9; 32]).unwrap(),
         ));
+    }
+
+    #[test]
+    fn v71_emits_complete_v70_checkpoint_only_from_exact_authenticated_archive() {
+        let empty_epoch = || SealedEpoch {
+            identities: BTreeMap::new(),
+            identity_subjects: BTreeMap::new(),
+            subject_identities: BTreeMap::new(),
+            subject_wallets: BTreeMap::<String, BTreeSet<String>>::new(),
+        };
+        let account_a = "a".repeat(64);
+        let account_b = "b".repeat(64);
+        let wallet_a = "0x1111111111111111111111111111111111111111";
+        let wallet_b = "0x2222222222222222222222222222222222222222";
+        let request_a = admission(&account_a, "request-1", wallet_a);
+        let request_b = admission(&account_b, "request-2", wallet_b);
+        let mut v70 =
+            DirectRuntime::new(empty_epoch(), RuntimeMode::IsolatedTest, vec![9; 32]).unwrap();
+        let result_a = v70.execute(request_a.clone()).unwrap();
+        let migration = V70MigrationBundle::seal(&v70, &[7; 32], &[8; 32]).unwrap();
+        let mut tree = SparseRequestTree::from_leaves(&migration.leaves).unwrap();
+        let proof_b = tree.proof(&account_b, "request-2").unwrap();
+        let mut v71 = DirectV71Runtime::from_v70_migration(
+            v70,
+            &migration,
+            "writer-epoch-2".into(),
+            &[7; 32],
+            &journal_verifying_key(&[8; 32]).unwrap(),
+        )
+        .unwrap();
+        let candidate = v71
+            .prepare_candidate(request_b.clone(), &proof_b, &[7; 32], &[8; 32])
+            .unwrap();
+        tree.insert(candidate.terminal_leaf().clone()).unwrap();
+        let journal_record = candidate.record().clone();
+        let result_b = v71.adopt_candidate(candidate).unwrap();
+        assert_eq!(tree.root().unwrap(), v71.request_index_root());
+
+        let checkpoint = v71
+            .seal_v70_rollback_checkpoint(
+                &migration,
+                std::slice::from_ref(&journal_record),
+                &[7; 32],
+                &journal_verifying_key(&[8; 32]).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(checkpoint.artifact.sequence, 2);
+        assert_eq!(checkpoint.receipt_records.len(), 2);
+        assert_eq!(checkpoint.artifact_hashes.len(), 2);
+
+        let mut restored =
+            DirectRuntime::new(empty_epoch(), RuntimeMode::IsolatedTest, vec![9; 32])
+                .unwrap()
+                .restore_checkpoint(&checkpoint, &[7; 32])
+                .unwrap();
+        assert_eq!(restored.committed_sequence(), v71.sequence());
+        assert_eq!(
+            restored.committed_state_hash(),
+            checkpoint.artifact.state_hash
+        );
+        assert_eq!(restored.execute(request_a).unwrap(), result_a);
+        assert_eq!(restored.execute(request_b).unwrap(), result_b);
+        assert_eq!(restored.committed_sequence(), 2);
+        assert_eq!(
+            restored
+                .portfolio(&identity_commitment_for(&account_b, wallet_b))
+                .unwrap(),
+            v71.portfolio(&identity_commitment_for(&account_b, wallet_b))
+                .unwrap()
+        );
+
+        let mut tampered = journal_record;
+        tampered.ciphertext[0] ^= 1;
+        assert!(v71
+            .seal_v70_rollback_checkpoint(
+                &migration,
+                &[tampered],
+                &[7; 32],
+                &journal_verifying_key(&[8; 32]).unwrap(),
+            )
+            .is_err());
     }
 
     #[test]
@@ -1080,6 +1373,28 @@ mod tests {
             restored
                 .financial_runtime()
                 .balance(&identity, "USDC", "USER_WITHDRAWAL_HOLD"),
+            4_840_000
+        );
+
+        let rollback = migrated
+            .seal_v70_rollback_checkpoint(
+                &bundle,
+                &[],
+                &[7; 32],
+                &journal_verifying_key(&[8; 32]).unwrap(),
+            )
+            .unwrap();
+        let rollback_restored =
+            DirectRuntime::new(empty_epoch(), RuntimeMode::IsolatedTest, vec![9; 32])
+                .unwrap()
+                .restore_checkpoint(&rollback, &[7; 32])
+                .unwrap();
+        assert_eq!(
+            rollback_restored.pending_usdc_bus_withdrawal(&account, withdrawal_id),
+            Some((wallet.into(), "4840000".into()))
+        );
+        assert_eq!(
+            rollback_restored.balance(&identity, "USDC", "USER_WITHDRAWAL_HOLD"),
             4_840_000
         );
     }

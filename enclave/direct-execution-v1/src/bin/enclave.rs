@@ -240,6 +240,13 @@ where
             seal_journal_checkpoint(state).await
         }
         RuntimeRequest::SealV70Migration => seal_v70_migration(state).await,
+        RuntimeRequest::SealV70RollbackCheckpoint { migration, journal_records } => {
+            let bytes = match seal_v70_rollback_checkpoint(state, migration, journal_records).await {
+                RuntimeResponse::CheckpointSealed { checkpoint } => checkpoint_sealed_frame(checkpoint, MAX_FRAME_BYTES)?,
+                other => serde_cbor::to_vec(&other).map_err(invalid)?,
+            };
+            return write_frame(&mut stream, &bytes).await;
+        }
         RuntimeRequest::ActivateV71Migration { bundle } => {
             activate_v71_migration(state, bundle).await
         }
@@ -888,6 +895,60 @@ async fn seal_v70_migration(state: Arc<Mutex<EnclaveState>>) -> RuntimeResponse 
         Ok(Ok(bundle)) => RuntimeResponse::V70MigrationSealed { bundle },
         _ => RuntimeResponse::Error {
             code: "V70_MIGRATION_SEAL_FAILED".into(),
+        },
+    }
+}
+
+async fn seal_v70_rollback_checkpoint(
+    state: Arc<Mutex<EnclaveState>>,
+    migration: layrs_direct_execution_v1::migration::V70MigrationBundle,
+    journal_records: Vec<layrs_direct_execution_v1::journal::DirectJournalRecord>,
+) -> RuntimeResponse {
+    let snapshot = {
+        let state = state.lock().await;
+        if !state.recovery_complete
+            || !state.v71_writer_eligible
+            || state.restore_candidate.is_some()
+            || state.v71_restore_candidate.is_some()
+        {
+            None
+        } else {
+            state.v71_runtime.clone().map(|runtime| {
+                (
+                    runtime,
+                    zeroize::Zeroizing::new(state.state_key.clone()),
+                )
+            })
+        }
+    };
+    let Some((runtime, state_key)) = snapshot else {
+        return RuntimeResponse::Error {
+            code: "V70_ROLLBACK_REQUIRES_VERIFIED_V71_HEAD".into(),
+        };
+    };
+    let verification_key = match derive_journal_signing_key(&state_key)
+        .and_then(|key| journal_verifying_key(&key))
+    {
+        Ok(key) => key,
+        Err(_) => {
+            return RuntimeResponse::Error {
+                code: "JOURNAL_KEY_INVALID".into(),
+            }
+        }
+    };
+    match tokio::task::spawn_blocking(move || {
+        runtime.seal_v70_rollback_checkpoint(
+            &migration,
+            &journal_records,
+            &state_key,
+            &verification_key,
+        )
+    })
+    .await
+    {
+        Ok(Ok(checkpoint)) => RuntimeResponse::CheckpointSealed { checkpoint },
+        _ => RuntimeResponse::Error {
+            code: "V70_ROLLBACK_ARCHIVE_INVALID".into(),
         },
     }
 }
@@ -2536,6 +2597,36 @@ mod tests {
             &witness.receipt,
             &layrs_direct_execution_v1::quest_receipt_public_key(&[7; 32]).unwrap(),
         ));
+        let rollback = runtime_response(
+            Arc::clone(&live),
+            RuntimeRequest::SealV70RollbackCheckpoint {
+                migration: bundle,
+                journal_records: Vec::new(),
+            },
+        )
+        .await;
+        let RuntimeResponse::CheckpointSealed { checkpoint } = rollback else {
+            panic!("expected v70 rollback checkpoint");
+        };
+        assert_eq!(checkpoint.artifact.sequence, 1);
+        let (epoch, mode, receipt_key, state_key) = {
+            let state = live.lock().await;
+            (
+                state.epoch.clone(),
+                state.mode,
+                state.receipt_key.clone(),
+                state.state_key.clone(),
+            )
+        };
+        let mut restored = DirectRuntime::new(epoch, mode, receipt_key)
+            .unwrap()
+            .restore_checkpoint(&checkpoint, &state_key)
+            .unwrap();
+        let RuntimeResponse::Execute { result: expected } = expected else {
+            unreachable!();
+        };
+        assert_eq!(restored.execute(command).unwrap(), expected);
+        assert_eq!(restored.committed_sequence(), 1);
     }
 
     async fn execute_without_ack(

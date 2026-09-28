@@ -3743,6 +3743,10 @@ pub enum RuntimeRequest {
     },
     SealJournalCheckpoint,
     SealV70Migration,
+    SealV70RollbackCheckpoint {
+        migration: migration::V70MigrationBundle,
+        journal_records: Vec<journal::DirectJournalRecord>,
+    },
     ActivateV71Migration {
         bundle: migration::V70MigrationBundle,
     },
