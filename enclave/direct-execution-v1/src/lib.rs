@@ -3703,11 +3703,20 @@ pub enum RuntimeRequest {
     Execute {
         request: DirectRequest,
     },
+    ExecuteJournal {
+        request: DirectRequest,
+        request_proof: request_index::SparseRequestProof,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        archived: Option<v71::ArchivedTerminalRecord>,
+    },
     /// The second, bounded frame of one direct request.  It is never stored as
     /// a workflow record: it merely proves that the parent read back the exact
     /// immutable candidate sent in the preceding frame.
     DurabilityAck {
         ack: DurabilityAck,
+    },
+    JournalDurabilityAck {
+        ack: journal::JournalDurabilityAck,
     },
     /// Startup-only handoff of immutable encrypted artifacts from the parent.
     /// The enclave reconstructs and verifies private state itself; PostgreSQL
@@ -3765,6 +3774,10 @@ pub enum RuntimeResponse {
     },
     CommitCandidate {
         artifact: DirectStateArtifact,
+    },
+    JournalCandidate {
+        record: journal::DirectJournalRecord,
+        terminal_leaf: request_index::TerminalRequestLeaf,
     },
     RecoveryComplete {
         recovered_sequence: u64,

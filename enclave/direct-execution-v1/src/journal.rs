@@ -499,6 +499,17 @@ pub fn journal_verifying_key(signing_key_seed: &[u8]) -> Result<[u8; 32], Journa
     Ok(SigningKey::from_bytes(&seed).verifying_key().to_bytes())
 }
 
+pub fn derive_journal_signing_key(state_key: &[u8]) -> Result<[u8; 32], JournalError> {
+    if state_key.len() != 32 {
+        return Err(JournalError::Invalid);
+    }
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(state_key)
+        .map_err(|_| JournalError::Invalid)?;
+    mac.update(b"layrs.direct-execution.journal-signing-key.v1\0");
+    mac.update(EPOCH_ID.as_bytes());
+    Ok(mac.finalize().into_bytes().into())
+}
+
 fn sign(signing_key_seed: &[u8], bytes: &[u8]) -> Result<String, JournalError> {
     let seed: [u8; 32] = signing_key_seed
         .try_into()
@@ -780,5 +791,14 @@ mod tests {
         let mut changed_ack = ack;
         changed_ack.sequence += 1;
         assert!(!changed_ack.verify_for(&changed, &[6; 32]));
+    }
+
+    #[test]
+    fn journal_signing_key_is_domain_derived_from_the_state_key() {
+        let first = derive_journal_signing_key(&[7; 32]).unwrap();
+        assert_eq!(first, derive_journal_signing_key(&[7; 32]).unwrap());
+        assert_ne!(first, derive_journal_signing_key(&[8; 32]).unwrap());
+        assert!(derive_journal_signing_key(&[7; 31]).is_err());
+        assert!(journal_verifying_key(&first).is_ok());
     }
 }

@@ -11,8 +11,10 @@ use aws_nitro_enclaves_nsm_api::{
 use hmac::{Hmac, Mac};
 use layrs_direct_execution_v1::{
     direct_frame::{CHECKPOINT_FRAME_OVERSIZED, MAX_FRAME_BYTES},
+    journal::{derive_journal_signing_key, journal_verifying_key},
     runtime_binding, runtime_binding_commitment, quest_receipt_public_key, quest_receipt_attestation_commitment, DirectRuntime, InMemoryDirectStateStore,
     RuntimeMeasurementBinding, RuntimeMode, RuntimeRequest, RuntimeResponse, SealedEpoch,
+    v71::DirectV71Runtime,
     WriterGrant, EPOCH_ID, TRANSACTION_MODEL,
 };
 use openssl::{
@@ -35,6 +37,7 @@ struct EnclaveState {
     transition_gate: Arc<Mutex<()>>,
     nsm_fd: i32,
     runtime: DirectRuntime,
+    v71_runtime: Option<DirectV71Runtime>,
     epoch: SealedEpoch,
     mode: RuntimeMode,
     receipt_key: Vec<u8>,
@@ -88,6 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         transition_gate: Arc::new(Mutex::new(())),
         nsm_fd,
         runtime: DirectRuntime::new(epoch.clone(), mode, receipt_key.clone())?,
+        v71_runtime: None,
         epoch,
         mode,
         receipt_key,
@@ -165,8 +169,18 @@ where
         RuntimeRequest::Execute { request } => {
             return execute_direct(&mut stream, state, request).await
         }
+        RuntimeRequest::ExecuteJournal {
+            request,
+            request_proof,
+            archived,
+        } => {
+            return execute_journal(&mut stream, state, request, request_proof, archived).await
+        }
         RuntimeRequest::DurabilityAck { .. } => RuntimeResponse::Error {
             code: "UNEXPECTED_DURABILITY_ACK".into(),
+        },
+        RuntimeRequest::JournalDurabilityAck { .. } => RuntimeResponse::Error {
+            code: "UNEXPECTED_JOURNAL_DURABILITY_ACK".into(),
         },
         RuntimeRequest::RecoverCommitted { artifacts } => recover_committed(state, artifacts).await,
         RuntimeRequest::BeginCommittedRestore => begin_committed_restore(state).await,
@@ -753,6 +767,10 @@ where
             drop(committed);
             return write_response(stream, RuntimeResponse::Error { code: "DIRECT_STATE_RECOVERY_REQUIRED".into() }).await;
         }
+        if committed.v71_runtime.is_some() {
+            drop(committed);
+            return write_response(stream, RuntimeResponse::Error { code: "JOURNAL_FORMAT_MISMATCH".into() }).await;
+        }
         if let Some(result) = committed.runtime.existing_result(&request).map_err(invalid)? {
             drop(committed);
             return write_response(stream, RuntimeResponse::Execute { result }).await;
@@ -791,6 +809,159 @@ where
         },
         Err(error) => return write_response(stream, RuntimeResponse::Error { code: error.to_string() }).await,
     }
+    write_response(stream, RuntimeResponse::Execute { result }).await
+}
+
+async fn execute_journal<S>(
+    stream: &mut S,
+    state: Arc<Mutex<EnclaveState>>,
+    request: layrs_direct_execution_v1::DirectRequest,
+    request_proof: layrs_direct_execution_v1::request_index::SparseRequestProof,
+    archived: Option<layrs_direct_execution_v1::v71::ArchivedTerminalRecord>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let _transition = transition(&state).await;
+    let (mut runtime, state_key, commit_ack_key, signing_key) = {
+        let committed = state.lock().await;
+        if !committed.recovery_complete || committed.restore_candidate.is_some() {
+            drop(committed);
+            return write_response(
+                stream,
+                RuntimeResponse::Error {
+                    code: "DIRECT_STATE_RECOVERY_REQUIRED".into(),
+                },
+            )
+            .await;
+        }
+        let Some(runtime) = committed.v71_runtime.clone() else {
+            drop(committed);
+            return write_response(
+                stream,
+                RuntimeResponse::Error {
+                    code: "JOURNAL_FORMAT_MISMATCH".into(),
+                },
+            )
+            .await;
+        };
+        let signing_key = derive_journal_signing_key(&committed.state_key).map_err(invalid)?;
+        (
+            runtime,
+            zeroize::Zeroizing::new(committed.state_key.clone()),
+            zeroize::Zeroizing::new(committed.commit_ack_key.clone()),
+            zeroize::Zeroizing::new(signing_key),
+        )
+    };
+
+    if request_proof.leaf.is_some() {
+        let Some(archived) = archived else {
+            return write_response(
+                stream,
+                RuntimeResponse::Error {
+                    code: "ARCHIVED_TERMINAL_REQUIRED".into(),
+                },
+            )
+            .await;
+        };
+        let verification_key = journal_verifying_key(signing_key.as_ref()).map_err(invalid)?;
+        let replayed = tokio::task::spawn_blocking(move || {
+            runtime.replay_archived(
+                &request,
+                &request_proof,
+                &archived,
+                &state_key,
+                &verification_key,
+            )
+        })
+        .await
+        .map_err(invalid)?;
+        return match replayed {
+            Ok(result) => write_response(stream, RuntimeResponse::Execute { result }).await,
+            Err(error) => {
+                write_response(
+                    stream,
+                    RuntimeResponse::Error {
+                        code: error.to_string(),
+                    },
+                )
+                .await
+            }
+        };
+    }
+    if archived.is_some() {
+        return write_response(
+            stream,
+            RuntimeResponse::Error {
+                code: "UNEXPECTED_ARCHIVED_TERMINAL".into(),
+            },
+        )
+        .await;
+    }
+
+    let (candidate_runtime, prepared) = tokio::task::spawn_blocking(move || {
+        let prepared =
+            runtime.prepare_candidate(request, &request_proof, &state_key, signing_key.as_ref());
+        (runtime, prepared)
+    })
+    .await
+    .map_err(invalid)?;
+    runtime = candidate_runtime;
+    let candidate = match prepared {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            return write_response(
+                stream,
+                RuntimeResponse::Error {
+                    code: error.to_string(),
+                },
+            )
+            .await
+        }
+    };
+    write_response(
+        stream,
+        RuntimeResponse::JournalCandidate {
+            record: candidate.record().clone(),
+            terminal_leaf: candidate.terminal_leaf().clone(),
+        },
+    )
+    .await?;
+    let ack: RuntimeRequest = serde_cbor::from_slice(&read_frame(stream).await?).map_err(invalid)?;
+    let RuntimeRequest::JournalDurabilityAck { ack } = ack else {
+        return write_response(
+            stream,
+            RuntimeResponse::Error {
+                code: "JOURNAL_DURABILITY_ACK_REQUIRED".into(),
+            },
+        )
+        .await;
+    };
+    if !ack.verify_for(candidate.record(), &commit_ack_key) {
+        return write_response(
+            stream,
+            RuntimeResponse::Error {
+                code: "INVALID_JOURNAL_DURABILITY_ACK".into(),
+            },
+        )
+        .await;
+    }
+    let result = candidate.result().clone();
+    let adopted = runtime.adopt_candidate(candidate);
+    if let Err(error) = adopted {
+        return write_response(
+            stream,
+            RuntimeResponse::Error {
+                code: error.to_string(),
+            },
+        )
+        .await;
+    }
+    let financial = runtime.financial_runtime().clone();
+    let mut committed = state.lock().await;
+    committed.runtime = financial;
+    committed.v71_runtime = Some(runtime);
+    drop(committed);
     write_response(stream, RuntimeResponse::Execute { result }).await
 }
 
@@ -1073,6 +1244,7 @@ mod tests {
             transition_gate: Arc::new(Mutex::new(())),
             nsm_fd: -1,
             runtime: DirectRuntime::new(epoch.clone(), mode, receipt_key.clone()).unwrap(),
+            v71_runtime: None,
             epoch,
             mode,
             receipt_key,
@@ -1093,6 +1265,7 @@ mod tests {
             transition_gate: Arc::new(Mutex::new(())),
             nsm_fd: -1,
             runtime: DirectRuntime::new(epoch.clone(), RuntimeMode::Dormant, vec![0; 32]).unwrap(),
+            v71_runtime: None,
             epoch,
             mode: RuntimeMode::Dormant,
             receipt_key: vec![0; 32],
@@ -1410,6 +1583,158 @@ mod tests {
         server.await.unwrap().unwrap();
         terminal
     }
+    async fn activate_empty_journal(state: &Arc<Mutex<EnclaveState>>) {
+        let mut state = state.lock().await;
+        let runtime = DirectV71Runtime::new_empty(state.runtime.clone(), "isolated-writer-1".into())
+            .unwrap();
+        state.v71_runtime = Some(runtime);
+        state.recovery_complete = true;
+    }
+    async fn commit_journal_through_parent_callback(
+        state: Arc<Mutex<EnclaveState>>,
+        request: DirectRequest,
+        proof: layrs_direct_execution_v1::request_index::SparseRequestProof,
+    ) -> (
+        RuntimeResponse,
+        layrs_direct_execution_v1::journal::DirectJournalRecord,
+        layrs_direct_execution_v1::request_index::TerminalRequestLeaf,
+    ) {
+        let (mut parent, enclave) = tokio::io::duplex(TEST_VSOCK_BUFFER_BYTES);
+        let server = tokio::spawn(serve(enclave, state));
+        write_frame(
+            &mut parent,
+            &serde_cbor::to_vec(&RuntimeRequest::ExecuteJournal {
+                request,
+                request_proof: proof,
+                archived: None,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let candidate: RuntimeResponse =
+            serde_cbor::from_slice(&read_frame(&mut parent).await.unwrap()).unwrap();
+        let RuntimeResponse::JournalCandidate {
+            record,
+            terminal_leaf,
+        } = candidate
+        else {
+            panic!("expected journal candidate, got {candidate:?}");
+        };
+        let ack = layrs_direct_execution_v1::journal::JournalDurabilityAck::issue(
+            &record,
+            &[9; 32],
+        )
+        .unwrap();
+        write_frame(
+            &mut parent,
+            &serde_cbor::to_vec(&RuntimeRequest::JournalDurabilityAck { ack }).unwrap(),
+        )
+        .await
+        .unwrap();
+        let terminal = serde_cbor::from_slice(&read_frame(&mut parent).await.unwrap()).unwrap();
+        server.await.unwrap().unwrap();
+        (terminal, record, terminal_leaf)
+    }
+
+    #[tokio::test]
+    async fn journal_commit_requires_exact_ack_and_replays_without_a_successor() {
+        let live = state();
+        activate_empty_journal(&live).await;
+        let command = request("journal-request-1");
+        let empty = layrs_direct_execution_v1::request_index::SparseRequestProof::empty_tree();
+        let (terminal, record, leaf) = commit_journal_through_parent_callback(
+            Arc::clone(&live),
+            command.clone(),
+            empty.clone(),
+        )
+        .await;
+        let RuntimeResponse::Execute { result } = terminal else {
+            panic!("journal command did not commit");
+        };
+        {
+            let state = live.lock().await;
+            assert_eq!(state.v71_runtime.as_ref().unwrap().sequence(), 1);
+            assert_eq!(state.runtime.committed_sequence(), 0);
+        }
+
+        let membership = layrs_direct_execution_v1::request_index::SparseRequestProof {
+            leaf: Some(leaf),
+            siblings: empty.siblings,
+        };
+        let replay = runtime_response(
+            Arc::clone(&live),
+            RuntimeRequest::ExecuteJournal {
+                request: command,
+                request_proof: membership,
+                archived: Some(
+                    layrs_direct_execution_v1::v71::ArchivedTerminalRecord::Journal { record },
+                ),
+            },
+        )
+        .await;
+        assert_eq!(replay, RuntimeResponse::Execute { result });
+        assert_eq!(live.lock().await.v71_runtime.as_ref().unwrap().sequence(), 1);
+
+        assert!(matches!(
+            runtime_response(
+                live,
+                RuntimeRequest::Execute {
+                    request: request("v70-after-v71")
+                }
+            )
+            .await,
+            RuntimeResponse::Error { ref code } if code == "JOURNAL_FORMAT_MISMATCH"
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_journal_ack_adopts_nothing_and_exact_retry_reseals_same_record() {
+        let live = state();
+        activate_empty_journal(&live).await;
+        let command = request("journal-invalid-ack");
+        let proof = layrs_direct_execution_v1::request_index::SparseRequestProof::empty_tree();
+        let (mut parent, enclave) = tokio::io::duplex(TEST_VSOCK_BUFFER_BYTES);
+        let server = tokio::spawn(serve(enclave, Arc::clone(&live)));
+        write_frame(
+            &mut parent,
+            &serde_cbor::to_vec(&RuntimeRequest::ExecuteJournal {
+                request: command.clone(),
+                request_proof: proof.clone(),
+                archived: None,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let response: RuntimeResponse =
+            serde_cbor::from_slice(&read_frame(&mut parent).await.unwrap()).unwrap();
+        let RuntimeResponse::JournalCandidate { record: first, .. } = response else {
+            panic!("expected journal candidate");
+        };
+        let mut ack = layrs_direct_execution_v1::journal::JournalDurabilityAck::issue(
+            &first,
+            &[9; 32],
+        )
+        .unwrap();
+        ack.signature = "0".repeat(64);
+        write_frame(
+            &mut parent,
+            &serde_cbor::to_vec(&RuntimeRequest::JournalDurabilityAck { ack }).unwrap(),
+        )
+        .await
+        .unwrap();
+        let rejected: RuntimeResponse =
+            serde_cbor::from_slice(&read_frame(&mut parent).await.unwrap()).unwrap();
+        assert!(matches!(rejected, RuntimeResponse::Error { ref code } if code == "INVALID_JOURNAL_DURABILITY_ACK"));
+        server.await.unwrap().unwrap();
+        assert_eq!(live.lock().await.v71_runtime.as_ref().unwrap().sequence(), 0);
+
+        let (terminal, retry, _) =
+            commit_journal_through_parent_callback(live, command, proof).await;
+        assert_eq!(retry, first);
+        assert!(matches!(terminal, RuntimeResponse::Execute { .. }));
+    }
     async fn execute_without_ack(
         state: Arc<Mutex<EnclaveState>>,
         request: DirectRequest,
@@ -1450,6 +1775,7 @@ mod tests {
             transition_gate: Arc::new(Mutex::new(())),
             nsm_fd: -1,
             runtime: DirectRuntime::new(epoch.clone(), RuntimeMode::Dormant, vec![0; 32]).unwrap(),
+            v71_runtime: None,
             epoch,
             mode: RuntimeMode::Dormant,
             receipt_key: vec![0; 32],

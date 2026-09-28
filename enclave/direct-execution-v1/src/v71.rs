@@ -20,6 +20,13 @@ use crate::{
     DirectRequest, DirectResult, DirectRuntime, RuntimeError,
 };
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum ArchivedTerminalRecord {
+    Journal { record: DirectJournalRecord },
+    Migration { record: MigratedTerminalRecord },
+}
+
 const GENESIS_RECORD_DOMAIN: &[u8] = b"layrs.direct-execution.journal-genesis.v71\0";
 const MIGRATION_TRANSITION_DOMAIN: &[u8] = b"layrs.direct-execution.migration-transition.v71\0";
 
@@ -311,6 +318,32 @@ impl DirectV71Runtime {
                 &self.runtime.receipt_key,
             )
             .map_err(Into::into)
+    }
+
+    pub fn replay_archived(
+        &self,
+        request: &DirectRequest,
+        request_proof: &SparseRequestProof,
+        archived: &ArchivedTerminalRecord,
+        state_key: &[u8],
+        archive_verification_key: &[u8],
+    ) -> Result<DirectResult, V71Error> {
+        match archived {
+            ArchivedTerminalRecord::Journal { record } => self.replay(
+                request,
+                request_proof,
+                record,
+                state_key,
+                archive_verification_key,
+            ),
+            ArchivedTerminalRecord::Migration { record } => self.replay_migrated(
+                request,
+                request_proof,
+                record,
+                state_key,
+                archive_verification_key,
+            ),
+        }
     }
 
     pub fn seal_checkpoint(
