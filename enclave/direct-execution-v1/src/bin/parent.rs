@@ -1833,6 +1833,9 @@ impl ArchiveStore {
                     PersistenceFormat::V70 => false,
                     PersistenceFormat::V71 => store.prepare_journal_restore().await?,
                     PersistenceFormat::V71Hot => store.prepare_hot_journal_restore().await?,
+                    PersistenceFormat::V70RollbackBaseline => {
+                        return Err("v70 rollback baseline restore dispatch invalid".into())
+                    }
                 };
                 if journal_ready {
                     state.hot_v71_enabled.store(true, Ordering::Release);
