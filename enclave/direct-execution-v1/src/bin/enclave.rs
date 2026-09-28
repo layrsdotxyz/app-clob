@@ -49,6 +49,16 @@ struct V71ShadowCommit {
     result: DirectResult,
 }
 
+struct BuiltV71Shadow {
+    runtime: DirectV71Runtime,
+    tree: SparseRequestTree,
+    migration: Arc<layrs_direct_execution_v1::migration::V70MigrationBundle>,
+    base_checkpoint: layrs_direct_execution_v1::v71_checkpoint::DirectV71Checkpoint,
+    commits: Vec<V71ShadowCommit>,
+    consecutive_matches: u64,
+    observed_effects: BTreeSet<String>,
+}
+
 enum V71ShadowState {
     Disabled,
     Pending {
@@ -1168,18 +1178,7 @@ fn build_v71_shadow(
     state_key: &[u8],
     signing_key: &[u8],
     verification_key: &[u8],
-) -> Result<
-    (
-        DirectV71Runtime,
-        SparseRequestTree,
-        Arc<layrs_direct_execution_v1::migration::V70MigrationBundle>,
-        layrs_direct_execution_v1::v71_checkpoint::DirectV71Checkpoint,
-        Vec<V71ShadowCommit>,
-        u64,
-        BTreeSet<String>,
-    ),
-    layrs_direct_execution_v1::v71::V71Error,
-> {
+) -> Result<BuiltV71Shadow, layrs_direct_execution_v1::v71::V71Error> {
     let mut runtime = DirectV71Runtime::from_v70_migration(
         source_runtime,
         &bundle,
@@ -1219,15 +1218,15 @@ fn build_v71_shadow(
         runtime.adopt_candidate(candidate)?;
     }
     runtime.verify_shadow_head(&authoritative)?;
-    Ok((
+    Ok(BuiltV71Shadow {
         runtime,
         tree,
         migration,
         base_checkpoint,
         commits,
-        observations.len() as u64,
-        effects,
-    ))
+        consecutive_matches: observations.len() as u64,
+        observed_effects: effects,
+    })
 }
 
 async fn begin_v71_shadow(
@@ -1348,7 +1347,7 @@ async fn begin_v71_shadow(
         .await;
         let mut state = task_state.lock().await;
         match built {
-            Ok(Ok((
+            Ok(Ok(BuiltV71Shadow {
                 runtime,
                 tree,
                 migration,
@@ -1356,7 +1355,7 @@ async fn begin_v71_shadow(
                 commits,
                 consecutive_matches,
                 observed_effects,
-            ))) => {
+            })) => {
                 state.v71_shadow = V71ShadowState::Active {
                     run_id: task_run_id.clone(),
                     source_sequence,
@@ -1952,7 +1951,7 @@ async fn observe_v71_shadow_commit(
                 *source_sequence,
                 runtime.clone(),
                 tree.clone(),
-                commits.clone(),
+                commits.len(),
                 *consecutive_matches,
                 observed_effects.clone(),
                 state.runtime.clone(),
@@ -1964,7 +1963,7 @@ async fn observe_v71_shadow_commit(
         source_sequence,
         mut runtime,
         mut tree,
-        mut commits,
+        commit_count,
         consecutive_matches,
         mut observed_effects,
         authoritative,
@@ -1989,7 +1988,7 @@ async fn observe_v71_shadow_commit(
             return;
         }
     };
-    if commits.len() >= MAX_V71_SHADOW_CATCH_UP {
+    if commit_count >= MAX_V71_SHADOW_CATCH_UP {
         let mut state = state.lock().await;
         latch_v71_shadow(
             &mut state.v71_shadow,
@@ -2013,40 +2012,41 @@ async fn observe_v71_shadow_commit(
         if root != candidate.record().request_index_root {
             return Err(layrs_direct_execution_v1::v71::V71Error::ShadowMismatch);
         }
-        commits.push(V71ShadowCommit {
+        let commit = V71ShadowCommit {
             record: candidate.record().clone(),
             terminal_leaf: candidate.terminal_leaf().clone(),
             result: candidate.result().clone(),
-        });
+        };
         observed_effects.insert(result.effect);
         runtime.adopt_candidate(candidate)?;
         Ok::<_, layrs_direct_execution_v1::v71::V71Error>((
             runtime,
             tree,
-            commits,
+            commit,
             observed_effects,
         ))
     })
     .await;
     let mut state = state.lock().await;
     match advanced {
-        Ok(Ok((runtime, tree, commits, observed_effects)))
+        Ok(Ok((runtime, tree, commit, observed_effects)))
             if matches!(&state.v71_shadow, V71ShadowState::Active { run_id: current, runtime: current_runtime, .. }
                 if current == &run_id && current_runtime.sequence() == prior_sequence) =>
         {
             let next_matches = consecutive_matches.saturating_add(1);
             let sequence = runtime.sequence();
-            let (migration, base_checkpoint, current_commit_count) =
-                match &state.v71_shadow {
-                    V71ShadowState::Active {
-                        migration,
-                        base_checkpoint,
-                        commits,
-                        ..
-                    } => (Arc::clone(migration), base_checkpoint.clone(), commits.len()),
-                    _ => return,
-                };
-            if current_commit_count != commits.len().saturating_sub(1) {
+            let V71ShadowState::Active {
+                runtime: current_runtime,
+                tree: current_tree,
+                commits,
+                consecutive_matches: current_matches,
+                observed_effects: current_effects,
+                ..
+            } = &mut state.v71_shadow
+            else {
+                return;
+            };
+            if commits.len() != commit_count {
                 latch_v71_shadow(
                     &mut state.v71_shadow,
                     run_id,
@@ -2055,17 +2055,11 @@ async fn observe_v71_shadow_commit(
                 );
                 return;
             }
-            state.v71_shadow = V71ShadowState::Active {
-                run_id: run_id.clone(),
-                source_sequence,
-                runtime,
-                tree,
-                migration,
-                base_checkpoint,
-                commits,
-                consecutive_matches: next_matches,
-                observed_effects,
-            };
+            *current_runtime = runtime;
+            *current_tree = tree;
+            commits.push(commit);
+            *current_matches = next_matches;
+            *current_effects = observed_effects;
             eprintln!(
                 "V71_SHADOW_MATCH run_id={} sequence={} consecutive_matches={}",
                 run_id, sequence, next_matches
@@ -3538,7 +3532,7 @@ mod tests {
                 V71ShadowObservation { request, result }
             })
             .collect::<Vec<_>>();
-        let (runtime, tree, migration, base_checkpoint, commits, matched, effects) = build_v71_shadow(
+        let built = build_v71_shadow(
             source.clone(),
             bundle.clone(),
             observations.clone(),
@@ -3549,15 +3543,18 @@ mod tests {
             &verification_key,
         )
         .unwrap();
-        assert_eq!(runtime.sequence(), 3);
-        assert_eq!(tree.root().unwrap(), runtime.request_index_root());
-        assert_eq!(migration.as_ref(), &bundle);
-        assert_eq!(base_checkpoint.sequence, 1);
-        assert_eq!(commits.len(), 2);
-        assert_eq!(commits[0].record.sequence, 2);
-        assert_eq!(commits[1].record.sequence, 3);
-        assert_eq!(matched, 2);
-        assert_eq!(effects, BTreeSet::from(["IDENTITY_ADMITTED".into()]));
+        assert_eq!(built.runtime.sequence(), 3);
+        assert_eq!(built.tree.root().unwrap(), built.runtime.request_index_root());
+        assert_eq!(built.migration.as_ref(), &bundle);
+        assert_eq!(built.base_checkpoint.sequence, 1);
+        assert_eq!(built.commits.len(), 2);
+        assert_eq!(built.commits[0].record.sequence, 2);
+        assert_eq!(built.commits[1].record.sequence, 3);
+        assert_eq!(built.consecutive_matches, 2);
+        assert_eq!(
+            built.observed_effects,
+            BTreeSet::from(["IDENTITY_ADMITTED".into()])
+        );
 
         let mut tampered = observations;
         tampered[0].result.effect = "TAMPERED".into();

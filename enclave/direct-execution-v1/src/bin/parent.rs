@@ -7638,8 +7638,7 @@ async fn stage_and_promote_v71_shadow(state: AppState, run_id: String) -> Result
 
     // Catch up without blocking traffic. Once a read is current, take the
     // ordinary in-memory writer gate and persist only the final small delta.
-    loop {
-        let (next, _, _, records, leaves, results, _) =
+    let (next, _, _, records, leaves, results, _) =
             export_shadow_after(&state, &run_id, head.sequence, false).await?;
         append_shadow_export(
             store,
@@ -7722,8 +7721,7 @@ async fn stage_and_promote_v71_shadow(state: AppState, run_id: String) -> Result
             "V71_HOT_PROMOTION_COMPLETE run_id={} sequence={}",
             run_id, head.sequence
         );
-        return Ok(());
-    }
+    Ok(())
 }
 
 /// Materializes the exact v70 rollback package for the restored v71 head
