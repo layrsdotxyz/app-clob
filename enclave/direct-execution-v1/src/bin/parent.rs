@@ -46,6 +46,8 @@ use layrs_direct_execution_v1::{
 use layrs_direct_execution_v1::journal::{
     canonical_receipt_hash, canonical_result_hash, DirectJournalRecord, DIRECT_JOURNAL_PROTOCOL,
 };
+use layrs_direct_execution_v1::migration::{V70MigrationBundle, V70_MIGRATION_MANIFEST_PROTOCOL};
+use layrs_direct_execution_v1::v71_checkpoint::{DirectV71Checkpoint, DIRECT_V71_CHECKPOINT_PROTOCOL};
 use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
     pkcs8::DecodePrivateKey,
@@ -1931,6 +1933,82 @@ fn journal_checkpoint_key(prefix: &str, sequence: u64, bytes: &[u8]) -> String {
     )
 }
 
+/// Most journal records a restore may replay after its checkpoint. A longer
+/// tail fails closed; it never falls back to an older checkpoint or genesis.
+#[cfg_attr(not(test), allow(dead_code))]
+const MAX_V71_RESTORE_TAIL_RECORDS: usize = 1000;
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn journal_migration_key(prefix: &str, source_sequence: u64, bytes: &[u8]) -> String {
+    format!(
+        "{prefix}/journal-v71/migrations/{source_sequence:020}-{}.cbor",
+        sha256(bytes)
+    )
+}
+
+/// Strict inverse of the content-addressed `{namespace}{seq:020}-{sha256}.cbor`
+/// journal keys. Returns `(sequence, content_hash)`; anything else is an error.
+#[cfg_attr(not(test), allow(dead_code))]
+fn journal_content_key_parts(key: &str, namespace: &str) -> Result<(u64, String), String> {
+    let (sequence, hash) = key
+        .strip_prefix(namespace)
+        .and_then(|name| name.strip_suffix(".cbor"))
+        .and_then(|name| name.split_once('-'))
+        .ok_or("journal content key format invalid")?;
+    if sequence.len() != 20
+        || !sequence.bytes().all(|b| b.is_ascii_digit())
+        || hash.len() != 64
+        || !hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err("journal content key format invalid".into());
+    }
+    let sequence = sequence
+        .parse::<u64>()
+        .map_err(|_| "journal content key sequence overflow")?;
+    if format!("{namespace}{sequence:020}-{hash}.cbor") != key {
+        return Err("journal content key noncanonical".into());
+    }
+    Ok((sequence, hash.to_string()))
+}
+
+/// One listed v71 checkpoint object, identified only by its key.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct JournalCheckpointCandidate {
+    sequence: u64,
+    content_hash: String,
+    key: String,
+}
+
+/// Every listed checkpoint key must be canonical and each sequence must have
+/// exactly one checkpoint. Returned in ascending sequence order.
+#[cfg_attr(not(test), allow(dead_code))]
+fn validate_journal_checkpoint_keys(
+    keys: &[String],
+    prefix: &str,
+) -> Result<Vec<JournalCheckpointCandidate>, String> {
+    let namespace = format!("{prefix}/journal-v71/checkpoints/");
+    let mut candidates = Vec::with_capacity(keys.len());
+    for key in keys {
+        let (sequence, content_hash) = journal_content_key_parts(key, &namespace)?;
+        candidates.push(JournalCheckpointCandidate {
+            sequence,
+            content_hash,
+            key: key.clone(),
+        });
+    }
+    candidates.sort_by(|a, b| a.key.cmp(&b.key));
+    if candidates
+        .windows(2)
+        .any(|pair| pair[0].sequence == pair[1].sequence)
+    {
+        return Err("journal checkpoint duplicate sequence".into());
+    }
+    Ok(candidates)
+}
+
 /// Plan section 4 step 2: the candidate must extend `head` exactly. Returns
 /// the canonical CBOR bytes to PUT. Any failure must not touch storage.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2469,6 +2547,230 @@ impl S3ImmutableArtifactStore {
         };
         *journal = JournalWriterState::Eligible(next.clone());
         Ok(next)
+    }
+    /// Create-only, content-addressed persistence of an enclave-sealed v70
+    /// migration bundle. The bundle may be production-sized, so it uses the
+    /// multipart path; the result is accepted only after an exact readback.
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn persist_v70_migration_bundle(&self, bundle: &V70MigrationBundle) -> Result<String, String> {
+        if self.journal_role != JournalRole::Writer {
+            return Err("JOURNAL_SHADOW_WRITE_UNSUPPORTED".into());
+        }
+        if bundle.manifest.protocol != V70_MIGRATION_MANIFEST_PROTOCOL
+            || bundle.manifest.epoch_id != EPOCH_ID
+        {
+            return Err("journal migration bundle header invalid".into());
+        }
+        let bytes = serde_cbor::to_vec(bundle).map_err(|_| "journal migration bundle encoding failed")?;
+        // `read` cannot return more than one frame, so a larger object could
+        // never be read back or restored; refuse it before any PUT.
+        if bytes.len() > MAX_FRAME_BYTES {
+            return Err("journal migration bundle oversized".into());
+        }
+        let key = journal_migration_key(&self.prefix, bundle.manifest.source_sequence, &bytes);
+        let readback = self.write_once_large(&key, bytes.clone()).await?;
+        if readback != bytes
+            || serde_cbor::from_slice::<V70MigrationBundle>(&readback).ok().as_ref() != Some(bundle)
+        {
+            return Err("journal migration bundle readback mismatch".into());
+        }
+        Ok(key)
+    }
+    /// Create-only, content-addressed persistence of an enclave-sealed v71
+    /// checkpoint; `write_once` performs the exact readback.
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn persist_journal_checkpoint(&self, checkpoint: &DirectV71Checkpoint) -> Result<String, String> {
+        if self.journal_role != JournalRole::Writer {
+            return Err("JOURNAL_SHADOW_WRITE_UNSUPPORTED".into());
+        }
+        if checkpoint.protocol != DIRECT_V71_CHECKPOINT_PROTOCOL || checkpoint.epoch_id != EPOCH_ID {
+            return Err("journal checkpoint header invalid".into());
+        }
+        let bytes = serde_cbor::to_vec(checkpoint).map_err(|_| "journal checkpoint encoding failed")?;
+        if bytes.len() > MAX_FRAME_BYTES {
+            return Err("journal checkpoint oversized".into());
+        }
+        let key = journal_checkpoint_key(&self.prefix, checkpoint.sequence, &bytes);
+        self.write_once(&key, bytes).await?;
+        Ok(key)
+    }
+    /// Paginated listing of `namespace` (a full key prefix ending in `/`),
+    /// optionally strictly after `start_after`, of at most `max` keys. Each
+    /// page is time-bounded. A timeout, error, key-count mismatch, empty
+    /// truncated page, missing or repeated token, foreign or out-of-range key,
+    /// duplicate, or more than `max` keys is `Err`. Sorted on success.
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn list_journal_keys(
+        &self,
+        namespace: &str,
+        start_after: Option<&str>,
+        max: usize,
+        page_timeout: Duration,
+    ) -> Result<Vec<String>, String> {
+        let mut token: Option<String> = None;
+        let mut seen_tokens = HashSet::new();
+        let mut keys = Vec::new();
+        loop {
+            let page = bounded_archive_operation(
+                page_timeout,
+                self.client
+                    .list_objects_v2()
+                    .bucket(&self.bucket)
+                    .prefix(namespace)
+                    .set_start_after(start_after.map(str::to_string))
+                    .set_continuation_token(token.clone())
+                    .send(),
+            )
+            .await?
+            .map_err(|_| "journal listing failed")?;
+            let contents = page.contents();
+            if page
+                .key_count
+                .is_some_and(|count| usize::try_from(count).ok() != Some(contents.len()))
+            {
+                return Err("journal listing ambiguous".into());
+            }
+            for object in contents {
+                let key = object.key().ok_or("journal listing key missing")?;
+                if key.len() <= namespace.len() || !key.starts_with(namespace) {
+                    return Err("journal listing key foreign".into());
+                }
+                if start_after.is_some_and(|after| key <= after) {
+                    return Err("journal listing key out of range".into());
+                }
+                keys.push(key.to_string());
+            }
+            if keys.len() > max {
+                return Err("journal listing exceeds bound".into());
+            }
+            if !page.is_truncated.unwrap_or(false) {
+                break;
+            }
+            if contents.is_empty() {
+                return Err("journal listing ambiguous".into());
+            }
+            let next = page
+                .next_continuation_token()
+                .filter(|token| !token.is_empty())
+                .ok_or("journal pagination token missing")?
+                .to_string();
+            if !seen_tokens.insert(next.clone()) {
+                return Err("journal pagination token repeated".into());
+            }
+            token = Some(next);
+        }
+        keys.sort();
+        if keys.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err("journal listing duplicate key".into());
+        }
+        Ok(keys)
+    }
+    /// All v71 checkpoint candidates, ascending, under the same finite bound
+    /// as the v70 restore listing. One malformed key fails the whole listing.
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn list_journal_checkpoint_candidates(
+        &self,
+    ) -> Result<Vec<JournalCheckpointCandidate>, String> {
+        let namespace = format!("{}/journal-v71/checkpoints/", self.prefix);
+        let keys = self
+            .list_journal_keys(&namespace, None, MAX_V70_LINEAGE_RECORDS, ARCHIVE_OPERATION_TIMEOUT)
+            .await?;
+        validate_journal_checkpoint_keys(&keys, &self.prefix)
+    }
+    /// Loads only the newest checkpoint. Its bytes must match the key's
+    /// content address and decode canonically to a checkpoint for the keyed
+    /// sequence. Any failure is final: an older checkpoint is never used.
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn load_newest_journal_checkpoint(
+        &self,
+    ) -> Result<Option<(JournalCheckpointCandidate, DirectV71Checkpoint)>, String> {
+        let Some(newest) = self.list_journal_checkpoint_candidates().await?.pop() else {
+            return Ok(None);
+        };
+        let bytes = self.read(&newest.key).await?;
+        if sha256(&bytes) != newest.content_hash {
+            return Err("journal checkpoint content address mismatch; older fallback forbidden".into());
+        }
+        let checkpoint: DirectV71Checkpoint = serde_cbor::from_slice(&bytes)
+            .map_err(|_| "journal checkpoint decode failed; older fallback forbidden")?;
+        if serde_cbor::to_vec(&checkpoint).ok().as_deref() != Some(bytes.as_slice())
+            || checkpoint.protocol != DIRECT_V71_CHECKPOINT_PROTOCOL
+            || checkpoint.epoch_id != EPOCH_ID
+            || checkpoint.sequence != newest.sequence
+        {
+            return Err("journal checkpoint invalid; older fallback forbidden".into());
+        }
+        Ok(Some((newest, checkpoint)))
+    }
+    /// Canonical record keys for exactly `after+1..=after+n`, `n` at most
+    /// `MAX_V71_RESTORE_TAIL_RECORDS`. Legacy `{seq}-{hash}` names above
+    /// `after` sort after the start key, so they are always seen and rejected.
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn list_journal_tail(&self, after: u64) -> Result<Vec<(u64, String)>, String> {
+        self.list_journal_tail_with_timeout(after, ARCHIVE_OPERATION_TIMEOUT).await
+    }
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn list_journal_tail_with_timeout(
+        &self,
+        after: u64,
+        page_timeout: Duration,
+    ) -> Result<Vec<(u64, String)>, String> {
+        let namespace = format!("{}/heads/", self.prefix);
+        let start_after = journal_record_key(&self.prefix, after);
+        let keys = self
+            .list_journal_keys(
+                &namespace,
+                Some(&start_after),
+                MAX_V71_RESTORE_TAIL_RECORDS,
+                page_timeout,
+            )
+            .await?;
+        validate_journal_tail_keys(&keys, &self.prefix, after, MAX_V71_RESTORE_TAIL_RECORDS)
+    }
+    /// Reads the bounded tail after `checkpoint` in sequence order. Each body
+    /// must decode canonically to a record at its key's sequence that links to
+    /// its predecessor's record hash, transition root, and request-index root,
+    /// starting from the checkpoint. A v70 head body above the checkpoint fails decode.
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn load_journal_tail(
+        &self,
+        checkpoint: &DirectV71Checkpoint,
+    ) -> Result<Vec<DirectJournalRecord>, String> {
+        let keys = self.list_journal_tail(checkpoint.sequence).await?;
+        let mut previous_record_hash = checkpoint.record_hash.clone();
+        let mut previous_transition_root = checkpoint.transition_root.clone();
+        let mut previous_request_index_root = checkpoint.request_index_root.clone();
+        let mut records = Vec::with_capacity(keys.len());
+        for (sequence, key) in keys {
+            let bytes = self.read(&key).await?;
+            if bytes.len() > MAX_JOURNAL_RECORD_BYTES {
+                return Err("journal tail record oversized".into());
+            }
+            let record: DirectJournalRecord = serde_cbor::from_slice(&bytes)
+                .map_err(|_| "journal tail record decode failed")?;
+            if serde_cbor::to_vec(&record).ok().as_deref() != Some(bytes.as_slice()) {
+                return Err("journal tail record noncanonical".into());
+            }
+            if record.protocol != DIRECT_JOURNAL_PROTOCOL || record.epoch_id != EPOCH_ID {
+                return Err("journal tail record header invalid".into());
+            }
+            if record.sequence != sequence {
+                return Err("journal tail record sequence mismatch".into());
+            }
+            if record.previous_record_hash != previous_record_hash
+                || record.previous_transition_root != previous_transition_root
+                || record.previous_request_index_root != previous_request_index_root
+            {
+                return Err("journal tail record predecessor mismatch".into());
+            }
+            previous_record_hash = record
+                .record_hash()
+                .map_err(|_| "journal tail record hash failed")?;
+            previous_transition_root = record.transition_root.clone();
+            previous_request_index_root = record.request_index_root.clone();
+            records.push(record);
+        }
+        Ok(records)
     }
     /// Immutable put of a large artifact as one multipart upload whose parts
     /// are sent concurrently.  The completed object is still conditional
@@ -8089,10 +8391,21 @@ mod tests {
     }
 
     fn v71_candidate() -> (DirectResult, DirectJournalRecord) {
+        let mut index = layrs_direct_execution_v1::request_index::SparseRequestTree::default();
+        v71_candidate_after(&v71_head(), &mut index, "request-42")
+    }
+
+    /// Seals the record after `head`, inserting its request into `index`, so
+    /// consecutive calls chain both request-index roots.
+    fn v71_candidate_after(
+        head: &JournalHead,
+        index: &mut layrs_direct_execution_v1::request_index::SparseRequestTree,
+        request_id: &str,
+    ) -> (DirectResult, DirectJournalRecord) {
         let mut request = DirectRequest {
             account_id: "account".into(),
             identity_commitment: "identity".into(),
-            request_id: "request-42".into(),
+            request_id: request_id.into(),
             request_hash: String::new(),
             financial_wallet_address: None,
             action: DirectAction::AdmitIdentity {
@@ -8123,10 +8436,10 @@ mod tests {
             genesis_ordinal: receipt.genesis_ordinal,
             receipt,
         };
-        let head = v71_head();
-        let proof = layrs_direct_execution_v1::request_index::SparseRequestProof::empty_tree();
-        let previous_index =
-            layrs_direct_execution_v1::request_index::empty_request_index_root();
+        let proof = index
+            .proof(&request.account_id, &request.request_id)
+            .unwrap();
+        let previous_index = index.root().unwrap();
         let leaf = layrs_direct_execution_v1::request_index::TerminalRequestLeaf {
             account_id: request.account_id.clone(),
             request_id: request.request_id.clone(),
@@ -8138,7 +8451,7 @@ mod tests {
                 sequence: head.sequence + 1,
             },
         };
-        let next_index = proof.insert(&previous_index, &leaf).unwrap();
+        let next_index = index.insert(leaf).unwrap();
         let record = DirectJournalRecord::seal(
             &head.writer_epoch,
             head.sequence + 1,
@@ -8700,5 +9013,670 @@ mod tests {
 
         server.abort();
         assert!(log.lock().await.is_empty());
+    }
+
+
+    fn v71_listing_page(keys: &[String], next_token: Option<&str>) -> Vec<u8> {
+        let objects = keys
+            .iter()
+            .map(|key| format!("<Contents><Key>{key}</Key><Size>1</Size></Contents>"))
+            .collect::<String>();
+        let truncation = match next_token {
+            Some(token) => format!(
+                "<IsTruncated>true</IsTruncated><NextContinuationToken>{token}</NextContinuationToken>"
+            ),
+            None => "<IsTruncated>false</IsTruncated>".into(),
+        };
+        v71_http(
+            200,
+            format!(
+                "<?xml version=\"1.0\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{truncation}<KeyCount>{}</KeyCount>{objects}</ListBucketResult>",
+                keys.len()
+            )
+            .as_bytes(),
+        )
+    }
+
+    fn v71_http_with_etag(etag: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 Mock\r\nETag: \"{etag}\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    /// Loopback S3 that accepts connections and never answers.
+    async fn v71_silent_s3() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                held.push(listener.accept().await.unwrap().0);
+            }
+        });
+        (endpoint, server)
+    }
+
+    fn v71_checkpoint(sequence: u64) -> DirectV71Checkpoint {
+        DirectV71Checkpoint {
+            protocol: DIRECT_V71_CHECKPOINT_PROTOCOL.into(),
+            epoch_id: EPOCH_ID.into(),
+            writer_epoch: "writer-epoch-1".into(),
+            sequence,
+            record_hash: v71_head().record_hash,
+            transition_root: v71_head().transition_root,
+            request_index_root: layrs_direct_execution_v1::request_index::empty_request_index_root(),
+            financial_state_root: "d".repeat(64),
+            nonce: vec![1; 12],
+            ciphertext: b"sealed-state".to_vec(),
+            ciphertext_hash: "e".repeat(64),
+            signature: "f".repeat(128),
+        }
+    }
+
+    fn v71_migration_bundle(migration_id: String) -> V70MigrationBundle {
+        V70MigrationBundle {
+            manifest: layrs_direct_execution_v1::migration::V70MigrationManifest {
+                protocol: V70_MIGRATION_MANIFEST_PROTOCOL.into(),
+                epoch_id: EPOCH_ID.into(),
+                migration_id,
+                source_sequence: 41,
+                source_state_hash: "a".repeat(64),
+                record_count: 0,
+                records_root: "b".repeat(64),
+                request_index_root: "c".repeat(64),
+                signature: "d".repeat(128),
+            },
+            records: Vec::new(),
+            leaves: Vec::new(),
+        }
+    }
+
+    fn v71_assert_create_only_put(head: &str, key: &str) {
+        assert!(head.starts_with(&format!("put /unit-test/{key}")), "{head}");
+        for header in [
+            "\r\nif-none-match: *\r\n",
+            "\r\nx-amz-server-side-encryption: aws:kms\r\n",
+            "\r\nx-amz-server-side-encryption-aws-kms-key-id: unit-kms-key\r\n",
+            "\r\nx-amz-object-lock-mode: compliance\r\n",
+            "\r\nx-amz-object-lock-retain-until-date: ",
+        ] {
+            assert!(head.contains(header), "{header:?} missing from {head}");
+        }
+    }
+
+    #[test]
+    fn v71_migration_and_checkpoint_content_keys_are_strict() {
+        let prefix = "epoch";
+        let hash = sha256(b"bundle");
+        let key = journal_migration_key(prefix, 41, b"bundle");
+        assert_eq!(
+            key,
+            format!("epoch/journal-v71/migrations/00000000000000000041-{hash}.cbor")
+        );
+        let migrations = "epoch/journal-v71/migrations/";
+        assert_eq!(
+            journal_content_key_parts(&key, migrations),
+            Ok((41, hash.clone()))
+        );
+        for bad in [
+            format!("{migrations}41-{hash}.cbor"),
+            format!("{migrations}00000000000000000041-{}.cbor", hash.to_uppercase()),
+            format!("{migrations}00000000000000000041-{}.cbor", &hash[1..]),
+            format!("{migrations}00000000000000000041.cbor"),
+            format!("{migrations}00000000000000000041-{hash}-x.cbor"),
+            format!("{migrations}00000000000000000041-{hash}.cbor.cbor"),
+            format!("{migrations}0000000000000000004a-{hash}.cbor"),
+            format!("{migrations}99999999999999999999-{hash}.cbor"),
+            format!("epoch/journal-v71/checkpoints/00000000000000000041-{hash}.cbor"),
+            format!("{migrations}00000000000000000041-{hash}.json"),
+        ] {
+            assert!(journal_content_key_parts(&bad, migrations).is_err(), "{bad}");
+        }
+
+        let seven = journal_checkpoint_key(prefix, 7, b"seven");
+        let forty_one = journal_checkpoint_key(prefix, 41, b"forty-one");
+        let candidates =
+            validate_journal_checkpoint_keys(&[forty_one.clone(), seven.clone()], prefix).unwrap();
+        assert_eq!(
+            candidates.iter().map(|c| c.sequence).collect::<Vec<_>>(),
+            [7, 41]
+        );
+        assert_eq!(candidates[1].key, forty_one);
+        assert_eq!(candidates[1].content_hash, sha256(b"forty-one"));
+        assert_eq!(
+            validate_journal_checkpoint_keys(
+                &[forty_one.clone(), journal_checkpoint_key(prefix, 41, b"twin")],
+                prefix
+            ),
+            Err("journal checkpoint duplicate sequence".into())
+        );
+        assert!(validate_journal_checkpoint_keys(
+            &[seven, "epoch/journal-v71/checkpoints/00000000000000000041.cbor".into()],
+            prefix
+        )
+        .is_err());
+        assert!(validate_journal_checkpoint_keys(&[journal_record_key(prefix, 41)], prefix).is_err());
+    }
+
+    #[tokio::test]
+    async fn v71_migration_bundle_persists_create_only_under_content_address_with_exact_readback() {
+        let bundle = v71_migration_bundle("migration-1".into());
+        let bytes = serde_cbor::to_vec(&bundle).unwrap();
+        let key = journal_migration_key("epoch", 41, &bytes);
+
+        let (endpoint, log, server) =
+            v71_mock_s3(vec![v71_http(200, b""), v71_http(200, &bytes)]).await;
+        let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Writer);
+        assert_eq!(store.persist_v70_migration_bundle(&bundle).await, Ok(key.clone()));
+        server.abort();
+        let log = log.lock().await;
+        assert_eq!(log.len(), 2);
+        v71_assert_create_only_put(&log[0].0, &key);
+        assert!(log[0].1.windows(bytes.len()).any(|window| window == bytes));
+        assert!(log[1].0.starts_with(&format!("get /unit-test/{key}")), "{}", log[1].0);
+        drop(log);
+
+        // An existing identical object is idempotent success.
+        let (endpoint, _, server) = v71_mock_s3(vec![
+            v71_s3_error(412, "PreconditionFailed"),
+            v71_http(200, &bytes),
+        ])
+        .await;
+        let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Writer);
+        assert_eq!(store.persist_v70_migration_bundle(&bundle).await, Ok(key.clone()));
+        server.abort();
+
+        for (responses, error) in [
+            (
+                vec![v71_s3_error(412, "PreconditionFailed"), v71_http(200, b"other")],
+                "archive immutable write failed",
+            ),
+            (
+                vec![v71_http(200, b""), v71_http(200, b"torn")],
+                "archive readback mismatch",
+            ),
+        ] {
+            let (endpoint, _, server) = v71_mock_s3(responses).await;
+            let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Writer);
+            assert_eq!(store.persist_v70_migration_bundle(&bundle).await, Err(error.into()));
+            server.abort();
+        }
+
+        // A shadow store or a foreign bundle header never reaches storage.
+        let (endpoint, log, server) = v71_mock_s3(Vec::new()).await;
+        let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Shadow);
+        assert_eq!(
+            store.persist_v70_migration_bundle(&bundle).await,
+            Err("JOURNAL_SHADOW_WRITE_UNSUPPORTED".into())
+        );
+        let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Writer);
+        let mut foreign = bundle.clone();
+        foreign.manifest.epoch_id = "other-epoch".into();
+        assert_eq!(
+            store.persist_v70_migration_bundle(&foreign).await,
+            Err("journal migration bundle header invalid".into())
+        );
+        let mut foreign = bundle;
+        foreign.manifest.protocol = "other-protocol".into();
+        assert!(store.persist_v70_migration_bundle(&foreign).await.is_err());
+        server.abort();
+        assert!(log.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v71_production_sized_migration_bundle_uses_multipart_create_only_with_exact_readback() {
+        let bundle = v71_migration_bundle("m".repeat(17 * 1024 * 1024));
+        let bytes = serde_cbor::to_vec(&bundle).unwrap();
+        assert!(bytes.len() > 16 * 1024 * 1024);
+        let key = journal_migration_key("epoch", 41, &bytes);
+        let (endpoint, log, server) = v71_mock_s3(vec![
+            v71_http(
+                200,
+                format!(
+                    "<?xml version=\"1.0\"?><InitiateMultipartUploadResult><Bucket>unit-test</Bucket><Key>{key}</Key><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>"
+                )
+                .as_bytes(),
+            ),
+            v71_http_with_etag("part-a"),
+            v71_http_with_etag("part-b"),
+            v71_http(
+                200,
+                format!(
+                    "<?xml version=\"1.0\"?><CompleteMultipartUploadResult><Bucket>unit-test</Bucket><Key>{key}</Key><ETag>\"whole\"</ETag></CompleteMultipartUploadResult>"
+                )
+                .as_bytes(),
+            ),
+            v71_http(200, &bytes),
+        ])
+        .await;
+        let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Writer);
+        assert_eq!(store.persist_v70_migration_bundle(&bundle).await, Ok(key.clone()));
+        server.abort();
+        let log = log.lock().await;
+        assert_eq!(log.len(), 5);
+        let create = &log[0].0;
+        assert!(create.starts_with(&format!("post /unit-test/{key}?uploads")), "{create}");
+        for header in [
+            "\r\nx-amz-server-side-encryption: aws:kms\r\n",
+            "\r\nx-amz-object-lock-mode: compliance\r\n",
+        ] {
+            assert!(create.contains(header), "{header:?} missing from {create}");
+        }
+        for (part, _) in &log[1..3] {
+            assert!(part.starts_with(&format!("put /unit-test/{key}?")), "{part}");
+            assert!(part.contains("uploadid=upload-1"), "{part}");
+        }
+        let complete = &log[3].0;
+        assert!(complete.starts_with(&format!("post /unit-test/{key}?")), "{complete}");
+        assert!(complete.contains("\r\nif-none-match: *\r\n"), "{complete}");
+        assert!(log[4].0.starts_with(&format!("get /unit-test/{key}")), "{}", log[4].0);
+    }
+
+    #[tokio::test]
+    async fn v71_checkpoint_persists_create_only_under_journal_checkpoint_key() {
+        let checkpoint = v71_checkpoint(41);
+        let bytes = serde_cbor::to_vec(&checkpoint).unwrap();
+        let key = journal_checkpoint_key("epoch", 41, &bytes);
+
+        let (endpoint, log, server) =
+            v71_mock_s3(vec![v71_http(200, b""), v71_http(200, &bytes)]).await;
+        let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Writer);
+        assert_eq!(store.persist_journal_checkpoint(&checkpoint).await, Ok(key.clone()));
+        server.abort();
+        let log = log.lock().await;
+        assert_eq!(log.len(), 2);
+        v71_assert_create_only_put(&log[0].0, &key);
+        assert!(log[1].0.starts_with(&format!("get /unit-test/{key}")), "{}", log[1].0);
+        drop(log);
+
+        let (endpoint, _, server) = v71_mock_s3(vec![
+            v71_s3_error(412, "PreconditionFailed"),
+            v71_http(200, b"other"),
+        ])
+        .await;
+        let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Writer);
+        assert_eq!(
+            store.persist_journal_checkpoint(&checkpoint).await,
+            Err("archive immutable write failed".into())
+        );
+        server.abort();
+
+        let (endpoint, log, server) = v71_mock_s3(Vec::new()).await;
+        let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Shadow);
+        assert_eq!(
+            store.persist_journal_checkpoint(&checkpoint).await,
+            Err("JOURNAL_SHADOW_WRITE_UNSUPPORTED".into())
+        );
+        let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Writer);
+        for mutate in [
+            (|c: &mut DirectV71Checkpoint| c.protocol = "other".into()) as fn(&mut DirectV71Checkpoint),
+            |c| c.epoch_id = "other-epoch".into(),
+        ] {
+            let mut foreign = checkpoint.clone();
+            mutate(&mut foreign);
+            assert_eq!(
+                store.persist_journal_checkpoint(&foreign).await,
+                Err("journal checkpoint header invalid".into())
+            );
+        }
+        server.abort();
+        assert!(log.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v71_checkpoint_listing_paginates_and_loads_only_the_newest_verified_checkpoint() {
+        let older = serde_cbor::to_vec(&v71_checkpoint(7)).unwrap();
+        let newest = serde_cbor::to_vec(&v71_checkpoint(41)).unwrap();
+        let older_key = journal_checkpoint_key("epoch", 7, &older);
+        let newest_key = journal_checkpoint_key("epoch", 41, &newest);
+        let (endpoint, log, server) = v71_mock_s3(vec![
+            v71_listing_page(&[older_key], Some("page-2")),
+            v71_listing_page(&[newest_key.clone()], None),
+            v71_http(200, &newest),
+        ])
+        .await;
+        let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Shadow);
+        let (candidate, checkpoint) = store.load_newest_journal_checkpoint().await.unwrap().unwrap();
+        assert_eq!(
+            candidate,
+            JournalCheckpointCandidate {
+                sequence: 41,
+                content_hash: sha256(&newest),
+                key: newest_key.clone(),
+            }
+        );
+        assert_eq!(checkpoint, v71_checkpoint(41));
+        server.abort();
+        let log = log.lock().await;
+        assert_eq!(log.len(), 3);
+        assert!(log[0].0.contains("prefix=epoch%2fjournal-v71%2fcheckpoints%2f"), "{}", log[0].0);
+        assert!(!log[0].0.contains("continuation-token="), "{}", log[0].0);
+        assert!(log[1].0.contains("continuation-token=page-2"), "{}", log[1].0);
+        assert!(log[2].0.starts_with(&format!("get /unit-test/{newest_key}")), "{}", log[2].0);
+        drop(log);
+
+        let (endpoint, _, server) = v71_mock_s3(vec![v71_listing_page(&[], None)]).await;
+        let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Writer);
+        assert_eq!(store.load_newest_journal_checkpoint().await, Ok(None));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn v71_checkpoint_listing_fails_closed_on_malformed_duplicate_or_ambiguous_pages() {
+        let seven = journal_checkpoint_key("epoch", 7, b"seven");
+        let forty_one = journal_checkpoint_key("epoch", 41, b"forty-one");
+        let miscounted = v71_http(
+            200,
+            format!(
+                "<?xml version=\"1.0\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><IsTruncated>false</IsTruncated><KeyCount>2</KeyCount><Contents><Key>{seven}</Key><Size>1</Size></Contents></ListBucketResult>"
+            )
+            .as_bytes(),
+        );
+        let cases = vec![
+            (
+                vec![v71_listing_page(
+                    &["epoch/journal-v71/checkpoints/00000000000000000041.cbor".into()],
+                    None,
+                )],
+                "journal content key format invalid",
+            ),
+            (
+                vec![v71_listing_page(
+                    &[forty_one.clone(), journal_checkpoint_key("epoch", 41, b"twin")],
+                    None,
+                )],
+                "journal checkpoint duplicate sequence",
+            ),
+            (
+                vec![
+                    v71_listing_page(&[seven.clone()], Some("t1")),
+                    v71_listing_page(&[forty_one.clone()], Some("t1")),
+                ],
+                "journal pagination token repeated",
+            ),
+            (
+                vec![v71_listing_page(&[seven.clone()], Some(""))],
+                "journal pagination token missing",
+            ),
+            (
+                vec![
+                    v71_listing_page(&[seven.clone()], Some("t1")),
+                    v71_listing_page(&[seven.clone()], None),
+                ],
+                "journal listing duplicate key",
+            ),
+            (
+                vec![v71_listing_page(&[], Some("t1"))],
+                "journal listing ambiguous",
+            ),
+            (vec![miscounted], "journal listing ambiguous"),
+            (
+                vec![v71_listing_page(&["epoch/checkpoints/x.cbor".into()], None)],
+                "journal listing key foreign",
+            ),
+            (vec![v71_s3_error(403, "AccessDenied")], "journal listing failed"),
+        ];
+        for (responses, error) in cases {
+            let pages = responses.len();
+            let (endpoint, log, server) = v71_mock_s3(responses).await;
+            let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Writer);
+            assert_eq!(
+                store.load_newest_journal_checkpoint().await,
+                Err(error.into()),
+                "{error}"
+            );
+            server.abort();
+            // Never a read of any checkpoint once the listing is rejected.
+            assert_eq!(log.lock().await.len(), pages, "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn v71_newest_checkpoint_corruption_fails_closed_without_older_fallback() {
+        let older = serde_cbor::to_vec(&v71_checkpoint(7)).unwrap();
+        let older_key = journal_checkpoint_key("epoch", 7, &older);
+        let mut wrong_protocol = v71_checkpoint(41);
+        wrong_protocol.protocol = "other".into();
+        let wrong_protocol = serde_cbor::to_vec(&wrong_protocol).unwrap();
+        let wrong_sequence = serde_cbor::to_vec(&v71_checkpoint(40)).unwrap();
+        let newest = serde_cbor::to_vec(&v71_checkpoint(41)).unwrap();
+        let cases: Vec<(String, Vec<u8>, &str)> = vec![
+            (
+                journal_checkpoint_key("epoch", 41, &newest),
+                older.clone(),
+                "journal checkpoint content address mismatch; older fallback forbidden",
+            ),
+            (
+                journal_checkpoint_key("epoch", 41, b"not-cbor"),
+                b"not-cbor".to_vec(),
+                "journal checkpoint decode failed; older fallback forbidden",
+            ),
+            (
+                journal_checkpoint_key("epoch", 41, &wrong_sequence),
+                wrong_sequence,
+                "journal checkpoint invalid; older fallback forbidden",
+            ),
+            (
+                journal_checkpoint_key("epoch", 41, &wrong_protocol),
+                wrong_protocol,
+                "journal checkpoint invalid; older fallback forbidden",
+            ),
+        ];
+        for (newest_key, body, error) in cases {
+            let (endpoint, log, server) = v71_mock_s3(vec![
+                v71_listing_page(&[older_key.clone(), newest_key.clone()], None),
+                v71_http(200, &body),
+            ])
+            .await;
+            let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Writer);
+            assert_eq!(store.load_newest_journal_checkpoint().await, Err(error.into()));
+            server.abort();
+            let log = log.lock().await;
+            assert_eq!(log.len(), 2, "{error}");
+            assert!(log[1].0.starts_with(&format!("get /unit-test/{newest_key}")), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn v71_tail_listing_starts_after_checkpoint_and_enforces_restore_bound() {
+        assert_eq!(MAX_V71_RESTORE_TAIL_RECORDS, 1000);
+        let keys = |range: std::ops::RangeInclusive<u64>| -> Vec<String> {
+            range.map(|sequence| journal_record_key("epoch", sequence)).collect()
+        };
+        let (endpoint, log, server) = v71_mock_s3(vec![v71_listing_page(&keys(42..=43), None)]).await;
+        let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Writer);
+        assert_eq!(
+            store.list_journal_tail(41).await,
+            Ok(keys(42..=43).into_iter().zip(42..).map(|(k, s)| (s, k)).collect())
+        );
+        server.abort();
+        let list = log.lock().await[0].0.clone();
+        for query in [
+            "list-type=2",
+            "prefix=epoch%2fheads%2f",
+            "start-after=epoch%2fheads%2f00000000000000000041.cbor",
+        ] {
+            assert!(list.contains(query), "{query} missing from {list}");
+        }
+
+        // Exactly the bound across pages is accepted.
+        let (endpoint, _, server) = v71_mock_s3(vec![
+            v71_listing_page(&keys(42..=641), Some("t1")),
+            v71_listing_page(&keys(642..=1041), None),
+        ])
+        .await;
+        let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Writer);
+        assert_eq!(store.list_journal_tail(41).await.unwrap().len(), 1000);
+        server.abort();
+
+        // One record over the bound fails closed.
+        let (endpoint, _, server) = v71_mock_s3(vec![
+            v71_listing_page(&keys(42..=1041), Some("t1")),
+            v71_listing_page(&keys(1042..=1042), None),
+        ])
+        .await;
+        let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Writer);
+        assert_eq!(
+            store.list_journal_tail(41).await,
+            Err("journal listing exceeds bound".into())
+        );
+        server.abort();
+
+        let (endpoint, _, server) = v71_mock_s3(vec![v71_listing_page(&[], None)]).await;
+        let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Writer);
+        assert_eq!(store.list_journal_tail(41).await, Ok(Vec::new()));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn v71_tail_listing_fails_closed_on_gap_duplicate_legacy_foreign_range_and_timeout() {
+        let record = |sequence| journal_record_key("epoch", sequence);
+        let legacy = format!("epoch/heads/00000000000000000043-{}.cbor", "a".repeat(64));
+        let cases = vec![
+            (vec![v71_listing_page(&[record(42), record(44)], None)], "journal tail sequence gap"),
+            (vec![v71_listing_page(&[record(43)], None)], "journal tail sequence gap"),
+            (
+                vec![v71_listing_page(&[record(42), legacy], None)],
+                "journal record key legacy suffix",
+            ),
+            (
+                vec![v71_listing_page(&[record(41)], None)],
+                "journal listing key out of range",
+            ),
+            (
+                vec![
+                    v71_listing_page(&[record(42)], Some("t1")),
+                    v71_listing_page(&[record(42)], None),
+                ],
+                "journal listing duplicate key",
+            ),
+            (
+                vec![v71_listing_page(&["epoch/artifacts/x.cbor".into()], None)],
+                "journal listing key foreign",
+            ),
+            (
+                vec![v71_listing_page(&["epoch/heads/zzz.cbor".into()], None)],
+                "archive key format invalid",
+            ),
+        ];
+        for (responses, error) in cases {
+            let (endpoint, _, server) = v71_mock_s3(responses).await;
+            let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Writer);
+            assert_eq!(store.list_journal_tail(41).await, Err(error.into()), "{error}");
+            server.abort();
+        }
+
+        let (endpoint, server) = v71_silent_s3().await;
+        let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Writer);
+        assert_eq!(
+            store
+                .list_journal_tail_with_timeout(41, Duration::from_millis(200))
+                .await,
+            Err("ARCHIVE_TIMEOUT".into())
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn v71_tail_loading_chains_records_from_checkpoint_and_rejects_tampering() {
+        let mut index = layrs_direct_execution_v1::request_index::SparseRequestTree::default();
+        let (_, first) = v71_candidate_after(&v71_head(), &mut index, "request-42");
+        let (_, second) = v71_candidate_after(&v71_next_head(&first), &mut index, "request-43");
+        assert_eq!(second.previous_request_index_root, first.request_index_root);
+        let first_bytes = serde_cbor::to_vec(&first).unwrap();
+        let second_bytes = serde_cbor::to_vec(&second).unwrap();
+        let listing = || {
+            v71_listing_page(
+                &[journal_record_key("epoch", 42), journal_record_key("epoch", 43)],
+                None,
+            )
+        };
+        let checkpoint = v71_checkpoint(41);
+
+        let (endpoint, log, server) = v71_mock_s3(vec![
+            listing(),
+            v71_http(200, &first_bytes),
+            v71_http(200, &second_bytes),
+        ])
+        .await;
+        let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Writer);
+        assert_eq!(
+            store.load_journal_tail(&checkpoint).await,
+            Ok(vec![first.clone(), second.clone()])
+        );
+        server.abort();
+        let log = log.lock().await;
+        assert!(log[1].0.starts_with("get /unit-test/epoch/heads/00000000000000000042.cbor"));
+        assert!(log[2].0.starts_with("get /unit-test/epoch/heads/00000000000000000043.cbor"));
+        drop(log);
+
+        // The checkpoint anchor must match the first record on every chained
+        // field, including the request-index root.
+        for (mutate, field) in [
+            (
+                (|c: &mut DirectV71Checkpoint| c.record_hash = "9".repeat(64))
+                    as fn(&mut DirectV71Checkpoint),
+                "record hash",
+            ),
+            (|c| c.transition_root = "9".repeat(64), "transition root"),
+            (|c| c.request_index_root = "9".repeat(64), "request-index root"),
+        ] {
+            let mut anchor = checkpoint.clone();
+            mutate(&mut anchor);
+            let (endpoint, _, server) = v71_mock_s3(vec![
+                listing(),
+                v71_http(200, &first_bytes),
+                v71_http(200, &second_bytes),
+            ])
+            .await;
+            let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Writer);
+            assert_eq!(
+                store.load_journal_tail(&anchor).await,
+                Err("journal tail record predecessor mismatch".into()),
+                "{field}"
+            );
+            server.abort();
+        }
+
+        // A second record whose request-index predecessor is not the first
+        // record's request-index root breaks the chain even if every other
+        // link holds. Its bytes are served verbatim, as tampered storage would.
+        let mut forked = second.clone();
+        forked.previous_request_index_root =
+            layrs_direct_execution_v1::request_index::empty_request_index_root();
+        assert_ne!(forked.previous_request_index_root, first.request_index_root);
+        let mut forked_hash_link = second.clone();
+        forked_hash_link.previous_record_hash = "9".repeat(64);
+        let v70_head_body = "a".repeat(64).into_bytes();
+        let cases: Vec<(Vec<u8>, Vec<u8>, &str)> = vec![
+            (
+                first_bytes.clone(),
+                serde_cbor::to_vec(&forked).unwrap(),
+                "journal tail record predecessor mismatch",
+            ),
+            (
+                first_bytes.clone(),
+                serde_cbor::to_vec(&forked_hash_link).unwrap(),
+                "journal tail record predecessor mismatch",
+            ),
+            (
+                second_bytes.clone(),
+                first_bytes.clone(),
+                "journal tail record sequence mismatch",
+            ),
+            (
+                v70_head_body,
+                second_bytes.clone(),
+                "journal tail record decode failed",
+            ),
+        ];
+        for (at_42, at_43, error) in cases {
+            let (endpoint, _, server) =
+                v71_mock_s3(vec![listing(), v71_http(200, &at_42), v71_http(200, &at_43)]).await;
+            let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Writer);
+            assert_eq!(store.load_journal_tail(&checkpoint).await, Err(error.into()), "{error}");
+            server.abort();
+        }
     }
 }
