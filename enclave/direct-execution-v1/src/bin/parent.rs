@@ -47,13 +47,16 @@ use layrs_direct_execution_v1::journal::{
     canonical_receipt_hash, canonical_result_hash, DirectJournalRecord, JournalDurabilityAck,
     DIRECT_JOURNAL_PROTOCOL,
 };
-use layrs_direct_execution_v1::migration::{V70MigrationBundle, V70_MIGRATION_MANIFEST_PROTOCOL};
+use layrs_direct_execution_v1::migration::{
+    MigratedTerminalRecord, V70MigrationBundle, V70_MIGRATION_MANIFEST_PROTOCOL,
+};
 use layrs_direct_execution_v1::request_index::{TerminalRequestLeaf, TerminalResultLocator};
 use layrs_direct_execution_v1::receipt_snapshot::DirectReceiptSnapshot;
 use layrs_direct_execution_v1::request_index_snapshot::{
     DirectRequestIndexSnapshot, DirectRequestIndexState,
 };
 use layrs_direct_execution_v1::v71_checkpoint::{DirectV71Checkpoint, DIRECT_V71_CHECKPOINT_PROTOCOL};
+use layrs_direct_execution_v1::v71::ArchivedTerminalRecord;
 use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
     pkcs8::DecodePrivateKey,
@@ -174,6 +177,7 @@ struct AppState {
     journal_request_index: Arc<Mutex<Option<DirectRequestIndexState>>>,
     journal_receipts:
         Arc<Mutex<Option<BTreeMap<(String, String), (u64, DirectReceipt)>>>>,
+    journal_migration: Arc<Mutex<Option<V70MigrationBundle>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -297,6 +301,7 @@ struct PreparedJournalRestore {
     tail: Vec<DirectJournalRecord>,
     index_snapshot: DirectRequestIndexSnapshot,
     receipt_snapshot: DirectReceiptSnapshot,
+    migration: Option<V70MigrationBundle>,
 }
 
 const CHECKPOINT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
@@ -2694,6 +2699,59 @@ impl S3ImmutableArtifactStore {
         }
         Ok(key)
     }
+    /// Restores the single immutable migration bundle that anchors all
+    /// migrated terminal-result locators. Multiple objects are ambiguous and
+    /// therefore fail closed rather than selecting by listing order.
+    async fn load_v70_migration_bundle(&self) -> Result<Option<V70MigrationBundle>, String> {
+        let namespace = format!("{}/journal-v71/migrations/", self.prefix);
+        let keys = self
+            .list_journal_keys(&namespace, None, 2, ARCHIVE_OPERATION_TIMEOUT)
+            .await?;
+        let Some(key) = keys.first() else {
+            return Ok(None);
+        };
+        if keys.len() != 1 {
+            return Err("journal migration bundle ambiguous".into());
+        }
+        let (source_sequence, content_hash) = journal_content_key_parts(key, &namespace)?;
+        let bytes = self.read(key).await?;
+        if bytes.len() > MAX_FRAME_BYTES || sha256(&bytes) != content_hash {
+            return Err("journal migration bundle content address mismatch".into());
+        }
+        let bundle: V70MigrationBundle = serde_cbor::from_slice(&bytes)
+            .map_err(|_| "journal migration bundle decode failed")?;
+        if serde_cbor::to_vec(&bundle).ok().as_deref() != Some(bytes.as_slice())
+            || bundle.manifest.protocol != V70_MIGRATION_MANIFEST_PROTOCOL
+            || bundle.manifest.epoch_id != EPOCH_ID
+            || bundle.manifest.source_sequence != source_sequence
+        {
+            return Err("journal migration bundle invalid".into());
+        }
+        Ok(Some(bundle))
+    }
+
+    /// Loads exactly the record named by a terminal journal locator. The
+    /// enclave subsequently verifies its signature and encrypted result.
+    async fn load_journal_record(&self, sequence: u64) -> Result<DirectJournalRecord, String> {
+        if sequence == 0 {
+            return Err("journal replay record sequence invalid".into());
+        }
+        let key = journal_record_key(&self.prefix, sequence);
+        let bytes = self.read(&key).await?;
+        if bytes.len() > MAX_JOURNAL_RECORD_BYTES {
+            return Err("journal replay record oversized".into());
+        }
+        let record: DirectJournalRecord = serde_cbor::from_slice(&bytes)
+            .map_err(|_| "journal replay record decode failed")?;
+        if serde_cbor::to_vec(&record).ok().as_deref() != Some(bytes.as_slice())
+            || record.protocol != DIRECT_JOURNAL_PROTOCOL
+            || record.epoch_id != EPOCH_ID
+            || record.sequence != sequence
+        {
+            return Err("journal replay record invalid".into());
+        }
+        Ok(record)
+    }
     /// Create-only, content-addressed persistence of an enclave-sealed v71
     /// checkpoint; `write_once` performs the exact readback.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -2999,11 +3057,27 @@ impl S3ImmutableArtifactStore {
         receipt_snapshot
             .verify(&index_snapshot)
             .map_err(|_| "journal receipt snapshot invalid")?;
+        let has_migrated_results = index_snapshot.leaves.iter().any(|leaf| {
+            matches!(leaf.locator, TerminalResultLocator::Migration { .. })
+        });
+        let migration = if has_migrated_results {
+            let bundle = self
+                .load_v70_migration_bundle()
+                .await?
+                .ok_or("journal migration bundle missing")?;
+            if !migration_matches_restored_index(&bundle, &index_snapshot) {
+                return Err("journal migration bundle does not match request index".into());
+            }
+            Some(bundle)
+        } else {
+            None
+        };
         *self.prepared_journal_restore.lock().await = Some(PreparedJournalRestore {
             checkpoint,
             tail,
             index_snapshot,
             receipt_snapshot,
+            migration,
         });
         Ok(true)
     }
@@ -3019,6 +3093,7 @@ impl S3ImmutableArtifactStore {
             tail,
             index_snapshot,
             receipt_snapshot,
+            migration,
         } = prepared;
         let mut index = DirectRequestIndexState::from_snapshot(
             index_snapshot.clone(),
@@ -3176,6 +3251,7 @@ impl S3ImmutableArtifactStore {
         self.establish_journal_head(head.clone()).await?;
         *state.journal_request_index.lock().await = Some(index);
         *state.journal_receipts.lock().await = Some(receipts);
+        *state.journal_migration.lock().await = migration;
         *state.committed_state_root.lock().await = Some(head.transition_root);
         eprintln!("VERIFIED_JOURNAL_RESTORE_COMPLETE {}", head.sequence);
         Ok(())
@@ -3976,6 +4052,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         persistence_format,
         journal_request_index: Arc::new(Mutex::new(None)),
         journal_receipts: Arc::new(Mutex::new(None)),
+        journal_migration: Arc::new(Mutex::new(None)),
     };
     // A Nitro EIF does not inherit the parent's systemd environment.  The
     // isolated test key material therefore crosses the existing VSOCK channel
@@ -6145,6 +6222,7 @@ async fn activate_v71_from_restored_v70(state: &AppState) -> io::Result<()> {
         .map_err(|error| invalid(format!("V71_WRITER_HEAD_FAILED:{error}")))?;
     *state.journal_request_index.lock().await = Some(index);
     *state.journal_receipts.lock().await = Some(receipts);
+    *state.journal_migration.lock().await = Some(bundle);
     *state.committed_state_root.lock().await = Some(transition_root);
     eprintln!("V71_MIGRATION_CUTOVER_READY sequence={sequence}");
     Ok(())
@@ -7301,6 +7379,73 @@ fn terminal_leaf_matches_record(
             })
 }
 
+fn terminal_leaf_matches_migrated_record(
+    leaf: &TerminalRequestLeaf,
+    record: &MigratedTerminalRecord,
+) -> bool {
+    leaf.account_id == record.account_id
+        && leaf.request_id == record.request_id
+        && leaf.request_hash == record.request_hash
+        && leaf.result_hash == record.result_hash
+        && leaf.receipt_hash == record.receipt_hash
+        && leaf.locator
+            == (TerminalResultLocator::Migration {
+                migration_id: record.migration_id.clone(),
+                ordinal: record.ordinal,
+            })
+}
+
+fn terminal_result_matches_leaf(result: &DirectResult, leaf: &TerminalRequestLeaf) -> bool {
+    canonical_result_hash(result).is_ok_and(|hash| hash == leaf.result_hash)
+        && canonical_receipt_hash(result).is_ok_and(|hash| hash == leaf.receipt_hash)
+        && result.receipt.account_id == leaf.account_id
+        && result.receipt.request_id == leaf.request_id
+        && result.receipt.request_hash == leaf.request_hash
+}
+
+async fn archived_terminal_for_leaf(
+    state: &AppState,
+    store: &S3ImmutableArtifactStore,
+    leaf: &TerminalRequestLeaf,
+) -> Result<ArchivedTerminalRecord, String> {
+    match &leaf.locator {
+        TerminalResultLocator::Migration {
+            migration_id,
+            ordinal,
+        } => {
+            let migration = state.journal_migration.lock().await;
+            let bundle = migration
+                .as_ref()
+                .ok_or("journal migration bundle unrestored")?;
+            if bundle.manifest.migration_id != *migration_id {
+                return Err("journal migration locator mismatch".into());
+            }
+            let index = ordinal
+                .checked_sub(1)
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or("journal migration ordinal invalid")?;
+            let record = bundle
+                .records
+                .get(index)
+                .filter(|record| terminal_leaf_matches_migrated_record(leaf, record))
+                .ok_or("journal migration record mismatch")?
+                .clone();
+            Ok(ArchivedTerminalRecord::Migration { record })
+        }
+        TerminalResultLocator::Journal {
+            writer_epoch,
+            sequence,
+        } => {
+            let record = store.load_journal_record(*sequence).await?;
+            if record.writer_epoch != *writer_epoch || !terminal_leaf_matches_record(leaf, &record)
+            {
+                return Err("journal replay record locator mismatch".into());
+            }
+            Ok(ArchivedTerminalRecord::Journal { record })
+        }
+    }
+}
+
 type JournalReceiptCache = BTreeMap<(String, String), (u64, DirectReceipt)>;
 
 fn migration_parent_state(
@@ -7360,6 +7505,42 @@ fn migration_parent_state(
     Ok((index, receipts, index_snapshot, receipt_snapshot))
 }
 
+fn migration_matches_restored_index(
+    bundle: &V70MigrationBundle,
+    index: &DirectRequestIndexSnapshot,
+) -> bool {
+    if bundle.manifest.source_sequence == 0
+        || bundle.manifest.source_sequence > index.sequence
+        || bundle.manifest.record_count != bundle.records.len() as u64
+        || bundle.leaves.len() != bundle.records.len()
+        || DirectRequestIndexSnapshot::from_leaves(
+            bundle.manifest.source_sequence,
+            &bundle.manifest.request_index_root,
+            bundle.leaves.clone(),
+        )
+        .is_err()
+    {
+        return false;
+    }
+    let migrated = index
+        .leaves
+        .iter()
+        .filter(|leaf| matches!(leaf.locator, TerminalResultLocator::Migration { .. }))
+        .collect::<Vec<_>>();
+    migrated.len() == bundle.leaves.len()
+        && migrated
+            .iter()
+            .zip(&bundle.leaves)
+            .all(|(indexed, bundled)| {
+                *indexed == bundled
+                    && matches!(
+                        &indexed.locator,
+                        TerminalResultLocator::Migration { migration_id, .. }
+                            if migration_id == &bundle.manifest.migration_id
+                    )
+            })
+}
+
 /// v71 preserves the same two-phase enclave adoption rule as v70 while the
 /// durable object is only the bounded encrypted successor record. The caller
 /// holds the financial gate, so the proof cache and durable head advance in
@@ -7394,13 +7575,18 @@ async fn exchange_direct_v71(
         previous_request_index_root = index
             .root()
             .map_err(|_| invalid("JOURNAL_REQUEST_INDEX_INVALID"))?;
-        let proof = index
+        index
             .proof(&request.account_id, &request.request_id)
-            .map_err(|_| invalid("JOURNAL_REQUEST_PROOF_FAILED"))?;
-        if proof.leaf.is_some() {
-            return Err(invalid("JOURNAL_REPLAY_ARCHIVE_REQUIRED"));
-        }
-        proof
+            .map_err(|_| invalid("JOURNAL_REQUEST_PROOF_FAILED"))?
+    };
+    let replay_leaf = request_proof.leaf.clone();
+    let archived = match replay_leaf.as_ref() {
+        Some(leaf) => Some(
+            archived_terminal_for_leaf(state, store, leaf)
+                .await
+                .map_err(invalid)?,
+        ),
+        None => None,
     };
     if state.journal_receipts.lock().await.is_none() {
         return Err(invalid("JOURNAL_RECEIPTS_UNRESTORED"));
@@ -7415,7 +7601,7 @@ async fn exchange_direct_v71(
             &serde_cbor::to_vec(&RuntimeRequest::ExecuteJournal {
                 request,
                 request_proof,
-                archived: None,
+                archived,
             })
             .map_err(invalid)?,
         )
@@ -7426,6 +7612,15 @@ async fn exchange_direct_v71(
     })
     .await?;
     eprintln!("FINANCIAL_AWAIT_END stage=enclave_journal_candidate");
+    if let Some(leaf) = replay_leaf {
+        return match first {
+            RuntimeResponse::Execute { result } if terminal_result_matches_leaf(&result, &leaf) => {
+                Ok(RuntimeResponse::Execute { result })
+            }
+            RuntimeResponse::Error { code } => Ok(RuntimeResponse::Error { code }),
+            _ => Err(invalid("JOURNAL_REPLAY_TERMINAL_INVALID")),
+        };
+    }
     let (record, terminal_leaf) = match first {
         RuntimeResponse::JournalCandidate {
             record,
@@ -7703,6 +7898,7 @@ mod tests {
             persistence_format: PersistenceFormat::V70,
             journal_request_index: Arc::new(Mutex::new(None)),
             journal_receipts: Arc::new(Mutex::new(None)),
+            journal_migration: Arc::new(Mutex::new(None)),
         };
         assert_eq!(store.seal_current_checkpoint(&state).await.unwrap_err(), "checkpoint head mismatch");
         // restore_streamed's final step: the same failure is only diagnosed.
@@ -8759,6 +8955,7 @@ mod tests {
             persistence_format: PersistenceFormat::V70,
             journal_request_index: Arc::new(Mutex::new(None)),
             journal_receipts: Arc::new(Mutex::new(None)),
+            journal_migration: Arc::new(Mutex::new(None)),
         };
         assert!(authenticated(&headers, &state).is_ok());
 
@@ -9593,6 +9790,19 @@ mod tests {
         assert_eq!(index.len(), 1);
         assert_eq!(receipts.len(), 1);
         assert!(receipt_snapshot.verify(&index_snapshot).is_ok());
+        assert!(migration_matches_restored_index(&bundle, &index_snapshot));
+
+        let record = &bundle.records[0];
+        assert!(terminal_leaf_matches_migrated_record(
+            &bundle.leaves[0],
+            record
+        ));
+        let mut changed_leaf = bundle.leaves[0].clone();
+        changed_leaf.result_hash = "e".repeat(64);
+        assert!(!terminal_leaf_matches_migrated_record(
+            &changed_leaf,
+            record
+        ));
 
         let mut changed = artifact;
         changed.receipt.effect = "TAMPERED".into();
@@ -10149,6 +10359,68 @@ mod tests {
         assert!(store.persist_v70_migration_bundle(&foreign).await.is_err());
         server.abort();
         assert!(log.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v71_migration_bundle_load_requires_one_canonical_content_address() {
+        let bundle = v71_migration_bundle("migration-1".into());
+        let bytes = serde_cbor::to_vec(&bundle).unwrap();
+        let key = journal_migration_key("epoch", 41, &bytes);
+        let (endpoint, log, server) = v71_mock_s3(vec![
+            v71_listing_page(&[key.clone()], None),
+            v71_http(200, &bytes),
+        ])
+        .await;
+        let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Shadow);
+        assert_eq!(store.load_v70_migration_bundle().await, Ok(Some(bundle.clone())));
+        server.abort();
+        assert_eq!(log.lock().await.len(), 2);
+
+        let twin = journal_migration_key("epoch", 42, b"twin");
+        let (endpoint, log, server) = v71_mock_s3(vec![v71_listing_page(
+            &[key.clone(), twin],
+            None,
+        )])
+        .await;
+        let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Shadow);
+        assert_eq!(
+            store.load_v70_migration_bundle().await,
+            Err("journal migration bundle ambiguous".into())
+        );
+        server.abort();
+        assert_eq!(log.lock().await.len(), 1);
+
+        let (endpoint, _, server) = v71_mock_s3(vec![
+            v71_listing_page(&[key], None),
+            v71_http(200, b"corrupt"),
+        ])
+        .await;
+        let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Shadow);
+        assert_eq!(
+            store.load_v70_migration_bundle().await,
+            Err("journal migration bundle content address mismatch".into())
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn v71_replay_record_load_is_exact_and_canonical() {
+        let (_, record) = v71_candidate();
+        let bytes = serde_cbor::to_vec(&record).unwrap();
+        let key = journal_record_key("epoch", record.sequence);
+        let (endpoint, log, server) = v71_mock_s3(vec![v71_http(200, &bytes)]).await;
+        let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Shadow);
+        assert_eq!(store.load_journal_record(record.sequence).await, Ok(record.clone()));
+        server.abort();
+        assert!(log.lock().await[0].0.starts_with(&format!("get /unit-test/{key}")));
+
+        let (endpoint, _, server) = v71_mock_s3(vec![v71_http(200, &bytes)]).await;
+        let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Shadow);
+        assert_eq!(
+            store.load_journal_record(record.sequence + 1).await,
+            Err("journal replay record invalid".into())
+        );
+        server.abort();
     }
 
     #[tokio::test]
