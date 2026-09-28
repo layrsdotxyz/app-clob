@@ -33,6 +33,7 @@ use uuid::Uuid;
 pub mod direct_frame;
 mod external_effect;
 pub mod journal;
+pub mod migration;
 mod quest_receipts;
 pub mod request_index;
 pub mod v71;

@@ -391,8 +391,8 @@ fn journal_nonce(
     if state_key.len() != 32 || associated_data.is_empty() || plaintext.is_empty() {
         return Err(JournalError::Invalid);
     }
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(state_key)
-        .map_err(|_| JournalError::Invalid)?;
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(state_key).map_err(|_| JournalError::Invalid)?;
     mac.update(JOURNAL_NONCE_DOMAIN);
     mac.update(&(associated_data.len() as u64).to_be_bytes());
     mac.update(associated_data);

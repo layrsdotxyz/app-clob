@@ -8,12 +8,16 @@ use thiserror::Error;
 
 use crate::{
     journal::{canonical_receipt_hash, canonical_result_hash, DirectJournalRecord, JournalError},
+    migration::{MigratedTerminalRecord, MigrationError, V70MigrationBundle},
     request_hash,
-    request_index::{RequestIndexError, SparseRequestProof, TerminalRequestLeaf},
+    request_index::{
+        RequestIndexError, SparseRequestProof, TerminalRequestLeaf, TerminalResultLocator,
+    },
     sha256, DirectRequest, DirectResult, DirectRuntime, RuntimeError,
 };
 
 const GENESIS_RECORD_DOMAIN: &[u8] = b"layrs.direct-execution.journal-genesis.v71\0";
+const MIGRATION_TRANSITION_DOMAIN: &[u8] = b"layrs.direct-execution.migration-transition.v71\0";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum V71Error {
@@ -23,6 +27,8 @@ pub enum V71Error {
     RequestIndex(#[from] RequestIndexError),
     #[error(transparent)]
     Journal(#[from] JournalError),
+    #[error(transparent)]
+    Migration(#[from] MigrationError),
     #[error("an authenticated archived result is required for exact replay")]
     ReplayProofRequired,
     #[error("candidate does not succeed the current v71 head")]
@@ -79,6 +85,47 @@ impl DirectV71Runtime {
             record_hash: sha256(&genesis),
             transition_root,
             request_index_root: crate::request_index::empty_request_index_root(),
+        })
+    }
+
+    /// Converts an exact authenticated v70 head into bounded v71 live state.
+    /// No request history is dropped until every migrated terminal record,
+    /// leaf, root, and manifest signature has verified against that same head.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_v70_migration(
+        mut runtime: DirectRuntime,
+        bundle: &V70MigrationBundle,
+        writer_epoch: String,
+        state_key: &[u8],
+        migration_verification_key: &[u8],
+    ) -> Result<Self, V71Error> {
+        if writer_epoch.is_empty()
+            || writer_epoch.len() > 128
+            || runtime.committed_sequence() != bundle.manifest.source_sequence
+            || runtime.committed_state_hash() != bundle.manifest.source_state_hash
+        {
+            return Err(V71Error::StaleCandidate);
+        }
+        bundle.verify_complete(state_key, migration_verification_key, &runtime.receipt_key)?;
+        let manifest_hash = bundle.manifest.manifest_hash()?;
+        let mut transition = Vec::with_capacity(
+            MIGRATION_TRANSITION_DOMAIN.len()
+                + manifest_hash.len()
+                + bundle.manifest.source_state_hash.len()
+                + bundle.manifest.request_index_root.len(),
+        );
+        transition.extend_from_slice(MIGRATION_TRANSITION_DOMAIN);
+        transition.extend_from_slice(manifest_hash.as_bytes());
+        transition.extend_from_slice(bundle.manifest.source_state_hash.as_bytes());
+        transition.extend_from_slice(bundle.manifest.request_index_root.as_bytes());
+        runtime.requests.clear();
+        Ok(Self {
+            runtime,
+            writer_epoch,
+            sequence: bundle.manifest.source_sequence,
+            record_hash: manifest_hash,
+            transition_root: sha256(&transition),
+            request_index_root: bundle.manifest.request_index_root.clone(),
         })
     }
 
@@ -141,8 +188,10 @@ impl DirectV71Runtime {
             request_hash: request.request_hash.clone(),
             result_hash,
             receipt_hash,
-            writer_epoch: self.writer_epoch.clone(),
-            journal_sequence: sequence,
+            locator: TerminalResultLocator::Journal {
+                writer_epoch: self.writer_epoch.clone(),
+                sequence,
+            },
         };
         let next_request_index_root =
             request_proof.insert(&self.request_index_root, &terminal_leaf)?;
@@ -194,9 +243,16 @@ impl DirectV71Runtime {
         if terminal.request_hash != request.request_hash {
             return Err(RuntimeError::RequestReuse.into());
         }
+        let TerminalResultLocator::Journal {
+            writer_epoch,
+            sequence,
+        } = &terminal.locator
+        else {
+            return Err(V71Error::ReplayProofRequired);
+        };
         let payload = archived_record.open_replay(
-            &terminal.writer_epoch,
-            terminal.journal_sequence,
+            writer_epoch,
+            *sequence,
             &terminal.account_id,
             &terminal.request_id,
             &terminal.request_hash,
@@ -207,6 +263,48 @@ impl DirectV71Runtime {
             &self.runtime.receipt_key,
         )?;
         Ok(payload.result)
+    }
+
+    pub fn replay_migrated(
+        &self,
+        request: &DirectRequest,
+        request_proof: &SparseRequestProof,
+        archived_record: &MigratedTerminalRecord,
+        state_key: &[u8],
+        migration_verification_key: &[u8],
+    ) -> Result<DirectResult, V71Error> {
+        if request.request_hash != request_hash(request) {
+            return Err(RuntimeError::InvalidRequest.into());
+        }
+        let terminal = request_proof.terminal_leaf(
+            &self.request_index_root,
+            &request.account_id,
+            &request.request_id,
+        )?;
+        if terminal.request_hash != request.request_hash {
+            return Err(RuntimeError::RequestReuse.into());
+        }
+        let TerminalResultLocator::Migration {
+            migration_id,
+            ordinal,
+        } = &terminal.locator
+        else {
+            return Err(V71Error::ReplayProofRequired);
+        };
+        archived_record
+            .open_replay(
+                migration_id,
+                *ordinal,
+                &terminal.account_id,
+                &terminal.request_id,
+                &terminal.request_hash,
+                &terminal.result_hash,
+                &terminal.receipt_hash,
+                state_key,
+                migration_verification_key,
+                &self.runtime.receipt_key,
+            )
+            .map_err(Into::into)
     }
 
     /// Adoption is called only after the parent has durably appended and read
@@ -405,5 +503,57 @@ mod tests {
             Err(V71Error::StaleCandidate)
         );
         assert_eq!(runtime.sequence(), 1);
+    }
+
+    #[test]
+    fn authenticated_v70_migration_preserves_exact_replay_then_drops_full_history() {
+        let epoch = SealedEpoch {
+            identities: BTreeMap::new(),
+            identity_subjects: BTreeMap::new(),
+            subject_identities: BTreeMap::new(),
+            subject_wallets: BTreeMap::<String, BTreeSet<String>>::new(),
+        };
+        let mut v70 = DirectRuntime::new(epoch, RuntimeMode::IsolatedTest, vec![9; 32]).unwrap();
+        let request = admission(
+            &"a".repeat(64),
+            "request-1",
+            "0x1111111111111111111111111111111111111111",
+        );
+        let expected = v70.execute(request.clone()).unwrap();
+        let source_hash = v70.committed_state_hash();
+        let bundle = V70MigrationBundle::seal(&v70, &[7; 32], &[8; 32]).unwrap();
+        let leaf = bundle.leaves[0].clone();
+        let record = bundle.records[0].clone();
+        let proof = SparseRequestProof {
+            leaf: Some(leaf),
+            siblings: SparseRequestProof::empty_tree().siblings,
+        };
+
+        let migrated = DirectV71Runtime::from_v70_migration(
+            v70,
+            &bundle,
+            "writer-epoch-2".into(),
+            &[7; 32],
+            &journal_verifying_key(&[8; 32]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(migrated.sequence(), 1);
+        assert!(migrated.financial_runtime().requests.is_empty());
+        assert_ne!(
+            migrated.financial_runtime().committed_state_hash(),
+            source_hash
+        );
+        assert_eq!(
+            migrated
+                .replay_migrated(
+                    &request,
+                    &proof,
+                    &record,
+                    &[7; 32],
+                    &journal_verifying_key(&[8; 32]).unwrap(),
+                )
+                .unwrap(),
+            expected
+        );
     }
 }

@@ -5,7 +5,10 @@
 //! Consequently, omitting an old request cannot turn an exact replay into a
 //! new command, and live enclave state does not grow with request history.
 
-use std::sync::OnceLock;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::OnceLock,
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -29,6 +32,28 @@ pub enum RequestIndexError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum TerminalResultLocator {
+    Journal { writer_epoch: String, sequence: u64 },
+    Migration { migration_id: String, ordinal: u64 },
+}
+
+impl TerminalResultLocator {
+    fn validate(&self) -> bool {
+        match self {
+            Self::Journal {
+                writer_epoch,
+                sequence,
+            } => !writer_epoch.is_empty() && writer_epoch.len() <= 128 && *sequence > 0,
+            Self::Migration {
+                migration_id,
+                ordinal,
+            } => valid_digest(migration_id) && *ordinal > 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TerminalRequestLeaf {
     pub account_id: String,
@@ -36,17 +61,14 @@ pub struct TerminalRequestLeaf {
     pub request_hash: String,
     pub result_hash: String,
     pub receipt_hash: String,
-    pub writer_epoch: String,
-    pub journal_sequence: u64,
+    pub locator: TerminalResultLocator,
 }
 
 impl TerminalRequestLeaf {
     pub fn validate(&self) -> bool {
         !self.account_id.is_empty()
             && !self.request_id.is_empty()
-            && !self.writer_epoch.is_empty()
-            && self.writer_epoch.len() <= 128
-            && self.journal_sequence > 0
+            && self.locator.validate()
             && [
                 self.request_hash.as_str(),
                 self.result_hash.as_str(),
@@ -161,6 +183,60 @@ pub fn empty_request_index_root() -> String {
     empty_hashes()[REQUEST_INDEX_DEPTH].clone()
 }
 
+/// Builds the canonical sparse root for a complete set of terminal leaves.
+/// This O(256*N) routine is intended for one-time v70 migration and offline
+/// verification. The live parent maintains an incremental proof index.
+pub fn request_index_root(leaves: &[TerminalRequestLeaf]) -> Result<String, RequestIndexError> {
+    if leaves.is_empty() {
+        return Ok(empty_request_index_root());
+    }
+    let mut current = BTreeMap::<[u8; 32], String>::new();
+    for leaf in leaves {
+        if !leaf.validate()
+            || current
+                .insert(decode_digest(&leaf.key_hash())?, leaf.leaf_hash()?)
+                .is_some()
+        {
+            return Err(RequestIndexError::Invalid);
+        }
+    }
+    for level in 0..REQUEST_INDEX_DEPTH {
+        let bit_index = REQUEST_INDEX_DEPTH - 1 - level;
+        let byte = bit_index / 8;
+        let mask = 1 << (7 - (bit_index % 8));
+        let mut consumed = BTreeSet::new();
+        let mut next = BTreeMap::new();
+        for (key, hash) in &current {
+            if consumed.contains(key) {
+                continue;
+            }
+            let mut sibling_key = *key;
+            sibling_key[byte] ^= mask;
+            let sibling = current
+                .get(&sibling_key)
+                .cloned()
+                .unwrap_or_else(|| empty_hashes()[level].clone());
+            let parent_hash = if key[byte] & mask == 0 {
+                branch_hash(hash, &sibling)?
+            } else {
+                branch_hash(&sibling, hash)?
+            };
+            consumed.insert(*key);
+            consumed.insert(sibling_key);
+            let mut parent_key = *key;
+            parent_key[byte] &= !mask;
+            if next.insert(parent_key, parent_hash).is_some() {
+                return Err(RequestIndexError::Invalid);
+            }
+        }
+        current = next;
+    }
+    if current.len() != 1 {
+        return Err(RequestIndexError::Invalid);
+    }
+    current.remove(&[0; 32]).ok_or(RequestIndexError::Invalid)
+}
+
 fn root_from_path(
     key: &[u8; 32],
     leaf_hash: &str,
@@ -234,8 +310,10 @@ mod tests {
             request_hash: request_hash.into(),
             result_hash: "b".repeat(64),
             receipt_hash: "c".repeat(64),
-            writer_epoch: "writer-epoch-1".into(),
-            journal_sequence: 1,
+            locator: TerminalResultLocator::Journal {
+                writer_epoch: "writer-epoch-1".into(),
+                sequence: 1,
+            },
         }
     }
 
@@ -304,6 +382,19 @@ mod tests {
         assert_eq!(
             proof.insert(&empty_request_index_root(), &leaf(&"a".repeat(64))),
             Err(RequestIndexError::Proof)
+        );
+    }
+
+    #[test]
+    fn complete_root_matches_single_leaf_proof_and_rejects_duplicate_keys() {
+        let terminal = leaf(&"a".repeat(64));
+        let expected = SparseRequestProof::empty_tree()
+            .insert(&empty_request_index_root(), &terminal)
+            .unwrap();
+        assert_eq!(request_index_root(&[terminal.clone()]).unwrap(), expected);
+        assert_eq!(
+            request_index_root(&[terminal.clone(), terminal]),
+            Err(RequestIndexError::Invalid)
         );
     }
 }
