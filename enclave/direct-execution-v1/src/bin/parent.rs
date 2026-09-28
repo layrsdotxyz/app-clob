@@ -242,6 +242,10 @@ struct S3ImmutableArtifactStore {
     verified_artifact_hashes: Arc<Mutex<Vec<String>>>,
     prepared_restore: Arc<Mutex<Option<PreparedArchiveRestore>>>,
     checkpoint_refresh_gate: Arc<Mutex<CheckpointRefresh>>,
+    // v71 append eligibility. Always `Unrestored` until the v71 restore path
+    // exists; live v70 never reads or advances it.
+    journal: Arc<Mutex<JournalWriterState>>,
+    journal_role: JournalRole,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1839,6 +1843,42 @@ struct JournalHead {
     transition_root: String,
 }
 
+/// In-process v71 append eligibility. Only `Eligible` may PUT, and a latch is
+/// never cleared in-process: recovery is a restart plus full restore.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum JournalWriterState {
+    Unrestored,
+    Eligible(JournalHead),
+    Latched(&'static str),
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JournalRole {
+    Writer,
+    Shadow,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn latch_journal_state(state: &mut JournalWriterState, code: &'static str) {
+    // Keep the first cause; a latched writer never becomes eligible again.
+    if !matches!(state, JournalWriterState::Latched(_)) {
+        *state = JournalWriterState::Latched(code);
+    }
+    eprintln!("JOURNAL_LATCHED reason={code}");
+}
+
+/// Every fence written against `writer_epoch` lives under this prefix,
+/// whatever head sequence it fences at.
+#[cfg_attr(not(test), allow(dead_code))]
+fn journal_fence_prefix(prefix: &str, writer_epoch: &str) -> String {
+    format!(
+        "{prefix}/journal-v71/fences/{}/",
+        sha256(writer_epoch.as_bytes())
+    )
+}
+
 /// v71 records occupy the v70 head slot so both formats contend for one
 /// create-only key per sequence.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2210,6 +2250,8 @@ impl S3ImmutableArtifactStore {
             verified_artifact_hashes: Arc::new(Mutex::new(Vec::new())),
             prepared_restore: Arc::new(Mutex::new(None)),
             checkpoint_refresh_gate: Arc::new(Mutex::new(CheckpointRefresh::default())),
+            journal: Arc::new(Mutex::new(JournalWriterState::Unrestored)),
+            journal_role: JournalRole::Writer,
         })
     }
     fn artifact_key(&self, artifact: &DirectStateArtifact) -> String {
@@ -2297,6 +2339,114 @@ impl S3ImmutableArtifactStore {
             return Err("archive readback mismatch".into());
         }
         Ok(())
+    }
+    /// True if any fence exists for `writer_epoch`. `ListObjectsV2` is
+    /// strongly consistent, so a fence durable before this call is seen.
+    /// Every error, timeout, or malformed/ambiguous page is `Err`, which
+    /// callers must treat as fenced.
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn writer_fenced(&self, writer_epoch: &str) -> Result<bool, String> {
+        let fence_prefix = journal_fence_prefix(&self.prefix, writer_epoch);
+        let page = bounded_archive_operation(
+            ARCHIVE_OPERATION_TIMEOUT,
+            self.client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&fence_prefix)
+                .max_keys(1)
+                .send(),
+        )
+        .await?
+        .map_err(|_| "journal fence listing failed")?;
+        let contents = page.contents();
+        if page
+            .key_count
+            .is_some_and(|count| usize::try_from(count).ok() != Some(contents.len()))
+        {
+            return Err("journal fence listing ambiguous".into());
+        }
+        for object in contents {
+            let key = object.key().ok_or("journal fence key missing")?;
+            if key.len() <= fence_prefix.len() || !key.starts_with(&fence_prefix) {
+                return Err("journal fence key foreign".into());
+            }
+        }
+        if contents.is_empty() && page.is_truncated.unwrap_or(false) {
+            return Err("journal fence listing ambiguous".into());
+        }
+        Ok(!contents.is_empty())
+    }
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn latch_journal(&self, code: &'static str) {
+        latch_journal_state(&mut *self.journal.lock().await, code);
+    }
+    /// Plan section 4 steps 1-6. The journal lock is held from the eligibility
+    /// check through the post-PUT fence listing, so nothing else can PUT or
+    /// advance the head meanwhile. Only an exact readback followed by an empty,
+    /// error-free fence listing advances the head; every other outcome latches.
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn append_journal_record(
+        &self,
+        record: &DirectJournalRecord,
+    ) -> Result<JournalHead, String> {
+        // A shadow store must never use authoritative heads. Until the shadow
+        // prefix guard exists, shadow appends are refused outright.
+        if self.journal_role != JournalRole::Writer {
+            return Err("JOURNAL_SHADOW_APPEND_UNSUPPORTED".into());
+        }
+        let mut journal = self.journal.lock().await;
+        let head = match &*journal {
+            JournalWriterState::Eligible(head) => head.clone(),
+            JournalWriterState::Latched(_) => return Err("JOURNAL_LATCHED".into()),
+            JournalWriterState::Unrestored => return Err("JOURNAL_UNRESTORED".into()),
+        };
+        let checked = precheck_journal_candidate(&head, record).and_then(|bytes| {
+            let record_hash = record
+                .record_hash()
+                .map_err(|_| "journal candidate hash failed")?;
+            Ok((bytes, record_hash))
+        });
+        let (bytes, record_hash) = match checked {
+            Ok(checked) => checked,
+            Err(reason) => {
+                eprintln!("JOURNAL_CANDIDATE_REJECTED reason={reason}");
+                latch_journal_state(&mut journal, "JOURNAL_CANDIDATE_OUT_OF_ORDER");
+                return Err("JOURNAL_CANDIDATE_OUT_OF_ORDER".into());
+            }
+        };
+        let key = journal_record_key(&self.prefix, record.sequence);
+        if let Err(error) = self.write_once(&key, bytes).await {
+            // Timeout or read exhaustion leaves the slot unknown; a conflict
+            // means another writer holds it. Neither may be retried here.
+            let code = match error.as_str() {
+                "ARCHIVE_SEQUENCE_CONFLICT" => "ARCHIVE_SEQUENCE_CONFLICT",
+                "ARCHIVE_TIMEOUT" => "ARCHIVE_TIMEOUT",
+                _ => "JOURNAL_APPEND_UNVERIFIED",
+            };
+            latch_journal_state(&mut journal, code);
+            return Err(error);
+        }
+        // Strictly after the PUT returned (plan section 5, N1).
+        match self.writer_fenced(&head.writer_epoch).await {
+            Ok(false) => {}
+            Ok(true) => {
+                latch_journal_state(&mut journal, "JOURNAL_WRITER_FENCED");
+                return Err("JOURNAL_WRITER_FENCED".into());
+            }
+            Err(error) => {
+                eprintln!("JOURNAL_FENCE_UNAVAILABLE error={error}");
+                latch_journal_state(&mut journal, "JOURNAL_FENCE_UNAVAILABLE");
+                return Err("JOURNAL_FENCE_UNAVAILABLE".into());
+            }
+        }
+        let next = JournalHead {
+            writer_epoch: head.writer_epoch,
+            sequence: record.sequence,
+            record_hash,
+            transition_root: record.transition_root.clone(),
+        };
+        *journal = JournalWriterState::Eligible(next.clone());
+        Ok(next)
     }
     /// Immutable put of a large artifact as one multipart upload whose parts
     /// are sent concurrently.  The completed object is still conditional
@@ -6348,7 +6498,7 @@ mod tests {
             }
         });
         let configuration=aws_sdk_s3::config::Builder::new().behavior_version_latest().region(aws_sdk_s3::config::Region::new("us-east-1")).credentials_provider(aws_sdk_s3::config::Credentials::new("unit-test","unit-test",None,None,"local-only")).endpoint_url(format!("http://{address}")).force_path_style(true).build();
-        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(Some(vec![head.clone()]))),verified_artifact_hashes:Arc::new(Mutex::new(vec![hash.clone()])),prepared_restore:Arc::new(Mutex::new(None)),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default()))};
+        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(Some(vec![head.clone()]))),verified_artifact_hashes:Arc::new(Mutex::new(vec![hash.clone()])),prepared_restore:Arc::new(Mutex::new(None)),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default())),journal:Arc::new(Mutex::new(JournalWriterState::Unrestored)),journal_role:JournalRole::Writer};
         let state = AppState {
             enclave_cid: 16,
             session_key: vec![7; 32],
@@ -6926,7 +7076,7 @@ mod tests {
             }
         });
         let configuration=aws_sdk_s3::config::Builder::new().behavior_version_latest().region(aws_sdk_s3::config::Region::new("us-east-1")).credentials_provider(aws_sdk_s3::config::Credentials::new("unit-test","unit-test",None,None,"local-only")).endpoint_url(format!("http://{address}")).force_path_style(true).build();
-        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),prepared_restore:Arc::new(Mutex::new(None)),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default()))};
+        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),prepared_restore:Arc::new(Mutex::new(None)),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default())),journal:Arc::new(Mutex::new(JournalWriterState::Unrestored)),journal_role:JournalRole::Writer};
         assert_eq!(store.read("epoch/immutable.cbor").await.unwrap(),b"complete-opaque-ciphertext");server.await.unwrap();
     }
     #[tokio::test]
@@ -6939,7 +7089,7 @@ mod tests {
             }
         });
         let configuration=aws_sdk_s3::config::Builder::new().behavior_version_latest().region(aws_sdk_s3::config::Region::new("us-east-1")).credentials_provider(aws_sdk_s3::config::Credentials::new("unit-test","unit-test",None,None,"local-only")).endpoint_url(format!("http://{address}")).force_path_style(true).build();
-        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),prepared_restore:Arc::new(Mutex::new(None)),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default()))};
+        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),prepared_restore:Arc::new(Mutex::new(None)),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default())),journal:Arc::new(Mutex::new(JournalWriterState::Unrestored)),journal_role:JournalRole::Writer};
         assert_eq!(store.read("epoch/immutable.cbor").await.unwrap_err(),"archive complete read retries exhausted");server.await.unwrap();
     }
     #[tokio::test]
@@ -6957,7 +7107,7 @@ mod tests {
             }
         });
         let configuration=aws_sdk_s3::config::Builder::new().behavior_version_latest().region(aws_sdk_s3::config::Region::new("us-east-1")).credentials_provider(aws_sdk_s3::config::Credentials::new("unit-test","unit-test",None,None,"local-only")).endpoint_url(format!("http://{address}")).force_path_style(true).build();
-        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),prepared_restore:Arc::new(Mutex::new(None)),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default()))};
+        let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),prepared_restore:Arc::new(Mutex::new(None)),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default())),journal:Arc::new(Mutex::new(JournalWriterState::Unrestored)),journal_role:JournalRole::Writer};
         let keys=store.list_restore_keys("artifacts").await.unwrap();assert_eq!(keys.len(),1250);assert!(keys.first().unwrap().contains("00000000000000000001"));assert!(keys.last().unwrap().contains("00000000000000001250"));server.await.unwrap();
     }
 
@@ -8151,5 +8301,344 @@ mod tests {
         let mut other = record.clone();
         other.receipt_hash = "d".repeat(64);
         assert!(!verify_terminal_matches_record(&result, &other));
+    }
+
+    fn v71_http(status: u16, body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 {status} Mock\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    fn v71_s3_error(status: u16, code: &str) -> Vec<u8> {
+        v71_http(
+            status,
+            format!(
+                "<?xml version=\"1.0\"?><Error><Code>{code}</Code><Message>mock</Message></Error>"
+            )
+            .as_bytes(),
+        )
+    }
+
+    fn v71_listing(keys: &[String]) -> Vec<u8> {
+        let objects = keys
+            .iter()
+            .map(|key| format!("<Contents><Key>{key}</Key><Size>1</Size></Contents>"))
+            .collect::<String>();
+        v71_http(
+            200,
+            format!(
+                "<?xml version=\"1.0\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><IsTruncated>false</IsTruncated><KeyCount>{}</KeyCount>{objects}</ListBucketResult>",
+                keys.len()
+            )
+            .as_bytes(),
+        )
+    }
+
+    type V71RequestLog = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+    /// Loopback S3 answering each request with the next scripted response (500
+    /// once exhausted) and logging `(lowercased request head, body)` in order.
+    async fn v71_mock_s3(
+        responses: Vec<Vec<u8>>,
+    ) -> (String, V71RequestLog, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let log = V71RequestLog::default();
+        let recorded = log.clone();
+        let server = tokio::spawn(async move {
+            let mut responses = responses.into_iter();
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 8192];
+                let entry = loop {
+                    let size = socket.read(&mut buffer).await.unwrap();
+                    assert!(size > 0, "request truncated");
+                    request.extend_from_slice(&buffer[..size]);
+                    let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .map_or(0, |value| value.trim().parse::<usize>().unwrap());
+                    if request.len() >= end + 4 + length {
+                        break (head, request[end + 4..end + 4 + length].to_vec());
+                    }
+                };
+                recorded.lock().await.push(entry);
+                let response = responses
+                    .next()
+                    .unwrap_or_else(|| v71_s3_error(500, "InternalError"));
+                socket.write_all(&response).await.unwrap();
+            }
+        });
+        (endpoint, log, server)
+    }
+
+    fn v71_store(
+        endpoint: &str,
+        state: JournalWriterState,
+        role: JournalRole,
+    ) -> S3ImmutableArtifactStore {
+        let configuration = aws_sdk_s3::config::Builder::new()
+            .behavior_version_latest()
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "unit-test",
+                "unit-test",
+                None,
+                None,
+                "local-only",
+            ))
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .build();
+        S3ImmutableArtifactStore {
+            client: S3Client::from_conf(configuration),
+            bucket: "unit-test".into(),
+            prefix: "epoch".into(),
+            kms_key_id: "unit-kms-key".into(),
+            retention_seconds: 86400,
+            verified_receipt_records: Arc::new(Mutex::new(None)),
+            verified_artifact_hashes: Arc::new(Mutex::new(Vec::new())),
+            prepared_restore: Arc::new(Mutex::new(None)),
+            checkpoint_refresh_gate: Arc::new(Mutex::new(CheckpointRefresh::default())),
+            journal: Arc::new(Mutex::new(state)),
+            journal_role: role,
+        }
+    }
+
+    fn v71_next_head(record: &DirectJournalRecord) -> JournalHead {
+        JournalHead {
+            writer_epoch: v71_head().writer_epoch,
+            sequence: 42,
+            record_hash: record.record_hash().unwrap(),
+            transition_root: record.transition_root.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn v71_append_puts_create_only_then_reads_back_then_lists_fences() {
+        let (_, record) = v71_candidate();
+        let bytes = serde_cbor::to_vec(&record).unwrap();
+        let (endpoint, log, server) = v71_mock_s3(vec![
+            v71_http(200, b""),
+            v71_http(200, &bytes),
+            v71_listing(&[]),
+        ])
+        .await;
+        let store = v71_store(
+            &endpoint,
+            JournalWriterState::Eligible(v71_head()),
+            JournalRole::Writer,
+        );
+        let next = store.append_journal_record(&record).await.unwrap();
+        assert_eq!(next, v71_next_head(&record));
+        assert_eq!(
+            *store.journal.lock().await,
+            JournalWriterState::Eligible(next)
+        );
+        server.abort();
+        let log = log.lock().await;
+        assert_eq!(log.len(), 3);
+        let (put, body) = &log[0];
+        assert!(
+            put.starts_with("put /unit-test/epoch/heads/00000000000000000042.cbor"),
+            "{put}"
+        );
+        for header in [
+            "\r\nif-none-match: *\r\n",
+            "\r\nx-amz-server-side-encryption: aws:kms\r\n",
+            "\r\nx-amz-server-side-encryption-aws-kms-key-id: unit-kms-key\r\n",
+            "\r\nx-amz-object-lock-mode: compliance\r\n",
+            "\r\nx-amz-object-lock-retain-until-date: ",
+        ] {
+            assert!(put.contains(header), "{header:?} missing from {put}");
+        }
+        assert!(body.windows(bytes.len()).any(|window| window == bytes));
+        assert!(
+            log[1]
+                .0
+                .starts_with("get /unit-test/epoch/heads/00000000000000000042.cbor"),
+            "{}",
+            log[1].0
+        );
+        let list = &log[2].0;
+        let fence_prefix = journal_fence_prefix("epoch", "writer-epoch-1");
+        assert!(list.starts_with("get /unit-test/?"), "{list}");
+        for query in [
+            "list-type=2".to_string(),
+            "max-keys=1".to_string(),
+            format!("prefix={}", fence_prefix.replace('/', "%2f")),
+        ] {
+            assert!(list.contains(&query), "{query} missing from {list}");
+        }
+    }
+
+    #[tokio::test]
+    async fn v71_append_412_with_identical_readback_is_idempotent_success() {
+        let (_, record) = v71_candidate();
+        let bytes = serde_cbor::to_vec(&record).unwrap();
+        let (endpoint, log, server) = v71_mock_s3(vec![
+            v71_s3_error(412, "PreconditionFailed"),
+            v71_http(200, &bytes),
+            v71_listing(&[]),
+        ])
+        .await;
+        let store = v71_store(
+            &endpoint,
+            JournalWriterState::Eligible(v71_head()),
+            JournalRole::Writer,
+        );
+        assert_eq!(
+            store.append_journal_record(&record).await,
+            Ok(v71_next_head(&record))
+        );
+        server.abort();
+        let methods: Vec<_> = log
+            .lock()
+            .await
+            .iter()
+            .map(|(head, _)| head[..4].to_string())
+            .collect();
+        assert_eq!(methods, ["put ", "get ", "get "]);
+    }
+
+    #[tokio::test]
+    async fn v71_append_412_with_different_readback_latches_sequence_conflict() {
+        let (_, record) = v71_candidate();
+        let (endpoint, log, server) = v71_mock_s3(vec![
+            v71_s3_error(412, "PreconditionFailed"),
+            v71_http(200, b"another-writer-record"),
+        ])
+        .await;
+        let store = v71_store(
+            &endpoint,
+            JournalWriterState::Eligible(v71_head()),
+            JournalRole::Writer,
+        );
+        assert_eq!(
+            store.append_journal_record(&record).await,
+            Err("ARCHIVE_SEQUENCE_CONFLICT".into())
+        );
+        assert_eq!(
+            *store.journal.lock().await,
+            JournalWriterState::Latched("ARCHIVE_SEQUENCE_CONFLICT")
+        );
+        // No fence listing after a conflict, and no further PUT once latched.
+        assert_eq!(
+            store.append_journal_record(&record).await,
+            Err("JOURNAL_LATCHED".into())
+        );
+        server.abort();
+        assert_eq!(log.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn v71_durable_append_latches_on_existing_fence_or_fence_listing_failure() {
+        let (_, record) = v71_candidate();
+        let bytes = serde_cbor::to_vec(&record).unwrap();
+        let fence = format!(
+            "{}00000000000000000041.cbor",
+            journal_fence_prefix("epoch", "writer-epoch-1")
+        );
+        let foreign = format!(
+            "{}00000000000000000041.cbor",
+            journal_fence_prefix("epoch", "writer-epoch-2")
+        );
+        for (listing, code) in [
+            (v71_listing(&[fence]), "JOURNAL_WRITER_FENCED"),
+            (
+                v71_s3_error(403, "AccessDenied"),
+                "JOURNAL_FENCE_UNAVAILABLE",
+            ),
+            (v71_listing(&[foreign]), "JOURNAL_FENCE_UNAVAILABLE"),
+        ] {
+            let (endpoint, log, server) =
+                v71_mock_s3(vec![v71_http(200, b""), v71_http(200, &bytes), listing]).await;
+            let store = v71_store(
+                &endpoint,
+                JournalWriterState::Eligible(v71_head()),
+                JournalRole::Writer,
+            );
+            assert_eq!(store.append_journal_record(&record).await, Err(code.into()));
+            assert_eq!(
+                *store.journal.lock().await,
+                JournalWriterState::Latched(code)
+            );
+            server.abort();
+            assert_eq!(log.lock().await.len(), 3, "{code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn v71_append_without_eligible_head_or_valid_candidate_never_touches_storage() {
+        let (_, record) = v71_candidate();
+        let (endpoint, log, server) = v71_mock_s3(Vec::new()).await;
+
+        let store = v71_store(
+            &endpoint,
+            JournalWriterState::Unrestored,
+            JournalRole::Writer,
+        );
+        assert_eq!(
+            store.append_journal_record(&record).await,
+            Err("JOURNAL_UNRESTORED".into())
+        );
+        assert_eq!(*store.journal.lock().await, JournalWriterState::Unrestored);
+
+        let store = v71_store(
+            &endpoint,
+            JournalWriterState::Eligible(v71_head()),
+            JournalRole::Writer,
+        );
+        store.latch_journal("ARCHIVE_TIMEOUT").await;
+        assert_eq!(
+            store.append_journal_record(&record).await,
+            Err("JOURNAL_LATCHED".into())
+        );
+        assert_eq!(
+            *store.journal.lock().await,
+            JournalWriterState::Latched("ARCHIVE_TIMEOUT")
+        );
+
+        let mut stale = v71_head();
+        stale.sequence = 40;
+        let store = v71_store(
+            &endpoint,
+            JournalWriterState::Eligible(stale),
+            JournalRole::Writer,
+        );
+        assert_eq!(
+            store.append_journal_record(&record).await,
+            Err("JOURNAL_CANDIDATE_OUT_OF_ORDER".into())
+        );
+        assert_eq!(
+            *store.journal.lock().await,
+            JournalWriterState::Latched("JOURNAL_CANDIDATE_OUT_OF_ORDER")
+        );
+
+        let store = v71_store(
+            &endpoint,
+            JournalWriterState::Eligible(v71_head()),
+            JournalRole::Shadow,
+        );
+        assert_eq!(
+            store.append_journal_record(&record).await,
+            Err("JOURNAL_SHADOW_APPEND_UNSUPPORTED".into())
+        );
+        assert_eq!(
+            *store.journal.lock().await,
+            JournalWriterState::Eligible(v71_head())
+        );
+
+        server.abort();
+        assert!(log.lock().await.is_empty());
     }
 }
