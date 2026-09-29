@@ -36,5 +36,39 @@
     "fileHashesMatched": true,
     "inspectorsTerminatedAfterReadback": true
   },
+  "isolatedAsgRollbackRehearsal": {
+    "launchTemplateId": "lt-0ac10b20c2a174ef7",
+    "autoScalingGroup": "layrs-v71-ed0b4f9-rehearsal-20260930-0358",
+    "instanceRefreshId": "8479c9d9-aea4-4cb8-80fb-9ff052616579",
+    "candidateVersion": 1,
+    "rollbackVersion": 2,
+    "minSize": 1,
+    "maxSize": 1,
+    "desiredCapacity": 1,
+    "healthCheckGracePeriodSeconds": 3600,
+    "awsRefreshStartUtc": "2026-09-29T22:26:46Z",
+    "observedSuccessfulUtc": "2026-09-29T22:30:11Z",
+    "awsRefreshSeconds": 205,
+    "endToEndObservedSeconds": 218,
+    "candidateInstanceTerminated": true,
+    "soleRollbackInstanceHealthyInService": true,
+    "rollbackImageIdVerified": "ami-0f0bd57649a151201",
+    "allRehearsalResourcesRemoved": true,
+    "writerGrantSupplied": false,
+    "runtimeEnvironmentSupplied": false
+  },
+  "healthGraceVerification": {
+    "verifiedAtIst": "2026-09-30T04:14:00+05:30",
+    "sourceTemplateSeconds": 3600,
+    "candidateTestExpectedSeconds": 3600,
+    "candidateTestMinimumSeconds": 1500,
+    "liveProductionAsgSeconds": 3600,
+    "liveProcessedStackTemplateSeconds": 3600,
+    "retainedRollbackChangeSet": "v70-rollback-3877e3a-stop-prepared-20260929",
+    "retainedRollbackProcessedTemplateSeconds": 3600,
+    "newV71ChangeSetCreated": false,
+    "newV71ChangeSetRequiredSeconds": 3600,
+    "executionFailClosedUnlessExactMatch": true
+  },
   "productionChanged": false
 }
