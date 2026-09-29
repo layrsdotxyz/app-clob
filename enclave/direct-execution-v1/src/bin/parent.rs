@@ -26,6 +26,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine,
 };
+use bytes::Bytes;
 use chacha20poly1305::{
     aead::{Aead, KeyInit},
     ChaCha20Poly1305, Key, Nonce,
@@ -265,47 +266,6 @@ impl Drop for FinancialWaitRegistration<'_> {
     fn drop(&mut self) { self.gate.waiters.lock().expect("financial waiter tracker poisoned").remove(&self.id); }
 }
 
-/// Health is sampled once in the background, never by competing NLB requests.
-/// A successful commit is stronger liveness evidence than a delayed status read.
-#[derive(Default)]
-struct ParentHealth {
-    restored: AtomicBool,
-    last_response_at: AtomicU64,
-}
-const HEALTH_FRESHNESS_SECONDS: u64 = 45;
-
-impl ParentHealth {
-    fn observe(&self, now: u64) { self.last_response_at.store(now, Ordering::Release); }
-    fn check(&self, now: u64, last_commit: u64, stalled_waiter: bool, grant_expired: bool) -> Result<(), &'static str> {
-        if !self.restored.load(Ordering::Acquire) { return Err("DIRECT_STATE_RECOVERY_REQUIRED"); }
-        if grant_expired { return Err("WRITER_AUTHORIZATION_EXPIRED"); }
-        let commit_recent = last_commit != 0 && now.checked_sub(last_commit).is_some_and(|age| age < WRITE_PATH_STALL_THRESHOLD.as_secs());
-        if stalled_waiter && !commit_recent { return Err("WRITE_PATH_STALLED"); }
-        let last = self.last_response_at.load(Ordering::Acquire).max(last_commit);
-        if last == 0 || !now.checked_sub(last).is_some_and(|age| age <= HEALTH_FRESHNESS_SECONDS) {
-            return Err("ENCLOSURE_UNAVAILABLE");
-        }
-        Ok(())
-    }
-}
-
-fn start_health_observer(state: AppState) {
-    tokio::spawn(async move {
-        loop {
-            if let Ok(RuntimeResponse::Status { .. }) = exchange(&state, RuntimeRequest::Status).await {
-                state.health.observe(now_unix());
-            }
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        }
-    });
-}
-
-/// Removes a cancelled lock wait, so it cannot become a permanent false stall.
-struct FinancialWaitRegistration<'a> { gate: &'a FinancialGate, id: u64 }
-impl Drop for FinancialWaitRegistration<'_> {
-    fn drop(&mut self) { self.gate.waiters.lock().expect("financial waiter tracker poisoned").remove(&self.id); }
-}
-
 /// Tracks contention without putting the health endpoint behind the write
 /// mutex it is meant to supervise. Waiting registrations live only for the
 /// duration of `lock`, and the returned owned guard can safely move into a
@@ -497,7 +457,7 @@ impl CheckpointRefresh {
             CheckpointRefreshOutcome::Persisted => self.requested,
             CheckpointRefreshOutcome::Failed => true,
             // Retrying cannot shrink an oversized checkpoint. Return to idle;
-            // a later commit may request one more interval-spaced attempt.
+            // later commits remain disabled until restart or upgrade.
             CheckpointRefreshOutcome::Skipped => {
                 self.requested = false;
                 self.disabled = true;
@@ -520,7 +480,8 @@ fn checkpoint_seal_reason(error: &str) -> &'static str {
         _ => "archive_read_or_write",
     }
 }
-/// Background checkpoint refresh. Exits when idle; never gates a commit.
+/// Background checkpoint refresh. Exits when idle. Its seal closure takes the
+/// financial gate so full-state checkpoint and commit buffers never overlap.
 async fn refresh_checkpoints<F, Fut>(gate: &Mutex<CheckpointRefresh>, mut seal: F)
 where
     F: FnMut() -> Fut,
@@ -2939,6 +2900,13 @@ impl S3ImmutableArtifactStore {
             self.schedule_journal_checkpoint(state).await;
         }
     }
+    /// A checkpoint seal reconstructs and transports the same large state used
+    /// by a commit. Holding the financial gate prevents both operations from
+    /// allocating full-state buffers concurrently in the parent and enclave.
+    async fn seal_current_checkpoint_serialized(&self, state: &AppState) -> Result<(), String> {
+        let _guard = state.financial_gate.lock("checkpoint_refresh").await;
+        self.seal_current_checkpoint(state).await
+    }
     /// Runs only after the final encrypted head is verified and adopted. The
     /// immutable archive stays authoritative and the prior checkpoint stays in
     /// place, so a failed seal is diagnosed but never fails the restore.
@@ -2949,7 +2917,7 @@ impl S3ImmutableArtifactStore {
             tokio::spawn(async move {
                 let (store, state) = (&store, &state);
                 refresh_checkpoints(&store.checkpoint_refresh_gate, move || {
-                    store.seal_current_checkpoint(state)
+                    store.seal_current_checkpoint_serialized(state)
                 })
                 .await;
             });
@@ -3019,7 +2987,7 @@ impl S3ImmutableArtifactStore {
     fn key_release_key(&self, activation_id: &str) -> String {
         format!("{}/authorization/{}.cbor", self.prefix, activation_id)
     }
-    async fn read(&self, key: &str) -> Result<Vec<u8>, String> {
+    async fn read(&self, key: &str) -> Result<Bytes, String> {
         // SDK request retries do not retry a response stream after headers.
         // Discard an incomplete body and GET the same immutable key again;
         // no partial bytes ever reach the encrypted successor verifier.
@@ -3032,7 +3000,7 @@ impl S3ImmutableArtifactStore {
                     .ok_or("archive read size invalid")?;
                 let bytes=response.body.collect().await.map_err(|_|"archive read body failed")?.into_bytes();
                 if bytes.len()!=length as usize {return Err("archive read body length mismatch");}
-                Ok(bytes.to_vec())
+                Ok(bytes)
             }).await;
             match result {
                 Ok(Ok(bytes)) => return Ok(bytes),
@@ -3361,7 +3329,7 @@ impl S3ImmutableArtifactStore {
         }
         let bundle: V70MigrationBundle = serde_cbor::from_slice(&bytes)
             .map_err(|_| "journal migration bundle decode failed")?;
-        if serde_cbor::to_vec(&bundle).ok().as_deref() != Some(bytes.as_slice())
+        if serde_cbor::to_vec(&bundle).ok().as_deref() != Some(bytes.as_ref())
             || bundle.manifest.protocol != V70_MIGRATION_MANIFEST_PROTOCOL
             || bundle.manifest.epoch_id != EPOCH_ID
             || bundle.manifest.source_sequence != source_sequence
@@ -3384,7 +3352,7 @@ impl S3ImmutableArtifactStore {
         }
         let record: DirectJournalRecord = serde_cbor::from_slice(&bytes)
             .map_err(|_| "journal replay record decode failed")?;
-        if serde_cbor::to_vec(&record).ok().as_deref() != Some(bytes.as_slice())
+        if serde_cbor::to_vec(&record).ok().as_deref() != Some(bytes.as_ref())
             || record.protocol != DIRECT_JOURNAL_PROTOCOL
             || record.epoch_id != EPOCH_ID
             || record.sequence != sequence
@@ -3580,7 +3548,7 @@ impl S3ImmutableArtifactStore {
             if key != archive_head_key(&self.prefix, sequence) {
                 return Err("sparse rollback head outside baseline lineage".into());
             }
-            let hash = String::from_utf8(self.read(&key).await?)
+            let hash = String::from_utf8(self.read(&key).await?.to_vec())
                 .map_err(|_| "archive sequence head hash invalid")?;
             if hash.len() != 64
                 || !hash
@@ -3630,7 +3598,7 @@ impl S3ImmutableArtifactStore {
         let baseline_bytes = self.read(&keys[0]).await?;
         let baseline: DirectStateArtifact = serde_cbor::from_slice(&baseline_bytes)
             .map_err(|_| "sparse rollback baseline artifact decode failed")?;
-        if serde_cbor::to_vec(&baseline).ok().as_deref() != Some(baseline_bytes.as_slice())
+        if serde_cbor::to_vec(&baseline).ok().as_deref() != Some(baseline_bytes.as_ref())
             || baseline.epoch_id != EPOCH_ID
             || baseline.sequence != base
             || baseline.state_hash != frontier.state_hash
@@ -3944,7 +3912,7 @@ impl S3ImmutableArtifactStore {
         }
         let checkpoint: DirectV71Checkpoint = serde_cbor::from_slice(&bytes)
             .map_err(|_| "journal checkpoint decode failed; older fallback forbidden")?;
-        if serde_cbor::to_vec(&checkpoint).ok().as_deref() != Some(bytes.as_slice())
+        if serde_cbor::to_vec(&checkpoint).ok().as_deref() != Some(bytes.as_ref())
             || checkpoint.protocol != DIRECT_V71_CHECKPOINT_PROTOCOL
             || checkpoint.epoch_id != EPOCH_ID
             || checkpoint.sequence != newest.sequence
@@ -4001,7 +3969,7 @@ impl S3ImmutableArtifactStore {
             total_bytes = advance_journal_tail_bytes(total_bytes, bytes.len())?;
             let record: DirectJournalRecord = serde_cbor::from_slice(&bytes)
                 .map_err(|_| "journal tail record decode failed")?;
-            if serde_cbor::to_vec(&record).ok().as_deref() != Some(bytes.as_slice()) {
+            if serde_cbor::to_vec(&record).ok().as_deref() != Some(bytes.as_ref()) {
                 return Err("journal tail record noncanonical".into());
             }
             if record.protocol != DIRECT_JOURNAL_PROTOCOL || record.epoch_id != EPOCH_ID {
@@ -4055,7 +4023,7 @@ impl S3ImmutableArtifactStore {
         if sha256(&bytes) != content_hash {
             return Err("journal parent snapshot content address mismatch".into());
         }
-        Ok(bytes)
+        Ok(bytes.to_vec())
     }
     async fn prepare_journal_restore(&self) -> Result<bool, String> {
         let Some((_, checkpoint)) = self.load_newest_journal_checkpoint().await? else {
@@ -4306,11 +4274,11 @@ impl S3ImmutableArtifactStore {
     /// acknowledgement.  Any failure that is not an existing-object conflict
     /// falls back to the proven single-put path, so this can only be faster,
     /// never weaker.  Returns the bytes that were read back.
-    async fn write_once_large(&self, key: &str, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    async fn write_once_large(&self, key: &str, bytes: Vec<u8>) -> Result<Bytes, String> {
         const PART_BYTES: usize = 16 * 1024 * 1024;
         if bytes.len() <= PART_BYTES {
             self.write_once(key, bytes.clone()).await?;
-            return Ok(bytes);
+            return Ok(Bytes::from(bytes));
         }
         let until = DateTime::from_secs(
             SystemTime::now()
@@ -4431,7 +4399,7 @@ impl S3ImmutableArtifactStore {
             // in fact completed is detected as an identical existing object.
             eprintln!("ARCHIVE_MULTIPART_FALLBACK reason={}", error.replace('\n', " "));
             self.write_once(key, bytes.clone()).await?;
-            return Ok(bytes);
+            return Ok(Bytes::from(bytes));
         }
         eprintln!("FINANCIAL_AWAIT_BEGIN stage=archive_readback");
         let restored = self.read(key).await?;
@@ -9174,7 +9142,7 @@ async fn exchange_direct_v70(
                 let store = store.clone(); let state = state.clone();
                 tokio::spawn(async move {
                     let (store, state) = (&store, &state);
-                    refresh_checkpoints(&store.checkpoint_refresh_gate, move || store.seal_current_checkpoint(state)).await;
+                    refresh_checkpoints(&store.checkpoint_refresh_gate, move || store.seal_current_checkpoint_serialized(state)).await;
                 });
             }
         }
@@ -10447,7 +10415,7 @@ mod tests {
         });
         let configuration=aws_sdk_s3::config::Builder::new().behavior_version_latest().region(aws_sdk_s3::config::Region::new("us-east-1")).credentials_provider(aws_sdk_s3::config::Credentials::new("unit-test","unit-test",None,None,"local-only")).endpoint_url(format!("http://{address}")).force_path_style(true).build();
         let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),prepared_restore:Arc::new(Mutex::new(None)),prepared_journal_restore:Arc::new(Mutex::new(None)),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default())),journal:Arc::new(Mutex::new(JournalWriterState::Unrestored)),journal_role:JournalRole::Writer};
-        assert_eq!(store.read("epoch/immutable.cbor").await.unwrap(),b"complete-opaque-ciphertext");server.await.unwrap();
+        assert_eq!(store.read("epoch/immutable.cbor").await.unwrap().as_ref(),b"complete-opaque-ciphertext");server.await.unwrap();
     }
     #[tokio::test]
     async fn s3_archive_read_fails_closed_after_five_truncated_bodies() {
