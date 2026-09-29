@@ -88,8 +88,10 @@ LAYRS_DIRECT_PERSISTENCE_FORMAT=v70-rollback-baseline
 LAYRS_DIRECT_ARCHIVE_PREFIX=<fresh rollback prefix>
 ```
 
-The rollback grant's committed frontier must exactly name the baseline head.
-Normal `v70` mode rejects the sparse archive.
+The rollback grant's committed frontier must name an authenticated historical
+record contained in the baseline checkpoint. The exact-head baseline may be
+later, but its checkpoint must prove that signed frontier before the retained
+v70 enclave receives it. Normal `v70` mode rejects the sparse archive.
 
 ## Release order
 
@@ -154,7 +156,7 @@ while that exact-head fence remains held.
 
 Before a rollout that may need rollback, rehearse this against a
 production-shaped copy. The rollback uses the bridge-derived compatibility
-parent, unchanged live bridge EIF, fresh rollback prefix, exact committed
+parent, unchanged live bridge EIF, fresh rollback prefix, signed historical
 frontier, and separate unconsumed rollback grant. Missing, extra, mutated,
 noncanonical, or wrong-frontier objects fail closed. The exact live bridge
 parent is not an immediate second hop because it requires a contiguous

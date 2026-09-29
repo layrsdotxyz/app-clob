@@ -2706,11 +2706,12 @@ fn validate_v70_rollback_checkpoint(
     Ok((key, head, frontier))
 }
 
-/// Sparse counterpart of `validate_checkpoint_archive` for an archive that
-/// begins at a governed rollback baseline. The exact committed frontier must
-/// accept the checkpoint, and every sequence from the baseline through the
-/// checkpoint must be backed by the listed artifact and head, which start at
-/// the baseline. Returns how many listed sequences the checkpoint covers.
+/// Sparse counterpart of `validate_checkpoint_archive` for an exact-head
+/// rollback package. The pre-issued rollback grant anchors an authenticated
+/// historical frontier contained in the checkpoint; the sparse archive starts
+/// at the later exact head materialized by the v71 writer. Returns the number
+/// of listed sequences covered through that checkpoint so any subsequent v70
+/// artifacts can be replayed normally.
 fn validate_sparse_checkpoint_archive(
     checkpoint: &layrs_direct_execution_v1::DirectCheckpoint,
     frontier: &layrs_direct_execution_v1::CommittedRestoreFrontier,
@@ -2728,22 +2729,23 @@ fn validate_sparse_checkpoint_archive(
     {
         return Err("sparse checkpoint outside governed baseline".into());
     }
-    let covered = usize::try_from(sequence - frontier.sequence + 1)
-        .map_err(|_| "checkpoint sequence overflow")?;
-    if covered > keys.len() {
-        return Err("checkpoint frontier outside immutable archive".into());
+    let listed_index = usize::try_from(
+        sequence
+            .checked_sub(heads[0].sequence)
+            .ok_or("checkpoint predates sparse rollback archive")?,
+    )
+    .map_err(|_| "checkpoint sequence overflow")?;
+    if listed_index >= keys.len() {
+        return Err("checkpoint beyond sparse rollback archive".into());
     }
-    for offset in 0..covered {
-        let expected = frontier.sequence + offset as u64;
-        let index = expected as usize - 1;
-        let hash = &checkpoint.artifact_hashes[index];
-        if checkpoint.receipt_records[index].sequence != expected
-            || keys[offset] != format!("{prefix}/artifacts/{expected:020}-{hash}.cbor")
-            || heads[offset].sequence != expected
-            || heads[offset].artifact_hash != *hash
-        {
-            return Err("checkpoint prefix differs from immutable archive".into());
-        }
+    let index = usize::try_from(sequence - 1).map_err(|_| "checkpoint sequence overflow")?;
+    let hash = &checkpoint.artifact_hashes[index];
+    if checkpoint.receipt_records[index].sequence != sequence
+        || keys[listed_index] != format!("{prefix}/artifacts/{sequence:020}-{hash}.cbor")
+        || heads[listed_index].sequence != sequence
+        || heads[listed_index].artifact_hash != *hash
+    {
+        return Err("checkpoint head differs from immutable archive".into());
     }
     if receipt_only_record(&checkpoint.artifact)
         != *checkpoint
@@ -2753,7 +2755,7 @@ fn validate_sparse_checkpoint_archive(
     {
         return Err("checkpoint terminal head mismatch".into());
     }
-    Ok(covered)
+    Ok(listed_index + 1)
 }
 
 /// The rollback-baseline mode is usable only with the governed grant's exact
@@ -3563,12 +3565,11 @@ impl S3ImmutableArtifactStore {
         Ok(checkpoint_key)
     }
     /// Explicit rollback-baseline restore listing. The archive must begin at
-    /// the exact governed committed frontier with one baseline artifact, head
-    /// pointer, and checkpoint, followed only by contiguous v70 successors
-    /// and their checkpoints. Anything below the baseline, a missing or
-    /// mismatched baseline object, a second baseline object, or a
-    /// noncanonical key fails closed. The normal `prepare_restore` is
-    /// unchanged and still rejects such an archive.
+    /// one exact-head artifact, pointer and checkpoint whose authenticated
+    /// history contains the pre-issued grant frontier, followed only by
+    /// contiguous v70 successors and their checkpoints. Missing, mismatched,
+    /// duplicate or noncanonical objects fail closed. The normal
+    /// `prepare_restore` is unchanged and still rejects such an archive.
     async fn prepare_sparse_rollback_restore(
         &self,
         frontier: &layrs_direct_execution_v1::CommittedRestoreFrontier,
@@ -3576,15 +3577,13 @@ impl S3ImmutableArtifactStore {
         if !frontier.valid() {
             return Err("governed checkpoint frontier invalid".into());
         }
-        let base = frontier.sequence;
         let candidates = self.list_restore_keys("artifacts").await?;
         let raw_heads = self.list_restore_keys("heads").await?;
         let checkpoint_keys = self.list_restore_keys("checkpoints").await?;
         let mut heads = Vec::with_capacity(raw_heads.len());
-        for (offset, key) in raw_heads.into_iter().enumerate() {
-            let sequence = base
-                .checked_add(offset as u64)
-                .ok_or("archive sequence overflow")?;
+        let head_prefix = format!("{}/heads/", self.prefix);
+        for key in raw_heads {
+            let sequence = archive_key_sequence(&key, &head_prefix, false)?;
             if key != archive_head_key(&self.prefix, sequence) {
                 return Err("sparse rollback head outside baseline lineage".into());
             }
@@ -3603,13 +3602,19 @@ impl S3ImmutableArtifactStore {
                 artifact_hash: hash,
             });
         }
-        let last = heads
-            .last()
+        let base = heads
+            .first()
             .ok_or("sparse rollback baseline head missing")?
             .sequence;
-        if heads[0].artifact_hash != frontier.artifact_hash {
-            return Err("sparse rollback baseline differs from governed frontier".into());
+        if base < frontier.sequence
+            || heads
+                .iter()
+                .enumerate()
+                .any(|(offset, head)| head.sequence != base + offset as u64)
+        {
+            return Err("sparse rollback head outside baseline lineage".into());
         }
+        let last = heads.last().unwrap().sequence;
         let artifact_prefix = format!("{}/artifacts/", self.prefix);
         let mut available = HashSet::with_capacity(candidates.len());
         let mut at_base = 0;
@@ -3641,13 +3646,12 @@ impl S3ImmutableArtifactStore {
         if serde_cbor::to_vec(&baseline).ok().as_deref() != Some(baseline_bytes.as_ref())
             || baseline.epoch_id != EPOCH_ID
             || baseline.sequence != base
-            || baseline.state_hash != frontier.state_hash
-            || artifact_hash(&baseline) != frontier.artifact_hash
+            || artifact_hash(&baseline) != heads[0].artifact_hash
         {
             return Err("sparse rollback baseline artifact mismatch".into());
         }
         let checkpoint_namespace = format!("{}/checkpoints/", self.prefix);
-        let mut baseline_checkpoints = 0;
+        let mut baseline_checkpoints = Vec::new();
         for key in &checkpoint_keys {
             let (sequence, state_hash, _) =
                 journal_parent_snapshot_key_parts(key, &checkpoint_namespace)
@@ -3656,14 +3660,30 @@ impl S3ImmutableArtifactStore {
                 return Err("sparse rollback checkpoint outside baseline lineage".into());
             }
             if sequence == base {
-                if state_hash != frontier.state_hash {
+                if state_hash != baseline.state_hash {
                     return Err("sparse rollback checkpoint outside baseline lineage".into());
                 }
-                baseline_checkpoints += 1;
+                baseline_checkpoints.push(key);
             }
         }
-        if baseline_checkpoints != 1 {
+        if baseline_checkpoints.len() != 1 {
             return Err("sparse rollback baseline checkpoint missing or ambiguous".into());
+        }
+        let checkpoint: layrs_direct_execution_v1::DirectCheckpoint =
+            serde_cbor::from_slice(&self.read(baseline_checkpoints[0]).await?)
+                .map_err(|_| "checkpoint decode failed; genesis fallback forbidden")?;
+        if self.checkpoint_key(&checkpoint)? != *baseline_checkpoints[0] {
+            return Err("checkpoint content address mismatch".into());
+        }
+        if validate_sparse_checkpoint_archive(
+            &checkpoint,
+            frontier,
+            &keys,
+            &heads,
+            &self.prefix,
+        )? != 1
+        {
+            return Err("sparse rollback baseline checkpoint mismatch".into());
         }
         let prepared = PreparedArchiveRestore {
             keys,
@@ -14319,7 +14339,7 @@ mod tests {
                         objects.insert(key.clone(), hash.clone().into_bytes());
                     }
                 }),
-                "sparse rollback baseline differs from governed frontier",
+                "archive committed artifact missing",
             ),
             (
                 "head body malformed",
@@ -14502,10 +14522,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v70_rollback_baseline_requires_the_exact_governed_frontier() {
+    async fn v70_rollback_baseline_requires_a_governed_frontier_in_its_checkpoint() {
         let fixture = v70_rollback_fixture();
         let (package, objects) = v70_rollback_package(&fixture).await;
         let frontier = v70_rollback_frontier(&package);
+        let checkpoint: layrs_direct_execution_v1::DirectCheckpoint =
+            serde_cbor::from_slice(&objects[&package.checkpoint_key]).unwrap();
+        let anchored = layrs_direct_execution_v1::CommittedRestoreFrontier {
+            sequence: 3,
+            state_hash: checkpoint.receipt_records[2].state_hash.clone(),
+            artifact_hash: checkpoint.artifact_hashes[2].clone(),
+        };
+        assert_eq!(
+            v70_rollback_try_restore(&fixture, objects.clone(), &anchored).await,
+            Ok(4)
+        );
         let with = |edit: &dyn Fn(&mut layrs_direct_execution_v1::CommittedRestoreFrontier)| {
             let mut frontier = frontier.clone();
             edit(&mut frontier);
@@ -14514,7 +14545,7 @@ mod tests {
         let cases = [
             (
                 with(&|f| f.sequence = 3),
-                "sparse rollback head outside baseline lineage",
+                "sparse checkpoint outside governed baseline",
             ),
             (
                 with(&|f| f.sequence = 5),
@@ -14522,11 +14553,11 @@ mod tests {
             ),
             (
                 with(&|f| f.artifact_hash = sha256(b"other")),
-                "sparse rollback baseline differs from governed frontier",
+                "sparse checkpoint outside governed baseline",
             ),
             (
                 with(&|f| f.state_hash = sha256(b"other")),
-                "sparse rollback baseline artifact mismatch",
+                "sparse checkpoint outside governed baseline",
             ),
             (
                 with(&|f| f.sequence = 0),
