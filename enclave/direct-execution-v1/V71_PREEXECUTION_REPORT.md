@@ -79,6 +79,26 @@ Production incident evidence:
 - ASG remains `MinSize=0`, `MaxSize=1`, `DesiredCapacity=1`, with a 1,200-second
   health grace period.
 
+Post-report incident update (read-only observation at 13:46 IST):
+
+- The replacement logged `VERIFIED_ARCHIVE_RESTORE_START 41414/41416` at
+  08:13:30 UTC and `VERIFIED_ARCHIVE_RESTORE_COMPLETE 41416` at 08:14:08 UTC,
+  about 21 minutes after its final service start.
+- The ASG had already selected it for replacement at 08:14:06 UTC, two seconds
+  before restore completed, because the 1,200-second health grace expired.
+- Before termination/draining completed, the restored writer durably committed
+  sequences 41,417 and 41,418 and persisted verified checkpoints for both.
+- The parent used about 970 MiB RSS after restore and no second OOM was present.
+  This replacement was lost to a health-grace race, not memory pressure.
+- The ASG automatically launched `i-0592e0c1c53d007da` at 08:14:08 UTC. The
+  direct lane remained unavailable while that second replacement initialized.
+
+The current incident therefore adds a second independent lockout mechanism:
+the normal v70 restore duration is already longer than the ASG health grace.
+Unless a subsequent restore happens faster, the ASG will recycle otherwise
+valid writers just as they become ready. No ASG setting, instance, or runtime
+was changed during this observation.
+
 ## V1(c): external effects and withdrawals
 
 Read-only archive plus PostgreSQL checks at sequence 41,416 found:
@@ -149,4 +169,3 @@ V2 must not execute from release packet `3990739` in its current form.
   positive withdrawal-hold aggregate; receipt/effect aggregates; and exact
   intent-to-terminal-receipt matching. The temporary CA file was mode 0600 and
   deleted; no credential or DB URL was printed or persisted.
-
