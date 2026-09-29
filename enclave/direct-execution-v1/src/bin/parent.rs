@@ -195,8 +195,9 @@ enum PersistenceFormat {
     V70,
     V71,
     V71Hot,
-    /// v70 persistence over a sparse rollback archive that begins at the
-    /// governed grant's exact committed frontier. Never selected implicitly.
+    /// v70 persistence over a sparse exact-head rollback archive whose
+    /// checkpoint contains the governed grant's signed frontier. Never
+    /// selected implicitly.
     V70RollbackBaseline,
 }
 
@@ -14005,7 +14006,7 @@ mod tests {
         assert_eq!(artifact_hash(&artifact), package.artifact_hash);
 
         // The explicit baseline branch restores it through the retained
-        // enclave's unchanged checkpoint rules and exact committed frontier.
+        // enclave's unchanged checkpoint rules and signed committed frontier.
         let fresh = v70_rollback_store_at(&endpoint, "rollback/v70");
         let frontier = v70_rollback_frontier(&package);
         let prepared = fresh
