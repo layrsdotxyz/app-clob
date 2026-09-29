@@ -80,7 +80,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex as StdMutex,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -422,7 +422,7 @@ impl V71CutoverMarker {
     }
 }
 
-const CHECKPOINT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const CHECKPOINT_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const CHECKPOINT_OVERSIZED: &str = "checkpoint frame oversized";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CheckpointRefreshOutcome {
@@ -505,6 +505,27 @@ where
         };
         if !gate.lock().await.finish(outcome) { break; }
     }
+}
+
+/// Runs only the exact-head snapshot phase while commits are excluded. The
+/// caller owns any immutable persistence after this returns, so a slow S3 PUT
+/// cannot extend the financial-gate hold.
+async fn checkpoint_snapshot_under_gate<T, F, Fut>(
+    gate: &FinancialGate,
+    snapshot: F,
+) -> (Result<T, String>, Duration, Duration)
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, String>>,
+{
+    let wait_started = Instant::now();
+    let guard = gate.lock("checkpoint_snapshot").await;
+    let wait = wait_started.elapsed();
+    let hold_started = Instant::now();
+    let result = snapshot().await;
+    let hold = hold_started.elapsed();
+    drop(guard);
+    (result, wait, hold)
 }
 
 /// Direct, synchronous adapter for the existing Base pool-ledger Privy
@@ -2753,9 +2774,9 @@ impl S3ImmutableArtifactStore {
         let bytes = serde_cbor::to_vec(checkpoint).map_err(|_| "checkpoint encoding failed")?;
         Ok(format!("{}/checkpoints/{:020}-{}-{}.cbor", self.prefix, checkpoint.artifact.sequence, checkpoint.artifact.state_hash, sha256(&bytes)))
     }
-    async fn seal_current_checkpoint(&self, state: &AppState) -> Result<(), String> {
+    async fn build_current_checkpoint(&self, state: &AppState) -> Result<Option<layrs_direct_execution_v1::DirectCheckpoint>, String> {
         let records = self.load_committed().await?;
-        let Some(head) = records.last() else { return Ok(()); };
+        let Some(head) = records.last() else { return Ok(None); };
         let artifact_hashes = self.verified_artifact_hashes.lock().await.clone();
         let hash = artifact_hashes.last().ok_or("checkpoint archive hashes missing")?;
         let key = format!("{}/artifacts/{:020}-{hash}.cbor", self.prefix, head.sequence);
@@ -2769,9 +2790,13 @@ impl S3ImmutableArtifactStore {
             RuntimeResponse::Error { code } if code == CHECKPOINT_FRAME_OVERSIZED => return Err(CHECKPOINT_OVERSIZED.into()),
             _ => return Err("checkpoint seal rejected".into()),
         };
+        Ok(Some(checkpoint))
+    }
+    async fn persist_checkpoint(&self, checkpoint: layrs_direct_execution_v1::DirectCheckpoint) -> Result<(), String> {
+        let sequence = checkpoint.artifact.sequence;
         let key = self.checkpoint_key(&checkpoint)?;
         self.write_once(&key, serde_cbor::to_vec(&checkpoint).map_err(|_| "checkpoint encoding failed")?).await?;
-        eprintln!("VERIFIED_ARCHIVE_CHECKPOINT_PERSISTED {}", checkpoint.artifact.sequence);
+        eprintln!("VERIFIED_ARCHIVE_CHECKPOINT_PERSISTED {sequence}");
         Ok(())
     }
     /// Captures one exact v71 head under the financial gate, then releases the
@@ -2900,12 +2925,27 @@ impl S3ImmutableArtifactStore {
             self.schedule_journal_checkpoint(state).await;
         }
     }
-    /// A checkpoint seal reconstructs and transports the same large state used
-    /// by a commit. Holding the financial gate prevents both operations from
-    /// allocating full-state buffers concurrently in the parent and enclave.
+    #[cfg(test)]
+    async fn seal_current_checkpoint(&self, state: &AppState) -> Result<(), String> {
+        let Some(checkpoint) = self.build_current_checkpoint(state).await? else { return Ok(()); };
+        self.persist_checkpoint(checkpoint).await
+    }
+    /// Hold the financial gate only while selecting/reading an exact immutable
+    /// head and obtaining its enclave seal. The content-addressed checkpoint
+    /// remains valid if commits advance while its S3 write completes.
     async fn seal_current_checkpoint_serialized(&self, state: &AppState) -> Result<(), String> {
-        let _guard = state.financial_gate.lock("checkpoint_refresh").await;
-        self.seal_current_checkpoint(state).await
+        let (checkpoint, wait, hold) = checkpoint_snapshot_under_gate(&state.financial_gate, || {
+            self.build_current_checkpoint(state)
+        }).await;
+        let checkpoint = checkpoint?;
+        let sequence = checkpoint.as_ref().map(|value| value.artifact.sequence).unwrap_or_default();
+        eprintln!(
+            "VERIFIED_ARCHIVE_CHECKPOINT_GATE_RELEASED sequence={sequence} wait_ms={} hold_ms={}",
+            wait.as_millis(),
+            hold.as_millis()
+        );
+        let Some(checkpoint) = checkpoint else { return Ok(()); };
+        self.persist_checkpoint(checkpoint).await
     }
     /// Runs only after the final encrypted head is verified and adopted. The
     /// immutable archive stays authoritative and the prior checkpoint stays in
@@ -9628,6 +9668,7 @@ mod tests {
 
     #[test]
     fn checkpoint_refresh_coalesces_bursts_and_retries_without_new_commits() {
+        assert_eq!(super::CHECKPOINT_REFRESH_INTERVAL, std::time::Duration::from_secs(300));
         let mut refresh = super::CheckpointRefresh::default();
         let now = tokio::time::Instant::now();
         assert!(refresh.request());
@@ -9695,6 +9736,233 @@ mod tests {
             .1
             .receipt_id = first.receipt_id;
         assert!(ordered_journal_receipts(&duplicate_receipt).is_err());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_persistence_does_not_hold_the_financial_gate() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        let gate = Arc::new(super::FinancialGate::new());
+        let snapshot_started = Arc::new(Notify::new());
+        let persistence_started = Arc::new(Notify::new());
+        let checkpoint = {
+            let gate = Arc::clone(&gate);
+            let snapshot_started = Arc::clone(&snapshot_started);
+            let persistence_started = Arc::clone(&persistence_started);
+            tokio::spawn(async move {
+                let (result, _, hold) = super::checkpoint_snapshot_under_gate(&gate, || async {
+                    snapshot_started.notify_one();
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    Ok::<_, String>(())
+                }).await;
+                result.unwrap();
+                assert!(hold >= std::time::Duration::from_millis(45));
+                persistence_started.notify_one();
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            })
+        };
+        snapshot_started.notified().await;
+        persistence_started.notified().await;
+        let order_started = std::time::Instant::now();
+        let order_guard = gate.lock("checkpoint_concurrency_test_order").await;
+        let order_wait = order_started.elapsed();
+        drop(order_guard);
+        assert!(order_wait < std::time::Duration::from_millis(50), "order waited {order_wait:?} for ungated persistence");
+        assert!(!checkpoint.is_finished(), "checkpoint persistence must still be running");
+        checkpoint.await.unwrap();
+    }
+
+    /// Production-sized synthetic checkpoint/order benchmark. It uses the
+    /// sealed opening fixture and local temporary storage only: no production
+    /// artifact, grant, secret, network service or account is accessed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "isolated rehearsal benchmark; set LAYRS_GATE_BENCH_RECORDS"]
+    async fn v70_checkpoint_gate_and_order_latency_benchmark() {
+        use layrs_direct_execution_v1::{
+            DirectRuntime, DirectStateStore, InMemoryDirectStateStore, RuntimeMode, SealedEpoch,
+        };
+        use uuid::Uuid;
+
+        fn epoch_path() -> PathBuf {
+            std::env::var("LAYRS_BRIDGE_BENCH_EPOCH_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../../.codex-review-bundles/unified-direct-execution-20260905/new-epoch-20260911/OPENING_EPOCH_STATE_20260911.json"))
+        }
+        fn request_for(subject: &str, identity: &str, id: &str, wallet: &str) -> DirectRequest {
+            let action = DirectAction::BeginUsdcBusWithdrawal {
+                withdrawal_id: id.into(),
+                destination_chain: "arbitrum".into(),
+                asset: "USDC".into(),
+                destination: wallet.into(),
+                amount_atomic: "999999999999999".into(),
+            };
+            let mut request = DirectRequest {
+                account_id: subject.into(),
+                identity_commitment: identity.into(),
+                request_id: id.into(),
+                request_hash: String::new(),
+                financial_wallet_address: Some(wallet.into()),
+                action,
+            };
+            request.request_hash = request_hash(&request);
+            request
+        }
+
+        let target: u64 = std::env::var("LAYRS_GATE_BENCH_RECORDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(70_000);
+        assert!((3..=MAX_V70_LINEAGE_RECORDS as u64).contains(&target));
+
+        let mut live = DirectRuntime::new(
+            SealedEpoch::load(epoch_path()).unwrap(),
+            RuntimeMode::IsolatedTest,
+            vec![7; 32],
+        ).unwrap();
+        let mut store = InMemoryDirectStateStore::default();
+        let subject = "a".repeat(64);
+        let wallet = "0x1111111111111111111111111111111111111111".to_string();
+        let identity = identity_commitment_for(&subject, &wallet);
+        let mut admission = DirectRequest {
+            account_id: subject.clone(),
+            identity_commitment: identity.clone(),
+            request_id: "gate-benchmark-admission".into(),
+            request_hash: String::new(),
+            financial_wallet_address: None,
+            action: DirectAction::AdmitIdentity { wallet_address: wallet.clone() },
+        };
+        admission.request_hash = request_hash(&admission);
+        live.execute_committed(admission, &[8; 32], &mut store).unwrap();
+        let mut deposit = DirectRequest {
+            account_id: subject.clone(),
+            identity_commitment: identity.clone(),
+            request_id: "gate-benchmark-deposit".into(),
+            request_hash: String::new(),
+            financial_wallet_address: Some(wallet.clone()),
+            action: DirectAction::CreditHorizenUsdcDeposit {
+                amount_atomic: "10000000".into(),
+                custody_reference: format!("horizen-usdc-deposit:0x{}", "ab".repeat(32)),
+            },
+        };
+        deposit.request_hash = request_hash(&deposit);
+        live.execute_committed(deposit, &[8; 32], &mut store).unwrap();
+        let mut records = store.artifacts().unwrap();
+        records.sort_by_key(|artifact| artifact.sequence);
+        for artifact in &mut records { artifact.ciphertext.clear(); }
+        let mut synthetic_root = records.last().unwrap().state_hash.clone();
+        let mut last_request = None;
+        while live.committed_sequence() < target {
+            let sequence = live.committed_sequence() + 1;
+            let id = Uuid::from_u128(0x73737373222243338444000000000000 + sequence as u128).to_string();
+            let request = request_for(&subject, &identity, &id, &wallet);
+            let result = live.execute(request.clone()).unwrap();
+            assert_eq!(result.effect, "WITHDRAWAL_REJECTED");
+            let next_root = sha256(format!("v70-gate-benchmark:{sequence}").as_bytes());
+            records.push(DirectStateArtifact {
+                epoch_id: EPOCH_ID.into(),
+                sequence,
+                prior_state_hash: synthetic_root,
+                state_hash: next_root.clone(),
+                request_hash: request.request_hash.clone(),
+                nonce: Vec::new(),
+                ciphertext: Vec::new(),
+                ciphertext_hash: String::new(),
+                receipt: result.receipt,
+            });
+            synthetic_root = next_root;
+            last_request = Some(request);
+        }
+        let artifact = live.prepare_candidate(last_request.unwrap(), &[8; 32]).unwrap().artifact;
+        let predecessor = records.len() - 2;
+        records[predecessor].state_hash = artifact.prior_state_hash.clone();
+        let mut compact_head = artifact.clone();
+        compact_head.ciphertext.clear();
+        *records.last_mut().unwrap() = compact_head;
+        let mut artifact_hashes = vec!["a".repeat(64); records.len()];
+        *artifact_hashes.last_mut().unwrap() = artifact_hash(&artifact);
+        let head_path = std::env::temp_dir().join(format!("layrs-v70-gate-benchmark-head-{}.cbor", std::process::id()));
+        let artifact_bytes = {
+            let bytes = serde_cbor::to_vec(&artifact).unwrap();
+            let mut file = std::fs::File::create(&head_path).unwrap();
+            std::io::Write::write_all(&mut file, &bytes).unwrap();
+            file.sync_all().unwrap();
+            bytes.len()
+        };
+        drop(artifact);
+
+        let order_id = Uuid::from_u128(0x74747474222243338444000000000000 + target as u128).to_string();
+        let order_request = request_for(&subject, &identity, &order_id, &wallet);
+        let live = Arc::new(live);
+        let gate = Arc::new(FinancialGate::new());
+
+        let baseline_started = Instant::now();
+        let baseline_guard = gate.lock("gate_benchmark_baseline_order").await;
+        let baseline_runtime = Arc::clone(&live);
+        let baseline_request = order_request.clone();
+        tokio::task::spawn_blocking(move || baseline_runtime.prepare_candidate(baseline_request, &[8; 32]))
+            .await.unwrap().unwrap();
+        drop(baseline_guard);
+        let baseline_order = baseline_started.elapsed();
+
+        let snapshot_started = Arc::new(tokio::sync::Notify::new());
+        let checkpoint_task = {
+            let gate = Arc::clone(&gate);
+            let live = Arc::clone(&live);
+            let snapshot_started = Arc::clone(&snapshot_started);
+            tokio::spawn(async move {
+                let (checkpoint, wait, hold) = checkpoint_snapshot_under_gate(&gate, || async move {
+                    snapshot_started.notify_one();
+                    tokio::task::spawn_blocking(move || {
+                        let bytes = std::fs::read(&head_path).unwrap();
+                        std::fs::remove_file(&head_path).unwrap();
+                        let exact_head: DirectStateArtifact = serde_cbor::from_slice(&bytes).unwrap();
+                        live.seal_checkpoint(exact_head, records, artifact_hashes, &[8; 32])
+                    })
+                        .await.map_err(|_| "checkpoint benchmark task failed".to_string())?
+                        .map_err(|_| "checkpoint benchmark seal failed".to_string())
+                }).await;
+                let checkpoint = checkpoint.unwrap();
+                let persist_started = Instant::now();
+                let path = std::env::temp_dir().join(format!("layrs-v70-gate-benchmark-{}.cbor", std::process::id()));
+                let (checkpoint_bytes, path) = tokio::task::spawn_blocking(move || {
+                    let bytes = serde_cbor::to_vec(&checkpoint).unwrap();
+                    let mut file = std::fs::File::create(&path).unwrap();
+                    std::io::Write::write_all(&mut file, &bytes).unwrap();
+                    file.sync_all().unwrap();
+                    (bytes.len(), path)
+                }).await.unwrap();
+                let persist = persist_started.elapsed();
+                std::fs::remove_file(path).unwrap();
+                (wait, hold, persist, checkpoint_bytes)
+            })
+        };
+        snapshot_started.notified().await;
+        let concurrent_started = Instant::now();
+        let concurrent_guard = gate.lock("gate_benchmark_concurrent_order").await;
+        let concurrent_gate_wait = concurrent_started.elapsed();
+        let concurrent_service_started = Instant::now();
+        let concurrent_runtime = Arc::clone(&live);
+        tokio::task::spawn_blocking(move || concurrent_runtime.prepare_candidate(order_request, &[8; 32]))
+            .await.unwrap().unwrap();
+        drop(concurrent_guard);
+        let concurrent_service = concurrent_service_started.elapsed();
+        let concurrent_order = concurrent_started.elapsed();
+        let (checkpoint_wait, checkpoint_hold, checkpoint_persist, checkpoint_bytes) = checkpoint_task.await.unwrap();
+
+        eprintln!(
+            "BRIDGE_GATE_BENCH records={target} artifact_bytes={artifact_bytes} checkpoint_bytes={checkpoint_bytes} checkpoint_wait_ms={} checkpoint_hold_ms={} checkpoint_persist_ms={} baseline_order_ms={} concurrent_order_ms={} concurrent_gate_wait_ms={} concurrent_service_ms={} concurrent_delta_ms={}",
+            checkpoint_wait.as_millis(),
+            checkpoint_hold.as_millis(),
+            checkpoint_persist.as_millis(),
+            baseline_order.as_millis(),
+            concurrent_order.as_millis(),
+            concurrent_gate_wait.as_millis(),
+            concurrent_service.as_millis(),
+            concurrent_order.saturating_sub(baseline_order).as_millis(),
+        );
+        assert!(checkpoint_hold < Duration::from_secs(15));
+        assert!(checkpoint_persist > Duration::ZERO);
     }
 
     use super::*;
