@@ -30,7 +30,7 @@ Do not begin a production rollout unless all of these are true:
 The soft abort is five minutes. At five minutes, stop advancing the rollout
 and retain the current authoritative writer. The hard abort must be later than
 the rehearsal's measured restore plus traffic-switch duration with a five
-minute margin, and is never less than 25 minutes; the earlier ten-minute rule
+minute margin, and is never less than 25 minutes. Any shorter fixed deadline
 is invalid because the measured legacy restore exceeded it. At the hard gate,
 remove the candidate from routing and use the retained writer or rehearsed
 rollback procedure. Never wait indefinitely for a checkpoint, shadow, grant,

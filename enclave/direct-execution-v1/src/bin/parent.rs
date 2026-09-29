@@ -7635,10 +7635,13 @@ async fn stage_and_promote_v71_shadow(state: AppState, run_id: String) -> Result
         Some(ArchiveStore::S3(store)) => store,
         _ => return Err("V71_S3_ARCHIVE_REQUIRED".into()),
     };
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10 * 60);
+    // This is a safe pre-cutover timeout: expiry leaves v70 authoritative.
+    // Keep it aligned with the minimum operator hard-abort window so the
+    // runtime cannot retain an obsolete shorter rollout deadline.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(25 * 60);
     let shadow_source_sequence = loop {
         if tokio::time::Instant::now() >= deadline {
-            return Err("V71_SHADOW_PROMOTION_ABORT_10_MINUTES".into());
+            return Err("V71_SHADOW_PROMOTION_TIMEOUT".into());
         }
         match exchange(&state, RuntimeRequest::V71ShadowStatus).await {
             Ok(RuntimeResponse::V71ShadowStatus {

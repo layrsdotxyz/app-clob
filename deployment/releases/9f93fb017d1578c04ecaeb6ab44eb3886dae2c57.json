@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "releaseStatus": "built-verified-not-authorized-for-production",
+  "releaseStatus": "superseded-do-not-deploy",
   "releaseId": "v71-prep-9f93fb0-20260928",
   "sourceCommit": "9f93fb017d1578c04ecaeb6ab44eb3886dae2c57",
   "sourceBranch": "codex/layrs-v71-integration-20260928",
@@ -51,5 +51,5 @@
   "candidateWriterGrantCommitment": null,
   "rollbackWriterGrantCommitment": null,
   "signature": null,
-  "signatureNote": "No production authorization is embedded. Activation requires current-head fencing, distinct candidate and rollback grants, exact public measurement-manifest rotation, and the five-minute soft and ten-minute hard abort gates. Durable Commands are not part of this release."
+  "signatureNote": "SUPERSEDED by 009e198. Do not deploy or sign this packet. Any successor uses a five-minute soft gate and a hard gate equal to measured restore plus measured ASG and traffic switch plus five minutes, with an absolute 25-minute floor. Durable Commands are not part of this release."
 }
