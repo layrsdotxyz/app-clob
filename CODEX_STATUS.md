@@ -2,9 +2,9 @@
 
 | Field | Status |
 | --- | --- |
-| Current step | Part A A0 complete; A1a pre-execution report next; v71 A2 correction remains non-production |
-| What's done | V1 report proves retained-v70 rollback loses every post-baseline v71 commit. A0 changed only the production ASG health-check grace from 1,200 to 3,600 seconds, with no process suspension; readback showed the same healthy `i-0592e0c1c53d007da` InService and desired/min/max unchanged at 1/0/1. Evidence is in `enclave/direct-execution-v1/A0_GRACE_RESULT.md`. |
-| What's next | Prepare A1a read-only bridge report: exact v70-only image/parameters, launch-template/ASG-only change-set proof, m6i.2xlarge memory/restore evidence, retained-v70 rollback path, signer inputs and current safety cutoff. Separately correct v71 rollback preservation, rebuild/rehearse both AMIs and rerun V1 before any later promotion approval. |
-| Blockers | A1b execution requires explicit approval after A1a. Current v71 packet 3990739 fails rollback-preservation V1(a) and cannot be promoted. |
-| Production-affecting action pending approval | A1 bridge execution and any later v71 promotion are not authorized. No production action is in flight. |
-| Last updated (IST) | 2026-09-29 14:21:00 IST |
+| Current step | Approved v71 completion: design and implement zero-loss v70 rollback preservation, then merge the live bridge delta |
+| What's done | Reconfirmed V1(a): packet `3990739` captures one v71 head and loses every acknowledged successor on retained-v70 rollback. Confirmed the existing exact-head materializer releases the financial gate before package persistence and is one-shot, so it cannot be the final rollback guarantee. Added the missing mandatory production gates: authenticated browser attestation/portfolio smoke, resolver capability and market lifecycle, proof-frontier/backlog progress, and zero new BFF/publisher binding errors. Auditing the narrowest lineage-preserving correction against the existing rollback worker branches and the live bridge commit `d5e65d7`. |
+| What's next | Implement the corrected rollback lineage and its post-capture v71-commit test; merge bridge memory/checkpoint fixes; run library/enclave/parent/template suites; rebuild candidate and rollback AMIs; rehearse promotion, post-promotion commits, complete ASG rollback and exact balance/receipt/sequence continuity; rerun V1; then prepare and execute the approved production rollout with all release-identity consumers rotated atomically. |
+| Blockers | None. Production remains untouched until V1, both AMI rehearsals, complete ASG rollback, restore-timed abort gates and consumer-identity rotation all pass. |
+| Production-affecting action pending approval | The owner has approved production rollout after all listed gates pass. No production action is currently in flight. |
+| Last updated (IST) | 2026-09-29 23:24:00 IST |

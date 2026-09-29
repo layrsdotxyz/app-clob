@@ -146,6 +146,23 @@ Use AWS profile `predifi-root` and region `us-east-1` throughout.
    journal candidate time, object PUT/readback, ACK time, journal record size,
    sequence continuity, all authenticated roots, checkpoint verification,
    unresolved effects, and writer health.
+10. Before the handoff, inventory every release-identity consumer and prepare
+    rollback-pinned rotations for the direct-market resolver, direct BFF and
+    public-proof publisher. After the candidate attests, rotate their exact
+    PCR/binding/manifest inputs together; preserve predecessor task definitions
+    and immutable secrets. A healthy writer alone is not release success.
+11. Run an authenticated production browser smoke as a normal user. Require a
+    verified enclave, trading enabled, and a readable private portfolio; abort
+    on `TRADING BLOCKED`, an attestation error, or an admission/portfolio error.
+12. Require the direct-market resolver capability check to pass against a fresh
+    nonce-bound candidate attestation, and verify the current market is open
+    and the first due resolution completes without a capability failure.
+13. Require the public-proof publisher frontier to advance and the pre-handoff
+    backlog to drain without a permanent gap or duplicate. Query both BFF and
+    publisher logs from handoff onward and require zero new
+    `QUEST_PUBLIC_RECEIPT_BINDING_INVALID` and
+    `QUEST_PUBLIC_RECEIPT_ATTESTATION_INVALID` errors. Any failure is an
+    incomplete release step and triggers the reviewed consumer/runtime rollback.
 
 The reviewed candidate invocation is:
 
