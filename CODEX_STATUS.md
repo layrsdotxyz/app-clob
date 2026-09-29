@@ -2,9 +2,9 @@
 
 | Field | Status |
 | --- | --- |
-| Current step | Approved v71 completion: rebuild and rehearse the corrected pre-issued rollback-grant path |
-| What's done | Current-frontier V1 passes with only the documented mm01 hold and zero unexplained holds or active deposit effects. The signed release manifest is stored in a new immutable secret under the existing signer. Review found that the prior sparse restore wrongly required a pre-issued rollback grant to name the unknowable future rollback head. The narrow correction now accepts a later exact-head checkpoint only when it cryptographically contains the signed historical frontier; targeted rollback tests pass 12/12, including later-head preservation and tamper/missing/extra-object rejection. Production is unchanged. |
-| What's next | Apply the identical restore correction to the bridge-derived rollback parent, run full suites, rebuild and inspect both AMIs, repeat the ASG rollback rehearsal, then generate and inspect candidate and rollback production change sets. Refuse execution unless both processed templates retain exactly 3,600 seconds. |
-| Blockers | No external blocker. Existing AMIs and their old rollback rehearsal are superseded by the correction and are not deployable. |
+| Current step | Approved v71 production rollout: final current-frontier refresh, projection-authority handoff, candidate execution and identity-consumer rotation |
+| What's done | Current-frontier V1 passes with only the documented mm01 hold and zero unexplained holds. Candidate and rollback suites pass; replacement AMIs are encrypted, hash-inspected and protected. Separate signed candidate/rollback grants verify. The isolated ASG candidate-to-rollback rehearsal passed in 220 seconds. Candidate, pre-promotion rollback and post-promotion exact-head rollback change sets are AVAILABLE, each changes exactly DormantLaunchTemplate, DormantAutoScalingGroup and the narrow RuntimeRole, and every processed template resolves HealthCheckGracePeriod to 3,600 seconds. The existing signer produced a new immutable v71 manifest; predecessor secrets are untouched. Production is still on the bridge. |
+| What's next | Refresh the mutable frontier and no-go gates, atomically rebind the projection authority to the candidate, execute the inspected candidate change set outside :25–:35 IST, monitor restore/promotion under the restore-based deadline, rotate all three release-identity consumers, then run post-release flow/proof/market checks. |
+| Blockers | None. Any second writer, unexplained hold, lineage/grant mismatch, new unresolved external effect, scope drift, or grace below 3,600 seconds is a hard no-go. |
 | Production-affecting action pending approval | The owner has approved production rollout after all listed gates pass. No production action is currently in flight. |
-| Last updated (IST) | 2026-09-30 04:43 IST |
+| Last updated (IST) | 2026-09-30 05:08 IST |

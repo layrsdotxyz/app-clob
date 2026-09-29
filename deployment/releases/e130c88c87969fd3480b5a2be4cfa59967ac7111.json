@@ -1,0 +1,80 @@
+{
+  "schemaVersion": 2,
+  "releaseStatus": "approved-pre-execution",
+  "releaseId": "v71-e130c88-anchor-20260930",
+  "sourceCommit": "e130c88c87969fd3480b5a2be4cfa59967ac7111",
+  "sourceBranch": "codex/layrs-v71-integration-20260928",
+  "region": "us-east-1",
+  "candidate": {
+    "amiId": "ami-0f0fc3bdd2e8ebf04",
+    "amiName": "layrs-opening-epoch-v71-rollback-anchor-bc52c6f-20260930",
+    "amiSnapshotId": "snap-001791e22460a57b8",
+    "parentSha256": "ba07ddb58651465d1293b40f174bf629678d89c6b38f47a3c97c5ad84d40e3f4",
+    "enclaveSha256": "7171cceee99929d0df27f62124f5760b596b98eb493c38e078456e830f2fc252",
+    "eifSha256": "fd432646a922c8863a2e697502fa2417a0df6e2a59c037fb6044ce64d747a679",
+    "pcr0": "6a82280c5ab06619ff0c6018fbc691ae3cae32125f476bfb083e55d5ec327ebb4c74d49b338b8fdb0a1ea930c284f28a",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "fa8211c97c9f5eb5e214822254a72362a7483ec21751cbb1e041adb5ff9dc278c01ff9354d0795a2b93291ea6fd422bb",
+    "activationId": "layrs-v71-e130c88-20260930-82e4ea02",
+    "writerGrantCommitment": "75ad85dea0fc4905d6b0b0f2427a157a554f9363142438415ef9e0aaa837de01"
+  },
+  "retainedV70Rollback": {
+    "sourceCommit": "b980988e0fb5b538299b4403fe5500a5a1a134a9",
+    "amiId": "ami-00b8bd8408d5008db",
+    "amiName": "layrs-opening-epoch-v70-rollback-anchor-b980988-20260930",
+    "amiSnapshotId": "snap-08d5d390cb95e0ca7",
+    "parentSha256": "2d8a3e3e939bb0a2c1e5d879c6924f061f381f7107765ce0145c4ad2ce820fd7",
+    "enclaveSha256": "229382b54cda8f4fbbbcb5d0fa8b6fa6e678cfde4b61aaac86da376bf3a3763a",
+    "eifSha256": "6100a96de33300bac8b13e7f0700883e0fe9f14bdfb900305d55d651b95a9256",
+    "pcr0": "59beb72420f56eb9b6a794b7d9ac4aced2c191ee964381cbc01d2d73e386645abe4eaa9af8757984ad52e79916029572",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "28a6c5946a520ea6f72ace25a5cf9b57a8949c84377858e1c81457edaadd188e2b11b2eaafcb8c3352bf9e4a9f012ced",
+    "activationId": "layrs-v70-rollback-b980988-20260930-b020a0e0",
+    "writerGrantCommitment": "1ca7974e3d78c37b6248e68c0c36c0100430b3a52f507dd655f3aefd40d72b5b"
+  },
+  "releaseManifest": {
+    "secretArn": "arn:aws:secretsmanager:us-east-1:082223548516:secret:layrs/production/runtime/v71-ed0b4f9-dd56553d330f7227-jsGdTY",
+    "sha256": "dd56553d330f72277bde0e0915a61e4b06d8d2600e64db9fb5c30a5980378df4",
+    "signer": "existing-release-signer"
+  },
+  "changeSets": {
+    "candidate": "v71-e130c88-anchor-20260930-0453",
+    "prePromotionRollback": "v70-prepromotion-b980988-anchor-20260930-0502",
+    "postPromotionRollback": "v70-rollback-b980988-anchor-20260930-0454",
+    "expectedResources": [
+      "DormantAutoScalingGroup",
+      "DormantLaunchTemplate",
+      "RuntimeRole"
+    ],
+    "healthCheckGracePeriodSeconds": 3600
+  },
+  "rollbackRehearsal": {
+    "kind": "isolated-asg-candidate-to-rollback",
+    "elapsedSeconds": 220,
+    "result": "pass"
+  },
+  "verification": {
+    "candidateLibrary": "110 passed, 3 ignored",
+    "candidateEnclave": "34 passed",
+    "candidateParent": "121 passed, 1 ignored",
+    "candidateRollbackFocused": "12 passed",
+    "rollbackLibrary": "73 passed, 1 ignored",
+    "rollbackEnclave": "24 passed",
+    "rollbackParent": "83 passed, 1 ignored",
+    "templateSuites": "candidate 5 passed; rollback 8 passed",
+    "kmsGrantSignatures": "verified",
+    "imageInspection": "encrypted, deregistration protected, writer disabled, production access denied, hashes matched"
+  },
+  "configuration": {
+    "persistenceFormat": "v71-hot",
+    "rollbackPrefix": "direct-execution/rollback/v71-e130c88-20260930-82e4ea02",
+    "maximumSubsidyAtomic": "50000",
+    "durableCommands": false
+  },
+  "abortPolicy": {
+    "softAbortSeconds": 300,
+    "hardAbortFormula": "max(1500, measured_restore_seconds + measured_asg_switch_seconds + 300)",
+    "hardAbortFloorSeconds": 1500,
+    "measuredAsgSwitchSeconds": 220
+  }
+}
