@@ -12,12 +12,12 @@ No step in this document is authorization to deploy or mutate production.
 
 Do not begin a production rollout unless all of these are true:
 
-1. The current v70 checkpoint still fits the old 256 MiB reader, so the
-   retained v70 EIF can restore the pre-rollout archive.
+1. The current checkpoint and full archive are readable by the exact live
+   bridge image, which remains the pre-promotion fallback.
 2. The bridge's 768 MiB frame benchmark passes within the 8 GiB enclave for
    commit, checkpoint seal, full restore, and failed oversize handling.
-3. The retained v70 EIF digest, launch inputs, and rollback commands have been
-   independently checked.
+3. The bridge-derived sparse-rollback parent, unchanged live bridge EIF digest,
+   launch inputs, and rollback commands have been independently checked.
 4. There are two distinct grants: one candidate grant and one unconsumed
    rollback grant. The rollback grant is never supplied to the candidate. A
    failed candidate attempt may consume only the candidate grant.
@@ -59,7 +59,7 @@ exact committed head, and write the three-object rollback baseline. On
 success it logs `V70_ROLLBACK_HANDOFF_READY` and deliberately retains the gate
 until the retained-v70 ASG replaces the process. This prevents any later v71
 command from being acknowledged outside the rollback package. Leave the
-prefix unset until the production-copy seal duration has been measured and
+prefix unset until the production-shaped-copy seal duration has been measured and
 the fresh prefix and rollback grant have been verified. The hook does not
 capture, queue, or replay pending commands and exposes no network endpoint.
 
@@ -121,7 +121,7 @@ and total latency. For every checkpoint, require disposable non-writer restore
 verification before publication. Abort on a journal latch, root mismatch,
 unresolved external effect, or latency regression beyond the agreed gate.
 
-### 5. Retained-v70 rollback
+### 5. Bridge-derived v70 rollback
 
 Keep serving v71 until rollback is actually required. Pause external dispatch,
 send `SIGUSR2` to the parent service, and require
@@ -134,10 +134,14 @@ read back exactly. The parent retains the financial gate after readiness; do
 not resume it or send a second signal. Execute the pre-reviewed ASG rollback
 while that exact-head fence remains held.
 
-Before a rollout that may need rollback, rehearse this against a production
-uses the retained v70 EIF, the fresh rollback prefix, the exact committed
-frontier, and the separate unconsumed rollback grant. Missing, extra, mutated,
-noncanonical, or wrong-frontier objects fail closed.
+Before a rollout that may need rollback, rehearse this against a
+production-shaped copy. The rollback uses the bridge-derived compatibility
+parent, unchanged live bridge EIF, fresh rollback prefix, exact committed
+frontier, and separate unconsumed rollback grant. Missing, extra, mutated,
+noncanonical, or wrong-frontier objects fail closed. The exact live bridge
+parent is not an immediate second hop because it requires a contiguous
+sequence-1-through-head archive; use it only after such an archive has been
+separately produced and rehearsed.
 
 ## Abort behavior
 
