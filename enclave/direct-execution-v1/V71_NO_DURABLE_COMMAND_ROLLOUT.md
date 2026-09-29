@@ -25,7 +25,17 @@ Do not begin a production rollout unless all of these are true:
    baseline and measured handoff capture, restore, and traffic-switch time.
 6. The non-writer restore verifier has accepted the latest v70 checkpoint and
    every published v71 checkpoint.
-7. There is no unresolved external effect.
+7. The balance gate reports zero unexplained withdrawal holds. A hold is
+   explained only when its reservation receipt, immutable four-leg custody
+   proof, destination-chain delivery, amount and intended terminal action are
+   all recorded and independently verified. The known mm01 hold
+   `dff330c1-4ca3-46de-bb86-d192b8ddcc67` is documented in
+   `evidence/MM01_EXPLAINED_WITHDRAWAL_HOLD_20260930.json`; it must be carried
+   forward unchanged, never reverted and never paid a second time. After
+   promotion, retry only its original settlement idempotency key and require a
+   `WITHDRAWAL_SETTLED` receipt bound to the existing Base transaction before
+   declaring the withdrawal gate healthy.
+8. There is no other unresolved external effect.
 
 The soft abort is five minutes. At five minutes, stop advancing the rollout
 and retain the current authoritative writer. The hard abort must be later than
@@ -46,6 +56,14 @@ LAYRS_DIRECT_V71_SHADOW_RUN_ID=<lowercase rollout id>
 LAYRS_DIRECT_V71_AUTO_PROMOTE=true
 LAYRS_DIRECT_V70_ROLLBACK_PREFIX=<fresh rollback prefix>
 ```
+
+Both the v71 candidate and bridge-derived rollback parent must read
+`maximumSubsidyAtomic=50000` from the same hash-pinned Phase-1
+`configurationJson` used by the BFF. The CloudFormation
+`UsdcMaximumSubsidyAtomic` parameter is fixed to 50000 as a deployment guard;
+it is not an independent runtime source. Both candidate and rollback processed
+change sets must retain `HealthCheckGracePeriod: 3600`, which exceeds the
+measured restore plus margin and prevents an ASG recycle loop during restore.
 
 `v71-hot` starts on v70 when the immutable cutover marker is absent. It starts
 on v71 only when `journal-v71/cutover.cbor` exists and exactly matches the

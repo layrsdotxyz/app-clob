@@ -77,8 +77,12 @@ archive exists. The present three-object handoff does not create that archive.
 ## Remaining production gates
 
 1. Re-run V1 against the current immutable production frontier: checkpoint
-   readability, exact sequence/state/artifact hashes, no unresolved external
-   effects, one healthy writer, and non-writer restore verification.
+   readability, exact sequence/state/artifact hashes, zero unexplained holds,
+   no other unresolved external effects, one healthy writer, and non-writer
+   restore verification. Preserve the documented mm01 hold in
+   `evidence/MM01_EXPLAINED_WITHDRAWAL_HOLD_20260930.json`; after promotion it
+   must settle through its original idempotency key and existing Base proof,
+   without hold reversal or a replacement payout.
 2. Create two distinct grants. The candidate never receives the unconsumed
    rollback grant. A failed candidate cannot burn the rollback activation.
 3. Sign the new immutable release manifest with the existing release signer.
@@ -88,7 +92,9 @@ archive exists. The present three-object handoff does not create that archive.
    secrets and task definitions intact for rollback.
 5. Create and inspect candidate and rollback CloudFormation change sets. The
    candidate scope must contain only the reviewed direct-execution resources;
-   the rollback packet must include the ASG update.
+   the rollback packet must include the ASG update. Both processed templates
+   must show `HealthCheckGracePeriod: 3600` and must source the 50,000-atomic
+   subsidy cap from the same hash-pinned Phase-1 configuration used by the BFF.
 6. Five-minute soft abort. Hard abort is the current-frontier measured restore
    plus the measured ASG/traffic-switch duration plus five minutes, never less
    than 25 minutes. The isolated ASG component measured 211 seconds. Avoid
