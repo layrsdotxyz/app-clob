@@ -293,6 +293,9 @@ where
         RuntimeRequest::SealJournalCheckpoint => {
             seal_journal_checkpoint(state).await
         }
+        RuntimeRequest::VerifyCheckpoint { checkpoint } => {
+            verify_checkpoint(state, checkpoint).await
+        }
         RuntimeRequest::VerifyJournalCheckpoint { checkpoint } => {
             verify_journal_checkpoint(state, checkpoint).await
         }
@@ -1850,6 +1853,54 @@ async fn verify_journal_checkpoint(
     }
 }
 
+/// Restore a v70 checkpoint with the enclave-held keys into a disposable
+/// runtime. This runs before authoritative startup recovery, never attaches
+/// the restored value to `EnclaveState`, and therefore cannot create a second
+/// writer or execute a financial command.
+async fn verify_checkpoint(
+    state: Arc<Mutex<EnclaveState>>,
+    checkpoint: layrs_direct_execution_v1::DirectCheckpoint,
+) -> RuntimeResponse {
+    let snapshot = {
+        let state = state.lock().await;
+        if state.recovery_complete
+            || state.restore_candidate.is_some()
+            || state.v71_restore_candidate.is_some()
+            || state.committed_restore_frontier.as_ref().is_some_and(|frontier| {
+                !frontier.accepts_checkpoint(&checkpoint)
+            })
+        {
+            None
+        } else {
+            Some((
+                state.epoch.clone(),
+                state.mode,
+                zeroize::Zeroizing::new(state.receipt_key.clone()),
+                zeroize::Zeroizing::new(state.state_key.clone()),
+            ))
+        }
+    };
+    let Some((epoch, mode, receipt_key, state_key)) = snapshot else {
+        return RuntimeResponse::Error {
+            code: "CHECKPOINT_VERIFY_UNAVAILABLE".into(),
+        };
+    };
+    match tokio::task::spawn_blocking(move || {
+        DirectRuntime::new(epoch, mode, receipt_key.to_vec())
+            .and_then(|runtime| runtime.restore_checkpoint(&checkpoint, &state_key))
+    })
+    .await
+    {
+        Ok(Ok(restored)) => RuntimeResponse::CheckpointVerified {
+            sequence: restored.committed_sequence(),
+            state_hash: restored.committed_state_hash(),
+        },
+        _ => RuntimeResponse::Error {
+            code: "CHECKPOINT_VERIFY_FAILED".into(),
+        },
+    }
+}
+
 async fn seal_checkpoint_with<F>(state: &Arc<Mutex<EnclaveState>>, seal: F) -> RuntimeResponse
 where F: FnOnce(&DirectRuntime, &[u8]) -> Result<layrs_direct_execution_v1::DirectCheckpoint, layrs_direct_execution_v1::RuntimeError> + Send + 'static {
     let snapshot = {
@@ -2849,6 +2900,32 @@ mod tests {
         // Reconnecting parent is allowed, but cannot change adopted state.
         assert!(matches!(begin_checkpoint_restore(Arc::clone(&restarted), checkpoint).await, RuntimeResponse::RestoreProgress { recovered_sequence: 3, .. }));
         assert!(matches!(finish_committed_restore(Arc::clone(&restarted), 3, root).await, RuntimeResponse::RecoveryComplete { .. }));
+    }
+    #[tokio::test]
+    async fn checkpoint_non_writer_verifier_restores_and_discards_exact_state() {
+        let running = state(); let store = FilesystemImmutableArtifactStore::new(artifact_dir());
+        recover(Arc::clone(&running), vec![]).await;
+        commit_through_parent_callback(Arc::clone(&running), request("checkpoint-verify"), &store).await;
+        let artifacts = store.load_committed().unwrap();
+        let records = artifacts.iter().cloned().map(|mut record| { record.ciphertext.clear(); record }).collect();
+        let hashes = artifacts.iter().map(layrs_direct_execution_v1::artifact_hash).collect();
+        let checkpoint = running.lock().await.runtime.seal_checkpoint(artifacts[0].clone(), records, hashes, &[8;32]).unwrap();
+        let expected_root = checkpoint.artifact.state_hash.clone();
+
+        let verifier = state();
+        assert_eq!(runtime_response(Arc::clone(&verifier), RuntimeRequest::VerifyCheckpoint { checkpoint: checkpoint.clone() }).await,
+            RuntimeResponse::CheckpointVerified { sequence: 1, state_hash: expected_root });
+        let state = verifier.lock().await;
+        assert!(!state.recovery_complete);
+        assert!(state.restore_candidate.is_none());
+        assert_eq!(state.runtime.committed_sequence(), 0);
+        drop(state);
+
+        let mut corrupt = checkpoint;
+        corrupt.artifact.ciphertext[0] ^= 1;
+        assert!(matches!(runtime_response(Arc::clone(&verifier), RuntimeRequest::VerifyCheckpoint { checkpoint: corrupt }).await,
+            RuntimeResponse::Error { ref code } if code == "CHECKPOINT_VERIFY_FAILED"));
+        assert_eq!(verifier.lock().await.runtime.committed_sequence(), 0);
     }
     #[tokio::test]
     async fn checkpoint_restore_rejects_rollback_below_governed_frontier_and_corrupt_snapshot() {

@@ -3744,6 +3744,12 @@ pub enum RuntimeRequest {
         writer_fence_evidence_sha256: Option<String>,
     },
     SealJournalCheckpoint,
+    /// Authenticates, decrypts and invariant-checks a v70 checkpoint in a
+    /// disposable runtime before authoritative startup recovery. The
+    /// restored runtime is discarded and can never execute a command.
+    VerifyCheckpoint {
+        checkpoint: DirectCheckpoint,
+    },
     /// Restores an authenticated checkpoint into a disposable runtime that is
     /// never installed as the writer. Parents use this before publishing each
     /// checkpoint; exact immutable readback then proves the published bytes
@@ -3922,6 +3928,7 @@ pub enum RuntimeResponse {
     },
     RestoreProgress { recovered_sequence: u64, recovered_state_hash: String },
     CheckpointSealed { checkpoint: DirectCheckpoint },
+    CheckpointVerified { sequence: u64, state_hash: String },
     Balance {
         amount_atomic: String,
     },

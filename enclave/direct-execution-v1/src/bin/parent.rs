@@ -4649,13 +4649,48 @@ impl S3ImmutableArtifactStore {
             checkpoint_keys,
         } = prepared;
         let (start, mut records, begin) = if let Some(key) = checkpoint_keys.last() {
-            let checkpoint: layrs_direct_execution_v1::DirectCheckpoint =
+            let verification_checkpoint: layrs_direct_execution_v1::DirectCheckpoint =
                 serde_cbor::from_slice(&self.read(key).await?)
                     .map_err(|_| "checkpoint decode failed; genesis fallback forbidden")?;
-            if self.checkpoint_key(&checkpoint)? != *key {
+            if self.checkpoint_key(&verification_checkpoint)? != *key {
                 return Err("checkpoint content address mismatch".into());
             }
-            let start = validate_checkpoint_archive(&checkpoint, &keys, &heads, &self.prefix)?;
+            let start = validate_checkpoint_archive(
+                &verification_checkpoint,
+                &keys,
+                &heads,
+                &self.prefix,
+            )?;
+            let expected_state_hash = verification_checkpoint.artifact.state_hash.clone();
+            match exchange(
+                state,
+                RuntimeRequest::VerifyCheckpoint {
+                    checkpoint: verification_checkpoint,
+                },
+            )
+            .await
+            .map_err(|_| "checkpoint non-writer verification transport failed")?
+            {
+                RuntimeResponse::CheckpointVerified {
+                    sequence,
+                    state_hash,
+                } if sequence == start as u64 && state_hash == expected_state_hash => {
+                    eprintln!("VERIFIED_CHECKPOINT_NON_WRITER_RESTORE {sequence}");
+                }
+                _ => return Err("checkpoint non-writer verification failed".into()),
+            }
+            // Re-read after the disposable verifier has dropped its restored
+            // runtime. This avoids retaining or cloning a checkpoint-sized
+            // frame while preserving exact content-address verification.
+            let checkpoint: layrs_direct_execution_v1::DirectCheckpoint =
+                serde_cbor::from_slice(&self.read(key).await?)
+                    .map_err(|_| "checkpoint decode failed after verification")?;
+            if self.checkpoint_key(&checkpoint)? != *key
+                || checkpoint.artifact.sequence != start as u64
+                || checkpoint.artifact.state_hash != expected_state_hash
+            {
+                return Err("checkpoint changed after non-writer verification".into());
+            }
             let records = checkpoint.receipt_records.clone();
             let begin = exchange(state, RuntimeRequest::BeginCheckpointRestore { checkpoint })
                 .await
