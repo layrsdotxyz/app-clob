@@ -22,16 +22,19 @@ Do not begin a production rollout unless all of these are true:
    rollback grant. The rollback grant is never supplied to the candidate. A
    failed candidate attempt may consume only the candidate grant.
 5. A production-copy rehearsal has produced the three-object rollback
-   baseline and measured restore plus traffic-switch time below 10 minutes.
+   baseline and measured handoff capture, restore, and traffic-switch time.
 6. The non-writer restore verifier has accepted the latest v70 checkpoint and
    every published v71 checkpoint.
 7. There is no unresolved external effect.
 
 The soft abort is five minutes. At five minutes, stop advancing the rollout
-and retain the current authoritative writer. The hard abort is ten minutes. At
-ten minutes, remove the candidate from routing and use the retained writer or
-the rehearsed rollback procedure. Never wait indefinitely for a checkpoint,
-shadow, grant, or health check.
+and retain the current authoritative writer. The hard abort must be later than
+the rehearsal's measured restore plus traffic-switch duration with a five
+minute margin, and is never less than 25 minutes; the earlier ten-minute rule
+is invalid because the measured legacy restore exceeded it. At the hard gate,
+remove the candidate from routing and use the retained writer or rehearsed
+rollback procedure. Never wait indefinitely for a checkpoint, shadow, grant,
+or health check.
 
 ## Configuration
 

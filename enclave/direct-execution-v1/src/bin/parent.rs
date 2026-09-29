@@ -2907,7 +2907,7 @@ impl S3ImmutableArtifactStore {
     /// Before opening the listener, collapse a restored tail that has reached
     /// checkpoint cadence. One synchronous attempt prevents the next commit
     /// from crossing the restore bound. Failure remains non-fatal and starts
-    /// the existing 30-second background retry, so availability is preserved.
+    /// the existing five-minute background retry, so availability is preserved.
     async fn catch_up_restored_journal_checkpoint(&self, state: &AppState) {
         let sequence = match &*self.journal.lock().await {
             JournalWriterState::Eligible(head) => head.sequence,
