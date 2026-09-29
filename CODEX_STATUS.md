@@ -2,9 +2,9 @@
 
 | Field | Status |
 | --- | --- |
-| Current step | Part 2 V1 complete; V2 blocked and not approvable |
-| What's done | V1 report written. Proven that retained-v70 rollback loses every v71 commit after its one-time captured baseline. Frontier advanced from 41,416 to 41,418 during the automatic recovery. Read-only archive/DB checks show zero withdrawal holds and no unresolved external effect. Observed the unplanned OOM and first automatic replacement without intervention. The replacement completed restore after about 21 minutes, two seconds after the ASG had already selected it for termination, then durably committed 41,417 and 41,418. |
-| What's next | Continue read-only monitoring of the second automatic v70 restore and sequence continuity. Emergency option pending owner approval: suspend only ASG HealthCheck and ReplaceUnhealthy before the next grace expiry, let restore finish, verify continuity, govern the grace increase to 1,800 seconds, then resume. Separately await the decision between a narrowly corrected rollback-preservation packet and a bridge-only emergency release; rerun V1 before any V2 action. |
-| Blockers | Current packet 3990739 fails V1(a). The production ASG health grace is 1,200 seconds while the observed restore took about 1,261 seconds, causing an automatic replacement loop and continued direct-lane unavailability. V2 requires explicit approval and must not execute from the current packet. |
-| Production-affecting action pending approval | Immediate ASG HealthCheck/ReplaceUnhealthy suspension and governed 1,800-second grace correction are pending approval. V2 writer fence, grants, manifest rotation and CloudFormation execution are also pending approval; none is in flight. |
-| Last updated (IST) | 2026-09-29 13:56:00 IST |
+| Current step | Part A A0 complete; A1a pre-execution report next; v71 A2 correction remains non-production |
+| What's done | V1 report proves retained-v70 rollback loses every post-baseline v71 commit. A0 changed only the production ASG health-check grace from 1,200 to 3,600 seconds, with no process suspension; readback showed the same healthy `i-0592e0c1c53d007da` InService and desired/min/max unchanged at 1/0/1. Evidence is in `enclave/direct-execution-v1/A0_GRACE_RESULT.md`. |
+| What's next | Prepare A1a read-only bridge report: exact v70-only image/parameters, launch-template/ASG-only change-set proof, m6i.2xlarge memory/restore evidence, retained-v70 rollback path, signer inputs and current safety cutoff. Separately correct v71 rollback preservation, rebuild/rehearse both AMIs and rerun V1 before any later promotion approval. |
+| Blockers | A1b execution requires explicit approval after A1a. Current v71 packet 3990739 fails rollback-preservation V1(a) and cannot be promoted. |
+| Production-affecting action pending approval | A1 bridge execution and any later v71 promotion are not authorized. No production action is in flight. |
+| Last updated (IST) | 2026-09-29 14:21:00 IST |
