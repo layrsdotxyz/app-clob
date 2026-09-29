@@ -5182,7 +5182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.health.observe(now_unix());
     start_health_observer(state.clone());
     start_base_withdrawal_observer(state.clone());
-    start_v70_rollback_materializer(state.clone());
+    start_v70_rollback_handoff(state.clone());
     let port = env::var("PORT").unwrap_or_else(|_| "8443".into()).parse()?;
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -7767,17 +7767,18 @@ async fn stage_and_promote_v71_shadow(state: AppState, run_id: String) -> Result
 }
 
 /// Materializes the exact v70 rollback package for the restored v71 head
-/// under the explicitly supplied fresh prefix. The authoritative archive is
-/// only read. `seal` performs the enclave exchange; production passes
+/// under the explicitly supplied fresh prefix while retaining the financial
+/// gate. The caller must keep the returned guard alive until the v70 writer
+/// handoff is complete: no later command can then be acknowledged outside the
+/// package. The authoritative archive is only read. `seal` performs the
+/// enclave exchange; production passes
 /// `|request| exchange_with_timeout(state, request, CHECKPOINT_EXCHANGE_TIMEOUT)`.
-/// Operators must pause dispatch first: commits after the captured head are
-/// not in the package, and a commit before the seal fails it closed.
 #[cfg_attr(not(test), allow(dead_code))]
-async fn materialize_v70_rollback<F, Fut>(
+async fn prepare_v70_rollback_handoff<F, Fut>(
     state: &AppState,
     fresh_prefix: &str,
     seal: F,
-) -> Result<V70RollbackPackage, String>
+) -> Result<(V70RollbackPackage, OwnedMutexGuard<()>), String>
 where
     F: FnOnce(RuntimeRequest) -> Fut,
     Fut: Future<Output = io::Result<RuntimeResponse>>,
@@ -7790,6 +7791,14 @@ where
         _ => return Err("v70 rollback requires the authoritative S3 archive".into()),
     };
     validate_v70_rollback_prefix(&store.prefix, fresh_prefix)?;
+    // This is an explicit rollback handoff, not a background checkpoint. Keep
+    // the gate through archive collection, enclave sealing, validation, and
+    // durable publication. Returning the guard lets the operator path keep
+    // dispatch fenced until the retained-v70 ASG has taken over.
+    let guard = state.financial_gate.lock("v70_rollback_handoff").await;
+    if !state.unresolved_external_effects.lock().await.is_empty() {
+        return Err("v70 rollback external effect pending".into());
+    }
     let head = match &*store.journal.lock().await {
         JournalWriterState::Eligible(head) => head.clone(),
         JournalWriterState::Unrestored | JournalWriterState::Latched(_) => {
@@ -7813,43 +7822,37 @@ where
         .await
         .map_err(|_| "v70 rollback prefix not fresh")?;
     let (migration, journal_records) = store.load_v70_rollback_inputs(&head, &restored).await?;
-    let (checkpoint, receipts) = {
-        let _guard = state.financial_gate.lock("v70_rollback_capture").await;
-        if !state.unresolved_external_effects.lock().await.is_empty() {
-            return Err("v70 rollback external effect pending".into());
+    if !matches!(&*store.journal.lock().await, JournalWriterState::Eligible(current) if *current == head)
+    {
+        return Err("v70 rollback head advanced".into());
+    }
+    let receipts = ordered_journal_receipts(
+        state
+            .journal_receipts
+            .lock()
+            .await
+            .as_ref()
+            .ok_or("v70 rollback receipts unavailable")?,
+    )?;
+    let response = seal(RuntimeRequest::SealV70RollbackCheckpoint {
+        migration,
+        journal_records,
+    })
+    .await
+    .map_err(|error| {
+        if frame_oversized(&error) {
+            "v70 rollback frame oversized"
+        } else {
+            "v70 rollback seal transport failed"
         }
-        if !matches!(&*store.journal.lock().await, JournalWriterState::Eligible(current) if *current == head)
-        {
-            return Err("v70 rollback head advanced".into());
+    })?;
+    let checkpoint = match response {
+        RuntimeResponse::CheckpointSealed { checkpoint } => checkpoint,
+        RuntimeResponse::Error { code } if code == CHECKPOINT_FRAME_OVERSIZED => {
+            return Err("v70 rollback frame oversized".into())
         }
-        let receipts = ordered_journal_receipts(
-            state
-                .journal_receipts
-                .lock()
-                .await
-                .as_ref()
-                .ok_or("v70 rollback receipts unavailable")?,
-        )?;
-        let response = seal(RuntimeRequest::SealV70RollbackCheckpoint {
-            migration,
-            journal_records,
-        })
-        .await
-        .map_err(|error| {
-            if frame_oversized(&error) {
-                "v70 rollback frame oversized"
-            } else {
-                "v70 rollback seal transport failed"
-            }
-        })?;
-        match response {
-            RuntimeResponse::CheckpointSealed { checkpoint } => (checkpoint, receipts),
-            RuntimeResponse::Error { code } if code == CHECKPOINT_FRAME_OVERSIZED => {
-                return Err("v70 rollback frame oversized".into())
-            }
-            RuntimeResponse::Error { .. } => return Err("v70 rollback seal rejected".into()),
-            _ => return Err("v70 rollback seal unexpected response".into()),
-        }
+        RuntimeResponse::Error { .. } => return Err("v70 rollback seal rejected".into()),
+        _ => return Err("v70 rollback seal unexpected response".into()),
     };
     let (key, pointer, frontier) =
         validate_v70_rollback_checkpoint(&checkpoint, head.sequence, &receipts, fresh_prefix)?;
@@ -7867,33 +7870,55 @@ where
         "V70_ROLLBACK_PACKAGE_MATERIALIZED sequence={} state_hash={} artifact_hash={}",
         package.sequence, package.state_hash, package.artifact_hash
     );
+    Ok((package, guard))
+}
+
+/// Test/helper wrapper that intentionally releases the handoff fence after a
+/// package is complete. Production uses `start_v70_rollback_handoff` below and
+/// retains it until process replacement.
+#[cfg_attr(not(test), allow(dead_code))]
+async fn materialize_v70_rollback<F, Fut>(
+    state: &AppState,
+    fresh_prefix: &str,
+    seal: F,
+) -> Result<V70RollbackPackage, String>
+where
+    F: FnOnce(RuntimeRequest) -> Fut,
+    Fut: Future<Output = io::Result<RuntimeResponse>>,
+{
+    let (package, guard) = prepare_v70_rollback_handoff(state, fresh_prefix, seal).await?;
+    drop(guard);
     Ok(package)
 }
 
-/// Explicit opt-in operator hook for producing the retained-v70 package. It
-/// waits for a hot promotion to become authoritative, then captures committed
-/// state only. It never stores or replays a pending command.
-fn start_v70_rollback_materializer(state: AppState) {
+/// Explicit local operator hook for the retained-v70 handoff. Merely setting
+/// the prefix has no effect on live traffic. SIGUSR2 begins the one-shot
+/// capture, and a successful capture intentionally keeps the financial gate
+/// until this process is replaced by the rehearsed v70 ASG change. It never
+/// stores or replays a pending command.
+fn start_v70_rollback_handoff(state: AppState) {
     let Ok(prefix) = env::var("LAYRS_DIRECT_V70_ROLLBACK_PREFIX") else {
         return;
     };
     tokio::spawn(async move {
-        let started = tokio::time::Instant::now();
-        let mut soft_abort_logged = false;
-        while state.effective_persistence_format() != PersistenceFormat::V71 {
-            let elapsed = started.elapsed();
-            if !soft_abort_logged && elapsed >= Duration::from_secs(5 * 60) {
-                eprintln!("V70_ROLLBACK_MATERIALIZER_SOFT_ABORT elapsed_seconds=300");
-                soft_abort_logged = true;
-            }
-            if elapsed >= Duration::from_secs(10 * 60) {
-                eprintln!("V70_ROLLBACK_MATERIALIZER_ABORTED reason=V71_NOT_AUTHORITATIVE");
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+        let Ok(mut signal) = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::user_defined2(),
+        ) else {
+            eprintln!("V70_ROLLBACK_HANDOFF_UNAVAILABLE reason=SIGNAL_REGISTRATION_FAILED");
+            return;
+        };
+        eprintln!("V70_ROLLBACK_HANDOFF_ARMED signal=SIGUSR2");
+        if signal.recv().await.is_none() {
+            eprintln!("V70_ROLLBACK_HANDOFF_ABORTED reason=SIGNAL_STREAM_CLOSED");
+            return;
         }
+        if state.effective_persistence_format() != PersistenceFormat::V71 {
+            eprintln!("V70_ROLLBACK_HANDOFF_ABORTED reason=V71_NOT_AUTHORITATIVE");
+            return;
+        }
+        eprintln!("V70_ROLLBACK_HANDOFF_STARTED");
         let seal_state = state.clone();
-        match materialize_v70_rollback(&state, &prefix, move |request| {
+        match prepare_v70_rollback_handoff(&state, &prefix, move |request| {
             let seal_state = seal_state.clone();
             async move {
                 exchange_with_timeout(&seal_state, request, CHECKPOINT_EXCHANGE_TIMEOUT).await
@@ -7901,15 +7926,19 @@ fn start_v70_rollback_materializer(state: AppState) {
         })
         .await
         {
-            Ok(package) => eprintln!(
-                "V70_ROLLBACK_MATERIALIZER_COMPLETE prefix={} sequence={} state_hash={} artifact_hash={} checkpoint_key={}",
-                package.prefix,
-                package.sequence,
-                package.state_hash,
-                package.artifact_hash,
-                package.checkpoint_key
-            ),
-            Err(reason) => eprintln!("V70_ROLLBACK_MATERIALIZER_ABORTED reason={reason}"),
+            Ok((package, guard)) => {
+                eprintln!(
+                    "V70_ROLLBACK_HANDOFF_READY prefix={} sequence={} state_hash={} artifact_hash={} checkpoint_key={}",
+                    package.prefix,
+                    package.sequence,
+                    package.state_hash,
+                    package.artifact_hash,
+                    package.checkpoint_key
+                );
+                std::future::pending::<()>().await;
+                drop(guard);
+            }
+            Err(reason) => eprintln!("V70_ROLLBACK_HANDOFF_ABORTED reason={reason}"),
         }
     });
 }
@@ -13126,6 +13155,54 @@ mod tests {
         }
     }
 
+    fn append_v71_rollback_successor(
+        fixture: &mut V70RollbackFixture,
+        seed: char,
+        wallet: char,
+    ) {
+        let mut tree = layrs_direct_execution_v1::request_index::SparseRequestTree::from_leaves(
+            &fixture.bundle.leaves,
+        )
+        .unwrap();
+        for record in &fixture.records {
+            tree.insert(TerminalRequestLeaf {
+                account_id: record.account_id.clone(),
+                request_id: record.request_id.clone(),
+                request_hash: record.request_hash.clone(),
+                result_hash: record.result_hash.clone(),
+                receipt_hash: record.receipt_hash.clone(),
+                locator: TerminalResultLocator::Journal {
+                    writer_epoch: record.writer_epoch.clone(),
+                    sequence: record.sequence,
+                },
+            })
+            .unwrap();
+        }
+        let request = v70_rollback_admission(seed, wallet);
+        let proof = tree
+            .proof(&request.account_id, &request.request_id)
+            .unwrap();
+        let candidate = fixture
+            .v71
+            .prepare_candidate(request.clone(), &proof, &[7; 32], &[8; 32])
+            .unwrap();
+        fixture.records.push(candidate.record().clone());
+        let result = fixture.v71.adopt_candidate(candidate).unwrap();
+        fixture.receipts.insert(
+            (request.account_id.clone(), request.request_id.clone()),
+            (fixture.v71.sequence(), result.receipt.clone()),
+        );
+        fixture.commands.push((request, result));
+        fixture.head = JournalHead {
+            writer_epoch: fixture.v71.writer_epoch().into(),
+            sequence: fixture.v71.sequence(),
+            record_hash: fixture.v71.record_hash().into(),
+            transition_root: fixture.v71.transition_root().into(),
+            request_index_root: fixture.v71.request_index_root().into(),
+            financial_state_root: fixture.v71.financial_state_root().unwrap(),
+        };
+    }
+
     /// The authoritative prefix `epoch`: the migration bundle, v70 head
     /// pointers (plus a legacy twin) through the source, then v71 records.
     fn v70_rollback_archive(fixture: &V70RollbackFixture) -> BTreeMap<String, Vec<u8>> {
@@ -13660,6 +13737,82 @@ mod tests {
         );
         assert_eq!(called.load(Ordering::SeqCst), 1);
         assert!(v70_rollback_puts(&log.lock().await[before..]).is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn v70_rollback_handoff_fences_post_capture_commit_until_v70_restore() {
+        let mut fixture = v70_rollback_fixture();
+        let (stale, _) = v70_rollback_package(&fixture).await;
+        append_v71_rollback_successor(&mut fixture, 'e', '5');
+        assert_eq!(stale.sequence + 1, fixture.head.sequence);
+
+        let (endpoint, _, _, server) = v70_rollback_s3(v70_rollback_archive(&fixture)).await;
+        let store = v71_store(
+            &endpoint,
+            JournalWriterState::Eligible(fixture.head.clone()),
+            JournalRole::Writer,
+        );
+        let state = v70_rollback_state(Some(store), &fixture);
+        let (package, handoff_guard) = prepare_v70_rollback_handoff(
+            &state,
+            "rollback",
+            v70_rollback_seal(fixture.v71.clone(), Arc::new(AtomicU64::new(0))),
+        )
+        .await
+        .unwrap();
+
+        // Model a v71 command arriving after package publication. It cannot
+        // enter the serialized commit path while the rollback handoff owns the
+        // gate, so it cannot become an acknowledged successor omitted from the
+        // retained-v70 frontier.
+        let gate = Arc::clone(&state.financial_gate);
+        let mut post_capture_commit = tokio::spawn(async move {
+            let _guard = gate.lock("post_capture_v71_commit").await;
+        });
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50),
+            &mut post_capture_commit,
+        )
+        .await
+        .is_err());
+
+        let frontier = v70_rollback_frontier(&package);
+        let rollback = v70_rollback_store_at(&endpoint, "rollback");
+        rollback
+            .prepare_sparse_rollback_restore(&frontier)
+            .await
+            .unwrap();
+        let (adopted, enclave) = v70_rollback_enclave(fixture.epoch.clone(), frontier);
+        rollback
+            .restore_sparse_rollback_with(
+                &v70_rollback_baseline_state(&fixture),
+                &v70_rollback_frontier(&package),
+                enclave,
+            )
+            .await
+            .unwrap();
+        let mut restored = adopted.lock().unwrap().take().unwrap();
+        assert_eq!(restored.committed_sequence(), fixture.v71.sequence());
+        assert_eq!(restored.committed_state_hash(), package.state_hash);
+        for (request, result) in &fixture.commands {
+            assert_eq!(
+                restored.portfolio(&request.identity_commitment).unwrap(),
+                fixture
+                    .v71
+                    .portfolio(&request.identity_commitment)
+                    .unwrap()
+            );
+            assert_eq!(restored.execute(request.clone()).unwrap(), *result);
+        }
+
+        // Only an explicit failed/abandoned handoff releases dispatch. The
+        // production SIGUSR2 path intentionally never drops this guard.
+        drop(handoff_guard);
+        tokio::time::timeout(Duration::from_secs(1), post_capture_commit)
+            .await
+            .unwrap()
+            .unwrap();
         server.abort();
     }
 

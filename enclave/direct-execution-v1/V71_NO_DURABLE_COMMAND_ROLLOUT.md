@@ -49,12 +49,16 @@ on v71 only when `journal-v71/cutover.cbor` exists and exactly matches the
 cryptographically verified checkpoint-plus-tail head. Pre-staged migration,
 checkpoint, snapshot, or journal objects cannot select v71 by themselves.
 
-`LAYRS_DIRECT_V70_ROLLBACK_PREFIX` is an explicit, one-shot operator hook. If
-set, the parent waits until v71 is authoritative, captures committed state
-through the existing financial gate, and writes the three-object rollback
-baseline. Leave it unset until the production-copy seal duration has been
-measured and the fresh prefix and rollback grant have been verified. It does
-not capture, queue, or replay pending commands.
+`LAYRS_DIRECT_V70_ROLLBACK_PREFIX` arms an explicit, one-shot local operator
+hook; setting it alone does not capture state or affect traffic. After v71 is
+authoritative, `SIGUSR2` makes the parent take the financial gate, capture the
+exact committed head, and write the three-object rollback baseline. On
+success it logs `V70_ROLLBACK_HANDOFF_READY` and deliberately retains the gate
+until the retained-v70 ASG replaces the process. This prevents any later v71
+command from being acknowledged outside the rollback package. Leave the
+prefix unset until the production-copy seal duration has been measured and
+the fresh prefix and rollback grant have been verified. The hook does not
+capture, queue, or replay pending commands and exposes no network endpoint.
 
 Rollback restore is explicit and never inferred:
 
@@ -116,14 +120,18 @@ unresolved external effect, or latency regression beyond the agreed gate.
 
 ### 5. Retained-v70 rollback
 
-The rollback materializer reads the authenticated migration and journal,
-asks the enclave for an exact v70 checkpoint at the captured head, and writes
-exactly three objects under a fresh prefix: one full encrypted head artifact,
-one head pointer, and one checkpoint discovery marker. Every write is
-create-only, KMS encrypted, Object Lock protected, and read back exactly.
+Keep serving v71 until rollback is actually required. Pause external dispatch,
+send `SIGUSR2` to the parent service, and require
+`V70_ROLLBACK_HANDOFF_READY` for the exact current sequence. The handoff reads
+the authenticated migration and journal, asks the enclave for an exact v70
+checkpoint, and writes exactly three objects under a fresh prefix: one full
+encrypted head artifact, one head pointer, and one checkpoint discovery
+marker. Every write is create-only, KMS encrypted, Object Lock protected, and
+read back exactly. The parent retains the financial gate after readiness; do
+not resume it or send a second signal. Execute the pre-reviewed ASG rollback
+while that exact-head fence remains held.
 
 Before a rollout that may need rollback, rehearse this against a production
-copy and record the elapsed seal, write, restore, and routing times. A rollback
 uses the retained v70 EIF, the fresh rollback prefix, the exact committed
 frontier, and the separate unconsumed rollback grant. Missing, extra, mutated,
 noncanonical, or wrong-frontier objects fail closed.
@@ -136,8 +144,12 @@ noncanonical, or wrong-frontier objects fail closed.
   v71 objects are non-authoritative.
 - Ambiguous promotion transport after the marker: restart in `v71-hot`; the
   marker selects the exact verified v71 head.
-- v71 failure after promotion: execute only the rehearsed sparse-baseline v70
-  restore with the retained EIF and rollback grant.
+- v71 failure after promotion: stop new dispatch, trigger `SIGUSR2`, require
+  exact-head `V70_ROLLBACK_HANDOFF_READY`, then execute only the rehearsed
+  sparse-baseline v70 ASG restore with the retained EIF and rollback grant.
+- Rollback preparation failure: do not change the ASG or consume the rollback
+  grant. The gate is released and v71 remains authoritative; investigate and
+  retry only with a new fresh prefix after review.
 - Never route two writers, reuse a consumed grant, delete immutable evidence,
   or convert a failed attempt into a pending-command workflow.
 
