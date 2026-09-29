@@ -99,6 +99,17 @@ Unless a subsequent restore happens faster, the ASG will recycle otherwise
 valid writers just as they become ready. No ASG setting, instance, or runtime
 was changed during this observation.
 
+Emergency recovery option, requiring explicit owner approval: temporarily
+suspend only the ASG `HealthCheck` and `ReplaceUnhealthy` processes before the
+current instance's grace expires; allow the existing v70 restore to complete;
+verify a healthy target, exactly one writer and continuity from sequence
+41,418; then update the governed ASG health grace from 1,200 to 1,800 seconds
+and resume both processes. AWS documents that `HealthCheck` marks failed ELB
+instances unhealthy and `ReplaceUnhealthy` terminates/replaces them; suspending
+those two processes is the narrow reversible control for this loop. It does
+not change the AMI, writer grant, ledger, archive, database or desired capacity.
+It is an incident recovery action, not approval to execute V2 packet 3990739.
+
 ## V1(c): external effects and withdrawals
 
 Read-only archive plus PostgreSQL checks at sequence 41,416 found:
