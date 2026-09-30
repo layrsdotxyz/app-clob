@@ -20,6 +20,7 @@ pub enum QuestReceiptKind {
     Deposit,
     PrivateFill,
     Withdrawal,
+    WithdrawalReservation,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -310,6 +311,9 @@ impl DirectRuntime {
             "FINANCIAL_WALLET_LINKED" if own => QuestReceiptKind::WalletLink,
             "DEPOSIT_CREDITED" | "DEPOSIT_FINALIZED" if own => QuestReceiptKind::Deposit,
             "WITHDRAWAL_SETTLED" if own => QuestReceiptKind::Withdrawal,
+            "WITHDRAWAL_RESERVED" if own && receipt.command_commitment.is_some() => {
+                QuestReceiptKind::WithdrawalReservation
+            }
             "ORDER_EXECUTED"
                 if filled
                     && (own
@@ -330,14 +334,16 @@ impl DirectRuntime {
             ]
             .concat(),
         );
-        let command_commitment = sign(
-            &self.receipt_key,
-            &[
-                b"layrs.quest-command.v1\0".as_slice(),
-                request_hash.as_bytes(),
-            ]
-            .concat(),
-        );
+        let command_commitment = receipt.command_commitment.clone().unwrap_or_else(|| {
+            sign(
+                &self.receipt_key,
+                &[
+                    b"layrs.quest-command.v1\0".as_slice(),
+                    request_hash.as_bytes(),
+                ]
+                .concat(),
+            )
+        });
         let receipt_id = format!(
             "receipt_{}",
             sha256(

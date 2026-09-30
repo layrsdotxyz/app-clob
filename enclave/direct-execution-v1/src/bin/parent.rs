@@ -9922,7 +9922,7 @@ mod tests {
         DirectStateArtifact {
             epoch_id: EPOCH_ID.into(), sequence: 7, prior_state_hash: "a".repeat(64), state_hash: "b".repeat(64), request_hash: "c".repeat(64),
             nonce: vec![1;12], ciphertext: vec![], ciphertext_hash: "d".repeat(64),
-            receipt: DirectReceipt { receipt_id: "receipt".into(), account_id: "account".into(), identity_commitment: "identity".into(), request_id: "request".into(), request_hash: "c".repeat(64), status: layrs_direct_execution_v1::TerminalStatus::Applied, effect: "BALANCE_READ".into(), amount_atomic: None, custody_reference: None, execution: None, resolution: None, projection_balance_updates: vec![], genesis_ordinal: 0, signature: "signature".into() }
+            receipt: DirectReceipt { receipt_id: "receipt".into(), account_id: "account".into(), identity_commitment: "identity".into(), request_id: "request".into(), request_hash: "c".repeat(64), status: layrs_direct_execution_v1::TerminalStatus::Applied, effect: "BALANCE_READ".into(), amount_atomic: None, custody_reference: None, command_commitment: None, execution: None, resolution: None, projection_balance_updates: vec![], genesis_ordinal: 0, signature: "signature".into() }
         }
     }
     #[test]
@@ -10355,7 +10355,7 @@ mod tests {
     #[test]
     fn receipt_cache_releases_entire_snapshot_allocation() {
         let artifact=DirectStateArtifact {epoch_id:EPOCH_ID.into(),sequence:1,prior_state_hash:"a".repeat(64),state_hash:"b".repeat(64),request_hash:"c".repeat(64),nonce:vec![1;12],ciphertext:vec![7;2_000_000],ciphertext_hash:"d".repeat(64),
-            receipt:DirectReceipt {receipt_id:"receipt".into(),account_id:"account".into(),identity_commitment:"identity".into(),request_id:"request".into(),request_hash:"c".repeat(64),status:layrs_direct_execution_v1::TerminalStatus::Applied,effect:"BALANCE_READ".into(),amount_atomic:None,custody_reference:None,execution:None,resolution:None,projection_balance_updates:vec![],genesis_ordinal:0,signature:"signature".into()}};
+            receipt:DirectReceipt {receipt_id:"receipt".into(),account_id:"account".into(),identity_commitment:"identity".into(),request_id:"request".into(),request_hash:"c".repeat(64),status:layrs_direct_execution_v1::TerminalStatus::Applied,effect:"BALANCE_READ".into(),amount_atomic:None,custody_reference:None,command_commitment:None,execution:None,resolution:None,projection_balance_updates:vec![],genesis_ordinal:0,signature:"signature".into()}};
         let record=receipt_only_record(&artifact);
         assert_eq!(record.ciphertext.capacity(),0);
         assert!(record.ciphertext.is_empty());
@@ -11269,6 +11269,7 @@ mod tests {
                 effect: "WITHDRAWAL_SETTLED".into(),
                 amount_atomic: Some("1000000".into()),
                 custody_reference: Some(custody_reference.clone()),
+                command_commitment: None,
                 execution: None,
                 resolution: None,
                 projection_balance_updates: vec![],
@@ -11377,6 +11378,7 @@ mod tests {
             effect: "IDENTITY_ADMITTED".into(),
             amount_atomic: None,
             custody_reference: None,
+            command_commitment: None,
             execution: None,
             resolution: None,
             projection_balance_updates: vec![],
