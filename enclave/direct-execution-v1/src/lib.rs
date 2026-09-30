@@ -527,6 +527,15 @@ impl CommittedRestoreFrontier {
         checkpoint.receipt_records.get(index).is_some_and(|record| record.sequence == self.sequence && record.state_hash == self.state_hash)
             && checkpoint.artifact_hashes.get(index) == Some(&self.artifact_hash)
     }
+    /// A checkpoint may safely precede the governed frontier when startup
+    /// streams the remaining immutable successors. The append path verifies
+    /// the exact frontier artifact and finalization refuses a head below it.
+    /// A checkpoint at or above the frontier must contain that exact record.
+    pub fn accepts_checkpoint_base(&self, checkpoint: &DirectCheckpoint) -> bool {
+        self.valid()
+            && (checkpoint.artifact.sequence < self.sequence
+                || self.accepts_checkpoint(checkpoint))
+    }
 }
 
 /// Public, immutable metadata for the KMS-wrapped direct-runtime root key.

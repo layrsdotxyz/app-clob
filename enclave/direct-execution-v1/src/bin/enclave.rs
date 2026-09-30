@@ -860,7 +860,7 @@ async fn begin_checkpoint_restore(state: Arc<Mutex<EnclaveState>>, checkpoint: l
     if state.v71_runtime.is_some() {
         return RuntimeResponse::Error { code: "JOURNAL_FORMAT_MISMATCH".into() };
     }
-    if state.committed_restore_frontier.as_ref().is_some_and(|frontier| !frontier.accepts_checkpoint(&checkpoint)) {
+    if state.committed_restore_frontier.as_ref().is_some_and(|frontier| !frontier.accepts_checkpoint_base(&checkpoint)) {
         return RuntimeResponse::Error { code: "CHECKPOINT_BELOW_GOVERNED_FRONTIER".into() };
     }
     let candidate = DirectRuntime::new(state.epoch.clone(), state.mode, state.receipt_key.clone())
@@ -1995,7 +1995,7 @@ async fn verify_checkpoint(
             || state.restore_candidate.is_some()
             || state.v71_restore_candidate.is_some()
             || state.committed_restore_frontier.as_ref().is_some_and(|frontier| {
-                !frontier.accepts_checkpoint(&checkpoint)
+                !frontier.accepts_checkpoint_base(&checkpoint)
             })
         {
             None
@@ -3056,22 +3056,46 @@ mod tests {
         assert_eq!(verifier.lock().await.runtime.committed_sequence(), 0);
     }
     #[tokio::test]
-    async fn checkpoint_restore_rejects_rollback_below_governed_frontier_and_corrupt_snapshot() {
+    async fn checkpoint_restore_requires_the_exact_governed_frontier_after_an_older_base() {
         let running = state(); let store = FilesystemImmutableArtifactStore::new(artifact_dir());
         recover(Arc::clone(&running), vec![]).await;
         commit_through_parent_callback(Arc::clone(&running), request("checkpoint-old"), &store).await;
         let first = store.load_committed().unwrap();
         let mut compact = first[0].clone(); compact.ciphertext.clear();
         let checkpoint = running.lock().await.runtime.seal_checkpoint(first[0].clone(), vec![compact], vec![layrs_direct_execution_v1::artifact_hash(&first[0])], &[8;32]).unwrap();
+        commit_through_parent_callback(Arc::clone(&running), request("frontier"), &store).await;
+        let artifacts = store.load_committed().unwrap();
+        let frontier_artifact = artifacts[1].clone();
+        let frontier = layrs_direct_execution_v1::CommittedRestoreFrontier {
+            sequence: frontier_artifact.sequence,
+            state_hash: frontier_artifact.state_hash.clone(),
+            artifact_hash: layrs_direct_execution_v1::artifact_hash(&frontier_artifact),
+        };
         let restarted = state();
-        restarted.lock().await.committed_restore_frontier = Some(layrs_direct_execution_v1::CommittedRestoreFrontier { sequence: 2, state_hash: "a".repeat(64), artifact_hash: "b".repeat(64) });
-        assert!(matches!(begin_checkpoint_restore(Arc::clone(&restarted), checkpoint.clone()).await, RuntimeResponse::Error { code } if code == "CHECKPOINT_BELOW_GOVERNED_FRONTIER"));
-        restarted.lock().await.committed_restore_frontier = None;
+        restarted.lock().await.committed_restore_frontier = Some(frontier.clone());
+        assert!(matches!(
+            runtime_response(Arc::clone(&restarted), RuntimeRequest::VerifyCheckpoint { checkpoint: checkpoint.clone() }).await,
+            RuntimeResponse::CheckpointVerified { sequence: 1, .. }
+        ));
+        assert!(matches!(begin_checkpoint_restore(Arc::clone(&restarted), checkpoint.clone()).await, RuntimeResponse::RestoreProgress { recovered_sequence: 1, .. }));
+        assert!(matches!(finish_committed_restore(Arc::clone(&restarted), 1, checkpoint.artifact.state_hash.clone()).await, RuntimeResponse::Error { code } if code == "RESTORE_FINAL_HEAD_MISMATCH"));
+
+        assert!(matches!(begin_checkpoint_restore(Arc::clone(&restarted), checkpoint.clone()).await, RuntimeResponse::RestoreProgress { recovered_sequence: 1, .. }));
+        let mut wrong_frontier = frontier_artifact.clone();
+        wrong_frontier.state_hash = "0".repeat(64);
+        assert!(matches!(append_committed_restore(Arc::clone(&restarted), wrong_frontier).await, RuntimeResponse::Error { code } if code == "RESTORE_GOVERNED_FRONTIER_MISMATCH"));
+
+        assert!(matches!(begin_checkpoint_restore(Arc::clone(&restarted), checkpoint.clone()).await, RuntimeResponse::RestoreProgress { recovered_sequence: 1, .. }));
+        assert!(matches!(append_committed_restore(Arc::clone(&restarted), frontier_artifact).await, RuntimeResponse::RestoreProgress { recovered_sequence: 2, .. }));
+        assert!(matches!(finish_committed_restore(Arc::clone(&restarted), 2, frontier.state_hash.clone()).await, RuntimeResponse::RecoveryComplete { recovered_sequence: 2, .. }));
+
+        let corrupt_verifier = state();
+        corrupt_verifier.lock().await.committed_restore_frontier = Some(frontier);
         let mut corrupt = checkpoint; corrupt.artifact.ciphertext[0] ^= 1;
-        assert!(matches!(begin_checkpoint_restore(Arc::clone(&restarted), corrupt).await, RuntimeResponse::Error { code } if code == "CHECKPOINT_AUTHENTICATION_FAILED"));
-        assert!(!restarted.lock().await.recovery_complete);
-        assert!(restarted.lock().await.restore_candidate.is_none());
-        assert_eq!(restarted.lock().await.runtime.committed_sequence(), 0);
+        assert!(matches!(begin_checkpoint_restore(Arc::clone(&corrupt_verifier), corrupt).await, RuntimeResponse::Error { code } if code == "CHECKPOINT_AUTHENTICATION_FAILED"));
+        assert!(!corrupt_verifier.lock().await.recovery_complete);
+        assert!(corrupt_verifier.lock().await.restore_candidate.is_none());
+        assert_eq!(corrupt_verifier.lock().await.runtime.committed_sequence(), 0);
     }
     #[tokio::test]
     async fn sealed_checkpoint_is_refused_unless_its_restore_frame_fits() {
