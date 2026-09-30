@@ -202,6 +202,29 @@ This image retains the bridge enclave identity but includes the strict sparse
 exact-head restore parent; the exact live bridge parent remains a later
 fallback only after a separately produced contiguous v70 archive exists.
 
+## Isolated ASG forward-to-rollback handoff
+
+The inspected candidate and rollback AMIs were exercised through a temporary
+ASG with the production instance class, subnet, enclave setting and
+restore-based 3,600-second health grace, but with the non-production SSM role,
+no runtime env, no grant, no archive prefix and no load balancer.
+
+- Candidate launch-template v1 reached `InService` in 17 seconds.
+- The booted candidate enclave reported the exact candidate PCR0/PCR1/PCR2,
+  8,192 MiB and two CPUs; no runtime env was present.
+- Launch-template v2 changed only the image to the paired retained-v70 AMI.
+- The ASG refresh began at Unix `1790760921` and completed successfully at
+  `1790761129`: 208 seconds.
+- Final state before cleanup: desired 1, max 1, exactly one healthy `InService`
+  instance on version 2, 3,600-second health grace; the version-1 instance was
+  gone.
+- The temporary ASG and launch template were deleted. Both ASG instances and
+  both independent inspection instances are confirmed terminated.
+
+This rehearsal validates the complete ASG rollback leg and its timing. It does
+not substitute for the pre-rollout exact-head package materialization check;
+that remains a gate against the current production frontier.
+
 ## Remaining gates
 
 - Re-run the complete path after the storage correction against a refreshed
