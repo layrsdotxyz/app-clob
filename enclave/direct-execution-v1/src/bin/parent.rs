@@ -4861,6 +4861,7 @@ enum CustomerAction {
     LinkPoolWallet {wallet_address:String,external_id:String},
     ReserveSignedWithdrawal {intent:SignedWithdrawalIntent,user_signature:String},
     SettleSignedWithdrawal {intent_hash:String,horizen_transaction_hash:String},
+    ReleaseExpiredSignedWithdrawal {intent:SignedWithdrawalIntent,finalized_block_number:String,finalized_block_hash:String},
     ReserveZenWithdrawal { destination_chain: String, destination: String, amount_atomic: String },
     PlaceOrder {
         order_id: String,
@@ -5506,6 +5507,32 @@ async fn command(
                 Ok(DepositFinality::Pending)=>return (StatusCode::SERVICE_UNAVAILABLE,"SIGNED_WITHDRAWAL_FINALITY_PENDING").into_response(),
                 Ok(DepositFinality::Reverted)=>return (StatusCode::CONFLICT,"SIGNED_WITHDRAWAL_PAYOUT_REVERTED").into_response(),
                 Ok(DepositFinality::Conflict)=>return (StatusCode::CONFLICT,"SIGNED_WITHDRAWAL_PAYOUT_CONFLICT").into_response(),
+                Err(_)=>return (StatusCode::SERVICE_UNAVAILABLE,"SIGNED_WITHDRAWAL_FINALITY_UNAVAILABLE").into_response(),
+            }
+        }
+        CustomerAction::ReleaseExpiredSignedWithdrawal {intent,finalized_block_number,finalized_block_hash} => {
+            let Ok(intent_hash)=intent.intent_hash_hex() else {
+                return (StatusCode::BAD_REQUEST,"SIGNED_WITHDRAWAL_INTENT_INVALID").into_response();
+            };
+            if request_id!=format!("signed-withdrawal-release:{}",intent_hash.trim_start_matches("0x"))
+                ||!intent.account.eq_ignore_ascii_case(&claims.wallet_address)
+                ||!claims.financial_wallet_address.as_deref().is_some_and(|wallet|wallet.eq_ignore_ascii_case(&intent.route_wallet)) {
+                return (StatusCode::FORBIDDEN,"SIGNED_WITHDRAWAL_RELEASE_BINDING_DENIED").into_response();
+            }
+            let Some(custody)=&state.usdc_custody else {
+                return (StatusCode::SERVICE_UNAVAILABLE,"USDC_CUSTODY_ADAPTER_NOT_ENABLED").into_response();
+            };
+            let block_hash=finalized_block_hash.to_ascii_lowercase();
+            match custody.signed_withdrawal_expiry(&intent,&finalized_block_number,&block_hash).await {
+                Ok(DepositFinality::Finalized)=>{
+                    let Ok(timestamp)=custody.finalized_block_timestamp(&finalized_block_number,&block_hash).await else {
+                        return (StatusCode::SERVICE_UNAVAILABLE,"SIGNED_WITHDRAWAL_FINALITY_UNAVAILABLE").into_response();
+                    };
+                    DirectAction::ReleaseExpiredSignedWithdrawal {intent_hash,
+                        finalized_block_hash:block_hash,finalized_block_timestamp:timestamp}
+                },
+                Ok(DepositFinality::Pending)=>return (StatusCode::SERVICE_UNAVAILABLE,"SIGNED_WITHDRAWAL_EXPIRY_PENDING").into_response(),
+                Ok(DepositFinality::Reverted|DepositFinality::Conflict)=>return (StatusCode::CONFLICT,"SIGNED_WITHDRAWAL_RELEASE_CONFLICT").into_response(),
                 Err(_)=>return (StatusCode::SERVICE_UNAVAILABLE,"SIGNED_WITHDRAWAL_FINALITY_UNAVAILABLE").into_response(),
             }
         }
