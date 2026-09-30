@@ -225,12 +225,23 @@ This rehearsal validates the complete ASG rollback leg and its timing. It does
 not substitute for the pre-rollout exact-head package materialization check;
 that remains a gate against the current production frontier.
 
+## Exact-head storage materialization rerun
+
+At 15:16 IST the frozen release source reran the parent S3-level test
+`tests::v70_rollback_materializes_exactly_three_objects_restorable_in_baseline_mode`
+in release mode. It passed one of one with zero failures. The test held the
+financial gate through exact-head capture, wrote exactly the encrypted
+artifact, head pointer and checkpoint discovery object to a fresh prefix,
+validated their content addresses, restored the same sequence/state/artifact
+hashes in `v70-rollback-baseline` mode, and rejected reuse of the now non-fresh
+prefix. This complements the current-frontier enclave rehearsal above; it does
+not write to or copy the production archive.
+
 ## Remaining gates
 
-- Re-run the complete path after the storage correction against a refreshed
-  production frontier and exercise the parent S3 staging/marker protocol.
-- Build and inspect the corrected candidate and bridge-derived rollback AMIs.
-- Rehearse the isolated storage/promotion, exact-head handoff, rollback ASG
-  replacement, and forward/rollback identity-consumer rotations.
+- Rehearse the forward and rollback identity-consumer rotations and freeze the
+  signed immutable release packet.
+- Refresh the production frontier and inspect the exact candidate and rollback
+  CloudFormation change sets.
 - Recheck Horizen gas and all sign-up/deposit/withdrawal preflights before any
   production retry. No funds or thresholds are changed by this work.
