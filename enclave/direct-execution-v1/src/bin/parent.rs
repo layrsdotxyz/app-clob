@@ -40,7 +40,7 @@ use layrs_direct_execution_v1::{
     GovernedBalanceRecovery, GovernedKeyReleaseArtifact, GovernedMarketRegistration,
     GovernedMarketResolution, ImmutableExternalEffectIntentStore, OrderAction, Outcome,
     ProjectionBalanceRow, ProjectionIdentityRow, ProjectionWalletRow, RelayWithdrawalBinding,
-    RuntimeMeasurementBinding, RuntimeRequest, RuntimeResponse, SealedEpoch, TimeInForce,
+    RuntimeMeasurementBinding, RuntimeRequest, RuntimeResponse, SealedEpoch, SignedWithdrawalIntent, TimeInForce,
     WriterGrant, EPOCH_ID, MAX_V70_LINEAGE_RECORDS, POSTGRES_PROJECTION_DDL,
 };
 use layrs_direct_execution_v1::journal::{
@@ -4859,6 +4859,7 @@ enum CustomerAction {
     VerifyZenWithdrawal {withdrawal_id:String,destination_chain:String,asset:String,destination:String,amount_atomic:String},
     LinkFinancialWallet {grant:WalletLinkGrant,signature:String},
     LinkPoolWallet {wallet_address:String,external_id:String},
+    ReserveSignedWithdrawal {intent:SignedWithdrawalIntent,user_signature:String},
     ReserveZenWithdrawal { destination_chain: String, destination: String, amount_atomic: String },
     PlaceOrder {
         order_id: String,
@@ -5472,6 +5473,18 @@ async fn command(
         }
         CustomerAction::LinkPoolWallet {wallet_address,external_id} => {
             DirectAction::LinkPoolWallet {wallet_address,external_id}
+        }
+        CustomerAction::ReserveSignedWithdrawal {intent,user_signature} => {
+            match signed_withdrawal_reservation_action(
+                &request_id,
+                claims.financial_wallet_address.as_deref(),
+                intent,
+                user_signature,
+                now_unix(),
+            ) {
+                Ok(action)=>action,
+                Err((status,code))=>return (status,code).into_response(),
+            }
         }
         CustomerAction::BeginUsdcBusWithdrawal { destination_chain,asset,destination, amount_atomic } => {
             if external_effect_pending {
@@ -6283,6 +6296,37 @@ fn signed_base_withdrawal_destination_matches(
     valid_base_withdrawal_destination(action_destination)
         && valid_base_withdrawal_destination(signed_destination)
         && action_destination.eq_ignore_ascii_case(signed_destination)
+}
+
+fn signed_withdrawal_reservation_action(
+    request_id: &str,
+    assigned_route_wallet: Option<&str>,
+    intent: SignedWithdrawalIntent,
+    user_signature: String,
+    now_unix: u64,
+) -> Result<DirectAction, (StatusCode, &'static str)> {
+    let expected_request_id = intent
+        .nonce_request_id()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "SIGNED_WITHDRAWAL_INTENT_INVALID"))?;
+    if request_id != expected_request_id {
+        return Err((StatusCode::BAD_REQUEST, "SIGNED_WITHDRAWAL_IDEMPOTENCY_KEY_MISMATCH"));
+    }
+    if now_unix >= intent.expiry_unix {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "SIGNED_WITHDRAWAL_EXPIRED"));
+    }
+    if !assigned_route_wallet
+        .is_some_and(|wallet| wallet.eq_ignore_ascii_case(&intent.route_wallet))
+    {
+        return Err((StatusCode::FORBIDDEN, "SIGNED_WITHDRAWAL_ROUTE_WALLET_MISMATCH"));
+    }
+    intent
+        .verify_signature(&user_signature)
+        .map_err(|_| (StatusCode::FORBIDDEN, "SIGNED_WITHDRAWAL_SIGNATURE_INVALID"))?;
+    Ok(DirectAction::ReserveSignedWithdrawal {
+        intent,
+        user_signature,
+        now_unix,
+    })
 }
 
 /// Reserve entitlement in the trusted ledger before any worker moves money.
@@ -9844,6 +9888,51 @@ mod tests {
         assert!(serde_json::from_value::<CustomerAction>(action).is_ok());
         for kind in ["SETTLE_USDC_BUS_WITHDRAWAL", "REVERT_USDC_BUS_WITHDRAWAL"] {
             assert!(serde_json::from_value::<CustomerAction>(serde_json::json!({"type":kind,"withdrawalId":"11111111-1111-4111-8111-111111111111", "destination":"0x1111111111111111111111111111111111111111", "amountAtomic":"5000000", "custodyReference":"fake"})).is_err());
+        }
+    }
+    #[test]
+    fn signed_withdrawal_public_action_accepts_only_the_exact_signed_reserve() {
+        let account = "0x4a62316623ad457f02cdc5d997ded67a383ec569";
+        let route_wallet = "0x2222222222222222222222222222222222222222";
+        let intent = SignedWithdrawalIntent {
+            account: account.into(),
+            pool: "0xb412f63299ccff4fe57714ee580895cca74dd284".into(),
+            token: "0x3c2269811836af69497e5f486a85d7316753cf62".into(),
+            route_wallet: route_wallet.into(),
+            amount_atomic: "20000000".into(),
+            recipient: "0x0d2bf0c9d6d96eea797c9d1b96895d8f70e3322e".into(),
+            destination_chain: "base".into(),
+            nonce: "42".into(),
+            expiry_unix: 1_800_000_000,
+        };
+        let signature = "0xba8fbfb0d569bf331f0861731196411af01388eff1b432c6fa645a35a33f3bec2036ea39976c51d1982b256c7efab11abe447cd4b2c6c717d46ea22361e94dbf1c";
+        let request_id = format!("signed-withdrawal:{account}:42");
+        assert!(matches!(
+            signed_withdrawal_reservation_action(
+                &request_id,
+                Some(route_wallet),
+                intent.clone(),
+                signature.into(),
+                1_799_999_999,
+            ),
+            Ok(DirectAction::ReserveSignedWithdrawal { .. })
+        ));
+        assert_eq!(
+            signed_withdrawal_reservation_action(
+                &request_id,
+                Some("0x3333333333333333333333333333333333333333"),
+                intent,
+                signature.into(),
+                1_799_999_999,
+            )
+            .unwrap_err(),
+            (StatusCode::FORBIDDEN, "SIGNED_WITHDRAWAL_ROUTE_WALLET_MISMATCH")
+        );
+        for kind in ["SETTLE_SIGNED_WITHDRAWAL", "RELEASE_EXPIRED_SIGNED_WITHDRAWAL"] {
+            assert!(serde_json::from_value::<CustomerAction>(serde_json::json!({
+                "type":kind,
+                "intentHash":"11".repeat(32)
+            })).is_err());
         }
     }
     #[test]
