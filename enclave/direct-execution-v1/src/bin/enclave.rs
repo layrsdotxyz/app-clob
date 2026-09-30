@@ -3711,6 +3711,41 @@ mod tests {
         )
     }
 
+    fn shadow_relink(
+        subject: &str,
+        identity: &str,
+        wallet: &str,
+        request_id: &str,
+    ) -> DirectRequest {
+        request_for(
+            subject,
+            identity,
+            request_id,
+            DirectAction::LinkFinancialWallet {
+                wallet_address: wallet.into(),
+            },
+        )
+    }
+
+    async fn commit_v70_with_immediate_ack(
+        state: Arc<Mutex<EnclaveState>>,
+        request: DirectRequest,
+    ) -> (RuntimeResponse, usize) {
+        let (mut parent, server) = begin(state, request).await;
+        let artifact = candidate(&mut parent).await;
+        let artifact_bytes = serde_cbor::to_vec(&artifact).unwrap().len();
+        let ack = DurabilityAck::issue(&artifact, &[9; 32]);
+        write_frame(
+            &mut parent,
+            &serde_cbor::to_vec(&RuntimeRequest::DurabilityAck { ack }).unwrap(),
+        )
+        .await
+        .unwrap();
+        let terminal = serde_cbor::from_slice(&read_frame(&mut parent).await.unwrap()).unwrap();
+        server.await.unwrap().unwrap();
+        (terminal, artifact_bytes)
+    }
+
     #[test]
     fn v71_shadow_catch_up_replays_every_observation_and_matches_final_v70_head() {
         let epoch = SealedEpoch::load(epoch_path()).unwrap();
@@ -3951,6 +3986,303 @@ mod tests {
         assert!(promoted.v71_writer_eligible);
         assert_eq!(promoted.v71_runtime.as_ref().map(DirectV71Runtime::sequence), Some(2));
         assert!(matches!(promoted.v71_shadow, V71ShadowState::Disabled));
+    }
+
+    /// Exercises the complete enclave-side hot transition at production-sized
+    /// request history. The first load burst is forced into the Pending window
+    /// while the migration worker runs, proving catch-up does not own the
+    /// transition gate. Framed v70 commits then exercise the real candidate and
+    /// durability-ack path before checkpoint verification and exact-head
+    /// promotion. Finally, a compact v71 successor is acknowledged and the
+    /// exact v70 rollback checkpoint is restored and compared.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "production-sized shadow/promotion rehearsal; set LAYRS_V71_REHEARSAL_HISTORY"]
+    async fn v71_production_sized_shadow_promotion_and_rollback_rehearsal() {
+        let history = std::env::var("LAYRS_V71_REHEARSAL_HISTORY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(43_000);
+        let pending_commits = std::env::var("LAYRS_V71_REHEARSAL_PENDING_COMMITS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(64);
+        let framed_commits = std::env::var("LAYRS_V71_REHEARSAL_FRAMED_COMMITS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(2);
+        assert!((1_000..=100_000).contains(&history));
+        assert!((1..MAX_V71_SHADOW_CATCH_UP / 2).contains(&pending_commits));
+        assert!((1..=10).contains(&framed_commits));
+
+        let state = state();
+        let subject = "a".repeat(64);
+        let wallet = "0x1111111111111111111111111111111111111111";
+        let identity = identity_commitment_for(&subject, wallet);
+        {
+            let mut committed = state.lock().await;
+            committed.recovery_complete = true;
+            committed
+                .runtime
+                .execute(request_for(
+                    &subject,
+                    &identity,
+                    "rehearsal-admission",
+                    DirectAction::AdmitIdentity {
+                        wallet_address: wallet.into(),
+                    },
+                ))
+                .unwrap();
+            for ordinal in 1..history {
+                committed
+                    .runtime
+                    .execute(shadow_relink(
+                        &subject,
+                        &identity,
+                        wallet,
+                        &format!("rehearsal-history-{ordinal:06}"),
+                    ))
+                    .unwrap();
+            }
+            assert_eq!(committed.runtime.committed_sequence(), history as u64);
+        }
+
+        let shadow_started = std::time::Instant::now();
+        assert!(matches!(
+            begin_v71_shadow(Arc::clone(&state), "production-rehearsal".into()).await,
+            RuntimeResponse::V71ShadowStatus {
+                phase,
+                source_sequence,
+                ..
+            } if phase == "PENDING" && source_sequence == history as u64
+        ));
+
+        // Hold the same transition gate used by real commits so the migration
+        // worker cannot install until this serialized authoritative burst is
+        // fully observed. The old implementation blocked here for the entire
+        // migration/catch-up build.
+        let pending_gate_started = std::time::Instant::now();
+        let pending_guard = transition(&state).await;
+        let pending_gate_wait = pending_gate_started.elapsed();
+        let pending_burst_started = std::time::Instant::now();
+        for ordinal in 0..pending_commits {
+            let request = shadow_relink(
+                &subject,
+                &identity,
+                wallet,
+                &format!("rehearsal-pending-{ordinal:06}"),
+            );
+            let result = state.lock().await.runtime.execute(request.clone()).unwrap();
+            observe_v71_shadow_commit(&state, request, result).await;
+        }
+        let pending_burst = pending_burst_started.elapsed();
+        assert!(matches!(
+            v71_shadow_status(&state).await,
+            RuntimeResponse::V71ShadowStatus {
+                phase,
+                sequence,
+                ..
+            } if phase == "PENDING" && sequence == (history + pending_commits) as u64
+        ));
+        drop(pending_guard);
+
+        let active = tokio::time::timeout(std::time::Duration::from_secs(15 * 60), async {
+            loop {
+                let status = v71_shadow_status(&state).await;
+                match &status {
+                    RuntimeResponse::V71ShadowStatus { phase, .. } if phase == "ACTIVE" => {
+                        break status;
+                    }
+                    RuntimeResponse::V71ShadowStatus { phase, .. }
+                        if phase.starts_with("LATCHED:") =>
+                    {
+                        panic!("shadow latched during production rehearsal: {phase}");
+                    }
+                    _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .expect("production-sized shadow did not become active");
+        let shadow_active_elapsed = shadow_started.elapsed();
+        assert!(matches!(
+            active,
+            RuntimeResponse::V71ShadowStatus {
+                sequence,
+                consecutive_matches,
+                ..
+            } if sequence == (history + pending_commits) as u64
+                && consecutive_matches == pending_commits as u64
+        ));
+
+        let mut framed_latencies = Vec::with_capacity(framed_commits);
+        let mut largest_v70_artifact = 0usize;
+        for ordinal in 0..framed_commits {
+            let started = std::time::Instant::now();
+            let (terminal, artifact_bytes) = commit_v70_with_immediate_ack(
+                Arc::clone(&state),
+                shadow_relink(
+                    &subject,
+                    &identity,
+                    wallet,
+                    &format!("rehearsal-framed-{ordinal:06}"),
+                ),
+            )
+            .await;
+            assert!(matches!(terminal, RuntimeResponse::Execute { .. }));
+            largest_v70_artifact = largest_v70_artifact.max(artifact_bytes);
+            framed_latencies.push(started.elapsed());
+        }
+
+        let export_started = std::time::Instant::now();
+        let export = export_v71_shadow(
+            &state,
+            "production-rehearsal".into(),
+            history as u64,
+            true,
+        )
+        .await;
+        let RuntimeResponse::V71ShadowExport {
+            writer_epoch,
+            sequence,
+            record_hash,
+            transition_root,
+            request_index_root,
+            financial_state_root,
+            migration: Some(migration),
+            base_checkpoint: Some(base_checkpoint),
+            records,
+            terminal_leaves,
+            results,
+            ..
+        } = export
+        else {
+            panic!("expected complete production-sized shadow export");
+        };
+        let export_elapsed = export_started.elapsed();
+        assert_eq!(base_checkpoint.sequence, history as u64);
+        assert_eq!(records.len(), pending_commits + framed_commits);
+        assert_eq!(terminal_leaves.len(), records.len());
+        assert_eq!(results.len(), records.len());
+        assert_eq!(sequence, (history + pending_commits + framed_commits) as u64);
+
+        let verification_started = std::time::Instant::now();
+        assert!(matches!(
+            verify_journal_checkpoint(Arc::clone(&state), base_checkpoint).await,
+            RuntimeResponse::JournalCheckpointVerified {
+                sequence: verified,
+                ..
+            } if verified == history as u64
+        ));
+        let verification_elapsed = verification_started.elapsed();
+
+        let promotion_started = std::time::Instant::now();
+        assert!(matches!(
+            promote_v71_shadow(
+                Arc::clone(&state),
+                "production-rehearsal".into(),
+                sequence,
+                record_hash,
+                transition_root,
+                request_index_root,
+                financial_state_root,
+            )
+            .await,
+            RuntimeResponse::V71ShadowPromoted {
+                sequence: promoted,
+                ..
+            } if promoted == sequence
+        ));
+        let promotion_elapsed = promotion_started.elapsed();
+
+        let mut tree = SparseRequestTree::from_leaves(&migration.leaves).unwrap();
+        for leaf in &terminal_leaves {
+            tree.insert(leaf.clone()).unwrap();
+        }
+        let post_request = shadow_relink(
+            &subject,
+            &identity,
+            wallet,
+            "rehearsal-post-promotion",
+        );
+        let proof = tree
+            .proof(&post_request.account_id, &post_request.request_id)
+            .unwrap();
+        let journal_started = std::time::Instant::now();
+        let (terminal, post_record, post_leaf) = commit_journal_through_parent_callback(
+            Arc::clone(&state),
+            post_request.clone(),
+            proof,
+        )
+        .await;
+        let journal_elapsed = journal_started.elapsed();
+        let RuntimeResponse::Execute { result: post_result } = terminal else {
+            panic!("post-promotion journal commit failed");
+        };
+        tree.insert(post_leaf).unwrap();
+
+        let mut journal_records = records;
+        journal_records.push(post_record);
+        let rollback_started = std::time::Instant::now();
+        let rollback = runtime_response(
+            Arc::clone(&state),
+            RuntimeRequest::SealV70RollbackCheckpoint {
+                migration: migration.clone(),
+                journal_records,
+            },
+        )
+        .await;
+        let rollback_elapsed = rollback_started.elapsed();
+        let RuntimeResponse::CheckpointSealed { checkpoint } = rollback else {
+            panic!("exact-head v70 rollback seal failed");
+        };
+        let rollback_bytes = serde_cbor::to_vec(&checkpoint).unwrap().len();
+        let expected_sequence = sequence + 1;
+        let expected_state_hash = checkpoint.artifact.state_hash.clone();
+        let expected_portfolio = {
+            let committed = state.lock().await;
+            let runtime = committed.v71_runtime.as_ref().unwrap();
+            assert_eq!(runtime.sequence(), expected_sequence);
+            runtime.portfolio(&identity).unwrap()
+        };
+        let mut restored = {
+            let committed = state.lock().await;
+            DirectRuntime::new(
+                committed.epoch.clone(),
+                committed.mode,
+                committed.receipt_key.clone(),
+            )
+            .unwrap()
+            .restore_checkpoint(&checkpoint, &committed.state_key)
+            .unwrap()
+        };
+        assert_eq!(restored.committed_sequence(), expected_sequence);
+        assert_eq!(restored.committed_state_hash(), expected_state_hash);
+        assert_eq!(restored.portfolio(&identity).unwrap(), expected_portfolio);
+        assert_eq!(restored.execute(post_request).unwrap(), post_result);
+
+        framed_latencies.sort_unstable();
+        let framed_p50 = framed_latencies[(framed_latencies.len() - 1) / 2];
+        let framed_p99 = framed_latencies[framed_latencies.len() - 1];
+        eprintln!(
+            "V71_FULL_PROMOTION_REHEARSAL history={} pending_commits={} framed_commits={} shadow_active_ms={} pending_gate_wait_ms={} pending_burst_ms={} framed_p50_ms={} framed_p99_ms={} largest_v70_artifact_bytes={} export_ms={} checkpoint_verify_ms={} promotion_ms={} journal_commit_ms={} rollback_seal_ms={} rollback_checkpoint_bytes={} final_sequence={} writer_epoch={}",
+            history,
+            pending_commits,
+            framed_commits,
+            shadow_active_elapsed.as_millis(),
+            pending_gate_wait.as_millis(),
+            pending_burst.as_millis(),
+            framed_p50.as_millis(),
+            framed_p99.as_millis(),
+            largest_v70_artifact,
+            export_elapsed.as_millis(),
+            verification_elapsed.as_millis(),
+            promotion_elapsed.as_millis(),
+            journal_elapsed.as_millis(),
+            rollback_elapsed.as_millis(),
+            rollback_bytes,
+            expected_sequence,
+            writer_epoch,
+        );
     }
 
     #[tokio::test]

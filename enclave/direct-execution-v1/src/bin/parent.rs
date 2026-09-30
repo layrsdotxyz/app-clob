@@ -232,6 +232,10 @@ impl AppState {
 struct ParentHealth {
     restored: AtomicBool,
     last_response_at: AtomicU64,
+    /// Once the immutable v71 cutover marker exists, an unconfirmed enclave
+    /// promotion is process-fatal. The financial gate remains held and health
+    /// stays failed until the ASG replaces this parent and restores the marker.
+    cutover_uncertain: AtomicBool,
 }
 const HEALTH_FRESHNESS_SECONDS: u64 = 45;
 
@@ -239,6 +243,7 @@ impl ParentHealth {
     fn observe(&self, now: u64) { self.last_response_at.store(now, Ordering::Release); }
     fn check(&self, now: u64, last_commit: u64, stalled_waiter: bool, grant_expired: bool) -> Result<(), &'static str> {
         if !self.restored.load(Ordering::Acquire) { return Err("DIRECT_STATE_RECOVERY_REQUIRED"); }
+        if self.cutover_uncertain.load(Ordering::Acquire) { return Err("V71_CUTOVER_CONFIRMATION_UNCERTAIN"); }
         if grant_expired { return Err("WRITER_AUTHORIZATION_EXPIRED"); }
         let commit_recent = last_commit != 0 && now.checked_sub(last_commit).is_some_and(|age| age < WRITE_PATH_STALL_THRESHOLD.as_secs());
         if stalled_waiter && !commit_recent { return Err("WRITE_PATH_STALLED"); }
@@ -248,6 +253,22 @@ impl ParentHealth {
         }
         Ok(())
     }
+}
+
+/// A marker is the durable format decision point. After it exists, dropping
+/// the gate on an ambiguous or rejected promotion could acknowledge newer v70
+/// commits that a marker-selected v71 restart cannot contain. Intentionally
+/// retain this one owned guard for the remaining process lifetime and fail the
+/// health check so replacement restores the exact staged v71 head.
+fn fail_closed_after_v71_marker(
+    health: &ParentHealth,
+    guard: tokio::sync::OwnedMutexGuard<()>,
+    reason: &'static str,
+) -> String {
+    health.cutover_uncertain.store(true, Ordering::Release);
+    eprintln!("V71_CUTOVER_CONFIRMATION_UNCERTAIN reason={reason}");
+    std::mem::forget(guard);
+    reason.into()
 }
 
 fn start_health_observer(state: AppState) {
@@ -2141,6 +2162,24 @@ fn journal_cutover_marker_key(prefix: &str) -> String {
     format!("{prefix}/journal-v71/cutover.cbor")
 }
 
+fn validate_v70_tip_at_cutover(
+    prefix: &str,
+    marker_sequence: u64,
+    head_keys: &[String],
+) -> Result<(), String> {
+    let head_prefix = format!("{prefix}/heads/");
+    let mut latest = None;
+    for key in head_keys {
+        let sequence = archive_key_sequence(key, &head_prefix, false)
+            .map_err(|_| "V71_CUTOVER_V70_HEAD_INVALID")?;
+        latest = Some(latest.map_or(sequence, |current: u64| current.max(sequence)));
+    }
+    if latest != Some(marker_sequence) {
+        return Err("V71_CUTOVER_V70_TIP_MISMATCH".into());
+    }
+    Ok(())
+}
+
 /// Strict inverse of `journal_record_key`. Legacy `{seq}-{hash}` head names,
 /// unpadded, foreign, overflowing, zero, or otherwise noncanonical keys are
 /// never valid journal records.
@@ -3284,6 +3323,12 @@ impl S3ImmutableArtifactStore {
         let Some(marker) = self.load_v71_cutover_marker().await? else {
             return Ok(false);
         };
+        // The marker and the legacy archive must describe the same last v70
+        // acknowledgement. A newer v70 tip means a previous parent released
+        // the gate after an unconfirmed cutover and startup must fail closed
+        // instead of silently selecting the older journal marker.
+        let v70_heads = self.list_restore_keys("heads").await?;
+        validate_v70_tip_at_cutover(&self.prefix, marker.sequence, &v70_heads)?;
         if !self.prepare_journal_restore().await? {
             return Err("V71_CUTOVER_MARKER_WITHOUT_JOURNAL".into());
         }
@@ -7829,7 +7874,7 @@ async fn stage_and_promote_v71_shadow(state: AppState, run_id: String) -> Result
         // command or pending-work payload. If the following transport is
         // ambiguous, restart deterministically restores this v71 frontier.
         store.persist_v71_cutover_marker(&head).await?;
-        let promoted = exchange(
+        let promoted = match exchange(
             &state,
             RuntimeRequest::PromoteV71Shadow {
                 run_id: run_id.clone(),
@@ -7841,7 +7886,16 @@ async fn stage_and_promote_v71_shadow(state: AppState, run_id: String) -> Result
             },
         )
         .await
-        .map_err(|_| "V71_SHADOW_PROMOTION_TRANSPORT_FAILED")?;
+        {
+            Ok(promoted) => promoted,
+            Err(_) => {
+                return Err(fail_closed_after_v71_marker(
+                    &state.health,
+                    guard,
+                    "V71_SHADOW_PROMOTION_TRANSPORT_FAILED",
+                ));
+            }
+        };
         if !matches!(promoted, RuntimeResponse::V71ShadowPromoted {
             ref writer_epoch,
             sequence,
@@ -7856,8 +7910,11 @@ async fn stage_and_promote_v71_shadow(state: AppState, run_id: String) -> Result
             && request_index_root == &head.request_index_root
             && financial_state_root == &head.financial_state_root)
         {
-            drop(guard);
-            return Err("V71_SHADOW_PROMOTION_MISMATCH".into());
+            return Err(fail_closed_after_v71_marker(
+                &state.health,
+                guard,
+                "V71_SHADOW_PROMOTION_MISMATCH",
+            ));
         }
         *state.journal_request_index.lock().await = Some(index);
         *state.journal_receipts.lock().await = Some(receipts);
@@ -9729,6 +9786,31 @@ mod tests {
     }
 
     #[test]
+    fn v71_hot_restore_requires_the_legacy_tip_to_equal_the_cutover_marker() {
+        let heads = (43_205..=43_207)
+            .map(|sequence| format!("epoch/heads/{sequence:020}.cbor"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            super::validate_v70_tip_at_cutover("epoch", 43_207, &heads),
+            Ok(())
+        );
+        assert_eq!(
+            super::validate_v70_tip_at_cutover("epoch", 43_206, &heads),
+            Err("V71_CUTOVER_V70_TIP_MISMATCH".into())
+        );
+        assert_eq!(
+            super::validate_v70_tip_at_cutover("epoch", 43_208, &heads),
+            Err("V71_CUTOVER_V70_TIP_MISMATCH".into())
+        );
+        let mut malformed = heads;
+        malformed.push("epoch/heads/not-a-head.cbor".into());
+        assert_eq!(
+            super::validate_v70_tip_at_cutover("epoch", 43_207, &malformed),
+            Err("V71_CUTOVER_V70_HEAD_INVALID".into())
+        );
+    }
+
+    #[test]
     fn checkpoint_refresh_coalesces_bursts_and_retries_without_new_commits() {
         assert_eq!(super::CHECKPOINT_REFRESH_INTERVAL, std::time::Duration::from_secs(300));
         let mut refresh = super::CheckpointRefresh::default();
@@ -10556,6 +10638,33 @@ mod tests {
         assert_eq!(health.check(160, 99, true, false), Err("WRITE_PATH_STALLED"));
         assert_eq!(health.check(160, 160, false, true), Err("WRITER_AUTHORIZATION_EXPIRED"));
         assert_eq!(health.check(159, 0, false, false), Err("ENCLOSURE_UNAVAILABLE")); // clock regression
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_promotion_after_marker_fails_health_and_keeps_gate_closed() {
+        let gate = FinancialGate::new();
+        let health = ParentHealth::default();
+        health.restored.store(true, Ordering::Release);
+        health.observe(100);
+        let guard = gate.lock("v71_cutover_test").await;
+        assert_eq!(
+            fail_closed_after_v71_marker(
+                &health,
+                guard,
+                "V71_SHADOW_PROMOTION_TRANSPORT_FAILED",
+            ),
+            "V71_SHADOW_PROMOTION_TRANSPORT_FAILED"
+        );
+        assert_eq!(
+            health.check(100, 100, false, false),
+            Err("V71_CUTOVER_CONFIRMATION_UNCERTAIN")
+        );
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50),
+            gate.lock("post_marker_v70_commit"),
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]

@@ -2,9 +2,9 @@
 
 | Field | Status |
 | --- | --- |
-| Current step | Queue item 1: retained-v70 rollback identity consumers rotated; internal-account flow verification stopped on a freshly reconfirmed reserve no-go |
-| What's done | Fresh Nitro attestation verified the rollback identity. New immutable manifest, BFF Phase-1, publication-successor, and administration Phase-1 secrets were created with only release-identity fields changed; predecessors remain untouched. BFF `:189`, proof publisher `:33`, and quest administration `:88` are each 1/1 healthy and all stacks are `UPDATE_COMPLETE`. Public manifest and attestation verify; the BFF stayed up; publisher binding failures stopped and at least 23 Horizen batches confirmed. Evidence: `evidence/ROLLBACK_IDENTITY_CONSUMER_ROTATION_20260930.md`. |
-| What's next | Obtain exact transfer authorization identifying the funding source and amount before any movement into the shared Horizen operating wallet. Then rerun internal-account signup setup, deposit and withdrawal checks. Do not skip queue item 1 or begin the v71 second attempt first. |
-| Blockers | Fresh read at 10:36 IST reconfirmed `QUEST_PREFLIGHT_RESERVE_SHORTFALL`: Horizen company native balance remains exactly `91636664139358` wei versus `102000000000000` required, a `10363335860642` wei deficit. Funding is a real-money action outside the identity-only approval. |
-| Production-affecting action pending approval | None in flight. A separate authorization is required to top up the public company address by at least the `10363335860642` wei deficit plus operational margin. |
-| Last updated (IST) | 2026-09-30 10:36 IST |
+| Current step | Queue item 2: v71 second-attempt fixes and full promotion rehearsal |
+| What's done | Item 1 rotation is deployed; user-flow verification is pending the user's gas-wallet decision. Commit `8f4ca93` fixes exact active-shadow checkpoint verification and moves catch-up replay outside the transition gate. The second safety review found and fixed the post-marker ambiguity: an unconfirmed promotion now permanently fences the process and fails health, and marker-selected startup rejects any unequal v70 archive tip. Both focused parent tests pass. The complete 1,000-record smoke path passed Pending load, framed v70 commit, verification, promotion, compact v71 commit, exact-head v70 seal/restore, portfolio equality and idempotent replay. Evidence is in `evidence/V71_SECOND_ATTEMPT_REHEARSAL_20260930.md`. |
+| What's next | Commit the post-marker safety fix, refresh the live frontier read-only, run the release-mode production-sized concurrent rehearsal, then build/inspect both AMIs and rehearse storage promotion, exact-head rollback ASG handoff and forward/rollback identity rotation. |
+| Blockers | No code/rehearsal blocker. The separate Horizen gas reserve remains below its preflight floor and must be rechecked before any production retry; no funds or thresholds will be changed here. |
+| Production-affecting action pending approval | None in flight. No v71 production retry until the gas reserve passes and all rehearsal gates pass. |
+| Last updated (IST) | 2026-09-30 14:16 IST |
