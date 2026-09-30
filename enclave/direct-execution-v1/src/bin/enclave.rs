@@ -3746,6 +3746,30 @@ mod tests {
         (terminal, artifact_bytes)
     }
 
+    fn process_memory_kib() -> (u64, u64) {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let value = |label: &str| {
+            status
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix(label)?
+                        .split_whitespace()
+                        .next()?
+                        .parse::<u64>()
+                        .ok()
+                })
+                .unwrap_or_default()
+        };
+        (value("VmRSS:"), value("VmHWM:"))
+    }
+
+    fn report_rehearsal_memory(phase: &str) {
+        let (rss_kib, high_water_kib) = process_memory_kib();
+        eprintln!(
+            "V71_REHEARSAL_MEMORY phase={phase} rss_kib={rss_kib} high_water_kib={high_water_kib}"
+        );
+    }
+
     #[test]
     fn v71_shadow_catch_up_replays_every_observation_and_matches_final_v70_head() {
         let epoch = SealedEpoch::load(epoch_path()).unwrap();
@@ -4113,6 +4137,7 @@ mod tests {
             } if sequence == (history + pending_commits) as u64
                 && consecutive_matches == pending_commits as u64
         ));
+        report_rehearsal_memory("shadow_active");
 
         let mut framed_latencies = Vec::with_capacity(framed_commits);
         let mut largest_v70_artifact = 0usize;
@@ -4132,6 +4157,7 @@ mod tests {
             largest_v70_artifact = largest_v70_artifact.max(artifact_bytes);
             framed_latencies.push(started.elapsed());
         }
+        report_rehearsal_memory("framed_v70_commits");
 
         let export_started = std::time::Instant::now();
         let export = export_v71_shadow(
@@ -4193,6 +4219,7 @@ mod tests {
             } if promoted == sequence
         ));
         let promotion_elapsed = promotion_started.elapsed();
+        report_rehearsal_memory("promoted");
 
         let mut tree = SparseRequestTree::from_leaves(&migration.leaves).unwrap();
         for leaf in &terminal_leaves {
@@ -4219,6 +4246,7 @@ mod tests {
             panic!("post-promotion journal commit failed");
         };
         tree.insert(post_leaf).unwrap();
+        report_rehearsal_memory("journal_commit");
 
         let mut journal_records = records;
         journal_records.push(post_record);
@@ -4235,6 +4263,7 @@ mod tests {
         let RuntimeResponse::CheckpointSealed { checkpoint } = rollback else {
             panic!("exact-head v70 rollback seal failed");
         };
+        report_rehearsal_memory("rollback_sealed");
         let rollback_bytes = serde_cbor::to_vec(&checkpoint).unwrap().len();
         let expected_sequence = sequence + 1;
         let expected_state_hash = checkpoint.artifact.state_hash.clone();
@@ -4259,6 +4288,7 @@ mod tests {
         assert_eq!(restored.committed_state_hash(), expected_state_hash);
         assert_eq!(restored.portfolio(&identity).unwrap(), expected_portfolio);
         assert_eq!(restored.execute(post_request).unwrap(), post_result);
+        report_rehearsal_memory("rollback_restored");
 
         framed_latencies.sort_unstable();
         let framed_p50 = framed_latencies[(framed_latencies.len() - 1) / 2];

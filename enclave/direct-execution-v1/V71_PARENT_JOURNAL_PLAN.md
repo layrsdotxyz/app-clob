@@ -50,22 +50,23 @@ review):
 
 ---
 
-## 2. Design decision: the v71 record *is* the head, stored in the v70 head slot
+## 2. Design decision: v71 records use a format-specific immutable namespace
 
-**Record key: `{prefix}/heads/{sequence:020}.cbor`, body = `serde_cbor(DirectJournalRecord)`, for every sequence above the v70→v71 bridge sequence `B`.**
+**Record key: `{prefix}/journal-v71/records/{sequence:020}.cbor`, body = `serde_cbor(DirectJournalRecord)`, for every sequence above the v70→v71 bridge sequence `B`.**
 
 Reasons:
 
 1. **One create-only PUT per commit.** The v70 artifact-then-head window (2313-2320) and its orphan artifacts disappear. The PUT's success is the commit point.
-2. **Storage-level exclusion across formats with no v70 code change.** A stale v70 writer and a v71 writer contend for the *same* key. Whichever loses gets `ARCHIVE_SEQUENCE_CONFLICT` through the existing path (2150-2155), and the loser acknowledges nothing. A separate v71 namespace would let an un-stopped v70 writer and a v71 writer both commit sequence `B+1`. That would be an acknowledged fork that the parent cannot prevent.
-3. **A retained v70 EIF fails closed instead of silently rolling back.** If a v70 EIF is pointed at a prefix that already holds v71 records, its restore reaches a CBOR record body where it expects 64 hex bytes and fails at 2410-2421 (or `committed_archive_keys` 1942-1944 finds no artifact). It cannot restore to `B` and drop v71 commits.
+2. **Shadow construction can coexist with authoritative v70 heads.** The same committed sequence exists in both formats while v70 serves traffic. Reusing `{prefix}/heads/{sequence}` would conflict immediately with the already-durable v70 full-state head and make live shadow staging impossible.
+3. **Cross-format exclusion moves to the cutover protocol.** The parent financial gate prevents another local v70 commit while the immutable cutover marker is written and the enclave is promoted. Any ambiguous marker write or promotion retains that gate and fails health. Startup accepts the marker only when the highest true v70 head equals the marker sequence; the writer grant and ASG handoff prevent a second parent writer.
 
-Consequence: a v70 rollback export (contract lines 145-150) cannot be written into the same prefix's `heads/` above `B`. It must target a fresh archive prefix. This is a Codex/verification decision, flagged in §11.
+Consequence: a retained raw v70 parent must never be pointed back at the mixed source prefix after cutover because it cannot interpret the v71 marker. Rollback first materializes an exact-head v70 package under a fresh archive prefix and then starts the retained v70 runtime against that prefix.
 
 Other keys (all written only by `write_once`, never overwritten or deleted):
 
 | Object | Key | Body |
 |---|---|---|
+| v71 record | `{prefix}/journal-v71/records/{seq:020}.cbor` | `serde_cbor(DirectJournalRecord)` |
 | v71 checkpoint | `{prefix}/journal-v71/checkpoints/{seq:020}-{sha256(bytes)}.cbor` | Codex-owned `DirectJournalCheckpoint`. Content-addressed like `checkpoint_key` (1994-1997). |
 | Writer fence | `{prefix}/journal-v71/fences/{sha256(fenced_writer_epoch)}/{head_seq:020}.cbor` | CBOR `JournalWriterFence` (§3.2) |
 | Shadow records | `{prefix}/shadow-v71/{run_id}/heads/{seq:020}.cbor` | same as the record |
@@ -158,8 +159,8 @@ Startup validation in `main`:
 
 | Function | Contract |
 |---|---|
-| `fn journal_record_key(prefix: &str, sequence: u64) -> String` | `archive_head_key(prefix, sequence)` (1790). A named alias documents the shared slot. |
-| `fn journal_record_key_sequence(key: &str, prefix: &str) -> Result<u64, String>` | `archive_key_sequence(key, "{prefix}/heads/", false)` (1794-1816), **plus** rejection of any `-` suffix. Legacy `{seq}-{hash}` names are never valid above `B`. |
+| `fn journal_record_key(prefix: &str, sequence: u64) -> String` | Canonical `{prefix}/journal-v71/records/{sequence:020}.cbor`. |
+| `fn journal_record_key_sequence(key: &str, prefix: &str) -> Result<u64, String>` | Strict inverse of `journal_record_key`; rejects suffixes, unpadded, zero, foreign and overflowing keys. |
 | `fn journal_fence_prefix(prefix: &str, writer_epoch: &str) -> String` / `fn journal_fence_key(prefix, writer_epoch, head_sequence) -> String` | §2 layout. `sha256` hex of the epoch. |
 | `fn journal_checkpoint_key(prefix: &str, sequence: u64, bytes: &[u8]) -> String` | §2 layout. |
 | `fn precheck_journal_candidate(head: &JournalHead, record: &DirectJournalRecord) -> Result<Vec<u8>, &'static str>` | §4 step 2. Returns the CBOR bytes to PUT. |
@@ -287,7 +288,7 @@ It runs in place of `restore_streamed` at 4941, before any route is served (2981
 2. **Checkpoint.** `list_restore_keys("journal-v71/checkpoints")` (2337). Select the last key, the same rule as 2503. Its sequence must satisfy `C >= B`, and `journal_checkpoint_key(C, bytes) == key` (content address, same as 2507-2509). A corrupt newest checkpoint fails closed with no fallback to an older one (the same principle as 2614-2616).
    - **No v71 checkpoint.** Allowed only when `list_journal_tail(after = B, max = 1)` is empty, meaning this is the first v71 boot. Run the existing `prepare_restore` + `restore_streamed` for `1..=B` and require the restored sequence `== B`. Then `SealJournalCheckpoint` → `persist_journal_checkpoint` → `read` must match, all **before** eligibility. No v71 append is allowed until a v71 checkpoint at `>= B` is durable. This keeps later restores on this path only.
    - **No checkpoint but tail above `B` exists** → fail closed (genesis/v70 fallback forbidden, contract lines 121-123).
-3. **Checkpoint anchor.** If `C == B`, `read(heads/{B})` must be the 64-hex v70 pointer equal to `frontier.artifact_hash`. If `C > B`, `read(heads/{C})` must decode to a record whose `record_hash()` equals the checkpoint's bound record hash. The enclave re-verifies this.
+3. **Checkpoint anchor.** If `C == B`, the migration bundle and authenticated v70 frontier anchor the checkpoint. If `C > B`, `read(journal-v71/records/{C})` must decode to a record whose `record_hash()` equals the checkpoint's bound record hash. The enclave re-verifies this.
 4. **Tail listing.** `list_journal_tail(after = C, max = MAX_V71_TAIL_RECORDS)` (Codex policy constant), then `validate_journal_tail_keys`. Fail closed on:
    - a gap, duplicate, or non-canonical key;
    - a legacy `{seq}-{hash}` name. Such names sort after `start_after` once `seq > C`, so they are always seen.
@@ -305,7 +306,7 @@ It runs in place of `restore_streamed` at 4941, before any route is served (2981
    - Otherwise require `writer_fenced(current) == Ok(false)`.
 
    Then set `Eligible(JournalHead{current, H, hash_H, root_H})`. `V71Shadow` stays `Unrestored` for authoritative purposes (§8).
-9. **Delete-marker guard (R1, required before production eligibility, §9 N5).** `list_object_versions` over `heads/` with `key_marker = heads/{C:020}.cbor`, and over `journal-v71/fences/`. Fail closed on any `DeleteMarker` entry or on any key with more than one version. A permission error fails closed and is never skipped.
+9. **Delete-marker guard (R1, required before production eligibility, §9 N5).** `list_object_versions` over `journal-v71/records/` with `key_marker = journal-v71/records/{C:020}.cbor`, and over `journal-v71/fences/`. Fail closed on any `DeleteMarker` entry or on any key with more than one version. A permission error fails closed and is never skipped.
 
 ---
 
@@ -318,7 +319,8 @@ soak time is not a cutover prerequisite.
 
 - **Store prefix.** Built once as `{LAYRS_DIRECT_ARCHIVE_PREFIX}/shadow-v71/{LAYRS_DIRECT_SHADOW_RUN_ID}`. The run id must match `[a-z0-9-]{1,64}` and is rejected otherwise. `journal_role = Shadow`.
 - **Write guard.** `append_journal_record` and `persist_journal_checkpoint` assert, in `Shadow` role, that every key starts with `{prefix}/shadow-v71/{run_id}/`. Violation → latch and no PUT.
-- **Never written by shadow:** the authoritative `heads/`, `artifacts/`, `checkpoints/`, `journal-v71/checkpoints/`, or `journal-v71/fences/`. `establish_writer_fence` is never called.
+- **Written during shadow staging:** immutable `journal-v71/records/` and the base `journal-v71/checkpoints/`; these are not authoritative until the cutover marker is durable.
+- **Never written by shadow:** v70 `heads/`, `artifacts/`, `checkpoints/`, or `journal-v71/fences/`. `establish_writer_fence` is never called.
 - **Never touched by shadow:** `committed_state_root`, projection, custody, intents, or the v70 `DurabilityAck`.
 - **No HTTP commands.** The command routes stay disabled because `direct_writer_route_enabled` (3058-3060) is unchanged, and the non-writer execution mode is enforced in §3.2.
 - **Same code path.** The shadow uses the §4 append and §7 restore code against its own prefix. That same code provides the "successful checkpoint-plus-tail restore" evidence the cutover gate needs (contract lines 131-137).
@@ -348,7 +350,7 @@ All tests are in the `parent.rs` `#[cfg(test)]` module. They use the existing lo
 
 1. `v71_record_key_shares_v70_head_slot_and_parser_rejects_legacy_and_foreign_keys`: key equality with `archive_head_key`. Hash suffix, wrong namespace, unpadded, and overflow are all rejected.
 2. `v71_precheck_rejects_wrong_epoch_sequence_predecessor_root_protocol_and_size_without_put`: the mock asserts zero connections, and the state becomes `Latched`.
-3. `v71_append_puts_once_with_create_only_kms_compliance_headers_then_reads_back_then_checks_fence`: the mock asserts request order PUT → GET → LIST. It also asserts headers `If-None-Match: *`, `x-amz-server-side-encryption: aws:kms`, `x-amz-object-lock-mode: COMPLIANCE`, and the key `heads/{seq:020}.cbor`. The head advances.
+3. `v71_append_puts_once_with_create_only_kms_compliance_headers_then_reads_back_then_checks_fence`: the mock asserts request order PUT → GET → LIST. It also asserts headers `If-None-Match: *`, `x-amz-server-side-encryption: aws:kms`, `x-amz-object-lock-mode: COMPLIANCE`, and the key `journal-v71/records/{seq:020}.cbor`. The head advances.
 4. `v71_append_412_with_identical_readback_is_idempotent_success`.
 5. `v71_append_412_with_different_readback_latches_sequence_conflict_and_maps_409`.
 6. `v71_durable_append_with_existing_fence_latches_without_ack`: the duplex side asserts no ack frame is received.
@@ -360,7 +362,7 @@ All tests are in the `parent.rs` `#[cfg(test)]` module. They use the existing lo
 12. `v71_restore_rejects_v70_head_body_above_bridge_and_record_sequence_key_mismatch`.
 13. `v71_writer_epoch_transitions_require_matching_fence_and_accept_aborted_lower_fence`: pure-function table test.
 14. `v71_handoff_aborts_when_post_fence_relist_sees_next_slot_and_rerun_is_idempotent`.
-15. `v71_v70_restore_fails_closed_on_a_v71_record_in_heads`: existing `prepare_restore` against a mock that serves a CBOR record at `heads/{B+1}` expects `archive sequence head hash invalid`.
+15. `v71_hot_restore_requires_the_legacy_tip_to_equal_the_cutover_marker`: startup lists only true v70 heads and fails closed if their maximum sequence differs from the immutable cutover marker.
 16. `v71_shadow_prefix_confines_all_writes_and_never_calls_fence_or_updates_state_root`.
 17. `v71_first_boot_requires_durable_bridge_checkpoint_before_eligibility`.
 18. `v71_delete_marker_or_multiple_versions_in_journal_namespace_fail_restore` (R1).

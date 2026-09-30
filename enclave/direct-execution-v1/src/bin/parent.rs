@@ -271,6 +271,31 @@ fn fail_closed_after_v71_marker(
     reason.into()
 }
 
+/// The marker PUT is itself an irreversible, potentially ambiguous format
+/// decision. A timeout or failed readback can still mean the immutable object
+/// became durable, so retain the gate and fail health exactly as for an
+/// unconfirmed promotion.
+async fn persist_v71_cutover_marker_or_fail_closed<F>(
+    health: &ParentHealth,
+    guard: tokio::sync::OwnedMutexGuard<()>,
+    persist: F,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, String>
+where
+    F: std::future::Future<Output = Result<(), String>>,
+{
+    match persist.await {
+        Ok(()) => Ok(guard),
+        Err(error) => {
+            eprintln!("V71_CUTOVER_MARKER_UNCONFIRMED error={error}");
+            Err(fail_closed_after_v71_marker(
+                health,
+                guard,
+                "V71_CUTOVER_MARKER_UNCONFIRMED",
+            ))
+        }
+    }
+}
+
 fn start_health_observer(state: AppState) {
     tokio::spawn(async move {
         loop {
@@ -2151,11 +2176,16 @@ fn journal_fence_prefix(prefix: &str, writer_epoch: &str) -> String {
     )
 }
 
-/// v71 records occupy the v70 head slot so both formats contend for one
-/// create-only key per sequence.
+fn journal_record_prefix(prefix: &str) -> String {
+    format!("{prefix}/journal-v71/records/")
+}
+
+/// v71 records use a format-specific immutable namespace. During shadow
+/// construction v70 has already committed its own full-state head at the same
+/// sequence; sharing that slot would make every staged append conflict.
 #[cfg_attr(not(test), allow(dead_code))]
 fn journal_record_key(prefix: &str, sequence: u64) -> String {
-    archive_head_key(prefix, sequence)
+    format!("{}{sequence:020}.cbor", journal_record_prefix(prefix))
 }
 
 fn journal_cutover_marker_key(prefix: &str) -> String {
@@ -2185,7 +2215,7 @@ fn validate_v70_tip_at_cutover(
 /// never valid journal records.
 #[cfg_attr(not(test), allow(dead_code))]
 fn journal_record_key_sequence(key: &str, prefix: &str) -> Result<u64, String> {
-    let namespace = format!("{prefix}/heads/");
+    let namespace = journal_record_prefix(prefix);
     if key
         .strip_prefix(namespace.as_str())
         .is_some_and(|name| name.contains('-'))
@@ -3123,7 +3153,7 @@ impl S3ImmutableArtifactStore {
         eprintln!("FINANCIAL_AWAIT_END stage=archive_put");
         let restored = self.read(key).await?;
         if put.is_err() && restored != bytes {
-            return Err(if key.contains("/heads/") {
+            return Err(if key.contains("/heads/") || key.contains("/journal-v71/records/") {
                 "ARCHIVE_SEQUENCE_CONFLICT"
             } else {
                 "archive immutable write failed"
@@ -3503,7 +3533,7 @@ impl S3ImmutableArtifactStore {
         // A record past the head exceeds `count` and fails the listing.
         let keys = self
             .list_journal_keys(
-                &format!("{}/heads/", self.prefix),
+                &journal_record_prefix(&self.prefix),
                 Some(&journal_record_key(&self.prefix, source)),
                 count,
                 ARCHIVE_OPERATION_TIMEOUT,
@@ -4028,7 +4058,7 @@ impl S3ImmutableArtifactStore {
         Ok(Some((newest, checkpoint)))
     }
     /// Canonical record keys for exactly `after+1..=after+n`, `n` at most
-    /// `MAX_V71_RESTORE_TAIL_RECORDS`. Legacy `{seq}-{hash}` names above
+    /// `MAX_V71_RESTORE_TAIL_RECORDS`. Noncanonical `{seq}-{hash}` names above
     /// `after` sort after the start key, so they are always seen and rejected.
     #[cfg_attr(not(test), allow(dead_code))]
     async fn list_journal_tail(&self, after: u64) -> Result<Vec<(u64, String)>, String> {
@@ -4040,7 +4070,7 @@ impl S3ImmutableArtifactStore {
         after: u64,
         page_timeout: Duration,
     ) -> Result<Vec<(u64, String)>, String> {
-        let namespace = format!("{}/heads/", self.prefix);
+        let namespace = journal_record_prefix(&self.prefix);
         let start_after = journal_record_key(&self.prefix, after);
         let keys = self
             .list_journal_keys(
@@ -4055,7 +4085,7 @@ impl S3ImmutableArtifactStore {
     /// Reads the bounded tail after `checkpoint` in sequence order. Each body
     /// must decode canonically to a record at its key's sequence that links to
     /// its predecessor's record hash, transition root, and request-index root,
-    /// starting from the checkpoint. A v70 head body above the checkpoint fails decode.
+    /// starting from the checkpoint.
     #[cfg_attr(not(test), allow(dead_code))]
     async fn load_journal_tail(
         &self,
@@ -7873,7 +7903,12 @@ async fn stage_and_promote_v71_shadow(state: AppState, run_id: String) -> Result
         // only the exact committed journal head staged above; it contains no
         // command or pending-work payload. If the following transport is
         // ambiguous, restart deterministically restores this v71 frontier.
-        store.persist_v71_cutover_marker(&head).await?;
+        let guard = persist_v71_cutover_marker_or_fail_closed(
+            &state.health,
+            guard,
+            store.persist_v71_cutover_marker(&head),
+        )
+        .await?;
         let promoted = match exchange(
             &state,
             RuntimeRequest::PromoteV71Shadow {
@@ -9787,9 +9822,15 @@ mod tests {
 
     #[test]
     fn v71_hot_restore_requires_the_legacy_tip_to_equal_the_cutover_marker() {
-        let heads = (43_205..=43_207)
+        let mut heads = (43_205..=43_207)
             .map(|sequence| format!("epoch/heads/{sequence:020}.cbor"))
             .collect::<Vec<_>>();
+        // Historical v70 content-addressed twins do not advance the tip.
+        heads.push(format!(
+            "epoch/heads/{:020}-{}.cbor",
+            43_207,
+            "a".repeat(64)
+        ));
         assert_eq!(
             super::validate_v70_tip_at_cutover("epoch", 43_207, &heads),
             Ok(())
@@ -10655,6 +10696,35 @@ mod tests {
             ),
             "V71_SHADOW_PROMOTION_TRANSPORT_FAILED"
         );
+        assert_eq!(
+            health.check(100, 100, false, false),
+            Err("V71_CUTOVER_CONFIRMATION_UNCERTAIN")
+        );
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50),
+            gate.lock("post_marker_v70_commit"),
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_marker_write_fails_health_and_keeps_gate_closed() {
+        let gate = FinancialGate::new();
+        let health = ParentHealth::default();
+        health.restored.store(true, Ordering::Release);
+        health.observe(100);
+        let guard = gate.lock("v71_marker_test").await;
+        let result = persist_v71_cutover_marker_or_fail_closed(
+            &health,
+            guard,
+            async { Err("ARCHIVE_TIMEOUT".into()) },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ref error) if error == "V71_CUTOVER_MARKER_UNCONFIRMED"
+        ));
         assert_eq!(
             health.check(100, 100, false, false),
             Err("V71_CUTOVER_CONFIRMATION_UNCERTAIN")
@@ -11903,46 +11973,42 @@ mod tests {
     }
 
     #[test]
-    fn v71_record_key_shares_v70_head_slot_and_parser_rejects_legacy_and_foreign_keys() {
+    fn v71_record_key_isolated_from_v70_and_parser_rejects_noncanonical_and_foreign_keys() {
         let prefix = "archive/epoch";
         for sequence in [1, 42, u64::MAX] {
             let key = journal_record_key(prefix, sequence);
-            assert_eq!(key, archive_head_key(prefix, sequence));
+            assert_ne!(key, archive_head_key(prefix, sequence));
             assert_eq!(journal_record_key_sequence(&key, prefix), Ok(sequence));
         }
         assert_eq!(
             journal_record_key(prefix, 42),
-            "archive/epoch/heads/00000000000000000042.cbor"
+            "archive/epoch/journal-v71/records/00000000000000000042.cbor"
         );
 
         let legacy = format!(
-            "{prefix}/heads/00000000000000000042-{}.cbor",
+            "{prefix}/journal-v71/records/00000000000000000042-{}.cbor",
             "d".repeat(64)
-        );
-        // The v70 parser admits the legacy name; the journal parser never does.
-        assert_eq!(
-            archive_key_sequence(&legacy, &format!("{prefix}/heads/"), false),
-            Ok(42)
         );
         for key in [
             legacy,
-            format!("{prefix}/heads/00000000000000000042-.cbor"),
-            format!("{prefix}/heads/42.cbor"),
-            format!("{prefix}/heads/0000000000000000042.cbor"),
-            format!("{prefix}/heads/000000000000000000042.cbor"),
-            format!("{prefix}/heads/+0000000000000000042.cbor"),
-            format!("{prefix}/heads/0000000000000000004a.cbor"),
-            format!("{prefix}/heads/00000000000000000000.cbor"),
-            format!("{prefix}/heads/18446744073709551616.cbor"),
-            format!("{prefix}/heads/99999999999999999999.cbor"),
-            format!("{prefix}/heads/00000000000000000042.CBOR"),
-            format!("{prefix}/heads/00000000000000000042.cbor.tmp"),
-            format!("{prefix}/heads/nested/00000000000000000042.cbor"),
+            format!("{prefix}/journal-v71/records/00000000000000000042-.cbor"),
+            format!("{prefix}/journal-v71/records/42.cbor"),
+            format!("{prefix}/journal-v71/records/0000000000000000042.cbor"),
+            format!("{prefix}/journal-v71/records/000000000000000000042.cbor"),
+            format!("{prefix}/journal-v71/records/+0000000000000000042.cbor"),
+            format!("{prefix}/journal-v71/records/0000000000000000004a.cbor"),
+            format!("{prefix}/journal-v71/records/00000000000000000000.cbor"),
+            format!("{prefix}/journal-v71/records/18446744073709551616.cbor"),
+            format!("{prefix}/journal-v71/records/99999999999999999999.cbor"),
+            format!("{prefix}/journal-v71/records/00000000000000000042.CBOR"),
+            format!("{prefix}/journal-v71/records/00000000000000000042.cbor.tmp"),
+            format!("{prefix}/journal-v71/records/nested/00000000000000000042.cbor"),
+            format!("{prefix}/heads/00000000000000000042.cbor"),
             format!("{prefix}/artifacts/00000000000000000042.cbor"),
             format!("{prefix}/journal-v71/checkpoints/00000000000000000042.cbor"),
-            format!("other/heads/00000000000000000042.cbor"),
-            format!("{prefix}-other/heads/00000000000000000042.cbor"),
-            format!("/{prefix}/heads/00000000000000000042.cbor"),
+            format!("other/journal-v71/records/00000000000000000042.cbor"),
+            format!("{prefix}-other/journal-v71/records/00000000000000000042.cbor"),
+            format!("/{prefix}/journal-v71/records/00000000000000000042.cbor"),
             String::new(),
         ] {
             assert!(journal_record_key_sequence(&key, prefix).is_err(), "{key}");
@@ -12063,7 +12129,7 @@ mod tests {
         );
         let mut legacy = keys(&[8]);
         legacy.push(format!(
-            "{prefix}/heads/00000000000000000009-{}.cbor",
+            "{prefix}/journal-v71/records/00000000000000000009-{}.cbor",
             "d".repeat(64)
         ));
         assert_eq!(
@@ -12071,10 +12137,12 @@ mod tests {
             Err("journal record key legacy suffix".into())
         );
         let mut foreign = keys(&[8]);
-        foreign.push(format!("other/heads/{:020}.cbor", 9));
+        foreign.push(format!("other/journal-v71/records/{:020}.cbor", 9));
         assert!(validate_journal_tail_keys(&foreign, prefix, 7, 3).is_err());
         let mut overflow = keys(&[8]);
-        overflow.push(format!("{prefix}/heads/99999999999999999999.cbor"));
+        overflow.push(format!(
+            "{prefix}/journal-v71/records/99999999999999999999.cbor"
+        ));
         assert_eq!(
             validate_journal_tail_keys(&overflow, prefix, 7, 3),
             Err("archive sequence overflow".into())
@@ -12358,7 +12426,7 @@ mod tests {
         assert_eq!(log.len(), 3);
         let (put, body) = &log[0];
         assert!(
-            put.starts_with("put /unit-test/epoch/heads/00000000000000000042.cbor"),
+            put.starts_with("put /unit-test/epoch/journal-v71/records/00000000000000000042.cbor"),
             "{put}"
         );
         for header in [
@@ -12374,7 +12442,7 @@ mod tests {
         assert!(
             log[1]
                 .0
-                .starts_with("get /unit-test/epoch/heads/00000000000000000042.cbor"),
+                .starts_with("get /unit-test/epoch/journal-v71/records/00000000000000000042.cbor"),
             "{}",
             log[1].0
         );
@@ -13206,8 +13274,8 @@ mod tests {
         let list = log.lock().await[0].0.clone();
         for query in [
             "list-type=2",
-            "prefix=epoch%2fheads%2f",
-            "start-after=epoch%2fheads%2f00000000000000000041.cbor",
+            "prefix=epoch%2fjournal-v71%2frecords%2f",
+            "start-after=epoch%2fjournal-v71%2frecords%2f00000000000000000041.cbor",
         ] {
             assert!(list.contains(query), "{query} missing from {list}");
         }
@@ -13244,7 +13312,7 @@ mod tests {
     #[tokio::test]
     async fn v71_tail_listing_fails_closed_on_gap_duplicate_legacy_foreign_range_and_timeout() {
         let record = |sequence| journal_record_key("epoch", sequence);
-        let legacy = format!("epoch/heads/00000000000000000043-{}.cbor", "a".repeat(64));
+        let legacy = format!("epoch/journal-v71/records/00000000000000000043-{}.cbor", "a".repeat(64));
         let cases = vec![
             (vec![v71_listing_page(&[record(42), record(44)], None)], "journal tail sequence gap"),
             (vec![v71_listing_page(&[record(43)], None)], "journal tail sequence gap"),
@@ -13268,7 +13336,7 @@ mod tests {
                 "journal listing key foreign",
             ),
             (
-                vec![v71_listing_page(&["epoch/heads/zzz.cbor".into()], None)],
+                vec![v71_listing_page(&["epoch/journal-v71/records/zzz.cbor".into()], None)],
                 "archive key format invalid",
             ),
         ];
@@ -13319,8 +13387,8 @@ mod tests {
         );
         server.abort();
         let log = log.lock().await;
-        assert!(log[1].0.starts_with("get /unit-test/epoch/heads/00000000000000000042.cbor"));
-        assert!(log[2].0.starts_with("get /unit-test/epoch/heads/00000000000000000043.cbor"));
+        assert!(log[1].0.starts_with("get /unit-test/epoch/journal-v71/records/00000000000000000042.cbor"));
+        assert!(log[2].0.starts_with("get /unit-test/epoch/journal-v71/records/00000000000000000043.cbor"));
         drop(log);
 
         // The checkpoint anchor must match the first record on every chained
