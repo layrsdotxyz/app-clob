@@ -217,7 +217,7 @@ mod tests {
         SignedWithdrawalIntent {
             account: format!("0x{}", hex::encode(address)),
             pool: "0xb412f63299ccff4fe57714ee580895cca74dd284".into(),
-            token: "0x3c2269811836af69497e5f486a85d7316753cf62".into(),
+            token: "0xdf7108f8b10f9b9ec1aba01cca057268cbf86b6c".into(),
             route_wallet: "0x2222222222222222222222222222222222222222".into(),
             amount_atomic: "20000000".into(),
             recipient: "0x0d2bf0c9d6d96eea797c9d1b96895d8f70e3322e".into(),
@@ -243,15 +243,15 @@ mod tests {
         let signature = sign(&intent, &key);
         assert_eq!(
             intent.intent_hash_hex().unwrap(),
-            "0x800fd3faa4b65d1c900148604b5058969e3ea46aed34323a7a3743b7312fae6b"
+            "0x9f2c75358eee694a9314d5f2306cf02b8b8c0e629e5018cac727e5b217986fa5"
         );
         assert_eq!(
             intent.command_commitment().unwrap(),
-            "c84a183ed44ef5453655b9a28f4b446b21e0e0d36f3b991cdc1a458c33e1e6b2"
+            "34b95928d767dda04814fc0ae2c48bdb8da6e5f97983f6557eac8625a427a7f2"
         );
         assert_eq!(
             signature,
-            "0xba8fbfb0d569bf331f0861731196411af01388eff1b432c6fa645a35a33f3bec2036ea39976c51d1982b256c7efab11abe447cd4b2c6c717d46ea22361e94dbf1c"
+            "0x64f5058ed8dfb51be05e905b43ae7f5ff2de9b4c304c52a5418e44a194f9f5d9602b4c29cd47360685da243e6b27d83f31175f40a0579db7bca51dde4cbac2ff1b"
         );
         intent.verify_signature(&signature).unwrap();
         assert_eq!(

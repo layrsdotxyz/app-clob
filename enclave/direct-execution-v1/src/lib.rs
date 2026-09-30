@@ -5324,7 +5324,7 @@ mod tests {
         let intent = SignedWithdrawalIntent {
             account,
             pool: "0xb412f63299ccff4fe57714ee580895cca74dd284".into(),
-            token: "0x3c2269811836af69497e5f486a85d7316753cf62".into(),
+            token: "0xdf7108f8b10f9b9ec1aba01cca057268cbf86b6c".into(),
             route_wallet: route_wallet.into(),
             amount_atomic: amount_atomic.into(),
             recipient: "0x0d2bf0c9d6d96eea797c9d1b96895d8f70e3322e".into(),

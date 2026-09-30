@@ -9897,7 +9897,7 @@ mod tests {
         let intent = SignedWithdrawalIntent {
             account: account.into(),
             pool: "0xb412f63299ccff4fe57714ee580895cca74dd284".into(),
-            token: "0x3c2269811836af69497e5f486a85d7316753cf62".into(),
+            token: "0xdf7108f8b10f9b9ec1aba01cca057268cbf86b6c".into(),
             route_wallet: route_wallet.into(),
             amount_atomic: "20000000".into(),
             recipient: "0x0d2bf0c9d6d96eea797c9d1b96895d8f70e3322e".into(),
@@ -9905,7 +9905,7 @@ mod tests {
             nonce: "42".into(),
             expiry_unix: 1_800_000_000,
         };
-        let signature = "0xba8fbfb0d569bf331f0861731196411af01388eff1b432c6fa645a35a33f3bec2036ea39976c51d1982b256c7efab11abe447cd4b2c6c717d46ea22361e94dbf1c";
+        let signature = "0x64f5058ed8dfb51be05e905b43ae7f5ff2de9b4c304c52a5418e44a194f9f5d9602b4c29cd47360685da243e6b27d83f31175f40a0579db7bca51dde4cbac2ff1b";
         let request_id = format!("signed-withdrawal:{account}:42");
         assert!(matches!(
             signed_withdrawal_reservation_action(
