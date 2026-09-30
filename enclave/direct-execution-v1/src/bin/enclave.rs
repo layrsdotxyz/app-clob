@@ -1194,7 +1194,39 @@ fn build_v71_shadow(
     let migration = Arc::new(bundle);
     let mut commits = Vec::with_capacity(observations.len());
     let mut effects = BTreeSet::new();
-    for observation in &observations {
+    apply_v71_shadow_observations(
+        &mut runtime,
+        &mut tree,
+        &mut commits,
+        &mut effects,
+        &observations,
+        &authoritative,
+        state_key,
+        signing_key,
+    )?;
+    Ok(BuiltV71Shadow {
+        runtime,
+        tree,
+        migration,
+        base_checkpoint,
+        commits,
+        consecutive_matches: observations.len() as u64,
+        observed_effects: effects,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_v71_shadow_observations(
+    runtime: &mut DirectV71Runtime,
+    tree: &mut SparseRequestTree,
+    commits: &mut Vec<V71ShadowCommit>,
+    effects: &mut BTreeSet<String>,
+    observations: &[V71ShadowObservation],
+    authoritative: &DirectRuntime,
+    state_key: &[u8],
+    signing_key: &[u8],
+) -> Result<(), layrs_direct_execution_v1::v71::V71Error> {
+    for observation in observations {
         let proof = tree.proof(
             &observation.request.account_id,
             &observation.request.request_id,
@@ -1221,15 +1253,7 @@ fn build_v71_shadow(
         runtime.adopt_candidate(candidate)?;
     }
     runtime.verify_shadow_head(&authoritative)?;
-    Ok(BuiltV71Shadow {
-        runtime,
-        tree,
-        migration,
-        base_checkpoint,
-        commits,
-        consecutive_matches: observations.len() as u64,
-        observed_effects: effects,
-    })
+    Ok(())
 }
 
 async fn begin_v71_shadow(
@@ -1303,24 +1327,28 @@ async fn begin_v71_shadow(
             return;
         };
 
-        // This brief gate covers only the small catch-up tail accumulated
-        // while the production-sized migration bundle was sealed.
+        // Snapshot the catch-up tail at one exact authoritative frontier, then
+        // release the transition gate before replaying it. New commits remain
+        // authoritative and append to the same bounded Pending observation
+        // window while this CPU-heavy work runs.
         let _transition = transition(&task_state).await;
         let (observations, authoritative) = {
-            let mut state = task_state.lock().await;
+            let state = task_state.lock().await;
             let V71ShadowState::Pending {
                 run_id,
                 source_sequence: pending_source,
                 observations,
-            } = &mut state.v71_shadow
+            } = &state.v71_shadow
             else {
                 return;
             };
             if run_id != &task_run_id || *pending_source != source_sequence {
                 return;
             }
-            (std::mem::take(observations), state.runtime.clone())
+            (observations.clone(), state.runtime.clone())
         };
+        let mut observed_count = observations.len();
+        drop(_transition);
         let verification_key = match journal_verifying_key(&signing_key) {
             Ok(key) => key,
             Err(_) => {
@@ -1348,39 +1376,123 @@ async fn begin_v71_shadow(
             )
         })
         .await;
-        let mut state = task_state.lock().await;
-        match built {
-            Ok(Ok(BuiltV71Shadow {
-                runtime,
-                tree,
-                migration,
-                base_checkpoint,
-                commits,
-                consecutive_matches,
-                observed_effects,
-            })) => {
-                state.v71_shadow = V71ShadowState::Active {
-                    run_id: task_run_id.clone(),
-                    source_sequence,
-                    runtime,
-                    tree,
-                    migration,
-                    base_checkpoint,
-                    commits,
-                    consecutive_matches,
-                    observed_effects,
-                };
-                eprintln!(
-                    "V71_SHADOW_ACTIVE run_id={} source_sequence={} caught_up={}",
-                    task_run_id, source_sequence, consecutive_matches
-                );
-            }
-            _ => latch_v71_shadow(
+        let Ok(Ok(mut built)) = built else {
+            let _transition = transition(&task_state).await;
+            let mut state = task_state.lock().await;
+            latch_v71_shadow(
                 &mut state.v71_shadow,
                 task_run_id,
                 source_sequence,
                 "V71_SHADOW_CATCH_UP_MISMATCH",
-            ),
+            );
+            return;
+        };
+
+        loop {
+            // Install only while no commit can land between the authoritative
+            // comparison and the state swap. If commits accumulated during
+            // replay, copy just that delta and replay it after releasing the
+            // transition gate again.
+            let _transition = transition(&task_state).await;
+            let next = {
+                let mut state = task_state.lock().await;
+                let V71ShadowState::Pending {
+                    run_id,
+                    source_sequence: pending_source,
+                    observations,
+                } = &state.v71_shadow
+                else {
+                    return;
+                };
+                if run_id != &task_run_id || *pending_source != source_sequence {
+                    return;
+                }
+                if observations.len() == observed_count {
+                    if built.runtime.verify_shadow_head(&state.runtime).is_err() {
+                        latch_v71_shadow(
+                            &mut state.v71_shadow,
+                            task_run_id,
+                            source_sequence,
+                            "V71_SHADOW_CATCH_UP_MISMATCH",
+                        );
+                        return;
+                    }
+                    let caught_up = built.consecutive_matches;
+                    state.v71_shadow = V71ShadowState::Active {
+                        run_id: task_run_id.clone(),
+                        source_sequence,
+                        runtime: built.runtime,
+                        tree: built.tree,
+                        migration: built.migration,
+                        base_checkpoint: built.base_checkpoint,
+                        commits: built.commits,
+                        consecutive_matches: caught_up,
+                        observed_effects: built.observed_effects,
+                    };
+                    eprintln!(
+                        "V71_SHADOW_ACTIVE run_id={} source_sequence={} caught_up={}",
+                        task_run_id, source_sequence, caught_up
+                    );
+                    return;
+                }
+                (
+                    observations[observed_count..].to_vec(),
+                    observations.len(),
+                    state.runtime.clone(),
+                )
+            };
+            drop(_transition);
+
+            let state_key = zeroize::Zeroizing::new(task_state.lock().await.state_key.clone());
+            let signing_key = match derive_journal_signing_key(&state_key) {
+                Ok(key) => zeroize::Zeroizing::new(key),
+                Err(_) => {
+                    let _transition = transition(&task_state).await;
+                    let mut state = task_state.lock().await;
+                    latch_v71_shadow(
+                        &mut state.v71_shadow,
+                        task_run_id,
+                        source_sequence,
+                        "V71_SHADOW_KEY_INVALID",
+                    );
+                    return;
+                }
+            };
+            let (observations, next_observed_count, authoritative) = next;
+            let advanced = tokio::task::spawn_blocking(move || {
+                apply_v71_shadow_observations(
+                    &mut built.runtime,
+                    &mut built.tree,
+                    &mut built.commits,
+                    &mut built.observed_effects,
+                    &observations,
+                    &authoritative,
+                    &state_key,
+                    signing_key.as_ref(),
+                )?;
+                built.consecutive_matches = built
+                    .consecutive_matches
+                    .saturating_add(observations.len() as u64);
+                Ok::<_, layrs_direct_execution_v1::v71::V71Error>(built)
+            })
+            .await;
+            match advanced {
+                Ok(Ok(next_built)) => {
+                    built = next_built;
+                    observed_count = next_observed_count;
+                }
+                _ => {
+                    let _transition = transition(&task_state).await;
+                    let mut state = task_state.lock().await;
+                    latch_v71_shadow(
+                        &mut state.v71_shadow,
+                        task_run_id,
+                        source_sequence,
+                        "V71_SHADOW_CATCH_UP_MISMATCH",
+                    );
+                    return;
+                }
+            }
         }
     });
 
@@ -1801,9 +1913,25 @@ async fn verify_journal_checkpoint(
         {
             None
         } else {
-            state.v71_runtime.as_ref().map(|runtime| {
+            let runtime = state.v71_runtime.as_ref().map(|runtime| {
+                runtime.financial_runtime().clone()
+            }).or_else(|| match &state.v71_shadow {
+                // Before promotion, verification is available only for the
+                // exact authenticated base checkpoint produced by this active
+                // shadow. This keeps the verifier non-writer and prevents an
+                // unrelated checkpoint from borrowing the shadow runtime.
+                V71ShadowState::Active {
+                    runtime,
+                    base_checkpoint,
+                    ..
+                } if base_checkpoint == &checkpoint => {
+                    Some(runtime.financial_runtime().clone())
+                }
+                _ => None,
+            });
+            runtime.map(|runtime| {
                 (
-                    runtime.financial_runtime().clone(),
+                    runtime,
                     zeroize::Zeroizing::new(state.state_key.clone()),
                 )
             })
@@ -3765,6 +3893,26 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(terminal_leaves.len(), 1);
         assert_eq!(results, vec![result]);
+
+        // The production failure happened here: before promotion there is no
+        // authoritative v71 runtime yet, but the exact active-shadow base
+        // checkpoint must still pass a disposable non-writer restore.
+        let base_checkpoint = base_checkpoint.unwrap();
+        assert!(matches!(
+            verify_journal_checkpoint(Arc::clone(&state), base_checkpoint.clone()).await,
+            RuntimeResponse::JournalCheckpointVerified {
+                sequence: 1,
+                ..
+            }
+        ));
+        let mut unrelated = base_checkpoint;
+        unrelated.sequence += 1;
+        assert_eq!(
+            verify_journal_checkpoint(Arc::clone(&state), unrelated).await,
+            RuntimeResponse::Error {
+                code: "JOURNAL_CHECKPOINT_VERIFY_UNAVAILABLE".into()
+            }
+        );
 
         assert!(matches!(
             promote_v71_shadow(

@@ -7325,6 +7325,9 @@ async fn verify_journal_checkpoint_non_writer(
     )
     .await
     .map_err(|_| "journal checkpoint verification transport failed")?;
+    if let RuntimeResponse::Error { code } = &response {
+        return Err(format!("journal checkpoint verification rejected: {code}"));
+    }
     if !journal_checkpoint_verification_matches(checkpoint, &response) {
         return Err("journal checkpoint verification mismatch".into());
     }
