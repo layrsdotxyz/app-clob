@@ -4858,6 +4858,7 @@ enum CustomerAction {
     VerifyUsdcBusWithdrawal {withdrawal_id:String,destination_chain:String,asset:String,destination:String,amount_atomic:String,proof:Value},
     VerifyZenWithdrawal {withdrawal_id:String,destination_chain:String,asset:String,destination:String,amount_atomic:String},
     LinkFinancialWallet {grant:WalletLinkGrant,signature:String},
+    LinkPoolWallet {wallet_address:String,external_id:String},
     ReserveZenWithdrawal { destination_chain: String, destination: String, amount_atomic: String },
     PlaceOrder {
         order_id: String,
@@ -5468,6 +5469,9 @@ async fn command(
                 Ok(action)=>action,
                 Err(_)=>return (StatusCode::FORBIDDEN,"USDC_WALLET_LINK_DENIED").into_response(),
             }
+        }
+        CustomerAction::LinkPoolWallet {wallet_address,external_id} => {
+            DirectAction::LinkPoolWallet {wallet_address,external_id}
         }
         CustomerAction::BeginUsdcBusWithdrawal { destination_chain,asset,destination, amount_atomic } => {
             if external_effect_pending {

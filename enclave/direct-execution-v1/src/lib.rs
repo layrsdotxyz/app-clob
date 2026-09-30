@@ -852,6 +852,12 @@ pub enum DirectAction {
     /// Add a newly verified participant wallet to the same canonical identity.
     /// Historical wallet references and every financial bucket remain intact.
     LinkFinancialWallet { wallet_address: String },
+    /// Permanent owner-less Privy pool wallet selected by the backend's
+    /// atomic assignment store and bound into the authenticated session.
+    LinkPoolWallet {
+        wallet_address: String,
+        external_id: String,
+    },
     /// Commit a per-user hold before custody movement. A Bus wait must not
     /// become the legacy global unresolved-external-effect writer fence.
     BeginUsdcBusWithdrawal { withdrawal_id: String, destination_chain:String, asset:String, destination: String, amount_atomic: String },
@@ -1864,6 +1870,15 @@ impl DirectRuntime {
             .as_deref()
             .map(str::to_ascii_lowercase);
         match &request.action {
+            DirectAction::LinkPoolWallet {wallet_address, external_id} => {
+                let wallet = wallet_address.to_ascii_lowercase();
+                if !valid_evm_wallet(&wallet)
+                    || !valid_pool_external_id(external_id)
+                    || request.request_id != format!("pool-wallet-link:{external_id}")
+                    || financial_wallet.as_deref() != Some(wallet.as_str()) {
+                    return Err(RuntimeError::InvalidRequest);
+                }
+            }
             DirectAction::ReserveSignedWithdrawal {
                 intent,
                 user_signature,
@@ -2144,6 +2159,23 @@ impl DirectRuntime {
                     }
                     self.subject_wallets.entry(request.account_id.clone()).or_default().insert(wallet.clone());
                     ("FINANCIAL_WALLET_LINKED".into(),None,Some(format!("wallet-link:{wallet}")))
+                }
+                DirectAction::LinkPoolWallet {wallet_address, ..} => {
+                    let wallet = wallet_address.to_ascii_lowercase();
+                    if self.subject_wallets.iter().any(|(subject, wallets)| {
+                        subject != &request.account_id && wallets.contains(&wallet)
+                    }) {
+                        return Err(RuntimeError::IdentityAlreadyAdmitted);
+                    }
+                    self.subject_wallets
+                        .entry(request.account_id.clone())
+                        .or_default()
+                        .insert(wallet.clone());
+                    (
+                        "POOL_WALLET_LINKED".into(),
+                        None,
+                        Some(format!("pool-wallet-link:{wallet}")),
+                    )
                 }
                 DirectAction::BeginUsdcBusWithdrawal {withdrawal_id,destination_chain,asset,destination,amount_atomic} => {
                     let value=amount(amount_atomic)?;
@@ -4544,6 +4576,13 @@ fn valid_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn valid_pool_external_id(value: &str) -> bool {
+    value.len() == 20
+        && value.starts_with("layrs_deposit_")
+        && value[14..].bytes().all(|byte| byte.is_ascii_digit())
+        && &value[14..] != "000000"
+}
+
 fn valid_transaction_hash_value(value: &str) -> bool {
     value.len() == 66
         && value.starts_with("0x")
@@ -5310,6 +5349,96 @@ mod tests {
             },
         );
         (request, intent)
+    }
+
+    fn pool_wallet_link_request(subject: &str, identity: &str, wallet: &str, slot_id: u32) -> DirectRequest {
+        let external_id = format!("layrs_deposit_{slot_id:06}");
+        let mut request = request_for(
+            subject,
+            identity,
+            &format!("pool-wallet-link:{external_id}"),
+            DirectAction::LinkPoolWallet {
+                wallet_address: wallet.into(),
+                external_id,
+            },
+        );
+        request.financial_wallet_address = Some(wallet.into());
+        request.request_hash = request_hash(&request);
+        request
+    }
+
+    #[test]
+    fn pool_wallet_link_is_session_bound_idempotent_unique_and_restart_safe() {
+        let subject = "d".repeat(64);
+        let primary = "0x1111111111111111111111111111111111111111";
+        let identity = identity_commitment_for(&subject, primary);
+        let pool_wallet = "0x9999999999999999999999999999999999999999";
+        let mut live = runtime(RuntimeMode::IsolatedTest);
+        let mut store = InMemoryDirectStateStore::default();
+        live.execute_committed(
+            request_for(
+                &subject,
+                &identity,
+                "pool-link-admission",
+                DirectAction::AdmitIdentity { wallet_address: primary.into() },
+            ),
+            &[8; 32],
+            &mut store,
+        ).unwrap();
+        let link = pool_wallet_link_request(&subject, &identity, pool_wallet, 1);
+        let result = live.execute_committed(link.clone(), &[8; 32], &mut store).unwrap();
+        assert_eq!(result.effect, "POOL_WALLET_LINKED");
+        assert!(live.subject_wallets[&subject].contains(pool_wallet));
+        assert_eq!(live.execute_committed(link.clone(), &[8; 32], &mut store).unwrap(), result);
+
+        let mut restored = DirectRuntime::restore_committed(
+            SealedEpoch::load(epoch_path()).unwrap(),
+            RuntimeMode::IsolatedTest,
+            vec![7; 32],
+            &[8; 32],
+            &store,
+        ).unwrap();
+        assert!(restored.subject_wallets[&subject].contains(pool_wallet));
+        assert_eq!(restored.execute_committed(link, &[8; 32], &mut store).unwrap(), result);
+
+        let other_subject = "e".repeat(64);
+        let other_primary = "0x2222222222222222222222222222222222222222";
+        let other_identity = identity_commitment_for(&other_subject, other_primary);
+        restored.execute(request_for(
+            &other_subject,
+            &other_identity,
+            "other-pool-admission",
+            DirectAction::AdmitIdentity { wallet_address: other_primary.into() },
+        )).unwrap();
+        let takeover = pool_wallet_link_request(&other_subject, &other_identity, pool_wallet, 2);
+        assert_eq!(restored.execute(takeover), Err(RuntimeError::IdentityAlreadyAdmitted));
+    }
+
+    #[test]
+    fn pool_wallet_link_rejects_unbound_wallet_and_invalid_slot() {
+        let subject = "d".repeat(64);
+        let primary = "0x1111111111111111111111111111111111111111";
+        let identity = identity_commitment_for(&subject, primary);
+        let pool_wallet = "0x9999999999999999999999999999999999999999";
+        let mut live = runtime(RuntimeMode::IsolatedTest);
+        live.execute(request_for(
+            &subject,
+            &identity,
+            "pool-link-admission",
+            DirectAction::AdmitIdentity { wallet_address: primary.into() },
+        )).unwrap();
+
+        let mut unbound = pool_wallet_link_request(&subject, &identity, pool_wallet, 1);
+        unbound.financial_wallet_address = Some("0x8888888888888888888888888888888888888888".into());
+        unbound.request_hash = request_hash(&unbound);
+        assert_eq!(live.execute(unbound), Err(RuntimeError::InvalidRequest));
+
+        let mut invalid = pool_wallet_link_request(&subject, &identity, pool_wallet, 2);
+        let DirectAction::LinkPoolWallet { external_id, .. } = &mut invalid.action else { unreachable!() };
+        *external_id = "layrs_deposit_000000".into();
+        invalid.request_id = "pool-wallet-link:layrs_deposit_000000".into();
+        invalid.request_hash = request_hash(&invalid);
+        assert_eq!(live.execute(invalid), Err(RuntimeError::InvalidRequest));
     }
 
     #[test]
