@@ -122,6 +122,86 @@ marker and ambiguous promotion gate-retention tests.
 The complete `cargo test` run for `enclave/direct-execution-v1` also passed
 across the library, enclave, parent, integration tests and doc tests.
 
+## Post-correction current-frontier rerun
+
+Read-only production refresh immediately before the rerun:
+
+- Head sequence: 44,840.
+- Head artifact: 175,636,642 bytes.
+- Latest checkpoint: sequence 44,834, 259,321,856 bytes.
+- One healthy in-service writer; launch-template version 75; ASG health grace
+  3,600 seconds.
+
+The exact `f231bc4d22c8eb7bdc841d6abe11c73a0e3f0dd7` release source then passed the
+complete release-mode transition again:
+
+```text
+V71_FULL_PROMOTION_REHEARSAL history=44840 pending_commits=64 framed_commits=2 shadow_active_ms=133869 pending_gate_wait_ms=0 pending_burst_ms=1 framed_p50_ms=4527 framed_p99_ms=4728 largest_v70_artifact_bytes=91173714 export_ms=68 checkpoint_verify_ms=18 promotion_ms=118 journal_commit_ms=59 rollback_seal_ms=36219 rollback_checkpoint_bytes=149922401 final_sequence=44907 writer_epoch=shadow-production-rehearsal
+V71_REHEARSAL_MEMORY phase=rollback_restored rss_kib=2390596 high_water_kib=3905604
+```
+
+Result: pass through shadow build under concurrent load, exact checkpoint
+verification, promotion, compact successor, rollback materialization and v70
+restore. Peak RSS was 3,905,604 KiB (3.73 GiB). Release binaries:
+
+- enclave SHA-256:
+  `9e2bf99d1a15ed6028d965c6a6de4e0985594511dddd9926835dcb0d0398e236`;
+- parent SHA-256:
+  `8d198971869c187d7d2719842d32ac48bc8894354201a059b53fa8b5d2e560f0`.
+
+## Candidate image build and independent inspection
+
+- Candidate AMI: `ami-030d6c96d9509c615`.
+- Encrypted snapshot: `snap-0895021d8a0e1a223`.
+- AMI state: available, private, deregistration protection
+  `enabled-with-cooldown`.
+- Safety tags: `WriterEnabled=false`, `ProductionAccess=denied`.
+- Installed parent SHA-256:
+  `8d198971869c187d7d2719842d32ac48bc8894354201a059b53fa8b5d2e560f0`.
+- Installed EIF SHA-256:
+  `6dbda0f0e78947fd28970641faf523c5029f24fe28bce3c94db2b08b55c5e461`.
+- PCR0:
+  `0fb65478faedc58e15f0f43db6ae1b0844f33d538402775a49fc588609ba1b75fd9e4bb6a14271935dac2e15b8efd894`.
+- PCR1:
+  `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493`.
+- PCR2:
+  `6c380880f381edb2af483a547979d949937852ad982a28d41a0186c6059bbc327b11e0618b8731a12db5a07e8557bdb7`.
+- Allocator: 8,192 MiB, two CPUs.
+- `/etc/layrs-opening/direct-runtime.env`: absent.
+- Local artifact files: zero.
+
+The inspection host was disposable and writer-disabled. It was terminated
+immediately after inspection; the Packer source host, temporary security group
+and temporary key pair were also removed.
+
+## Paired retained-v70 rollback image
+
+- Rollback source commit: `5dad5a03daec069a15634db3827715cf4691ff34`.
+- Rollback AMI: `ami-03627140f4af90a9c`.
+- Encrypted snapshot: `snap-031214db5c62062fa`.
+- AMI state: available, private, deregistration protection
+  `enabled-with-cooldown`.
+- Safety tags: `WriterEnabled=false`, `ProductionAccess=denied`.
+- Installed compatibility-parent SHA-256:
+  `c7a6c8be7b4a78c366cb2b6eb29b6c6cc0ee5cb2f25b495f19808b53e21deb42`.
+- Preserved live-bridge EIF SHA-256:
+  `6100a96de33300bac8b13e7f0700883e0fe9f14bdfb900305d55d651b95a9256`.
+- Preserved PCR0:
+  `59beb72420f56eb9b6a794b7d9ac4aced2c191ee964381cbc01d2d73e386645abe4eaa9af8757984ad52e79916029572`.
+- Preserved PCR1:
+  `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493`.
+- Preserved PCR2:
+  `28a6c5946a520ea6f72ace25a5cf9b57a8949c84377858e1c81457edaadd188e2b11b2eaafcb8c3352bf9e4a9f012ced`.
+- Allocator: 8,192 MiB, two CPUs; runtime env absent; local artifact files
+  zero.
+- Exact release-mode parent suite: 83 passed, zero failed, one benchmark
+  ignored.
+
+The rollback inspection host was terminated immediately after inspection.
+This image retains the bridge enclave identity but includes the strict sparse
+exact-head restore parent; the exact live bridge parent remains a later
+fallback only after a separately produced contiguous v70 archive exists.
+
 ## Remaining gates
 
 - Re-run the complete path after the storage correction against a refreshed
