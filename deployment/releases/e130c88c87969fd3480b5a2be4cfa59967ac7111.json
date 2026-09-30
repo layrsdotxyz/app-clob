@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "releaseStatus": "approved-pre-execution",
+  "releaseStatus": "failed-rolled-back-no-go",
   "releaseId": "v71-e130c88-anchor-20260930",
   "sourceCommit": "e130c88c87969fd3480b5a2be4cfa59967ac7111",
   "sourceBranch": "codex/layrs-v71-integration-20260928",
@@ -76,5 +76,16 @@
     "hardAbortFormula": "max(1500, measured_restore_seconds + measured_asg_switch_seconds + 300)",
     "hardAbortFloorSeconds": 1500,
     "measuredAsgSwitchSeconds": 220
+  },
+  "productionOutcome": {
+    "candidatePromoted": false,
+    "cutoverMarkerPresent": false,
+    "candidateFailure": "journal checkpoint verification mismatch",
+    "candidateRestoreSequence": 43205,
+    "rollbackRestoreSequence": 43207,
+    "postRollbackProjectionSequence": 43217,
+    "rollbackTargetHealthy": true,
+    "balanceContinuity": "preserved",
+    "remainingNoGo": "rollback grant identity is not accepted by the pinned BFF and proof-publisher configurations"
   }
 }
