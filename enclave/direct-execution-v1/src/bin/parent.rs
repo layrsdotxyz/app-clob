@@ -4860,6 +4860,7 @@ enum CustomerAction {
     LinkFinancialWallet {grant:WalletLinkGrant,signature:String},
     LinkPoolWallet {wallet_address:String,external_id:String},
     ReserveSignedWithdrawal {intent:SignedWithdrawalIntent,user_signature:String},
+    SettleSignedWithdrawal {intent_hash:String,horizen_transaction_hash:String},
     ReserveZenWithdrawal { destination_chain: String, destination: String, amount_atomic: String },
     PlaceOrder {
         order_id: String,
@@ -5484,6 +5485,28 @@ async fn command(
             ) {
                 Ok(action)=>action,
                 Err((status,code))=>return (status,code).into_response(),
+            }
+        }
+        CustomerAction::SettleSignedWithdrawal {intent_hash,horizen_transaction_hash} => {
+            let normalized_intent=intent_hash.to_ascii_lowercase();
+            let normalized_hash=horizen_transaction_hash.to_ascii_lowercase();
+            if request_id!=format!("signed-withdrawal-settle:{}",normalized_intent.trim_start_matches("0x")) {
+                return (StatusCode::BAD_REQUEST,"SIGNED_WITHDRAWAL_SETTLEMENT_IDEMPOTENCY_MISMATCH").into_response();
+            }
+            let Some(route_wallet)=claims.financial_wallet_address.as_deref() else {
+                return (StatusCode::FORBIDDEN,"DIRECT_FINANCIAL_WALLET_REQUIRED").into_response();
+            };
+            let Some(custody)=&state.usdc_custody else {
+                return (StatusCode::SERVICE_UNAVAILABLE,"USDC_CUSTODY_ADAPTER_NOT_ENABLED").into_response();
+            };
+            match custody.signed_withdrawal_finality(&claims.wallet_address,route_wallet,&normalized_intent,&normalized_hash).await {
+                Ok(DepositFinality::Finalized)=>DirectAction::SettleSignedWithdrawal {
+                    intent_hash:normalized_intent,horizen_transaction_hash:normalized_hash,
+                },
+                Ok(DepositFinality::Pending)=>return (StatusCode::SERVICE_UNAVAILABLE,"SIGNED_WITHDRAWAL_FINALITY_PENDING").into_response(),
+                Ok(DepositFinality::Reverted)=>return (StatusCode::CONFLICT,"SIGNED_WITHDRAWAL_PAYOUT_REVERTED").into_response(),
+                Ok(DepositFinality::Conflict)=>return (StatusCode::CONFLICT,"SIGNED_WITHDRAWAL_PAYOUT_CONFLICT").into_response(),
+                Err(_)=>return (StatusCode::SERVICE_UNAVAILABLE,"SIGNED_WITHDRAWAL_FINALITY_UNAVAILABLE").into_response(),
             }
         }
         CustomerAction::BeginUsdcBusWithdrawal { destination_chain,asset,destination, amount_atomic } => {

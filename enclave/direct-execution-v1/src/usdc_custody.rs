@@ -50,6 +50,36 @@ impl UsdcCustodyAdapter {
         let tx=self.rpc("eth_getTransactionByHash",json!([hash])).await?;
         Ok(deposit_effect(wallet,hash,amount,&receipt,&tx))
     }
+    /// Independently proves the exact public `Withdrawal` event before the
+    /// parent asks the enclave to consume one hold. A missing receipt or an
+    /// insufficient confirmation depth remains pending for this operation.
+    pub async fn signed_withdrawal_finality(&self,account:&str,route_wallet:&str,intent_hash:&str,hash:&str)->Result<DepositFinality,String> {
+        if !valid_transaction_hash(hash)||!valid_transaction_hash(intent_hash)
+            ||canonical_evm_address(account).is_err()||canonical_evm_address(route_wallet).is_err() {
+            return Ok(DepositFinality::Conflict);
+        }
+        if self.rpc("eth_chainId",json!([])).await?.as_str().and_then(parse_quantity)!=Some(26514) {
+            return Err("USDC RPC chain mismatch".into());
+        }
+        let asset=self.rpc("eth_call",json!([{"to":POOL,"data":selector("asset()")},"latest"])).await?;
+        if asset.as_str().map(|asset|asset.to_ascii_lowercase())!=Some(address_topic(USDC)) {
+            return Err("USDC pool asset mismatch".into());
+        }
+        let receipt=self.rpc("eth_getTransactionReceipt",json!([hash])).await?;
+        if receipt.is_null() {return Ok(DepositFinality::Pending);}
+        let block_number=receipt.get("blockNumber").and_then(Value::as_str).and_then(parse_quantity).ok_or("USDC block missing")?;
+        let head=self.rpc("eth_blockNumber",json!([])).await?.as_str().and_then(parse_quantity).ok_or("USDC head missing")?;
+        if head.checked_sub(block_number).and_then(|distance|distance.checked_add(1)).unwrap_or(0)<u128::from(self.confirmations) {
+            return Ok(DepositFinality::Pending);
+        }
+        let block=self.rpc("eth_getBlockByNumber",json!([quantity(block_number),false])).await?;
+        if block.get("hash").and_then(Value::as_str)!=receipt.get("blockHash").and_then(Value::as_str)
+            ||receipt.get("blockHash").and_then(Value::as_str).filter(|value|valid_transaction_hash(value)).is_none() {
+            return Ok(DepositFinality::Conflict);
+        }
+        let tx=self.rpc("eth_getTransactionByHash",json!([hash])).await?;
+        Ok(signed_withdrawal_effect(account,route_wallet,intent_hash,hash,&receipt,&tx))
+    }
 }
 fn selector(value:&str)->String {format!("0x{}",&topic(value)[2..10])}
 fn topic(value:&str)->String {
@@ -85,6 +115,29 @@ fn deposit_effect(wallet:&str,hash:&str,amount:&str,receipt:&Value,tx:&Value)->D
         _=>DepositFinality::Conflict,
     }
 }
+fn signed_withdrawal_effect(account:&str,route_wallet:&str,intent_hash:&str,hash:&str,receipt:&Value,tx:&Value)->DepositFinality {
+    if !equals(tx.get("hash").and_then(Value::as_str),hash)||!equals(receipt.get("transactionHash").and_then(Value::as_str),hash)
+        ||!equals(tx.get("from").and_then(Value::as_str),route_wallet)||!equals(receipt.get("from").and_then(Value::as_str),route_wallet)
+        ||!equals(tx.get("to").and_then(Value::as_str),POOL)||!equals(receipt.get("to").and_then(Value::as_str),POOL)
+        ||tx.get("input").and_then(Value::as_str).is_none_or(|input|!input.starts_with(&selector("withdrawWithProof((address,uint256,address,address,string,string,uint256,uint256),bytes,(bytes32,string,uint64,bytes32,bytes32,bytes,uint8,bytes32[]))")))
+        ||tx.get("value").and_then(Value::as_str).and_then(parse_quantity)!=Some(0)
+        ||tx.get("chainId").and_then(Value::as_str).and_then(parse_quantity)!=Some(26514)
+        ||tx.get("blockHash")!=receipt.get("blockHash")||tx.get("blockNumber")!=receipt.get("blockNumber") {
+        return DepositFinality::Conflict;
+    }
+    if receipt.get("status").and_then(Value::as_str)==Some("0x0") {return DepositFinality::Reverted;}
+    let withdrawal_topic=topic("Withdrawal(bytes32,address,address,address,uint256,string,string,uint256,uint256,bytes,bytes32,string)");
+    let count=receipt.get("logs").and_then(Value::as_array).map_or(0,|logs|logs.iter().filter(|log|{
+        log.get("removed").and_then(Value::as_bool)!=Some(true)
+            &&equals(log.get("address").and_then(Value::as_str),POOL)
+            &&log.get("topics").and_then(Value::as_array).is_some_and(|topics|topics.len()==4
+                &&equals(topics[0].as_str(),&withdrawal_topic)
+                &&equals(topics[1].as_str(),intent_hash)
+                &&equals(topics[2].as_str(),&address_topic(account))
+                &&equals(topics[3].as_str(),&address_topic(route_wallet)))
+    }).count());
+    if receipt.get("status").and_then(Value::as_str)==Some("0x1")&&count==1 {DepositFinality::Finalized}else{DepositFinality::Conflict}
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +166,17 @@ mod tests {
         assert!(matches!(deposit_effect(&wallet,&hash,"5000000",&receipt,&tx),DepositFinality::Conflict));
         let (wallet,hash,mut receipt,tx)=fixture();let duplicate=receipt["logs"][1].clone();receipt["logs"].as_array_mut().unwrap().push(duplicate);
         assert!(matches!(deposit_effect(&wallet,&hash,"5000000",&receipt,&tx),DepositFinality::Conflict));
+    }
+    #[test]
+    fn signed_withdrawal_requires_exact_pool_call_and_event() {
+        let account="0x1111111111111111111111111111111111111111";let route="0x2222222222222222222222222222222222222222";
+        let intent=format!("0x{}","c".repeat(64));let hash=format!("0x{}","a".repeat(64));let block=format!("0x{}","b".repeat(64));
+        let input=format!("{}00",selector("withdrawWithProof((address,uint256,address,address,string,string,uint256,uint256),bytes,(bytes32,string,uint64,bytes32,bytes32,bytes,uint8,bytes32[]))"));
+        let tx=json!({"hash":hash,"from":route,"to":POOL,"input":input,"value":"0x0","chainId":"0x6792","blockNumber":"0x10","blockHash":block});
+        let receipt=json!({"transactionHash":hash,"from":route,"to":POOL,"status":"0x1","blockNumber":"0x10","blockHash":block,"logs":[{
+            "address":POOL,"topics":[topic("Withdrawal(bytes32,address,address,address,uint256,string,string,uint256,uint256,bytes,bytes32,string)"),intent,address_topic(account),address_topic(route)],"data":"0x"}]});
+        assert!(matches!(signed_withdrawal_effect(account,route,&intent,&hash,&receipt,&tx),DepositFinality::Finalized));
+        let mut wrong=receipt.clone();wrong["logs"][0]["topics"][1]=json!(format!("0x{}","d".repeat(64)));
+        assert!(matches!(signed_withdrawal_effect(account,route,&intent,&hash,&wrong,&tx),DepositFinality::Conflict));
     }
 }
