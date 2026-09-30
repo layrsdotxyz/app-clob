@@ -2,9 +2,9 @@
 
 | Field | Status |
 | --- | --- |
-| Current step | v71 production rollout stopped at no-go; retained-v70 rollback completed |
-| What's done | Candidate restored exact v70 sequence 43,205 but v71 promotion aborted before cutover with `journal checkpoint verification mismatch`. The immutable cutover marker is absent. The reviewed pre-promotion rollback executed with the separate grant and restored exact sequence 43,207; the rollback writer is the sole healthy instance, has zero restarts, and projection advanced monotonically to 43,217. User balances and commits were preserved; mm01 remains the same single explained hold and no payout was duplicated. |
-| What's next | Stop. Diagnose the checkpoint-verification mismatch and prepare a separately reviewed rollback-identity consumer rotation before any new production action. Do not resume v71 or rotate consumers from this failed packet. |
-| Blockers | Hard no-go: BFF and proof publisher reject the new rollback grant/key-release binding with `QUEST_PUBLIC_RECEIPT_BINDING_INVALID`. Proofs are not advancing and the user-facing release bar is not met, despite the healthy financial writer. |
-| Production-affecting action pending approval | None in flight. Further production changes require a corrected, reviewed packet. |
-| Last updated (IST) | 2026-09-30 06:09 IST |
+| Current step | Retained-v70 rollback identity consumers rotated; post-check stopped on an independent reserve no-go |
+| What's done | Fresh Nitro attestation verified the rollback identity. New immutable manifest, BFF Phase-1, publication-successor, and administration Phase-1 secrets were created with only release-identity fields changed; predecessors remain untouched. BFF `:189`, proof publisher `:33`, and quest administration `:88` are each 1/1 healthy and all stacks are `UPDATE_COMPLETE`. Public manifest and attestation verify; the BFF stayed up; publisher binding failures stopped and at least 23 Horizen batches confirmed. Evidence: `evidence/ROLLBACK_IDENTITY_CONSUMER_ROTATION_20260930.md`. |
+| What's next | Stop scope expansion. Obtain explicit authorization before any funds movement to restore the shared Horizen native reserve floor. After that, rerun internal-account signup setup, deposit and withdrawal checks; v71 remains separately stopped on its checkpoint-verification no-go. |
+| Blockers | Deposit, withdrawal, and wallet-setup admission preflights fail `QUEST_PREFLIGHT_RESERVE_SHORTFALL`: Horizen company native balance is `91636664139358` wei versus `102000000000000` required. All other configured reserve floors pass. Funding is outside this identity-only approval. |
+| Production-affecting action pending approval | None in flight. A separate authorization is required to top up the public company address by at least the `10363335860642` wei deficit plus operational margin. |
+| Last updated (IST) | 2026-09-30 10:34 IST |
