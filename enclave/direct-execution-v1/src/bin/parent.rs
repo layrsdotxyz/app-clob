@@ -18,7 +18,7 @@ use aws_smithy_types::{
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -43,6 +43,7 @@ use layrs_direct_execution_v1::{
     ProjectionBalanceRow, ProjectionIdentityRow, ProjectionWalletRow, RelayWithdrawalBinding,
     RuntimeMeasurementBinding, RuntimeRequest, RuntimeResponse, SealedEpoch, SignedWithdrawalIntent, TimeInForce,
     WriterGrant, EPOCH_ID, MAX_V70_LINEAGE_RECORDS, POSTGRES_PROJECTION_DDL,
+    TRANSACTION_MODEL,
 };
 use layrs_direct_execution_v1::journal::{
     canonical_receipt_hash, canonical_result_hash, DirectJournalRecord, JournalDurabilityAck,
@@ -153,6 +154,9 @@ use usdc_wallet_link::{WalletLinkAuthority,WalletLinkGrant};
 #[path = "../usdc_bus_custody.rs"]
 mod usdc_bus_custody;
 use usdc_bus_custody::{UsdcBusCustodyAdapter,BusDepositProof,BusDepositFinalizationProof};
+#[path = "../unified_deposit_custody.rs"]
+mod unified_deposit_custody;
+use unified_deposit_custody::{UnifiedDepositCustodyAdapter, UnifiedSourceDepositProof};
 #[derive(Clone)]
 struct AppState {
     enclave_cid: u32,
@@ -167,6 +171,7 @@ struct AppState {
     usdc_custody: Option<UsdcCustodyAdapter>,
     usdc_link_authority: Option<WalletLinkAuthority>,
     usdc_bus_custody: Option<UsdcBusCustodyAdapter>,
+    unified_deposit_custody: Option<UnifiedDepositCustodyAdapter>,
     /// Serializes only the bounded synchronous request and an unresolved
     /// external intent.  It is process memory, never durable workflow state.
     financial_gate: Arc<FinancialGate>,
@@ -175,6 +180,9 @@ struct AppState {
     committed_state_root: Arc<Mutex<Option<String>>>,
     unresolved_external_effects: Arc<Mutex<BTreeMap<String, ExternalEffectIntent>>>,
     governed_bootstrap: Option<GovernedBootstrapConfig>,
+    /// Current authorization metadata only. Runtime key material and all
+    /// financial state remain inside the enclave.
+    current_writer_grant: Arc<Mutex<Option<WriterGrant>>>,
     persistence_format: PersistenceFormat,
     /// Set only after a verified v71 restore or same-process shadow promotion.
     /// This is a format selector, not command/workflow persistence.
@@ -5048,6 +5056,9 @@ enum CustomerAction {
     },
     CreditZenDeposit { transaction_hash: String, amount_atomic: String },
     CreditHorizenUsdcDeposit { transaction_hash: String, amount_atomic: String },
+    CreditUnifiedUsdcSourceDeposits {operation_id:String,amount_atomic:String,proof:UnifiedSourceDepositProof},
+    FinalizeUnifiedUsdcDeposit {operation_id:String,amount_atomic:String,source_custody_reference:String,
+        horizen_transaction_hash:String},
     CreditArbitrumUsdcBusDeposit {operation_id:String,amount_atomic:String,proof:BusDepositProof},
     FinalizeArbitrumUsdcBusDeposit {operation_id:String,amount_atomic:String,proof:BusDepositFinalizationProof},
     BeginUsdcBusWithdrawal { destination_chain:String,asset:String,destination: String, amount_atomic: String },
@@ -5225,6 +5236,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
+    let current_writer_grant = Arc::new(Mutex::new(
+        governed_bootstrap.as_ref().map(|config| config.grant.clone()),
+    ));
     let state = AppState {
         enclave_cid: env::var("LAYRS_ENCLAVE_CID")
             .unwrap_or_else(|_| "16".into())
@@ -5258,6 +5272,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             UsdcCustodyAdapter::from_environment().map_err(|_|"USDC custody configuration invalid")?
         } else {None},
         usdc_bus_custody: if financial_enabled {UsdcBusCustodyAdapter::from_environment()?} else {None},
+        unified_deposit_custody: if financial_enabled {
+            UnifiedDepositCustodyAdapter::from_environment()
+                .map_err(|error| format!("unified deposit custody configuration invalid: {error}"))?
+        } else { None },
         usdc_link_authority: if financial_enabled {
             WalletLinkAuthority::from_environment().map_err(|_|"USDC linking authority configuration invalid")?
         } else {None},
@@ -5267,6 +5285,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         committed_state_root: Arc::new(Mutex::new(None)),
         unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
         governed_bootstrap,
+        current_writer_grant,
         persistence_format,
         hot_v71_enabled: Arc::new(AtomicBool::new(false)),
         journal_request_index: Arc::new(Mutex::new(None)),
@@ -5390,6 +5409,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/privacy/receipt-key-attestation", get(quest_receipt_attestation))
         .route("/v1/runtime/status", get(status))
         .route("/v1/operator/markets", post(register_market))
+        .route("/v1/operator/writer-grant/renew", post(renew_writer_grant))
         .route("/v1/operator/markets/resolve", post(resolve_market))
         .route("/v1/operator/markets/:market_id", get(market_status))
         .route(
@@ -5506,9 +5526,154 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
         _ => (StatusCode::BAD_GATEWAY, "UNEXPECTED_RESPONSE").into_response(),
     }
 }
+async fn renew_writer_grant(
+    State(state): State<AppState>,
+    Json(grant): Json<WriterGrant>,
+) -> Response {
+    let Some(config) = state.governed_bootstrap.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_UNAVAILABLE").into_response();
+    };
+    let now = now_unix();
+    if !grant.verify(now, &config.binding)
+        || grant.runtime_measurement != config.binding
+        || grant.key_release_kms_key_id != config.kms_key_id
+        || grant.authorization_scope != config.requested_mode
+    {
+        return (StatusCode::FORBIDDEN, "WRITER_GRANT_RENEWAL_INVALID").into_response();
+    }
+    let Some(current) = state.current_writer_grant.lock().await.as_ref().cloned() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_UNAVAILABLE").into_response();
+    };
+    let current_commitment = current.commitment();
+    let Some(projection) = state.projection.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_DATABASE_UNAVAILABLE").into_response();
+    };
+    if projection.verify_governed_runtime_mode(&grant, config.requested_mode == "production-enabled").await.is_err() {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_DATABASE_MISMATCH").into_response();
+    }
+    let runtime = match exchange(&state, RuntimeRequest::Status).await {
+        Ok(RuntimeResponse::Status { status }) => status,
+        _ => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_STATUS_UNAVAILABLE").into_response(),
+    };
+    let Some(runtime_commitment) = runtime.writer_grant_commitment.as_deref() else {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_RUNTIME_MISMATCH").into_response();
+    };
+    let Some(runtime_artifact_hash) = runtime.key_release_artifact_hash.as_deref() else {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_RUNTIME_MISMATCH").into_response();
+    };
+    let successor_commitment = grant.commitment();
+    let store = match state.artifact_store.as_ref() {
+        Some(store) => store,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_ARCHIVE_UNAVAILABLE").into_response(),
+    };
+    if runtime_commitment == successor_commitment {
+        let artifact = match store.load_key_release(&grant.activation_id).await {
+            Ok(Some(artifact)) if artifact.verify_for(&grant, &config.binding, &config.kms_key_id)
+                && artifact.artifact_hash() == runtime_artifact_hash => artifact,
+            _ => return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_ARTIFACT_MISMATCH").into_response(),
+        };
+        *state.current_writer_grant.lock().await = Some(grant.clone());
+        return Json(json!({
+            "activationId": grant.activation_id,
+            "writerGrantCommitment": successor_commitment,
+            "writerGrantExpiresAtUnix": grant.expires_at_unix,
+            "keyReleaseArtifactHash": artifact.artifact_hash(),
+            "idempotent": true,
+        })).into_response();
+    }
+    let Some(predecessor) = grant.key_release_predecessor.as_ref() else {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_PREDECESSOR_MISMATCH").into_response();
+    };
+    if runtime_commitment != current_commitment
+        || predecessor.activation_id != current.activation_id
+        || predecessor.writer_grant_commitment != current_commitment
+        || predecessor.artifact_sha256 != runtime_artifact_hash
+    {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_PREDECESSOR_MISMATCH").into_response();
+    }
+    let artifact = match store.load_key_release(&grant.activation_id).await {
+        Ok(Some(artifact)) => {
+            if !artifact.verify_for(&grant, &config.binding, &config.kms_key_id) {
+                return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_ARTIFACT_MISMATCH").into_response();
+            }
+            artifact
+        }
+        Ok(None) => {
+            let predecessor_artifact = match store.load_key_release(&predecessor.activation_id).await {
+                Ok(Some(artifact)) if artifact.verify_as_predecessor(predecessor, &config.kms_key_id) => artifact,
+                _ => return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_PREDECESSOR_MISMATCH").into_response(),
+            };
+            let source_context = predecessor_artifact.encryption_context.clone().into_iter().collect();
+            let mut destination_context = BTreeMap::new();
+            destination_context.insert("layrs-runtime".into(), TRANSACTION_MODEL.into());
+            destination_context.insert("layrs-epoch".into(), EPOCH_ID.into());
+            destination_context.insert("layrs-writer-grant".into(), successor_commitment.clone());
+            let destination_context_map = destination_context.clone().into_iter().collect();
+            let aws = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+            let reencrypted = match KmsClient::new(&aws).re_encrypt()
+                .ciphertext_blob(KmsBlob::new(predecessor_artifact.ciphertext_blob))
+                .source_key_id(&config.kms_key_id)
+                .destination_key_id(&config.kms_key_id)
+                .set_source_encryption_context(Some(source_context))
+                .set_destination_encryption_context(Some(destination_context_map))
+                .send().await
+            {
+                Ok(value) => value,
+                Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_KMS_FAILED").into_response(),
+            };
+            let Some(ciphertext) = reencrypted.ciphertext_blob() else {
+                return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_KMS_FAILED").into_response();
+            };
+            let artifact = GovernedKeyReleaseArtifact {
+                protocol: "layrs.direct-execution.key-release.v1".into(),
+                activation_id: grant.activation_id.clone(),
+                writer_grant_commitment: successor_commitment.clone(),
+                runtime_measurement: config.binding.clone(),
+                kms_key_id: config.kms_key_id.clone(),
+                encryption_context: destination_context,
+                ciphertext_blob: ciphertext.as_ref().to_vec(),
+            };
+            if !artifact.verify_for(&grant, &config.binding, &config.kms_key_id) {
+                return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_ARTIFACT_MISMATCH").into_response();
+            }
+            match store.persist_key_release(&artifact).await {
+                Ok(artifact) => artifact,
+                Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_ARCHIVE_FAILED").into_response(),
+            }
+        }
+        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_ARCHIVE_FAILED").into_response(),
+    };
+    let artifact_hash = artifact.artifact_hash();
+    match exchange(&state, RuntimeRequest::RenewGovernedWriter {
+        grant: grant.clone(),
+        key_release_artifact_hash: artifact_hash.clone(),
+    }).await {
+        Ok(RuntimeResponse::GovernedWriterRenewed {
+            writer_grant_commitment,
+            writer_grant_expires_at_unix,
+            key_release_artifact_hash,
+            ..
+        }) if writer_grant_commitment == successor_commitment
+            && writer_grant_expires_at_unix == grant.expires_at_unix
+            && key_release_artifact_hash == artifact_hash => {
+                *state.current_writer_grant.lock().await = Some(grant.clone());
+                eprintln!("WRITER_GRANT_HOT_RENEWED activation={} expiry={}", grant.activation_id, grant.expires_at_unix);
+                Json(json!({
+                    "activationId": grant.activation_id,
+                    "writerGrantCommitment": successor_commitment,
+                    "writerGrantExpiresAtUnix": grant.expires_at_unix,
+                    "keyReleaseArtifactHash": artifact_hash,
+                    "idempotent": false,
+                })).into_response()
+            }
+        Ok(RuntimeResponse::Error { code }) => (StatusCode::CONFLICT, code).into_response(),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_ENCLAVE_FAILED").into_response(),
+    }
+}
 async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     let now = now_unix();
-    let expired = state.governed_bootstrap.as_ref().is_some_and(|config| config.grant.expires_at_unix <= now);
+    let expired = state.current_writer_grant.lock().await.as_ref()
+        .is_some_and(|grant| grant.expires_at_unix <= now);
     match state.health.check(now, state.last_commit_at.load(Ordering::Acquire), state.financial_gate.stalled(now), expired) {
         Ok(()) => (StatusCode::OK, "ok"),
         Err(code) => (StatusCode::SERVICE_UNAVAILABLE, code),
@@ -5768,6 +5933,48 @@ async fn command(
             }
         }
         CustomerAction::CreditArbitrumUsdcBusDeposit {..}|CustomerAction::FinalizeArbitrumUsdcBusDeposit {..}=>return (StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING").into_response(),
+        CustomerAction::CreditUnifiedUsdcSourceDeposits {operation_id,amount_atomic,proof} if !external_effect_pending => {
+            let Some(wallet)=claims.financial_wallet_address.as_deref() else {
+                return (StatusCode::FORBIDDEN,"DIRECT_FINANCIAL_WALLET_REQUIRED").into_response();
+            };
+            if request_id!=format!("unified-usdc-deposit-credit:{operation_id}") {
+                return (StatusCode::BAD_REQUEST,"DEPOSIT_IDEMPOTENCY_KEY_MISMATCH").into_response();
+            }
+            let Some(custody)=&state.unified_deposit_custody else {
+                return (StatusCode::SERVICE_UNAVAILABLE,"UNIFIED_DEPOSIT_CUSTODY_NOT_ENABLED").into_response();
+            };
+            match custody.source_finality(wallet,&amount_atomic,&proof).await {
+                Ok(Some((custody_reference,source_references)))=>DirectAction::CreditUnifiedUsdcSourceDeposits {
+                    operation_id,source_chain:proof.source_chain,amount_atomic,custody_reference,source_references,
+                },
+                Ok(None)=>return (StatusCode::SERVICE_UNAVAILABLE,"UNIFIED_DEPOSIT_SOURCE_FINALITY_PENDING").into_response(),
+                Err(_)=>return (StatusCode::CONFLICT,"UNIFIED_DEPOSIT_SOURCE_PROOF_CONFLICT").into_response(),
+            }
+        }
+        CustomerAction::FinalizeUnifiedUsdcDeposit {operation_id,amount_atomic,source_custody_reference,horizen_transaction_hash}
+            if !external_effect_pending => {
+            let Some(wallet)=claims.financial_wallet_address.as_deref() else {
+                return (StatusCode::FORBIDDEN,"DIRECT_FINANCIAL_WALLET_REQUIRED").into_response();
+            };
+            if request_id!=format!("unified-usdc-deposit-finalize:{operation_id}") {
+                return (StatusCode::BAD_REQUEST,"DEPOSIT_IDEMPOTENCY_KEY_MISMATCH").into_response();
+            }
+            let hash=horizen_transaction_hash.to_ascii_lowercase();
+            let Some(custody)=&state.usdc_custody else {
+                return (StatusCode::SERVICE_UNAVAILABLE,"USDC_CUSTODY_ADAPTER_NOT_ENABLED").into_response();
+            };
+            match custody.deposit_finality(wallet,&hash,&amount_atomic).await {
+                Ok(DepositFinality::Finalized)=>DirectAction::FinalizeUnifiedUsdcDeposit {
+                    operation_id,amount_atomic,source_custody_reference,
+                    custody_reference:format!("horizen-usdc-deposit:{hash}"),
+                },
+                Ok(DepositFinality::Pending)=>return (StatusCode::SERVICE_UNAVAILABLE,"DEPOSIT_FINALITY_PENDING").into_response(),
+                Ok(DepositFinality::Reverted|DepositFinality::Conflict)=>return (StatusCode::CONFLICT,"DEPOSIT_TRANSACTION_BINDING_CONFLICT").into_response(),
+                Err(_)=>return (StatusCode::SERVICE_UNAVAILABLE,"DEPOSIT_FINALITY_UNAVAILABLE").into_response(),
+            }
+        }
+        CustomerAction::CreditUnifiedUsdcSourceDeposits {..}|CustomerAction::FinalizeUnifiedUsdcDeposit {..}=>
+            return (StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING").into_response(),
         CustomerAction::CreditHorizenUsdcDeposit {transaction_hash,amount_atomic} if !external_effect_pending => {
             let Some(source)=claims.financial_wallet_address.as_deref() else {return (StatusCode::FORBIDDEN,"DIRECT_FINANCIAL_WALLET_REQUIRED").into_response();};
             let hash=transaction_hash.to_ascii_lowercase();let reference=format!("horizen-usdc-deposit:{hash}");
@@ -7296,10 +7503,14 @@ impl Projection {
             return Err(ProjectionError::OpeningMismatch);
         }
         let grant_row = self.client.lock().await.query_opt(
-            "SELECT 1 FROM direct_execution_writer_grants WHERE activation_id=$1 AND epoch_id=$2 AND old_writer_fence_evidence_sha256=$3 AND expires_at_unix=$4",
+            "SELECT grant_json::text FROM direct_execution_writer_grants WHERE activation_id=$1 AND epoch_id=$2 AND old_writer_fence_evidence_sha256=$3 AND expires_at_unix=$4",
             &[&grant.activation_id, &EPOCH_ID, &grant.old_writer_fence_evidence_sha256, &(grant.expires_at_unix as i64)],
-        ).await.map_err(|_| ProjectionError::Database)?.is_some();
-        if grant_row {
+        ).await.map_err(|_| ProjectionError::Database)?;
+        let exact_grant = grant_row.and_then(|row| {
+            let raw: String = row.get(0);
+            serde_json::from_str::<WriterGrant>(&raw).ok()
+        }).is_some_and(|stored| stored == *grant);
+        if exact_grant {
             Ok(())
         } else {
             Err(ProjectionError::OpeningMismatch)
@@ -10446,12 +10657,14 @@ mod tests {
             usdc_custody: None,
             usdc_link_authority: None,
             usdc_bus_custody: None,
+            unified_deposit_custody: None,
             financial_gate: Arc::new(FinancialGate::new()),
             last_commit_at: Arc::new(AtomicU64::new(0)),
             health: Arc::new(ParentHealth::default()),
             committed_state_root: Arc::new(Mutex::new(Some(head.state_hash.clone()))),
             unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
             governed_bootstrap: None,
+            current_writer_grant: Arc::new(Mutex::new(None)),
             persistence_format: PersistenceFormat::V70,
             hot_v71_enabled: Arc::new(AtomicBool::new(false)),
             journal_request_index: Arc::new(Mutex::new(None)),
@@ -11651,12 +11864,14 @@ mod tests {
             usdc_custody: None,
             usdc_link_authority: None,
             usdc_bus_custody: None,
+            unified_deposit_custody: None,
         financial_gate: Arc::new(FinancialGate::new()),
         last_commit_at: Arc::new(AtomicU64::new(0)),
         health: Arc::new(ParentHealth::default()),
             committed_state_root: Arc::new(Mutex::new(None)),
             unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
             governed_bootstrap: None,
+            current_writer_grant: Arc::new(Mutex::new(None)),
             persistence_format: PersistenceFormat::V70,
             hot_v71_enabled: Arc::new(AtomicBool::new(false)),
             journal_request_index: Arc::new(Mutex::new(None)),
@@ -14003,12 +14218,14 @@ mod tests {
             usdc_custody: None,
             usdc_link_authority: None,
             usdc_bus_custody: None,
+            unified_deposit_custody: None,
             financial_gate: Arc::new(FinancialGate::new()),
             last_commit_at: Arc::new(AtomicU64::new(0)),
             health: Arc::new(ParentHealth::default()),
             committed_state_root: Arc::new(Mutex::new(Some(fixture.head.transition_root.clone()))),
             unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
             governed_bootstrap: None,
+            current_writer_grant: Arc::new(Mutex::new(None)),
             persistence_format: PersistenceFormat::V71,
             hot_v71_enabled: Arc::new(AtomicBool::new(false)),
             journal_request_index: Arc::new(Mutex::new(None)),

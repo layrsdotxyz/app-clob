@@ -853,6 +853,26 @@ pub enum DirectAction {
     /// Parent constructs this only after independently observing the user's
     /// individual Horizen USDC.e pool deposit at canonical finality.
     CreditHorizenUsdcDeposit { amount_atomic: String, custody_reference: String },
+    /// Parent constructs this only after independently verifying every
+    /// source-chain ERC20 transfer in the batch. A batch is used so several
+    /// sub-minimum deposits become tradable atomically when their wallet
+    /// balance reaches the 5 USDC threshold.
+    CreditUnifiedUsdcSourceDeposits {
+        operation_id: String,
+        source_chain: String,
+        amount_atomic: String,
+        custody_reference: String,
+        source_references: Vec<String>,
+    },
+    /// Parent constructs this after the exact batch principal is observed in
+    /// LayrsPool on Horizen. It removes only the withdrawal restriction; the
+    /// source credit above already made the principal tradable.
+    FinalizeUnifiedUsdcDeposit {
+        operation_id: String,
+        amount_atomic: String,
+        source_custody_reference: String,
+        custody_reference: String,
+    },
     /// Parent verifies the participant's canonical normal Bus boarding first.
     CreditArbitrumUsdcBusDeposit { operation_id:String, amount_atomic:String, custody_reference:String },
     /// Parent proves that same Bus ticket arrived and the participant deposited
@@ -1349,6 +1369,14 @@ struct ConditionalUsdcDeposit {
     wallet_address:String,
     amount_atomic:String,
     boarding_reference:String,
+    /// Empty only for the historical Bus compatibility records. Omitting the
+    /// empty value preserves their exact serialized state hash.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    source_chain:String,
+    /// Empty only for historical Bus records, whose single ticket reference
+    /// remains in `boarding_reference`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    source_references:Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1393,25 +1421,46 @@ fn validate_conditional_deposits(state: &DirectState, key: &[u8]) -> Result<(), 
     let invalid = || RuntimeError::StateArtifact;
     let mut expected = BTreeSet::new();
     for ((account, id), (hash, result)) in &state.requests {
-        let Some(operation) = id.strip_prefix("usdc-bus-deposit-credit:") else { continue; };
+        let (operation, unified) = if let Some(operation) = id.strip_prefix("unified-usdc-deposit-credit:") {
+            (operation, true)
+        } else if let Some(operation) = id.strip_prefix("usdc-bus-deposit-credit:") {
+            // Historical receipt validation only. New production commands do
+            // not construct or route through the retired Bus action.
+            (operation, false)
+        } else {
+            continue;
+        };
         let receipt = &result.receipt;
+        let operation_reference = if unified {
+            format!("unified-usdc-operation:{operation}")
+        } else {
+            format!("arbitrum-usdc-bus-operation:{operation}")
+        };
+        let valid_reference = receipt.custody_reference.as_deref().is_some_and(|reference| {
+            (if unified { valid_unified_source_custody_reference(reference) } else { valid_bus_deposit_reference(reference) })
+                && state.credited_custody_references.contains(reference)
+        });
         if !valid_bus_withdrawal_id(operation) || result.effect != "DEPOSIT_CONDITIONALLY_CREDITED"
             || result.status != TerminalStatus::Applied || receipt.status != result.status
             || receipt.effect != result.effect || receipt.account_id != *account || receipt.request_id != *id
             || receipt.request_hash != *hash || !verify_receipt(key, receipt)
             || !state.subject_identities.get(account).is_some_and(|set| set.contains(&receipt.identity_commitment))
             || !receipt.amount_atomic.as_deref().is_some_and(|value| amount(value).is_ok_and(|value| value >= 5_000_000))
-            || !receipt.custody_reference.as_deref().is_some_and(|reference| valid_bus_deposit_reference(reference)
-                && state.credited_custody_references.contains(reference))
-            || !state.credited_custody_references.contains(&format!("arbitrum-usdc-bus-operation:{operation}")) {
+            || !valid_reference
+            || !state.credited_custody_references.contains(&operation_reference) {
             return Err(invalid());
         }
-        if let Some((final_hash, final_result)) = state.requests.get(&(account.clone(), format!("usdc-bus-deposit-finalize:{operation}"))) {
+        let final_id = if unified {
+            format!("unified-usdc-deposit-finalize:{operation}")
+        } else {
+            format!("usdc-bus-deposit-finalize:{operation}")
+        };
+        if let Some((final_hash, final_result)) = state.requests.get(&(account.clone(), final_id.clone())) {
             let final_receipt = &final_result.receipt;
             if final_result.status != TerminalStatus::Applied || final_result.effect != "DEPOSIT_FINALIZED"
                 || final_receipt.status != final_result.status || final_receipt.effect != final_result.effect
                 || final_receipt.account_id != *account || final_receipt.identity_commitment != receipt.identity_commitment
-                || final_receipt.request_hash != *final_hash || final_receipt.request_id != format!("usdc-bus-deposit-finalize:{operation}")
+                || final_receipt.request_hash != *final_hash || final_receipt.request_id != final_id
                 || final_receipt.amount_atomic != receipt.amount_atomic || !verify_receipt(key, final_receipt)
                 || !final_receipt.custody_reference.as_deref().is_some_and(|reference|
                     reference.strip_prefix("horizen-usdc-deposit:").is_some_and(valid_transaction_hash_value)
@@ -1423,6 +1472,11 @@ fn validate_conditional_deposits(state: &DirectState, key: &[u8]) -> Result<(), 
                 || Some(&pending.amount_atomic) != receipt.amount_atomic.as_ref()
                 || Some(&pending.boarding_reference) != receipt.custody_reference.as_ref()
                 || !state.subject_wallets.get(account).is_some_and(|wallets| wallets.contains(&pending.wallet_address))
+                || (unified && (!valid_unified_source_chain(&pending.source_chain)
+                    || pending.source_references.is_empty()
+                    || pending.source_references.iter().any(|reference| !valid_unified_source_reference(reference, &pending.source_chain)
+                        || !state.credited_custody_references.contains(reference))))
+                || (!unified && (!pending.source_chain.is_empty() || !pending.source_references.is_empty()))
                 || !expected.insert(operation.to_string()) { return Err(invalid()); }
         }
     }
@@ -1908,6 +1962,8 @@ impl DirectRuntime {
             }
             // Preserve the existing deposit lane unchanged. Base deposit
             DirectAction::CreditZenDeposit { .. } | DirectAction::CreditHorizenUsdcDeposit { .. }
+            | DirectAction::CreditUnifiedUsdcSourceDeposits { .. }
+            | DirectAction::FinalizeUnifiedUsdcDeposit { .. }
             | DirectAction::CreditArbitrumUsdcBusDeposit { .. } | DirectAction::FinalizeArbitrumUsdcBusDeposit { .. } => {
                 let Some(wallet) = financial_wallet.as_deref() else { return Err(RuntimeError::DestinationDenied); };
                 if !valid_evm_wallet(wallet) || !self.subject_wallets.get(&request.account_id)
@@ -2119,6 +2175,75 @@ impl DirectRuntime {
                     self.credited_custody_references.insert(reference);
                     ("DEPOSIT_CREDITED".into(),Some(amount_atomic.clone()),Some(custody_reference.clone()))
                 }
+                DirectAction::CreditUnifiedUsdcSourceDeposits {
+                    operation_id,
+                    source_chain,
+                    amount_atomic,
+                    custody_reference,
+                    source_references,
+                } => {
+                    let value = amount(amount_atomic)?;
+                    if value < 5_000_000
+                        || !valid_bus_withdrawal_id(operation_id)
+                        || request.request_id != format!("unified-usdc-deposit-credit:{operation_id}")
+                        || !valid_unified_source_chain(source_chain)
+                        || !valid_unified_source_custody_reference(custody_reference)
+                        || source_references.is_empty()
+                        || source_references.iter().any(|reference|
+                            !valid_unified_source_reference(reference, source_chain))
+                        || source_references.iter().collect::<BTreeSet<_>>().len() != source_references.len()
+                        || self.conditional_usdc_deposits.contains_key(operation_id)
+                    {
+                        return Err(RuntimeError::InvalidRequest);
+                    }
+                    let operation_reference = format!("unified-usdc-operation:{operation_id}");
+                    if self.credited_custody_references.contains(custody_reference)
+                        || self.credited_custody_references.contains(&operation_reference)
+                        || source_references.iter().any(|reference| self.credited_custody_references.contains(reference))
+                    {
+                        return Err(RuntimeError::CustodyReferenceReuse);
+                    }
+                    let wallet = financial_wallet.clone().ok_or(RuntimeError::DestinationDenied)?;
+                    self.add(&request.identity_commitment, "USER_AVAILABLE", value)?;
+                    self.credited_custody_references.insert(custody_reference.clone());
+                    self.credited_custody_references.insert(operation_reference);
+                    self.credited_custody_references.extend(source_references.iter().cloned());
+                    self.conditional_usdc_deposits.insert(operation_id.clone(), ConditionalUsdcDeposit {
+                        account_id: request.account_id.clone(),
+                        identity_commitment: request.identity_commitment.clone(),
+                        wallet_address: wallet,
+                        amount_atomic: amount_atomic.clone(),
+                        boarding_reference: custody_reference.clone(),
+                        source_chain: source_chain.clone(),
+                        source_references: source_references.clone(),
+                    });
+                    ("DEPOSIT_CONDITIONALLY_CREDITED".into(), Some(amount_atomic.clone()), Some(custody_reference.clone()))
+                }
+                DirectAction::FinalizeUnifiedUsdcDeposit {
+                    operation_id,
+                    amount_atomic,
+                    source_custody_reference,
+                    custody_reference,
+                } => {
+                    let pending = self.conditional_usdc_deposits.get(operation_id).ok_or(RuntimeError::InvalidRequest)?;
+                    if request.request_id != format!("unified-usdc-deposit-finalize:{operation_id}")
+                        || pending.account_id != request.account_id
+                        || pending.identity_commitment != request.identity_commitment
+                        || Some(pending.wallet_address.as_str()) != financial_wallet.as_deref()
+                        || pending.amount_atomic != *amount_atomic
+                        || pending.boarding_reference != *source_custody_reference
+                        || custody_reference != &custody_reference.to_ascii_lowercase()
+                        || !custody_reference.strip_prefix("horizen-usdc-deposit:").is_some_and(valid_transaction_hash_value)
+                    {
+                        return Err(RuntimeError::InvalidRequest);
+                    }
+                    if self.credited_custody_references.contains(custody_reference) {
+                        return Err(RuntimeError::CustodyReferenceReuse);
+                    }
+                    self.credited_custody_references.insert(custody_reference.clone());
+                    self.conditional_usdc_deposits.remove(operation_id);
+                    ("DEPOSIT_FINALIZED".into(), Some(amount_atomic.clone()), Some(custody_reference.clone()))
+                }
                 DirectAction::CreditArbitrumUsdcBusDeposit {operation_id,amount_atomic,custody_reference} => {
                     let value=amount(amount_atomic)?;
                     if value<5_000_000 || !valid_bus_withdrawal_id(operation_id)
@@ -2139,7 +2264,8 @@ impl DirectRuntime {
                     self.credited_custody_references.insert(operation_reference);
                     self.conditional_usdc_deposits.insert(operation_id.clone(),ConditionalUsdcDeposit {
                         account_id:request.account_id.clone(),identity_commitment:request.identity_commitment.clone(),
-                        wallet_address:wallet,amount_atomic:amount_atomic.clone(),boarding_reference:custody_reference.clone()});
+                        wallet_address:wallet,amount_atomic:amount_atomic.clone(),boarding_reference:custody_reference.clone(),
+                        source_chain:String::new(),source_references:Vec::new()});
                     ("DEPOSIT_CONDITIONALLY_CREDITED".into(),Some(amount_atomic.clone()),Some(custody_reference.clone()))
                 }
                 DirectAction::FinalizeArbitrumUsdcBusDeposit {operation_id,amount_atomic,boarding_reference,custody_reference} => {
@@ -4036,6 +4162,18 @@ pub enum RuntimeRequest {
         /// ledger decryption key and is delivered only after grant validation.
         commit_ack_key: Vec<u8>,
     },
+    /// Replaces only the time-bounded authorization on an already-running
+    /// governed writer. The successor must be governance-signed, preserve the
+    /// exact runtime/fence/recovery scope and name the currently attested
+    /// grant plus key-release artifact as its predecessor. Runtime keys and
+    /// financial state never cross this boundary and are not recreated.
+    RenewGovernedWriter {
+        grant: WriterGrant,
+        /// Hash of the immutable successor key-release artifact. The parent
+        /// creates it with KMS ReEncrypt under the successor commitment; the
+        /// encrypted root key itself never enters this request.
+        key_release_artifact_hash: String,
+    },
     /// Startup-only protected-key handoff for an explicitly isolated test
     /// runtime.  Nitro does not propagate the parent's systemd environment
     /// into an EIF, so test keys must cross the already-authenticated VSOCK
@@ -4176,6 +4314,12 @@ pub enum RuntimeResponse {
     },
     GovernedBootstrapComplete {
         writer_grant_commitment: String,
+    },
+    GovernedWriterRenewed {
+        writer_grant_commitment: String,
+        writer_grant_expires_at_unix: u64,
+        predecessor_key_release_artifact_hash: String,
+        key_release_artifact_hash: String,
     },
     BootstrapComplete,
     Execute {
@@ -4659,6 +4803,27 @@ fn valid_bus_deposit_reference(value:&str)->bool {
     parts.len()==3&&parts[0]=="arbitrum-usdc-bus-deposit"&&valid_transaction_hash_value(parts[1])
         &&parts[1]==parts[1].to_ascii_lowercase()
         &&parts[2].parse::<u128>().ok().is_some_and(|ticket|ticket<(1u128<<72)&&ticket.to_string()==parts[2])
+}
+fn valid_unified_source_chain(value: &str) -> bool {
+    matches!(value, "arbitrum" | "base" | "ethereum" | "polygon" | "optimism" | "bnb" | "tempo" | "robinhood" | "horizen")
+}
+fn valid_unified_source_reference(value: &str, chain: &str) -> bool {
+    let parts = value.split(':').collect::<Vec<_>>();
+    parts.len() == 5
+        && parts[0] == "unified-usdc-transfer"
+        && parts[1] == chain
+        && valid_transaction_hash_value(parts[2])
+        && parts[2] == parts[2].to_ascii_lowercase()
+        && parts[3].parse::<u64>().ok().is_some_and(|index| index.to_string() == parts[3])
+        && positive_atomic_value(parts[4]).is_some_and(|amount| amount.to_string() == parts[4])
+}
+fn valid_unified_source_custody_reference(value: &str) -> bool {
+    let parts = value.split(':').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts[0] == "unified-usdc-source"
+        && valid_unified_source_chain(parts[1])
+        && valid_sha256(parts[2])
+        && parts[2] == parts[2].to_ascii_lowercase()
 }
 fn valid_bus_terminal_reference(value:&str,reverted:bool)->bool {
     if !reverted {
@@ -5455,6 +5620,106 @@ mod tests {
         invalid.request_id = "pool-wallet-link:layrs_deposit_000000".into();
         invalid.request_hash = request_hash(&invalid);
         assert_eq!(live.execute(invalid), Err(RuntimeError::InvalidRequest));
+    }
+
+    #[test]
+    fn unified_source_batch_is_tradable_but_not_withdrawable_until_pool_finality() {
+        let subject = "a".repeat(64);
+        let primary = "0x1111111111111111111111111111111111111111";
+        let wallet = "0x9999999999999999999999999999999999999999";
+        let identity = identity_commitment_for(&subject, primary);
+        let operation_id = Uuid::from_u128(771).to_string();
+        let state_key = [8u8; 32];
+        let mut live = runtime(RuntimeMode::IsolatedTest);
+        let mut store = InMemoryDirectStateStore::default();
+        live.execute_committed(
+            request_for(&subject, &identity, "unified-admission", DirectAction::AdmitIdentity { wallet_address: primary.into() }),
+            &state_key,
+            &mut store,
+        ).unwrap();
+        live.execute_committed(
+            pool_wallet_link_request(&subject, &identity, wallet, 771),
+            &state_key,
+            &mut store,
+        ).unwrap();
+        let source_reference = format!("unified-usdc-source:arbitrum:{}", "ab".repeat(32));
+        let source_references = vec![
+            format!("unified-usdc-transfer:arbitrum:0x{}:0:2000000", "11".repeat(32)),
+            format!("unified-usdc-transfer:arbitrum:0x{}:1:3000000", "22".repeat(32)),
+        ];
+        let mut credit = request_for(
+            &subject,
+            &identity,
+            &format!("unified-usdc-deposit-credit:{operation_id}"),
+            DirectAction::CreditUnifiedUsdcSourceDeposits {
+                operation_id: operation_id.clone(),
+                source_chain: "arbitrum".into(),
+                amount_atomic: "5000000".into(),
+                custody_reference: source_reference.clone(),
+                source_references,
+            },
+        );
+        credit.financial_wallet_address = Some(wallet.into());
+        credit.request_hash = request_hash(&credit);
+        assert_eq!(
+            live.execute_committed(credit, &state_key, &mut store).unwrap().effect,
+            "DEPOSIT_CONDITIONALLY_CREDITED"
+        );
+        assert_eq!(live.balance(&identity, "USDC", "USER_AVAILABLE"), 5_000_000);
+
+        let market = "layrs:v5:BTC:USDC:1h:unified-in-transit";
+        live.execute_committed(market_registration_request(market, "unified-market"), &state_key, &mut store).unwrap();
+        let order_id = Uuid::from_u128(773).to_string();
+        assert_eq!(live.execute_committed(request_for(&subject, &identity, "unified-order", DirectAction::PlaceOrder {
+            order_id: order_id.clone(), market_id: market.into(), outcome: Outcome::Up, action: OrderAction::Buy,
+            price_micros: 500_000, quantity_micros: "2000000".into(), time_in_force: TimeInForce::Gtc,
+            expires_at_millis: None, now_millis: 1_000,
+        }), &state_key, &mut store).unwrap().effect, "ORDER_PLACED");
+        // Trading can reserve the source-confirmed balance; cancelling proves
+        // the ordinary order lifecycle returns it while the withdrawal hold
+        // below remains independently restricted.
+        live.execute_committed(request_for(&subject, &identity, "unified-order-cancel", DirectAction::CancelOrder {
+            order_id,
+        }), &state_key, &mut store).unwrap();
+
+        let withdrawal_id = Uuid::from_u128(772).to_string();
+        let blocked = bus_begin(&subject, &identity, wallet, &withdrawal_id);
+        assert_eq!(live.execute(blocked), Err(RuntimeError::InsufficientAvailable));
+
+        let mut restored = DirectRuntime::restore_committed(
+            SealedEpoch::load(epoch_path()).unwrap(),
+            RuntimeMode::IsolatedTest,
+            vec![7; 32],
+            &state_key,
+            &store,
+        ).unwrap();
+        assert_eq!(restored.conditional_usdc_deposits.len(), 1);
+        let mut finalize = request_for(
+            &subject,
+            &identity,
+            &format!("unified-usdc-deposit-finalize:{operation_id}"),
+            DirectAction::FinalizeUnifiedUsdcDeposit {
+                operation_id,
+                amount_atomic: "5000000".into(),
+                source_custody_reference: source_reference,
+                custody_reference: format!("horizen-usdc-deposit:0x{}", "33".repeat(32)),
+            },
+        );
+        finalize.financial_wallet_address = Some(wallet.into());
+        finalize.request_hash = request_hash(&finalize);
+        assert_eq!(
+            restored.execute_committed(finalize, &state_key, &mut store).unwrap().effect,
+            "DEPOSIT_FINALIZED"
+        );
+        assert!(restored.conditional_usdc_deposits.is_empty());
+        assert_eq!(
+            restored.execute_committed(
+                bus_begin(&subject, &identity, wallet, &withdrawal_id),
+                &state_key,
+                &mut store,
+            ).unwrap().effect,
+            "WITHDRAWAL_RESERVED"
+        );
     }
 
     #[test]
