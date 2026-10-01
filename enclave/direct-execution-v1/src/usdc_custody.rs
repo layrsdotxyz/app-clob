@@ -28,7 +28,7 @@ impl UsdcCustodyAdapter {
         body.get("result").cloned().ok_or("USDC RPC result missing".into())
     }
     pub async fn deposit_finality(&self,wallet:&str,hash:&str,amount:&str)->Result<DepositFinality,String> {
-        if !valid_transaction_hash(hash)||canonical_evm_address(wallet).is_err()||amount.parse::<u128>().ok().filter(|amount|*amount>=5_000_000).is_none() {
+        if !valid_transaction_hash(hash)||canonical_evm_address(wallet).is_err()||amount.parse::<u128>().ok().filter(|amount|*amount>0).is_none() {
             return Ok(DepositFinality::Conflict);
         }
         let chain=self.rpc("eth_chainId",json!([])).await?;
@@ -132,7 +132,7 @@ fn event_count(receipt:&Value,contract:&str,signature:&str,accounts:&[&str],valu
     }).count())
 }
 fn deposit_effect(wallet:&str,hash:&str,amount:&str,receipt:&Value,tx:&Value)->DepositFinality {
-    let Some(value)=amount.parse::<u128>().ok().filter(|value|*value>=5_000_000) else {return DepositFinality::Conflict;};
+    let Some(value)=amount.parse::<u128>().ok().filter(|value|*value>0) else {return DepositFinality::Conflict;};
     let data=format!("{}{value:064x}",selector("deposit(uint256)"));
     if !equals(tx.get("hash").and_then(Value::as_str),hash)||!equals(receipt.get("transactionHash").and_then(Value::as_str),hash)
         ||!equals(tx.get("from").and_then(Value::as_str),wallet)||!equals(receipt.get("from").and_then(Value::as_str),wallet)
@@ -202,7 +202,16 @@ mod tests {
             let (wallet,hash,receipt,mut tx)=fixture();tx[field]=json!(if field=="value" {"0x1"} else {"0x0"});
             assert!(matches!(deposit_effect(&wallet,&hash,"5000000",&receipt,&tx),DepositFinality::Conflict),"field {field}");
         }
-        let (wallet,hash,receipt,tx)=fixture();assert!(matches!(deposit_effect(&wallet,&hash,"4999999",&receipt,&tx),DepositFinality::Conflict));
+        let (wallet,hash,receipt,tx)=fixture();assert!(matches!(deposit_effect(&wallet,&hash,"0",&receipt,&tx),DepositFinality::Conflict));
+    }
+    #[test]
+    fn accepts_an_exact_sub_five_usdc_pool_effect() {
+        let (wallet,hash,mut receipt,mut tx)=fixture();
+        let value=1u128;
+        tx["input"]=json!(format!("{}{:064x}",selector("deposit(uint256)"),value));
+        receipt["logs"][0]["data"]=json!(format!("0x{:064x}",value));
+        receipt["logs"][1]["data"]=json!(format!("0x{:064x}",value));
+        assert!(matches!(deposit_effect(&wallet,&hash,"1",&receipt,&tx),DepositFinality::Finalized));
     }
     #[test]
     fn receipt_requires_exactly_one_transfer_and_pool_deposit() {

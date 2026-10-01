@@ -2101,7 +2101,7 @@ impl DirectRuntime {
                     let value=amount(amount_atomic)?;
                     let hash=custody_reference.strip_prefix("horizen-usdc-deposit:")
                         .filter(|value|valid_transaction_hash_value(value)).ok_or(RuntimeError::InvalidRequest)?;
-                    if value<5_000_000 {return Err(RuntimeError::InvalidRequest);}
+                    if value==0 {return Err(RuntimeError::InvalidRequest);}
                     let reference=format!("horizen-usdc-deposit:{}",hash.to_ascii_lowercase());
                     if self.credited_custody_references.contains(&reference) {
                         return Err(RuntimeError::CustodyReferenceReuse);
@@ -6110,9 +6110,9 @@ mod tests {
         }
     }
     #[test]
-    fn horizen_usdc_credit_requires_the_own_admitted_wallet_minimum_and_unique_proof() {
+    fn horizen_usdc_credit_requires_the_own_admitted_wallet_positive_amount_and_unique_proof() {
         let (mut live,subject,identity,wallet,_)=bus_fixture();
-        for (amount,source,reference) in [("4999999",wallet.as_str(),format!("horizen-usdc-deposit:0x{}","aa".repeat(32))),
+        for (amount,source,reference) in [("0",wallet.as_str(),format!("horizen-usdc-deposit:0x{}","aa".repeat(32))),
             ("5000000","0x3333333333333333333333333333333333333333",format!("horizen-usdc-deposit:0x{}","aa".repeat(32))),
             ("5000000",wallet.as_str(),format!("base-deposit:0x{}","aa".repeat(32))),
             ("5000000",wallet.as_str(),format!("horizen-usdc-deposit:0x{}","ab".repeat(32)))] {
@@ -6120,6 +6120,21 @@ mod tests {
                 amount_atomic:amount.into(),custody_reference:reference});credit.financial_wallet_address=Some(source.into());credit.request_hash=request_hash(&credit);
             assert!(live.execute(credit).is_err());assert_eq!(live.state_hash(),root);
         }
+    }
+
+    #[test]
+    fn horizen_usdc_pool_credit_has_no_legacy_minimum() {
+        let mut live=runtime(RuntimeMode::IsolatedTest);
+        let mut store=InMemoryDirectStateStore::default();
+        let subject="a".repeat(64);let wallet="0x1111111111111111111111111111111111111111";
+        let identity=identity_commitment_for(&subject,wallet);
+        live.execute_committed(request_for(&subject,&identity,"admit-small-deposit",DirectAction::AdmitIdentity {
+            wallet_address:wallet.into()}),&[8;32],&mut store).unwrap();
+        let mut credit=request_for(&subject,&identity,"small-deposit",DirectAction::CreditHorizenUsdcDeposit {
+            amount_atomic:"1".into(),custody_reference:format!("horizen-usdc-deposit:0x{}","ef".repeat(32))});
+        credit.financial_wallet_address=Some(wallet.into());credit.request_hash=request_hash(&credit);
+        assert_eq!(live.execute_committed(credit,&[8;32],&mut store).unwrap().effect,"DEPOSIT_CREDITED");
+        assert_eq!(live.balance(&identity,"USDC","USER_AVAILABLE"),1);
     }
     #[test]
     fn replacement_wallet_links_to_existing_identity_without_resetting_balance_or_history() {
