@@ -2210,6 +2210,34 @@ fn validate_v70_tip_at_cutover(
     Ok(())
 }
 
+/// The cutover marker anchors the immutable record that was current when v70
+/// stopped advancing. A later checkpoint or tail is expected after the first
+/// post-cutover commit, so the marker is an ancestor of the restored head and
+/// must not be compared with that head directly.
+fn validate_v71_cutover_marker_ancestor(
+    marker: &V71CutoverMarker,
+    record: &DirectJournalRecord,
+    restored_head_sequence: u64,
+) -> Result<(), String> {
+    if marker.sequence > restored_head_sequence {
+        return Err("V71_CUTOVER_MARKER_AFTER_HEAD".into());
+    }
+    let record_hash = record
+        .record_hash()
+        .map_err(|_| "V71_CUTOVER_ANCESTOR_HASH_INVALID")?;
+    if marker.epoch_id != record.epoch_id
+        || marker.writer_epoch != record.writer_epoch
+        || marker.sequence != record.sequence
+        || marker.record_hash != record_hash
+        || marker.transition_root != record.transition_root
+        || marker.request_index_root != record.request_index_root
+        || marker.financial_state_root != record.financial_state_root
+    {
+        return Err("V71_CUTOVER_MARKER_ANCESTOR_MISMATCH".into());
+    }
+    Ok(())
+}
+
 /// Strict inverse of `journal_record_key`. Legacy `{seq}-{hash}` head names,
 /// unpadded, foreign, overflowing, zero, or otherwise noncanonical keys are
 /// never valid journal records.
@@ -3362,40 +3390,28 @@ impl S3ImmutableArtifactStore {
         if !self.prepare_journal_restore().await? {
             return Err("V71_CUTOVER_MARKER_WITHOUT_JOURNAL".into());
         }
-        let prepared = self.prepared_journal_restore.lock().await;
-        let prepared = prepared
-            .as_ref()
-            .ok_or("V71_CUTOVER_JOURNAL_UNPREPARED")?;
-        let (writer_epoch, sequence, record_hash, transition_root, request_index_root, financial_state_root) =
-            match prepared.tail.last() {
-                Some(record) => (
-                    record.writer_epoch.as_str(),
-                    record.sequence,
-                    record
-                        .record_hash()
-                        .map_err(|_| "V71_CUTOVER_TAIL_HASH_INVALID")?,
-                    record.transition_root.as_str(),
-                    record.request_index_root.as_str(),
-                    record.financial_state_root.as_str(),
-                ),
-                None => (
-                    prepared.checkpoint.writer_epoch.as_str(),
-                    prepared.checkpoint.sequence,
-                    prepared.checkpoint.record_hash.clone(),
-                    prepared.checkpoint.transition_root.as_str(),
-                    prepared.checkpoint.request_index_root.as_str(),
-                    prepared.checkpoint.financial_state_root.as_str(),
-                ),
-            };
-        if marker.writer_epoch != writer_epoch
-            || marker.sequence != sequence
-            || marker.record_hash != record_hash
-            || marker.transition_root != transition_root
-            || marker.request_index_root != request_index_root
-            || marker.financial_state_root != financial_state_root
-        {
-            return Err("V71_CUTOVER_MARKER_HEAD_MISMATCH".into());
+        let restored_head_sequence = {
+            let prepared = self.prepared_journal_restore.lock().await;
+            let prepared = prepared
+                .as_ref()
+                .ok_or("V71_CUTOVER_JOURNAL_UNPREPARED")?;
+            prepared
+                .tail
+                .last()
+                .map_or(prepared.checkpoint.sequence, |record| record.sequence)
+        };
+        if marker.sequence > restored_head_sequence {
+            return Err("V71_CUTOVER_MARKER_AFTER_HEAD".into());
         }
+        let cutover_record = self
+            .load_journal_record(marker.sequence)
+            .await
+            .map_err(|error| format!("V71_CUTOVER_ANCESTOR_LOAD_FAILED: {error}"))?;
+        validate_v71_cutover_marker_ancestor(
+            &marker,
+            &cutover_record,
+            restored_head_sequence,
+        )?;
         Ok(true)
     }
     /// Create-only, content-addressed persistence of an enclave-sealed v70
@@ -9849,6 +9865,86 @@ mod tests {
             super::validate_v70_tip_at_cutover("epoch", 43_207, &malformed),
             Err("V71_CUTOVER_V70_HEAD_INVALID".into())
         );
+    }
+
+    #[test]
+    fn v71_hot_restore_accepts_the_cutover_record_as_an_ancestor_of_a_later_head() {
+        let (_, mut cutover_record) = v71_candidate();
+        cutover_record.sequence = 45_035;
+        let marker = super::V71CutoverMarker {
+            protocol: super::V71_CUTOVER_MARKER_PROTOCOL.into(),
+            epoch_id: cutover_record.epoch_id.clone(),
+            writer_epoch: cutover_record.writer_epoch.clone(),
+            sequence: cutover_record.sequence,
+            record_hash: cutover_record.record_hash().unwrap(),
+            transition_root: cutover_record.transition_root.clone(),
+            request_index_root: cutover_record.request_index_root.clone(),
+            financial_state_root: cutover_record.financial_state_root.clone(),
+        };
+        let checkpoint_sequence = 46_031;
+        let restored_head_sequence = 46_042;
+        assert!(marker.sequence < checkpoint_sequence);
+        assert!(checkpoint_sequence < restored_head_sequence);
+        assert_eq!(
+            super::validate_v71_cutover_marker_ancestor(
+                &marker,
+                &cutover_record,
+                restored_head_sequence,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn v71_hot_restore_rejects_nonancestor_cutover_markers_and_markers_after_head() {
+        let (_, mut cutover_record) = v71_candidate();
+        cutover_record.sequence = 45_035;
+        let marker = super::V71CutoverMarker {
+            protocol: super::V71_CUTOVER_MARKER_PROTOCOL.into(),
+            epoch_id: cutover_record.epoch_id.clone(),
+            writer_epoch: cutover_record.writer_epoch.clone(),
+            sequence: cutover_record.sequence,
+            record_hash: cutover_record.record_hash().unwrap(),
+            transition_root: cutover_record.transition_root.clone(),
+            request_index_root: cutover_record.request_index_root.clone(),
+            financial_state_root: cutover_record.financial_state_root.clone(),
+        };
+        assert_eq!(
+            super::validate_v71_cutover_marker_ancestor(&marker, &cutover_record, 45_034),
+            Err("V71_CUTOVER_MARKER_AFTER_HEAD".into())
+        );
+
+        let assert_mismatch = |changed: super::V71CutoverMarker| {
+            assert_eq!(
+                super::validate_v71_cutover_marker_ancestor(
+                    &changed,
+                    &cutover_record,
+                    46_042,
+                ),
+                Err("V71_CUTOVER_MARKER_ANCESTOR_MISMATCH".into())
+            );
+        };
+        let mut changed = marker.clone();
+        changed.epoch_id = "other-epoch".into();
+        assert_mismatch(changed);
+        let mut changed = marker.clone();
+        changed.writer_epoch = "other-writer".into();
+        assert_mismatch(changed);
+        let mut changed = marker.clone();
+        changed.sequence += 1;
+        assert_mismatch(changed);
+        let mut changed = marker.clone();
+        changed.record_hash = "0".repeat(64);
+        assert_mismatch(changed);
+        let mut changed = marker.clone();
+        changed.transition_root = "0".repeat(64);
+        assert_mismatch(changed);
+        let mut changed = marker.clone();
+        changed.request_index_root = "0".repeat(64);
+        assert_mismatch(changed);
+        let mut changed = marker;
+        changed.financial_state_root = "0".repeat(64);
+        assert_mismatch(changed);
     }
 
     #[test]
