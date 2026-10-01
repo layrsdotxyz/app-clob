@@ -2,9 +2,9 @@
 
 | Field | Status |
 | --- | --- |
-| Current step | Queue C: Stargate Horizen-to-Arbitrum leg after unified withdrawal payout. |
-| What's done | Added canonical EIP-712 verification and nonce-stable request IDs; per-operation USDC reserve, settlement and finalized-expiry release actions; restart reconstruction from authenticated receipts; accepted-reserve-only public command commitments; Rust/Solidity golden vectors. Added the policy-free pool-wallet link and reserve boundary. The parent independently verifies chain 26514, canonical confirmation depth, the exact LayrsPool payout event, and—before an expiry release—a canonical post-expiry block where `consumedWithdrawalNonces(account,nonce)` is false. The enclave then consumes or releases only the matching account's hold. Full direct-execution suite passes: 117 library, 33 enclave and 122 parent tests, with 3 benchmark-only tests ignored. No Durable Commands or new signing authority were added. |
-| What's next | Implement and verify the per-operation pinned Stargate V2 Horizen-to-Arbitrum delivery leg, then the destination Relay leg. |
-| Blockers | No engine blocker. Route activation is gated on exact Relay plus Stargate route verification. |
-| Production-affecting action pending approval | None. No production deploy or funds movement during implementation. |
-| Last updated (IST) | 2026-09-30 21:14 IST |
+| Current step | Unified-flow engine release based on the recovered v71 production lineage. |
+| What's done | The branch now carries the production recovery fixes through `01b64a6` (older-checkpoint replay, cutover-marker ancestor validation and terminal Taxi custody verification) together with policy-free pool-wallet binding, user-signed withdrawal reservation, finalized Horizen payout verification, expiry release proof and removal of the legacy Horizen USDC credit minimum. |
+| What's next | Add per-deposit in-transit withdrawal holds while keeping credited funds tradable, complete the permanent checkpoint-pause fix, remove obsolete Bus/Quest runtime paths that are not needed to verify historical receipts, then build and test the new EIF. |
+| Blockers | None in code. Production rollout remains contingent on a passing full suite, immutable release artifacts and the writer-grant consistency gate. |
+| Production-affecting action pending approval | None; standing owner authorization applies. |
+| Last updated (IST) | 2026-10-02 04:30 IST |

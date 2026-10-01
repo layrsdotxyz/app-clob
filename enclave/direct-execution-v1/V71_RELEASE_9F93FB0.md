@@ -1,4 +1,7 @@
-# v71 release packet: `9f93fb0`
+# SUPERSEDED — DO NOT DEPLOY: v71 release packet `9f93fb0`
+
+This packet is historical evidence only. The `009e198` successor replaces it;
+do not use this file to create a change set, grant, manifest or deadline.
 
 This is the frozen pre-production packet for the full-state write-amplification
 bridge and v71 hot migration. It is not authorization to deploy. Do not execute
@@ -133,8 +136,10 @@ Use AWS profile `predifi-root` and region `us-east-1` throughout.
    `DormantAutoScalingGroup`; it must not modify the database, archive bucket,
    KMS keys, secrets, load balancer, target group, security groups, market
    services, or publisher. Delete the change set on any deviation.
-6. Record the five-minute soft-abort and ten-minute hard-abort timestamps,
-   then execute once. Do not retry with the same candidate grant.
+6. Record the five-minute soft-abort timestamp and a hard-abort timestamp equal
+   to measured restore plus measured ASG/traffic switch plus five minutes, with
+   an absolute 25-minute floor. Then execute once. Do not retry with the same
+   candidate grant.
 7. Require exact candidate attestation, grant commitment, verified restore,
    sequence/root continuity, healthy target, and no second writer before
    restoring normal routing. Require at least one exact v70-to-v71 replay match
@@ -146,6 +151,23 @@ Use AWS profile `predifi-root` and region `us-east-1` throughout.
    journal candidate time, object PUT/readback, ACK time, journal record size,
    sequence continuity, all authenticated roots, checkpoint verification,
    unresolved effects, and writer health.
+10. Before the handoff, inventory every release-identity consumer and prepare
+    rollback-pinned rotations for the direct-market resolver, direct BFF and
+    public-proof publisher. After the candidate attests, rotate their exact
+    PCR/binding/manifest inputs together; preserve predecessor task definitions
+    and immutable secrets. A healthy writer alone is not release success.
+11. Run an authenticated production browser smoke as a normal user. Require a
+    verified enclave, trading enabled, and a readable private portfolio; abort
+    on `TRADING BLOCKED`, an attestation error, or an admission/portfolio error.
+12. Require the direct-market resolver capability check to pass against a fresh
+    nonce-bound candidate attestation, and verify the current market is open
+    and the first due resolution completes without a capability failure.
+13. Require the public-proof publisher frontier to advance and the pre-handoff
+    backlog to drain without a permanent gap or duplicate. Query both BFF and
+    publisher logs from handoff onward and require zero new
+    `QUEST_PUBLIC_RECEIPT_BINDING_INVALID` and
+    `QUEST_PUBLIC_RECEIPT_ATTESTATION_INVALID` errors. Any failure is an
+    incomplete release step and triggers the reviewed consumer/runtime rollback.
 
 The reviewed candidate invocation is:
 
@@ -177,9 +199,10 @@ parameter uses `UsePreviousValue: true`.
 
 - **Five minutes:** stop advancement. Do not consume another grant, write a
   cutover marker manually, or broaden scope.
-- **Ten minutes:** remove the candidate from routing and execute rollback. Do
-  not wait indefinitely for restore, health, shadow, materialization, or a
-  checkpoint.
+- **Restore-based hard gate:** remove the candidate from routing and execute
+  rollback when measured restore plus measured ASG/traffic switch plus a
+  five-minute margin has elapsed, never earlier than 25 minutes. Do not wait
+  indefinitely for restore, health, shadow, materialization, or a checkpoint.
 - Before v71 is authoritative, rollback uses AMI
   `ami-093fabb94cc52931e`, `PersistenceFormat=v70`, the unchanged production
   archive prefix, and the separate rollback grant pinned to the frozen v70
@@ -219,15 +242,16 @@ archive prefix, and either `PersistenceFormat=v70` or
 `PersistenceFormat=v70-rollback-baseline`. It sets `V71ShadowRunId`,
 `V70RollbackPrefix` to empty and `V71AutoPromote=false`. The change set must be
 inspected before execution even under the hard-abort path; a pre-reviewed
-root-only parameter file is what keeps that inspection within the ten-minute
-limit.
+root-only parameter file is what keeps that inspection within the measured
+restore-based limit.
 
 ## Important availability limit
 
 The current production ASG has `MaxSize=1`; the runtime has no durable command
 queue. Therefore a strict zero-duration outage during the initial EIF/writer
 replacement cannot be promised by this release. The handoff must be bounded by
-the five/ten-minute rule, and requests made while there is no healthy writer
+the five-minute soft gate and restore-based hard gate, and requests made while
+there is no healthy writer
 cannot be durably queued by this system. This must be accepted explicitly or a
 separately approved dual-slot handoff must be built before execution.
 

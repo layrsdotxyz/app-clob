@@ -529,6 +529,15 @@ impl CommittedRestoreFrontier {
         checkpoint.receipt_records.get(index).is_some_and(|record| record.sequence == self.sequence && record.state_hash == self.state_hash)
             && checkpoint.artifact_hashes.get(index) == Some(&self.artifact_hash)
     }
+    /// A checkpoint may safely precede the governed frontier when startup
+    /// streams the remaining immutable successors. The append path verifies
+    /// the exact frontier artifact and finalization refuses a head below it.
+    /// A checkpoint at or above the frontier must contain that exact record.
+    pub fn accepts_checkpoint_base(&self, checkpoint: &DirectCheckpoint) -> bool {
+        self.valid()
+            && (checkpoint.artifact.sequence < self.sequence
+                || self.accepts_checkpoint(checkpoint))
+    }
 }
 
 /// Public, immutable metadata for the KMS-wrapped direct-runtime root key.
@@ -4072,6 +4081,12 @@ pub enum RuntimeRequest {
         writer_fence_evidence_sha256: Option<String>,
     },
     SealJournalCheckpoint,
+    /// Authenticates, decrypts and invariant-checks a v70 checkpoint in a
+    /// disposable runtime before authoritative startup recovery. The
+    /// restored runtime is discarded and can never execute a command.
+    VerifyCheckpoint {
+        checkpoint: DirectCheckpoint,
+    },
     /// Restores an authenticated checkpoint into a disposable runtime that is
     /// never installed as the writer. Parents use this before publishing each
     /// checkpoint; exact immutable readback then proves the published bytes
@@ -4250,6 +4265,7 @@ pub enum RuntimeResponse {
     },
     RestoreProgress { recovered_sequence: u64, recovered_state_hash: String },
     CheckpointSealed { checkpoint: DirectCheckpoint },
+    CheckpointVerified { sequence: u64, state_hash: String },
     Balance {
         amount_atomic: String,
     },

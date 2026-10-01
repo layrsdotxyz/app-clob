@@ -11,6 +11,9 @@ Type=simple
 User=layrsopening
 Environment=PORT=8443
 Environment=LAYRS_ENCLAVE_CID=16
+# Bound glibc arena multiplication so transient full-frame buffers are returned
+# predictably instead of being retained across many Tokio worker threads.
+Environment=MALLOC_ARENA_MAX=2
 Environment=LAYRS_OPENING_EPOCH_PATH=/opt/layrs-opening/OPENING_EPOCH_STATE_20260911.json
 Environment=LAYRS_OPENING_EVIDENCE_PATH=/opt/layrs-opening/OPENING_EPOCH_EVIDENCE_MANIFEST_20260911.json
 # Isolated, write-once encrypted successor-artifact mount.  The protected ACK

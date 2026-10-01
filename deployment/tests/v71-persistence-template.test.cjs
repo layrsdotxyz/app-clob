@@ -24,6 +24,24 @@ test('parent receives only the selected persistence controls',()=>{
   assert.ok(!template.includes('DURABLE_COMMAND'));
 });
 
+test('USDC subsidy cap comes from the hash-pinned Phase-1 configuration and is fixed at 50,000',()=>{
+  assert.ok(template.includes('UsdcMaximumSubsidyAtomic: { Type: Number, Default: 50000, AllowedValues: [50000] }'));
+  assert.ok(template.includes("!If [UsdcCustodyActive, !Ref UsdcPhase1ConfigurationSecretArn, !Ref 'AWS::NoValue']"));
+  assert.ok(template.includes('phase1_raw = required(secret("${UsdcPhase1ConfigurationSecretArn}"), "configurationJson")'));
+  assert.ok(template.includes('hashlib.sha256(phase1_raw.encode("utf-8")).hexdigest() != "${UsdcPhase1ConfigurationSha256}"'));
+  assert.ok(template.includes('phase1_subsidy != "${UsdcMaximumSubsidyAtomic}"'));
+  assert.ok(template.includes('"LAYRS_DIRECT_USDC_MAX_SUBSIDY_ATOMIC": phase1_subsidy'));
+  assert.ok(!template.includes('"LAYRS_DIRECT_USDC_MAX_SUBSIDY_ATOMIC": "${UsdcMaximumSubsidyAtomic}"'));
+});
+
+test('candidate ASG health grace remains above measured restore plus margin',()=>{
+  const match=template.match(/HealthCheckGracePeriod: ([0-9]+)/);
+  assert.ok(match,'ASG health grace must be explicit');
+  const seconds=Number(match[1]);
+  assert.equal(seconds,3600);
+  assert.ok(seconds>=25*60,'health grace must exceed the restore-based hard-abort floor');
+});
+
 test('actual parent bootstrap remains valid Python',()=>{
   const match=template.match(/            \/usr\/bin\/python3 - <<'PY'\n([\s\S]*?)\n            PY/);
   assert.ok(match,'actual bootstrap must exist');

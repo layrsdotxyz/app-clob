@@ -70,9 +70,14 @@ Parameters:
   HorizenConfirmations: { Type: Number, Default: 20, MinValue: 1 }
   UsdcCustodyEnabled: { Type: String, Default: 'false', AllowedValues: ['true', 'false'] }
   UsdcRpcSecretArn: { Type: String, Default: '' }
+  # The parent reads the exact configurationJson consumed and hash-pinned by
+  # the BFF. UsdcMaximumSubsidyAtomic is a visible deployment guard only; it
+  # is never a second runtime source for the cap.
+  UsdcPhase1ConfigurationSecretArn: { Type: String, Default: '' }
+  UsdcPhase1ConfigurationSha256: { Type: String, Default: '', AllowedPattern: '^(?:|[a-f0-9]{64})$' }
   UsdcLedgerWalletAddress: { Type: String, Default: '', AllowedPattern: '^(?:0x[0-9a-f]{40})?$' }
   UsdcAdministratorPublicKeyDerBase64: { Type: String, Default: '', AllowedPattern: '^(?:[A-Za-z0-9+/]{100,255}={0,2})?$' }
-  UsdcMaximumSubsidyAtomic: { Type: Number, Default: 10000, MinValue: 1, MaxValue: 5000000 }
+  UsdcMaximumSubsidyAtomic: { Type: Number, Default: 50000, AllowedValues: [50000] }
   UsdcMaximumBridgeFeeWei: { Type: Number, Default: 100000000000000, MinValue: 1 }
   ArbitrumConfirmations: { Type: Number, Default: 1, AllowedValues: [1] }
   EthereumConfirmations: { Type: Number, Default: 12, MinValue: 1 }
@@ -88,6 +93,8 @@ Rules:
       - Assert: !And
           - !Equals [!Ref ExecutionMode, production-enabled]
           - !Not [!Equals [!Ref UsdcRpcSecretArn, '']]
+          - !Not [!Equals [!Ref UsdcPhase1ConfigurationSecretArn, '']]
+          - !Not [!Equals [!Ref UsdcPhase1ConfigurationSha256, '']]
           - !Not [!Equals [!Ref UsdcLedgerWalletAddress, '']]
           - !Not [!Equals [!Ref UsdcLedgerWalletAddress, '0x0000000000000000000000000000000000000000']]
           - !Not [!Equals [!Ref UsdcAdministratorPublicKeyDerBase64, '']]
@@ -167,6 +174,7 @@ Resources:
                   - !Ref RpcSecretArn
                   - !If [RelayObservationConfigured, !Ref RelayObservationSecretArn, !Ref 'AWS::NoValue']
                   - !If [UsdcCustodyActive, !Ref UsdcRpcSecretArn, !Ref 'AWS::NoValue']
+                  - !If [UsdcCustodyActive, !Ref UsdcPhase1ConfigurationSecretArn, !Ref 'AWS::NoValue']
               - Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
                 Resource: !GetAtt RuntimeLogGroup.Arn
@@ -334,6 +342,14 @@ Resources:
                     # authority only. No P1 financial/operator/admin PEM is
                     # supplied to this parent by the USDC release bindings.
                     usdc_rpc = secret("${UsdcRpcSecretArn}")
+                    phase1_raw = required(secret("${UsdcPhase1ConfigurationSecretArn}"), "configurationJson")
+                    if hashlib.sha256(phase1_raw.encode("utf-8")).hexdigest() != "${UsdcPhase1ConfigurationSha256}":
+                        raise RuntimeError("USDC Phase-1 configuration hash mismatch")
+                    phase1 = json.loads(phase1_raw)
+                    phase1_limits = phase1.get("limits") if isinstance(phase1, dict) else None
+                    phase1_subsidy = phase1_limits.get("maximumSubsidyAtomic") if isinstance(phase1_limits, dict) else None
+                    if not isinstance(phase1_subsidy, str) or phase1_subsidy != "${UsdcMaximumSubsidyAtomic}":
+                        raise RuntimeError("USDC Phase-1 subsidy cap mismatch")
                     values.update({
                         "LAYRS_DIRECT_USDC_CUSTODY_ENABLED": "true",
                         "LAYRSV2_HORIZEN_RPC_URL": required(usdc_rpc, "horizenRpcUrl"),
@@ -351,7 +367,7 @@ Resources:
                         "LAYRSV2_POLYGON_CONFIRMATIONS": "${PolygonConfirmations}",
                         "LAYRSV2_TEMPO_CONFIRMATIONS": "${TempoConfirmations}",
                         "LAYRS_DIRECT_USDC_LEDGER_WALLET_ADDRESS": "${UsdcLedgerWalletAddress}",
-                        "LAYRS_DIRECT_USDC_MAX_SUBSIDY_ATOMIC": "${UsdcMaximumSubsidyAtomic}",
+                        "LAYRS_DIRECT_USDC_MAX_SUBSIDY_ATOMIC": phase1_subsidy,
                         "LAYRS_DIRECT_USDC_MAX_BRIDGE_FEE_WEI": "${UsdcMaximumBridgeFeeWei}",
                         "LAYRS_DIRECT_USDC_ADMIN_PUBLIC_KEY_DER_BASE64": "${UsdcAdministratorPublicKeyDerBase64}",
                     })
@@ -395,7 +411,10 @@ Resources:
       MaxSize: '1'
       DesiredCapacity: !Ref DormantRuntimeDesiredCapacity
       HealthCheckType: ELB
-      HealthCheckGracePeriod: 300
+      # The measured legacy restore exceeded fourteen minutes. Keep the A0
+      # incident-mitigation grace so ELB health cannot recycle a valid host
+      # while either the candidate or rollback parent is still restoring.
+      HealthCheckGracePeriod: 3600
       TargetGroupARNs: [!Ref ReadOnlyRuntimeTargetGroup]
       Tags: [{ Key: WriterEnabled, Value: !If [FinancialWriterEnabled, 'true', 'false'], PropagateAtLaunch: true }]
   ReadOnlyRuntimeLoadBalancer:

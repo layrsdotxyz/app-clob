@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "releaseStatus": "built-inspected-rehearsed-awaiting-current-frontier-v1",
+  "releaseId": "v71-rollback-3cbce68-20260930",
+  "sourceCommit": "3cbce68549717642c8ad525a2340b0b36262ffcb",
+  "sourceBranch": "codex/layrs-v71-integration-20260928",
+  "region": "us-east-1",
+  "candidate": {
+    "amiId": "ami-00498fa3f6e6a20e8",
+    "amiName": "layrs-opening-epoch-v71-rollback-3cbce68-20260930",
+    "amiSnapshotId": "snap-023f816e3459da783",
+    "amiEncrypted": true,
+    "amiDeregistrationProtection": "enabled-without-cooldown",
+    "parentSizeBytes": 47015080,
+    "parentSha256": "6b6ead2f255a7466d0b507e6dc3215f6d2b699319d5ed1e02ccc5dddaa77b929",
+    "enclaveSizeBytes": 14813960,
+    "enclaveSha256": "0915f6bc609df6ba8d319e89c6d97e60d149437cb1d4050f56adca674160f8da",
+    "eifSha256": "cc604191f25613094de7aeda9678dd146fb82f8dfa2bb8a5535680f61801685f",
+    "measurements": {
+      "hashAlgorithm": "SHA384",
+      "pcr0": "db914cd8668e133389cf81587f4b046976b3cffe9e75c835cc8d09353b13865b451c4dee6d380890ccdfaa358a4bd2f5",
+      "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+      "pcr2": "02b8b7b1093b3c2bbe02627e041a40e76fa99717fd285b4d29d43816584091b48d873a76f98140090816600b85361acd"
+    }
+  },
+  "bridgeDerivedSparseRollback": {
+    "amiId": "ami-0b4ed3c6d60f6714b",
+    "amiName": "layrs-opening-epoch-v70-sparse-rollback-3733866-20260930",
+    "amiSnapshotId": "snap-088223183d321a1b3",
+    "amiEncrypted": true,
+    "amiDeregistrationProtection": "enabled-without-cooldown",
+    "implementationCommit": "37338667f80e562b8aa2c2d58a397dbc2ce1fea0",
+    "evidenceCommit": "2212d423177095f5d76aa907052b27eabcd89c94",
+    "parentSizeBytes": 45024664,
+    "parentSha256": "d18529a45fa875c95c44e9c7aa7ed59e8096b83bc53d9c03d95c8aa29367c143",
+    "eifSha256": "6100a96de33300bac8b13e7f0700883e0fe9f14bdfb900305d55d651b95a9256",
+    "measurements": {
+      "hashAlgorithm": "SHA384",
+      "pcr0": "59beb72420f56eb9b6a794b7d9ac4aced2c191ee964381cbc01d2d73e386645abe4eaa9af8757984ad52e79916029572",
+      "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+      "pcr2": "28a6c5946a520ea6f72ace25a5cf9b57a8949c84377858e1c81457edaadd188e2b11b2eaafcb8c3352bf9e4a9f012ced"
+    }
+  },
+  "verification": {
+    "libraryTests": "110 passed, 3 ignored benchmarks",
+    "enclaveTests": "33 passed",
+    "parentTests": "121 passed, 1 ignored benchmark; no obsolete shorter fixed gate remains in the parent controller",
+    "releaseModeRollbackTests": "12 passed; post-promotion successor restored at the exact sequence with matching state, portfolios, terminal results and receipts; post-capture dispatch remained fenced",
+    "v71CommitBenchmark": "45000-history, 500 samples: p50 5.098 ms, p95 7.196 ms, p99 8.162 ms, 36088-byte maximum journal record, 874224 KiB process peak RSS",
+    "v70CheckpointConcurrencyBenchmark": "45000 records: 96688408-byte artifact, 155053515-byte checkpoint, 1770 ms gate hold, 805 ms persistence after gate release, 895 ms baseline order, 2659 ms concurrent order",
+    "bridgeCompatibilityTests": "83 passed, 1 ignored benchmark; sparse baseline plus contiguous successor restored to exact final root and receipt cache; ordinary v70 rejected the sparse archive",
+    "isolatedImageInspection": "both final AMIs matched expected parent and EIF hashes; candidate PCR0/PCR1/PCR2 matched the preserved inspected EIF; runtime environments were absent; inspection instances were terminated",
+    "isolatedAsgRollback": "candidate launch-template version 1 was replaced by bridge-derived sparse rollback version 2 in 211 seconds; exactly one healthy rollback instance remained; the ASG, launch template and instances were deleted"
+  },
+  "activation": null,
+  "candidateWriterGrantCommitment": null,
+  "rollbackWriterGrantCommitment": null,
+  "signature": null,
+  "signatureNote": "No secret, grant or production authorization is embedded. Production requires current-frontier V1, separate unconsumed candidate and rollback grants, the existing release signer, immutable consumer identity rotation, exact change-set inspection, and a five-minute soft gate plus hard gate equal to measured restore plus measured ASG and traffic switch plus five minutes with a 25-minute floor. The exact live bridge image is not an immediate sparse-package fallback. Durable Commands are not part of this release."
+}

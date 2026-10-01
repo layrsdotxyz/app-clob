@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "classification": "explained-proof-backed-withdrawal-hold",
+  "withdrawalId": "dff330c1-4ca3-46de-bb86-d192b8ddcc67",
+  "reservationReceiptId": "323fada4ccee8ab138a220b9579ebc86d276996c39d74c24d7a05eb959554c1e",
+  "amountAtomic": "20000000",
+  "asset": "USDC",
+  "destinationChain": "base",
+  "destination": "0x0d2bf0c9d6d96eea797c9d1b96895d8f70e3322e",
+  "proof": {
+    "horizenPoolReleaseTransactionHash": "0x8bb5fbba01d015071f3e2d9119d1ba58bf97e9360a5768c04a948b50c87361c9",
+    "horizenBoardingTransactionHash": "0x2dbc8c61aed40be7899145c3db403d897ae32a454049f9ac39e2e6b333731c29",
+    "horizenDriveTransactionHash": "0xf9e53966e77f7adf14ce4ac508049e906eaedf574f316229a014c1f80a4797ba",
+    "guid": "0xeb79ce85446c0344d5799ec63b9a759e52136c38039510f4c6832c73eff7cf9b",
+    "seat": 0,
+    "baseArrivalTransactionHash": "0x29a8070662ab161ba2799c691e6bf62da6f48a12f70bb8e83a5b1e0d499c62e5",
+    "baseArrivalBlock": "51959553",
+    "deliveredAmountAtomic": "20000000"
+  },
+  "observedLedgerState": {
+    "queueStatus": "BOARDED",
+    "holdReceiptPresent": true,
+    "settlementReceiptPresent": false,
+    "rejectionReceiptPresent": false,
+    "failureCode": "QUEST_PARENT_COMMIT_PENDING"
+  },
+  "cause": {
+    "actualBridgeSubsidyAtomic": "12008",
+    "workerPhase1MaximumSubsidyAtomic": "50000",
+    "liveBridgeParentMaximumSubsidyAtomic": "10000",
+    "parentRejection": "USDC_BUS_CUSTODY_PROOF_CONFLICT"
+  },
+  "rolloutTreatment": {
+    "countsAsUnexplainedHold": false,
+    "carryForwardWithoutMutation": true,
+    "revertHold": false,
+    "sendReplacementPayout": false,
+    "requiredTerminalAction": "After v71 promotion, retry the original settlement idempotency key against the existing immutable proof and require WITHDRAWAL_SETTLED plus the Base transaction hash before declaring the withdrawal gate healthy."
+  },
+  "evidenceMethod": "Read-only database, immutable archive and chain-RPC verification; no financial or production mutation."
+}

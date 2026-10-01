@@ -293,6 +293,9 @@ where
         RuntimeRequest::SealJournalCheckpoint => {
             seal_journal_checkpoint(state).await
         }
+        RuntimeRequest::VerifyCheckpoint { checkpoint } => {
+            verify_checkpoint(state, checkpoint).await
+        }
         RuntimeRequest::VerifyJournalCheckpoint { checkpoint } => {
             verify_journal_checkpoint(state, checkpoint).await
         }
@@ -857,7 +860,7 @@ async fn begin_checkpoint_restore(state: Arc<Mutex<EnclaveState>>, checkpoint: l
     if state.v71_runtime.is_some() {
         return RuntimeResponse::Error { code: "JOURNAL_FORMAT_MISMATCH".into() };
     }
-    if state.committed_restore_frontier.as_ref().is_some_and(|frontier| !frontier.accepts_checkpoint(&checkpoint)) {
+    if state.committed_restore_frontier.as_ref().is_some_and(|frontier| !frontier.accepts_checkpoint_base(&checkpoint)) {
         return RuntimeResponse::Error { code: "CHECKPOINT_BELOW_GOVERNED_FRONTIER".into() };
     }
     let candidate = DirectRuntime::new(state.epoch.clone(), state.mode, state.receipt_key.clone())
@@ -1191,7 +1194,39 @@ fn build_v71_shadow(
     let migration = Arc::new(bundle);
     let mut commits = Vec::with_capacity(observations.len());
     let mut effects = BTreeSet::new();
-    for observation in &observations {
+    apply_v71_shadow_observations(
+        &mut runtime,
+        &mut tree,
+        &mut commits,
+        &mut effects,
+        &observations,
+        &authoritative,
+        state_key,
+        signing_key,
+    )?;
+    Ok(BuiltV71Shadow {
+        runtime,
+        tree,
+        migration,
+        base_checkpoint,
+        commits,
+        consecutive_matches: observations.len() as u64,
+        observed_effects: effects,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_v71_shadow_observations(
+    runtime: &mut DirectV71Runtime,
+    tree: &mut SparseRequestTree,
+    commits: &mut Vec<V71ShadowCommit>,
+    effects: &mut BTreeSet<String>,
+    observations: &[V71ShadowObservation],
+    authoritative: &DirectRuntime,
+    state_key: &[u8],
+    signing_key: &[u8],
+) -> Result<(), layrs_direct_execution_v1::v71::V71Error> {
+    for observation in observations {
         let proof = tree.proof(
             &observation.request.account_id,
             &observation.request.request_id,
@@ -1218,15 +1253,7 @@ fn build_v71_shadow(
         runtime.adopt_candidate(candidate)?;
     }
     runtime.verify_shadow_head(&authoritative)?;
-    Ok(BuiltV71Shadow {
-        runtime,
-        tree,
-        migration,
-        base_checkpoint,
-        commits,
-        consecutive_matches: observations.len() as u64,
-        observed_effects: effects,
-    })
+    Ok(())
 }
 
 async fn begin_v71_shadow(
@@ -1300,24 +1327,28 @@ async fn begin_v71_shadow(
             return;
         };
 
-        // This brief gate covers only the small catch-up tail accumulated
-        // while the production-sized migration bundle was sealed.
+        // Snapshot the catch-up tail at one exact authoritative frontier, then
+        // release the transition gate before replaying it. New commits remain
+        // authoritative and append to the same bounded Pending observation
+        // window while this CPU-heavy work runs.
         let _transition = transition(&task_state).await;
         let (observations, authoritative) = {
-            let mut state = task_state.lock().await;
+            let state = task_state.lock().await;
             let V71ShadowState::Pending {
                 run_id,
                 source_sequence: pending_source,
                 observations,
-            } = &mut state.v71_shadow
+            } = &state.v71_shadow
             else {
                 return;
             };
             if run_id != &task_run_id || *pending_source != source_sequence {
                 return;
             }
-            (std::mem::take(observations), state.runtime.clone())
+            (observations.clone(), state.runtime.clone())
         };
+        let mut observed_count = observations.len();
+        drop(_transition);
         let verification_key = match journal_verifying_key(&signing_key) {
             Ok(key) => key,
             Err(_) => {
@@ -1345,39 +1376,123 @@ async fn begin_v71_shadow(
             )
         })
         .await;
-        let mut state = task_state.lock().await;
-        match built {
-            Ok(Ok(BuiltV71Shadow {
-                runtime,
-                tree,
-                migration,
-                base_checkpoint,
-                commits,
-                consecutive_matches,
-                observed_effects,
-            })) => {
-                state.v71_shadow = V71ShadowState::Active {
-                    run_id: task_run_id.clone(),
-                    source_sequence,
-                    runtime,
-                    tree,
-                    migration,
-                    base_checkpoint,
-                    commits,
-                    consecutive_matches,
-                    observed_effects,
-                };
-                eprintln!(
-                    "V71_SHADOW_ACTIVE run_id={} source_sequence={} caught_up={}",
-                    task_run_id, source_sequence, consecutive_matches
-                );
-            }
-            _ => latch_v71_shadow(
+        let Ok(Ok(mut built)) = built else {
+            let _transition = transition(&task_state).await;
+            let mut state = task_state.lock().await;
+            latch_v71_shadow(
                 &mut state.v71_shadow,
                 task_run_id,
                 source_sequence,
                 "V71_SHADOW_CATCH_UP_MISMATCH",
-            ),
+            );
+            return;
+        };
+
+        loop {
+            // Install only while no commit can land between the authoritative
+            // comparison and the state swap. If commits accumulated during
+            // replay, copy just that delta and replay it after releasing the
+            // transition gate again.
+            let _transition = transition(&task_state).await;
+            let next = {
+                let mut state = task_state.lock().await;
+                let V71ShadowState::Pending {
+                    run_id,
+                    source_sequence: pending_source,
+                    observations,
+                } = &state.v71_shadow
+                else {
+                    return;
+                };
+                if run_id != &task_run_id || *pending_source != source_sequence {
+                    return;
+                }
+                if observations.len() == observed_count {
+                    if built.runtime.verify_shadow_head(&state.runtime).is_err() {
+                        latch_v71_shadow(
+                            &mut state.v71_shadow,
+                            task_run_id,
+                            source_sequence,
+                            "V71_SHADOW_CATCH_UP_MISMATCH",
+                        );
+                        return;
+                    }
+                    let caught_up = built.consecutive_matches;
+                    state.v71_shadow = V71ShadowState::Active {
+                        run_id: task_run_id.clone(),
+                        source_sequence,
+                        runtime: built.runtime,
+                        tree: built.tree,
+                        migration: built.migration,
+                        base_checkpoint: built.base_checkpoint,
+                        commits: built.commits,
+                        consecutive_matches: caught_up,
+                        observed_effects: built.observed_effects,
+                    };
+                    eprintln!(
+                        "V71_SHADOW_ACTIVE run_id={} source_sequence={} caught_up={}",
+                        task_run_id, source_sequence, caught_up
+                    );
+                    return;
+                }
+                (
+                    observations[observed_count..].to_vec(),
+                    observations.len(),
+                    state.runtime.clone(),
+                )
+            };
+            drop(_transition);
+
+            let state_key = zeroize::Zeroizing::new(task_state.lock().await.state_key.clone());
+            let signing_key = match derive_journal_signing_key(&state_key) {
+                Ok(key) => zeroize::Zeroizing::new(key),
+                Err(_) => {
+                    let _transition = transition(&task_state).await;
+                    let mut state = task_state.lock().await;
+                    latch_v71_shadow(
+                        &mut state.v71_shadow,
+                        task_run_id,
+                        source_sequence,
+                        "V71_SHADOW_KEY_INVALID",
+                    );
+                    return;
+                }
+            };
+            let (observations, next_observed_count, authoritative) = next;
+            let advanced = tokio::task::spawn_blocking(move || {
+                apply_v71_shadow_observations(
+                    &mut built.runtime,
+                    &mut built.tree,
+                    &mut built.commits,
+                    &mut built.observed_effects,
+                    &observations,
+                    &authoritative,
+                    &state_key,
+                    signing_key.as_ref(),
+                )?;
+                built.consecutive_matches = built
+                    .consecutive_matches
+                    .saturating_add(observations.len() as u64);
+                Ok::<_, layrs_direct_execution_v1::v71::V71Error>(built)
+            })
+            .await;
+            match advanced {
+                Ok(Ok(next_built)) => {
+                    built = next_built;
+                    observed_count = next_observed_count;
+                }
+                _ => {
+                    let _transition = transition(&task_state).await;
+                    let mut state = task_state.lock().await;
+                    latch_v71_shadow(
+                        &mut state.v71_shadow,
+                        task_run_id,
+                        source_sequence,
+                        "V71_SHADOW_CATCH_UP_MISMATCH",
+                    );
+                    return;
+                }
+            }
         }
     });
 
@@ -1798,9 +1913,25 @@ async fn verify_journal_checkpoint(
         {
             None
         } else {
-            state.v71_runtime.as_ref().map(|runtime| {
+            let runtime = state.v71_runtime.as_ref().map(|runtime| {
+                runtime.financial_runtime().clone()
+            }).or_else(|| match &state.v71_shadow {
+                // Before promotion, verification is available only for the
+                // exact authenticated base checkpoint produced by this active
+                // shadow. This keeps the verifier non-writer and prevents an
+                // unrelated checkpoint from borrowing the shadow runtime.
+                V71ShadowState::Active {
+                    runtime,
+                    base_checkpoint,
+                    ..
+                } if base_checkpoint == &checkpoint => {
+                    Some(runtime.financial_runtime().clone())
+                }
+                _ => None,
+            });
+            runtime.map(|runtime| {
                 (
-                    runtime.financial_runtime().clone(),
+                    runtime,
                     zeroize::Zeroizing::new(state.state_key.clone()),
                 )
             })
@@ -1846,6 +1977,54 @@ async fn verify_journal_checkpoint(
         },
         _ => RuntimeResponse::Error {
             code: "JOURNAL_CHECKPOINT_VERIFY_FAILED".into(),
+        },
+    }
+}
+
+/// Restore a v70 checkpoint with the enclave-held keys into a disposable
+/// runtime. This runs before authoritative startup recovery, never attaches
+/// the restored value to `EnclaveState`, and therefore cannot create a second
+/// writer or execute a financial command.
+async fn verify_checkpoint(
+    state: Arc<Mutex<EnclaveState>>,
+    checkpoint: layrs_direct_execution_v1::DirectCheckpoint,
+) -> RuntimeResponse {
+    let snapshot = {
+        let state = state.lock().await;
+        if state.recovery_complete
+            || state.restore_candidate.is_some()
+            || state.v71_restore_candidate.is_some()
+            || state.committed_restore_frontier.as_ref().is_some_and(|frontier| {
+                !frontier.accepts_checkpoint_base(&checkpoint)
+            })
+        {
+            None
+        } else {
+            Some((
+                state.epoch.clone(),
+                state.mode,
+                zeroize::Zeroizing::new(state.receipt_key.clone()),
+                zeroize::Zeroizing::new(state.state_key.clone()),
+            ))
+        }
+    };
+    let Some((epoch, mode, receipt_key, state_key)) = snapshot else {
+        return RuntimeResponse::Error {
+            code: "CHECKPOINT_VERIFY_UNAVAILABLE".into(),
+        };
+    };
+    match tokio::task::spawn_blocking(move || {
+        DirectRuntime::new(epoch, mode, receipt_key.to_vec())
+            .and_then(|runtime| runtime.restore_checkpoint(&checkpoint, &state_key))
+    })
+    .await
+    {
+        Ok(Ok(restored)) => RuntimeResponse::CheckpointVerified {
+            sequence: restored.committed_sequence(),
+            state_hash: restored.committed_state_hash(),
+        },
+        _ => RuntimeResponse::Error {
+            code: "CHECKPOINT_VERIFY_FAILED".into(),
         },
     }
 }
@@ -2851,22 +3030,72 @@ mod tests {
         assert!(matches!(finish_committed_restore(Arc::clone(&restarted), 3, root).await, RuntimeResponse::RecoveryComplete { .. }));
     }
     #[tokio::test]
-    async fn checkpoint_restore_rejects_rollback_below_governed_frontier_and_corrupt_snapshot() {
+    async fn checkpoint_non_writer_verifier_restores_and_discards_exact_state() {
+        let running = state(); let store = FilesystemImmutableArtifactStore::new(artifact_dir());
+        recover(Arc::clone(&running), vec![]).await;
+        commit_through_parent_callback(Arc::clone(&running), request("checkpoint-verify"), &store).await;
+        let artifacts = store.load_committed().unwrap();
+        let records = artifacts.iter().cloned().map(|mut record| { record.ciphertext.clear(); record }).collect();
+        let hashes = artifacts.iter().map(layrs_direct_execution_v1::artifact_hash).collect();
+        let checkpoint = running.lock().await.runtime.seal_checkpoint(artifacts[0].clone(), records, hashes, &[8;32]).unwrap();
+        let expected_root = checkpoint.artifact.state_hash.clone();
+
+        let verifier = state();
+        assert_eq!(runtime_response(Arc::clone(&verifier), RuntimeRequest::VerifyCheckpoint { checkpoint: checkpoint.clone() }).await,
+            RuntimeResponse::CheckpointVerified { sequence: 1, state_hash: expected_root });
+        let state = verifier.lock().await;
+        assert!(!state.recovery_complete);
+        assert!(state.restore_candidate.is_none());
+        assert_eq!(state.runtime.committed_sequence(), 0);
+        drop(state);
+
+        let mut corrupt = checkpoint;
+        corrupt.artifact.ciphertext[0] ^= 1;
+        assert!(matches!(runtime_response(Arc::clone(&verifier), RuntimeRequest::VerifyCheckpoint { checkpoint: corrupt }).await,
+            RuntimeResponse::Error { ref code } if code == "CHECKPOINT_VERIFY_FAILED"));
+        assert_eq!(verifier.lock().await.runtime.committed_sequence(), 0);
+    }
+    #[tokio::test]
+    async fn checkpoint_restore_requires_the_exact_governed_frontier_after_an_older_base() {
         let running = state(); let store = FilesystemImmutableArtifactStore::new(artifact_dir());
         recover(Arc::clone(&running), vec![]).await;
         commit_through_parent_callback(Arc::clone(&running), request("checkpoint-old"), &store).await;
         let first = store.load_committed().unwrap();
         let mut compact = first[0].clone(); compact.ciphertext.clear();
         let checkpoint = running.lock().await.runtime.seal_checkpoint(first[0].clone(), vec![compact], vec![layrs_direct_execution_v1::artifact_hash(&first[0])], &[8;32]).unwrap();
+        commit_through_parent_callback(Arc::clone(&running), request("frontier"), &store).await;
+        let artifacts = store.load_committed().unwrap();
+        let frontier_artifact = artifacts[1].clone();
+        let frontier = layrs_direct_execution_v1::CommittedRestoreFrontier {
+            sequence: frontier_artifact.sequence,
+            state_hash: frontier_artifact.state_hash.clone(),
+            artifact_hash: layrs_direct_execution_v1::artifact_hash(&frontier_artifact),
+        };
         let restarted = state();
-        restarted.lock().await.committed_restore_frontier = Some(layrs_direct_execution_v1::CommittedRestoreFrontier { sequence: 2, state_hash: "a".repeat(64), artifact_hash: "b".repeat(64) });
-        assert!(matches!(begin_checkpoint_restore(Arc::clone(&restarted), checkpoint.clone()).await, RuntimeResponse::Error { code } if code == "CHECKPOINT_BELOW_GOVERNED_FRONTIER"));
-        restarted.lock().await.committed_restore_frontier = None;
+        restarted.lock().await.committed_restore_frontier = Some(frontier.clone());
+        assert!(matches!(
+            runtime_response(Arc::clone(&restarted), RuntimeRequest::VerifyCheckpoint { checkpoint: checkpoint.clone() }).await,
+            RuntimeResponse::CheckpointVerified { sequence: 1, .. }
+        ));
+        assert!(matches!(begin_checkpoint_restore(Arc::clone(&restarted), checkpoint.clone()).await, RuntimeResponse::RestoreProgress { recovered_sequence: 1, .. }));
+        assert!(matches!(finish_committed_restore(Arc::clone(&restarted), 1, checkpoint.artifact.state_hash.clone()).await, RuntimeResponse::Error { code } if code == "RESTORE_FINAL_HEAD_MISMATCH"));
+
+        assert!(matches!(begin_checkpoint_restore(Arc::clone(&restarted), checkpoint.clone()).await, RuntimeResponse::RestoreProgress { recovered_sequence: 1, .. }));
+        let mut wrong_frontier = frontier_artifact.clone();
+        wrong_frontier.state_hash = "0".repeat(64);
+        assert!(matches!(append_committed_restore(Arc::clone(&restarted), wrong_frontier).await, RuntimeResponse::Error { code } if code == "RESTORE_GOVERNED_FRONTIER_MISMATCH"));
+
+        assert!(matches!(begin_checkpoint_restore(Arc::clone(&restarted), checkpoint.clone()).await, RuntimeResponse::RestoreProgress { recovered_sequence: 1, .. }));
+        assert!(matches!(append_committed_restore(Arc::clone(&restarted), frontier_artifact).await, RuntimeResponse::RestoreProgress { recovered_sequence: 2, .. }));
+        assert!(matches!(finish_committed_restore(Arc::clone(&restarted), 2, frontier.state_hash.clone()).await, RuntimeResponse::RecoveryComplete { recovered_sequence: 2, .. }));
+
+        let corrupt_verifier = state();
+        corrupt_verifier.lock().await.committed_restore_frontier = Some(frontier);
         let mut corrupt = checkpoint; corrupt.artifact.ciphertext[0] ^= 1;
-        assert!(matches!(begin_checkpoint_restore(Arc::clone(&restarted), corrupt).await, RuntimeResponse::Error { code } if code == "CHECKPOINT_AUTHENTICATION_FAILED"));
-        assert!(!restarted.lock().await.recovery_complete);
-        assert!(restarted.lock().await.restore_candidate.is_none());
-        assert_eq!(restarted.lock().await.runtime.committed_sequence(), 0);
+        assert!(matches!(begin_checkpoint_restore(Arc::clone(&corrupt_verifier), corrupt).await, RuntimeResponse::Error { code } if code == "CHECKPOINT_AUTHENTICATION_FAILED"));
+        assert!(!corrupt_verifier.lock().await.recovery_complete);
+        assert!(corrupt_verifier.lock().await.restore_candidate.is_none());
+        assert_eq!(corrupt_verifier.lock().await.runtime.committed_sequence(), 0);
     }
     #[tokio::test]
     async fn sealed_checkpoint_is_refused_unless_its_restore_frame_fits() {
@@ -3506,6 +3735,65 @@ mod tests {
         )
     }
 
+    fn shadow_relink(
+        subject: &str,
+        identity: &str,
+        wallet: &str,
+        request_id: &str,
+    ) -> DirectRequest {
+        request_for(
+            subject,
+            identity,
+            request_id,
+            DirectAction::LinkFinancialWallet {
+                wallet_address: wallet.into(),
+            },
+        )
+    }
+
+    async fn commit_v70_with_immediate_ack(
+        state: Arc<Mutex<EnclaveState>>,
+        request: DirectRequest,
+    ) -> (RuntimeResponse, usize) {
+        let (mut parent, server) = begin(state, request).await;
+        let artifact = candidate(&mut parent).await;
+        let artifact_bytes = serde_cbor::to_vec(&artifact).unwrap().len();
+        let ack = DurabilityAck::issue(&artifact, &[9; 32]);
+        write_frame(
+            &mut parent,
+            &serde_cbor::to_vec(&RuntimeRequest::DurabilityAck { ack }).unwrap(),
+        )
+        .await
+        .unwrap();
+        let terminal = serde_cbor::from_slice(&read_frame(&mut parent).await.unwrap()).unwrap();
+        server.await.unwrap().unwrap();
+        (terminal, artifact_bytes)
+    }
+
+    fn process_memory_kib() -> (u64, u64) {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let value = |label: &str| {
+            status
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix(label)?
+                        .split_whitespace()
+                        .next()?
+                        .parse::<u64>()
+                        .ok()
+                })
+                .unwrap_or_default()
+        };
+        (value("VmRSS:"), value("VmHWM:"))
+    }
+
+    fn report_rehearsal_memory(phase: &str) {
+        let (rss_kib, high_water_kib) = process_memory_kib();
+        eprintln!(
+            "V71_REHEARSAL_MEMORY phase={phase} rss_kib={rss_kib} high_water_kib={high_water_kib}"
+        );
+    }
+
     #[test]
     fn v71_shadow_catch_up_replays_every_observation_and_matches_final_v70_head() {
         let epoch = SealedEpoch::load(epoch_path()).unwrap();
@@ -3689,6 +3977,26 @@ mod tests {
         assert_eq!(terminal_leaves.len(), 1);
         assert_eq!(results, vec![result]);
 
+        // The production failure happened here: before promotion there is no
+        // authoritative v71 runtime yet, but the exact active-shadow base
+        // checkpoint must still pass a disposable non-writer restore.
+        let base_checkpoint = base_checkpoint.unwrap();
+        assert!(matches!(
+            verify_journal_checkpoint(Arc::clone(&state), base_checkpoint.clone()).await,
+            RuntimeResponse::JournalCheckpointVerified {
+                sequence: 1,
+                ..
+            }
+        ));
+        let mut unrelated = base_checkpoint;
+        unrelated.sequence += 1;
+        assert_eq!(
+            verify_journal_checkpoint(Arc::clone(&state), unrelated).await,
+            RuntimeResponse::Error {
+                code: "JOURNAL_CHECKPOINT_VERIFY_UNAVAILABLE".into()
+            }
+        );
+
         assert!(matches!(
             promote_v71_shadow(
                 Arc::clone(&state),
@@ -3726,6 +4034,309 @@ mod tests {
         assert!(promoted.v71_writer_eligible);
         assert_eq!(promoted.v71_runtime.as_ref().map(DirectV71Runtime::sequence), Some(2));
         assert!(matches!(promoted.v71_shadow, V71ShadowState::Disabled));
+    }
+
+    /// Exercises the complete enclave-side hot transition at production-sized
+    /// request history. The first load burst is forced into the Pending window
+    /// while the migration worker runs, proving catch-up does not own the
+    /// transition gate. Framed v70 commits then exercise the real candidate and
+    /// durability-ack path before checkpoint verification and exact-head
+    /// promotion. Finally, a compact v71 successor is acknowledged and the
+    /// exact v70 rollback checkpoint is restored and compared.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "production-sized shadow/promotion rehearsal; set LAYRS_V71_REHEARSAL_HISTORY"]
+    async fn v71_production_sized_shadow_promotion_and_rollback_rehearsal() {
+        let history = std::env::var("LAYRS_V71_REHEARSAL_HISTORY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(43_000);
+        let pending_commits = std::env::var("LAYRS_V71_REHEARSAL_PENDING_COMMITS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(64);
+        let framed_commits = std::env::var("LAYRS_V71_REHEARSAL_FRAMED_COMMITS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(2);
+        assert!((1_000..=100_000).contains(&history));
+        assert!((1..MAX_V71_SHADOW_CATCH_UP / 2).contains(&pending_commits));
+        assert!((1..=10).contains(&framed_commits));
+
+        let state = state();
+        let subject = "a".repeat(64);
+        let wallet = "0x1111111111111111111111111111111111111111";
+        let identity = identity_commitment_for(&subject, wallet);
+        {
+            let mut committed = state.lock().await;
+            committed.recovery_complete = true;
+            committed
+                .runtime
+                .execute(request_for(
+                    &subject,
+                    &identity,
+                    "rehearsal-admission",
+                    DirectAction::AdmitIdentity {
+                        wallet_address: wallet.into(),
+                    },
+                ))
+                .unwrap();
+            for ordinal in 1..history {
+                committed
+                    .runtime
+                    .execute(shadow_relink(
+                        &subject,
+                        &identity,
+                        wallet,
+                        &format!("rehearsal-history-{ordinal:06}"),
+                    ))
+                    .unwrap();
+            }
+            assert_eq!(committed.runtime.committed_sequence(), history as u64);
+        }
+
+        let shadow_started = std::time::Instant::now();
+        assert!(matches!(
+            begin_v71_shadow(Arc::clone(&state), "production-rehearsal".into()).await,
+            RuntimeResponse::V71ShadowStatus {
+                phase,
+                source_sequence,
+                ..
+            } if phase == "PENDING" && source_sequence == history as u64
+        ));
+
+        // Hold the same transition gate used by real commits so the migration
+        // worker cannot install until this serialized authoritative burst is
+        // fully observed. The old implementation blocked here for the entire
+        // migration/catch-up build.
+        let pending_gate_started = std::time::Instant::now();
+        let pending_guard = transition(&state).await;
+        let pending_gate_wait = pending_gate_started.elapsed();
+        let pending_burst_started = std::time::Instant::now();
+        for ordinal in 0..pending_commits {
+            let request = shadow_relink(
+                &subject,
+                &identity,
+                wallet,
+                &format!("rehearsal-pending-{ordinal:06}"),
+            );
+            let result = state.lock().await.runtime.execute(request.clone()).unwrap();
+            observe_v71_shadow_commit(&state, request, result).await;
+        }
+        let pending_burst = pending_burst_started.elapsed();
+        assert!(matches!(
+            v71_shadow_status(&state).await,
+            RuntimeResponse::V71ShadowStatus {
+                phase,
+                sequence,
+                ..
+            } if phase == "PENDING" && sequence == (history + pending_commits) as u64
+        ));
+        drop(pending_guard);
+
+        let active = tokio::time::timeout(std::time::Duration::from_secs(15 * 60), async {
+            loop {
+                let status = v71_shadow_status(&state).await;
+                match &status {
+                    RuntimeResponse::V71ShadowStatus { phase, .. } if phase == "ACTIVE" => {
+                        break status;
+                    }
+                    RuntimeResponse::V71ShadowStatus { phase, .. }
+                        if phase.starts_with("LATCHED:") =>
+                    {
+                        panic!("shadow latched during production rehearsal: {phase}");
+                    }
+                    _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .expect("production-sized shadow did not become active");
+        let shadow_active_elapsed = shadow_started.elapsed();
+        assert!(matches!(
+            active,
+            RuntimeResponse::V71ShadowStatus {
+                sequence,
+                consecutive_matches,
+                ..
+            } if sequence == (history + pending_commits) as u64
+                && consecutive_matches == pending_commits as u64
+        ));
+        report_rehearsal_memory("shadow_active");
+
+        let mut framed_latencies = Vec::with_capacity(framed_commits);
+        let mut largest_v70_artifact = 0usize;
+        for ordinal in 0..framed_commits {
+            let started = std::time::Instant::now();
+            let (terminal, artifact_bytes) = commit_v70_with_immediate_ack(
+                Arc::clone(&state),
+                shadow_relink(
+                    &subject,
+                    &identity,
+                    wallet,
+                    &format!("rehearsal-framed-{ordinal:06}"),
+                ),
+            )
+            .await;
+            assert!(matches!(terminal, RuntimeResponse::Execute { .. }));
+            largest_v70_artifact = largest_v70_artifact.max(artifact_bytes);
+            framed_latencies.push(started.elapsed());
+        }
+        report_rehearsal_memory("framed_v70_commits");
+
+        let export_started = std::time::Instant::now();
+        let export = export_v71_shadow(
+            &state,
+            "production-rehearsal".into(),
+            history as u64,
+            true,
+        )
+        .await;
+        let RuntimeResponse::V71ShadowExport {
+            writer_epoch,
+            sequence,
+            record_hash,
+            transition_root,
+            request_index_root,
+            financial_state_root,
+            migration: Some(migration),
+            base_checkpoint: Some(base_checkpoint),
+            records,
+            terminal_leaves,
+            results,
+            ..
+        } = export
+        else {
+            panic!("expected complete production-sized shadow export");
+        };
+        let export_elapsed = export_started.elapsed();
+        assert_eq!(base_checkpoint.sequence, history as u64);
+        assert_eq!(records.len(), pending_commits + framed_commits);
+        assert_eq!(terminal_leaves.len(), records.len());
+        assert_eq!(results.len(), records.len());
+        assert_eq!(sequence, (history + pending_commits + framed_commits) as u64);
+
+        let verification_started = std::time::Instant::now();
+        assert!(matches!(
+            verify_journal_checkpoint(Arc::clone(&state), base_checkpoint).await,
+            RuntimeResponse::JournalCheckpointVerified {
+                sequence: verified,
+                ..
+            } if verified == history as u64
+        ));
+        let verification_elapsed = verification_started.elapsed();
+
+        let promotion_started = std::time::Instant::now();
+        assert!(matches!(
+            promote_v71_shadow(
+                Arc::clone(&state),
+                "production-rehearsal".into(),
+                sequence,
+                record_hash,
+                transition_root,
+                request_index_root,
+                financial_state_root,
+            )
+            .await,
+            RuntimeResponse::V71ShadowPromoted {
+                sequence: promoted,
+                ..
+            } if promoted == sequence
+        ));
+        let promotion_elapsed = promotion_started.elapsed();
+        report_rehearsal_memory("promoted");
+
+        let mut tree = SparseRequestTree::from_leaves(&migration.leaves).unwrap();
+        for leaf in &terminal_leaves {
+            tree.insert(leaf.clone()).unwrap();
+        }
+        let post_request = shadow_relink(
+            &subject,
+            &identity,
+            wallet,
+            "rehearsal-post-promotion",
+        );
+        let proof = tree
+            .proof(&post_request.account_id, &post_request.request_id)
+            .unwrap();
+        let journal_started = std::time::Instant::now();
+        let (terminal, post_record, post_leaf) = commit_journal_through_parent_callback(
+            Arc::clone(&state),
+            post_request.clone(),
+            proof,
+        )
+        .await;
+        let journal_elapsed = journal_started.elapsed();
+        let RuntimeResponse::Execute { result: post_result } = terminal else {
+            panic!("post-promotion journal commit failed");
+        };
+        tree.insert(post_leaf).unwrap();
+        report_rehearsal_memory("journal_commit");
+
+        let mut journal_records = records;
+        journal_records.push(post_record);
+        let rollback_started = std::time::Instant::now();
+        let rollback = runtime_response(
+            Arc::clone(&state),
+            RuntimeRequest::SealV70RollbackCheckpoint {
+                migration: migration.clone(),
+                journal_records,
+            },
+        )
+        .await;
+        let rollback_elapsed = rollback_started.elapsed();
+        let RuntimeResponse::CheckpointSealed { checkpoint } = rollback else {
+            panic!("exact-head v70 rollback seal failed");
+        };
+        report_rehearsal_memory("rollback_sealed");
+        let rollback_bytes = serde_cbor::to_vec(&checkpoint).unwrap().len();
+        let expected_sequence = sequence + 1;
+        let expected_state_hash = checkpoint.artifact.state_hash.clone();
+        let expected_portfolio = {
+            let committed = state.lock().await;
+            let runtime = committed.v71_runtime.as_ref().unwrap();
+            assert_eq!(runtime.sequence(), expected_sequence);
+            runtime.portfolio(&identity).unwrap()
+        };
+        let mut restored = {
+            let committed = state.lock().await;
+            DirectRuntime::new(
+                committed.epoch.clone(),
+                committed.mode,
+                committed.receipt_key.clone(),
+            )
+            .unwrap()
+            .restore_checkpoint(&checkpoint, &committed.state_key)
+            .unwrap()
+        };
+        assert_eq!(restored.committed_sequence(), expected_sequence);
+        assert_eq!(restored.committed_state_hash(), expected_state_hash);
+        assert_eq!(restored.portfolio(&identity).unwrap(), expected_portfolio);
+        assert_eq!(restored.execute(post_request).unwrap(), post_result);
+        report_rehearsal_memory("rollback_restored");
+
+        framed_latencies.sort_unstable();
+        let framed_p50 = framed_latencies[(framed_latencies.len() - 1) / 2];
+        let framed_p99 = framed_latencies[framed_latencies.len() - 1];
+        eprintln!(
+            "V71_FULL_PROMOTION_REHEARSAL history={} pending_commits={} framed_commits={} shadow_active_ms={} pending_gate_wait_ms={} pending_burst_ms={} framed_p50_ms={} framed_p99_ms={} largest_v70_artifact_bytes={} export_ms={} checkpoint_verify_ms={} promotion_ms={} journal_commit_ms={} rollback_seal_ms={} rollback_checkpoint_bytes={} final_sequence={} writer_epoch={}",
+            history,
+            pending_commits,
+            framed_commits,
+            shadow_active_elapsed.as_millis(),
+            pending_gate_wait.as_millis(),
+            pending_burst.as_millis(),
+            framed_p50.as_millis(),
+            framed_p99.as_millis(),
+            largest_v70_artifact,
+            export_elapsed.as_millis(),
+            verification_elapsed.as_millis(),
+            promotion_elapsed.as_millis(),
+            journal_elapsed.as_millis(),
+            rollback_elapsed.as_millis(),
+            rollback_bytes,
+            expected_sequence,
+            writer_epoch,
+        );
     }
 
     #[tokio::test]

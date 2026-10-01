@@ -26,6 +26,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine,
 };
+use bytes::Bytes;
 use chacha20poly1305::{
     aead::{Aead, KeyInit},
     ChaCha20Poly1305, Key, Nonce,
@@ -79,7 +80,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex as StdMutex,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -194,8 +195,9 @@ enum PersistenceFormat {
     V70,
     V71,
     V71Hot,
-    /// v70 persistence over a sparse rollback archive that begins at the
-    /// governed grant's exact committed frontier. Never selected implicitly.
+    /// v70 persistence over a sparse exact-head rollback archive whose
+    /// checkpoint contains the governed grant's signed frontier. Never
+    /// selected implicitly.
     V70RollbackBaseline,
 }
 
@@ -230,6 +232,10 @@ impl AppState {
 struct ParentHealth {
     restored: AtomicBool,
     last_response_at: AtomicU64,
+    /// Once the immutable v71 cutover marker exists, an unconfirmed enclave
+    /// promotion is process-fatal. The financial gate remains held and health
+    /// stays failed until the ASG replaces this parent and restores the marker.
+    cutover_uncertain: AtomicBool,
 }
 const HEALTH_FRESHNESS_SECONDS: u64 = 45;
 
@@ -237,6 +243,7 @@ impl ParentHealth {
     fn observe(&self, now: u64) { self.last_response_at.store(now, Ordering::Release); }
     fn check(&self, now: u64, last_commit: u64, stalled_waiter: bool, grant_expired: bool) -> Result<(), &'static str> {
         if !self.restored.load(Ordering::Acquire) { return Err("DIRECT_STATE_RECOVERY_REQUIRED"); }
+        if self.cutover_uncertain.load(Ordering::Acquire) { return Err("V71_CUTOVER_CONFIRMATION_UNCERTAIN"); }
         if grant_expired { return Err("WRITER_AUTHORIZATION_EXPIRED"); }
         let commit_recent = last_commit != 0 && now.checked_sub(last_commit).is_some_and(|age| age < WRITE_PATH_STALL_THRESHOLD.as_secs());
         if stalled_waiter && !commit_recent { return Err("WRITE_PATH_STALLED"); }
@@ -245,6 +252,47 @@ impl ParentHealth {
             return Err("ENCLOSURE_UNAVAILABLE");
         }
         Ok(())
+    }
+}
+
+/// A marker is the durable format decision point. After it exists, dropping
+/// the gate on an ambiguous or rejected promotion could acknowledge newer v70
+/// commits that a marker-selected v71 restart cannot contain. Intentionally
+/// retain this one owned guard for the remaining process lifetime and fail the
+/// health check so replacement restores the exact staged v71 head.
+fn fail_closed_after_v71_marker(
+    health: &ParentHealth,
+    guard: tokio::sync::OwnedMutexGuard<()>,
+    reason: &'static str,
+) -> String {
+    health.cutover_uncertain.store(true, Ordering::Release);
+    eprintln!("V71_CUTOVER_CONFIRMATION_UNCERTAIN reason={reason}");
+    std::mem::forget(guard);
+    reason.into()
+}
+
+/// The marker PUT is itself an irreversible, potentially ambiguous format
+/// decision. A timeout or failed readback can still mean the immutable object
+/// became durable, so retain the gate and fail health exactly as for an
+/// unconfirmed promotion.
+async fn persist_v71_cutover_marker_or_fail_closed<F>(
+    health: &ParentHealth,
+    guard: tokio::sync::OwnedMutexGuard<()>,
+    persist: F,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, String>
+where
+    F: std::future::Future<Output = Result<(), String>>,
+{
+    match persist.await {
+        Ok(()) => Ok(guard),
+        Err(error) => {
+            eprintln!("V71_CUTOVER_MARKER_UNCONFIRMED error={error}");
+            Err(fail_closed_after_v71_marker(
+                health,
+                guard,
+                "V71_CUTOVER_MARKER_UNCONFIRMED",
+            ))
+        }
     }
 }
 
@@ -421,7 +469,7 @@ impl V71CutoverMarker {
     }
 }
 
-const CHECKPOINT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const CHECKPOINT_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const CHECKPOINT_OVERSIZED: &str = "checkpoint frame oversized";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CheckpointRefreshOutcome {
@@ -456,7 +504,7 @@ impl CheckpointRefresh {
             CheckpointRefreshOutcome::Persisted => self.requested,
             CheckpointRefreshOutcome::Failed => true,
             // Retrying cannot shrink an oversized checkpoint. Return to idle;
-            // a later commit may request one more interval-spaced attempt.
+            // later commits remain disabled until restart or upgrade.
             CheckpointRefreshOutcome::Skipped => {
                 self.requested = false;
                 self.disabled = true;
@@ -479,7 +527,8 @@ fn checkpoint_seal_reason(error: &str) -> &'static str {
         _ => "archive_read_or_write",
     }
 }
-/// Background checkpoint refresh. Exits when idle; never gates a commit.
+/// Background checkpoint refresh. Exits when idle. Its seal closure takes the
+/// financial gate so full-state checkpoint and commit buffers never overlap.
 async fn refresh_checkpoints<F, Fut>(gate: &Mutex<CheckpointRefresh>, mut seal: F)
 where
     F: FnMut() -> Fut,
@@ -503,6 +552,27 @@ where
         };
         if !gate.lock().await.finish(outcome) { break; }
     }
+}
+
+/// Runs only the exact-head snapshot phase while commits are excluded. The
+/// caller owns any immutable persistence after this returns, so a slow S3 PUT
+/// cannot extend the financial-gate hold.
+async fn checkpoint_snapshot_under_gate<T, F, Fut>(
+    gate: &FinancialGate,
+    snapshot: F,
+) -> (Result<T, String>, Duration, Duration)
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, String>>,
+{
+    let wait_started = Instant::now();
+    let guard = gate.lock("checkpoint_snapshot").await;
+    let wait = wait_started.elapsed();
+    let hold_started = Instant::now();
+    let result = snapshot().await;
+    let hold = hold_started.elapsed();
+    drop(guard);
+    (result, wait, hold)
 }
 
 /// Direct, synchronous adapter for the existing Base pool-ledger Privy
@@ -2106,15 +2176,66 @@ fn journal_fence_prefix(prefix: &str, writer_epoch: &str) -> String {
     )
 }
 
-/// v71 records occupy the v70 head slot so both formats contend for one
-/// create-only key per sequence.
+fn journal_record_prefix(prefix: &str) -> String {
+    format!("{prefix}/journal-v71/records/")
+}
+
+/// v71 records use a format-specific immutable namespace. During shadow
+/// construction v70 has already committed its own full-state head at the same
+/// sequence; sharing that slot would make every staged append conflict.
 #[cfg_attr(not(test), allow(dead_code))]
 fn journal_record_key(prefix: &str, sequence: u64) -> String {
-    archive_head_key(prefix, sequence)
+    format!("{}{sequence:020}.cbor", journal_record_prefix(prefix))
 }
 
 fn journal_cutover_marker_key(prefix: &str) -> String {
     format!("{prefix}/journal-v71/cutover.cbor")
+}
+
+fn validate_v70_tip_at_cutover(
+    prefix: &str,
+    marker_sequence: u64,
+    head_keys: &[String],
+) -> Result<(), String> {
+    let head_prefix = format!("{prefix}/heads/");
+    let mut latest = None;
+    for key in head_keys {
+        let sequence = archive_key_sequence(key, &head_prefix, false)
+            .map_err(|_| "V71_CUTOVER_V70_HEAD_INVALID")?;
+        latest = Some(latest.map_or(sequence, |current: u64| current.max(sequence)));
+    }
+    if latest != Some(marker_sequence) {
+        return Err("V71_CUTOVER_V70_TIP_MISMATCH".into());
+    }
+    Ok(())
+}
+
+/// The cutover marker anchors the immutable record that was current when v70
+/// stopped advancing. A later checkpoint or tail is expected after the first
+/// post-cutover commit, so the marker is an ancestor of the restored head and
+/// must not be compared with that head directly.
+fn validate_v71_cutover_marker_ancestor(
+    marker: &V71CutoverMarker,
+    record: &DirectJournalRecord,
+    restored_head_sequence: u64,
+) -> Result<(), String> {
+    if marker.sequence > restored_head_sequence {
+        return Err("V71_CUTOVER_MARKER_AFTER_HEAD".into());
+    }
+    let record_hash = record
+        .record_hash()
+        .map_err(|_| "V71_CUTOVER_ANCESTOR_HASH_INVALID")?;
+    if marker.epoch_id != record.epoch_id
+        || marker.writer_epoch != record.writer_epoch
+        || marker.sequence != record.sequence
+        || marker.record_hash != record_hash
+        || marker.transition_root != record.transition_root
+        || marker.request_index_root != record.request_index_root
+        || marker.financial_state_root != record.financial_state_root
+    {
+        return Err("V71_CUTOVER_MARKER_ANCESTOR_MISMATCH".into());
+    }
+    Ok(())
 }
 
 /// Strict inverse of `journal_record_key`. Legacy `{seq}-{hash}` head names,
@@ -2122,7 +2243,7 @@ fn journal_cutover_marker_key(prefix: &str) -> String {
 /// never valid journal records.
 #[cfg_attr(not(test), allow(dead_code))]
 fn journal_record_key_sequence(key: &str, prefix: &str) -> Result<u64, String> {
-    let namespace = format!("{prefix}/heads/");
+    let namespace = journal_record_prefix(prefix);
     if key
         .strip_prefix(namespace.as_str())
         .is_some_and(|name| name.contains('-'))
@@ -2683,11 +2804,12 @@ fn validate_v70_rollback_checkpoint(
     Ok((key, head, frontier))
 }
 
-/// Sparse counterpart of `validate_checkpoint_archive` for an archive that
-/// begins at a governed rollback baseline. The exact committed frontier must
-/// accept the checkpoint, and every sequence from the baseline through the
-/// checkpoint must be backed by the listed artifact and head, which start at
-/// the baseline. Returns how many listed sequences the checkpoint covers.
+/// Sparse counterpart of `validate_checkpoint_archive` for an exact-head
+/// rollback package. The pre-issued rollback grant anchors an authenticated
+/// historical frontier contained in the checkpoint; the sparse archive starts
+/// at the later exact head materialized by the v71 writer. Returns the number
+/// of listed sequences covered through that checkpoint so any subsequent v70
+/// artifacts can be replayed normally.
 fn validate_sparse_checkpoint_archive(
     checkpoint: &layrs_direct_execution_v1::DirectCheckpoint,
     frontier: &layrs_direct_execution_v1::CommittedRestoreFrontier,
@@ -2705,22 +2827,23 @@ fn validate_sparse_checkpoint_archive(
     {
         return Err("sparse checkpoint outside governed baseline".into());
     }
-    let covered = usize::try_from(sequence - frontier.sequence + 1)
-        .map_err(|_| "checkpoint sequence overflow")?;
-    if covered > keys.len() {
-        return Err("checkpoint frontier outside immutable archive".into());
+    let listed_index = usize::try_from(
+        sequence
+            .checked_sub(heads[0].sequence)
+            .ok_or("checkpoint predates sparse rollback archive")?,
+    )
+    .map_err(|_| "checkpoint sequence overflow")?;
+    if listed_index >= keys.len() {
+        return Err("checkpoint beyond sparse rollback archive".into());
     }
-    for offset in 0..covered {
-        let expected = frontier.sequence + offset as u64;
-        let index = expected as usize - 1;
-        let hash = &checkpoint.artifact_hashes[index];
-        if checkpoint.receipt_records[index].sequence != expected
-            || keys[offset] != format!("{prefix}/artifacts/{expected:020}-{hash}.cbor")
-            || heads[offset].sequence != expected
-            || heads[offset].artifact_hash != *hash
-        {
-            return Err("checkpoint prefix differs from immutable archive".into());
-        }
+    let index = usize::try_from(sequence - 1).map_err(|_| "checkpoint sequence overflow")?;
+    let hash = &checkpoint.artifact_hashes[index];
+    if checkpoint.receipt_records[index].sequence != sequence
+        || keys[listed_index] != format!("{prefix}/artifacts/{sequence:020}-{hash}.cbor")
+        || heads[listed_index].sequence != sequence
+        || heads[listed_index].artifact_hash != *hash
+    {
+        return Err("checkpoint head differs from immutable archive".into());
     }
     if receipt_only_record(&checkpoint.artifact)
         != *checkpoint
@@ -2730,7 +2853,7 @@ fn validate_sparse_checkpoint_archive(
     {
         return Err("checkpoint terminal head mismatch".into());
     }
-    Ok(covered)
+    Ok(listed_index + 1)
 }
 
 /// The rollback-baseline mode is usable only with the governed grant's exact
@@ -2751,9 +2874,9 @@ impl S3ImmutableArtifactStore {
         let bytes = serde_cbor::to_vec(checkpoint).map_err(|_| "checkpoint encoding failed")?;
         Ok(format!("{}/checkpoints/{:020}-{}-{}.cbor", self.prefix, checkpoint.artifact.sequence, checkpoint.artifact.state_hash, sha256(&bytes)))
     }
-    async fn seal_current_checkpoint(&self, state: &AppState) -> Result<(), String> {
+    async fn build_current_checkpoint(&self, state: &AppState) -> Result<Option<layrs_direct_execution_v1::DirectCheckpoint>, String> {
         let records = self.load_committed().await?;
-        let Some(head) = records.last() else { return Ok(()); };
+        let Some(head) = records.last() else { return Ok(None); };
         let artifact_hashes = self.verified_artifact_hashes.lock().await.clone();
         let hash = artifact_hashes.last().ok_or("checkpoint archive hashes missing")?;
         let key = format!("{}/artifacts/{:020}-{hash}.cbor", self.prefix, head.sequence);
@@ -2767,9 +2890,13 @@ impl S3ImmutableArtifactStore {
             RuntimeResponse::Error { code } if code == CHECKPOINT_FRAME_OVERSIZED => return Err(CHECKPOINT_OVERSIZED.into()),
             _ => return Err("checkpoint seal rejected".into()),
         };
+        Ok(Some(checkpoint))
+    }
+    async fn persist_checkpoint(&self, checkpoint: layrs_direct_execution_v1::DirectCheckpoint) -> Result<(), String> {
+        let sequence = checkpoint.artifact.sequence;
         let key = self.checkpoint_key(&checkpoint)?;
         self.write_once(&key, serde_cbor::to_vec(&checkpoint).map_err(|_| "checkpoint encoding failed")?).await?;
-        eprintln!("VERIFIED_ARCHIVE_CHECKPOINT_PERSISTED {}", checkpoint.artifact.sequence);
+        eprintln!("VERIFIED_ARCHIVE_CHECKPOINT_PERSISTED {sequence}");
         Ok(())
     }
     /// Captures one exact v71 head under the financial gate, then releases the
@@ -2880,7 +3007,7 @@ impl S3ImmutableArtifactStore {
     /// Before opening the listener, collapse a restored tail that has reached
     /// checkpoint cadence. One synchronous attempt prevents the next commit
     /// from crossing the restore bound. Failure remains non-fatal and starts
-    /// the existing 30-second background retry, so availability is preserved.
+    /// the existing five-minute background retry, so availability is preserved.
     async fn catch_up_restored_journal_checkpoint(&self, state: &AppState) {
         let sequence = match &*self.journal.lock().await {
             JournalWriterState::Eligible(head) => head.sequence,
@@ -2898,6 +3025,28 @@ impl S3ImmutableArtifactStore {
             self.schedule_journal_checkpoint(state).await;
         }
     }
+    #[cfg(test)]
+    async fn seal_current_checkpoint(&self, state: &AppState) -> Result<(), String> {
+        let Some(checkpoint) = self.build_current_checkpoint(state).await? else { return Ok(()); };
+        self.persist_checkpoint(checkpoint).await
+    }
+    /// Hold the financial gate only while selecting/reading an exact immutable
+    /// head and obtaining its enclave seal. The content-addressed checkpoint
+    /// remains valid if commits advance while its S3 write completes.
+    async fn seal_current_checkpoint_serialized(&self, state: &AppState) -> Result<(), String> {
+        let (checkpoint, wait, hold) = checkpoint_snapshot_under_gate(&state.financial_gate, || {
+            self.build_current_checkpoint(state)
+        }).await;
+        let checkpoint = checkpoint?;
+        let sequence = checkpoint.as_ref().map(|value| value.artifact.sequence).unwrap_or_default();
+        eprintln!(
+            "VERIFIED_ARCHIVE_CHECKPOINT_GATE_RELEASED sequence={sequence} wait_ms={} hold_ms={}",
+            wait.as_millis(),
+            hold.as_millis()
+        );
+        let Some(checkpoint) = checkpoint else { return Ok(()); };
+        self.persist_checkpoint(checkpoint).await
+    }
     /// Runs only after the final encrypted head is verified and adopted. The
     /// immutable archive stays authoritative and the prior checkpoint stays in
     /// place, so a failed seal is diagnosed but never fails the restore.
@@ -2908,7 +3057,7 @@ impl S3ImmutableArtifactStore {
             tokio::spawn(async move {
                 let (store, state) = (&store, &state);
                 refresh_checkpoints(&store.checkpoint_refresh_gate, move || {
-                    store.seal_current_checkpoint(state)
+                    store.seal_current_checkpoint_serialized(state)
                 })
                 .await;
             });
@@ -2978,7 +3127,7 @@ impl S3ImmutableArtifactStore {
     fn key_release_key(&self, activation_id: &str) -> String {
         format!("{}/authorization/{}.cbor", self.prefix, activation_id)
     }
-    async fn read(&self, key: &str) -> Result<Vec<u8>, String> {
+    async fn read(&self, key: &str) -> Result<Bytes, String> {
         // SDK request retries do not retry a response stream after headers.
         // Discard an incomplete body and GET the same immutable key again;
         // no partial bytes ever reach the encrypted successor verifier.
@@ -2991,7 +3140,7 @@ impl S3ImmutableArtifactStore {
                     .ok_or("archive read size invalid")?;
                 let bytes=response.body.collect().await.map_err(|_|"archive read body failed")?.into_bytes();
                 if bytes.len()!=length as usize {return Err("archive read body length mismatch");}
-                Ok(bytes.to_vec())
+                Ok(bytes)
             }).await;
             match result {
                 Ok(Ok(bytes)) => return Ok(bytes),
@@ -3032,7 +3181,7 @@ impl S3ImmutableArtifactStore {
         eprintln!("FINANCIAL_AWAIT_END stage=archive_put");
         let restored = self.read(key).await?;
         if put.is_err() && restored != bytes {
-            return Err(if key.contains("/heads/") {
+            return Err(if key.contains("/heads/") || key.contains("/journal-v71/records/") {
                 "ARCHIVE_SEQUENCE_CONFLICT"
             } else {
                 "archive immutable write failed"
@@ -3232,43 +3381,37 @@ impl S3ImmutableArtifactStore {
         let Some(marker) = self.load_v71_cutover_marker().await? else {
             return Ok(false);
         };
+        // The marker and the legacy archive must describe the same last v70
+        // acknowledgement. A newer v70 tip means a previous parent released
+        // the gate after an unconfirmed cutover and startup must fail closed
+        // instead of silently selecting the older journal marker.
+        let v70_heads = self.list_restore_keys("heads").await?;
+        validate_v70_tip_at_cutover(&self.prefix, marker.sequence, &v70_heads)?;
         if !self.prepare_journal_restore().await? {
             return Err("V71_CUTOVER_MARKER_WITHOUT_JOURNAL".into());
         }
-        let prepared = self.prepared_journal_restore.lock().await;
-        let prepared = prepared
-            .as_ref()
-            .ok_or("V71_CUTOVER_JOURNAL_UNPREPARED")?;
-        let (writer_epoch, sequence, record_hash, transition_root, request_index_root, financial_state_root) =
-            match prepared.tail.last() {
-                Some(record) => (
-                    record.writer_epoch.as_str(),
-                    record.sequence,
-                    record
-                        .record_hash()
-                        .map_err(|_| "V71_CUTOVER_TAIL_HASH_INVALID")?,
-                    record.transition_root.as_str(),
-                    record.request_index_root.as_str(),
-                    record.financial_state_root.as_str(),
-                ),
-                None => (
-                    prepared.checkpoint.writer_epoch.as_str(),
-                    prepared.checkpoint.sequence,
-                    prepared.checkpoint.record_hash.clone(),
-                    prepared.checkpoint.transition_root.as_str(),
-                    prepared.checkpoint.request_index_root.as_str(),
-                    prepared.checkpoint.financial_state_root.as_str(),
-                ),
-            };
-        if marker.writer_epoch != writer_epoch
-            || marker.sequence != sequence
-            || marker.record_hash != record_hash
-            || marker.transition_root != transition_root
-            || marker.request_index_root != request_index_root
-            || marker.financial_state_root != financial_state_root
-        {
-            return Err("V71_CUTOVER_MARKER_HEAD_MISMATCH".into());
+        let restored_head_sequence = {
+            let prepared = self.prepared_journal_restore.lock().await;
+            let prepared = prepared
+                .as_ref()
+                .ok_or("V71_CUTOVER_JOURNAL_UNPREPARED")?;
+            prepared
+                .tail
+                .last()
+                .map_or(prepared.checkpoint.sequence, |record| record.sequence)
+        };
+        if marker.sequence > restored_head_sequence {
+            return Err("V71_CUTOVER_MARKER_AFTER_HEAD".into());
         }
+        let cutover_record = self
+            .load_journal_record(marker.sequence)
+            .await
+            .map_err(|error| format!("V71_CUTOVER_ANCESTOR_LOAD_FAILED: {error}"))?;
+        validate_v71_cutover_marker_ancestor(
+            &marker,
+            &cutover_record,
+            restored_head_sequence,
+        )?;
         Ok(true)
     }
     /// Create-only, content-addressed persistence of an enclave-sealed v70
@@ -3320,7 +3463,7 @@ impl S3ImmutableArtifactStore {
         }
         let bundle: V70MigrationBundle = serde_cbor::from_slice(&bytes)
             .map_err(|_| "journal migration bundle decode failed")?;
-        if serde_cbor::to_vec(&bundle).ok().as_deref() != Some(bytes.as_slice())
+        if serde_cbor::to_vec(&bundle).ok().as_deref() != Some(bytes.as_ref())
             || bundle.manifest.protocol != V70_MIGRATION_MANIFEST_PROTOCOL
             || bundle.manifest.epoch_id != EPOCH_ID
             || bundle.manifest.source_sequence != source_sequence
@@ -3343,7 +3486,7 @@ impl S3ImmutableArtifactStore {
         }
         let record: DirectJournalRecord = serde_cbor::from_slice(&bytes)
             .map_err(|_| "journal replay record decode failed")?;
-        if serde_cbor::to_vec(&record).ok().as_deref() != Some(bytes.as_slice())
+        if serde_cbor::to_vec(&record).ok().as_deref() != Some(bytes.as_ref())
             || record.protocol != DIRECT_JOURNAL_PROTOCOL
             || record.epoch_id != EPOCH_ID
             || record.sequence != sequence
@@ -3406,7 +3549,7 @@ impl S3ImmutableArtifactStore {
         // A record past the head exceeds `count` and fails the listing.
         let keys = self
             .list_journal_keys(
-                &format!("{}/heads/", self.prefix),
+                &journal_record_prefix(&self.prefix),
                 Some(&journal_record_key(&self.prefix, source)),
                 count,
                 ARCHIVE_OPERATION_TIMEOUT,
@@ -3514,12 +3657,11 @@ impl S3ImmutableArtifactStore {
         Ok(checkpoint_key)
     }
     /// Explicit rollback-baseline restore listing. The archive must begin at
-    /// the exact governed committed frontier with one baseline artifact, head
-    /// pointer, and checkpoint, followed only by contiguous v70 successors
-    /// and their checkpoints. Anything below the baseline, a missing or
-    /// mismatched baseline object, a second baseline object, or a
-    /// noncanonical key fails closed. The normal `prepare_restore` is
-    /// unchanged and still rejects such an archive.
+    /// one exact-head artifact, pointer and checkpoint whose authenticated
+    /// history contains the pre-issued grant frontier, followed only by
+    /// contiguous v70 successors and their checkpoints. Missing, mismatched,
+    /// duplicate or noncanonical objects fail closed. The normal
+    /// `prepare_restore` is unchanged and still rejects such an archive.
     async fn prepare_sparse_rollback_restore(
         &self,
         frontier: &layrs_direct_execution_v1::CommittedRestoreFrontier,
@@ -3527,19 +3669,17 @@ impl S3ImmutableArtifactStore {
         if !frontier.valid() {
             return Err("governed checkpoint frontier invalid".into());
         }
-        let base = frontier.sequence;
         let candidates = self.list_restore_keys("artifacts").await?;
         let raw_heads = self.list_restore_keys("heads").await?;
         let checkpoint_keys = self.list_restore_keys("checkpoints").await?;
         let mut heads = Vec::with_capacity(raw_heads.len());
-        for (offset, key) in raw_heads.into_iter().enumerate() {
-            let sequence = base
-                .checked_add(offset as u64)
-                .ok_or("archive sequence overflow")?;
+        let head_prefix = format!("{}/heads/", self.prefix);
+        for key in raw_heads {
+            let sequence = archive_key_sequence(&key, &head_prefix, false)?;
             if key != archive_head_key(&self.prefix, sequence) {
                 return Err("sparse rollback head outside baseline lineage".into());
             }
-            let hash = String::from_utf8(self.read(&key).await?)
+            let hash = String::from_utf8(self.read(&key).await?.to_vec())
                 .map_err(|_| "archive sequence head hash invalid")?;
             if hash.len() != 64
                 || !hash
@@ -3554,13 +3694,19 @@ impl S3ImmutableArtifactStore {
                 artifact_hash: hash,
             });
         }
-        let last = heads
-            .last()
+        let base = heads
+            .first()
             .ok_or("sparse rollback baseline head missing")?
             .sequence;
-        if heads[0].artifact_hash != frontier.artifact_hash {
-            return Err("sparse rollback baseline differs from governed frontier".into());
+        if base < frontier.sequence
+            || heads
+                .iter()
+                .enumerate()
+                .any(|(offset, head)| head.sequence != base + offset as u64)
+        {
+            return Err("sparse rollback head outside baseline lineage".into());
         }
+        let last = heads.last().unwrap().sequence;
         let artifact_prefix = format!("{}/artifacts/", self.prefix);
         let mut available = HashSet::with_capacity(candidates.len());
         let mut at_base = 0;
@@ -3589,16 +3735,15 @@ impl S3ImmutableArtifactStore {
         let baseline_bytes = self.read(&keys[0]).await?;
         let baseline: DirectStateArtifact = serde_cbor::from_slice(&baseline_bytes)
             .map_err(|_| "sparse rollback baseline artifact decode failed")?;
-        if serde_cbor::to_vec(&baseline).ok().as_deref() != Some(baseline_bytes.as_slice())
+        if serde_cbor::to_vec(&baseline).ok().as_deref() != Some(baseline_bytes.as_ref())
             || baseline.epoch_id != EPOCH_ID
             || baseline.sequence != base
-            || baseline.state_hash != frontier.state_hash
-            || artifact_hash(&baseline) != frontier.artifact_hash
+            || artifact_hash(&baseline) != heads[0].artifact_hash
         {
             return Err("sparse rollback baseline artifact mismatch".into());
         }
         let checkpoint_namespace = format!("{}/checkpoints/", self.prefix);
-        let mut baseline_checkpoints = 0;
+        let mut baseline_checkpoints = Vec::new();
         for key in &checkpoint_keys {
             let (sequence, state_hash, _) =
                 journal_parent_snapshot_key_parts(key, &checkpoint_namespace)
@@ -3607,14 +3752,30 @@ impl S3ImmutableArtifactStore {
                 return Err("sparse rollback checkpoint outside baseline lineage".into());
             }
             if sequence == base {
-                if state_hash != frontier.state_hash {
+                if state_hash != baseline.state_hash {
                     return Err("sparse rollback checkpoint outside baseline lineage".into());
                 }
-                baseline_checkpoints += 1;
+                baseline_checkpoints.push(key);
             }
         }
-        if baseline_checkpoints != 1 {
+        if baseline_checkpoints.len() != 1 {
             return Err("sparse rollback baseline checkpoint missing or ambiguous".into());
+        }
+        let checkpoint: layrs_direct_execution_v1::DirectCheckpoint =
+            serde_cbor::from_slice(&self.read(baseline_checkpoints[0]).await?)
+                .map_err(|_| "checkpoint decode failed; genesis fallback forbidden")?;
+        if self.checkpoint_key(&checkpoint)? != *baseline_checkpoints[0] {
+            return Err("checkpoint content address mismatch".into());
+        }
+        if validate_sparse_checkpoint_archive(
+            &checkpoint,
+            frontier,
+            &keys,
+            &heads,
+            &self.prefix,
+        )? != 1
+        {
+            return Err("sparse rollback baseline checkpoint mismatch".into());
         }
         let prepared = PreparedArchiveRestore {
             keys,
@@ -3903,7 +4064,7 @@ impl S3ImmutableArtifactStore {
         }
         let checkpoint: DirectV71Checkpoint = serde_cbor::from_slice(&bytes)
             .map_err(|_| "journal checkpoint decode failed; older fallback forbidden")?;
-        if serde_cbor::to_vec(&checkpoint).ok().as_deref() != Some(bytes.as_slice())
+        if serde_cbor::to_vec(&checkpoint).ok().as_deref() != Some(bytes.as_ref())
             || checkpoint.protocol != DIRECT_V71_CHECKPOINT_PROTOCOL
             || checkpoint.epoch_id != EPOCH_ID
             || checkpoint.sequence != newest.sequence
@@ -3913,7 +4074,7 @@ impl S3ImmutableArtifactStore {
         Ok(Some((newest, checkpoint)))
     }
     /// Canonical record keys for exactly `after+1..=after+n`, `n` at most
-    /// `MAX_V71_RESTORE_TAIL_RECORDS`. Legacy `{seq}-{hash}` names above
+    /// `MAX_V71_RESTORE_TAIL_RECORDS`. Noncanonical `{seq}-{hash}` names above
     /// `after` sort after the start key, so they are always seen and rejected.
     #[cfg_attr(not(test), allow(dead_code))]
     async fn list_journal_tail(&self, after: u64) -> Result<Vec<(u64, String)>, String> {
@@ -3925,7 +4086,7 @@ impl S3ImmutableArtifactStore {
         after: u64,
         page_timeout: Duration,
     ) -> Result<Vec<(u64, String)>, String> {
-        let namespace = format!("{}/heads/", self.prefix);
+        let namespace = journal_record_prefix(&self.prefix);
         let start_after = journal_record_key(&self.prefix, after);
         let keys = self
             .list_journal_keys(
@@ -3940,7 +4101,7 @@ impl S3ImmutableArtifactStore {
     /// Reads the bounded tail after `checkpoint` in sequence order. Each body
     /// must decode canonically to a record at its key's sequence that links to
     /// its predecessor's record hash, transition root, and request-index root,
-    /// starting from the checkpoint. A v70 head body above the checkpoint fails decode.
+    /// starting from the checkpoint.
     #[cfg_attr(not(test), allow(dead_code))]
     async fn load_journal_tail(
         &self,
@@ -3960,7 +4121,7 @@ impl S3ImmutableArtifactStore {
             total_bytes = advance_journal_tail_bytes(total_bytes, bytes.len())?;
             let record: DirectJournalRecord = serde_cbor::from_slice(&bytes)
                 .map_err(|_| "journal tail record decode failed")?;
-            if serde_cbor::to_vec(&record).ok().as_deref() != Some(bytes.as_slice()) {
+            if serde_cbor::to_vec(&record).ok().as_deref() != Some(bytes.as_ref()) {
                 return Err("journal tail record noncanonical".into());
             }
             if record.protocol != DIRECT_JOURNAL_PROTOCOL || record.epoch_id != EPOCH_ID {
@@ -4014,7 +4175,7 @@ impl S3ImmutableArtifactStore {
         if sha256(&bytes) != content_hash {
             return Err("journal parent snapshot content address mismatch".into());
         }
-        Ok(bytes)
+        Ok(bytes.to_vec())
     }
     async fn prepare_journal_restore(&self) -> Result<bool, String> {
         let Some((_, checkpoint)) = self.load_newest_journal_checkpoint().await? else {
@@ -4265,11 +4426,11 @@ impl S3ImmutableArtifactStore {
     /// acknowledgement.  Any failure that is not an existing-object conflict
     /// falls back to the proven single-put path, so this can only be faster,
     /// never weaker.  Returns the bytes that were read back.
-    async fn write_once_large(&self, key: &str, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    async fn write_once_large(&self, key: &str, bytes: Vec<u8>) -> Result<Bytes, String> {
         const PART_BYTES: usize = 16 * 1024 * 1024;
         if bytes.len() <= PART_BYTES {
             self.write_once(key, bytes.clone()).await?;
-            return Ok(bytes);
+            return Ok(Bytes::from(bytes));
         }
         let until = DateTime::from_secs(
             SystemTime::now()
@@ -4390,7 +4551,7 @@ impl S3ImmutableArtifactStore {
             // in fact completed is detected as an identical existing object.
             eprintln!("ARCHIVE_MULTIPART_FALLBACK reason={}", error.replace('\n', " "));
             self.write_once(key, bytes.clone()).await?;
-            return Ok(bytes);
+            return Ok(Bytes::from(bytes));
         }
         eprintln!("FINANCIAL_AWAIT_BEGIN stage=archive_readback");
         let restored = self.read(key).await?;
@@ -4600,13 +4761,48 @@ impl S3ImmutableArtifactStore {
             checkpoint_keys,
         } = prepared;
         let (start, mut records, begin) = if let Some(key) = checkpoint_keys.last() {
-            let checkpoint: layrs_direct_execution_v1::DirectCheckpoint =
+            let verification_checkpoint: layrs_direct_execution_v1::DirectCheckpoint =
                 serde_cbor::from_slice(&self.read(key).await?)
                     .map_err(|_| "checkpoint decode failed; genesis fallback forbidden")?;
-            if self.checkpoint_key(&checkpoint)? != *key {
+            if self.checkpoint_key(&verification_checkpoint)? != *key {
                 return Err("checkpoint content address mismatch".into());
             }
-            let start = validate_checkpoint_archive(&checkpoint, &keys, &heads, &self.prefix)?;
+            let start = validate_checkpoint_archive(
+                &verification_checkpoint,
+                &keys,
+                &heads,
+                &self.prefix,
+            )?;
+            let expected_state_hash = verification_checkpoint.artifact.state_hash.clone();
+            match exchange(
+                state,
+                RuntimeRequest::VerifyCheckpoint {
+                    checkpoint: verification_checkpoint,
+                },
+            )
+            .await
+            .map_err(|_| "checkpoint non-writer verification transport failed")?
+            {
+                RuntimeResponse::CheckpointVerified {
+                    sequence,
+                    state_hash,
+                } if sequence == start as u64 && state_hash == expected_state_hash => {
+                    eprintln!("VERIFIED_CHECKPOINT_NON_WRITER_RESTORE {sequence}");
+                }
+                _ => return Err("checkpoint non-writer verification failed".into()),
+            }
+            // Re-read after the disposable verifier has dropped its restored
+            // runtime. This avoids retaining or cloning a checkpoint-sized
+            // frame while preserving exact content-address verification.
+            let checkpoint: layrs_direct_execution_v1::DirectCheckpoint =
+                serde_cbor::from_slice(&self.read(key).await?)
+                    .map_err(|_| "checkpoint decode failed after verification")?;
+            if self.checkpoint_key(&checkpoint)? != *key
+                || checkpoint.artifact.sequence != start as u64
+                || checkpoint.artifact.state_hash != expected_state_hash
+            {
+                return Err("checkpoint changed after non-writer verification".into());
+            }
             let records = checkpoint.receipt_records.clone();
             let begin = exchange(state, RuntimeRequest::BeginCheckpointRestore { checkpoint })
                 .await
@@ -5186,7 +5382,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.health.observe(now_unix());
     start_health_observer(state.clone());
     start_base_withdrawal_observer(state.clone());
-    start_v70_rollback_materializer(state.clone());
+    start_v70_rollback_handoff(state.clone());
     let port = env::var("PORT").unwrap_or_else(|_| "8443".into()).parse()?;
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -7318,6 +7514,9 @@ async fn verify_journal_checkpoint_non_writer(
     )
     .await
     .map_err(|_| "journal checkpoint verification transport failed")?;
+    if let RuntimeResponse::Error { code } = &response {
+        return Err(format!("journal checkpoint verification rejected: {code}"));
+    }
     if !journal_checkpoint_verification_matches(checkpoint, &response) {
         return Err("journal checkpoint verification mismatch".into());
     }
@@ -7684,10 +7883,13 @@ async fn stage_and_promote_v71_shadow(state: AppState, run_id: String) -> Result
         Some(ArchiveStore::S3(store)) => store,
         _ => return Err("V71_S3_ARCHIVE_REQUIRED".into()),
     };
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10 * 60);
+    // This is a safe pre-cutover timeout: expiry leaves v70 authoritative.
+    // Keep it aligned with the minimum operator hard-abort window so the
+    // runtime cannot retain an obsolete shorter rollout deadline.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(25 * 60);
     let shadow_source_sequence = loop {
         if tokio::time::Instant::now() >= deadline {
-            return Err("V71_SHADOW_PROMOTION_ABORT_10_MINUTES".into());
+            return Err("V71_SHADOW_PROMOTION_TIMEOUT".into());
         }
         match exchange(&state, RuntimeRequest::V71ShadowStatus).await {
             Ok(RuntimeResponse::V71ShadowStatus {
@@ -7815,8 +8017,13 @@ async fn stage_and_promote_v71_shadow(state: AppState, run_id: String) -> Result
         // only the exact committed journal head staged above; it contains no
         // command or pending-work payload. If the following transport is
         // ambiguous, restart deterministically restores this v71 frontier.
-        store.persist_v71_cutover_marker(&head).await?;
-        let promoted = exchange(
+        let guard = persist_v71_cutover_marker_or_fail_closed(
+            &state.health,
+            guard,
+            store.persist_v71_cutover_marker(&head),
+        )
+        .await?;
+        let promoted = match exchange(
             &state,
             RuntimeRequest::PromoteV71Shadow {
                 run_id: run_id.clone(),
@@ -7828,7 +8035,16 @@ async fn stage_and_promote_v71_shadow(state: AppState, run_id: String) -> Result
             },
         )
         .await
-        .map_err(|_| "V71_SHADOW_PROMOTION_TRANSPORT_FAILED")?;
+        {
+            Ok(promoted) => promoted,
+            Err(_) => {
+                return Err(fail_closed_after_v71_marker(
+                    &state.health,
+                    guard,
+                    "V71_SHADOW_PROMOTION_TRANSPORT_FAILED",
+                ));
+            }
+        };
         if !matches!(promoted, RuntimeResponse::V71ShadowPromoted {
             ref writer_epoch,
             sequence,
@@ -7843,8 +8059,11 @@ async fn stage_and_promote_v71_shadow(state: AppState, run_id: String) -> Result
             && request_index_root == &head.request_index_root
             && financial_state_root == &head.financial_state_root)
         {
-            drop(guard);
-            return Err("V71_SHADOW_PROMOTION_MISMATCH".into());
+            return Err(fail_closed_after_v71_marker(
+                &state.health,
+                guard,
+                "V71_SHADOW_PROMOTION_MISMATCH",
+            ));
         }
         *state.journal_request_index.lock().await = Some(index);
         *state.journal_receipts.lock().await = Some(receipts);
@@ -7865,17 +8084,18 @@ async fn stage_and_promote_v71_shadow(state: AppState, run_id: String) -> Result
 }
 
 /// Materializes the exact v70 rollback package for the restored v71 head
-/// under the explicitly supplied fresh prefix. The authoritative archive is
-/// only read. `seal` performs the enclave exchange; production passes
+/// under the explicitly supplied fresh prefix while retaining the financial
+/// gate. The caller must keep the returned guard alive until the v70 writer
+/// handoff is complete: no later command can then be acknowledged outside the
+/// package. The authoritative archive is only read. `seal` performs the
+/// enclave exchange; production passes
 /// `|request| exchange_with_timeout(state, request, CHECKPOINT_EXCHANGE_TIMEOUT)`.
-/// Operators must pause dispatch first: commits after the captured head are
-/// not in the package, and a commit before the seal fails it closed.
 #[cfg_attr(not(test), allow(dead_code))]
-async fn materialize_v70_rollback<F, Fut>(
+async fn prepare_v70_rollback_handoff<F, Fut>(
     state: &AppState,
     fresh_prefix: &str,
     seal: F,
-) -> Result<V70RollbackPackage, String>
+) -> Result<(V70RollbackPackage, OwnedMutexGuard<()>), String>
 where
     F: FnOnce(RuntimeRequest) -> Fut,
     Fut: Future<Output = io::Result<RuntimeResponse>>,
@@ -7888,6 +8108,14 @@ where
         _ => return Err("v70 rollback requires the authoritative S3 archive".into()),
     };
     validate_v70_rollback_prefix(&store.prefix, fresh_prefix)?;
+    // This is an explicit rollback handoff, not a background checkpoint. Keep
+    // the gate through archive collection, enclave sealing, validation, and
+    // durable publication. Returning the guard lets the operator path keep
+    // dispatch fenced until the retained-v70 ASG has taken over.
+    let guard = state.financial_gate.lock("v70_rollback_handoff").await;
+    if !state.unresolved_external_effects.lock().await.is_empty() {
+        return Err("v70 rollback external effect pending".into());
+    }
     let head = match &*store.journal.lock().await {
         JournalWriterState::Eligible(head) => head.clone(),
         JournalWriterState::Unrestored | JournalWriterState::Latched(_) => {
@@ -7911,43 +8139,37 @@ where
         .await
         .map_err(|_| "v70 rollback prefix not fresh")?;
     let (migration, journal_records) = store.load_v70_rollback_inputs(&head, &restored).await?;
-    let (checkpoint, receipts) = {
-        let _guard = state.financial_gate.lock("v70_rollback_capture").await;
-        if !state.unresolved_external_effects.lock().await.is_empty() {
-            return Err("v70 rollback external effect pending".into());
+    if !matches!(&*store.journal.lock().await, JournalWriterState::Eligible(current) if *current == head)
+    {
+        return Err("v70 rollback head advanced".into());
+    }
+    let receipts = ordered_journal_receipts(
+        state
+            .journal_receipts
+            .lock()
+            .await
+            .as_ref()
+            .ok_or("v70 rollback receipts unavailable")?,
+    )?;
+    let response = seal(RuntimeRequest::SealV70RollbackCheckpoint {
+        migration,
+        journal_records,
+    })
+    .await
+    .map_err(|error| {
+        if frame_oversized(&error) {
+            "v70 rollback frame oversized"
+        } else {
+            "v70 rollback seal transport failed"
         }
-        if !matches!(&*store.journal.lock().await, JournalWriterState::Eligible(current) if *current == head)
-        {
-            return Err("v70 rollback head advanced".into());
+    })?;
+    let checkpoint = match response {
+        RuntimeResponse::CheckpointSealed { checkpoint } => checkpoint,
+        RuntimeResponse::Error { code } if code == CHECKPOINT_FRAME_OVERSIZED => {
+            return Err("v70 rollback frame oversized".into())
         }
-        let receipts = ordered_journal_receipts(
-            state
-                .journal_receipts
-                .lock()
-                .await
-                .as_ref()
-                .ok_or("v70 rollback receipts unavailable")?,
-        )?;
-        let response = seal(RuntimeRequest::SealV70RollbackCheckpoint {
-            migration,
-            journal_records,
-        })
-        .await
-        .map_err(|error| {
-            if frame_oversized(&error) {
-                "v70 rollback frame oversized"
-            } else {
-                "v70 rollback seal transport failed"
-            }
-        })?;
-        match response {
-            RuntimeResponse::CheckpointSealed { checkpoint } => (checkpoint, receipts),
-            RuntimeResponse::Error { code } if code == CHECKPOINT_FRAME_OVERSIZED => {
-                return Err("v70 rollback frame oversized".into())
-            }
-            RuntimeResponse::Error { .. } => return Err("v70 rollback seal rejected".into()),
-            _ => return Err("v70 rollback seal unexpected response".into()),
-        }
+        RuntimeResponse::Error { .. } => return Err("v70 rollback seal rejected".into()),
+        _ => return Err("v70 rollback seal unexpected response".into()),
     };
     let (key, pointer, frontier) =
         validate_v70_rollback_checkpoint(&checkpoint, head.sequence, &receipts, fresh_prefix)?;
@@ -7965,33 +8187,55 @@ where
         "V70_ROLLBACK_PACKAGE_MATERIALIZED sequence={} state_hash={} artifact_hash={}",
         package.sequence, package.state_hash, package.artifact_hash
     );
+    Ok((package, guard))
+}
+
+/// Test/helper wrapper that intentionally releases the handoff fence after a
+/// package is complete. Production uses `start_v70_rollback_handoff` below and
+/// retains it until process replacement.
+#[cfg_attr(not(test), allow(dead_code))]
+async fn materialize_v70_rollback<F, Fut>(
+    state: &AppState,
+    fresh_prefix: &str,
+    seal: F,
+) -> Result<V70RollbackPackage, String>
+where
+    F: FnOnce(RuntimeRequest) -> Fut,
+    Fut: Future<Output = io::Result<RuntimeResponse>>,
+{
+    let (package, guard) = prepare_v70_rollback_handoff(state, fresh_prefix, seal).await?;
+    drop(guard);
     Ok(package)
 }
 
-/// Explicit opt-in operator hook for producing the retained-v70 package. It
-/// waits for a hot promotion to become authoritative, then captures committed
-/// state only. It never stores or replays a pending command.
-fn start_v70_rollback_materializer(state: AppState) {
+/// Explicit local operator hook for the retained-v70 handoff. Merely setting
+/// the prefix has no effect on live traffic. SIGUSR2 begins the one-shot
+/// capture, and a successful capture intentionally keeps the financial gate
+/// until this process is replaced by the rehearsed v70 ASG change. It never
+/// stores or replays a pending command.
+fn start_v70_rollback_handoff(state: AppState) {
     let Ok(prefix) = env::var("LAYRS_DIRECT_V70_ROLLBACK_PREFIX") else {
         return;
     };
     tokio::spawn(async move {
-        let started = tokio::time::Instant::now();
-        let mut soft_abort_logged = false;
-        while state.effective_persistence_format() != PersistenceFormat::V71 {
-            let elapsed = started.elapsed();
-            if !soft_abort_logged && elapsed >= Duration::from_secs(5 * 60) {
-                eprintln!("V70_ROLLBACK_MATERIALIZER_SOFT_ABORT elapsed_seconds=300");
-                soft_abort_logged = true;
-            }
-            if elapsed >= Duration::from_secs(10 * 60) {
-                eprintln!("V70_ROLLBACK_MATERIALIZER_ABORTED reason=V71_NOT_AUTHORITATIVE");
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+        let Ok(mut signal) = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::user_defined2(),
+        ) else {
+            eprintln!("V70_ROLLBACK_HANDOFF_UNAVAILABLE reason=SIGNAL_REGISTRATION_FAILED");
+            return;
+        };
+        eprintln!("V70_ROLLBACK_HANDOFF_ARMED signal=SIGUSR2");
+        if signal.recv().await.is_none() {
+            eprintln!("V70_ROLLBACK_HANDOFF_ABORTED reason=SIGNAL_STREAM_CLOSED");
+            return;
         }
+        if state.effective_persistence_format() != PersistenceFormat::V71 {
+            eprintln!("V70_ROLLBACK_HANDOFF_ABORTED reason=V71_NOT_AUTHORITATIVE");
+            return;
+        }
+        eprintln!("V70_ROLLBACK_HANDOFF_STARTED");
         let seal_state = state.clone();
-        match materialize_v70_rollback(&state, &prefix, move |request| {
+        match prepare_v70_rollback_handoff(&state, &prefix, move |request| {
             let seal_state = seal_state.clone();
             async move {
                 exchange_with_timeout(&seal_state, request, CHECKPOINT_EXCHANGE_TIMEOUT).await
@@ -7999,15 +8243,19 @@ fn start_v70_rollback_materializer(state: AppState) {
         })
         .await
         {
-            Ok(package) => eprintln!(
-                "V70_ROLLBACK_MATERIALIZER_COMPLETE prefix={} sequence={} state_hash={} artifact_hash={} checkpoint_key={}",
-                package.prefix,
-                package.sequence,
-                package.state_hash,
-                package.artifact_hash,
-                package.checkpoint_key
-            ),
-            Err(reason) => eprintln!("V70_ROLLBACK_MATERIALIZER_ABORTED reason={reason}"),
+            Ok((package, guard)) => {
+                eprintln!(
+                    "V70_ROLLBACK_HANDOFF_READY prefix={} sequence={} state_hash={} artifact_hash={} checkpoint_key={}",
+                    package.prefix,
+                    package.sequence,
+                    package.state_hash,
+                    package.artifact_hash,
+                    package.checkpoint_key
+                );
+                std::future::pending::<()>().await;
+                drop(guard);
+            }
+            Err(reason) => eprintln!("V70_ROLLBACK_HANDOFF_ABORTED reason={reason}"),
         }
     });
 }
@@ -9202,7 +9450,7 @@ async fn exchange_direct_v70(
                 let store = store.clone(); let state = state.clone();
                 tokio::spawn(async move {
                     let (store, state) = (&store, &state);
-                    refresh_checkpoints(&store.checkpoint_refresh_gate, move || store.seal_current_checkpoint(state)).await;
+                    refresh_checkpoints(&store.checkpoint_refresh_gate, move || store.seal_current_checkpoint_serialized(state)).await;
                 });
             }
         }
@@ -9687,7 +9935,119 @@ mod tests {
     }
 
     #[test]
+    fn v71_hot_restore_requires_the_legacy_tip_to_equal_the_cutover_marker() {
+        let mut heads = (43_205..=43_207)
+            .map(|sequence| format!("epoch/heads/{sequence:020}.cbor"))
+            .collect::<Vec<_>>();
+        // Historical v70 content-addressed twins do not advance the tip.
+        heads.push(format!(
+            "epoch/heads/{:020}-{}.cbor",
+            43_207,
+            "a".repeat(64)
+        ));
+        assert_eq!(
+            super::validate_v70_tip_at_cutover("epoch", 43_207, &heads),
+            Ok(())
+        );
+        assert_eq!(
+            super::validate_v70_tip_at_cutover("epoch", 43_206, &heads),
+            Err("V71_CUTOVER_V70_TIP_MISMATCH".into())
+        );
+        assert_eq!(
+            super::validate_v70_tip_at_cutover("epoch", 43_208, &heads),
+            Err("V71_CUTOVER_V70_TIP_MISMATCH".into())
+        );
+        let mut malformed = heads;
+        malformed.push("epoch/heads/not-a-head.cbor".into());
+        assert_eq!(
+            super::validate_v70_tip_at_cutover("epoch", 43_207, &malformed),
+            Err("V71_CUTOVER_V70_HEAD_INVALID".into())
+        );
+    }
+
+    #[test]
+    fn v71_hot_restore_accepts_the_cutover_record_as_an_ancestor_of_a_later_head() {
+        let (_, mut cutover_record) = v71_candidate();
+        cutover_record.sequence = 45_035;
+        let marker = super::V71CutoverMarker {
+            protocol: super::V71_CUTOVER_MARKER_PROTOCOL.into(),
+            epoch_id: cutover_record.epoch_id.clone(),
+            writer_epoch: cutover_record.writer_epoch.clone(),
+            sequence: cutover_record.sequence,
+            record_hash: cutover_record.record_hash().unwrap(),
+            transition_root: cutover_record.transition_root.clone(),
+            request_index_root: cutover_record.request_index_root.clone(),
+            financial_state_root: cutover_record.financial_state_root.clone(),
+        };
+        let checkpoint_sequence = 46_031;
+        let restored_head_sequence = 46_042;
+        assert!(marker.sequence < checkpoint_sequence);
+        assert!(checkpoint_sequence < restored_head_sequence);
+        assert_eq!(
+            super::validate_v71_cutover_marker_ancestor(
+                &marker,
+                &cutover_record,
+                restored_head_sequence,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn v71_hot_restore_rejects_nonancestor_cutover_markers_and_markers_after_head() {
+        let (_, mut cutover_record) = v71_candidate();
+        cutover_record.sequence = 45_035;
+        let marker = super::V71CutoverMarker {
+            protocol: super::V71_CUTOVER_MARKER_PROTOCOL.into(),
+            epoch_id: cutover_record.epoch_id.clone(),
+            writer_epoch: cutover_record.writer_epoch.clone(),
+            sequence: cutover_record.sequence,
+            record_hash: cutover_record.record_hash().unwrap(),
+            transition_root: cutover_record.transition_root.clone(),
+            request_index_root: cutover_record.request_index_root.clone(),
+            financial_state_root: cutover_record.financial_state_root.clone(),
+        };
+        assert_eq!(
+            super::validate_v71_cutover_marker_ancestor(&marker, &cutover_record, 45_034),
+            Err("V71_CUTOVER_MARKER_AFTER_HEAD".into())
+        );
+
+        let assert_mismatch = |changed: super::V71CutoverMarker| {
+            assert_eq!(
+                super::validate_v71_cutover_marker_ancestor(
+                    &changed,
+                    &cutover_record,
+                    46_042,
+                ),
+                Err("V71_CUTOVER_MARKER_ANCESTOR_MISMATCH".into())
+            );
+        };
+        let mut changed = marker.clone();
+        changed.epoch_id = "other-epoch".into();
+        assert_mismatch(changed);
+        let mut changed = marker.clone();
+        changed.writer_epoch = "other-writer".into();
+        assert_mismatch(changed);
+        let mut changed = marker.clone();
+        changed.sequence += 1;
+        assert_mismatch(changed);
+        let mut changed = marker.clone();
+        changed.record_hash = "0".repeat(64);
+        assert_mismatch(changed);
+        let mut changed = marker.clone();
+        changed.transition_root = "0".repeat(64);
+        assert_mismatch(changed);
+        let mut changed = marker.clone();
+        changed.request_index_root = "0".repeat(64);
+        assert_mismatch(changed);
+        let mut changed = marker;
+        changed.financial_state_root = "0".repeat(64);
+        assert_mismatch(changed);
+    }
+
+    #[test]
     fn checkpoint_refresh_coalesces_bursts_and_retries_without_new_commits() {
+        assert_eq!(super::CHECKPOINT_REFRESH_INTERVAL, std::time::Duration::from_secs(300));
         let mut refresh = super::CheckpointRefresh::default();
         let now = tokio::time::Instant::now();
         assert!(refresh.request());
@@ -9755,6 +10115,233 @@ mod tests {
             .1
             .receipt_id = first.receipt_id;
         assert!(ordered_journal_receipts(&duplicate_receipt).is_err());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_persistence_does_not_hold_the_financial_gate() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        let gate = Arc::new(super::FinancialGate::new());
+        let snapshot_started = Arc::new(Notify::new());
+        let persistence_started = Arc::new(Notify::new());
+        let checkpoint = {
+            let gate = Arc::clone(&gate);
+            let snapshot_started = Arc::clone(&snapshot_started);
+            let persistence_started = Arc::clone(&persistence_started);
+            tokio::spawn(async move {
+                let (result, _, hold) = super::checkpoint_snapshot_under_gate(&gate, || async {
+                    snapshot_started.notify_one();
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    Ok::<_, String>(())
+                }).await;
+                result.unwrap();
+                assert!(hold >= std::time::Duration::from_millis(45));
+                persistence_started.notify_one();
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            })
+        };
+        snapshot_started.notified().await;
+        persistence_started.notified().await;
+        let order_started = std::time::Instant::now();
+        let order_guard = gate.lock("checkpoint_concurrency_test_order").await;
+        let order_wait = order_started.elapsed();
+        drop(order_guard);
+        assert!(order_wait < std::time::Duration::from_millis(50), "order waited {order_wait:?} for ungated persistence");
+        assert!(!checkpoint.is_finished(), "checkpoint persistence must still be running");
+        checkpoint.await.unwrap();
+    }
+
+    /// Production-sized synthetic checkpoint/order benchmark. It uses the
+    /// sealed opening fixture and local temporary storage only: no production
+    /// artifact, grant, secret, network service or account is accessed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "isolated rehearsal benchmark; set LAYRS_GATE_BENCH_RECORDS"]
+    async fn v70_checkpoint_gate_and_order_latency_benchmark() {
+        use layrs_direct_execution_v1::{
+            DirectRuntime, DirectStateStore, InMemoryDirectStateStore, RuntimeMode, SealedEpoch,
+        };
+        use uuid::Uuid;
+
+        fn epoch_path() -> PathBuf {
+            std::env::var("LAYRS_BRIDGE_BENCH_EPOCH_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../../.codex-review-bundles/unified-direct-execution-20260905/new-epoch-20260911/OPENING_EPOCH_STATE_20260911.json"))
+        }
+        fn request_for(subject: &str, identity: &str, id: &str, wallet: &str) -> DirectRequest {
+            let action = DirectAction::BeginUsdcBusWithdrawal {
+                withdrawal_id: id.into(),
+                destination_chain: "arbitrum".into(),
+                asset: "USDC".into(),
+                destination: wallet.into(),
+                amount_atomic: "999999999999999".into(),
+            };
+            let mut request = DirectRequest {
+                account_id: subject.into(),
+                identity_commitment: identity.into(),
+                request_id: id.into(),
+                request_hash: String::new(),
+                financial_wallet_address: Some(wallet.into()),
+                action,
+            };
+            request.request_hash = request_hash(&request);
+            request
+        }
+
+        let target: u64 = std::env::var("LAYRS_GATE_BENCH_RECORDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(70_000);
+        assert!((3..=MAX_V70_LINEAGE_RECORDS as u64).contains(&target));
+
+        let mut live = DirectRuntime::new(
+            SealedEpoch::load(epoch_path()).unwrap(),
+            RuntimeMode::IsolatedTest,
+            vec![7; 32],
+        ).unwrap();
+        let mut store = InMemoryDirectStateStore::default();
+        let subject = "a".repeat(64);
+        let wallet = "0x1111111111111111111111111111111111111111".to_string();
+        let identity = identity_commitment_for(&subject, &wallet);
+        let mut admission = DirectRequest {
+            account_id: subject.clone(),
+            identity_commitment: identity.clone(),
+            request_id: "gate-benchmark-admission".into(),
+            request_hash: String::new(),
+            financial_wallet_address: None,
+            action: DirectAction::AdmitIdentity { wallet_address: wallet.clone() },
+        };
+        admission.request_hash = request_hash(&admission);
+        live.execute_committed(admission, &[8; 32], &mut store).unwrap();
+        let mut deposit = DirectRequest {
+            account_id: subject.clone(),
+            identity_commitment: identity.clone(),
+            request_id: "gate-benchmark-deposit".into(),
+            request_hash: String::new(),
+            financial_wallet_address: Some(wallet.clone()),
+            action: DirectAction::CreditHorizenUsdcDeposit {
+                amount_atomic: "10000000".into(),
+                custody_reference: format!("horizen-usdc-deposit:0x{}", "ab".repeat(32)),
+            },
+        };
+        deposit.request_hash = request_hash(&deposit);
+        live.execute_committed(deposit, &[8; 32], &mut store).unwrap();
+        let mut records = store.artifacts().unwrap();
+        records.sort_by_key(|artifact| artifact.sequence);
+        for artifact in &mut records { artifact.ciphertext.clear(); }
+        let mut synthetic_root = records.last().unwrap().state_hash.clone();
+        let mut last_request = None;
+        while live.committed_sequence() < target {
+            let sequence = live.committed_sequence() + 1;
+            let id = Uuid::from_u128(0x73737373222243338444000000000000 + sequence as u128).to_string();
+            let request = request_for(&subject, &identity, &id, &wallet);
+            let result = live.execute(request.clone()).unwrap();
+            assert_eq!(result.effect, "WITHDRAWAL_REJECTED");
+            let next_root = sha256(format!("v70-gate-benchmark:{sequence}").as_bytes());
+            records.push(DirectStateArtifact {
+                epoch_id: EPOCH_ID.into(),
+                sequence,
+                prior_state_hash: synthetic_root,
+                state_hash: next_root.clone(),
+                request_hash: request.request_hash.clone(),
+                nonce: Vec::new(),
+                ciphertext: Vec::new(),
+                ciphertext_hash: String::new(),
+                receipt: result.receipt,
+            });
+            synthetic_root = next_root;
+            last_request = Some(request);
+        }
+        let artifact = live.prepare_candidate(last_request.unwrap(), &[8; 32]).unwrap().artifact;
+        let predecessor = records.len() - 2;
+        records[predecessor].state_hash = artifact.prior_state_hash.clone();
+        let mut compact_head = artifact.clone();
+        compact_head.ciphertext.clear();
+        *records.last_mut().unwrap() = compact_head;
+        let mut artifact_hashes = vec!["a".repeat(64); records.len()];
+        *artifact_hashes.last_mut().unwrap() = artifact_hash(&artifact);
+        let head_path = std::env::temp_dir().join(format!("layrs-v70-gate-benchmark-head-{}.cbor", std::process::id()));
+        let artifact_bytes = {
+            let bytes = serde_cbor::to_vec(&artifact).unwrap();
+            let mut file = std::fs::File::create(&head_path).unwrap();
+            std::io::Write::write_all(&mut file, &bytes).unwrap();
+            file.sync_all().unwrap();
+            bytes.len()
+        };
+        drop(artifact);
+
+        let order_id = Uuid::from_u128(0x74747474222243338444000000000000 + target as u128).to_string();
+        let order_request = request_for(&subject, &identity, &order_id, &wallet);
+        let live = Arc::new(live);
+        let gate = Arc::new(FinancialGate::new());
+
+        let baseline_started = Instant::now();
+        let baseline_guard = gate.lock("gate_benchmark_baseline_order").await;
+        let baseline_runtime = Arc::clone(&live);
+        let baseline_request = order_request.clone();
+        tokio::task::spawn_blocking(move || baseline_runtime.prepare_candidate(baseline_request, &[8; 32]))
+            .await.unwrap().unwrap();
+        drop(baseline_guard);
+        let baseline_order = baseline_started.elapsed();
+
+        let snapshot_started = Arc::new(tokio::sync::Notify::new());
+        let checkpoint_task = {
+            let gate = Arc::clone(&gate);
+            let live = Arc::clone(&live);
+            let snapshot_started = Arc::clone(&snapshot_started);
+            tokio::spawn(async move {
+                let (checkpoint, wait, hold) = checkpoint_snapshot_under_gate(&gate, || async move {
+                    snapshot_started.notify_one();
+                    tokio::task::spawn_blocking(move || {
+                        let bytes = std::fs::read(&head_path).unwrap();
+                        std::fs::remove_file(&head_path).unwrap();
+                        let exact_head: DirectStateArtifact = serde_cbor::from_slice(&bytes).unwrap();
+                        live.seal_checkpoint(exact_head, records, artifact_hashes, &[8; 32])
+                    })
+                        .await.map_err(|_| "checkpoint benchmark task failed".to_string())?
+                        .map_err(|_| "checkpoint benchmark seal failed".to_string())
+                }).await;
+                let checkpoint = checkpoint.unwrap();
+                let persist_started = Instant::now();
+                let path = std::env::temp_dir().join(format!("layrs-v70-gate-benchmark-{}.cbor", std::process::id()));
+                let (checkpoint_bytes, path) = tokio::task::spawn_blocking(move || {
+                    let bytes = serde_cbor::to_vec(&checkpoint).unwrap();
+                    let mut file = std::fs::File::create(&path).unwrap();
+                    std::io::Write::write_all(&mut file, &bytes).unwrap();
+                    file.sync_all().unwrap();
+                    (bytes.len(), path)
+                }).await.unwrap();
+                let persist = persist_started.elapsed();
+                std::fs::remove_file(path).unwrap();
+                (wait, hold, persist, checkpoint_bytes)
+            })
+        };
+        snapshot_started.notified().await;
+        let concurrent_started = Instant::now();
+        let concurrent_guard = gate.lock("gate_benchmark_concurrent_order").await;
+        let concurrent_gate_wait = concurrent_started.elapsed();
+        let concurrent_service_started = Instant::now();
+        let concurrent_runtime = Arc::clone(&live);
+        tokio::task::spawn_blocking(move || concurrent_runtime.prepare_candidate(order_request, &[8; 32]))
+            .await.unwrap().unwrap();
+        drop(concurrent_guard);
+        let concurrent_service = concurrent_service_started.elapsed();
+        let concurrent_order = concurrent_started.elapsed();
+        let (checkpoint_wait, checkpoint_hold, checkpoint_persist, checkpoint_bytes) = checkpoint_task.await.unwrap();
+
+        eprintln!(
+            "BRIDGE_GATE_BENCH records={target} artifact_bytes={artifact_bytes} checkpoint_bytes={checkpoint_bytes} checkpoint_wait_ms={} checkpoint_hold_ms={} checkpoint_persist_ms={} baseline_order_ms={} concurrent_order_ms={} concurrent_gate_wait_ms={} concurrent_service_ms={} concurrent_delta_ms={}",
+            checkpoint_wait.as_millis(),
+            checkpoint_hold.as_millis(),
+            checkpoint_persist.as_millis(),
+            baseline_order.as_millis(),
+            concurrent_order.as_millis(),
+            concurrent_gate_wait.as_millis(),
+            concurrent_service.as_millis(),
+            concurrent_order.saturating_sub(baseline_order).as_millis(),
+        );
+        assert!(checkpoint_hold < Duration::from_secs(15));
+        assert!(checkpoint_persist > Duration::ZERO);
     }
 
     use super::*;
@@ -10334,6 +10921,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unconfirmed_promotion_after_marker_fails_health_and_keeps_gate_closed() {
+        let gate = FinancialGate::new();
+        let health = ParentHealth::default();
+        health.restored.store(true, Ordering::Release);
+        health.observe(100);
+        let guard = gate.lock("v71_cutover_test").await;
+        assert_eq!(
+            fail_closed_after_v71_marker(
+                &health,
+                guard,
+                "V71_SHADOW_PROMOTION_TRANSPORT_FAILED",
+            ),
+            "V71_SHADOW_PROMOTION_TRANSPORT_FAILED"
+        );
+        assert_eq!(
+            health.check(100, 100, false, false),
+            Err("V71_CUTOVER_CONFIRMATION_UNCERTAIN")
+        );
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50),
+            gate.lock("post_marker_v70_commit"),
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_marker_write_fails_health_and_keeps_gate_closed() {
+        let gate = FinancialGate::new();
+        let health = ParentHealth::default();
+        health.restored.store(true, Ordering::Release);
+        health.observe(100);
+        let guard = gate.lock("v71_marker_test").await;
+        let result = persist_v71_cutover_marker_or_fail_closed(
+            &health,
+            guard,
+            async { Err("ARCHIVE_TIMEOUT".into()) },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ref error) if error == "V71_CUTOVER_MARKER_UNCONFIRMED"
+        ));
+        assert_eq!(
+            health.check(100, 100, false, false),
+            Err("V71_CUTOVER_CONFIRMATION_UNCERTAIN")
+        );
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50),
+            gate.lock("post_marker_v70_commit"),
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
     async fn cancelled_gate_wait_does_not_leave_a_false_stall() {
         let gate = Arc::new(FinancialGate::new());
         let owner = gate.lock("owner").await;
@@ -10520,7 +11163,7 @@ mod tests {
         });
         let configuration=aws_sdk_s3::config::Builder::new().behavior_version_latest().region(aws_sdk_s3::config::Region::new("us-east-1")).credentials_provider(aws_sdk_s3::config::Credentials::new("unit-test","unit-test",None,None,"local-only")).endpoint_url(format!("http://{address}")).force_path_style(true).build();
         let store=S3ImmutableArtifactStore {client:S3Client::from_conf(configuration),bucket:"unit-test".into(),prefix:"epoch".into(),kms_key_id:"not-used".into(),retention_seconds:86400,verified_receipt_records:Arc::new(Mutex::new(None)),verified_artifact_hashes:Arc::new(Mutex::new(Vec::new())),prepared_restore:Arc::new(Mutex::new(None)),prepared_journal_restore:Arc::new(Mutex::new(None)),checkpoint_refresh_gate:Arc::new(Mutex::new(CheckpointRefresh::default())),journal:Arc::new(Mutex::new(JournalWriterState::Unrestored)),journal_role:JournalRole::Writer};
-        assert_eq!(store.read("epoch/immutable.cbor").await.unwrap(),b"complete-opaque-ciphertext");server.await.unwrap();
+        assert_eq!(store.read("epoch/immutable.cbor").await.unwrap().as_ref(),b"complete-opaque-ciphertext");server.await.unwrap();
     }
     #[tokio::test]
     async fn s3_archive_read_fails_closed_after_five_truncated_bodies() {
@@ -11571,46 +12214,42 @@ mod tests {
     }
 
     #[test]
-    fn v71_record_key_shares_v70_head_slot_and_parser_rejects_legacy_and_foreign_keys() {
+    fn v71_record_key_isolated_from_v70_and_parser_rejects_noncanonical_and_foreign_keys() {
         let prefix = "archive/epoch";
         for sequence in [1, 42, u64::MAX] {
             let key = journal_record_key(prefix, sequence);
-            assert_eq!(key, archive_head_key(prefix, sequence));
+            assert_ne!(key, archive_head_key(prefix, sequence));
             assert_eq!(journal_record_key_sequence(&key, prefix), Ok(sequence));
         }
         assert_eq!(
             journal_record_key(prefix, 42),
-            "archive/epoch/heads/00000000000000000042.cbor"
+            "archive/epoch/journal-v71/records/00000000000000000042.cbor"
         );
 
         let legacy = format!(
-            "{prefix}/heads/00000000000000000042-{}.cbor",
+            "{prefix}/journal-v71/records/00000000000000000042-{}.cbor",
             "d".repeat(64)
-        );
-        // The v70 parser admits the legacy name; the journal parser never does.
-        assert_eq!(
-            archive_key_sequence(&legacy, &format!("{prefix}/heads/"), false),
-            Ok(42)
         );
         for key in [
             legacy,
-            format!("{prefix}/heads/00000000000000000042-.cbor"),
-            format!("{prefix}/heads/42.cbor"),
-            format!("{prefix}/heads/0000000000000000042.cbor"),
-            format!("{prefix}/heads/000000000000000000042.cbor"),
-            format!("{prefix}/heads/+0000000000000000042.cbor"),
-            format!("{prefix}/heads/0000000000000000004a.cbor"),
-            format!("{prefix}/heads/00000000000000000000.cbor"),
-            format!("{prefix}/heads/18446744073709551616.cbor"),
-            format!("{prefix}/heads/99999999999999999999.cbor"),
-            format!("{prefix}/heads/00000000000000000042.CBOR"),
-            format!("{prefix}/heads/00000000000000000042.cbor.tmp"),
-            format!("{prefix}/heads/nested/00000000000000000042.cbor"),
+            format!("{prefix}/journal-v71/records/00000000000000000042-.cbor"),
+            format!("{prefix}/journal-v71/records/42.cbor"),
+            format!("{prefix}/journal-v71/records/0000000000000000042.cbor"),
+            format!("{prefix}/journal-v71/records/000000000000000000042.cbor"),
+            format!("{prefix}/journal-v71/records/+0000000000000000042.cbor"),
+            format!("{prefix}/journal-v71/records/0000000000000000004a.cbor"),
+            format!("{prefix}/journal-v71/records/00000000000000000000.cbor"),
+            format!("{prefix}/journal-v71/records/18446744073709551616.cbor"),
+            format!("{prefix}/journal-v71/records/99999999999999999999.cbor"),
+            format!("{prefix}/journal-v71/records/00000000000000000042.CBOR"),
+            format!("{prefix}/journal-v71/records/00000000000000000042.cbor.tmp"),
+            format!("{prefix}/journal-v71/records/nested/00000000000000000042.cbor"),
+            format!("{prefix}/heads/00000000000000000042.cbor"),
             format!("{prefix}/artifacts/00000000000000000042.cbor"),
             format!("{prefix}/journal-v71/checkpoints/00000000000000000042.cbor"),
-            format!("other/heads/00000000000000000042.cbor"),
-            format!("{prefix}-other/heads/00000000000000000042.cbor"),
-            format!("/{prefix}/heads/00000000000000000042.cbor"),
+            format!("other/journal-v71/records/00000000000000000042.cbor"),
+            format!("{prefix}-other/journal-v71/records/00000000000000000042.cbor"),
+            format!("/{prefix}/journal-v71/records/00000000000000000042.cbor"),
             String::new(),
         ] {
             assert!(journal_record_key_sequence(&key, prefix).is_err(), "{key}");
@@ -11731,7 +12370,7 @@ mod tests {
         );
         let mut legacy = keys(&[8]);
         legacy.push(format!(
-            "{prefix}/heads/00000000000000000009-{}.cbor",
+            "{prefix}/journal-v71/records/00000000000000000009-{}.cbor",
             "d".repeat(64)
         ));
         assert_eq!(
@@ -11739,10 +12378,12 @@ mod tests {
             Err("journal record key legacy suffix".into())
         );
         let mut foreign = keys(&[8]);
-        foreign.push(format!("other/heads/{:020}.cbor", 9));
+        foreign.push(format!("other/journal-v71/records/{:020}.cbor", 9));
         assert!(validate_journal_tail_keys(&foreign, prefix, 7, 3).is_err());
         let mut overflow = keys(&[8]);
-        overflow.push(format!("{prefix}/heads/99999999999999999999.cbor"));
+        overflow.push(format!(
+            "{prefix}/journal-v71/records/99999999999999999999.cbor"
+        ));
         assert_eq!(
             validate_journal_tail_keys(&overflow, prefix, 7, 3),
             Err("archive sequence overflow".into())
@@ -12026,7 +12667,7 @@ mod tests {
         assert_eq!(log.len(), 3);
         let (put, body) = &log[0];
         assert!(
-            put.starts_with("put /unit-test/epoch/heads/00000000000000000042.cbor"),
+            put.starts_with("put /unit-test/epoch/journal-v71/records/00000000000000000042.cbor"),
             "{put}"
         );
         for header in [
@@ -12042,7 +12683,7 @@ mod tests {
         assert!(
             log[1]
                 .0
-                .starts_with("get /unit-test/epoch/heads/00000000000000000042.cbor"),
+                .starts_with("get /unit-test/epoch/journal-v71/records/00000000000000000042.cbor"),
             "{}",
             log[1].0
         );
@@ -12874,8 +13515,8 @@ mod tests {
         let list = log.lock().await[0].0.clone();
         for query in [
             "list-type=2",
-            "prefix=epoch%2fheads%2f",
-            "start-after=epoch%2fheads%2f00000000000000000041.cbor",
+            "prefix=epoch%2fjournal-v71%2frecords%2f",
+            "start-after=epoch%2fjournal-v71%2frecords%2f00000000000000000041.cbor",
         ] {
             assert!(list.contains(query), "{query} missing from {list}");
         }
@@ -12912,7 +13553,7 @@ mod tests {
     #[tokio::test]
     async fn v71_tail_listing_fails_closed_on_gap_duplicate_legacy_foreign_range_and_timeout() {
         let record = |sequence| journal_record_key("epoch", sequence);
-        let legacy = format!("epoch/heads/00000000000000000043-{}.cbor", "a".repeat(64));
+        let legacy = format!("epoch/journal-v71/records/00000000000000000043-{}.cbor", "a".repeat(64));
         let cases = vec![
             (vec![v71_listing_page(&[record(42), record(44)], None)], "journal tail sequence gap"),
             (vec![v71_listing_page(&[record(43)], None)], "journal tail sequence gap"),
@@ -12936,7 +13577,7 @@ mod tests {
                 "journal listing key foreign",
             ),
             (
-                vec![v71_listing_page(&["epoch/heads/zzz.cbor".into()], None)],
+                vec![v71_listing_page(&["epoch/journal-v71/records/zzz.cbor".into()], None)],
                 "archive key format invalid",
             ),
         ];
@@ -12987,8 +13628,8 @@ mod tests {
         );
         server.abort();
         let log = log.lock().await;
-        assert!(log[1].0.starts_with("get /unit-test/epoch/heads/00000000000000000042.cbor"));
-        assert!(log[2].0.starts_with("get /unit-test/epoch/heads/00000000000000000043.cbor"));
+        assert!(log[1].0.starts_with("get /unit-test/epoch/journal-v71/records/00000000000000000042.cbor"));
+        assert!(log[2].0.starts_with("get /unit-test/epoch/journal-v71/records/00000000000000000043.cbor"));
         drop(log);
 
         // The checkpoint anchor must match the first record on every chained
@@ -13269,6 +13910,54 @@ mod tests {
             receipts,
             head,
         }
+    }
+
+    fn append_v71_rollback_successor(
+        fixture: &mut V70RollbackFixture,
+        seed: char,
+        wallet: char,
+    ) {
+        let mut tree = layrs_direct_execution_v1::request_index::SparseRequestTree::from_leaves(
+            &fixture.bundle.leaves,
+        )
+        .unwrap();
+        for record in &fixture.records {
+            tree.insert(TerminalRequestLeaf {
+                account_id: record.account_id.clone(),
+                request_id: record.request_id.clone(),
+                request_hash: record.request_hash.clone(),
+                result_hash: record.result_hash.clone(),
+                receipt_hash: record.receipt_hash.clone(),
+                locator: TerminalResultLocator::Journal {
+                    writer_epoch: record.writer_epoch.clone(),
+                    sequence: record.sequence,
+                },
+            })
+            .unwrap();
+        }
+        let request = v70_rollback_admission(seed, wallet);
+        let proof = tree
+            .proof(&request.account_id, &request.request_id)
+            .unwrap();
+        let candidate = fixture
+            .v71
+            .prepare_candidate(request.clone(), &proof, &[7; 32], &[8; 32])
+            .unwrap();
+        fixture.records.push(candidate.record().clone());
+        let result = fixture.v71.adopt_candidate(candidate).unwrap();
+        fixture.receipts.insert(
+            (request.account_id.clone(), request.request_id.clone()),
+            (fixture.v71.sequence(), result.receipt.clone()),
+        );
+        fixture.commands.push((request, result));
+        fixture.head = JournalHead {
+            writer_epoch: fixture.v71.writer_epoch().into(),
+            sequence: fixture.v71.sequence(),
+            record_hash: fixture.v71.record_hash().into(),
+            transition_root: fixture.v71.transition_root().into(),
+            request_index_root: fixture.v71.request_index_root().into(),
+            financial_state_root: fixture.v71.financial_state_root().unwrap(),
+        };
     }
 
     /// The authoritative prefix `epoch`: the migration bundle, v70 head
@@ -13738,7 +14427,7 @@ mod tests {
         assert_eq!(artifact_hash(&artifact), package.artifact_hash);
 
         // The explicit baseline branch restores it through the retained
-        // enclave's unchanged checkpoint rules and exact committed frontier.
+        // enclave's unchanged checkpoint rules and signed committed frontier.
         let fresh = v70_rollback_store_at(&endpoint, "rollback/v70");
         let frontier = v70_rollback_frontier(&package);
         let prepared = fresh
@@ -13805,6 +14494,82 @@ mod tests {
         );
         assert_eq!(called.load(Ordering::SeqCst), 1);
         assert!(v70_rollback_puts(&log.lock().await[before..]).is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn v70_rollback_handoff_fences_post_capture_commit_until_v70_restore() {
+        let mut fixture = v70_rollback_fixture();
+        let (stale, _) = v70_rollback_package(&fixture).await;
+        append_v71_rollback_successor(&mut fixture, 'e', '5');
+        assert_eq!(stale.sequence + 1, fixture.head.sequence);
+
+        let (endpoint, _, _, server) = v70_rollback_s3(v70_rollback_archive(&fixture)).await;
+        let store = v71_store(
+            &endpoint,
+            JournalWriterState::Eligible(fixture.head.clone()),
+            JournalRole::Writer,
+        );
+        let state = v70_rollback_state(Some(store), &fixture);
+        let (package, handoff_guard) = prepare_v70_rollback_handoff(
+            &state,
+            "rollback",
+            v70_rollback_seal(fixture.v71.clone(), Arc::new(AtomicU64::new(0))),
+        )
+        .await
+        .unwrap();
+
+        // Model a v71 command arriving after package publication. It cannot
+        // enter the serialized commit path while the rollback handoff owns the
+        // gate, so it cannot become an acknowledged successor omitted from the
+        // retained-v70 frontier.
+        let gate = Arc::clone(&state.financial_gate);
+        let mut post_capture_commit = tokio::spawn(async move {
+            let _guard = gate.lock("post_capture_v71_commit").await;
+        });
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50),
+            &mut post_capture_commit,
+        )
+        .await
+        .is_err());
+
+        let frontier = v70_rollback_frontier(&package);
+        let rollback = v70_rollback_store_at(&endpoint, "rollback");
+        rollback
+            .prepare_sparse_rollback_restore(&frontier)
+            .await
+            .unwrap();
+        let (adopted, enclave) = v70_rollback_enclave(fixture.epoch.clone(), frontier);
+        rollback
+            .restore_sparse_rollback_with(
+                &v70_rollback_baseline_state(&fixture),
+                &v70_rollback_frontier(&package),
+                enclave,
+            )
+            .await
+            .unwrap();
+        let mut restored = adopted.lock().unwrap().take().unwrap();
+        assert_eq!(restored.committed_sequence(), fixture.v71.sequence());
+        assert_eq!(restored.committed_state_hash(), package.state_hash);
+        for (request, result) in &fixture.commands {
+            assert_eq!(
+                restored.portfolio(&request.identity_commitment).unwrap(),
+                fixture
+                    .v71
+                    .portfolio(&request.identity_commitment)
+                    .unwrap()
+            );
+            assert_eq!(restored.execute(request.clone()).unwrap(), *result);
+        }
+
+        // Only an explicit failed/abandoned handoff releases dispatch. The
+        // production SIGUSR2 path intentionally never drops this guard.
+        drop(handoff_guard);
+        tokio::time::timeout(Duration::from_secs(1), post_capture_commit)
+            .await
+            .unwrap()
+            .unwrap();
         server.abort();
     }
 
@@ -13996,7 +14761,7 @@ mod tests {
                         objects.insert(key.clone(), hash.clone().into_bytes());
                     }
                 }),
-                "sparse rollback baseline differs from governed frontier",
+                "archive committed artifact missing",
             ),
             (
                 "head body malformed",
@@ -14179,10 +14944,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v70_rollback_baseline_requires_the_exact_governed_frontier() {
+    async fn v70_rollback_baseline_requires_a_governed_frontier_in_its_checkpoint() {
         let fixture = v70_rollback_fixture();
         let (package, objects) = v70_rollback_package(&fixture).await;
         let frontier = v70_rollback_frontier(&package);
+        let checkpoint: layrs_direct_execution_v1::DirectCheckpoint =
+            serde_cbor::from_slice(&objects[&package.checkpoint_key]).unwrap();
+        let anchored = layrs_direct_execution_v1::CommittedRestoreFrontier {
+            sequence: 3,
+            state_hash: checkpoint.receipt_records[2].state_hash.clone(),
+            artifact_hash: checkpoint.artifact_hashes[2].clone(),
+        };
+        assert_eq!(
+            v70_rollback_try_restore(&fixture, objects.clone(), &anchored).await,
+            Ok(4)
+        );
         let with = |edit: &dyn Fn(&mut layrs_direct_execution_v1::CommittedRestoreFrontier)| {
             let mut frontier = frontier.clone();
             edit(&mut frontier);
@@ -14191,7 +14967,7 @@ mod tests {
         let cases = [
             (
                 with(&|f| f.sequence = 3),
-                "sparse rollback head outside baseline lineage",
+                "sparse checkpoint outside governed baseline",
             ),
             (
                 with(&|f| f.sequence = 5),
@@ -14199,11 +14975,11 @@ mod tests {
             ),
             (
                 with(&|f| f.artifact_hash = sha256(b"other")),
-                "sparse rollback baseline differs from governed frontier",
+                "sparse checkpoint outside governed baseline",
             ),
             (
                 with(&|f| f.state_hash = sha256(b"other")),
-                "sparse rollback baseline artifact mismatch",
+                "sparse checkpoint outside governed baseline",
             ),
             (
                 with(&|f| f.sequence = 0),

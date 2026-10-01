@@ -12,26 +12,39 @@ No step in this document is authorization to deploy or mutate production.
 
 Do not begin a production rollout unless all of these are true:
 
-1. The current v70 checkpoint still fits the old 256 MiB reader, so the
-   retained v70 EIF can restore the pre-rollout archive.
+1. The current checkpoint and full archive are readable by the exact live
+   bridge image, which remains the pre-promotion fallback.
 2. The bridge's 768 MiB frame benchmark passes within the 8 GiB enclave for
    commit, checkpoint seal, full restore, and failed oversize handling.
-3. The retained v70 EIF digest, launch inputs, and rollback commands have been
-   independently checked.
+3. The bridge-derived sparse-rollback parent, unchanged live bridge EIF digest,
+   launch inputs, and rollback commands have been independently checked.
 4. There are two distinct grants: one candidate grant and one unconsumed
    rollback grant. The rollback grant is never supplied to the candidate. A
    failed candidate attempt may consume only the candidate grant.
 5. A production-copy rehearsal has produced the three-object rollback
-   baseline and measured restore plus traffic-switch time below 10 minutes.
+   baseline and measured handoff capture, restore, and traffic-switch time.
 6. The non-writer restore verifier has accepted the latest v70 checkpoint and
    every published v71 checkpoint.
-7. There is no unresolved external effect.
+7. The balance gate reports zero unexplained withdrawal holds. A hold is
+   explained only when its reservation receipt, immutable four-leg custody
+   proof, destination-chain delivery, amount and intended terminal action are
+   all recorded and independently verified. The known mm01 hold
+   `dff330c1-4ca3-46de-bb86-d192b8ddcc67` is documented in
+   `evidence/MM01_EXPLAINED_WITHDRAWAL_HOLD_20260930.json`; it must be carried
+   forward unchanged, never reverted and never paid a second time. After
+   promotion, retry only its original settlement idempotency key and require a
+   `WITHDRAWAL_SETTLED` receipt bound to the existing Base transaction before
+   declaring the withdrawal gate healthy.
+8. There is no other unresolved external effect.
 
 The soft abort is five minutes. At five minutes, stop advancing the rollout
-and retain the current authoritative writer. The hard abort is ten minutes. At
-ten minutes, remove the candidate from routing and use the retained writer or
-the rehearsed rollback procedure. Never wait indefinitely for a checkpoint,
-shadow, grant, or health check.
+and retain the current authoritative writer. The hard abort must be later than
+the rehearsal's measured restore plus traffic-switch duration with a five
+minute margin, and is never less than 25 minutes. Any shorter fixed deadline
+is invalid because the measured legacy restore exceeded it. At the hard gate,
+remove the candidate from routing and use the retained writer or rehearsed
+rollback procedure. Never wait indefinitely for a checkpoint, shadow, grant,
+or health check.
 
 ## Configuration
 
@@ -44,17 +57,29 @@ LAYRS_DIRECT_V71_AUTO_PROMOTE=true
 LAYRS_DIRECT_V70_ROLLBACK_PREFIX=<fresh rollback prefix>
 ```
 
+Both the v71 candidate and bridge-derived rollback parent must read
+`maximumSubsidyAtomic=50000` from the same hash-pinned Phase-1
+`configurationJson` used by the BFF. The CloudFormation
+`UsdcMaximumSubsidyAtomic` parameter is fixed to 50000 as a deployment guard;
+it is not an independent runtime source. Both candidate and rollback processed
+change sets must retain `HealthCheckGracePeriod: 3600`, which exceeds the
+measured restore plus margin and prevents an ASG recycle loop during restore.
+
 `v71-hot` starts on v70 when the immutable cutover marker is absent. It starts
 on v71 only when `journal-v71/cutover.cbor` exists and exactly matches the
 cryptographically verified checkpoint-plus-tail head. Pre-staged migration,
 checkpoint, snapshot, or journal objects cannot select v71 by themselves.
 
-`LAYRS_DIRECT_V70_ROLLBACK_PREFIX` is an explicit, one-shot operator hook. If
-set, the parent waits until v71 is authoritative, captures committed state
-through the existing financial gate, and writes the three-object rollback
-baseline. Leave it unset until the production-copy seal duration has been
-measured and the fresh prefix and rollback grant have been verified. It does
-not capture, queue, or replay pending commands.
+`LAYRS_DIRECT_V70_ROLLBACK_PREFIX` arms an explicit, one-shot local operator
+hook; setting it alone does not capture state or affect traffic. After v71 is
+authoritative, `SIGUSR2` makes the parent take the financial gate, capture the
+exact committed head, and write the three-object rollback baseline. On
+success it logs `V70_ROLLBACK_HANDOFF_READY` and deliberately retains the gate
+until the retained-v70 ASG replaces the process. This prevents any later v71
+command from being acknowledged outside the rollback package. Leave the
+prefix unset until the production-shaped-copy seal duration has been measured and
+the fresh prefix and rollback grant have been verified. The hook does not
+capture, queue, or replay pending commands and exposes no network endpoint.
 
 Rollback restore is explicit and never inferred:
 
@@ -63,8 +88,10 @@ LAYRS_DIRECT_PERSISTENCE_FORMAT=v70-rollback-baseline
 LAYRS_DIRECT_ARCHIVE_PREFIX=<fresh rollback prefix>
 ```
 
-The rollback grant's committed frontier must exactly name the baseline head.
-Normal `v70` mode rejects the sparse archive.
+The rollback grant's committed frontier must name an authenticated historical
+record contained in the baseline checkpoint. The exact-head baseline may be
+later, but its checkpoint must prove that signed frontier before the retained
+v70 enclave receives it. Normal `v70` mode rejects the sparse archive.
 
 ## Release order
 
@@ -114,19 +141,27 @@ and total latency. For every checkpoint, require disposable non-writer restore
 verification before publication. Abort on a journal latch, root mismatch,
 unresolved external effect, or latency regression beyond the agreed gate.
 
-### 5. Retained-v70 rollback
+### 5. Bridge-derived v70 rollback
 
-The rollback materializer reads the authenticated migration and journal,
-asks the enclave for an exact v70 checkpoint at the captured head, and writes
-exactly three objects under a fresh prefix: one full encrypted head artifact,
-one head pointer, and one checkpoint discovery marker. Every write is
-create-only, KMS encrypted, Object Lock protected, and read back exactly.
+Keep serving v71 until rollback is actually required. Pause external dispatch,
+send `SIGUSR2` to the parent service, and require
+`V70_ROLLBACK_HANDOFF_READY` for the exact current sequence. The handoff reads
+the authenticated migration and journal, asks the enclave for an exact v70
+checkpoint, and writes exactly three objects under a fresh prefix: one full
+encrypted head artifact, one head pointer, and one checkpoint discovery
+marker. Every write is create-only, KMS encrypted, Object Lock protected, and
+read back exactly. The parent retains the financial gate after readiness; do
+not resume it or send a second signal. Execute the pre-reviewed ASG rollback
+while that exact-head fence remains held.
 
-Before a rollout that may need rollback, rehearse this against a production
-copy and record the elapsed seal, write, restore, and routing times. A rollback
-uses the retained v70 EIF, the fresh rollback prefix, the exact committed
-frontier, and the separate unconsumed rollback grant. Missing, extra, mutated,
-noncanonical, or wrong-frontier objects fail closed.
+Before a rollout that may need rollback, rehearse this against a
+production-shaped copy. The rollback uses the bridge-derived compatibility
+parent, unchanged live bridge EIF, fresh rollback prefix, signed historical
+frontier, and separate unconsumed rollback grant. Missing, extra, mutated,
+noncanonical, or wrong-frontier objects fail closed. The exact live bridge
+parent is not an immediate second hop because it requires a contiguous
+sequence-1-through-head archive; use it only after such an archive has been
+separately produced and rehearsed.
 
 ## Abort behavior
 
@@ -136,8 +171,12 @@ noncanonical, or wrong-frontier objects fail closed.
   v71 objects are non-authoritative.
 - Ambiguous promotion transport after the marker: restart in `v71-hot`; the
   marker selects the exact verified v71 head.
-- v71 failure after promotion: execute only the rehearsed sparse-baseline v70
-  restore with the retained EIF and rollback grant.
+- v71 failure after promotion: stop new dispatch, trigger `SIGUSR2`, require
+  exact-head `V70_ROLLBACK_HANDOFF_READY`, then execute only the rehearsed
+  sparse-baseline v70 ASG restore with the retained EIF and rollback grant.
+- Rollback preparation failure: do not change the ASG or consume the rollback
+  grant. The gate is released and v71 remains authoritative; investigate and
+  retry only with a new fresh prefix after review.
 - Never route two writers, reuse a consumed grant, delete immutable evidence,
   or convert a failed attempt into a pending-command workflow.
 

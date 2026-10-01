@@ -33,8 +33,20 @@ pub(super) struct BusWithdrawalProof {
 }
 #[derive(Clone,Debug,Serialize,Deserialize)]
 #[serde(rename_all="camelCase",deny_unknown_fields)]
+pub(super) struct TaxiWithdrawalProof {
+    pub pool_transaction_hash:String,pub boarding_transaction_hash:String,
+    pub destination_transaction_hash:String,
+}
+#[derive(Clone,Debug,Serialize,Deserialize)]
+#[serde(rename_all="camelCase",deny_unknown_fields)]
 struct RelayBusWithdrawalProof {
     pool_transaction_hash:String,boarding_transaction_hash:String,driving_transaction_hash:String,
+    destination_transaction_hash:String,relay:RelayWithdrawalBinding,destination_receipt_hash:String,
+}
+#[derive(Clone,Debug,Serialize,Deserialize)]
+#[serde(rename_all="camelCase",deny_unknown_fields)]
+struct RelayTaxiWithdrawalProof {
+    pool_transaction_hash:String,boarding_transaction_hash:String,
     destination_transaction_hash:String,relay:RelayWithdrawalBinding,destination_receipt_hash:String,
 }
 #[derive(Clone,Debug,Serialize,Deserialize)]
@@ -201,8 +213,18 @@ impl UsdcBusCustodyAdapter {
             return local_terminal_effect(&self.ledger,destination,amount,&proof,&pool).map(Some);
         }
         if matches!(destination_chain,"solana"|"robinhood") {
-            let proof:RelayBusWithdrawalProof=serde_json::from_value(proof.clone()).map_err(|_|denied())?;
-            return self.relay_settlement(destination_chain,destination,amount,&proof).await;
+            if let Ok(taxi)=serde_json::from_value::<RelayTaxiWithdrawalProof>(proof.clone()) {
+                return self.relay_taxi_settlement(destination_chain,destination,amount,&taxi).await;
+            }
+            let bus:RelayBusWithdrawalProof=serde_json::from_value(proof.clone()).map_err(|_|denied())?;
+            return self.relay_settlement(destination_chain,destination,amount,&bus).await;
+        }
+        if let Ok(taxi)=serde_json::from_value::<TaxiWithdrawalProof>(proof.clone()) {
+            let Some(pool)=self.confirmed(false,&taxi.pool_transaction_hash).await? else {return Ok(None);};
+            let Some(boarding)=self.confirmed(false,&taxi.boarding_transaction_hash).await? else {return Ok(None);};
+            let Some(arrival)=self.confirmed_destination(destination_chain,&taxi.destination_transaction_hash).await? else {return Ok(None);};
+            return taxi_terminal_effect(destination_chain,&self.ledger,destination,amount,self.maximum_subsidy,self.maximum_native,
+                &taxi,&pool,&boarding,&arrival).map(Some);
         }
         let proof:BusWithdrawalProof=serde_json::from_value(proof.clone()).map_err(|_|denied())?;
         let Some(pool)=self.confirmed(false,&proof.pool_transaction_hash).await? else {return Ok(None);};
@@ -270,6 +292,56 @@ impl UsdcBusCustodyAdapter {
         Ok(Some(format!("horizen-usdc-relay:{}:{}:{}:{}:{}",proof.pool_transaction_hash,
             driving_guid(&driving)?,proof.destination_transaction_hash,proof.relay.request_id,proof.destination_receipt_hash)))
     }
+    async fn relay_taxi_settlement(&self,destination_chain:&str,destination:&str,amount:&str,proof:&RelayTaxiWithdrawalProof)->Result<Option<String>,String>{
+        proof.relay.verify(amount).map_err(|_|denied())?;
+        let (chain,currency)=match destination_chain {"solana"=>(SOLANA_CHAIN,SOLANA_USDC),"robinhood"=>(ROBINHOOD_CHAIN,ROBINHOOD_USDG),_=>return Err(denied())};
+        if proof.relay.destination_chain_id!=chain||!relay_address_eq(&proof.relay.destination_currency,currency,chain)
+            ||!relay_address_eq(&proof.relay.recipient,destination,chain)
+            ||proof.relay.minimum_destination_amount_atomic.parse::<u128>().ok().is_none_or(|value|value<amount.parse::<u128>().unwrap_or(u128::MAX)) {return Err(denied());}
+        let taxi=TaxiWithdrawalProof {pool_transaction_hash:proof.pool_transaction_hash.clone(),boarding_transaction_hash:proof.boarding_transaction_hash.clone(),
+            destination_transaction_hash:proof.destination_transaction_hash.clone()};
+        let Some(pool)=self.confirmed(false,&taxi.pool_transaction_hash).await? else{return Ok(None)};
+        let Some(boarding)=self.confirmed(false,&taxi.boarding_transaction_hash).await? else{return Ok(None)};
+        let Some(arrival)=self.confirmed(true,&taxi.destination_transaction_hash).await? else{return Ok(None)};
+        let taxi_reference=taxi_terminal_effect("arbitrum",&self.ledger,&proof.relay.deposit_address,amount,self.maximum_subsidy,self.maximum_native,
+            &taxi,&pool,&boarding,&arrival)?;
+        let status=self.relay_get(&format!("/intents/status/v3?requestId={}",proof.relay.request_id)).await?;
+        let details=self.relay_get(&format!("/requests/v3?id={}",proof.relay.request_id)).await?;
+        let intake_hashes=relay_hashes(status.get("inTxHashes"));
+        if status.get("status").and_then(Value::as_str)!=Some("success")
+            ||status.get("requestId").and_then(Value::as_str).is_some_and(|id|!id.eq_ignore_ascii_case(&proof.relay.request_id))
+            ||status.get("originChainId").and_then(Value::as_u64).is_some_and(|value|value!=42161)
+            ||status.get("destinationChainId").and_then(Value::as_u64).is_some_and(|value|value!=chain)
+            ||intake_hashes.len()!=1 {return Err(denied());}
+        let intake_hash=&intake_hashes[0];
+        let Some(intake)=self.confirmed(true,intake_hash).await? else{return Ok(None)};
+        let arrival_block=arrival.receipt["blockNumber"].as_str().and_then(parse_quantity).ok_or_else(denied)?;
+        let intake_block=intake.receipt["blockNumber"].as_str().and_then(parse_quantity).ok_or_else(denied)?;
+        if intake_block<=arrival_block||!relay_origin_spend(&intake.receipt,&proof.relay.deposit_address,amount.parse().map_err(|_|denied())?) {return Err(denied());}
+        let requests=details.get("requests").and_then(Value::as_array).filter(|values|values.len()==1).ok_or_else(denied)?;
+        let request=&requests[0];
+        if request.get("id").and_then(Value::as_str).is_none_or(|id|!id.eq_ignore_ascii_case(&proof.relay.request_id))
+            ||request.get("recipient").and_then(Value::as_str).is_none_or(|value|relay_address_eq(value,destination,chain)==false)
+            ||request.pointer("/depositAddress/address").and_then(Value::as_str).is_none_or(|value|!value.eq_ignore_ascii_case(&proof.relay.deposit_address))
+            ||!relay_request_has_intake(request,42161,intake_hash)
+            ||!relay_currency_matches(request.pointer("/data/route/quoted/origin/inputCurrency"),42161,ARB_TOKEN,amount)
+            ||!relay_currency_matches(request.pointer("/data/route/quoted/destination/outputCurrency"),chain,currency,&proof.relay.quoted_destination_amount_atomic)
+            ||request.get("status").and_then(Value::as_str)!=Some("success") {return Err(denied());}
+        let hashes=relay_destination_hashes(request,chain);let status_hashes=relay_hashes(status.get("txHashes"));
+        if hashes.len()!=1||status_hashes.len()!=1||hashes[0]!=status_hashes[0]||hashes[0]!=proof.destination_receipt_hash{return Err(denied());}
+        let actual=relay_actual_destination_amount(request,&proof.relay)?;
+        if actual.parse::<u128>().ok().is_none_or(|value|value<amount.parse::<u128>().unwrap_or(u128::MAX)){return Err(denied());}
+        if chain==ROBINHOOD_CHAIN {
+            let Some(finalized)=self.confirmed_at(&self.robinhood_url,ROBINHOOD_CHAIN.into(),1,&proof.destination_receipt_hash).await? else{return Ok(None)};
+            let delivered=actual.parse::<u128>().map_err(|_|denied())?;
+            if transfer(&finalized.receipt,ROBINHOOD_USDG,ZERO,destination,delivered).is_empty()
+                &&events(&finalized.receipt,ROBINHOOD_USDG,"Transfer(address,address,uint256)").into_iter().filter(|log|log["topics"].as_array().map(Vec::len)==Some(3)
+                    &&eq(&log["topics"][2],&format!("0x{}",address_word(destination)))&&integer(&log["data"],0).ok()==Some(delivered)).count()!=1{return Err(denied());}
+        } else if !self.solana_delivery(destination,&proof.destination_receipt_hash,&actual).await? {return Ok(None)}
+        let guid=taxi_reference.split(':').nth(2).ok_or_else(denied)?;
+        Ok(Some(format!("horizen-usdc-relay:{}:{}:{}:{}:{}",proof.pool_transaction_hash,
+            guid,proof.destination_transaction_hash,proof.relay.request_id,proof.destination_receipt_hash)))
+    }
     async fn solana_delivery(&self,recipient:&str,signature:&str,amount:&str)->Result<bool,String>{
         if !valid_relay_transaction_hash(signature)||signature.starts_with("0x"){return Err(denied());}
         let statuses=self.rpc(&self.solana_url,"getSignatureStatuses",json!([[signature],{"searchTransactionHistory":true}])).await?;
@@ -333,6 +405,61 @@ fn local_terminal_effect(ledger:&str,destination:&str,amount:&str,proof:&LocalUs
         ||!eq(&withdrawals[0]["data"],&format!("0x{}",word(principal)))
         ||transfer(&pool.receipt,HZ_TOKEN,POOL,&recipient,principal).len()!=1{return Err(denied());}
     Ok(format!("horizen-usdc-local:{}",proof.pool_transaction_hash))
+}
+
+fn taxi_terminal_effect(destination_chain:&str,ledger:&str,destination:&str,amount:&str,max_subsidy:u128,max_native:u128,
+    proof:&TaxiWithdrawalProof,pool:&Confirmed,boarding:&Confirmed,arrival:&Confirmed)->Result<String,String>{
+    let route=destination_route(destination_chain)?;
+    let recipient=canonical_evm_address(destination).map_err(|_|denied())?;
+    let principal=amount.parse::<u128>().ok().filter(|value|*value>0&&value.to_string()==amount).ok_or_else(denied)?;
+    coherence(pool,26514,&proof.pool_transaction_hash)?;coherence(boarding,26514,&proof.boarding_transaction_hash)?;
+    coherence(arrival,route.chain,&proof.destination_transaction_hash)?;
+    let pool_call=format!("{}{}{}",selector("withdraw(address,uint256)"),address_word(ledger),word(principal));
+    let withdrawals=events(&pool.receipt,POOL,"Withdrawn(address,uint256,address)");
+    if !eq(&pool.tx["from"],ledger)||!eq(&pool.tx["to"],POOL)||!eq(&pool.tx["input"],&pool_call)
+        ||pool.tx["value"].as_str().and_then(parse_quantity)!=Some(0)||withdrawals.len()!=1
+        ||withdrawals[0]["topics"].as_array().map(Vec::len)!=Some(3)
+        ||!eq(&withdrawals[0]["topics"][1],&format!("0x{}",address_word(ledger)))
+        ||!eq(&withdrawals[0]["topics"][2],&format!("0x{}",address_word(ledger)))
+        ||!eq(&withdrawals[0]["data"],&format!("0x{}",word(principal)))
+        ||transfer(&pool.receipt,HZ_TOKEN,POOL,ledger,principal).len()!=1 {return Err(denied());}
+    let sends=events(&boarding.receipt,HZ_BRIDGE,"OFTSent(bytes32,uint32,address,uint256,uint256)");
+    if sends.len()!=1||!events(&boarding.receipt,HZ_MESSAGING,"BusRode(uint32,uint72,uint80,bytes)").is_empty()
+        ||sends[0]["topics"].as_array().map(Vec::len)!=Some(3)
+        ||eq(&sends[0]["topics"][1],&format!("0x{}",word(0)))
+        ||!eq(&sends[0]["topics"][2],&format!("0x{}",address_word(ledger)))
+        ||integer(&sends[0]["data"],0)?!=route.eid {return Err(denied());}
+    let guid=sends[0]["topics"][1].as_str().ok_or_else(denied)?.to_ascii_lowercase();
+    if !valid_transaction_hash(&guid) {return Err(denied());}
+    let gross=integer(&sends[0]["data"],1)?;let received=integer(&sends[0]["data"],2)?;
+    let native=boarding.tx["value"].as_str().and_then(parse_quantity).ok_or_else(denied)?;
+    if gross<principal||gross-principal>max_subsidy||received<principal||native==0||native>max_native {return Err(denied());}
+    let send_call=format!("{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
+        selector("sendToken((uint32,bytes32,uint256,uint256,bytes,bytes,bytes),(uint256,uint256),address)"),
+        word(128),word(native),word(0),address_word(ledger),word(route.eid),address_word(&recipient),word(gross),word(principal),
+        word(224),word(256),word(288),word(0),word(0),word(0));
+    if !eq(&boarding.tx["from"],ledger)||!eq(&boarding.tx["to"],HZ_BRIDGE)||!eq(&boarding.tx["input"],&send_call) {return Err(denied());}
+    let direct_burn=transfer(&boarding.receipt,HZ_TOKEN,ledger,ZERO,gross);
+    if direct_burn.len()!=1 {
+        let pulls=transfer(&boarding.receipt,HZ_TOKEN,ledger,HZ_BRIDGE,gross);
+        let burns=transfer(&boarding.receipt,HZ_TOKEN,HZ_BRIDGE,ZERO,gross);
+        if !direct_burn.is_empty()||pulls.len()!=1||burns.len()!=1 {return Err(denied());}
+        let index=|log:&Value|log["logIndex"].as_str().and_then(parse_quantity).ok_or_else(denied);
+        if index(pulls[0])?>=index(burns[0])?||index(burns[0])?>=index(sends[0])? {return Err(denied());}
+    }
+    let receives=events(&arrival.receipt,route.bridge,"OFTReceived(bytes32,uint32,address,uint256)").into_iter().filter(|log|
+        log["topics"].as_array().map(Vec::len)==Some(3)&&eq(&log["topics"][1],&guid)
+        &&eq(&log["topics"][2],&format!("0x{}",address_word(&recipient)))
+        &&integer(&log["data"],0).ok()==Some(30399)&&integer(&log["data"],1).ok()==Some(received)).collect::<Vec<_>>();
+    let transfer_source=if route.mints {ZERO}else{route.bridge};
+    let transfers=transfer(&arrival.receipt,route.token,transfer_source,&recipient,received);
+    if receives.len()!=1||transfers.len()!=1 {return Err(denied());}
+    let transfer_index=transfers[0]["logIndex"].as_str().and_then(parse_quantity).ok_or_else(denied)?;
+    let receive_index=receives[0]["logIndex"].as_str().and_then(parse_quantity).ok_or_else(denied)?;
+    if transfer_index>=receive_index||receive_index>u128::from(u64::MAX) {return Err(denied());}
+    // Preserve the enclave's stable terminal-reference schema. The proof
+    // adapter, not this historical label, distinguishes Taxi from Bus.
+    Ok(format!("horizen-usdc-bus:{}:{guid}:{}:0:{receive_index}",proof.pool_transaction_hash,proof.destination_transaction_hash))
 }
 
 fn scoped_deposit_boarding(boarding:&Confirmed,proof:&BusDepositProof,wallet:&str,trace:Option<&Value>)->Result<(Value,Value),String>{
@@ -618,6 +745,32 @@ mod tests {
         let proof:BusWithdrawalProof=serde_json::from_value(value["proof"].clone()).unwrap();
         terminal_effect("arbitrum",value["ledger"].as_str().unwrap(),value["recipient"].as_str().unwrap(),value["amountAtomic"].as_str().unwrap(),10000,1000,&proof,
             &material(value,"pool"),&material(value,"boarding"),&material(value,"driving"),&material(value,"arrival"))
+    }
+    fn taxi_fixture()->Value {
+        let mut value=fixture();let guid=format!("0x{}","f".repeat(64));
+        value["boarding"]["receipt"]["logs"].as_array_mut().unwrap().remove(1);
+        value["boarding"]["receipt"]["logs"][1]["topics"][1]=json!(guid);
+        let gross=5_003_002u128;let principal=5_000_000u128;let native=100u128;
+        value["boarding"]["tx"]["input"]=json!(format!("{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
+            selector("sendToken((uint32,bytes32,uint256,uint256,bytes,bytes,bytes),(uint256,uint256),address)"),
+            word(128),word(native),word(0),address_word(value["ledger"].as_str().unwrap()),word(30110),
+            address_word(value["recipient"].as_str().unwrap()),word(gross),word(principal),word(224),word(256),word(288),word(0),word(0),word(0)));
+        value
+    }
+    #[test]
+    fn taxi_withdrawal_binds_empty_command_nonzero_guid_and_exact_destination_delivery(){
+        let value=taxi_fixture();
+        let proof=TaxiWithdrawalProof {pool_transaction_hash:value["proof"]["poolTransactionHash"].as_str().unwrap().into(),
+            boarding_transaction_hash:value["proof"]["boardingTransactionHash"].as_str().unwrap().into(),
+            destination_transaction_hash:value["proof"]["destinationTransactionHash"].as_str().unwrap().into()};
+        let reference=taxi_terminal_effect("arbitrum",value["ledger"].as_str().unwrap(),value["recipient"].as_str().unwrap(),
+            value["amountAtomic"].as_str().unwrap(),10_000,1_000,&proof,&material(&value,"pool"),&material(&value,"boarding"),&material(&value,"arrival")).unwrap();
+        assert_eq!(reference,format!("horizen-usdc-bus:{}:0x{}:{}:0:1",proof.pool_transaction_hash,"f".repeat(64),proof.destination_transaction_hash));
+        let bus=value["proof"].clone();
+        assert!(serde_json::from_value::<TaxiWithdrawalProof>(bus).is_err());
+        let legacy=fixture();
+        assert!(taxi_terminal_effect("arbitrum",legacy["ledger"].as_str().unwrap(),legacy["recipient"].as_str().unwrap(),
+            legacy["amountAtomic"].as_str().unwrap(),10_000,1_000,&proof,&material(&legacy,"pool"),&material(&legacy,"boarding"),&material(&legacy,"arrival")).is_err());
     }
     fn destination_fixture(chain:&str)->Value {
         let route=destination_route(chain).unwrap();
