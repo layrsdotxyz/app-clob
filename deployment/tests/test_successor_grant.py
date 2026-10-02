@@ -43,5 +43,16 @@ class ProductionWriterShapeTest(unittest.TestCase):
         self.assertFalse(MODULE.production_writer_is_single_and_live(group))
 
 
+class RuntimeMeasurementChangeTest(unittest.TestCase):
+    def test_hot_renewal_is_not_a_runtime_change(self):
+        binding = {"amiId": "ami-current", "pcr0": "current"}
+        self.assertFalse(MODULE.runtime_measurement_changed({"runtimeMeasurement": binding.copy()}, binding))
+
+    def test_new_ami_is_a_runtime_change(self):
+        current = {"runtimeMeasurement": {"amiId": "ami-current", "pcr0": "current"}}
+        candidate = {"amiId": "ami-next", "pcr0": "next"}
+        self.assertTrue(MODULE.runtime_measurement_changed(current, candidate))
+
+
 if __name__ == "__main__":
     unittest.main()
