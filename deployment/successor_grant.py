@@ -106,6 +106,11 @@ def production_writer_is_single_and_live(group: dict) -> bool:
     )
 
 
+def runtime_measurement_changed(current_grant: dict, approved_binding: dict) -> bool:
+    """Bind prepared-artifact evidence to whether this is a runtime upgrade."""
+    return current_grant.get("runtimeMeasurement") != approved_binding
+
+
 class Rotator:
     def __init__(self, target: str, connect_host: str, connect_port: int):
         self.target_name = target
@@ -495,12 +500,13 @@ class Rotator:
             artifact = run_helper(
                 "verify-artifact", str(successor_path), str(successor_artifact_path), str(now)
             )
+            runtime_changed = runtime_measurement_changed(current["grant"], binding)
             expected_evidence = {
                 "activationId": activation,
                 "writerGrantCommitment": commitment,
                 "writerGrantExpiresAtUnix": expiry,
                 "keyReleaseArtifactHash": artifact.get("artifactHash"),
-                "runtimeChanged": False,
+                "runtimeChanged": runtime_changed,
             }
             if evidence != expected_evidence:
                 fail("PREPARED_ARTIFACT_EVIDENCE_MISMATCH")
@@ -545,6 +551,7 @@ class Rotator:
                 "successorObjectVersionId": successor_source["versionId"],
                 "expiresAtUnix": expiry,
                 "runtimeAmiId": binding["amiId"],
+                "runtimeChanged": runtime_changed,
             }
         except BaseException:
             connection.rollback()
