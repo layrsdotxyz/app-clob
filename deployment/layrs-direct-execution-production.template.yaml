@@ -455,12 +455,6 @@ Resources:
             Tags: [{ Key: Project, Value: Layrs }, { Key: Environment, Value: production-direct }, { Key: WriterEnabled, Value: !If [FinancialWriterEnabled, 'true', 'false'] }, { Key: TransactionModel, Value: layrs.direct-execution.v1 }, { Key: CandidateAmiId, Value: !Ref CandidateAmiId }]
   DormantAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
-    UpdatePolicy:
-      AutoScalingRollingUpdate:
-        MinInstancesInService: 0
-        MaxBatchSize: 1
-        PauseTime: PT5M
-        WaitOnResourceSignals: false
     Properties:
       VPCZoneIdentifier: [!Ref PrivateSubnetId]
       LaunchTemplate: { LaunchTemplateId: !Ref DormantLaunchTemplate, Version: !GetAtt DormantLaunchTemplate.LatestVersionNumber }

@@ -46,6 +46,8 @@ test('hot grant renewal stages a restart-safe successor without replacing the wr
   assert.match(template,/StagedWriterGrantBase64:\n    Type: String\n    Default: ''\n    NoEcho: true/);
   assert.ok(template.includes("StagedWriterGrantCommitment: { Type: String, Default: '' }"));
   assert.match(template,/kms:EncryptionContext:layrs-writer-grant:\n\s+- !Ref WriterGrantCommitment\n\s+- !Ref StagedWriterGrantCommitment/);
+  assert.doesNotMatch(template,/AutoScalingRollingUpdate/,
+    'grant-only launch-template staging must not recycle the live writer; releases refresh capacity explicitly');
   assert.ok(template.includes('"LAYRS_DIRECT_STAGED_WRITER_GRANT_JSON"'));
   assert.equal((template.match(/Type: AWS::EC2::LaunchTemplate/g)||[]).length,1);
   assert.equal((template.match(/Type: AWS::AutoScaling::AutoScalingGroup/g)||[]).length,1);
