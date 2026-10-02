@@ -94,6 +94,18 @@ def resolve4(host: str) -> set[str]:
     return {row[4][0] for row in socket.getaddrinfo(host, 5432, socket.AF_INET, socket.SOCK_STREAM)}
 
 
+def production_writer_is_single_and_live(group: dict) -> bool:
+    """MinSize is intentionally zero; desired and observed live writers are the fence."""
+    instances = group.get("Instances", [])
+    return (
+        group.get("MinSize") == 0
+        and group.get("MaxSize") == 1
+        and group.get("DesiredCapacity") == 1
+        and len(instances) == 1
+        and instances[0].get("LifecycleState") == "InService"
+    )
+
+
 class Rotator:
     def __init__(self, target: str, connect_host: str, connect_port: int):
         self.target_name = target
@@ -144,9 +156,7 @@ class Rotator:
         if len(groups) != 1:
             fail("PRODUCTION_ASG_COUNT")
         if self.target_name == "production":
-            instances = groups[0]["Instances"]
-            if groups[0]["MinSize"] != 1 or groups[0]["DesiredCapacity"] != 1 or len(instances) != 1 \
-                    or instances[0].get("LifecycleState") != "InService":
+            if not production_writer_is_single_and_live(groups[0]):
                 fail("PRODUCTION_WRITER_NOT_SINGLE_AND_LIVE")
         cluster = self.rds.describe_db_clusters(DBClusterIdentifier=self.target["cluster"])["DBClusters"]
         if len(cluster) != 1 or cluster[0]["Endpoint"] != self.target["endpoint"]:
