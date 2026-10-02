@@ -3497,13 +3497,23 @@ impl S3ImmutableArtifactStore {
         }
         Ok(key)
     }
-    /// Restores the single immutable migration bundle that anchors all
-    /// migrated terminal-result locators. Multiple objects are ambiguous and
-    /// therefore fail closed rather than selecting by listing order.
-    async fn load_v70_migration_bundle(&self) -> Result<Option<V70MigrationBundle>, String> {
+    /// Restores only the immutable migration bundle already named by the
+    /// authenticated request index. Failed shadow attempts at another source
+    /// sequence remain harmless immutable history and are not candidates.
+    /// Multiple objects for the bound sequence are still ambiguous and fail
+    /// closed rather than selecting by listing order.
+    async fn load_v70_migration_bundle(
+        &self,
+        expected_source_sequence: u64,
+        expected_migration_id: &str,
+    ) -> Result<Option<V70MigrationBundle>, String> {
+        if expected_source_sequence == 0 || expected_migration_id.is_empty() {
+            return Err("journal migration binding invalid".into());
+        }
         let namespace = format!("{}/journal-v71/migrations/", self.prefix);
+        let bound_prefix = format!("{namespace}{expected_source_sequence:020}-");
         let keys = self
-            .list_journal_keys(&namespace, None, 2, ARCHIVE_OPERATION_TIMEOUT)
+            .list_journal_keys(&bound_prefix, None, 2, ARCHIVE_OPERATION_TIMEOUT)
             .await?;
         let Some(key) = keys.first() else {
             return Ok(None);
@@ -3522,6 +3532,8 @@ impl S3ImmutableArtifactStore {
             || bundle.manifest.protocol != V70_MIGRATION_MANIFEST_PROTOCOL
             || bundle.manifest.epoch_id != EPOCH_ID
             || bundle.manifest.source_sequence != source_sequence
+            || source_sequence != expected_source_sequence
+            || bundle.manifest.migration_id != expected_migration_id
         {
             return Err("journal migration bundle invalid".into());
         }
@@ -3583,7 +3595,10 @@ impl S3ImmutableArtifactStore {
         restored: &V70MigrationBundle,
     ) -> Result<(V70MigrationBundle, Vec<DirectJournalRecord>), String> {
         let bundle = self
-            .load_v70_migration_bundle()
+            .load_v70_migration_bundle(
+                restored.manifest.source_sequence,
+                &restored.manifest.migration_id,
+            )
             .await?
             .ok_or("v70 rollback migration bundle missing")?;
         if bundle != *restored {
@@ -4020,7 +4035,7 @@ impl S3ImmutableArtifactStore {
             .await?;
         self.persist_journal_checkpoint(checkpoint).await
     }
-    /// Paginated listing of `namespace` (a full key prefix ending in `/`),
+    /// Paginated listing of `namespace` (a full key prefix),
     /// optionally strictly after `start_after`, of at most `max` keys. Each
     /// page is time-bounded. A timeout, error, key-count mismatch, empty
     /// truncated page, missing or repeated token, foreign or out-of-range key,
@@ -4261,12 +4276,11 @@ impl S3ImmutableArtifactStore {
         receipt_snapshot
             .verify(&index_snapshot)
             .map_err(|_| "journal receipt snapshot invalid")?;
-        let has_migrated_results = index_snapshot.leaves.iter().any(|leaf| {
-            matches!(leaf.locator, TerminalResultLocator::Migration { .. })
-        });
-        let migration = if has_migrated_results {
+        let migration = if let Some((source_sequence, migration_id)) =
+            restored_migration_binding(&index_snapshot)?
+        {
             let bundle = self
-                .load_v70_migration_bundle()
+                .load_v70_migration_bundle(source_sequence, &migration_id)
                 .await?
                 .ok_or("journal migration bundle missing")?;
             if !migration_matches_restored_index(&bundle, &index_snapshot) {
@@ -10107,6 +10121,41 @@ fn migration_parent_state(
     Ok((index, receipts, index_snapshot, receipt_snapshot))
 }
 
+/// The authenticated checkpoint index commits the migration id in every
+/// migrated locator. A v70 migration contains exactly one terminal leaf per
+/// source sequence, so their count is also the only admissible source
+/// sequence for bundle discovery.
+fn restored_migration_binding(
+    index: &DirectRequestIndexSnapshot,
+) -> Result<Option<(u64, String)>, String> {
+    let mut migration_id: Option<&str> = None;
+    let mut count = 0usize;
+    for leaf in &index.leaves {
+        if let TerminalResultLocator::Migration {
+            migration_id: current,
+            ..
+        } = &leaf.locator
+        {
+            if migration_id.is_some_and(|expected| expected != current) {
+                return Err("journal request index has multiple migrations".into());
+            }
+            migration_id = Some(current);
+            count = count
+                .checked_add(1)
+                .ok_or("journal migration source sequence overflow")?;
+        }
+    }
+    let Some(migration_id) = migration_id else {
+        return Ok(None);
+    };
+    let source_sequence = u64::try_from(count)
+        .map_err(|_| "journal migration source sequence overflow")?;
+    if source_sequence == 0 {
+        return Err("journal migration source sequence invalid".into());
+    }
+    Ok(Some((source_sequence, migration_id.to_string())))
+}
+
 fn migration_matches_restored_index(
     bundle: &V70MigrationBundle,
     index: &DirectRequestIndexSnapshot,
@@ -13024,6 +13073,31 @@ mod tests {
         assert_eq!(receipts.len(), 1);
         assert!(receipt_snapshot.verify(&index_snapshot).is_ok());
         assert!(migration_matches_restored_index(&bundle, &index_snapshot));
+        assert_eq!(
+            restored_migration_binding(&index_snapshot),
+            Ok(Some((1, bundle.manifest.migration_id.clone())))
+        );
+
+        let mut journal_only = index_snapshot.clone();
+        journal_only.leaves[0].locator = TerminalResultLocator::Journal {
+            writer_epoch: "writer-epoch-1".into(),
+            sequence: 1,
+        };
+        assert_eq!(restored_migration_binding(&journal_only), Ok(None));
+
+        let mut mixed = index_snapshot.clone();
+        let mut foreign = mixed.leaves[0].clone();
+        foreign.account_id = "f".repeat(64);
+        foreign.request_id = "foreign-request".into();
+        foreign.locator = TerminalResultLocator::Migration {
+            migration_id: sha256(b"another-migration"),
+            ordinal: 2,
+        };
+        mixed.leaves.push(foreign);
+        assert_eq!(
+            restored_migration_binding(&mixed),
+            Err("journal request index has multiple migrations".into())
+        );
 
         let record = &bundle.records[0];
         assert!(terminal_leaf_matches_migrated_record(
@@ -13676,21 +13750,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v71_migration_bundle_load_requires_one_canonical_content_address() {
+    async fn v71_migration_bundle_load_selects_only_the_index_bound_source() {
         let bundle = v71_migration_bundle("migration-1".into());
         let bytes = serde_cbor::to_vec(&bundle).unwrap();
         let key = journal_migration_key("epoch", 41, &bytes);
+        let migration_id = bundle.manifest.migration_id.clone();
         let (endpoint, log, server) = v71_mock_s3(vec![
             v71_listing_page(&[key.clone()], None),
             v71_http(200, &bytes),
         ])
         .await;
         let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Shadow);
-        assert_eq!(store.load_v70_migration_bundle().await, Ok(Some(bundle.clone())));
+        assert_eq!(
+            store.load_v70_migration_bundle(41, &migration_id).await,
+            Ok(Some(bundle.clone()))
+        );
         server.abort();
-        assert_eq!(log.lock().await.len(), 2);
+        let log = log.lock().await;
+        assert_eq!(log.len(), 2);
+        assert!(
+            log[0].0.contains(
+                "prefix=epoch%2fjournal-v71%2fmigrations%2f00000000000000000041-"
+            ),
+            "{}",
+            log[0].0
+        );
+        drop(log);
 
-        let twin = journal_migration_key("epoch", 42, b"twin");
+        // A second failed attempt at another source sequence is excluded by
+        // the S3 prefix. Only a twin at the bound sequence is ambiguous.
+        let twin = journal_migration_key("epoch", 41, b"twin");
         let (endpoint, log, server) = v71_mock_s3(vec![v71_listing_page(
             &[key.clone(), twin],
             None,
@@ -13698,7 +13787,7 @@ mod tests {
         .await;
         let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Shadow);
         assert_eq!(
-            store.load_v70_migration_bundle().await,
+            store.load_v70_migration_bundle(41, &migration_id).await,
             Err("journal migration bundle ambiguous".into())
         );
         server.abort();
@@ -13711,7 +13800,7 @@ mod tests {
         .await;
         let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Shadow);
         assert_eq!(
-            store.load_v70_migration_bundle().await,
+            store.load_v70_migration_bundle(41, &migration_id).await,
             Err("journal migration bundle content address mismatch".into())
         );
         server.abort();
@@ -15719,7 +15808,7 @@ mod tests {
                 Box::new(|_| {}),
                 Some(other_bundle),
                 fixture.head.clone(),
-                "v70 rollback migration bundle differs from restored lineage",
+                "journal migration bundle invalid",
             ),
             (
                 Box::new(|_| {}),
