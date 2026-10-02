@@ -5118,8 +5118,8 @@ enum CustomerAction {
     },
     CreditZenDeposit { transaction_hash: String, amount_atomic: String },
     CreditHorizenUsdcDeposit { transaction_hash: String, amount_atomic: String },
-    CreditUnifiedUsdcSourceDeposits {operation_id:String,amount_atomic:String,proof:UnifiedSourceDepositProof},
-    FinalizeUnifiedUsdcDeposit {operation_id:String,amount_atomic:String,source_custody_reference:String,
+    CreditUnifiedSourceDeposits {operation_id:String,asset:String,amount_atomic:String,proof:UnifiedSourceDepositProof},
+    FinalizeUnifiedDeposit {operation_id:String,asset:String,amount_atomic:String,source_custody_reference:String,
         horizen_transaction_hash:String},
     CreditArbitrumUsdcBusDeposit {operation_id:String,amount_atomic:String,proof:BusDepositProof},
     FinalizeArbitrumUsdcBusDeposit {operation_id:String,amount_atomic:String,proof:BusDepositFinalizationProof},
@@ -6181,47 +6181,55 @@ async fn command(
             }
         }
         CustomerAction::CreditArbitrumUsdcBusDeposit {..}|CustomerAction::FinalizeArbitrumUsdcBusDeposit {..}=>return (StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING").into_response(),
-        CustomerAction::CreditUnifiedUsdcSourceDeposits {operation_id,amount_atomic,proof} if !external_effect_pending => {
+        CustomerAction::CreditUnifiedSourceDeposits {operation_id,asset,amount_atomic,proof} if !external_effect_pending => {
             let Some(wallet)=claims.financial_wallet_address.as_deref() else {
                 return (StatusCode::FORBIDDEN,"DIRECT_FINANCIAL_WALLET_REQUIRED").into_response();
             };
-            if request_id!=format!("unified-usdc-deposit-credit:{operation_id}") {
+            if !matches!(asset.as_str(),"USDC"|"ZEN")
+                || request_id!=format!("unified-{}-deposit-credit:{operation_id}",asset.to_ascii_lowercase()) {
                 return (StatusCode::BAD_REQUEST,"DEPOSIT_IDEMPOTENCY_KEY_MISMATCH").into_response();
             }
             let Some(custody)=&state.unified_deposit_custody else {
                 return (StatusCode::SERVICE_UNAVAILABLE,"UNIFIED_DEPOSIT_CUSTODY_NOT_ENABLED").into_response();
             };
-            match custody.source_finality(wallet,&amount_atomic,&proof).await {
-                Ok(Some((custody_reference,source_references)))=>DirectAction::CreditUnifiedUsdcSourceDeposits {
-                    operation_id,source_chain:proof.source_chain,amount_atomic,custody_reference,source_references,
+            match custody.source_finality(wallet,&asset,&amount_atomic,&proof).await {
+                Ok(Some((custody_reference,source_references)))=>DirectAction::CreditUnifiedSourceDeposits {
+                    operation_id,asset,source_chain:proof.source_chain,amount_atomic,custody_reference,source_references,
                 },
                 Ok(None)=>return (StatusCode::SERVICE_UNAVAILABLE,"UNIFIED_DEPOSIT_SOURCE_FINALITY_PENDING").into_response(),
                 Err(_)=>return (StatusCode::CONFLICT,"UNIFIED_DEPOSIT_SOURCE_PROOF_CONFLICT").into_response(),
             }
         }
-        CustomerAction::FinalizeUnifiedUsdcDeposit {operation_id,amount_atomic,source_custody_reference,horizen_transaction_hash}
+        CustomerAction::FinalizeUnifiedDeposit {operation_id,asset,amount_atomic,source_custody_reference,horizen_transaction_hash}
             if !external_effect_pending => {
             let Some(wallet)=claims.financial_wallet_address.as_deref() else {
                 return (StatusCode::FORBIDDEN,"DIRECT_FINANCIAL_WALLET_REQUIRED").into_response();
             };
-            if request_id!=format!("unified-usdc-deposit-finalize:{operation_id}") {
+            if !matches!(asset.as_str(),"USDC"|"ZEN")
+                || request_id!=format!("unified-{}-deposit-finalize:{operation_id}",asset.to_ascii_lowercase()) {
                 return (StatusCode::BAD_REQUEST,"DEPOSIT_IDEMPOTENCY_KEY_MISMATCH").into_response();
             }
             let hash=horizen_transaction_hash.to_ascii_lowercase();
-            let Some(custody)=&state.usdc_custody else {
-                return (StatusCode::SERVICE_UNAVAILABLE,"USDC_CUSTODY_ADAPTER_NOT_ENABLED").into_response();
+            let finality=if asset=="USDC" {
+                let Some(custody)=&state.usdc_custody else {
+                    return (StatusCode::SERVICE_UNAVAILABLE,"USDC_CUSTODY_ADAPTER_NOT_ENABLED").into_response();
+                };custody.deposit_finality(wallet,&hash,&amount_atomic).await
+            } else {
+                let Some(custody)=&state.zen_custody else {
+                    return (StatusCode::SERVICE_UNAVAILABLE,"ZEN_CUSTODY_ADAPTER_NOT_ENABLED").into_response();
+                };custody.deposit_finality(wallet,&hash,&amount_atomic).await
             };
-            match custody.deposit_finality(wallet,&hash,&amount_atomic).await {
-                Ok(DepositFinality::Finalized)=>DirectAction::FinalizeUnifiedUsdcDeposit {
-                    operation_id,amount_atomic,source_custody_reference,
-                    custody_reference:format!("horizen-usdc-deposit:{hash}"),
+            match finality {
+                Ok(DepositFinality::Finalized)=>DirectAction::FinalizeUnifiedDeposit {
+                    operation_id,asset:asset.clone(),amount_atomic,source_custody_reference,
+                    custody_reference:format!("horizen-{}-deposit:{hash}",asset.to_ascii_lowercase()),
                 },
                 Ok(DepositFinality::Pending)=>return (StatusCode::SERVICE_UNAVAILABLE,"DEPOSIT_FINALITY_PENDING").into_response(),
                 Ok(DepositFinality::Reverted|DepositFinality::Conflict)=>return (StatusCode::CONFLICT,"DEPOSIT_TRANSACTION_BINDING_CONFLICT").into_response(),
                 Err(_)=>return (StatusCode::SERVICE_UNAVAILABLE,"DEPOSIT_FINALITY_UNAVAILABLE").into_response(),
             }
         }
-        CustomerAction::CreditUnifiedUsdcSourceDeposits {..}|CustomerAction::FinalizeUnifiedUsdcDeposit {..}=>
+        CustomerAction::CreditUnifiedSourceDeposits {..}|CustomerAction::FinalizeUnifiedDeposit {..}=>
             return (StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING").into_response(),
         CustomerAction::CreditHorizenUsdcDeposit {transaction_hash,amount_atomic} if !external_effect_pending => {
             let Some(source)=claims.financial_wallet_address.as_deref() else {return (StatusCode::FORBIDDEN,"DIRECT_FINANCIAL_WALLET_REQUIRED").into_response();};

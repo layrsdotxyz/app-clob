@@ -1,7 +1,8 @@
-//! Independent source-chain proof for unified USDC wallet deposits. The
+//! Independent source-chain proof for unified wallet deposits. The
 //! backend may discover a transfer, but only canonical RPC evidence can turn
-//! it into an enclave credit. Several transfers are verified as one batch so
-//! the five-USDC wallet threshold is crossed atomically.
+//! it into an enclave credit. Several USDC transfers are verified as one batch
+//! so the five-USDC wallet threshold is crossed atomically; ZEN uses the same
+//! proof boundary on its two supported source chains.
 use super::*;
 
 const TRANSFER_TOPIC: &str =
@@ -27,7 +28,7 @@ pub(super) struct UnifiedSourceDepositProof {
 #[derive(Clone)]
 struct ChainConfig {
     chain_id: u64,
-    token: String,
+    tokens: BTreeMap<String, String>,
     rpc_url: String,
     confirmations: u64,
 }
@@ -62,9 +63,21 @@ impl UnifiedDepositCustodyAdapter {
             let confirmations = env::var(format!("{prefix}_CONFIRMATIONS")).map_err(|_| format!("{prefix}_CONFIRMATIONS required"))?
                 .parse::<u64>().ok().filter(|value| *value > 0 && *value <= 10_000)
                 .ok_or_else(|| format!("{prefix}_CONFIRMATIONS invalid"))?;
-            let token = canonical_evm_address(&env::var(format!("{prefix}_TOKEN_ADDRESS"))
+            let usdc = canonical_evm_address(&env::var(format!("{prefix}_TOKEN_ADDRESS"))
                 .map_err(|_| format!("{prefix}_TOKEN_ADDRESS required"))?)?;
-            chains.insert(chain.into(), ChainConfig { chain_id, token, rpc_url, confirmations });
+            let mut tokens = BTreeMap::from([("USDC".into(), usdc)]);
+            if matches!(chain, "base" | "horizen") {
+                let zen = canonical_evm_address(&env::var(format!("{prefix}_ZEN_TOKEN_ADDRESS"))
+                    .map_err(|_| format!("{prefix}_ZEN_TOKEN_ADDRESS required"))?)?;
+                let expected = if chain == "base" {
+                    "0xf43eb8de897fbc7f2502483b2bef7bb9ea179229"
+                } else {
+                    "0x57da2d504bf8b83ef304759d9f2648522d7a9280"
+                };
+                if zen != expected { return Err(format!("{prefix}_ZEN_TOKEN_ADDRESS invalid")); }
+                tokens.insert("ZEN".into(), zen);
+            }
+            chains.insert(chain.into(), ChainConfig { chain_id, tokens, rpc_url, confirmations });
         }
         Ok(Some(Self {
             client: reqwest::Client::builder().timeout(Duration::from_secs(8)).build()
@@ -91,12 +104,18 @@ impl UnifiedDepositCustodyAdapter {
     pub async fn source_finality(
         &self,
         wallet: &str,
+        asset: &str,
         expected_amount: &str,
         proof: &UnifiedSourceDepositProof,
     ) -> Result<Option<(String, Vec<String>)>, String> {
         let wallet = canonical_evm_address(wallet)?;
         let config = self.chains.get(&proof.source_chain).ok_or("unified deposit chain unsupported")?;
-        let expected = expected_amount.parse::<u128>().ok().filter(|value| *value >= 5_000_000)
+        let token = config.tokens.get(asset).ok_or("unified deposit asset unsupported")?;
+        let expected = expected_amount.parse::<u128>().ok().filter(|value| match asset {
+            "USDC" => *value >= 5_000_000,
+            "ZEN" => *value > 0,
+            _ => false,
+        })
             .ok_or("unified deposit batch below minimum")?;
         if proof.transfers.is_empty() || proof.transfers.len() > 100 {
             return Err("unified deposit transfer batch invalid".into());
@@ -145,7 +164,7 @@ impl UnifiedDepositCustodyAdapter {
                     && log.get("transactionHash").and_then(Value::as_str).is_some_and(|value| value.eq_ignore_ascii_case(&hash))
                     && log.get("blockHash") == receipt.get("blockHash")
                     && log.get("blockNumber") == receipt.get("blockNumber")
-                    && log.get("address").and_then(Value::as_str).is_some_and(|value| value.eq_ignore_ascii_case(&config.token))
+                    && log.get("address").and_then(Value::as_str).is_some_and(|value| value.eq_ignore_ascii_case(token))
                     && log.get("topics").and_then(Value::as_array).is_some_and(|topics| topics.len() == 3
                         && topics[0].as_str().is_some_and(|value| value.eq_ignore_ascii_case(TRANSFER_TOPIC))
                         && topics[1].as_str().is_some_and(|value| !value.eq_ignore_ascii_case(ZERO_ADDRESS_TOPIC))
@@ -156,7 +175,7 @@ impl UnifiedDepositCustodyAdapter {
                 return Err("unified deposit transfer proof conflict".into());
             }
             total = total.checked_add(amount).ok_or("unified deposit amount overflow")?;
-            references.push(format!("unified-usdc-transfer:{}:{hash}:{log_index}:{amount}", proof.source_chain));
+            references.push(format!("unified-{}-transfer:{}:{hash}:{log_index}:{amount}", asset.to_ascii_lowercase(), proof.source_chain));
         }
         if total != expected {
             return Err("unified deposit batch amount conflict".into());
@@ -168,6 +187,6 @@ impl UnifiedDepositCustodyAdapter {
         }
         let digest = sha256(&serde_json::to_vec(&(proof.source_chain.as_str(), &references))
             .map_err(|_| "unified deposit binding unavailable")?);
-        Ok(Some((format!("unified-usdc-source:{}:{digest}", proof.source_chain), references)))
+        Ok(Some((format!("unified-{}-source:{}:{digest}", asset.to_ascii_lowercase(), proof.source_chain), references)))
     }
 }
