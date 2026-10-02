@@ -54,5 +54,22 @@ class RuntimeMeasurementChangeTest(unittest.TestCase):
         self.assertTrue(MODULE.runtime_measurement_changed(current, candidate))
 
 
+class ProductionWriterCapacityZeroTest(unittest.TestCase):
+    def test_accepts_exact_capacity_zero_state(self):
+        self.assertTrue(MODULE.production_writer_is_capacity_zero({
+            "MinSize": 0, "MaxSize": 1, "DesiredCapacity": 0, "Instances": [],
+        }))
+
+    def test_rejects_live_pending_or_nonzero_floor(self):
+        base = {"MinSize": 0, "MaxSize": 1, "DesiredCapacity": 0, "Instances": []}
+        for changed in (
+            {**base, "MinSize": 1},
+            {**base, "MaxSize": 2},
+            {**base, "DesiredCapacity": 1},
+            {**base, "Instances": [{"LifecycleState": "Terminating"}]},
+        ):
+            self.assertFalse(MODULE.production_writer_is_capacity_zero(changed))
+
+
 if __name__ == "__main__":
     unittest.main()

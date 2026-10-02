@@ -106,6 +106,16 @@ def production_writer_is_single_and_live(group: dict) -> bool:
     )
 
 
+def production_writer_is_capacity_zero(group: dict) -> bool:
+    """A cold runtime rotation installs its successor only after the writer is gone."""
+    return (
+        group.get("MinSize") == 0
+        and group.get("MaxSize") == 1
+        and group.get("DesiredCapacity") == 0
+        and len(group.get("Instances", [])) == 0
+    )
+
+
 def runtime_measurement_changed(current_grant: dict, approved_binding: dict) -> bool:
     """Bind prepared-artifact evidence to whether this is a runtime upgrade."""
     return current_grant.get("runtimeMeasurement") != approved_binding
@@ -152,7 +162,7 @@ class Rotator:
             ca_path.unlink(missing_ok=True)
         return connection
 
-    def assert_target_in_session(self, cursor) -> dict:
+    def assert_target_in_session(self, cursor, production_writer_mode: str = "live") -> dict:
         if self.sts.get_caller_identity().get("Account") != ACCOUNT:
             fail("AWS_ACCOUNT_MISMATCH")
         groups = self.session.client("autoscaling").describe_auto_scaling_groups(
@@ -161,7 +171,14 @@ class Rotator:
         if len(groups) != 1:
             fail("PRODUCTION_ASG_COUNT")
         if self.target_name == "production":
-            if not production_writer_is_single_and_live(groups[0]):
+            valid_writer_state = (
+                production_writer_is_single_and_live(groups[0])
+                if production_writer_mode == "live"
+                else production_writer_is_capacity_zero(groups[0])
+                if production_writer_mode == "zero"
+                else False
+            )
+            if not valid_writer_state:
                 fail("PRODUCTION_WRITER_NOT_SINGLE_AND_LIVE")
         cluster = self.rds.describe_db_clusters(DBClusterIdentifier=self.target["cluster"])["DBClusters"]
         if len(cluster) != 1 or cluster[0]["Endpoint"] != self.target["endpoint"]:
@@ -471,6 +488,9 @@ class Rotator:
         now = int(time.time())
         successor = json.loads(successor_path.read_text(encoding="utf-8"))
         evidence = json.loads(prepared_evidence_path.read_text(encoding="utf-8"))
+        if not isinstance(evidence.get("runtimeChanged"), bool):
+            fail("PREPARED_RUNTIME_CHANGED_INVALID")
+        production_writer_mode = "zero" if evidence["runtimeChanged"] else "live"
         binding = self.runtime_binding(binding_path)
         work = Path(tempfile.mkdtemp(prefix="layrs-successor-install-", dir="/dev/shm"))
         os.chmod(work, 0o700)
@@ -482,7 +502,7 @@ class Rotator:
             connection.set_session(isolation_level="SERIALIZABLE", readonly=False, autocommit=False)
             cursor = connection.cursor()
             cursor.execute("SET LOCAL lock_timeout='5s'; SET LOCAL statement_timeout='30s'")
-            target_evidence = self.assert_target_in_session(cursor)
+            target_evidence = self.assert_target_in_session(cursor, production_writer_mode)
             current = self.current_authorization(cursor, for_update=True)
             write_new(current_path, json.dumps(current["grant"], separators=(",", ":")).encode())
             source = self.current_artifact(current["activation"], predecessor_artifact_path)
@@ -535,7 +555,7 @@ class Rotator:
             after = self.current_authorization(cursor, for_update=False)
             if after["activation"] != activation or after["grant"] != successor:
                 fail("SUCCESSOR_READBACK_MISMATCH")
-            if self.assert_target_in_session(cursor) != target_evidence:
+            if self.assert_target_in_session(cursor, production_writer_mode) != target_evidence:
                 fail("SQL_SESSION_TARGET_CHANGED")
             connection.commit()
             return {
