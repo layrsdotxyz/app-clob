@@ -240,6 +240,11 @@ impl AppState {
 struct ParentHealth {
     restored: AtomicBool,
     last_response_at: AtomicU64,
+    /// A checkpoint seal deliberately occupies the enclave's serialized
+    /// request path, so the background status observer cannot respond while
+    /// it runs. This timestamp grants only that bounded operation a health
+    /// pause; its RAII guard clears the pause on every return path.
+    checkpoint_seal_started_at: AtomicU64,
     /// Once the immutable v71 cutover marker exists, an unconfirmed enclave
     /// promotion is process-fatal. The financial gate remains held and health
     /// stays failed until the ASG replaces this parent and restores the marker.
@@ -249,10 +254,30 @@ const HEALTH_FRESHNESS_SECONDS: u64 = 45;
 
 impl ParentHealth {
     fn observe(&self, now: u64) { self.last_response_at.store(now, Ordering::Release); }
+    fn pause_for_checkpoint(&self, now: u64) -> CheckpointHealthPause<'_> {
+        let started_at = now.max(1);
+        self.checkpoint_seal_started_at
+            .store(started_at, Ordering::Release);
+        CheckpointHealthPause {
+            health: self,
+            started_at,
+        }
+    }
     fn check(&self, now: u64, last_commit: u64, stalled_waiter: bool, grant_expired: bool) -> Result<(), &'static str> {
         if !self.restored.load(Ordering::Acquire) { return Err("DIRECT_STATE_RECOVERY_REQUIRED"); }
         if self.cutover_uncertain.load(Ordering::Acquire) { return Err("V71_CUTOVER_CONFIRMATION_UNCERTAIN"); }
         if grant_expired { return Err("WRITER_AUTHORIZATION_EXPIRED"); }
+        let checkpoint_started_at = self.checkpoint_seal_started_at.load(Ordering::Acquire);
+        if checkpoint_started_at != 0 {
+            return if now
+                .checked_sub(checkpoint_started_at)
+                .is_some_and(|age| age <= CHECKPOINT_EXCHANGE_TIMEOUT.as_secs())
+            {
+                Ok(())
+            } else {
+                Err("CHECKPOINT_SEAL_STALLED")
+            };
+        }
         let commit_recent = last_commit != 0 && now.checked_sub(last_commit).is_some_and(|age| age < WRITE_PATH_STALL_THRESHOLD.as_secs());
         if stalled_waiter && !commit_recent { return Err("WRITE_PATH_STALLED"); }
         let last = self.last_response_at.load(Ordering::Acquire).max(last_commit);
@@ -260,6 +285,22 @@ impl ParentHealth {
             return Err("ENCLOSURE_UNAVAILABLE");
         }
         Ok(())
+    }
+}
+
+struct CheckpointHealthPause<'a> {
+    health: &'a ParentHealth,
+    started_at: u64,
+}
+
+impl Drop for CheckpointHealthPause<'_> {
+    fn drop(&mut self) {
+        let _ = self.health.checkpoint_seal_started_at.compare_exchange(
+            self.started_at,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 }
 
@@ -2891,8 +2932,11 @@ impl S3ImmutableArtifactStore {
         let artifact: DirectStateArtifact = serde_cbor::from_slice(&self.read(&key).await?)
             .map_err(|_| "checkpoint head decode failed")?;
         if receipt_only_record(&artifact) != *head { return Err("checkpoint head mismatch".into()); }
+        let health_pause = state.health.pause_for_checkpoint(now_unix());
         let response = exchange_with_timeout(state, RuntimeRequest::SealCheckpoint { artifact, receipt_records: records, artifact_hashes }, CHECKPOINT_EXCHANGE_TIMEOUT)
             .await.map_err(|error| if frame_oversized(&error) { CHECKPOINT_OVERSIZED } else { "checkpoint seal transport failed" })?;
+        state.health.observe(now_unix());
+        drop(health_pause);
         let checkpoint = match response {
             RuntimeResponse::CheckpointSealed { checkpoint } => checkpoint,
             RuntimeResponse::Error { code } if code == CHECKPOINT_FRAME_OVERSIZED => return Err(CHECKPOINT_OVERSIZED.into()),
@@ -2929,6 +2973,7 @@ impl S3ImmutableArtifactStore {
         if !journal_checkpoint_due(head.sequence, last_checkpoint) {
             return Ok(());
         }
+        let health_pause = state.health.pause_for_checkpoint(now_unix());
         let response = exchange_with_timeout(
             state,
             RuntimeRequest::SealJournalCheckpoint,
@@ -2936,6 +2981,8 @@ impl S3ImmutableArtifactStore {
         )
         .await
         .map_err(|_| "journal checkpoint seal transport failed")?;
+        state.health.observe(now_unix());
+        drop(health_pause);
         let checkpoint = match response {
             RuntimeResponse::JournalCheckpointSealed { checkpoint }
                 if checkpoint.writer_epoch == head.writer_epoch
@@ -11361,6 +11408,39 @@ mod tests {
         assert_eq!(health.check(160, 99, true, false), Err("WRITE_PATH_STALLED"));
         assert_eq!(health.check(160, 160, false, true), Err("WRITER_AUTHORIZATION_EXPIRED"));
         assert_eq!(health.check(159, 0, false, false), Err("ENCLOSURE_UNAVAILABLE")); // clock regression
+    }
+
+    #[test]
+    fn health_pauses_only_for_a_bounded_checkpoint_seal() {
+        let health = ParentHealth::default();
+        assert_eq!(
+            health.check(100, 0, false, false),
+            Err("DIRECT_STATE_RECOVERY_REQUIRED")
+        );
+        health.restored.store(true, Ordering::Release);
+        health.observe(100);
+        {
+            let _pause = health.pause_for_checkpoint(100);
+            assert_eq!(health.check(152, 0, true, false), Ok(()));
+            assert_eq!(
+                health.check(152, 0, true, true),
+                Err("WRITER_AUTHORIZATION_EXPIRED")
+            );
+            health.cutover_uncertain.store(true, Ordering::Release);
+            assert_eq!(
+                health.check(152, 0, true, false),
+                Err("V71_CUTOVER_CONFIRMATION_UNCERTAIN")
+            );
+            health.cutover_uncertain.store(false, Ordering::Release);
+            assert_eq!(
+                health.check(401, 0, true, false),
+                Err("CHECKPOINT_SEAL_STALLED")
+            );
+        }
+        assert_eq!(
+            health.check(152, 0, true, false),
+            Err("WRITE_PATH_STALLED")
+        );
     }
 
     #[tokio::test]
