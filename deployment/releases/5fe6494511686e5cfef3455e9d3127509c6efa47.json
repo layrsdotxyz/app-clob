@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 2,
+  "releaseStatus": "validated-candidate-not-deployed",
+  "releaseId": "unified-20261002-5fe6494",
+  "sourceCommit": "5fe6494511686e5cfef3455e9d3127509c6efa47",
+  "sourceBranch": "main",
+  "region": "us-east-1",
+  "candidate": {
+    "amiId": "ami-02608d2bc5bdf2419",
+    "amiName": "layrs-opening-epoch-unified-20261002-5fe6494",
+    "amiSnapshotId": "snap-06a8d213ed8fa366a",
+    "createdAt": "2026-10-02T05:40:46.000Z",
+    "parentSha256": "206dd63baccafec4f362b18011468c55a4b8ec0d5e02f6e40820427e213398bc",
+    "enclaveSha256": "edee6e82c1fe1fc9c7ce56a19b41c97baacb6e00b8c7a910043683bb0b0a6ee6",
+    "eifSha256": "1193ead635cb196c0d980cc393fcc0d285895d02356c916a73a309575310f9a6",
+    "pcr0": "b9091da0b168ea48cc9d655543060f4943ae2ba038166d7249c277c442279c496dc70e1c2239cea8a12ad2de22690d5b",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "060a2293ba87c4c8065f7ce96b45e6859db2a6b680efd54a8189683b8801515750e33465be84135b8febcae27b89b392",
+    "encrypted": true,
+    "deregistrationProtection": "enabled-without-cooldown",
+    "productionAccess": "denied",
+    "writerEnabled": false
+  },
+  "verification": {
+    "library": "122 passed, 3 ignored",
+    "enclave": "36 passed, 1 ignored",
+    "parent": "134 passed, 1 ignored",
+    "template": "6 passed",
+    "releaseBuild": "canonical locked parent container build passed",
+    "imageInspection": "encrypted, deregistration protected, production access denied, parent hash matched the canonical build, EIF hash and PCR0/PCR1/PCR2 matched the prior tested candidate"
+  },
+  "scope": [
+    "source-final deposit credit with per-deposit in-transit withdrawal restriction",
+    "asset-bound unified deposits and signed withdrawals",
+    "in-place writer-grant renewal without writer recycle",
+    "checkpoint health freshness fix",
+    "stale migration bundle selection fix",
+    "exact BNB 18-decimal source receipt normalization to 6-decimal USDC ledger units",
+    "exact seven-chain unified source adapter set"
+  ],
+  "activation": null,
+  "signature": null,
+  "productionMutation": false
+}
