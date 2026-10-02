@@ -48,11 +48,10 @@ impl UnifiedDepositCustodyAdapter {
             return Ok(None);
         }
         let mut chains = BTreeMap::new();
-        for chain in ["ethereum", "base", "arbitrum", "optimism", "polygon", "bnb", "tempo", "robinhood", "horizen"] {
+        for chain in ["ethereum", "base", "arbitrum", "optimism", "polygon", "bnb", "horizen"] {
             let prefix = format!("LAYRS_UNIFIED_{}", chain.to_ascii_uppercase());
             let rpc_url = match env::var(format!("{prefix}_RPC_URL")) {
                 Ok(value) if !value.trim().is_empty() => value,
-                _ if matches!(chain, "tempo" | "robinhood") => continue,
                 _ => return Err(format!("{prefix}_RPC_URL required")),
             };
             let mut rpc_urls = vec![rpc_url];
