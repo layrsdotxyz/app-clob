@@ -28,10 +28,13 @@ pub(super) struct UnifiedSourceDepositProof {
 #[derive(Clone)]
 struct ChainConfig {
     chain_id: u64,
-    tokens: BTreeMap<String, String>,
+    tokens: BTreeMap<String, TokenConfig>,
     rpc_urls: Vec<String>,
     confirmations: u64,
 }
+
+#[derive(Clone)]
+struct TokenConfig { address: String, source_decimals: u32, ledger_decimals: u32 }
 
 #[derive(Clone)]
 pub(super) struct UnifiedDepositCustodyAdapter {
@@ -78,7 +81,8 @@ impl UnifiedDepositCustodyAdapter {
                 .ok_or_else(|| format!("{prefix}_CONFIRMATIONS invalid"))?;
             let usdc = canonical_evm_address(&env::var(format!("{prefix}_TOKEN_ADDRESS"))
                 .map_err(|_| format!("{prefix}_TOKEN_ADDRESS required"))?)?;
-            let mut tokens = BTreeMap::from([("USDC".into(), usdc)]);
+            let mut tokens = BTreeMap::from([("USDC".into(),TokenConfig {address:usdc,
+                source_decimals:if chain=="bnb" {18}else{6},ledger_decimals:6})]);
             if matches!(chain, "base" | "horizen") {
                 let zen = canonical_evm_address(&env::var(format!("{prefix}_ZEN_TOKEN_ADDRESS"))
                     .map_err(|_| format!("{prefix}_ZEN_TOKEN_ADDRESS required"))?)?;
@@ -88,7 +92,7 @@ impl UnifiedDepositCustodyAdapter {
                     "0x57da2d504bf8b83ef304759d9f2648522d7a9280"
                 };
                 if zen != expected { return Err(format!("{prefix}_ZEN_TOKEN_ADDRESS invalid")); }
-                tokens.insert("ZEN".into(), zen);
+                tokens.insert("ZEN".into(),TokenConfig {address:zen,source_decimals:18,ledger_decimals:18});
             }
             chains.insert(chain.into(), ChainConfig { chain_id, tokens, rpc_urls, confirmations });
         }
@@ -182,7 +186,7 @@ impl UnifiedDepositCustodyAdapter {
                     && log.get("transactionHash").and_then(Value::as_str).is_some_and(|value| value.eq_ignore_ascii_case(&hash))
                     && log.get("blockHash") == receipt.get("blockHash")
                     && log.get("blockNumber") == receipt.get("blockNumber")
-                    && log.get("address").and_then(Value::as_str).is_some_and(|value| value.eq_ignore_ascii_case(token))
+                    && log.get("address").and_then(Value::as_str).is_some_and(|value| value.eq_ignore_ascii_case(&token.address))
                     && log.get("topics").and_then(Value::as_array).is_some_and(|topics| topics.len() == 3
                         && topics[0].as_str().is_some_and(|value| value.eq_ignore_ascii_case(TRANSFER_TOPIC))
                         && topics[1].as_str().is_some_and(|value| !value.eq_ignore_ascii_case(ZERO_ADDRESS_TOPIC))
@@ -195,7 +199,7 @@ impl UnifiedDepositCustodyAdapter {
             total = total.checked_add(amount).ok_or("unified deposit amount overflow")?;
             references.push(format!("unified-{}-transfer:{}:{hash}:{log_index}:{amount}", asset.to_ascii_lowercase(), proof.source_chain));
         }
-        if total != expected {
+        if normalize_source_amount(total,token.source_decimals,token.ledger_decimals)? != expected {
             return Err("unified deposit batch amount conflict".into());
         }
         references.sort();
@@ -209,10 +213,25 @@ impl UnifiedDepositCustodyAdapter {
     }
 }
 
+fn normalize_source_amount(amount:u128,source_decimals:u32,ledger_decimals:u32)->Result<u128,String>{
+    if source_decimals==ledger_decimals{return Ok(amount);}
+    if source_decimals<ledger_decimals{let scale=10u128.checked_pow(ledger_decimals-source_decimals)
+        .ok_or("unified deposit amount overflow")?;return amount.checked_mul(scale)
+        .ok_or_else(||"unified deposit amount overflow".into());}
+    let scale=10u128.checked_pow(source_decimals-ledger_decimals).ok_or("unified deposit amount overflow")?;
+    if amount%scale!=0{return Err("unified deposit source precision invalid".into());}Ok(amount/scale)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{http::StatusCode, routing::post, Json, Router};
+
+    #[test]
+    fn bnb_usdc_normalizes_to_six_decimal_ledger_units_without_rounding(){
+        assert_eq!(normalize_source_amount(5_000_000_000_000_000_000,18,6).unwrap(),5_000_000);
+        assert!(normalize_source_amount(5_000_000_000_000_000_001,18,6).is_err());
+    }
 
     #[tokio::test]
     async fn rpc_uses_the_second_provider_after_primary_failure() {
