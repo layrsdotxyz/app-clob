@@ -40,6 +40,8 @@ test('candidate ASG health grace remains above measured restore plus margin',()=
   const seconds=Number(match[1]);
   assert.equal(seconds,3600);
   assert.ok(seconds>=25*60,'health grace must exceed the restore-based hard-abort floor');
+  assert.match(template,/HealthCheckIntervalSeconds: 30/);
+  assert.match(template,/UnhealthyThresholdCount: 8/);
 });
 
 test('hot grant renewal stages a restart-safe successor without replacing the writer',()=>{

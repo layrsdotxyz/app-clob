@@ -490,9 +490,13 @@ Resources:
       HealthCheckProtocol: HTTP
       HealthCheckPort: '8443'
       HealthCheckPath: /healthz
+      HealthCheckIntervalSeconds: 30
       Matcher: { HttpCode: '200-399' }
       HealthyThresholdCount: 3
-      UnhealthyThresholdCount: 3
+      # A verified cold restore has taken more than four minutes. Preserve the
+      # live incident mitigation so normal initial health does not cross the
+      # unhealthy boundary before the parent begins listening.
+      UnhealthyThresholdCount: 8
   ReadOnlyRuntimeListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
