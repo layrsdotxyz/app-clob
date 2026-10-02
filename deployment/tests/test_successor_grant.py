@@ -53,6 +53,11 @@ class RuntimeMeasurementChangeTest(unittest.TestCase):
         candidate = {"amiId": "ami-next", "pcr0": "next"}
         self.assertTrue(MODULE.runtime_measurement_changed(current, candidate))
 
+    def test_runtime_binding_source_commit_is_used_for_successor_identity(self):
+        source = Path(MODULE.__file__).read_text(encoding="utf-8")
+        self.assertIn("runtime_binding['sourceCommit'][:7]", source)
+        self.assertNotIn("current['grant']['runtimeMeasurement']['sourceCommit'][:7]", source)
+
 
 class ProductionWriterCapacityZeroTest(unittest.TestCase):
     def test_accepts_exact_capacity_zero_state(self):

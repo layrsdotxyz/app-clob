@@ -32,6 +32,7 @@ EPOCH = "layrs-opening-epoch-20260911-941107537728c98b"
 MIGRATION_SECRET = "layrsv2/fresh-epoch-20260826/database/migration"
 CA_SECRET = "layrs/production/runtime/green-core-5658a29-20260909"
 PRODUCTION_ASG = "layrs-production-direct-execution-dormant-DormantAutoScalingGroup-7IpwwCXpbuJL"
+CLONE_ASG = "layrs-v71-ancestor-rehearsal-20261001"
 HELPER = Path(os.environ.get(
     "LAYRS_WRITER_GRANT_HELPER",
     Path(__file__).parents[1] / "enclave/direct-execution-v1/target/release/writer-grant-helper",
@@ -45,6 +46,7 @@ TARGETS = {
         "prefix": "direct-execution/rehearsal-v71-cutover-ancestor-20261001",
         "activation_prefix": "layrs-v71-ancestor-rehearsal",
         "required_tag": ("RehearsalId", "v71-ancestor-20261001"),
+        "asg": CLONE_ASG,
     },
     "production": {
         "cluster": "layrsv2-fresh-epoch-20260826-aurora",
@@ -53,6 +55,7 @@ TARGETS = {
         "prefix": "direct-execution/layrs-opening-epoch-20260911-941107537728c98b",
         "activation_prefix": "layrs-v71",
         "required_tag": None,
+        "asg": PRODUCTION_ASG,
     },
 }
 
@@ -166,20 +169,19 @@ class Rotator:
         if self.sts.get_caller_identity().get("Account") != ACCOUNT:
             fail("AWS_ACCOUNT_MISMATCH")
         groups = self.session.client("autoscaling").describe_auto_scaling_groups(
-            AutoScalingGroupNames=[PRODUCTION_ASG]
+            AutoScalingGroupNames=[self.target["asg"]]
         )["AutoScalingGroups"]
         if len(groups) != 1:
-            fail("PRODUCTION_ASG_COUNT")
-        if self.target_name == "production":
-            valid_writer_state = (
-                production_writer_is_single_and_live(groups[0])
-                if production_writer_mode == "live"
-                else production_writer_is_capacity_zero(groups[0])
-                if production_writer_mode == "zero"
-                else False
-            )
-            if not valid_writer_state:
-                fail("PRODUCTION_WRITER_NOT_SINGLE_AND_LIVE")
+            fail("TARGET_ASG_COUNT")
+        valid_writer_state = (
+            production_writer_is_single_and_live(groups[0])
+            if production_writer_mode == "live"
+            else production_writer_is_capacity_zero(groups[0])
+            if production_writer_mode == "zero"
+            else False
+        )
+        if not valid_writer_state:
+            fail("TARGET_WRITER_STATE_INVALID")
         cluster = self.rds.describe_db_clusters(DBClusterIdentifier=self.target["cluster"])["DBClusters"]
         if len(cluster) != 1 or cluster[0]["Endpoint"] != self.target["endpoint"]:
             fail("TARGET_CLUSTER_CONTROL_PLANE_MISMATCH")
@@ -340,7 +342,7 @@ class Rotator:
                 fail("PREDECESSOR_ACTIVATION_MISMATCH")
             activation = (
                 f"{self.target['activation_prefix']}-"
-                f"{current['grant']['runtimeMeasurement']['sourceCommit'][:7]}-"
+                f"{runtime_binding['sourceCommit'][:7]}-"
                 f"{time.strftime('%Y%m%d', time.gmtime(now))}-{secrets.token_hex(4)}"
             )
             successor = dict(current["grant"])
@@ -579,10 +581,114 @@ class Rotator:
         finally:
             connection.close()
 
+    def install_cold(
+        self,
+        successor_path: Path,
+        binding_path: Path,
+        renew_expired_predecessor: bool = False,
+    ) -> dict:
+        """Install a runtime-changing successor while the exact target writer is stopped.
+
+        The old runtime cannot create an artifact for a grant bound to a new
+        runtime measurement. The new runtime creates that immutable successor
+        artifact from the verified predecessor during governed bootstrap.
+        """
+        if not str(successor_path).startswith("/dev/shm/") \
+                or stat.S_IMODE(successor_path.stat().st_mode) & 0o077:
+            fail("SUCCESSOR_MUST_BE_PRIVATE_TMPFS")
+        now = int(time.time())
+        successor = json.loads(successor_path.read_text(encoding="utf-8"))
+        binding = self.runtime_binding(binding_path)
+        work = Path(tempfile.mkdtemp(prefix="layrs-successor-cold-install-", dir="/dev/shm"))
+        os.chmod(work, 0o700)
+        current_path = work / "current.json"
+        predecessor_artifact_path = work / "predecessor.cbor"
+        connection = self.connect()
+        try:
+            connection.set_session(isolation_level="SERIALIZABLE", readonly=False, autocommit=False)
+            cursor = connection.cursor()
+            cursor.execute("SET LOCAL lock_timeout='5s'; SET LOCAL statement_timeout='30s'")
+            target_evidence = self.assert_target_in_session(cursor, "zero")
+            current = self.current_authorization(cursor, for_update=True)
+            if current["expiry"] <= now:
+                if not renew_expired_predecessor or current["expiry"] < 2:
+                    fail("PREDECESSOR_GRANT_EXPIRED")
+                predecessor_verify_time = current["expiry"] - 1
+                expired_predecessor_renewed = True
+            else:
+                if renew_expired_predecessor:
+                    fail("PREDECESSOR_NOT_EXPIRED")
+                predecessor_verify_time = now
+                expired_predecessor_renewed = False
+            write_new(current_path, json.dumps(current["grant"], separators=(",", ":")).encode())
+            source = self.current_artifact(current["activation"], predecessor_artifact_path)
+            predecessor = run_helper(
+                "verify-predecessor", str(current_path), str(predecessor_artifact_path),
+                str(predecessor_verify_time),
+            )
+            verified = run_helper(
+                "verify-successor", str(current_path), str(predecessor_artifact_path),
+                str(successor_path), str(binding_path), str(predecessor_verify_time), str(now),
+            )
+            if not runtime_measurement_changed(current["grant"], binding):
+                fail("COLD_INSTALL_REQUIRES_RUNTIME_CHANGE")
+            activation = verified.get("successorActivationId")
+            commitment = verified.get("successorGrantCommitment")
+            expiry = int(verified.get("expiresAtUnix", "0"))
+            if successor.get("activationId") != activation \
+                    or int(successor.get("expiresAtUnix", 0)) != expiry:
+                fail("SUCCESSOR_GRANT_METADATA_MISMATCH")
+            cursor.execute(
+                """UPDATE layrs_direct_v1.direct_execution_writer_grants
+                      SET activation_id=%s, expires_at_unix=%s, grant_json=%s::jsonb,
+                          applied_at=transaction_timestamp()
+                    WHERE epoch_id=%s AND activation_id=%s
+                      AND expires_at_unix=%s AND grant_json=%s::jsonb""",
+                (activation, expiry, successor_path.read_text(), EPOCH, current["activation"],
+                 current["expiry"], current_path.read_text()),
+            )
+            if cursor.rowcount != 1:
+                fail("GRANT_UPDATE_COUNT")
+            cursor.execute(
+                """UPDATE layrs_direct_v1.direct_execution_writer_fence
+                      SET activation_id=%s, changed_at=transaction_timestamp()
+                    WHERE epoch_id=%s AND activation_id=%s
+                      AND old_writer_authorized=FALSE AND target_writer_enabled=TRUE""",
+                (activation, EPOCH, current["activation"]),
+            )
+            if cursor.rowcount != 1:
+                fail("FENCE_UPDATE_COUNT")
+            after = self.current_authorization(cursor, for_update=False)
+            if after["activation"] != activation or after["grant"] != successor:
+                fail("SUCCESSOR_READBACK_MISMATCH")
+            if self.assert_target_in_session(cursor, "zero") != target_evidence:
+                fail("SQL_SESSION_TARGET_CHANGED")
+            connection.commit()
+            return {
+                "status": "SUCCESSOR_GRANT_COLD_DATABASE_CAS_APPLIED",
+                "target": self.target_name,
+                "clusterIdentifier": target_evidence["clusterIdentifier"],
+                "productionAddressExcluded": target_evidence["productionAddressExcluded"],
+                "predecessorActivationId": predecessor["activationId"],
+                "predecessorArtifactHash": predecessor["artifactHash"],
+                "predecessorObjectVersionId": source["versionId"],
+                "successorActivationId": activation,
+                "successorGrantCommitment": commitment,
+                "expiresAtUnix": expiry,
+                "runtimeAmiId": binding["amiId"],
+                "runtimeChanged": True,
+                "expiredPredecessorRenewed": expired_predecessor_renewed,
+            }
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("operation", choices=("prepare", "install"))
+    parser.add_argument("operation", choices=("prepare", "install", "install-cold"))
     parser.add_argument("--target", choices=sorted(TARGETS), required=True)
     parser.add_argument("--connect-host", default="127.0.0.1")
     parser.add_argument("--connect-port", type=int, default=55432)
@@ -596,7 +702,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.valid_seconds < 3600 or args.valid_seconds > 7 * 24 * 60 * 60:
         fail("VALIDITY_OUT_OF_RANGE")
-    if args.target == "production" and args.operation == "install" \
+    if args.target == "production" and args.operation in ("install", "install-cold") \
             and args.confirm_production_mutation != "APPROVE_PRODUCTION_WRITER_GRANT_HOT_RENEWAL":
         fail("PRODUCTION_CONFIRMATION_REQUIRED")
     rotator = Rotator(args.target, args.connect_host, args.connect_port)
@@ -607,11 +713,17 @@ def main() -> None:
             Path(args.output), args.valid_seconds, Path(args.runtime_binding),
             args.renew_expired_predecessor, apply_database=False,
         )
-    else:
+    elif args.operation == "install":
         if not args.successor or not args.prepared_evidence or args.output or args.renew_expired_predecessor:
             fail("INSTALL_ARGUMENTS_INVALID")
         result = rotator.install_prepared(
             Path(args.successor), Path(args.prepared_evidence), Path(args.runtime_binding)
+        )
+    else:
+        if not args.successor or args.prepared_evidence or args.output:
+            fail("INSTALL_COLD_ARGUMENTS_INVALID")
+        result = rotator.install_cold(
+            Path(args.successor), Path(args.runtime_binding), args.renew_expired_predecessor
         )
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
 
