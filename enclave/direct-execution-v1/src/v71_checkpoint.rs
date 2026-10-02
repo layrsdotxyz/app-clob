@@ -19,8 +19,10 @@ use thiserror::Error;
 
 use crate::{
     amount, sha256, valid_bus_deposit_reference, valid_bus_withdrawal_id,
-    valid_layrs_withdrawal_destination, ConditionalUsdcDeposit, DirectMarketResolutionRecord,
-    DirectRuntime, MarketConfig, OrderReservation, Outcome, PriceTimeBook, UsdcBusHold, EPOCH_ID,
+    valid_layrs_withdrawal_destination, valid_unified_source_chain,
+    valid_unified_source_custody_reference, valid_unified_source_reference,
+    ConditionalUsdcDeposit, DirectMarketResolutionRecord, DirectRuntime, MarketConfig,
+    OrderReservation, Outcome, PriceTimeBook, UsdcBusHold, EPOCH_ID,
 };
 
 pub const DIRECT_V71_CHECKPOINT_PROTOCOL: &str = "layrs.direct-execution.checkpoint.v71";
@@ -327,10 +329,41 @@ impl V71FinancialState {
         let mut pending_wallets = BTreeSet::new();
         for (operation, pending) in &self.conditional_usdc_deposits {
             let value = amount(&pending.amount_atomic).map_err(|_| V71CheckpointError::Invalid)?;
+            let asset = pending.asset_name();
+            let unified = !pending.source_chain.is_empty() || !pending.source_references.is_empty();
+            let reference_valid = if unified {
+                matches!(asset, "USDC" | "ZEN")
+                    && (asset != "USDC" || value >= 5_000_000)
+                    && (asset != "ZEN" || value > 0)
+                    && valid_unified_source_chain(&pending.source_chain)
+                    && (asset != "ZEN" || pending.source_chain == "horizen")
+                    && valid_unified_source_custody_reference(&pending.boarding_reference, asset)
+                    && !pending.source_references.is_empty()
+                    && pending
+                        .source_references
+                        .iter()
+                        .all(|reference| {
+                            valid_unified_source_reference(reference, &pending.source_chain, asset)
+                                && self.credited_custody_references.contains(reference)
+                        })
+                    && pending.source_references.iter().collect::<BTreeSet<_>>().len()
+                        == pending.source_references.len()
+                    && self.credited_custody_references.contains(&format!(
+                        "unified-{}-operation:{operation}",
+                        asset.to_ascii_lowercase()
+                    ))
+            } else {
+                asset == "USDC"
+                    && value >= 5_000_000
+                    && valid_bus_deposit_reference(&pending.boarding_reference)
+                    && self
+                        .credited_custody_references
+                        .contains(&format!("arbitrum-usdc-bus-operation:{operation}"))
+                    && pending_wallets.insert(pending.wallet_address.clone())
+            };
             if !valid_bus_withdrawal_id(operation)
-                || value < 5_000_000
                 || value.to_string() != pending.amount_atomic
-                || !valid_bus_deposit_reference(&pending.boarding_reference)
+                || !reference_valid
                 || !self
                     .subject_identities
                     .get(&pending.account_id)
@@ -342,10 +375,6 @@ impl V71FinancialState {
                 || !self
                     .credited_custody_references
                     .contains(&pending.boarding_reference)
-                || !self
-                    .credited_custody_references
-                    .contains(&format!("arbitrum-usdc-bus-operation:{operation}"))
-                || !pending_wallets.insert(pending.wallet_address.clone())
             {
                 return Err(V71CheckpointError::Invalid);
             }
