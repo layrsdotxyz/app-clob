@@ -911,6 +911,9 @@ pub enum DirectAction {
     SettleSignedWithdrawal {
         intent_hash: String,
         asset: String,
+        route_wallet: String,
+        payout_destination: String,
+        amount_atomic: String,
         horizen_transaction_hash: String,
     },
     /// Releases one operation after a finalized Horizen block is strictly
@@ -1365,6 +1368,7 @@ struct SignedWithdrawalHold {
     identity_commitment: String,
     intent_hash: String,
     route_wallet: String,
+    payout_destination: String,
     asset: String,
     amount_atomic: String,
     expiry_unix: u64,
@@ -1495,7 +1499,7 @@ fn validate_conditional_deposits(state: &DirectState, key: &[u8]) -> Result<(), 
                 || !state.subject_wallets.get(account).is_some_and(|wallets| wallets.contains(&pending.wallet_address))
                 || (unified_asset.is_some() && (Some(pending.asset_name()) != unified_asset
                     || !valid_unified_source_chain(&pending.source_chain)
-                    || (pending.asset_name() == "ZEN" && !matches!(pending.source_chain.as_str(), "base" | "horizen"))
+                    || (pending.asset_name() == "ZEN" && pending.source_chain != "horizen")
                     || pending.source_references.is_empty()
                     || pending.source_references.iter().any(|reference| !valid_unified_source_reference(reference, &pending.source_chain, pending.asset_name())
                         || !state.credited_custody_references.contains(reference))))
@@ -1584,16 +1588,18 @@ fn reconstruct_signed_withdrawal_holds(
         }
         let reference = receipt.custody_reference.as_deref().ok_or_else(invalid)?;
         let parts = reference.split(':').collect::<Vec<_>>();
-        if !matches!(parts.len(), 5 | 6) || parts[0] != "signed-withdrawal-reservation" {
+        if !matches!(parts.len(), 5 | 6 | 7) || parts[0] != "signed-withdrawal-reservation" {
             return Err(invalid());
         }
         let intent_hash = parts[1];
         // The first signed-withdrawal release emitted five fields and was
         // USDC-only. New receipts bind the selected ledger asset explicitly.
-        let (asset, route_wallet, expiry, nonce_value) = if parts.len() == 5 {
-            ("USDC", parts[2], parts[3], parts[4])
+        let (asset, route_wallet, payout_destination, expiry, nonce_value) = if parts.len() == 5 {
+            ("USDC", parts[2], parts[2], parts[3], parts[4])
+        } else if parts.len() == 6 {
+            (parts[2], parts[3], parts[3], parts[4], parts[5])
         } else {
-            (parts[2], parts[3], parts[4], parts[5])
+            (parts[2], parts[3], parts[4], parts[5], parts[6])
         };
         let expiry_unix = expiry.parse::<u64>().map_err(|_| invalid())?;
         let nonce = nonce_value.parse::<u128>().map_err(|_| invalid())?;
@@ -1601,6 +1607,7 @@ fn reconstruct_signed_withdrawal_holds(
         let value = amount(atomic).map_err(|_| invalid())?;
         if !valid_sha256(intent_hash)
             || !valid_evm_wallet(route_wallet)
+            || !valid_evm_wallet(payout_destination)
             || !matches!(asset, "USDC" | "ZEN")
             || expiry_unix == 0
             || nonce.to_string() != nonce_value
@@ -1631,6 +1638,7 @@ fn reconstruct_signed_withdrawal_holds(
                     identity_commitment: receipt.identity_commitment.clone(),
                     intent_hash: intent_hash.into(),
                     route_wallet: route_wallet.into(),
+                    payout_destination: payout_destination.into(),
                     asset: asset.into(),
                     amount_atomic: atomic.into(),
                     expiry_unix,
@@ -2222,7 +2230,7 @@ impl DirectRuntime {
                         || (asset == "USDC" && value < 5_000_000)
                         || !valid_bus_withdrawal_id(operation_id)
                         || request.request_id != format!("unified-{}-deposit-credit:{operation_id}", asset.to_ascii_lowercase())
-                        || (asset == "ZEN" && !matches!(source_chain.as_str(), "base" | "horizen"))
+                        || (asset == "ZEN" && source_chain != "horizen")
                         || !valid_unified_source_chain(source_chain)
                         || !valid_unified_source_custody_reference(custody_reference, asset)
                         || source_references.is_empty()
@@ -2442,6 +2450,11 @@ impl DirectRuntime {
                             "USER_WITHDRAWAL_HOLD",
                             value,
                         )?;
+                        let payout_destination = if intent.destination_chain == "horizen" {
+                            intent.recipient.to_ascii_lowercase()
+                        } else {
+                            intent.route_wallet.to_ascii_lowercase()
+                        };
                         self.signed_withdrawals.insert(
                             intent_hash.clone(),
                             SignedWithdrawalHold {
@@ -2449,6 +2462,7 @@ impl DirectRuntime {
                                 identity_commitment: request.identity_commitment.clone(),
                                 intent_hash: intent_hash.clone(),
                                 route_wallet: intent.route_wallet.to_ascii_lowercase(),
+                                payout_destination: payout_destination.clone(),
                                 asset: asset.into(),
                                 amount_atomic: intent.amount_atomic.clone(),
                                 expiry_unix: intent.expiry_unix,
@@ -2458,7 +2472,7 @@ impl DirectRuntime {
                             "WITHDRAWAL_RESERVED".into(),
                             Some(intent.amount_atomic.clone()),
                             Some(format!(
-                                "signed-withdrawal-reservation:{intent_hash}:{asset}:{}:{}:{}",
+                                "signed-withdrawal-reservation:{intent_hash}:{asset}:{}:{payout_destination}:{}:{}",
                                 intent.route_wallet.to_ascii_lowercase(),
                                 intent.expiry_unix,
                                 intent.nonce
@@ -2469,6 +2483,9 @@ impl DirectRuntime {
                 DirectAction::SettleSignedWithdrawal {
                     intent_hash,
                     asset,
+                    route_wallet,
+                    payout_destination,
+                    amount_atomic,
                     horizen_transaction_hash,
                 } => {
                     let normalized_hash = intent_hash.strip_prefix("0x").unwrap_or(intent_hash);
@@ -2480,6 +2497,9 @@ impl DirectRuntime {
                         || hold.account_id != request.account_id
                         || hold.identity_commitment != request.identity_commitment
                         || hold.asset != *asset
+                        || hold.route_wallet != route_wallet.to_ascii_lowercase()
+                        || hold.payout_destination != payout_destination.to_ascii_lowercase()
+                        || hold.amount_atomic != *amount_atomic
                         || !valid_transaction_hash_value(horizen_transaction_hash)
                         || horizen_transaction_hash != &horizen_transaction_hash.to_ascii_lowercase()
                     {
@@ -5945,6 +5965,9 @@ mod tests {
                 DirectAction::SettleSignedWithdrawal {
                     intent_hash: first_hash,
                     asset: "USDC".into(),
+                    route_wallet: route_wallet.into(),
+                    payout_destination: route_wallet.into(),
+                    amount_atomic: "2000000".into(),
                     horizen_transaction_hash: format!("0x{}", "ef".repeat(32)),
                 },
             ),
@@ -6046,6 +6069,9 @@ mod tests {
             DirectAction::SettleSignedWithdrawal {
                 intent_hash: intent_hash.clone(),
                 asset: "USDC".into(),
+                route_wallet: route_wallet.into(),
+                payout_destination: route_wallet.into(),
+                amount_atomic: "2000000000000000000".into(),
                 horizen_transaction_hash: format!("0x{}", "55".repeat(32)),
             },
         );
@@ -6058,6 +6084,9 @@ mod tests {
                 DirectAction::SettleSignedWithdrawal {
                     intent_hash,
                     asset: "ZEN".into(),
+                    route_wallet: route_wallet.into(),
+                    payout_destination: route_wallet.into(),
+                    amount_atomic: "2000000000000000000".into(),
                     horizen_transaction_hash: format!("0x{}", "55".repeat(32)),
                 },
             ),

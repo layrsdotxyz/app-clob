@@ -4,7 +4,8 @@ use super::*;
 const USDC:&str="0xdf7108f8b10f9b9ec1aba01cca057268cbf86b6c";
 const POOL:&str="0xb412f63299ccff4fe57714ee580895cca74dd284";
 #[derive(Clone)]
-pub(super) struct UsdcCustodyAdapter {client:reqwest::Client,rpc_url:String,confirmations:u64}
+pub(super) struct UsdcCustodyAdapter {client:reqwest::Client,rpc_url:String,confirmations:u64,
+    usdc_ledger_wallet:Option<String>,zen_ledger_wallet:Option<String>}
 impl UsdcCustodyAdapter {
     pub fn from_environment()->Result<Option<Self>,String> {
         if env::var("LAYRS_DIRECT_USDC_CUSTODY_ENABLED").as_deref()!=Ok("true")
@@ -17,7 +18,11 @@ impl UsdcCustodyAdapter {
         let confirmations=env::var("LAYRSV2_HORIZEN_CONFIRMATIONS").map_err(|_|"Horizen finality required")?
             .parse::<u64>().ok().filter(|value|*value>0&&*value<=10_000).ok_or("Horizen finality invalid")?;
         let client=reqwest::Client::builder().timeout(Duration::from_secs(5)).build().map_err(|_|"Horizen RPC client unavailable")?;
-        Ok(Some(Self {client,rpc_url,confirmations}))
+        let usdc_ledger_wallet=env::var("LAYRS_DIRECT_USDC_LEDGER_WALLET_ADDRESS").ok()
+            .and_then(|value|canonical_evm_address(&value).ok());
+        let zen_ledger_wallet=env::var("LAYRSV2_HORIZEN_POOL_LEDGER_PRIVY_ADDRESS").ok()
+            .and_then(|value|canonical_evm_address(&value).ok());
+        Ok(Some(Self {client,rpc_url,confirmations,usdc_ledger_wallet,zen_ledger_wallet}))
     }
     async fn rpc(&self,method:&str,params:Value)->Result<Value,String> {
         let response=self.client.post(&self.rpc_url).json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
@@ -51,14 +56,16 @@ impl UsdcCustodyAdapter {
         let tx=self.rpc("eth_getTransactionByHash",json!([hash])).await?;
         Ok(deposit_effect(wallet,hash,amount,&receipt,&tx))
     }
-    /// Independently proves the exact public `Withdrawal` event before the
+    /// Independently proves the existing pool's exact `withdraw` call before the
     /// parent asks the enclave to consume one hold. A missing receipt or an
     /// insufficient confirmation depth remains pending for this operation.
-    pub async fn signed_withdrawal_finality(&self,account:&str,route_wallet:&str,intent_hash:&str,hash:&str,
+    pub async fn signed_withdrawal_finality(&self,payout_destination:&str,amount_atomic:&str,hash:&str,
         pool:&str,token:&str)->Result<DepositFinality,String> {
-        if !valid_transaction_hash(hash)||!valid_transaction_hash(intent_hash)
-            ||canonical_evm_address(account).is_err()||canonical_evm_address(route_wallet).is_err()
-            ||approved_signed_withdrawal_asset(pool,token).is_none() {
+        let Some(asset)=approved_signed_withdrawal_asset(pool,token) else {return Ok(DepositFinality::Conflict);};
+        let ledger_wallet=match asset {SignedWithdrawalAsset::Usdc=>self.usdc_ledger_wallet.as_deref(),
+            SignedWithdrawalAsset::Zen=>self.zen_ledger_wallet.as_deref()}.ok_or("withdrawal ledger wallet missing")?;
+        if !valid_transaction_hash(hash)||canonical_evm_address(payout_destination).is_err()
+            ||amount_atomic.parse::<u128>().ok().filter(|value|*value>0).is_none() {
             return Ok(DepositFinality::Conflict);
         }
         if self.rpc("eth_chainId",json!([])).await?.as_str().and_then(parse_quantity)!=Some(26514) {
@@ -81,11 +88,12 @@ impl UsdcCustodyAdapter {
             return Ok(DepositFinality::Conflict);
         }
         let tx=self.rpc("eth_getTransactionByHash",json!([hash])).await?;
-        Ok(signed_withdrawal_effect(account,route_wallet,intent_hash,hash,pool,&receipt,&tx))
+        Ok(signed_withdrawal_effect(ledger_wallet,payout_destination,amount_atomic,hash,pool,token,&receipt,&tx))
     }
     /// Proves that a finalized canonical block is later than the signed
-    /// expiry and that LayrsPool's nonce remains unconsumed at that block.
-    /// Only then can the enclave safely return this one hold to available.
+    /// expiry. The BFF invokes this release only when the stable Privy payout
+    /// reference has no submission; once any payout is submitted, expiry can
+    /// no longer release the hold because the existing pool has no nonce.
     pub async fn signed_withdrawal_expiry(&self,intent:&SignedWithdrawalIntent,block_number:&str,block_hash:&str)->Result<DepositFinality,String> {
         if intent.validate().is_err()||!valid_transaction_hash(block_hash)
             ||block_number.parse::<u128>().ok().filter(|value|value.to_string()==block_number).is_none() {
@@ -99,17 +107,8 @@ impl UsdcCustodyAdapter {
         if head.checked_sub(number).and_then(|distance|distance.checked_add(1)).unwrap_or(0)<u128::from(self.confirmations) {
             return Ok(DepositFinality::Pending);
         }
-        let account=canonical_evm_address(&intent.account).map_err(|_|"USDC account invalid")?;
-        let nonce=intent.nonce.parse::<u128>().map_err(|_|"USDC nonce invalid")?;
-        let data=format!("{}{}{:064x}",selector("consumedWithdrawalNonces(address,uint256)"),
-            address_topic(&account).trim_start_matches("0x"),nonce);
-        let asset=intent.asset().map_err(|_|"withdrawal asset invalid")?;
-        let consumed=self.rpc("eth_call",json!([{"to":asset.pool(),"data":data},quantity(number)])).await?;
-        // Fetch and bind the canonical block after the state read. If a reorg
-        // races the numbered eth_call, the caller-provided hash no longer
-        // matches and the release fails closed.
         let block=self.rpc("eth_getBlockByNumber",json!([quantity(number),false])).await?;
-        signed_withdrawal_expiry_effect(intent,block_hash,&block,&consumed)
+        signed_withdrawal_expiry_effect(intent,block_hash,&block)
     }
     pub async fn finalized_block_timestamp(&self,block_number:&str,block_hash:&str)->Result<u64,String> {
         let number=block_number.parse::<u128>().map_err(|_|"USDC block invalid")?;
@@ -153,38 +152,32 @@ fn deposit_effect(wallet:&str,hash:&str,amount:&str,receipt:&Value,tx:&Value)->D
         _=>DepositFinality::Conflict,
     }
 }
-fn signed_withdrawal_effect(account:&str,route_wallet:&str,intent_hash:&str,hash:&str,pool:&str,receipt:&Value,tx:&Value)->DepositFinality {
+fn signed_withdrawal_effect(ledger_wallet:&str,payout_destination:&str,amount_atomic:&str,hash:&str,pool:&str,token:&str,
+    receipt:&Value,tx:&Value)->DepositFinality {
+    let Ok(expected_input)=pool_withdraw_calldata(payout_destination,amount_atomic) else {return DepositFinality::Conflict;};
+    let Ok(value)=amount_atomic.parse::<u128>() else {return DepositFinality::Conflict;};
     if !equals(tx.get("hash").and_then(Value::as_str),hash)||!equals(receipt.get("transactionHash").and_then(Value::as_str),hash)
-        ||!equals(tx.get("from").and_then(Value::as_str),route_wallet)||!equals(receipt.get("from").and_then(Value::as_str),route_wallet)
+        ||!equals(tx.get("from").and_then(Value::as_str),ledger_wallet)||!equals(receipt.get("from").and_then(Value::as_str),ledger_wallet)
         ||!equals(tx.get("to").and_then(Value::as_str),pool)||!equals(receipt.get("to").and_then(Value::as_str),pool)
-        ||tx.get("input").and_then(Value::as_str).is_none_or(|input|!input.starts_with(&selector("withdrawWithProof((address,uint256,address,address,string,string,uint256,uint256),bytes,(bytes32,string,uint64,bytes32,bytes32,bytes,uint8,bytes32[]))")))
+        ||tx.get("input").and_then(Value::as_str).is_none_or(|input|!input.eq_ignore_ascii_case(&expected_input))
         ||tx.get("value").and_then(Value::as_str).and_then(parse_quantity)!=Some(0)
         ||tx.get("chainId").and_then(Value::as_str).and_then(parse_quantity)!=Some(26514)
         ||tx.get("blockHash")!=receipt.get("blockHash")||tx.get("blockNumber")!=receipt.get("blockNumber") {
         return DepositFinality::Conflict;
     }
     if receipt.get("status").and_then(Value::as_str)==Some("0x0") {return DepositFinality::Reverted;}
-    let withdrawal_topic=topic("Withdrawal(bytes32,address,address,address,uint256,string,string,uint256,uint256,bytes,bytes32,string)");
-    let count=receipt.get("logs").and_then(Value::as_array).map_or(0,|logs|logs.iter().filter(|log|{
-        log.get("removed").and_then(Value::as_bool)!=Some(true)
-            &&equals(log.get("address").and_then(Value::as_str),pool)
-            &&log.get("topics").and_then(Value::as_array).is_some_and(|topics|topics.len()==4
-                &&equals(topics[0].as_str(),&withdrawal_topic)
-                &&equals(topics[1].as_str(),intent_hash)
-                &&equals(topics[2].as_str(),&address_topic(account))
-                &&equals(topics[3].as_str(),&address_topic(route_wallet)))
-    }).count());
-    if receipt.get("status").and_then(Value::as_str)==Some("0x1")&&count==1 {DepositFinality::Finalized}else{DepositFinality::Conflict}
+    let withdrawal_count=event_count(receipt,pool,&topic("Withdrawn(address,uint256,address)"),
+        &[payout_destination,ledger_wallet],value);
+    let transfer_count=event_count(receipt,token,ERC20_TRANSFER_TOPIC,&[pool,payout_destination],value);
+    if receipt.get("status").and_then(Value::as_str)==Some("0x1")&&withdrawal_count==1&&transfer_count==1 {
+        DepositFinality::Finalized
+    }else{DepositFinality::Conflict}
 }
-fn signed_withdrawal_expiry_effect(intent:&SignedWithdrawalIntent,block_hash:&str,block:&Value,consumed:&Value)->Result<DepositFinality,String> {
+fn signed_withdrawal_expiry_effect(intent:&SignedWithdrawalIntent,block_hash:&str,block:&Value)->Result<DepositFinality,String> {
     if !equals(block.get("hash").and_then(Value::as_str),block_hash) {return Ok(DepositFinality::Conflict);}
     let timestamp=block.get("timestamp").and_then(Value::as_str).and_then(parse_quantity).ok_or("USDC block timestamp missing")?;
     if timestamp<=u128::from(intent.expiry_unix) {return Ok(DepositFinality::Pending);}
-    match consumed.as_str().map(|value|value.to_ascii_lowercase()) {
-        Some(value) if value==format!("0x{:064x}",0)=>Ok(DepositFinality::Finalized),
-        Some(value) if value==format!("0x{:064x}",1)=>Ok(DepositFinality::Conflict),
-        _=>Err("USDC withdrawal nonce malformed".into()),
-    }
+    Ok(DepositFinality::Finalized)
 }
 #[cfg(test)]
 mod tests {
@@ -226,27 +219,29 @@ mod tests {
     }
     #[test]
     fn signed_withdrawal_requires_exact_pool_call_and_event() {
-        let account="0x1111111111111111111111111111111111111111";let route="0x2222222222222222222222222222222222222222";
-        let intent=format!("0x{}","c".repeat(64));let hash=format!("0x{}","a".repeat(64));let block=format!("0x{}","b".repeat(64));
-        let input=format!("{}00",selector("withdrawWithProof((address,uint256,address,address,string,string,uint256,uint256),bytes,(bytes32,string,uint64,bytes32,bytes32,bytes,uint8,bytes32[]))"));
-        let tx=json!({"hash":hash,"from":route,"to":POOL,"input":input,"value":"0x0","chainId":"0x6792","blockNumber":"0x10","blockHash":block});
-        let receipt=json!({"transactionHash":hash,"from":route,"to":POOL,"status":"0x1","blockNumber":"0x10","blockHash":block,"logs":[{
-            "address":POOL,"topics":[topic("Withdrawal(bytes32,address,address,address,uint256,string,string,uint256,uint256,bytes,bytes32,string)"),intent,address_topic(account),address_topic(route)],"data":"0x"}]});
-        assert!(matches!(signed_withdrawal_effect(account,route,&intent,&hash,POOL,&receipt,&tx),DepositFinality::Finalized));
-        let mut wrong=receipt.clone();wrong["logs"][0]["topics"][1]=json!(format!("0x{}","d".repeat(64)));
-        assert!(matches!(signed_withdrawal_effect(account,route,&intent,&hash,POOL,&wrong,&tx),DepositFinality::Conflict));
+        let ledger="0x1111111111111111111111111111111111111111";let destination="0x2222222222222222222222222222222222222222";
+        let hash=format!("0x{}","a".repeat(64));let block=format!("0x{}","b".repeat(64));let amount="2000000";
+        let input=pool_withdraw_calldata(destination,amount).unwrap();
+        let tx=json!({"hash":hash,"from":ledger,"to":POOL,"input":input,"value":"0x0","chainId":"0x6792","blockNumber":"0x10","blockHash":block});
+        let receipt=json!({"transactionHash":hash,"from":ledger,"to":POOL,"status":"0x1","blockNumber":"0x10","blockHash":block,"logs":[
+            {"address":POOL,"topics":[topic("Withdrawn(address,uint256,address)"),address_topic(destination),address_topic(ledger)],
+                "data":format!("0x{:064x}",2_000_000u128)},
+            {"address":USDC,"topics":[ERC20_TRANSFER_TOPIC,address_topic(POOL),address_topic(destination)],
+                "data":format!("0x{:064x}",2_000_000u128)}]});
+        assert!(matches!(signed_withdrawal_effect(ledger,destination,amount,&hash,POOL,USDC,&receipt,&tx),DepositFinality::Finalized));
+        let mut wrong=receipt.clone();wrong["logs"][0]["topics"][1]=json!(address_topic(ledger));
+        assert!(matches!(signed_withdrawal_effect(ledger,destination,amount,&hash,POOL,USDC,&wrong,&tx),DepositFinality::Conflict));
     }
     #[test]
-    fn expired_release_requires_later_canonical_block_and_unconsumed_nonce() {
+    fn expired_unsubmitted_release_requires_a_later_canonical_block() {
         let key=k256::ecdsa::SigningKey::from_bytes((&[7u8;32]).into()).unwrap();
         let public=key.verifying_key().to_encoded_point(false);
         let account=format!("0x{}",hex::encode(&Keccak256::digest(&public.as_bytes()[1..])[12..]));
         let intent=SignedWithdrawalIntent {account,pool:POOL.into(),token:USDC.into(),route_wallet:"0x2222222222222222222222222222222222222222".into(),
             amount_atomic:"20000000".into(),recipient:"0x3333333333333333333333333333333333333333".into(),destination_chain:"base".into(),nonce:"42".into(),expiry_unix:100};
         let hash=format!("0x{}","b".repeat(64));let block=json!({"hash":hash,"timestamp":"0x65"});
-        assert!(matches!(signed_withdrawal_expiry_effect(&intent,&hash,&block,&json!(format!("0x{:064x}",0))).unwrap(),DepositFinality::Finalized));
-        assert!(matches!(signed_withdrawal_expiry_effect(&intent,&hash,&block,&json!(format!("0x{:064x}",1))).unwrap(),DepositFinality::Conflict));
+        assert!(matches!(signed_withdrawal_expiry_effect(&intent,&hash,&block).unwrap(),DepositFinality::Finalized));
         let early=json!({"hash":hash,"timestamp":"0x64"});
-        assert!(matches!(signed_withdrawal_expiry_effect(&intent,&hash,&early,&json!(format!("0x{:064x}",0))).unwrap(),DepositFinality::Pending));
+        assert!(matches!(signed_withdrawal_expiry_effect(&intent,&hash,&early).unwrap(),DepositFinality::Pending));
     }
 }

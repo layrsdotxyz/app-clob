@@ -15,7 +15,7 @@ test('unified source proof is default-off and bound to the production writer',()
   assert.ok(template.includes("!If [UnifiedDepositsActive, !Ref UnifiedRpcSecretArn, !Ref 'AWS::NoValue']"));
 });
 
-test('all nine asset lanes and their canonical chain bindings reach the parent',()=>{
+test('the seven USDC lanes and Horizen-only ZEN binding reach the parent',()=>{
   for(const [chain,id,token,confirmations] of [
     ['ethereum','1','0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48','UnifiedEthereumConfirmations'],
     ['base','8453','0x833589fcd6edb6e08f4c7c32d4f71b54bda02913','UnifiedBaseConfirmations'],
@@ -27,7 +27,7 @@ test('all nine asset lanes and their canonical chain bindings reach the parent',
   ]){
     assert.ok(template.includes(`"${chain}": ("${id}", "${token}", "\${${confirmations}}")`));
   }
-  assert.ok(template.includes('"LAYRS_UNIFIED_BASE_ZEN_TOKEN_ADDRESS": "0xf43eb8de897fbc7f2502483b2bef7bb9ea179229"'));
+  assert.ok(!template.includes('LAYRS_UNIFIED_BASE_ZEN_TOKEN_ADDRESS'));
   assert.ok(template.includes('"LAYRS_UNIFIED_HORIZEN_ZEN_TOKEN_ADDRESS": "0x57da2d504bf8b83ef304759d9f2648522d7a9280"'));
   assert.ok(template.includes('"LAYRS_UNIFIED_USDC_FINALITY_ENABLED": "true"'));
 });
