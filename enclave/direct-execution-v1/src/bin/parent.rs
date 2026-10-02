@@ -34,7 +34,8 @@ use chacha20poly1305::{
 use hmac::{Hmac, Mac};
 use layrs_direct_execution_v1::{
     direct_frame::{CHECKPOINT_FRAME_OVERSIZED, MAX_FRAME_BYTES},
-    artifact_hash, identity_commitment_for, reference_for, relay_reference_for, relay_result_hash,valid_layrs_withdrawal_destination,
+    approved_signed_withdrawal_asset, artifact_hash, identity_commitment_for, reference_for,
+    relay_reference_for, relay_result_hash,valid_layrs_withdrawal_destination,
     relay_reverted_result_hash, request_hash, sha256, sign, DirectAction, DirectReceipt,
     DirectRequest, DirectResult, DirectStateArtifact, DurabilityAck, ExternalEffectIntent,
     ExternalEffectRecovery, FilesystemImmutableArtifactStore, FilesystemImmutableIntentStore,
@@ -5128,7 +5129,7 @@ enum CustomerAction {
     LinkFinancialWallet {grant:WalletLinkGrant,signature:String},
     LinkPoolWallet {wallet_address:String,external_id:String},
     ReserveSignedWithdrawal {intent:SignedWithdrawalIntent,user_signature:String},
-    SettleSignedWithdrawal {intent_hash:String,horizen_transaction_hash:String},
+    SettleSignedWithdrawal {intent_hash:String,pool:String,token:String,horizen_transaction_hash:String},
     ReleaseExpiredSignedWithdrawal {intent:SignedWithdrawalIntent,finalized_block_number:String,finalized_block_hash:String},
     ReserveZenWithdrawal { destination_chain: String, destination: String, amount_atomic: String },
     PlaceOrder {
@@ -6091,7 +6092,7 @@ async fn command(
                 Err((status,code))=>return (status,code).into_response(),
             }
         }
-        CustomerAction::SettleSignedWithdrawal {intent_hash,horizen_transaction_hash} => {
+        CustomerAction::SettleSignedWithdrawal {intent_hash,pool,token,horizen_transaction_hash} => {
             let normalized_intent=intent_hash.to_ascii_lowercase();
             let normalized_hash=horizen_transaction_hash.to_ascii_lowercase();
             if request_id!=format!("signed-withdrawal-settle:{}",normalized_intent.trim_start_matches("0x")) {
@@ -6103,9 +6104,14 @@ async fn command(
             let Some(custody)=&state.usdc_custody else {
                 return (StatusCode::SERVICE_UNAVAILABLE,"USDC_CUSTODY_ADAPTER_NOT_ENABLED").into_response();
             };
-            match custody.signed_withdrawal_finality(&claims.wallet_address,route_wallet,&normalized_intent,&normalized_hash).await {
+            let asset=match approved_signed_withdrawal_asset(&pool,&token) {
+                Some(asset)=>asset.ledger_asset(),
+                None=>return (StatusCode::BAD_REQUEST,"SIGNED_WITHDRAWAL_ASSET_INVALID").into_response(),
+            };
+            match custody.signed_withdrawal_finality(&claims.wallet_address,route_wallet,&normalized_intent,
+                &normalized_hash,&pool,&token).await {
                 Ok(DepositFinality::Finalized)=>DirectAction::SettleSignedWithdrawal {
-                    intent_hash:normalized_intent,horizen_transaction_hash:normalized_hash,
+                    intent_hash:normalized_intent,asset:asset.into(),horizen_transaction_hash:normalized_hash,
                 },
                 Ok(DepositFinality::Pending)=>return (StatusCode::SERVICE_UNAVAILABLE,"SIGNED_WITHDRAWAL_FINALITY_PENDING").into_response(),
                 Ok(DepositFinality::Reverted)=>return (StatusCode::CONFLICT,"SIGNED_WITHDRAWAL_PAYOUT_REVERTED").into_response(),

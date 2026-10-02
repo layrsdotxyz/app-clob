@@ -50,7 +50,10 @@ pub use external_effect::{
     RelayWithdrawalBinding, EXTERNAL_EFFECT_INTENT_PROTOCOL_VERSION,
     MAX_PROVIDER_IDEMPOTENCY_WINDOW_SECONDS,
 };
-pub use signed_withdrawal::{SignedWithdrawalError, SignedWithdrawalIntent};
+pub use signed_withdrawal::{
+    approved_signed_withdrawal_asset, SignedWithdrawalAsset, SignedWithdrawalError, SignedWithdrawalIntent,
+    HORIZEN_USDC_POOL, HORIZEN_USDC_TOKEN, HORIZEN_ZEN_POOL, HORIZEN_ZEN_TOKEN,
+};
 
 pub const EPOCH_ID: &str = "layrs-opening-epoch-20260911-941107537728c98b";
 pub const EPOCH_STATE_SHA256: &str =
@@ -905,6 +908,7 @@ pub enum DirectAction {
     /// Terminal proof that LayrsPool paid the signed route wallet on Horizen.
     SettleSignedWithdrawal {
         intent_hash: String,
+        asset: String,
         horizen_transaction_hash: String,
     },
     /// Releases one operation after a finalized Horizen block is strictly
@@ -1359,6 +1363,7 @@ struct SignedWithdrawalHold {
     identity_commitment: String,
     intent_hash: String,
     route_wallet: String,
+    asset: String,
     amount_atomic: String,
     expiry_unix: u64,
 }
@@ -1369,6 +1374,10 @@ struct ConditionalUsdcDeposit {
     wallet_address:String,
     amount_atomic:String,
     boarding_reference:String,
+    /// Historical and pre-unified records were USDC-only. An omitted value
+    /// therefore decodes as USDC without changing any existing state hash.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    asset:String,
     /// Empty only for the historical Bus compatibility records. Omitting the
     /// empty value preserves their exact serialized state hash.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -1377,6 +1386,12 @@ struct ConditionalUsdcDeposit {
     /// remains in `boarding_reference`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     source_references:Vec<String>,
+}
+
+impl ConditionalUsdcDeposit {
+    fn asset_name(&self) -> &str {
+        if self.asset.is_empty() { "USDC" } else { &self.asset }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1472,7 +1487,8 @@ fn validate_conditional_deposits(state: &DirectState, key: &[u8]) -> Result<(), 
                 || Some(&pending.amount_atomic) != receipt.amount_atomic.as_ref()
                 || Some(&pending.boarding_reference) != receipt.custody_reference.as_ref()
                 || !state.subject_wallets.get(account).is_some_and(|wallets| wallets.contains(&pending.wallet_address))
-                || (unified && (!valid_unified_source_chain(&pending.source_chain)
+                || (unified && (pending.asset_name() != "USDC"
+                    || !valid_unified_source_chain(&pending.source_chain)
                     || pending.source_references.is_empty()
                     || pending.source_references.iter().any(|reference| !valid_unified_source_reference(reference, &pending.source_chain)
                         || !state.credited_custody_references.contains(reference))))
@@ -1561,19 +1577,26 @@ fn reconstruct_signed_withdrawal_holds(
         }
         let reference = receipt.custody_reference.as_deref().ok_or_else(invalid)?;
         let parts = reference.split(':').collect::<Vec<_>>();
-        if parts.len() != 5 || parts[0] != "signed-withdrawal-reservation" {
+        if !matches!(parts.len(), 5 | 6) || parts[0] != "signed-withdrawal-reservation" {
             return Err(invalid());
         }
         let intent_hash = parts[1];
-        let route_wallet = parts[2];
-        let expiry_unix = parts[3].parse::<u64>().map_err(|_| invalid())?;
-        let nonce = parts[4].parse::<u128>().map_err(|_| invalid())?;
+        // The first signed-withdrawal release emitted five fields and was
+        // USDC-only. New receipts bind the selected ledger asset explicitly.
+        let (asset, route_wallet, expiry, nonce_value) = if parts.len() == 5 {
+            ("USDC", parts[2], parts[3], parts[4])
+        } else {
+            (parts[2], parts[3], parts[4], parts[5])
+        };
+        let expiry_unix = expiry.parse::<u64>().map_err(|_| invalid())?;
+        let nonce = nonce_value.parse::<u128>().map_err(|_| invalid())?;
         let atomic = receipt.amount_atomic.as_deref().ok_or_else(invalid)?;
         let value = amount(atomic).map_err(|_| invalid())?;
         if !valid_sha256(intent_hash)
             || !valid_evm_wallet(route_wallet)
+            || !matches!(asset, "USDC" | "ZEN")
             || expiry_unix == 0
-            || nonce.to_string() != parts[4]
+            || nonce.to_string() != nonce_value
             || value.to_string() != atomic
             || receipt.command_commitment.as_deref().is_none_or(|commitment| !valid_sha256(commitment))
         {
@@ -1601,6 +1624,7 @@ fn reconstruct_signed_withdrawal_holds(
                     identity_commitment: receipt.identity_commitment.clone(),
                     intent_hash: intent_hash.into(),
                     route_wallet: route_wallet.into(),
+                    asset: asset.into(),
                     amount_atomic: atomic.into(),
                     expiry_unix,
                 },
@@ -1631,7 +1655,7 @@ fn validate_withdrawal_hold_balances(
     }
     for hold in signed_holds.values() {
         let total = totals
-            .entry((hold.identity_commitment.clone(), "USDC".into()))
+            .entry((hold.identity_commitment.clone(), hold.asset.clone()))
             .or_default();
         *total = total
             .checked_add(amount(&hold.amount_atomic).map_err(|_| invalid())?)
@@ -1954,8 +1978,11 @@ impl DirectRuntime {
                 if request.request_id != intent.nonce_request_id().map_err(|_| RuntimeError::InvalidRequest)?
                     || *now_unix >= intent.expiry_unix
                     || intent.verify_signature(user_signature).is_err()
+                    || intent.asset().is_err()
                     || !wallets.contains(&intent.account.to_ascii_lowercase())
                     || !wallets.contains(&intent.route_wallet.to_ascii_lowercase())
+                    || financial_wallet.as_deref()
+                        != Some(intent.route_wallet.to_ascii_lowercase().as_str())
                 {
                     return Err(RuntimeError::InvalidRequest);
                 }
@@ -2214,6 +2241,7 @@ impl DirectRuntime {
                         wallet_address: wallet,
                         amount_atomic: amount_atomic.clone(),
                         boarding_reference: custody_reference.clone(),
+                        asset: "USDC".into(),
                         source_chain: source_chain.clone(),
                         source_references: source_references.clone(),
                     });
@@ -2265,7 +2293,7 @@ impl DirectRuntime {
                     self.conditional_usdc_deposits.insert(operation_id.clone(),ConditionalUsdcDeposit {
                         account_id:request.account_id.clone(),identity_commitment:request.identity_commitment.clone(),
                         wallet_address:wallet,amount_atomic:amount_atomic.clone(),boarding_reference:custody_reference.clone(),
-                        source_chain:String::new(),source_references:Vec::new()});
+                        asset:String::new(),source_chain:String::new(),source_references:Vec::new()});
                     ("DEPOSIT_CONDITIONALLY_CREDITED".into(),Some(amount_atomic.clone()),Some(custody_reference.clone()))
                 }
                 DirectAction::FinalizeArbitrumUsdcBusDeposit {operation_id,amount_atomic,boarding_reference,custody_reference} => {
@@ -2371,6 +2399,10 @@ impl DirectRuntime {
                     ((if reverted {"WITHDRAWAL_REVERTED"} else {"WITHDRAWAL_SETTLED"}).into(),Some(amount_atomic.clone()),Some(custody_reference.clone()))
                 }
                 DirectAction::ReserveSignedWithdrawal { intent, now_unix: _, .. } => {
+                    let asset = intent
+                        .asset()
+                        .map_err(|_| RuntimeError::InvalidRequest)?
+                        .ledger_asset();
                     let intent_hash = intent
                         .intent_hash_hex()
                         .map_err(|_| RuntimeError::InvalidRequest)?
@@ -2381,16 +2413,17 @@ impl DirectRuntime {
                         return Err(RuntimeError::RequestReuse);
                     }
                     let value = amount(&intent.amount_atomic)?;
-                    if self.balance(&request.identity_commitment, "USDC", "USER_AVAILABLE") < value {
+                    if self.balance(&request.identity_commitment, asset, "USER_AVAILABLE") < value {
                         (
                             "WITHDRAWAL_REJECTED".into(),
                             Some(intent.amount_atomic.clone()),
                             Some(format!("signed-withdrawal-rejection:{intent_hash}:INSUFFICIENT_AVAILABLE")),
                         )
                     } else {
-                        self.verify_settled_usdc_withdrawal(&request.identity_commitment, value)?;
-                        self.move_bucket(
+                        self.verify_settled_withdrawal(&request.identity_commitment, asset, value)?;
+                        self.move_asset_bucket(
                             &request.identity_commitment,
+                            asset,
                             "USER_AVAILABLE",
                             "USER_WITHDRAWAL_HOLD",
                             value,
@@ -2402,6 +2435,7 @@ impl DirectRuntime {
                                 identity_commitment: request.identity_commitment.clone(),
                                 intent_hash: intent_hash.clone(),
                                 route_wallet: intent.route_wallet.to_ascii_lowercase(),
+                                asset: asset.into(),
                                 amount_atomic: intent.amount_atomic.clone(),
                                 expiry_unix: intent.expiry_unix,
                             },
@@ -2410,7 +2444,7 @@ impl DirectRuntime {
                             "WITHDRAWAL_RESERVED".into(),
                             Some(intent.amount_atomic.clone()),
                             Some(format!(
-                                "signed-withdrawal-reservation:{intent_hash}:{}:{}:{}",
+                                "signed-withdrawal-reservation:{intent_hash}:{asset}:{}:{}:{}",
                                 intent.route_wallet.to_ascii_lowercase(),
                                 intent.expiry_unix,
                                 intent.nonce
@@ -2420,6 +2454,7 @@ impl DirectRuntime {
                 }
                 DirectAction::SettleSignedWithdrawal {
                     intent_hash,
+                    asset,
                     horizen_transaction_hash,
                 } => {
                     let normalized_hash = intent_hash.strip_prefix("0x").unwrap_or(intent_hash);
@@ -2430,12 +2465,14 @@ impl DirectRuntime {
                     if request.request_id != format!("signed-withdrawal-settle:{normalized_hash}")
                         || hold.account_id != request.account_id
                         || hold.identity_commitment != request.identity_commitment
+                        || hold.asset != *asset
                         || !valid_transaction_hash_value(horizen_transaction_hash)
                         || horizen_transaction_hash != &horizen_transaction_hash.to_ascii_lowercase()
                     {
                         return Err(RuntimeError::DestinationDenied);
                     }
                     let value = amount(&hold.amount_atomic)?;
+                    let ledger_asset = hold.asset.clone();
                     let reference = format!(
                         "signed-withdrawal-horizen:{normalized_hash}:{horizen_transaction_hash}"
                     );
@@ -2443,8 +2480,9 @@ impl DirectRuntime {
                     if !self.credited_custody_references.insert(reference.clone()) {
                         return Err(RuntimeError::CustodyReferenceReuse);
                     }
-                    self.move_bucket(
+                    self.move_asset_bucket(
                         &request.identity_commitment,
+                        &ledger_asset,
                         "USER_WITHDRAWAL_HOLD",
                         "USER_SETTLED",
                         value,
@@ -2473,11 +2511,13 @@ impl DirectRuntime {
                     }
                     let value = amount(&hold.amount_atomic)?;
                     let amount_atomic = hold.amount_atomic.clone();
+                    let ledger_asset = hold.asset.clone();
                     let reference = format!(
                         "signed-withdrawal-expired:{normalized_hash}:{finalized_block_hash}:{finalized_block_timestamp}"
                     );
-                    self.move_bucket(
+                    self.move_asset_bucket(
                         &request.identity_commitment,
+                        &ledger_asset,
                         "USER_WITHDRAWAL_HOLD",
                         "USER_AVAILABLE",
                         value,
@@ -2965,9 +3005,13 @@ impl DirectRuntime {
         Ok(())
     }
     fn verify_settled_usdc_withdrawal(&self,identity:&str,value:u128)->Result<(),RuntimeError> {
-        let pending=self.conditional_usdc_deposits.values().filter(|entry|entry.identity_commitment==identity)
+        self.verify_settled_withdrawal(identity, "USDC", value)
+    }
+    fn verify_settled_withdrawal(&self,identity:&str,asset:&str,value:u128)->Result<(),RuntimeError> {
+        let pending=self.conditional_usdc_deposits.values().filter(|entry|entry.identity_commitment==identity
+            && entry.asset_name()==asset)
             .try_fold(0u128,|sum,entry|sum.checked_add(amount(&entry.amount_atomic)?).ok_or(RuntimeError::InvalidRequest))?;
-        let available=self.balances.get(identity).and_then(|b|b.get(&("USDC".into(),"USER_AVAILABLE".into()))).copied().unwrap_or(0);
+        let available=self.balances.get(identity).and_then(|b|b.get(&(asset.into(),"USER_AVAILABLE".into()))).copied().unwrap_or(0);
         if value>available.saturating_sub(pending) {return Err(RuntimeError::InsufficientAvailable);}
         Ok(())
     }
@@ -5500,12 +5544,36 @@ mod tests {
         amount_atomic: &str,
         expiry_unix: u64,
     ) -> (DirectRequest, SignedWithdrawalIntent) {
+        signed_withdrawal_request_for_asset(
+            subject,
+            identity,
+            key,
+            route_wallet,
+            HORIZEN_USDC_POOL,
+            HORIZEN_USDC_TOKEN,
+            nonce,
+            amount_atomic,
+            expiry_unix,
+        )
+    }
+
+    fn signed_withdrawal_request_for_asset(
+        subject: &str,
+        identity: &str,
+        key: &SigningKey,
+        route_wallet: &str,
+        pool: &str,
+        token: &str,
+        nonce: u128,
+        amount_atomic: &str,
+        expiry_unix: u64,
+    ) -> (DirectRequest, SignedWithdrawalIntent) {
         let public = key.verifying_key().to_encoded_point(false);
         let account = format!("0x{}", hex::encode(&sha3::Keccak256::digest(&public.as_bytes()[1..])[12..]));
         let intent = SignedWithdrawalIntent {
             account,
-            pool: "0xb412f63299ccff4fe57714ee580895cca74dd284".into(),
-            token: "0xdf7108f8b10f9b9ec1aba01cca057268cbf86b6c".into(),
+            pool: pool.into(),
+            token: token.into(),
             route_wallet: route_wallet.into(),
             amount_atomic: amount_atomic.into(),
             recipient: "0x0d2bf0c9d6d96eea797c9d1b96895d8f70e3322e".into(),
@@ -5519,7 +5587,7 @@ mod tests {
         let mut signature_bytes = signature.to_bytes().to_vec();
         signature_bytes.push(recovery_id.to_byte() + 27);
         let request_id = intent.nonce_request_id().unwrap();
-        let request = request_for(
+        let mut request = request_for(
             subject,
             identity,
             &request_id,
@@ -5529,6 +5597,8 @@ mod tests {
                 now_unix: 1_700_000_000,
             },
         );
+        request.financial_wallet_address = Some(route_wallet.into());
+        request.request_hash = request_hash(&request);
         (request, intent)
     }
 
@@ -5761,6 +5831,10 @@ mod tests {
         );
         let first_id = first.request_id.clone();
         let first_hash = first_intent.intent_hash_hex().unwrap().trim_start_matches("0x").to_owned();
+        let mut substituted_route = first.clone();
+        substituted_route.financial_wallet_address = Some(account.clone());
+        substituted_route.request_hash = request_hash(&substituted_route);
+        assert_eq!(live.execute(substituted_route), Err(RuntimeError::InvalidRequest));
         let result = live.execute_committed(first.clone(), &state_key, &mut store).unwrap();
         assert_eq!(result.effect, "WITHDRAWAL_RESERVED");
         assert_eq!(result.receipt.command_commitment, Some(first_intent.command_commitment().unwrap()));
@@ -5792,6 +5866,7 @@ mod tests {
                 &format!("signed-withdrawal-settle:{first_hash}"),
                 DirectAction::SettleSignedWithdrawal {
                     intent_hash: first_hash,
+                    asset: "USDC".into(),
                     horizen_transaction_hash: format!("0x{}", "ef".repeat(32)),
                 },
             ),
@@ -5831,6 +5906,90 @@ mod tests {
         intent.recipient = "0x1111111111111111111111111111111111111111".into();
         conflicting.request_hash = request_hash(&conflicting);
         assert_eq!(restored.execute(conflicting), Err(RuntimeError::RequestReuse));
+    }
+
+    #[test]
+    fn signed_zen_withdrawal_reserves_restarts_and_settles_only_zen() {
+        let key = SigningKey::from_bytes((&[9u8; 32]).into()).unwrap();
+        let public = key.verifying_key().to_encoded_point(false);
+        let account = format!("0x{}", hex::encode(&sha3::Keccak256::digest(&public.as_bytes()[1..])[12..]));
+        let route_wallet = "0x2222222222222222222222222222222222222222";
+        let subject = "e".repeat(64);
+        let identity = identity_commitment_for(&subject, &account);
+        let state_key = [8u8; 32];
+        let mut live = runtime(RuntimeMode::IsolatedTest);
+        let mut store = InMemoryDirectStateStore::default();
+        live.execute_committed(
+            request_for(&subject, &identity, "zen-signed-admission", DirectAction::AdmitIdentity { wallet_address: account.clone() }),
+            &state_key,
+            &mut store,
+        ).unwrap();
+        live.execute_committed(
+            request_for(&subject, &identity, "zen-signed-route", DirectAction::LinkFinancialWallet { wallet_address: route_wallet.into() }),
+            &state_key,
+            &mut store,
+        ).unwrap();
+        let mut deposit = request_for(&subject, &identity, "zen-signed-deposit", DirectAction::CreditZenDeposit {
+            amount_atomic: "5000000000000000000".into(),
+            custody_reference: format!("horizen-zen-deposit:0x{}", "44".repeat(32)),
+        });
+        deposit.financial_wallet_address = Some(route_wallet.into());
+        deposit.request_hash = request_hash(&deposit);
+        live.execute_committed(deposit, &state_key, &mut store).unwrap();
+
+        let (reserve, intent) = signed_withdrawal_request_for_asset(
+            &subject,
+            &identity,
+            &key,
+            route_wallet,
+            HORIZEN_ZEN_POOL,
+            HORIZEN_ZEN_TOKEN,
+            7,
+            "2000000000000000000",
+            1_900_000_000,
+        );
+        let intent_hash = intent.intent_hash_hex().unwrap().trim_start_matches("0x").to_owned();
+        assert_eq!(live.execute_committed(reserve, &state_key, &mut store).unwrap().effect, "WITHDRAWAL_RESERVED");
+        assert_eq!(live.balance(&identity, "ZEN", "USER_WITHDRAWAL_HOLD"), 2_000_000_000_000_000_000);
+        assert_eq!(live.balance(&identity, "USDC", "USER_WITHDRAWAL_HOLD"), 0);
+
+        let mut restored = DirectRuntime::restore_committed(
+            SealedEpoch::load(epoch_path()).unwrap(),
+            RuntimeMode::IsolatedTest,
+            vec![7; 32],
+            &state_key,
+            &store,
+        ).unwrap();
+        assert_eq!(restored.signed_withdrawals[&intent_hash].asset, "ZEN");
+        let crossed = request_for(
+            &subject,
+            &identity,
+            &format!("signed-withdrawal-settle:{intent_hash}"),
+            DirectAction::SettleSignedWithdrawal {
+                intent_hash: intent_hash.clone(),
+                asset: "USDC".into(),
+                horizen_transaction_hash: format!("0x{}", "55".repeat(32)),
+            },
+        );
+        assert_eq!(restored.execute(crossed), Err(RuntimeError::DestinationDenied));
+        restored.execute_committed(
+            request_for(
+                &subject,
+                &identity,
+                &format!("signed-withdrawal-settle:{intent_hash}"),
+                DirectAction::SettleSignedWithdrawal {
+                    intent_hash,
+                    asset: "ZEN".into(),
+                    horizen_transaction_hash: format!("0x{}", "55".repeat(32)),
+                },
+            ),
+            &state_key,
+            &mut store,
+        ).unwrap();
+        assert_eq!(restored.balance(&identity, "ZEN", "USER_WITHDRAWAL_HOLD"), 0);
+        assert_eq!(restored.balance(&identity, "ZEN", "USER_SETTLED"), 2_000_000_000_000_000_000);
+        assert_eq!(restored.balance(&identity, "ZEN", "USER_AVAILABLE"), 3_000_000_000_000_000_000);
+        assert_eq!(restored.balance(&identity, "USDC", "USER_SETTLED"), 0);
     }
     fn bus_fixture_funded(funded:&str)->(DirectRuntime,String,String,String,InMemoryDirectStateStore) {
         let mut live=runtime(RuntimeMode::IsolatedTest);

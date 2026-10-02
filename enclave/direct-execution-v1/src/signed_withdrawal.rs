@@ -14,7 +14,57 @@ use sha3::Keccak256;
 pub const WITHDRAWAL_SOURCE_CHAIN_ID: u64 = 26_514;
 pub const WITHDRAWAL_EIP712_NAME: &str = "LayrsPool";
 pub const WITHDRAWAL_EIP712_VERSION: &str = "2";
+pub const HORIZEN_USDC_POOL: &str = "0xb412f63299ccff4fe57714ee580895cca74dd284";
+pub const HORIZEN_USDC_TOKEN: &str = "0xdf7108f8b10f9b9ec1aba01cca057268cbf86b6c";
+pub const HORIZEN_ZEN_POOL: &str = "0xbf820a025d5e4f887470c7c86f997e9899c718c7";
+pub const HORIZEN_ZEN_TOKEN: &str = "0x57da2d504bf8b83ef304759d9f2648522d7a9280";
 const COMMAND_COMMITMENT_DOMAIN: &[u8] = b"layrs.unified-withdrawal-reserve.v1\0";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignedWithdrawalAsset {
+    Usdc,
+    Zen,
+}
+
+impl SignedWithdrawalAsset {
+    pub fn ledger_asset(self) -> &'static str {
+        match self {
+            Self::Usdc => "USDC",
+            Self::Zen => "ZEN",
+        }
+    }
+
+    pub fn pool(self) -> &'static str {
+        match self {
+            Self::Usdc => HORIZEN_USDC_POOL,
+            Self::Zen => HORIZEN_ZEN_POOL,
+        }
+    }
+
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Usdc => HORIZEN_USDC_TOKEN,
+            Self::Zen => HORIZEN_ZEN_TOKEN,
+        }
+    }
+}
+
+pub fn approved_signed_withdrawal_asset(
+    pool: &str,
+    token: &str,
+) -> Option<SignedWithdrawalAsset> {
+    if pool.eq_ignore_ascii_case(HORIZEN_USDC_POOL)
+        && token.eq_ignore_ascii_case(HORIZEN_USDC_TOKEN)
+    {
+        Some(SignedWithdrawalAsset::Usdc)
+    } else if pool.eq_ignore_ascii_case(HORIZEN_ZEN_POOL)
+        && token.eq_ignore_ascii_case(HORIZEN_ZEN_TOKEN)
+    {
+        Some(SignedWithdrawalAsset::Zen)
+    } else {
+        None
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -39,11 +89,17 @@ pub enum SignedWithdrawalError {
 }
 
 impl SignedWithdrawalIntent {
+    pub fn asset(&self) -> Result<SignedWithdrawalAsset, SignedWithdrawalError> {
+        approved_signed_withdrawal_asset(&self.pool, &self.token)
+            .ok_or(SignedWithdrawalError::InvalidIntent)
+    }
+
     pub fn validate(&self) -> Result<(), SignedWithdrawalError> {
         parse_address(&self.account)?;
         parse_address(&self.pool)?;
         parse_address(&self.token)?;
         parse_address(&self.route_wallet)?;
+        self.asset()?;
         let amount = parse_u128(&self.amount_atomic)?;
         let _nonce = parse_u128(&self.nonce)?;
         if amount == 0
@@ -278,6 +334,27 @@ mod tests {
             intent.verify_signature(&sign(&intent, &other)),
             Err(SignedWithdrawalError::InvalidSignature)
         );
+    }
+
+    #[test]
+    fn accepts_only_exact_deployed_pool_token_pairs() {
+        let key = SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
+        let mut intent = fixture(&key);
+        assert_eq!(intent.asset(), Ok(SignedWithdrawalAsset::Usdc));
+
+        intent.pool = HORIZEN_ZEN_POOL.into();
+        intent.token = HORIZEN_ZEN_TOKEN.into();
+        assert_eq!(intent.asset(), Ok(SignedWithdrawalAsset::Zen));
+        assert!(intent.validate().is_ok());
+
+        intent.token = HORIZEN_USDC_TOKEN.into();
+        assert_eq!(intent.validate(), Err(SignedWithdrawalError::InvalidIntent));
+        intent.pool = HORIZEN_USDC_POOL.into();
+        intent.token = HORIZEN_ZEN_TOKEN.into();
+        assert_eq!(intent.validate(), Err(SignedWithdrawalError::InvalidIntent));
+        intent.pool = "0x1111111111111111111111111111111111111111".into();
+        intent.token = "0x2222222222222222222222222222222222222222".into();
+        assert_eq!(intent.validate(), Err(SignedWithdrawalError::InvalidIntent));
     }
 
     #[test]
