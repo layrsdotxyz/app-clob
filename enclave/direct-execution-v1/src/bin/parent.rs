@@ -6197,6 +6197,9 @@ async fn command(
                     operation_id,asset,source_chain:proof.source_chain,amount_atomic,custody_reference,source_references,
                 },
                 Ok(None)=>return (StatusCode::SERVICE_UNAVAILABLE,"UNIFIED_DEPOSIT_SOURCE_FINALITY_PENDING").into_response(),
+                Err(error) if error.starts_with("unified deposit RPC")=>return (
+                    StatusCode::SERVICE_UNAVAILABLE,"UNIFIED_DEPOSIT_SOURCE_FINALITY_PENDING"
+                ).into_response(),
                 Err(_)=>return (StatusCode::CONFLICT,"UNIFIED_DEPOSIT_SOURCE_PROOF_CONFLICT").into_response(),
             }
         }

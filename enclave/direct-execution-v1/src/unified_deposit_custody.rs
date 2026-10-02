@@ -29,7 +29,7 @@ pub(super) struct UnifiedSourceDepositProof {
 struct ChainConfig {
     chain_id: u64,
     tokens: BTreeMap<String, String>,
-    rpc_url: String,
+    rpc_urls: Vec<String>,
     confirmations: u64,
 }
 
@@ -52,11 +52,24 @@ impl UnifiedDepositCustodyAdapter {
                 _ if matches!(chain, "tempo" | "robinhood") => continue,
                 _ => return Err(format!("{prefix}_RPC_URL required")),
             };
-            let parsed = reqwest::Url::parse(&rpc_url).map_err(|_| format!("{prefix}_RPC_URL invalid"))?;
-            if parsed.scheme() != "https"
-                && !(parsed.scheme() == "http" && matches!(parsed.host_str(), Some("127.0.0.1" | "localhost")))
-            {
-                return Err(format!("{prefix}_RPC_URL requires HTTPS or localhost"));
+            let mut rpc_urls = vec![rpc_url];
+            if chain != "horizen" {
+                if let Ok(fallback) = env::var(format!("{prefix}_RPC_FALLBACK_URL")) {
+                    if !fallback.trim().is_empty() {
+                        rpc_urls.push(fallback);
+                    }
+                }
+            }
+            if rpc_urls.len() == 2 && rpc_urls[0] == rpc_urls[1] {
+                return Err(format!("{prefix}_RPC_FALLBACK_URL duplicates primary"));
+            }
+            for rpc_url in &rpc_urls {
+                let parsed = reqwest::Url::parse(rpc_url).map_err(|_| format!("{prefix}_RPC_URL invalid"))?;
+                if parsed.scheme() != "https"
+                    && !(parsed.scheme() == "http" && matches!(parsed.host_str(), Some("127.0.0.1" | "localhost")))
+                {
+                    return Err(format!("{prefix}_RPC_URL requires HTTPS or localhost"));
+                }
             }
             let chain_id = env::var(format!("{prefix}_CHAIN_ID")).map_err(|_| format!("{prefix}_CHAIN_ID required"))?
                 .parse::<u64>().ok().filter(|value| *value > 0).ok_or_else(|| format!("{prefix}_CHAIN_ID invalid"))?;
@@ -77,7 +90,7 @@ impl UnifiedDepositCustodyAdapter {
                 if zen != expected { return Err(format!("{prefix}_ZEN_TOKEN_ADDRESS invalid")); }
                 tokens.insert("ZEN".into(), zen);
             }
-            chains.insert(chain.into(), ChainConfig { chain_id, tokens, rpc_url, confirmations });
+            chains.insert(chain.into(), ChainConfig { chain_id, tokens, rpc_urls, confirmations });
         }
         Ok(Some(Self {
             client: reqwest::Client::builder().timeout(Duration::from_secs(8)).build()
@@ -87,18 +100,23 @@ impl UnifiedDepositCustodyAdapter {
     }
 
     async fn rpc(&self, config: &ChainConfig, method: &str, params: Value) -> Result<Value, String> {
-        let body: Value = self.client.post(&config.rpc_url)
-            .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
-            .send().await.map_err(|_| "unified deposit RPC unavailable")?
-            .error_for_status().map_err(|_| "unified deposit RPC rejected")?
-            .json().await.map_err(|_| "unified deposit RPC malformed")?;
-        if body.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
-            || body.get("id").and_then(Value::as_u64) != Some(1)
-            || body.get("error").is_some()
-        {
-            return Err("unified deposit RPC rejected".into());
+        for rpc_url in &config.rpc_urls {
+            let Ok(response) = self.client.post(rpc_url)
+                .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params.clone()}))
+                .send().await else { continue; };
+            let Ok(response) = response.error_for_status() else { continue; };
+            let Ok(body) = response.json::<Value>().await else { continue; };
+            if body.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+                || body.get("id").and_then(Value::as_u64) != Some(1)
+                || body.get("error").is_some()
+            {
+                continue;
+            }
+            if let Some(result) = body.get("result") {
+                return Ok(result.clone());
+            }
         }
-        body.get("result").cloned().ok_or_else(|| "unified deposit RPC result missing".into())
+        Err("unified deposit RPC unavailable".into())
     }
 
     pub async fn source_finality(
@@ -188,5 +206,41 @@ impl UnifiedDepositCustodyAdapter {
         let digest = sha256(&serde_json::to_vec(&(proof.source_chain.as_str(), &references))
             .map_err(|_| "unified deposit binding unavailable")?);
         Ok(Some((format!("unified-{}-source:{}:{digest}", asset.to_ascii_lowercase(), proof.source_chain), references)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{http::StatusCode, routing::post, Json, Router};
+
+    #[tokio::test]
+    async fn rpc_uses_the_second_provider_after_primary_failure() {
+        let primary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_address = primary.local_addr().unwrap();
+        let primary_task = tokio::spawn(async move {
+            axum::serve(primary, Router::new().route("/", post(|| async { StatusCode::SERVICE_UNAVAILABLE })))
+                .await.unwrap();
+        });
+        let fallback = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_address = fallback.local_addr().unwrap();
+        let fallback_task = tokio::spawn(async move {
+            axum::serve(fallback, Router::new().route("/", post(|| async {
+                Json(json!({"jsonrpc":"2.0","id":1,"result":"0x1"}))
+            }))).await.unwrap();
+        });
+        let adapter = UnifiedDepositCustodyAdapter {
+            client: reqwest::Client::builder().timeout(Duration::from_secs(1)).build().unwrap(),
+            chains: BTreeMap::new(),
+        };
+        let config = ChainConfig {
+            chain_id: 1,
+            tokens: BTreeMap::new(),
+            rpc_urls: vec![format!("http://{primary_address}"), format!("http://{fallback_address}")],
+            confirmations: 1,
+        };
+        assert_eq!(adapter.rpc(&config, "eth_chainId", json!([])).await.unwrap(), json!("0x1"));
+        primary_task.abort();
+        fallback_task.abort();
     }
 }

@@ -7,7 +7,8 @@ const POOL:&str="0xb412f63299ccff4fe57714ee580895cca74dd284";
 pub(super) struct UsdcCustodyAdapter {client:reqwest::Client,rpc_url:String,confirmations:u64}
 impl UsdcCustodyAdapter {
     pub fn from_environment()->Result<Option<Self>,String> {
-        if env::var("LAYRS_DIRECT_USDC_CUSTODY_ENABLED").as_deref()!=Ok("true") {return Ok(None);}
+        if env::var("LAYRS_DIRECT_USDC_CUSTODY_ENABLED").as_deref()!=Ok("true")
+            &&env::var("LAYRS_UNIFIED_USDC_FINALITY_ENABLED").as_deref()!=Ok("true") {return Ok(None);}
         let rpc_url=env::var("LAYRSV2_HORIZEN_RPC_URL").map_err(|_|"Horizen RPC required")?;
         let parsed=reqwest::Url::parse(&rpc_url).map_err(|_|"Horizen RPC configuration invalid")?;
         if parsed.scheme()!="https"&&!(parsed.scheme()=="http"&&matches!(parsed.host_str(),Some("127.0.0.1"|"localhost"))) {
