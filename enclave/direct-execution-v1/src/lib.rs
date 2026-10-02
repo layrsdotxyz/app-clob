@@ -5770,6 +5770,7 @@ mod tests {
             live.execute_committed(credit, &state_key, &mut store).unwrap().effect,
             "DEPOSIT_CONDITIONALLY_CREDITED"
         );
+        assert!(v71_checkpoint::financial_state_root_ignoring_history(&live).is_ok());
         assert_eq!(live.balance(&identity, "USDC", "USER_AVAILABLE"), 5_000_000);
 
         let market = "layrs:v5:BTC:USDC:1h:unified-in-transit";
