@@ -42,6 +42,15 @@ test('candidate ASG health grace remains above measured restore plus margin',()=
   assert.ok(seconds>=25*60,'health grace must exceed the restore-based hard-abort floor');
 });
 
+test('hot grant renewal stages a restart-safe successor without replacing the writer',()=>{
+  assert.match(template,/StagedWriterGrantBase64:\n    Type: String\n    Default: ''\n    NoEcho: true/);
+  assert.ok(template.includes("StagedWriterGrantCommitment: { Type: String, Default: '' }"));
+  assert.match(template,/kms:EncryptionContext:layrs-writer-grant:\n\s+- !Ref WriterGrantCommitment\n\s+- !Ref StagedWriterGrantCommitment/);
+  assert.ok(template.includes('"LAYRS_DIRECT_STAGED_WRITER_GRANT_JSON"'));
+  assert.equal((template.match(/Type: AWS::EC2::LaunchTemplate/g)||[]).length,1);
+  assert.equal((template.match(/Type: AWS::AutoScaling::AutoScalingGroup/g)||[]).length,1);
+});
+
 test('actual parent bootstrap remains valid Python',()=>{
   const match=template.match(/            \/usr\/bin\/python3 - <<'PY'\n([\s\S]*?)\n            PY/);
   assert.ok(match,'actual bootstrap must exist');

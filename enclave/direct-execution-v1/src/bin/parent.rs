@@ -5179,7 +5179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         execution_mode.as_deref(),
         Some("admission-enabled" | "production-enabled")
     ) {
-        let grant: WriterGrant = env::var("LAYRS_DIRECT_WRITER_GRANT_JSON")
+        let primary: WriterGrant = env::var("LAYRS_DIRECT_WRITER_GRANT_JSON")
             .ok()
             .and_then(|value| serde_json::from_str(&value).ok())
             .ok_or("production writer grant is required")?;
@@ -5192,20 +5192,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .duration_since(UNIX_EPOCH)
             .map(|value| value.as_secs())
             .unwrap_or(0);
-        if !grant.verify(now, &binding) {
-            return Err("production writer grant signature is invalid".into());
-        }
         let kms_key_id = env::var("LAYRS_DIRECT_KEY_RELEASE_KMS_KEY_ID")
             .map_err(|_| "production key-release KMS reference is required")?;
-        if kms_key_id != grant.key_release_kms_key_id {
-            return Err("production key-release KMS reference mismatch".into());
+        let mut candidates = vec![primary];
+        if let Ok(raw) = env::var("LAYRS_DIRECT_STAGED_WRITER_GRANT_JSON") {
+            let staged: WriterGrant = serde_json::from_str(&raw)
+                .map_err(|_| "staged production writer grant is invalid")?;
+            candidates.push(staged);
         }
-        projection
-            .as_ref()
-            .ok_or("production projection is required")?
-            .verify_governed_runtime_mode(&grant, financial_enabled)
-            .await
-            .map_err(|_| "runtime authorization and writer fence verification failed")?;
+        if candidates.len() == 2 && candidates[0].commitment() == candidates[1].commitment() {
+            return Err("staged production writer grant duplicates the primary grant".into());
+        }
+        for candidate in &candidates {
+            if !candidate.verify(now, &binding) {
+                return Err("production writer grant signature is invalid".into());
+            }
+            if candidate.key_release_kms_key_id != kms_key_id {
+                return Err("production key-release KMS reference mismatch".into());
+            }
+        }
+        let projection = projection.as_ref().ok_or("production projection is required")?;
+        let mut selected = None;
+        for candidate in candidates {
+            if projection.verify_governed_runtime_mode(&candidate, financial_enabled).await.is_ok() {
+                if selected.is_some() {
+                    return Err("multiple production writer grants match the database fence".into());
+                }
+                selected = Some(candidate);
+            }
+        }
+        let grant = selected.ok_or("runtime authorization and writer fence verification failed")?;
         Some(GovernedBootstrapConfig {
             grant,
             binding,
@@ -5409,6 +5425,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/privacy/receipt-key-attestation", get(quest_receipt_attestation))
         .route("/v1/runtime/status", get(status))
         .route("/v1/operator/markets", post(register_market))
+        .route("/v1/operator/writer-grant/source", get(writer_grant_source))
+        .route("/v1/operator/writer-grant/prepare", post(prepare_writer_grant))
         .route("/v1/operator/writer-grant/renew", post(renew_writer_grant))
         .route("/v1/operator/markets/resolve", post(resolve_market))
         .route("/v1/operator/markets/:market_id", get(market_status))
@@ -5526,6 +5544,162 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
         _ => (StatusCode::BAD_GATEWAY, "UNEXPECTED_RESPONSE").into_response(),
     }
 }
+/// Returns only public signed authorization material after proving that the
+/// database, runtime, and immutable artifact all name the same live grant.
+/// It deliberately contains no runtime keys, credentials, database URL, or
+/// ciphertext and lets the external renewal job avoid prose/copied values.
+async fn writer_grant_source(State(state): State<AppState>) -> Response {
+    let Some(config) = state.governed_bootstrap.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_UNAVAILABLE").into_response();
+    };
+    let Some(grant) = state.current_writer_grant.lock().await.as_ref().cloned() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_UNAVAILABLE").into_response();
+    };
+    let Some(projection) = state.projection.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_DATABASE_UNAVAILABLE").into_response();
+    };
+    if projection.verify_governed_runtime_mode(&grant, config.requested_mode == "production-enabled").await.is_err() {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_DATABASE_MISMATCH").into_response();
+    }
+    let runtime = match exchange(&state, RuntimeRequest::Status).await {
+        Ok(RuntimeResponse::Status { status }) => status,
+        _ => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_STATUS_UNAVAILABLE").into_response(),
+    };
+    let commitment = grant.commitment();
+    let Some(artifact_hash) = runtime.key_release_artifact_hash.as_deref() else {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_RUNTIME_MISMATCH").into_response();
+    };
+    if runtime.writer_grant_commitment.as_deref() != Some(commitment.as_str())
+        || runtime.writer_grant_expires_at_unix != Some(grant.expires_at_unix)
+    {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_RUNTIME_MISMATCH").into_response();
+    }
+    let artifact = match state.artifact_store.as_ref() {
+        Some(store) => match store.load_key_release(&grant.activation_id).await {
+            Ok(Some(artifact)) if artifact.verify_for(&grant, &config.binding, &config.kms_key_id)
+                && artifact.artifact_hash() == artifact_hash => artifact,
+            _ => return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_ARTIFACT_MISMATCH").into_response(),
+        },
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_ARCHIVE_UNAVAILABLE").into_response(),
+    };
+    Json(json!({
+        "grant": grant,
+        "writerGrantCommitment": commitment,
+        "writerGrantExpiresAtUnix": runtime.writer_grant_expires_at_unix,
+        "keyReleaseArtifactHash": artifact.artifact_hash(),
+        "runtimeMeasurement": config.binding,
+    })).into_response()
+}
+/// Creates the immutable successor key-release artifact without changing the
+/// database, enclave authorization, health, or financial state. Consumers can
+/// therefore be deployed with the exact current+successor binding before the
+/// database/enclave CAS. Retrying the same signed grant is idempotent.
+async fn prepare_writer_grant(
+    State(state): State<AppState>,
+    Json(grant): Json<WriterGrant>,
+) -> Response {
+    let Some(config) = state.governed_bootstrap.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_UNAVAILABLE").into_response();
+    };
+    let now = now_unix();
+    if !grant.verify(now, &config.binding)
+        || grant.runtime_measurement != config.binding
+        || grant.key_release_kms_key_id != config.kms_key_id
+        || grant.authorization_scope != config.requested_mode
+    {
+        return (StatusCode::FORBIDDEN, "WRITER_GRANT_RENEWAL_INVALID").into_response();
+    }
+    let Some(current) = state.current_writer_grant.lock().await.as_ref().cloned() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_UNAVAILABLE").into_response();
+    };
+    let current_commitment = current.commitment();
+    let Some(projection) = state.projection.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_DATABASE_UNAVAILABLE").into_response();
+    };
+    // Preparation must happen while the database still names the predecessor.
+    // The final /renew call performs the inverse check after the CAS.
+    if projection.verify_governed_runtime_mode(&current, config.requested_mode == "production-enabled").await.is_err() {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_DATABASE_MISMATCH").into_response();
+    }
+    let runtime = match exchange(&state, RuntimeRequest::Status).await {
+        Ok(RuntimeResponse::Status { status }) => status,
+        _ => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_STATUS_UNAVAILABLE").into_response(),
+    };
+    let (Some(runtime_commitment), Some(runtime_artifact_hash)) = (
+        runtime.writer_grant_commitment.as_deref(),
+        runtime.key_release_artifact_hash.as_deref(),
+    ) else {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_RUNTIME_MISMATCH").into_response();
+    };
+    let Some(predecessor) = grant.key_release_predecessor.as_ref() else {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_PREDECESSOR_MISMATCH").into_response();
+    };
+    if runtime_commitment != current_commitment
+        || predecessor.activation_id != current.activation_id
+        || predecessor.writer_grant_commitment != current_commitment
+        || predecessor.artifact_sha256 != runtime_artifact_hash
+    {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_PREDECESSOR_MISMATCH").into_response();
+    }
+    let successor_commitment = grant.commitment();
+    let Some(store) = state.artifact_store.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_ARCHIVE_UNAVAILABLE").into_response();
+    };
+    let artifact = match store.load_key_release(&grant.activation_id).await {
+        Ok(Some(artifact)) if artifact.verify_for(&grant, &config.binding, &config.kms_key_id) => artifact,
+        Ok(Some(_)) => return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_ARTIFACT_MISMATCH").into_response(),
+        Ok(None) => {
+            let predecessor_artifact = match store.load_key_release(&predecessor.activation_id).await {
+                Ok(Some(artifact)) if artifact.verify_as_predecessor(predecessor, &config.kms_key_id) => artifact,
+                _ => return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_PREDECESSOR_MISMATCH").into_response(),
+            };
+            let source_context = predecessor_artifact.encryption_context.clone().into_iter().collect();
+            let mut destination_context = BTreeMap::new();
+            destination_context.insert("layrs-runtime".into(), TRANSACTION_MODEL.into());
+            destination_context.insert("layrs-epoch".into(), EPOCH_ID.into());
+            destination_context.insert("layrs-writer-grant".into(), successor_commitment.clone());
+            let aws = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+            let reencrypted = match KmsClient::new(&aws).re_encrypt()
+                .ciphertext_blob(KmsBlob::new(predecessor_artifact.ciphertext_blob))
+                .source_key_id(&config.kms_key_id)
+                .destination_key_id(&config.kms_key_id)
+                .set_source_encryption_context(Some(source_context))
+                .set_destination_encryption_context(Some(destination_context.clone().into_iter().collect()))
+                .send().await
+            {
+                Ok(value) => value,
+                Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_KMS_FAILED").into_response(),
+            };
+            let Some(ciphertext) = reencrypted.ciphertext_blob() else {
+                return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_KMS_FAILED").into_response();
+            };
+            let artifact = GovernedKeyReleaseArtifact {
+                protocol: "layrs.direct-execution.key-release.v1".into(),
+                activation_id: grant.activation_id.clone(),
+                writer_grant_commitment: successor_commitment.clone(),
+                runtime_measurement: config.binding.clone(),
+                kms_key_id: config.kms_key_id.clone(),
+                encryption_context: destination_context,
+                ciphertext_blob: ciphertext.as_ref().to_vec(),
+            };
+            if !artifact.verify_for(&grant, &config.binding, &config.kms_key_id) {
+                return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_ARTIFACT_MISMATCH").into_response();
+            }
+            match store.persist_key_release(&artifact).await {
+                Ok(artifact) => artifact,
+                Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_ARCHIVE_FAILED").into_response(),
+            }
+        }
+        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_ARCHIVE_FAILED").into_response(),
+    };
+    Json(json!({
+        "activationId": grant.activation_id,
+        "writerGrantCommitment": successor_commitment,
+        "writerGrantExpiresAtUnix": grant.expires_at_unix,
+        "keyReleaseArtifactHash": artifact.artifact_hash(),
+        "runtimeChanged": false,
+    })).into_response()
+}
 async fn renew_writer_grant(
     State(state): State<AppState>,
     Json(grant): Json<WriterGrant>,
@@ -5548,9 +5722,8 @@ async fn renew_writer_grant(
     let Some(projection) = state.projection.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_DATABASE_UNAVAILABLE").into_response();
     };
-    if projection.verify_governed_runtime_mode(&grant, config.requested_mode == "production-enabled").await.is_err() {
-        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_DATABASE_MISMATCH").into_response();
-    }
+    let financial_writer_enabled = config.requested_mode == "production-enabled";
+    let successor_in_database = projection.verify_governed_runtime_mode(&grant, financial_writer_enabled).await.is_ok();
     let runtime = match exchange(&state, RuntimeRequest::Status).await {
         Ok(RuntimeResponse::Status { status }) => status,
         _ => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_STATUS_UNAVAILABLE").into_response(),
@@ -5567,6 +5740,9 @@ async fn renew_writer_grant(
         None => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_ARCHIVE_UNAVAILABLE").into_response(),
     };
     if runtime_commitment == successor_commitment {
+        if !successor_in_database {
+            return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_DATABASE_MISMATCH").into_response();
+        }
         let artifact = match store.load_key_release(&grant.activation_id).await {
             Ok(Some(artifact)) if artifact.verify_for(&grant, &config.binding, &config.kms_key_id)
                 && artifact.artifact_hash() == runtime_artifact_hash => artifact,
@@ -5644,6 +5820,11 @@ async fn renew_writer_grant(
         Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_ARCHIVE_FAILED").into_response(),
     };
     let artifact_hash = artifact.artifact_hash();
+    if !successor_in_database
+        && projection.cas_governed_writer_grant(&current, &grant, financial_writer_enabled).await.is_err()
+    {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_DATABASE_MISMATCH").into_response();
+    }
     match exchange(&state, RuntimeRequest::RenewGovernedWriter {
         grant: grant.clone(),
         key_release_artifact_hash: artifact_hash.clone(),
@@ -7515,6 +7696,55 @@ impl Projection {
         } else {
             Err(ProjectionError::OpeningMismatch)
         }
+    }
+
+    async fn cas_governed_writer_grant(
+        &self,
+        current: &WriterGrant,
+        successor: &WriterGrant,
+        financial_writer_enabled: bool,
+    ) -> Result<(), ProjectionError> {
+        let current_expiry = i64::try_from(current.expires_at_unix).map_err(|_| ProjectionError::OpeningMismatch)?;
+        let successor_expiry = i64::try_from(successor.expires_at_unix).map_err(|_| ProjectionError::OpeningMismatch)?;
+        let mut client = self.client.lock().await;
+        let transaction = client.transaction().await.map_err(|_| ProjectionError::Database)?;
+        let row = transaction.query_opt(
+            "SELECT activation_id,expires_at_unix,grant_json::text FROM direct_execution_writer_grants WHERE epoch_id=$1 FOR UPDATE",
+            &[&EPOCH_ID],
+        ).await.map_err(|_| ProjectionError::Database)?.ok_or(ProjectionError::OpeningMismatch)?;
+        let activation: String = row.get(0);
+        let expiry: i64 = row.get(1);
+        let stored: WriterGrant = serde_json::from_str(&row.get::<_, String>(2))
+            .map_err(|_| ProjectionError::OpeningMismatch)?;
+        if activation != current.activation_id || expiry != current_expiry || stored != *current {
+            return Err(ProjectionError::OpeningMismatch);
+        }
+        let fence = transaction.query_opt(
+            "SELECT old_writer_fence_evidence_sha256,old_writer_authorized,target_writer_enabled,activation_id FROM direct_execution_writer_fence WHERE epoch_id=$1 FOR UPDATE",
+            &[&EPOCH_ID],
+        ).await.map_err(|_| ProjectionError::Database)?.ok_or(ProjectionError::OpeningMismatch)?;
+        if fence.get::<_, String>(0) != current.old_writer_fence_evidence_sha256
+            || fence.get::<_, bool>(1)
+            || fence.get::<_, bool>(2) != financial_writer_enabled
+            || fence.get::<_, Option<String>>(3).as_deref() != Some(current.activation_id.as_str())
+        {
+            return Err(ProjectionError::OpeningMismatch);
+        }
+        let successor_json = serde_json::to_string(successor).map_err(|_| ProjectionError::Database)?;
+        if transaction.execute(
+            "UPDATE direct_execution_writer_grants SET activation_id=$1,expires_at_unix=$2,grant_json=$3::text::jsonb,applied_at=transaction_timestamp() WHERE epoch_id=$4 AND activation_id=$5 AND expires_at_unix=$6",
+            &[&successor.activation_id, &successor_expiry, &successor_json, &EPOCH_ID,
+              &current.activation_id, &current_expiry],
+        ).await.map_err(|_| ProjectionError::Database)? != 1 {
+            return Err(ProjectionError::OpeningMismatch);
+        }
+        if transaction.execute(
+            "UPDATE direct_execution_writer_fence SET activation_id=$1,changed_at=transaction_timestamp() WHERE epoch_id=$2 AND activation_id=$3 AND old_writer_authorized=FALSE AND target_writer_enabled=$4",
+            &[&successor.activation_id, &EPOCH_ID, &current.activation_id, &financial_writer_enabled],
+        ).await.map_err(|_| ProjectionError::Database)? != 1 {
+            return Err(ProjectionError::OpeningMismatch);
+        }
+        transaction.commit().await.map_err(|_| ProjectionError::Database)
     }
 }
 

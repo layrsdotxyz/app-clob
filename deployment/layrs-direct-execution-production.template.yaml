@@ -54,11 +54,16 @@ Parameters:
     Type: String
     Default: ''
     NoEcho: true
+  StagedWriterGrantBase64:
+    Type: String
+    Default: ''
+    NoEcho: true
   ApprovedRuntimeBindingBase64:
     Type: String
     Default: ''
     NoEcho: true
   WriterGrantCommitment: { Type: String, Default: '' }
+  StagedWriterGrantCommitment: { Type: String, Default: '' }
   ApprovedPcr0: { Type: String, Default: '' }
   ApprovedPcr1: { Type: String, Default: '' }
   ApprovedPcr2: { Type: String, Default: '' }
@@ -138,7 +143,9 @@ Resources:
                     kms:RecipientAttestation:PCR2: !Ref ApprovedPcr2
                     kms:EncryptionContext:layrs-runtime: layrs.direct-execution.v1
                     kms:EncryptionContext:layrs-epoch: layrs-opening-epoch-20260911-941107537728c98b
-                    kms:EncryptionContext:layrs-writer-grant: !Ref WriterGrantCommitment
+                    kms:EncryptionContext:layrs-writer-grant:
+                      - !Ref WriterGrantCommitment
+                      - !Ref StagedWriterGrantCommitment
               # A measured-runtime upgrade may rewrap the exact prior root-key
               # ciphertext under the newly signed grant context. KMS performs
               # this entirely inside the service; the parent cannot receive
@@ -314,6 +321,11 @@ Resources:
                     "LAYRS_DIRECT_WRITER_GRANT_JSON": writer_grant,
                     "LAYRS_DIRECT_APPROVED_RUNTIME_BINDING_JSON": runtime_binding,
                 })
+                if "${StagedWriterGrantBase64}":
+                    values["LAYRS_DIRECT_STAGED_WRITER_GRANT_JSON"] = json.dumps(
+                        json.loads(base64.b64decode("${StagedWriterGrantBase64}", validate=True).decode("utf-8")),
+                        separators=(",", ":"),
+                    )
             if "${ExecutionMode}" == "production-enabled":
                 if "${RelayObservationSecretArn}":
                     relay_observation = secret("${RelayObservationSecretArn}")
