@@ -1,8 +1,8 @@
 //! Independent source-chain proof for unified wallet deposits. The
 //! backend may discover a transfer, but only canonical RPC evidence can turn
 //! it into an enclave credit. Several USDC transfers are verified as one batch
-//! so the five-USDC wallet threshold is crossed atomically; ZEN uses the same
-//! proof boundary on its two supported source chains.
+//! so the per-chain five-USDC wallet threshold is crossed atomically; ZEN uses
+//! the same proof boundary for direct Horizen deposits.
 use super::*;
 
 const TRANSFER_TOPIC: &str =
@@ -82,14 +82,10 @@ impl UnifiedDepositCustodyAdapter {
                 .map_err(|_| format!("{prefix}_TOKEN_ADDRESS required"))?)?;
             let mut tokens = BTreeMap::from([("USDC".into(),TokenConfig {address:usdc,
                 source_decimals:if chain=="bnb" {18}else{6},ledger_decimals:6})]);
-            if matches!(chain, "base" | "horizen") {
+            if chain == "horizen" {
                 let zen = canonical_evm_address(&env::var(format!("{prefix}_ZEN_TOKEN_ADDRESS"))
                     .map_err(|_| format!("{prefix}_ZEN_TOKEN_ADDRESS required"))?)?;
-                let expected = if chain == "base" {
-                    "0xf43eb8de897fbc7f2502483b2bef7bb9ea179229"
-                } else {
-                    "0x57da2d504bf8b83ef304759d9f2648522d7a9280"
-                };
+                let expected = "0x57da2d504bf8b83ef304759d9f2648522d7a9280";
                 if zen != expected { return Err(format!("{prefix}_ZEN_TOKEN_ADDRESS invalid")); }
                 tokens.insert("ZEN".into(),TokenConfig {address:zen,source_decimals:18,ledger_decimals:18});
             }

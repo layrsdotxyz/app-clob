@@ -42,7 +42,8 @@ use layrs_direct_execution_v1::{
     GovernedBalanceRecovery, GovernedKeyReleaseArtifact, GovernedMarketRegistration,
     GovernedMarketResolution, ImmutableExternalEffectIntentStore, OrderAction, Outcome,
     ProjectionBalanceRow, ProjectionIdentityRow, ProjectionWalletRow, RelayWithdrawalBinding,
-    RuntimeMeasurementBinding, RuntimeRequest, RuntimeResponse, SealedEpoch, SignedWithdrawalIntent, TimeInForce,
+    RuntimeMeasurementBinding, RuntimeRequest, RuntimeResponse, SealedEpoch, SignedWithdrawalAsset,
+    SignedWithdrawalIntent, TimeInForce,
     WriterGrant, EPOCH_ID, MAX_V70_LINEAGE_RECORDS, POSTGRES_PROJECTION_DDL,
     TRANSACTION_MODEL,
 };
@@ -5129,7 +5130,8 @@ enum CustomerAction {
     LinkFinancialWallet {grant:WalletLinkGrant,signature:String},
     LinkPoolWallet {wallet_address:String,external_id:String},
     ReserveSignedWithdrawal {intent:SignedWithdrawalIntent,user_signature:String},
-    SettleSignedWithdrawal {intent_hash:String,pool:String,token:String,horizen_transaction_hash:String},
+    SettleSignedWithdrawal {intent_hash:String,pool:String,token:String,payout_destination:String,amount_atomic:String,
+        horizen_transaction_hash:String},
     ReleaseExpiredSignedWithdrawal {intent:SignedWithdrawalIntent,finalized_block_number:String,finalized_block_hash:String},
     ReserveZenWithdrawal { destination_chain: String, destination: String, amount_atomic: String },
     PlaceOrder {
@@ -6092,7 +6094,7 @@ async fn command(
                 Err((status,code))=>return (status,code).into_response(),
             }
         }
-        CustomerAction::SettleSignedWithdrawal {intent_hash,pool,token,horizen_transaction_hash} => {
+        CustomerAction::SettleSignedWithdrawal {intent_hash,pool,token,payout_destination,amount_atomic,horizen_transaction_hash} => {
             let normalized_intent=intent_hash.to_ascii_lowercase();
             let normalized_hash=horizen_transaction_hash.to_ascii_lowercase();
             if request_id!=format!("signed-withdrawal-settle:{}",normalized_intent.trim_start_matches("0x")) {
@@ -6108,10 +6110,10 @@ async fn command(
                 Some(asset)=>asset.ledger_asset(),
                 None=>return (StatusCode::BAD_REQUEST,"SIGNED_WITHDRAWAL_ASSET_INVALID").into_response(),
             };
-            match custody.signed_withdrawal_finality(&claims.wallet_address,route_wallet,&normalized_intent,
-                &normalized_hash,&pool,&token).await {
+            match custody.signed_withdrawal_finality(&payout_destination,&amount_atomic,&normalized_hash,&pool,&token).await {
                 Ok(DepositFinality::Finalized)=>DirectAction::SettleSignedWithdrawal {
-                    intent_hash:normalized_intent,asset:asset.into(),horizen_transaction_hash:normalized_hash,
+                    intent_hash:normalized_intent,asset:asset.into(),route_wallet:route_wallet.into(),payout_destination,amount_atomic,
+                    horizen_transaction_hash:normalized_hash,
                 },
                 Ok(DepositFinality::Pending)=>return (StatusCode::SERVICE_UNAVAILABLE,"SIGNED_WITHDRAWAL_FINALITY_PENDING").into_response(),
                 Ok(DepositFinality::Reverted)=>return (StatusCode::CONFLICT,"SIGNED_WITHDRAWAL_PAYOUT_REVERTED").into_response(),

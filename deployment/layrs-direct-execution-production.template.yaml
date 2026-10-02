@@ -391,7 +391,6 @@ Resources:
                     values.update({
                         "LAYRS_UNIFIED_DEPOSITS_ENABLED": "true",
                         "LAYRS_UNIFIED_USDC_FINALITY_ENABLED": "true",
-                        "LAYRS_UNIFIED_BASE_ZEN_TOKEN_ADDRESS": "0xf43eb8de897fbc7f2502483b2bef7bb9ea179229",
                         "LAYRS_UNIFIED_HORIZEN_ZEN_TOKEN_ADDRESS": "0x57da2d504bf8b83ef304759d9f2648522d7a9280",
                     })
                 if "${UsdcCustodyEnabled}" == "true":

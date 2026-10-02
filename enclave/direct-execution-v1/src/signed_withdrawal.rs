@@ -1,10 +1,11 @@
 //! Canonical user authorization for unified withdrawals.
 //!
-//! The same EIP-712 digest is checked by the enclave before reserving balance
-//! and by `LayrsPool` before releasing custody. A nonce-stable request id makes
-//! a second payload with the same user nonce collide in v71's authenticated
-//! sparse request index, even after the active hold has reached a terminal
-//! state and left compact financial state.
+//! The EIP-712 digest is checked by the enclave before reserving balance. The
+//! existing LayrsPool remains unchanged: after independent receipt evidence,
+//! its existing ledger signer executes `withdraw(address,uint256)`. A
+//! nonce-stable request id makes a second payload with the same user nonce
+//! collide in v71's authenticated sparse request index, even after the active
+//! hold has reached a terminal state and left compact financial state.
 
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
