@@ -102,6 +102,7 @@ struct EnclaveState {
     v71_restore_candidate: Option<DirectV71Runtime>,
     committed_restore_frontier: Option<layrs_direct_execution_v1::CommittedRestoreFrontier>,
     pending_governed_bootstrap: Option<PendingGovernedBootstrap>,
+    current_writer_grant: Option<WriterGrant>,
     writer_grant_commitment: Option<String>,
     old_writer_fence_evidence_sha256: Option<String>,
     writer_grant_expires_at_unix: Option<u64>,
@@ -160,6 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         v71_restore_candidate: None,
         committed_restore_frontier: None,
         pending_governed_bootstrap: None,
+        current_writer_grant: None,
         writer_grant_commitment: None,
         old_writer_fence_evidence_sha256: None,
         writer_grant_expires_at_unix: None,
@@ -243,6 +245,9 @@ where
                 commit_ack_key,
             )
             .await
+        }
+        RuntimeRequest::RenewGovernedWriter { grant, key_release_artifact_hash } => {
+            renew_governed_writer(state, grant, key_release_artifact_hash).await
         }
         RuntimeRequest::BootstrapIsolated {
             receipt_key,
@@ -659,6 +664,7 @@ where
     state.receipt_key = receipt_key;
     state.state_key = state_key;
     state.commit_ack_key = commit_ack_key;
+    state.current_writer_grant = Some(pending.grant.clone());
     state.writer_grant_expires_at_unix = Some(pending.grant.expires_at_unix);
     state.committed_restore_frontier = pending.grant.committed_restore_frontier;
     state.writer_grant_commitment = Some(writer_grant_commitment.clone());
@@ -666,6 +672,99 @@ where
     state.key_release_artifact_hash = Some(key_release_artifact_hash);
     RuntimeResponse::GovernedBootstrapComplete {
         writer_grant_commitment,
+    }
+}
+
+async fn renew_governed_writer(
+    state: Arc<Mutex<EnclaveState>>,
+    grant: WriterGrant,
+    key_release_artifact_hash: String,
+) -> RuntimeResponse {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    let signature_valid = grant.verify(now, &grant.runtime_measurement);
+    renew_governed_writer_verified(state, grant, key_release_artifact_hash, now, signature_valid).await
+}
+
+async fn renew_governed_writer_verified(
+    state: Arc<Mutex<EnclaveState>>,
+    grant: WriterGrant,
+    successor_key_release_artifact_hash: String,
+    now: u64,
+    signature_valid: bool,
+) -> RuntimeResponse {
+    let _transition = transition(&state).await;
+    let mut state = state.lock().await;
+    let Some(current) = state.current_writer_grant.as_ref() else {
+        return RuntimeResponse::Error { code: "WRITER_GRANT_RENEWAL_UNAVAILABLE".into() };
+    };
+    let Some(current_commitment) = state.writer_grant_commitment.as_ref() else {
+        return RuntimeResponse::Error { code: "WRITER_GRANT_RENEWAL_UNAVAILABLE".into() };
+    };
+    let Some(key_release_artifact_hash) = state.key_release_artifact_hash.clone() else {
+        return RuntimeResponse::Error { code: "WRITER_GRANT_RENEWAL_UNAVAILABLE".into() };
+    };
+    let requested_commitment = grant.commitment();
+    if requested_commitment == *current_commitment
+        && state.writer_grant_expires_at_unix == Some(grant.expires_at_unix)
+        && successor_key_release_artifact_hash == key_release_artifact_hash
+    {
+        return RuntimeResponse::GovernedWriterRenewed {
+            writer_grant_commitment: requested_commitment,
+            writer_grant_expires_at_unix: grant.expires_at_unix,
+            predecessor_key_release_artifact_hash: grant.key_release_predecessor.as_ref()
+                .map(|predecessor| predecessor.artifact_sha256.clone())
+                .unwrap_or_default(),
+            key_release_artifact_hash: successor_key_release_artifact_hash,
+        };
+    }
+    let predecessor_matches = grant.key_release_predecessor.as_ref().is_some_and(|predecessor| {
+        predecessor.activation_id == current.activation_id
+            && predecessor.writer_grant_commitment == *current_commitment
+            && predecessor.artifact_sha256 == key_release_artifact_hash
+    });
+    let immutable_scope_matches = grant.environment == current.environment
+        && grant.authorization_scope == current.authorization_scope
+        && grant.epoch_id == current.epoch_id
+        && grant.runtime == current.runtime
+        && grant.opening_epoch_sha256 == current.opening_epoch_sha256
+        && grant.opening_evidence_manifest_sha256 == current.opening_evidence_manifest_sha256
+        && grant.runtime_measurement == current.runtime_measurement
+        && grant.old_writer_fence_evidence_sha256 == current.old_writer_fence_evidence_sha256
+        && grant.key_release_kms_key_id == current.key_release_kms_key_id
+        && grant.committed_restore_frontier == current.committed_restore_frontier
+        && grant.governance_key_id == current.governance_key_id
+        && grant.signing_algorithm == current.signing_algorithm;
+    if !signature_valid
+        || successor_key_release_artifact_hash.len() != 64
+        || !successor_key_release_artifact_hash.bytes().all(|byte|
+            byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || successor_key_release_artifact_hash == key_release_artifact_hash
+        || grant.expires_at_unix <= now
+        || grant.expires_at_unix <= current.expires_at_unix
+        || !predecessor_matches
+        || !immutable_scope_matches
+        || state.mode == RuntimeMode::Dormant
+        || !state.recovery_complete
+        || state.pending_governed_bootstrap.is_some()
+        || state.restore_candidate.is_some()
+        || state.v71_restore_candidate.is_some()
+    {
+        return RuntimeResponse::Error { code: "WRITER_GRANT_RENEWAL_INVALID".into() };
+    }
+    let commitment = requested_commitment;
+    let expiry = grant.expires_at_unix;
+    state.current_writer_grant = Some(grant);
+    state.writer_grant_commitment = Some(commitment.clone());
+    state.writer_grant_expires_at_unix = Some(expiry);
+    state.key_release_artifact_hash = Some(successor_key_release_artifact_hash.clone());
+    RuntimeResponse::GovernedWriterRenewed {
+        writer_grant_commitment: commitment,
+        writer_grant_expires_at_unix: expiry,
+        predecessor_key_release_artifact_hash: key_release_artifact_hash,
+        key_release_artifact_hash: successor_key_release_artifact_hash,
     }
 }
 
@@ -2818,6 +2917,7 @@ mod tests {
             v71_restore_candidate: None,
             committed_restore_frontier: None,
             pending_governed_bootstrap: None,
+            current_writer_grant: None,
             writer_grant_commitment: None,
             old_writer_fence_evidence_sha256: None,
             writer_grant_expires_at_unix: None,
@@ -2843,6 +2943,7 @@ mod tests {
             v71_restore_candidate: None,
             committed_restore_frontier: None,
             pending_governed_bootstrap: None,
+            current_writer_grant: None,
             writer_grant_commitment: None,
             old_writer_fence_evidence_sha256: None,
             writer_grant_expires_at_unix: None,
@@ -4385,6 +4486,7 @@ mod tests {
             v71_restore_candidate: None,
             committed_restore_frontier: None,
             pending_governed_bootstrap: None,
+            current_writer_grant: None,
             writer_grant_commitment: None,
             old_writer_fence_evidence_sha256: None,
             writer_grant_expires_at_unix: None,
@@ -4554,6 +4656,120 @@ mod tests {
             Some(grant.commitment().as_str())
         );
         assert!(restarted.runtime.writer_enabled());
+    }
+
+    fn successor_grant(
+        current: &WriterGrant,
+        predecessor_artifact_hash: &str,
+        expires_at_unix: u64,
+    ) -> WriterGrant {
+        let mut successor = current.clone();
+        successor.activation_id = "production-bootstrap-test-2".into();
+        successor.key_release_predecessor = Some(layrs_direct_execution_v1::KeyReleasePredecessor {
+            activation_id: current.activation_id.clone(),
+            artifact_sha256: predecessor_artifact_hash.into(),
+            writer_grant_commitment: current.commitment(),
+        });
+        successor.expires_at_unix = expires_at_unix;
+        successor.signature = "deterministic-successor-test-signature".into();
+        successor
+    }
+
+    async fn bootstrapped_writer() -> (Arc<Mutex<EnclaveState>>, WriterGrant) {
+        let binding = measurement_binding();
+        let grant = writer_grant(&binding);
+        let state = dormant_state();
+        assert!(matches!(
+            begin_test_bootstrap(Arc::clone(&state), grant.clone(), binding, 1_000, true).await,
+            RuntimeResponse::GovernedKeyRecipient { .. }
+        ));
+        assert!(matches!(
+            complete_test_bootstrap(Arc::clone(&state), &grant, true).await,
+            RuntimeResponse::GovernedBootstrapComplete { .. }
+        ));
+        state.lock().await.recovery_complete = true;
+        (state, grant)
+    }
+
+    #[tokio::test]
+    async fn governed_writer_renewal_extends_only_authorization_without_restart_or_state_change() {
+        let (state, current) = bootstrapped_writer().await;
+        let before = {
+            let state = state.lock().await;
+            (
+                state.runtime.committed_sequence(),
+                state.runtime.committed_state_hash(),
+                state.receipt_key.clone(),
+                state.state_key.clone(),
+                state.commit_ack_key.clone(),
+                state.mode,
+            )
+        };
+        let successor = successor_grant(&current, &"2".repeat(64), 4_000);
+        let response = renew_governed_writer_verified(
+            Arc::clone(&state),
+            successor.clone(),
+            "3".repeat(64),
+            1_500,
+            true,
+        ).await;
+        assert_eq!(response, RuntimeResponse::GovernedWriterRenewed {
+            writer_grant_commitment: successor.commitment(),
+            writer_grant_expires_at_unix: 4_000,
+            predecessor_key_release_artifact_hash: "2".repeat(64),
+            key_release_artifact_hash: "3".repeat(64),
+        });
+        let state = state.lock().await;
+        assert_eq!(state.writer_grant_commitment.as_deref(), Some(successor.commitment().as_str()));
+        assert_eq!(state.writer_grant_expires_at_unix, Some(4_000));
+        assert_eq!(state.key_release_artifact_hash, Some("3".repeat(64)));
+        assert_eq!(state.current_writer_grant.as_ref(), Some(&successor));
+        assert_eq!(before, (
+            state.runtime.committed_sequence(),
+            state.runtime.committed_state_hash(),
+            state.receipt_key.clone(),
+            state.state_key.clone(),
+            state.commit_ack_key.clone(),
+            state.mode,
+        ));
+    }
+
+    #[tokio::test]
+    async fn governed_writer_renewal_rejects_wrong_lineage_scope_expiry_and_signature() {
+        let (state, current) = bootstrapped_writer().await;
+        let original_commitment = current.commitment();
+        let valid = successor_grant(&current, &"2".repeat(64), 4_000);
+        let mut candidates = Vec::new();
+        let mut wrong_artifact = valid.clone();
+        wrong_artifact.key_release_predecessor.as_mut().unwrap().artifact_sha256 = "3".repeat(64);
+        candidates.push((wrong_artifact, true));
+        let mut wrong_commitment = valid.clone();
+        wrong_commitment.key_release_predecessor.as_mut().unwrap().writer_grant_commitment = "4".repeat(64);
+        candidates.push((wrong_commitment, true));
+        let mut wrong_measurement = valid.clone();
+        wrong_measurement.runtime_measurement.parent_sha256 = "5".repeat(64);
+        candidates.push((wrong_measurement, true));
+        let mut shorter = valid.clone();
+        shorter.expires_at_unix = current.expires_at_unix;
+        candidates.push((shorter, true));
+        candidates.push((valid.clone(), false));
+        for (candidate, signature_valid) in candidates {
+            assert_eq!(
+                renew_governed_writer_verified(Arc::clone(&state), candidate, "3".repeat(64), 1_500, signature_valid).await,
+                RuntimeResponse::Error { code: "WRITER_GRANT_RENEWAL_INVALID".into() },
+            );
+            let state = state.lock().await;
+            assert_eq!(state.writer_grant_commitment.as_deref(), Some(original_commitment.as_str()));
+            assert_eq!(state.writer_grant_expires_at_unix, Some(current.expires_at_unix));
+        }
+        {
+            let mut guarded = state.lock().await;
+            guarded.restore_candidate = Some(guarded.runtime.clone());
+        }
+        assert_eq!(
+            renew_governed_writer_verified(state, valid, "3".repeat(64), 1_500, true).await,
+            RuntimeResponse::Error { code: "WRITER_GRANT_RENEWAL_INVALID".into() },
+        );
     }
 
     #[test]

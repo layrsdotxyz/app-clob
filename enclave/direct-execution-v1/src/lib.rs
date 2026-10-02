@@ -38,6 +38,7 @@ mod quest_receipts;
 pub mod request_index;
 pub mod request_index_snapshot;
 pub mod receipt_snapshot;
+pub mod signed_withdrawal;
 pub mod v71;
 pub mod v71_checkpoint;
 pub use quest_receipts::{PublicQuestReceipt,QuestReceiptPayload,QuestReceiptKind,QuestReceiptWitness,QuestReceiptLookupPayload,quest_public_receipt_hash,QUEST_RECEIPT_PROTOCOL,
@@ -48,6 +49,10 @@ pub use external_effect::{
     ExternalEffectRecovery, FilesystemImmutableIntentStore, ImmutableExternalEffectIntentStore,
     RelayWithdrawalBinding, EXTERNAL_EFFECT_INTENT_PROTOCOL_VERSION,
     MAX_PROVIDER_IDEMPOTENCY_WINDOW_SECONDS,
+};
+pub use signed_withdrawal::{
+    approved_signed_withdrawal_asset, SignedWithdrawalAsset, SignedWithdrawalError, SignedWithdrawalIntent,
+    HORIZEN_USDC_POOL, HORIZEN_USDC_TOKEN, HORIZEN_ZEN_POOL, HORIZEN_ZEN_TOKEN,
 };
 
 pub const EPOCH_ID: &str = "layrs-opening-epoch-20260911-941107537728c98b";
@@ -851,6 +856,28 @@ pub enum DirectAction {
     /// Parent constructs this only after independently observing the user's
     /// individual Horizen USDC.e pool deposit at canonical finality.
     CreditHorizenUsdcDeposit { amount_atomic: String, custody_reference: String },
+    /// Parent constructs this only after independently verifying every
+    /// source-chain ERC20 transfer in the batch. A batch is used so several
+    /// sub-minimum deposits become tradable atomically when their wallet
+    /// balance reaches the 5 USDC threshold.
+    CreditUnifiedSourceDeposits {
+        operation_id: String,
+        asset: String,
+        source_chain: String,
+        amount_atomic: String,
+        custody_reference: String,
+        source_references: Vec<String>,
+    },
+    /// Parent constructs this after the exact batch principal is observed in
+    /// LayrsPool on Horizen. It removes only the withdrawal restriction; the
+    /// source credit above already made the principal tradable.
+    FinalizeUnifiedDeposit {
+        operation_id: String,
+        asset: String,
+        amount_atomic: String,
+        source_custody_reference: String,
+        custody_reference: String,
+    },
     /// Parent verifies the participant's canonical normal Bus boarding first.
     CreditArbitrumUsdcBusDeposit { operation_id:String, amount_atomic:String, custody_reference:String },
     /// Parent proves that same Bus ticket arrived and the participant deposited
@@ -859,6 +886,12 @@ pub enum DirectAction {
     /// Add a newly verified participant wallet to the same canonical identity.
     /// Historical wallet references and every financial bucket remain intact.
     LinkFinancialWallet { wallet_address: String },
+    /// Permanent owner-less Privy pool wallet selected by the backend's
+    /// atomic assignment store and bound into the authenticated session.
+    LinkPoolWallet {
+        wallet_address: String,
+        external_id: String,
+    },
     /// Commit a per-user hold before custody movement. A Bus wait must not
     /// become the legacy global unresolved-external-effect writer fence.
     BeginUsdcBusWithdrawal { withdrawal_id: String, destination_chain:String, asset:String, destination: String, amount_atomic: String },
@@ -866,6 +899,27 @@ pub enum DirectAction {
     SettleUsdcBusWithdrawal { withdrawal_id: String, destination_chain:String, asset:String, destination: String, amount_atomic: String, custody_reference: String },
     /// Release only on an independently verified reverted pool transaction.
     RevertUsdcBusWithdrawal { withdrawal_id: String, destination_chain:String, asset:String, destination: String, amount_atomic: String, custody_reference: String },
+    /// User-signed EIP-712 intent. A successful command moves only this
+    /// user's available USDC into a per-operation hold and exposes an exact
+    /// command commitment for the public receipt registry.
+    ReserveSignedWithdrawal {
+        intent: SignedWithdrawalIntent,
+        user_signature: String,
+        now_unix: u64,
+    },
+    /// Terminal proof that LayrsPool paid the signed route wallet on Horizen.
+    SettleSignedWithdrawal {
+        intent_hash: String,
+        asset: String,
+        horizen_transaction_hash: String,
+    },
+    /// Releases one operation after a finalized Horizen block is strictly
+    /// later than the signed expiry. It cannot close or affect another lane.
+    ReleaseExpiredSignedWithdrawal {
+        intent_hash: String,
+        finalized_block_hash: String,
+        finalized_block_timestamp: u64,
+    },
     PlaceOrder {
         order_id: String,
         market_id: String,
@@ -954,6 +1008,11 @@ pub struct DirectReceipt {
     pub effect: String,
     pub amount_atomic: Option<String>,
     pub custody_reference: Option<String>,
+    /// Public, engine-authenticated command commitment for operations whose
+    /// on-chain execution consumes the published reserve receipt. Rejected
+    /// commands never receive this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_commitment: Option<String>,
     pub execution: Option<OrderExecution>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution: Option<DirectResolutionExecution>,
@@ -1128,6 +1187,7 @@ pub struct DirectRuntime {
     /// transfer and finality.
     credited_custody_references: BTreeSet<String>,
     usdc_bus_withdrawals: BTreeMap<String, UsdcBusHold>,
+    signed_withdrawals: BTreeMap<String, SignedWithdrawalHold>,
     conditional_usdc_deposits: BTreeMap<String, ConditionalUsdcDeposit>,
     requests: BTreeMap<(String, String), (String, DirectResult)>,
     receipt_key: Vec<u8>,
@@ -1300,12 +1360,40 @@ struct UsdcBusHold {
     amount_atomic: String,
 }
 #[derive(Clone, Serialize, Deserialize)]
+struct SignedWithdrawalHold {
+    account_id: String,
+    identity_commitment: String,
+    intent_hash: String,
+    route_wallet: String,
+    asset: String,
+    amount_atomic: String,
+    expiry_unix: u64,
+}
+#[derive(Clone, Serialize, Deserialize)]
 struct ConditionalUsdcDeposit {
     account_id:String,
     identity_commitment:String,
     wallet_address:String,
     amount_atomic:String,
     boarding_reference:String,
+    /// Historical and pre-unified records were USDC-only. An omitted value
+    /// therefore decodes as USDC without changing any existing state hash.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    asset:String,
+    /// Empty only for the historical Bus compatibility records. Omitting the
+    /// empty value preserves their exact serialized state hash.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    source_chain:String,
+    /// Empty only for historical Bus records, whose single ticket reference
+    /// remains in `boarding_reference`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    source_references:Vec<String>,
+}
+
+impl ConditionalUsdcDeposit {
+    fn asset_name(&self) -> &str {
+        if self.asset.is_empty() { "USDC" } else { &self.asset }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1350,28 +1438,53 @@ fn validate_conditional_deposits(state: &DirectState, key: &[u8]) -> Result<(), 
     let invalid = || RuntimeError::StateArtifact;
     let mut expected = BTreeSet::new();
     for ((account, id), (hash, result)) in &state.requests {
-        let Some(operation) = id.strip_prefix("usdc-bus-deposit-credit:") else { continue; };
+        let (operation, unified_asset) = if let Some(operation) = id.strip_prefix("unified-usdc-deposit-credit:") {
+            (operation, Some("USDC"))
+        } else if let Some(operation) = id.strip_prefix("unified-zen-deposit-credit:") {
+            (operation, Some("ZEN"))
+        } else if let Some(operation) = id.strip_prefix("usdc-bus-deposit-credit:") {
+            // Historical receipt validation only. New production commands do
+            // not construct or route through the retired Bus action.
+            (operation, None)
+        } else {
+            continue;
+        };
         let receipt = &result.receipt;
+        let operation_reference = if let Some(asset) = unified_asset {
+            format!("unified-{}-operation:{operation}", asset.to_ascii_lowercase())
+        } else {
+            format!("arbitrum-usdc-bus-operation:{operation}")
+        };
+        let valid_reference = receipt.custody_reference.as_deref().is_some_and(|reference| {
+            (if let Some(asset) = unified_asset { valid_unified_source_custody_reference(reference, asset) } else { valid_bus_deposit_reference(reference) })
+                && state.credited_custody_references.contains(reference)
+        });
         if !valid_bus_withdrawal_id(operation) || result.effect != "DEPOSIT_CONDITIONALLY_CREDITED"
             || result.status != TerminalStatus::Applied || receipt.status != result.status
             || receipt.effect != result.effect || receipt.account_id != *account || receipt.request_id != *id
             || receipt.request_hash != *hash || !verify_receipt(key, receipt)
             || !state.subject_identities.get(account).is_some_and(|set| set.contains(&receipt.identity_commitment))
-            || !receipt.amount_atomic.as_deref().is_some_and(|value| amount(value).is_ok_and(|value| value >= 5_000_000))
-            || !receipt.custody_reference.as_deref().is_some_and(|reference| valid_bus_deposit_reference(reference)
-                && state.credited_custody_references.contains(reference))
-            || !state.credited_custody_references.contains(&format!("arbitrum-usdc-bus-operation:{operation}")) {
+            || !receipt.amount_atomic.as_deref().is_some_and(|value| amount(value).is_ok_and(|value|
+                unified_asset != Some("USDC") || value >= 5_000_000))
+            || !valid_reference
+            || !state.credited_custody_references.contains(&operation_reference) {
             return Err(invalid());
         }
-        if let Some((final_hash, final_result)) = state.requests.get(&(account.clone(), format!("usdc-bus-deposit-finalize:{operation}"))) {
+        let final_id = if let Some(asset) = unified_asset {
+            format!("unified-{}-deposit-finalize:{operation}", asset.to_ascii_lowercase())
+        } else {
+            format!("usdc-bus-deposit-finalize:{operation}")
+        };
+        if let Some((final_hash, final_result)) = state.requests.get(&(account.clone(), final_id.clone())) {
             let final_receipt = &final_result.receipt;
             if final_result.status != TerminalStatus::Applied || final_result.effect != "DEPOSIT_FINALIZED"
                 || final_receipt.status != final_result.status || final_receipt.effect != final_result.effect
                 || final_receipt.account_id != *account || final_receipt.identity_commitment != receipt.identity_commitment
-                || final_receipt.request_hash != *final_hash || final_receipt.request_id != format!("usdc-bus-deposit-finalize:{operation}")
+                || final_receipt.request_hash != *final_hash || final_receipt.request_id != final_id
                 || final_receipt.amount_atomic != receipt.amount_atomic || !verify_receipt(key, final_receipt)
                 || !final_receipt.custody_reference.as_deref().is_some_and(|reference|
-                    reference.strip_prefix("horizen-usdc-deposit:").is_some_and(valid_transaction_hash_value)
+                    reference.strip_prefix(&format!("horizen-{}-deposit:", unified_asset.unwrap_or("USDC").to_ascii_lowercase()))
+                        .is_some_and(valid_transaction_hash_value)
                     && state.credited_custody_references.contains(reference))
                 || state.conditional_usdc_deposits.contains_key(operation) { return Err(invalid()); }
         } else {
@@ -1380,6 +1493,13 @@ fn validate_conditional_deposits(state: &DirectState, key: &[u8]) -> Result<(), 
                 || Some(&pending.amount_atomic) != receipt.amount_atomic.as_ref()
                 || Some(&pending.boarding_reference) != receipt.custody_reference.as_ref()
                 || !state.subject_wallets.get(account).is_some_and(|wallets| wallets.contains(&pending.wallet_address))
+                || (unified_asset.is_some() && (Some(pending.asset_name()) != unified_asset
+                    || !valid_unified_source_chain(&pending.source_chain)
+                    || (pending.asset_name() == "ZEN" && !matches!(pending.source_chain.as_str(), "base" | "horizen"))
+                    || pending.source_references.is_empty()
+                    || pending.source_references.iter().any(|reference| !valid_unified_source_reference(reference, &pending.source_chain, pending.asset_name())
+                        || !state.credited_custody_references.contains(reference))))
+                || (unified_asset.is_none() && (!pending.source_chain.is_empty() || !pending.source_references.is_empty()))
                 || !expected.insert(operation.to_string()) { return Err(invalid()); }
         }
     }
@@ -1390,11 +1510,11 @@ fn validate_conditional_deposits(state: &DirectState, key: &[u8]) -> Result<(), 
 fn reconstruct_bus_holds(state: &DirectState, receipt_key: &[u8]) -> Result<BTreeMap<String, UsdcBusHold>, RuntimeError> {
     let invalid = || RuntimeError::StateArtifact;
     let mut holds = BTreeMap::new();
-    let mut totals = BTreeMap::<(String,String), u128>::new();
     for ((account, id), (hash, result)) in &state.requests {
         let receipt = &result.receipt;
         let terminal = id.starts_with("usdc-bus-settle:") || id.starts_with("usdc-bus-revert:");
         if result.effect != "WITHDRAWAL_RESERVED" && !terminal { continue; }
+        if result.effect == "WITHDRAWAL_RESERVED" && !valid_bus_withdrawal_id(id) { continue; }
         if receipt.account_id != *account || receipt.request_id != *id || receipt.request_hash != *hash
             || result.status != TerminalStatus::Applied || receipt.status != result.status || receipt.effect != result.effect
             || !verify_receipt(receipt_key, receipt)
@@ -1433,19 +1553,136 @@ fn reconstruct_bus_holds(state: &DirectState, receipt_key: &[u8]) -> Result<BTre
         if holds.values().any(|hold: &UsdcBusHold| hold.identity_commitment == receipt.identity_commitment)
             || holds.insert(id.clone(), UsdcBusHold { account_id: account.clone(), identity_commitment: receipt.identity_commitment.clone(),
                 destination:destination.into(),destination_chain:destination_chain.into(),asset:asset.into(),amount_atomic:atomic.into() }).is_some() { return Err(invalid()); }
-        let total = totals.entry((receipt.identity_commitment.clone(),asset.into())).or_default();
-        *total = total.checked_add(value).ok_or_else(invalid)?;
     }
-    // Legacy withdrawals move atomically and leave no persistent hold. A
-    // missing receipt must never unlock either supported ledger asset.
-    for (identity, balances) in &state.balances {
-        for asset in ["USDC","ZEN"] {
-            let actual = balances.get(&(asset.into(), "USER_WITHDRAWAL_HOLD".into())).copied().unwrap_or_default();
-            if actual != totals.remove(&(identity.clone(),asset.into())).unwrap_or_default() { return Err(invalid()); }
+    Ok(holds)
+}
+
+fn reconstruct_signed_withdrawal_holds(
+    state: &DirectState,
+    receipt_key: &[u8],
+) -> Result<BTreeMap<String, SignedWithdrawalHold>, RuntimeError> {
+    let invalid = || RuntimeError::StateArtifact;
+    let mut holds = BTreeMap::new();
+    for ((account, id), (hash, result)) in &state.requests {
+        if result.effect != "WITHDRAWAL_RESERVED" || !id.starts_with("signed-withdrawal:") {
+            continue;
+        }
+        let receipt = &result.receipt;
+        if result.status != TerminalStatus::Applied
+            || receipt.status != result.status
+            || receipt.effect != result.effect
+            || receipt.account_id != *account
+            || receipt.request_id != *id
+            || receipt.request_hash != *hash
+            || !verify_receipt(receipt_key, receipt)
+            || !state
+                .subject_identities
+                .get(account)
+                .is_some_and(|set| set.contains(&receipt.identity_commitment))
+        {
+            return Err(invalid());
+        }
+        let reference = receipt.custody_reference.as_deref().ok_or_else(invalid)?;
+        let parts = reference.split(':').collect::<Vec<_>>();
+        if !matches!(parts.len(), 5 | 6) || parts[0] != "signed-withdrawal-reservation" {
+            return Err(invalid());
+        }
+        let intent_hash = parts[1];
+        // The first signed-withdrawal release emitted five fields and was
+        // USDC-only. New receipts bind the selected ledger asset explicitly.
+        let (asset, route_wallet, expiry, nonce_value) = if parts.len() == 5 {
+            ("USDC", parts[2], parts[3], parts[4])
+        } else {
+            (parts[2], parts[3], parts[4], parts[5])
+        };
+        let expiry_unix = expiry.parse::<u64>().map_err(|_| invalid())?;
+        let nonce = nonce_value.parse::<u128>().map_err(|_| invalid())?;
+        let atomic = receipt.amount_atomic.as_deref().ok_or_else(invalid)?;
+        let value = amount(atomic).map_err(|_| invalid())?;
+        if !valid_sha256(intent_hash)
+            || !valid_evm_wallet(route_wallet)
+            || !matches!(asset, "USDC" | "ZEN")
+            || expiry_unix == 0
+            || nonce.to_string() != nonce_value
+            || value.to_string() != atomic
+            || receipt.command_commitment.as_deref().is_none_or(|commitment| !valid_sha256(commitment))
+        {
+            return Err(invalid());
+        }
+        let settled = state.requests.contains_key(&(
+            account.clone(),
+            format!("signed-withdrawal-settle:{intent_hash}"),
+        ));
+        let released = state.requests.contains_key(&(
+            account.clone(),
+            format!("signed-withdrawal-release:{intent_hash}"),
+        ));
+        if settled && released {
+            return Err(invalid());
+        }
+        if settled || released {
+            continue;
+        }
+        if holds
+            .insert(
+                intent_hash.into(),
+                SignedWithdrawalHold {
+                    account_id: account.clone(),
+                    identity_commitment: receipt.identity_commitment.clone(),
+                    intent_hash: intent_hash.into(),
+                    route_wallet: route_wallet.into(),
+                    asset: asset.into(),
+                    amount_atomic: atomic.into(),
+                    expiry_unix,
+                },
+            )
+            .is_some()
+        {
+            return Err(invalid());
         }
     }
-    if !totals.is_empty() { return Err(invalid()); }
     Ok(holds)
+}
+
+fn validate_withdrawal_hold_balances(
+    state: &DirectState,
+    bus_holds: &BTreeMap<String, UsdcBusHold>,
+    signed_holds: &BTreeMap<String, SignedWithdrawalHold>,
+) -> Result<(), RuntimeError> {
+    let invalid = || RuntimeError::StateArtifact;
+    let mut totals = BTreeMap::<(String, String), u128>::new();
+    for hold in bus_holds.values() {
+        let asset = if hold.asset == "ZEN" { "ZEN" } else { "USDC" };
+        let total = totals
+            .entry((hold.identity_commitment.clone(), asset.into()))
+            .or_default();
+        *total = total
+            .checked_add(amount(&hold.amount_atomic).map_err(|_| invalid())?)
+            .ok_or_else(invalid)?;
+    }
+    for hold in signed_holds.values() {
+        let total = totals
+            .entry((hold.identity_commitment.clone(), hold.asset.clone()))
+            .or_default();
+        *total = total
+            .checked_add(amount(&hold.amount_atomic).map_err(|_| invalid())?)
+            .ok_or_else(invalid)?;
+    }
+    for (identity, balances) in &state.balances {
+        for asset in ["USDC", "ZEN"] {
+            let actual = balances
+                .get(&(asset.into(), "USER_WITHDRAWAL_HOLD".into()))
+                .copied()
+                .unwrap_or_default();
+            if actual != totals.remove(&(identity.clone(), asset.into())).unwrap_or_default() {
+                return Err(invalid());
+            }
+        }
+    }
+    if !totals.is_empty() {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 /// Minimal immutable artifact boundary.  Production implements this with the
@@ -1675,6 +1912,7 @@ impl DirectRuntime {
             rounding_reserve_atomic: 0,
             credited_custody_references: BTreeSet::new(),
             usdc_bus_withdrawals: BTreeMap::new(),
+            signed_withdrawals: BTreeMap::new(),
             conditional_usdc_deposits: BTreeMap::new(),
             requests: BTreeMap::new(),
             receipt_key,
@@ -1726,8 +1964,40 @@ impl DirectRuntime {
             .as_deref()
             .map(str::to_ascii_lowercase);
         match &request.action {
+            DirectAction::LinkPoolWallet {wallet_address, external_id} => {
+                let wallet = wallet_address.to_ascii_lowercase();
+                if !valid_evm_wallet(&wallet)
+                    || !valid_pool_external_id(external_id)
+                    || request.request_id != format!("pool-wallet-link:{external_id}")
+                    || financial_wallet.as_deref() != Some(wallet.as_str()) {
+                    return Err(RuntimeError::InvalidRequest);
+                }
+            }
+            DirectAction::ReserveSignedWithdrawal {
+                intent,
+                user_signature,
+                now_unix,
+            } => {
+                let wallets = self
+                    .subject_wallets
+                    .get(&request.account_id)
+                    .ok_or(RuntimeError::IdentityDenied)?;
+                if request.request_id != intent.nonce_request_id().map_err(|_| RuntimeError::InvalidRequest)?
+                    || *now_unix >= intent.expiry_unix
+                    || intent.verify_signature(user_signature).is_err()
+                    || intent.asset().is_err()
+                    || !wallets.contains(&intent.account.to_ascii_lowercase())
+                    || !wallets.contains(&intent.route_wallet.to_ascii_lowercase())
+                    || financial_wallet.as_deref()
+                        != Some(intent.route_wallet.to_ascii_lowercase().as_str())
+                {
+                    return Err(RuntimeError::InvalidRequest);
+                }
+            }
             // Preserve the existing deposit lane unchanged. Base deposit
             DirectAction::CreditZenDeposit { .. } | DirectAction::CreditHorizenUsdcDeposit { .. }
+            | DirectAction::CreditUnifiedSourceDeposits { .. }
+            | DirectAction::FinalizeUnifiedDeposit { .. }
             | DirectAction::CreditArbitrumUsdcBusDeposit { .. } | DirectAction::FinalizeArbitrumUsdcBusDeposit { .. } => {
                 let Some(wallet) = financial_wallet.as_deref() else { return Err(RuntimeError::DestinationDenied); };
                 if !valid_evm_wallet(wallet) || !self.subject_wallets.get(&request.account_id)
@@ -1930,7 +2200,7 @@ impl DirectRuntime {
                     let value=amount(amount_atomic)?;
                     let hash=custody_reference.strip_prefix("horizen-usdc-deposit:")
                         .filter(|value|valid_transaction_hash_value(value)).ok_or(RuntimeError::InvalidRequest)?;
-                    if value<5_000_000 {return Err(RuntimeError::InvalidRequest);}
+                    if value==0 {return Err(RuntimeError::InvalidRequest);}
                     let reference=format!("horizen-usdc-deposit:{}",hash.to_ascii_lowercase());
                     if self.credited_custody_references.contains(&reference) {
                         return Err(RuntimeError::CustodyReferenceReuse);
@@ -1938,6 +2208,83 @@ impl DirectRuntime {
                     self.add(&request.identity_commitment,"USER_AVAILABLE",value)?;
                     self.credited_custody_references.insert(reference);
                     ("DEPOSIT_CREDITED".into(),Some(amount_atomic.clone()),Some(custody_reference.clone()))
+                }
+                DirectAction::CreditUnifiedSourceDeposits {
+                    operation_id,
+                    asset,
+                    source_chain,
+                    amount_atomic,
+                    custody_reference,
+                    source_references,
+                } => {
+                    let value = amount(amount_atomic)?;
+                    if !matches!(asset.as_str(), "USDC" | "ZEN")
+                        || (asset == "USDC" && value < 5_000_000)
+                        || !valid_bus_withdrawal_id(operation_id)
+                        || request.request_id != format!("unified-{}-deposit-credit:{operation_id}", asset.to_ascii_lowercase())
+                        || (asset == "ZEN" && !matches!(source_chain.as_str(), "base" | "horizen"))
+                        || !valid_unified_source_chain(source_chain)
+                        || !valid_unified_source_custody_reference(custody_reference, asset)
+                        || source_references.is_empty()
+                        || source_references.iter().any(|reference|
+                            !valid_unified_source_reference(reference, source_chain, asset))
+                        || source_references.iter().collect::<BTreeSet<_>>().len() != source_references.len()
+                        || self.conditional_usdc_deposits.contains_key(operation_id)
+                    {
+                        return Err(RuntimeError::InvalidRequest);
+                    }
+                    let operation_reference = format!("unified-{}-operation:{operation_id}", asset.to_ascii_lowercase());
+                    if self.credited_custody_references.contains(custody_reference)
+                        || self.credited_custody_references.contains(&operation_reference)
+                        || source_references.iter().any(|reference| self.credited_custody_references.contains(reference))
+                    {
+                        return Err(RuntimeError::CustodyReferenceReuse);
+                    }
+                    let wallet = financial_wallet.clone().ok_or(RuntimeError::DestinationDenied)?;
+                    self.add_asset(&request.identity_commitment, asset, "USER_AVAILABLE", value)?;
+                    self.credited_custody_references.insert(custody_reference.clone());
+                    self.credited_custody_references.insert(operation_reference);
+                    self.credited_custody_references.extend(source_references.iter().cloned());
+                    self.conditional_usdc_deposits.insert(operation_id.clone(), ConditionalUsdcDeposit {
+                        account_id: request.account_id.clone(),
+                        identity_commitment: request.identity_commitment.clone(),
+                        wallet_address: wallet,
+                        amount_atomic: amount_atomic.clone(),
+                        boarding_reference: custody_reference.clone(),
+                        asset: asset.clone(),
+                        source_chain: source_chain.clone(),
+                        source_references: source_references.clone(),
+                    });
+                    ("DEPOSIT_CONDITIONALLY_CREDITED".into(), Some(amount_atomic.clone()), Some(custody_reference.clone()))
+                }
+                DirectAction::FinalizeUnifiedDeposit {
+                    operation_id,
+                    asset,
+                    amount_atomic,
+                    source_custody_reference,
+                    custody_reference,
+                } => {
+                    let pending = self.conditional_usdc_deposits.get(operation_id).ok_or(RuntimeError::InvalidRequest)?;
+                    if !matches!(asset.as_str(), "USDC" | "ZEN")
+                        || request.request_id != format!("unified-{}-deposit-finalize:{operation_id}", asset.to_ascii_lowercase())
+                        || pending.account_id != request.account_id
+                        || pending.identity_commitment != request.identity_commitment
+                        || Some(pending.wallet_address.as_str()) != financial_wallet.as_deref()
+                        || pending.amount_atomic != *amount_atomic
+                        || pending.asset_name() != asset
+                        || pending.boarding_reference != *source_custody_reference
+                        || custody_reference != &custody_reference.to_ascii_lowercase()
+                        || !custody_reference.strip_prefix(&format!("horizen-{}-deposit:", asset.to_ascii_lowercase()))
+                            .is_some_and(valid_transaction_hash_value)
+                    {
+                        return Err(RuntimeError::InvalidRequest);
+                    }
+                    if self.credited_custody_references.contains(custody_reference) {
+                        return Err(RuntimeError::CustodyReferenceReuse);
+                    }
+                    self.credited_custody_references.insert(custody_reference.clone());
+                    self.conditional_usdc_deposits.remove(operation_id);
+                    ("DEPOSIT_FINALIZED".into(), Some(amount_atomic.clone()), Some(custody_reference.clone()))
                 }
                 DirectAction::CreditArbitrumUsdcBusDeposit {operation_id,amount_atomic,custody_reference} => {
                     let value=amount(amount_atomic)?;
@@ -1959,7 +2306,8 @@ impl DirectRuntime {
                     self.credited_custody_references.insert(operation_reference);
                     self.conditional_usdc_deposits.insert(operation_id.clone(),ConditionalUsdcDeposit {
                         account_id:request.account_id.clone(),identity_commitment:request.identity_commitment.clone(),
-                        wallet_address:wallet,amount_atomic:amount_atomic.clone(),boarding_reference:custody_reference.clone()});
+                        wallet_address:wallet,amount_atomic:amount_atomic.clone(),boarding_reference:custody_reference.clone(),
+                        asset:String::new(),source_chain:String::new(),source_references:Vec::new()});
                     ("DEPOSIT_CONDITIONALLY_CREDITED".into(),Some(amount_atomic.clone()),Some(custody_reference.clone()))
                 }
                 DirectAction::FinalizeArbitrumUsdcBusDeposit {operation_id,amount_atomic,boarding_reference,custody_reference} => {
@@ -1988,6 +2336,23 @@ impl DirectRuntime {
                     }
                     self.subject_wallets.entry(request.account_id.clone()).or_default().insert(wallet.clone());
                     ("FINANCIAL_WALLET_LINKED".into(),None,Some(format!("wallet-link:{wallet}")))
+                }
+                DirectAction::LinkPoolWallet {wallet_address, ..} => {
+                    let wallet = wallet_address.to_ascii_lowercase();
+                    if self.subject_wallets.iter().any(|(subject, wallets)| {
+                        subject != &request.account_id && wallets.contains(&wallet)
+                    }) {
+                        return Err(RuntimeError::IdentityAlreadyAdmitted);
+                    }
+                    self.subject_wallets
+                        .entry(request.account_id.clone())
+                        .or_default()
+                        .insert(wallet.clone());
+                    (
+                        "POOL_WALLET_LINKED".into(),
+                        None,
+                        Some(format!("pool-wallet-link:{wallet}")),
+                    )
                 }
                 DirectAction::BeginUsdcBusWithdrawal {withdrawal_id,destination_chain,asset,destination,amount_atomic} => {
                     let value=amount(amount_atomic)?;
@@ -2046,6 +2411,133 @@ impl DirectRuntime {
                     if let Some(reference)=seat_reference {self.credited_custody_references.insert(reference);}
                     self.usdc_bus_withdrawals.remove(withdrawal_id);
                     ((if reverted {"WITHDRAWAL_REVERTED"} else {"WITHDRAWAL_SETTLED"}).into(),Some(amount_atomic.clone()),Some(custody_reference.clone()))
+                }
+                DirectAction::ReserveSignedWithdrawal { intent, now_unix: _, .. } => {
+                    let asset = intent
+                        .asset()
+                        .map_err(|_| RuntimeError::InvalidRequest)?
+                        .ledger_asset();
+                    let intent_hash = intent
+                        .intent_hash_hex()
+                        .map_err(|_| RuntimeError::InvalidRequest)?
+                        .strip_prefix("0x")
+                        .ok_or(RuntimeError::InvalidRequest)?
+                        .to_owned();
+                    if self.signed_withdrawals.contains_key(&intent_hash) {
+                        return Err(RuntimeError::RequestReuse);
+                    }
+                    let value = amount(&intent.amount_atomic)?;
+                    if self.balance(&request.identity_commitment, asset, "USER_AVAILABLE") < value {
+                        (
+                            "WITHDRAWAL_REJECTED".into(),
+                            Some(intent.amount_atomic.clone()),
+                            Some(format!("signed-withdrawal-rejection:{intent_hash}:INSUFFICIENT_AVAILABLE")),
+                        )
+                    } else {
+                        self.verify_settled_withdrawal(&request.identity_commitment, asset, value)?;
+                        self.move_asset_bucket(
+                            &request.identity_commitment,
+                            asset,
+                            "USER_AVAILABLE",
+                            "USER_WITHDRAWAL_HOLD",
+                            value,
+                        )?;
+                        self.signed_withdrawals.insert(
+                            intent_hash.clone(),
+                            SignedWithdrawalHold {
+                                account_id: request.account_id.clone(),
+                                identity_commitment: request.identity_commitment.clone(),
+                                intent_hash: intent_hash.clone(),
+                                route_wallet: intent.route_wallet.to_ascii_lowercase(),
+                                asset: asset.into(),
+                                amount_atomic: intent.amount_atomic.clone(),
+                                expiry_unix: intent.expiry_unix,
+                            },
+                        );
+                        (
+                            "WITHDRAWAL_RESERVED".into(),
+                            Some(intent.amount_atomic.clone()),
+                            Some(format!(
+                                "signed-withdrawal-reservation:{intent_hash}:{asset}:{}:{}:{}",
+                                intent.route_wallet.to_ascii_lowercase(),
+                                intent.expiry_unix,
+                                intent.nonce
+                            )),
+                        )
+                    }
+                }
+                DirectAction::SettleSignedWithdrawal {
+                    intent_hash,
+                    asset,
+                    horizen_transaction_hash,
+                } => {
+                    let normalized_hash = intent_hash.strip_prefix("0x").unwrap_or(intent_hash);
+                    let hold = self
+                        .signed_withdrawals
+                        .get(normalized_hash)
+                        .ok_or(RuntimeError::InvalidRequest)?;
+                    if request.request_id != format!("signed-withdrawal-settle:{normalized_hash}")
+                        || hold.account_id != request.account_id
+                        || hold.identity_commitment != request.identity_commitment
+                        || hold.asset != *asset
+                        || !valid_transaction_hash_value(horizen_transaction_hash)
+                        || horizen_transaction_hash != &horizen_transaction_hash.to_ascii_lowercase()
+                    {
+                        return Err(RuntimeError::DestinationDenied);
+                    }
+                    let value = amount(&hold.amount_atomic)?;
+                    let ledger_asset = hold.asset.clone();
+                    let reference = format!(
+                        "signed-withdrawal-horizen:{normalized_hash}:{horizen_transaction_hash}"
+                    );
+                    let amount_atomic = hold.amount_atomic.clone();
+                    if !self.credited_custody_references.insert(reference.clone()) {
+                        return Err(RuntimeError::CustodyReferenceReuse);
+                    }
+                    self.move_asset_bucket(
+                        &request.identity_commitment,
+                        &ledger_asset,
+                        "USER_WITHDRAWAL_HOLD",
+                        "USER_SETTLED",
+                        value,
+                    )?;
+                    self.signed_withdrawals.remove(normalized_hash);
+                    ("WITHDRAWAL_SETTLED".into(), Some(amount_atomic), Some(reference))
+                }
+                DirectAction::ReleaseExpiredSignedWithdrawal {
+                    intent_hash,
+                    finalized_block_hash,
+                    finalized_block_timestamp,
+                } => {
+                    let normalized_hash = intent_hash.strip_prefix("0x").unwrap_or(intent_hash);
+                    let hold = self
+                        .signed_withdrawals
+                        .get(normalized_hash)
+                        .ok_or(RuntimeError::InvalidRequest)?;
+                    if request.request_id != format!("signed-withdrawal-release:{normalized_hash}")
+                        || hold.account_id != request.account_id
+                        || hold.identity_commitment != request.identity_commitment
+                        || *finalized_block_timestamp <= hold.expiry_unix
+                        || !valid_transaction_hash_value(finalized_block_hash)
+                        || finalized_block_hash != &finalized_block_hash.to_ascii_lowercase()
+                    {
+                        return Err(RuntimeError::DestinationDenied);
+                    }
+                    let value = amount(&hold.amount_atomic)?;
+                    let amount_atomic = hold.amount_atomic.clone();
+                    let ledger_asset = hold.asset.clone();
+                    let reference = format!(
+                        "signed-withdrawal-expired:{normalized_hash}:{finalized_block_hash}:{finalized_block_timestamp}"
+                    );
+                    self.move_asset_bucket(
+                        &request.identity_commitment,
+                        &ledger_asset,
+                        "USER_WITHDRAWAL_HOLD",
+                        "USER_AVAILABLE",
+                        value,
+                    )?;
+                    self.signed_withdrawals.remove(normalized_hash);
+                    ("WITHDRAWAL_RELEASED".into(), Some(amount_atomic), Some(reference))
                 }
                 DirectAction::PlaceOrder {
                     order_id,
@@ -2252,6 +2744,18 @@ impl DirectRuntime {
                     ("TRANSFER_SETTLED".into(), Some(amount_atomic.clone()), None)
                 }
             };
+        let command_commitment = match &request.action {
+            DirectAction::ReserveSignedWithdrawal { intent, .. }
+                if effect == "WITHDRAWAL_RESERVED" =>
+            {
+                Some(
+                    intent
+                        .command_commitment()
+                        .map_err(|_| RuntimeError::InvalidRequest)?,
+                )
+            }
+            _ => None,
+        };
         let terminal_status = if effect == "WITHDRAWAL_REVERTED" {
             TerminalStatus::RejectedEffectNone
         } else {
@@ -2291,6 +2795,7 @@ impl DirectRuntime {
             effect: effect.clone(),
             amount_atomic,
             custody_reference,
+            command_commitment,
             execution,
             resolution: resolution_execution,
             projection_balance_updates,
@@ -2514,9 +3019,13 @@ impl DirectRuntime {
         Ok(())
     }
     fn verify_settled_usdc_withdrawal(&self,identity:&str,value:u128)->Result<(),RuntimeError> {
-        let pending=self.conditional_usdc_deposits.values().filter(|entry|entry.identity_commitment==identity)
+        self.verify_settled_withdrawal(identity, "USDC", value)
+    }
+    fn verify_settled_withdrawal(&self,identity:&str,asset:&str,value:u128)->Result<(),RuntimeError> {
+        let pending=self.conditional_usdc_deposits.values().filter(|entry|entry.identity_commitment==identity
+            && entry.asset_name()==asset)
             .try_fold(0u128,|sum,entry|sum.checked_add(amount(&entry.amount_atomic)?).ok_or(RuntimeError::InvalidRequest))?;
-        let available=self.balances.get(identity).and_then(|b|b.get(&("USDC".into(),"USER_AVAILABLE".into()))).copied().unwrap_or(0);
+        let available=self.balances.get(identity).and_then(|b|b.get(&(asset.into(),"USER_AVAILABLE".into()))).copied().unwrap_or(0);
         if value>available.saturating_sub(pending) {return Err(RuntimeError::InsufficientAvailable);}
         Ok(())
     }
@@ -2602,6 +3111,8 @@ impl DirectRuntime {
         // The signed original reservation binds the recipient; reconstruct
         // only its still-active entitlement, never from a disposable index.
         let bus_holds = reconstruct_bus_holds(&state, &self.receipt_key)?;
+        let signed_holds = reconstruct_signed_withdrawal_holds(&state, &self.receipt_key)?;
+        validate_withdrawal_hold_balances(&state, &bus_holds, &signed_holds)?;
         validate_conditional_deposits(&state, &self.receipt_key)?;
         self.balances = state.balances;
         self.zen_fee_revenue_atomic = state.zen_fee_revenue_atomic;
@@ -2620,6 +3131,7 @@ impl DirectRuntime {
         self.rounding_reserve_atomic = state.rounding_reserve_atomic;
         self.credited_custody_references = state.credited_custody_references;
         self.usdc_bus_withdrawals = bus_holds;
+        self.signed_withdrawals = signed_holds;
         self.conditional_usdc_deposits = state.conditional_usdc_deposits;
         self.requests = state.requests;
         Ok(())
@@ -3708,6 +4220,18 @@ pub enum RuntimeRequest {
         /// ledger decryption key and is delivered only after grant validation.
         commit_ack_key: Vec<u8>,
     },
+    /// Replaces only the time-bounded authorization on an already-running
+    /// governed writer. The successor must be governance-signed, preserve the
+    /// exact runtime/fence/recovery scope and name the currently attested
+    /// grant plus key-release artifact as its predecessor. Runtime keys and
+    /// financial state never cross this boundary and are not recreated.
+    RenewGovernedWriter {
+        grant: WriterGrant,
+        /// Hash of the immutable successor key-release artifact. The parent
+        /// creates it with KMS ReEncrypt under the successor commitment; the
+        /// encrypted root key itself never enters this request.
+        key_release_artifact_hash: String,
+    },
     /// Startup-only protected-key handoff for an explicitly isolated test
     /// runtime.  Nitro does not propagate the parent's systemd environment
     /// into an EIF, so test keys must cross the already-authenticated VSOCK
@@ -3848,6 +4372,12 @@ pub enum RuntimeResponse {
     },
     GovernedBootstrapComplete {
         writer_grant_commitment: String,
+    },
+    GovernedWriterRenewed {
+        writer_grant_commitment: String,
+        writer_grant_expires_at_unix: u64,
+        predecessor_key_release_artifact_hash: String,
+        key_release_artifact_hash: String,
     },
     BootstrapComplete,
     Execute {
@@ -4099,6 +4629,21 @@ pub fn request_hash(request: &DirectRequest) -> String {
             ))
             .expect("serializable governed balance recovery"),
         ),
+        DirectAction::ReserveSignedWithdrawal {
+            intent,
+            user_signature,
+            now_unix: _,
+        } => sha256(
+            &serde_json::to_vec(&(
+                request.account_id.as_str(),
+                request.identity_commitment.as_str(),
+                request.request_id.as_str(),
+                "RESERVE_SIGNED_WITHDRAWAL",
+                intent,
+                user_signature,
+            ))
+            .expect("serializable signed withdrawal request"),
+        ),
         DirectAction::ReserveWithdrawal {
             destination,
             amount_atomic,
@@ -4249,6 +4794,13 @@ fn valid_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn valid_pool_external_id(value: &str) -> bool {
+    value.len() == 20
+        && value.starts_with("layrs_deposit_")
+        && value[14..].bytes().all(|byte| byte.is_ascii_digit())
+        && &value[14..] != "000000"
+}
+
 fn valid_transaction_hash_value(value: &str) -> bool {
     value.len() == 66
         && value.starts_with("0x")
@@ -4309,6 +4861,27 @@ fn valid_bus_deposit_reference(value:&str)->bool {
     parts.len()==3&&parts[0]=="arbitrum-usdc-bus-deposit"&&valid_transaction_hash_value(parts[1])
         &&parts[1]==parts[1].to_ascii_lowercase()
         &&parts[2].parse::<u128>().ok().is_some_and(|ticket|ticket<(1u128<<72)&&ticket.to_string()==parts[2])
+}
+fn valid_unified_source_chain(value: &str) -> bool {
+    matches!(value, "arbitrum" | "base" | "ethereum" | "polygon" | "optimism" | "bnb" | "tempo" | "robinhood" | "horizen")
+}
+fn valid_unified_source_reference(value: &str, chain: &str, asset: &str) -> bool {
+    let parts = value.split(':').collect::<Vec<_>>();
+    parts.len() == 5
+        && parts[0] == format!("unified-{}-transfer", asset.to_ascii_lowercase())
+        && parts[1] == chain
+        && valid_transaction_hash_value(parts[2])
+        && parts[2] == parts[2].to_ascii_lowercase()
+        && parts[3].parse::<u64>().ok().is_some_and(|index| index.to_string() == parts[3])
+        && positive_atomic_value(parts[4]).is_some_and(|amount| amount.to_string() == parts[4])
+}
+fn valid_unified_source_custody_reference(value: &str, asset: &str) -> bool {
+    let parts = value.split(':').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts[0] == format!("unified-{}-source", asset.to_ascii_lowercase())
+        && valid_unified_source_chain(parts[1])
+        && valid_sha256(parts[2])
+        && parts[2] == parts[2].to_ascii_lowercase()
 }
 fn valid_bus_terminal_reference(value:&str,reverted:bool)->bool {
     if !reverted {
@@ -4373,6 +4946,7 @@ pub const POSTGRES_PROJECTION_DDL: &str =
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k256::ecdsa::SigningKey;
     use std::path::PathBuf;
 
     fn attestation_binding_vector() -> RuntimeBinding {
@@ -4974,6 +5548,527 @@ mod tests {
     fn bus_fixture()->(DirectRuntime,String,String,String,InMemoryDirectStateStore) {
         bus_fixture_funded("10000000")
     }
+
+    fn signed_withdrawal_request(
+        subject: &str,
+        identity: &str,
+        key: &SigningKey,
+        route_wallet: &str,
+        nonce: u128,
+        amount_atomic: &str,
+        expiry_unix: u64,
+    ) -> (DirectRequest, SignedWithdrawalIntent) {
+        signed_withdrawal_request_for_asset(
+            subject,
+            identity,
+            key,
+            route_wallet,
+            HORIZEN_USDC_POOL,
+            HORIZEN_USDC_TOKEN,
+            nonce,
+            amount_atomic,
+            expiry_unix,
+        )
+    }
+
+    fn signed_withdrawal_request_for_asset(
+        subject: &str,
+        identity: &str,
+        key: &SigningKey,
+        route_wallet: &str,
+        pool: &str,
+        token: &str,
+        nonce: u128,
+        amount_atomic: &str,
+        expiry_unix: u64,
+    ) -> (DirectRequest, SignedWithdrawalIntent) {
+        let public = key.verifying_key().to_encoded_point(false);
+        let account = format!("0x{}", hex::encode(&sha3::Keccak256::digest(&public.as_bytes()[1..])[12..]));
+        let intent = SignedWithdrawalIntent {
+            account,
+            pool: pool.into(),
+            token: token.into(),
+            route_wallet: route_wallet.into(),
+            amount_atomic: amount_atomic.into(),
+            recipient: "0x0d2bf0c9d6d96eea797c9d1b96895d8f70e3322e".into(),
+            destination_chain: "base".into(),
+            nonce: nonce.to_string(),
+            expiry_unix,
+        };
+        let (signature, recovery_id) = key
+            .sign_prehash_recoverable(&intent.digest().unwrap())
+            .unwrap();
+        let mut signature_bytes = signature.to_bytes().to_vec();
+        signature_bytes.push(recovery_id.to_byte() + 27);
+        let request_id = intent.nonce_request_id().unwrap();
+        let mut request = request_for(
+            subject,
+            identity,
+            &request_id,
+            DirectAction::ReserveSignedWithdrawal {
+                intent: intent.clone(),
+                user_signature: format!("0x{}", hex::encode(signature_bytes)),
+                now_unix: 1_700_000_000,
+            },
+        );
+        request.financial_wallet_address = Some(route_wallet.into());
+        request.request_hash = request_hash(&request);
+        (request, intent)
+    }
+
+    fn pool_wallet_link_request(subject: &str, identity: &str, wallet: &str, slot_id: u32) -> DirectRequest {
+        let external_id = format!("layrs_deposit_{slot_id:06}");
+        let mut request = request_for(
+            subject,
+            identity,
+            &format!("pool-wallet-link:{external_id}"),
+            DirectAction::LinkPoolWallet {
+                wallet_address: wallet.into(),
+                external_id,
+            },
+        );
+        request.financial_wallet_address = Some(wallet.into());
+        request.request_hash = request_hash(&request);
+        request
+    }
+
+    #[test]
+    fn pool_wallet_link_is_session_bound_idempotent_unique_and_restart_safe() {
+        let subject = "d".repeat(64);
+        let primary = "0x1111111111111111111111111111111111111111";
+        let identity = identity_commitment_for(&subject, primary);
+        let pool_wallet = "0x9999999999999999999999999999999999999999";
+        let mut live = runtime(RuntimeMode::IsolatedTest);
+        let mut store = InMemoryDirectStateStore::default();
+        live.execute_committed(
+            request_for(
+                &subject,
+                &identity,
+                "pool-link-admission",
+                DirectAction::AdmitIdentity { wallet_address: primary.into() },
+            ),
+            &[8; 32],
+            &mut store,
+        ).unwrap();
+        let link = pool_wallet_link_request(&subject, &identity, pool_wallet, 1);
+        let result = live.execute_committed(link.clone(), &[8; 32], &mut store).unwrap();
+        assert_eq!(result.effect, "POOL_WALLET_LINKED");
+        assert!(live.subject_wallets[&subject].contains(pool_wallet));
+        assert_eq!(live.execute_committed(link.clone(), &[8; 32], &mut store).unwrap(), result);
+
+        let mut restored = DirectRuntime::restore_committed(
+            SealedEpoch::load(epoch_path()).unwrap(),
+            RuntimeMode::IsolatedTest,
+            vec![7; 32],
+            &[8; 32],
+            &store,
+        ).unwrap();
+        assert!(restored.subject_wallets[&subject].contains(pool_wallet));
+        assert_eq!(restored.execute_committed(link, &[8; 32], &mut store).unwrap(), result);
+
+        let other_subject = "e".repeat(64);
+        let other_primary = "0x2222222222222222222222222222222222222222";
+        let other_identity = identity_commitment_for(&other_subject, other_primary);
+        restored.execute(request_for(
+            &other_subject,
+            &other_identity,
+            "other-pool-admission",
+            DirectAction::AdmitIdentity { wallet_address: other_primary.into() },
+        )).unwrap();
+        let takeover = pool_wallet_link_request(&other_subject, &other_identity, pool_wallet, 2);
+        assert_eq!(restored.execute(takeover), Err(RuntimeError::IdentityAlreadyAdmitted));
+    }
+
+    #[test]
+    fn pool_wallet_link_rejects_unbound_wallet_and_invalid_slot() {
+        let subject = "d".repeat(64);
+        let primary = "0x1111111111111111111111111111111111111111";
+        let identity = identity_commitment_for(&subject, primary);
+        let pool_wallet = "0x9999999999999999999999999999999999999999";
+        let mut live = runtime(RuntimeMode::IsolatedTest);
+        live.execute(request_for(
+            &subject,
+            &identity,
+            "pool-link-admission",
+            DirectAction::AdmitIdentity { wallet_address: primary.into() },
+        )).unwrap();
+
+        let mut unbound = pool_wallet_link_request(&subject, &identity, pool_wallet, 1);
+        unbound.financial_wallet_address = Some("0x8888888888888888888888888888888888888888".into());
+        unbound.request_hash = request_hash(&unbound);
+        assert_eq!(live.execute(unbound), Err(RuntimeError::InvalidRequest));
+
+        let mut invalid = pool_wallet_link_request(&subject, &identity, pool_wallet, 2);
+        let DirectAction::LinkPoolWallet { external_id, .. } = &mut invalid.action else { unreachable!() };
+        *external_id = "layrs_deposit_000000".into();
+        invalid.request_id = "pool-wallet-link:layrs_deposit_000000".into();
+        invalid.request_hash = request_hash(&invalid);
+        assert_eq!(live.execute(invalid), Err(RuntimeError::InvalidRequest));
+    }
+
+    #[test]
+    fn unified_source_batch_is_tradable_but_not_withdrawable_until_pool_finality() {
+        let subject = "a".repeat(64);
+        let primary = "0x1111111111111111111111111111111111111111";
+        let wallet = "0x9999999999999999999999999999999999999999";
+        let identity = identity_commitment_for(&subject, primary);
+        let operation_id = Uuid::from_u128(771).to_string();
+        let state_key = [8u8; 32];
+        let mut live = runtime(RuntimeMode::IsolatedTest);
+        let mut store = InMemoryDirectStateStore::default();
+        live.execute_committed(
+            request_for(&subject, &identity, "unified-admission", DirectAction::AdmitIdentity { wallet_address: primary.into() }),
+            &state_key,
+            &mut store,
+        ).unwrap();
+        live.execute_committed(
+            pool_wallet_link_request(&subject, &identity, wallet, 771),
+            &state_key,
+            &mut store,
+        ).unwrap();
+        let source_reference = format!("unified-usdc-source:arbitrum:{}", "ab".repeat(32));
+        let source_references = vec![
+            format!("unified-usdc-transfer:arbitrum:0x{}:0:2000000", "11".repeat(32)),
+            format!("unified-usdc-transfer:arbitrum:0x{}:1:3000000", "22".repeat(32)),
+        ];
+        let mut credit = request_for(
+            &subject,
+            &identity,
+            &format!("unified-usdc-deposit-credit:{operation_id}"),
+            DirectAction::CreditUnifiedSourceDeposits {
+                operation_id: operation_id.clone(),
+                asset: "USDC".into(),
+                source_chain: "arbitrum".into(),
+                amount_atomic: "5000000".into(),
+                custody_reference: source_reference.clone(),
+                source_references,
+            },
+        );
+        credit.financial_wallet_address = Some(wallet.into());
+        credit.request_hash = request_hash(&credit);
+        assert_eq!(
+            live.execute_committed(credit, &state_key, &mut store).unwrap().effect,
+            "DEPOSIT_CONDITIONALLY_CREDITED"
+        );
+        assert_eq!(live.balance(&identity, "USDC", "USER_AVAILABLE"), 5_000_000);
+
+        let market = "layrs:v5:BTC:USDC:1h:unified-in-transit";
+        live.execute_committed(market_registration_request(market, "unified-market"), &state_key, &mut store).unwrap();
+        let order_id = Uuid::from_u128(773).to_string();
+        assert_eq!(live.execute_committed(request_for(&subject, &identity, "unified-order", DirectAction::PlaceOrder {
+            order_id: order_id.clone(), market_id: market.into(), outcome: Outcome::Up, action: OrderAction::Buy,
+            price_micros: 500_000, quantity_micros: "2000000".into(), time_in_force: TimeInForce::Gtc,
+            expires_at_millis: None, now_millis: 1_000,
+        }), &state_key, &mut store).unwrap().effect, "ORDER_PLACED");
+        // Trading can reserve the source-confirmed balance; cancelling proves
+        // the ordinary order lifecycle returns it while the withdrawal hold
+        // below remains independently restricted.
+        live.execute_committed(request_for(&subject, &identity, "unified-order-cancel", DirectAction::CancelOrder {
+            order_id,
+        }), &state_key, &mut store).unwrap();
+
+        let withdrawal_id = Uuid::from_u128(772).to_string();
+        let blocked = bus_begin(&subject, &identity, wallet, &withdrawal_id);
+        assert_eq!(live.execute(blocked), Err(RuntimeError::InsufficientAvailable));
+
+        let mut restored = DirectRuntime::restore_committed(
+            SealedEpoch::load(epoch_path()).unwrap(),
+            RuntimeMode::IsolatedTest,
+            vec![7; 32],
+            &state_key,
+            &store,
+        ).unwrap();
+        assert_eq!(restored.conditional_usdc_deposits.len(), 1);
+        let mut finalize = request_for(
+            &subject,
+            &identity,
+            &format!("unified-usdc-deposit-finalize:{operation_id}"),
+            DirectAction::FinalizeUnifiedDeposit {
+                operation_id,
+                asset: "USDC".into(),
+                amount_atomic: "5000000".into(),
+                source_custody_reference: source_reference,
+                custody_reference: format!("horizen-usdc-deposit:0x{}", "33".repeat(32)),
+            },
+        );
+        finalize.financial_wallet_address = Some(wallet.into());
+        finalize.request_hash = request_hash(&finalize);
+        assert_eq!(
+            restored.execute_committed(finalize, &state_key, &mut store).unwrap().effect,
+            "DEPOSIT_FINALIZED"
+        );
+        assert!(restored.conditional_usdc_deposits.is_empty());
+        assert_eq!(
+            restored.execute_committed(
+                bus_begin(&subject, &identity, wallet, &withdrawal_id),
+                &state_key,
+                &mut store,
+            ).unwrap().effect,
+            "WITHDRAWAL_RESERVED"
+        );
+    }
+
+    #[test]
+    fn unified_zen_source_credit_survives_restart_and_withholds_only_that_deposit() {
+        let subject = "b".repeat(64);
+        let primary = "0x1111111111111111111111111111111111111111";
+        let wallet = "0x8888888888888888888888888888888888888888";
+        let identity = identity_commitment_for(&subject, primary);
+        let operation_id = Uuid::from_u128(881).to_string();
+        let state_key = [9u8; 32];
+        let mut live = runtime(RuntimeMode::IsolatedTest);
+        let mut store = InMemoryDirectStateStore::default();
+        live.execute_committed(
+            request_for(&subject, &identity, "zen-unified-admission", DirectAction::AdmitIdentity { wallet_address: primary.into() }),
+            &state_key,
+            &mut store,
+        ).unwrap();
+        live.execute_committed(pool_wallet_link_request(&subject, &identity, wallet, 881), &state_key, &mut store).unwrap();
+        let source_reference = format!("unified-zen-source:horizen:{}", "ab".repeat(32));
+        let mut credit = request_for(
+            &subject,
+            &identity,
+            &format!("unified-zen-deposit-credit:{operation_id}"),
+            DirectAction::CreditUnifiedSourceDeposits {
+                operation_id: operation_id.clone(),
+                asset: "ZEN".into(),
+                source_chain: "horizen".into(),
+                amount_atomic: "1000000000000000000".into(),
+                custody_reference: source_reference.clone(),
+                source_references: vec![format!(
+                    "unified-zen-transfer:horizen:0x{}:0:1000000000000000000",
+                    "11".repeat(32)
+                )],
+            },
+        );
+        credit.financial_wallet_address = Some(wallet.into());
+        credit.request_hash = request_hash(&credit);
+        live.execute_committed(credit, &state_key, &mut store).unwrap();
+        assert_eq!(live.balance(&identity, "ZEN", "USER_AVAILABLE"), 1_000_000_000_000_000_000);
+        assert_eq!(live.verify_settled_withdrawal(&identity, "ZEN", 1), Err(RuntimeError::InsufficientAvailable));
+
+        let mut restored = DirectRuntime::restore_committed(
+            SealedEpoch::load(epoch_path()).unwrap(), RuntimeMode::IsolatedTest, vec![7; 32], &state_key, &store,
+        ).unwrap();
+        assert_eq!(restored.verify_settled_withdrawal(&identity, "ZEN", 1), Err(RuntimeError::InsufficientAvailable));
+        let mut finalize = request_for(
+            &subject,
+            &identity,
+            &format!("unified-zen-deposit-finalize:{operation_id}"),
+            DirectAction::FinalizeUnifiedDeposit {
+                operation_id,
+                asset: "ZEN".into(),
+                amount_atomic: "1000000000000000000".into(),
+                source_custody_reference: source_reference,
+                custody_reference: format!("horizen-zen-deposit:0x{}", "33".repeat(32)),
+            },
+        );
+        finalize.financial_wallet_address = Some(wallet.into());
+        finalize.request_hash = request_hash(&finalize);
+        restored.execute_committed(finalize, &state_key, &mut store).unwrap();
+        assert!(restored.conditional_usdc_deposits.is_empty());
+        assert_eq!(restored.verify_settled_withdrawal(&identity, "ZEN", 1_000_000_000_000_000_000), Ok(()));
+    }
+
+    #[test]
+    fn signed_withdrawals_are_per_operation_restart_safe_and_publish_only_accepted_reserves() {
+        let key = SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
+        let public = key.verifying_key().to_encoded_point(false);
+        let account = format!("0x{}", hex::encode(&sha3::Keccak256::digest(&public.as_bytes()[1..])[12..]));
+        let route_wallet = "0x2222222222222222222222222222222222222222";
+        let subject = "f".repeat(64);
+        let identity = identity_commitment_for(&subject, &account);
+        let state_key = [8u8; 32];
+        let mut live = runtime(RuntimeMode::IsolatedTest);
+        let mut store = InMemoryDirectStateStore::default();
+        live.execute_committed(
+            request_for(&subject, &identity, "signed-admission", DirectAction::AdmitIdentity { wallet_address: account.clone() }),
+            &state_key,
+            &mut store,
+        ).unwrap();
+        live.execute_committed(
+            request_for(&subject, &identity, "signed-route-wallet", DirectAction::LinkFinancialWallet { wallet_address: route_wallet.into() }),
+            &state_key,
+            &mut store,
+        ).unwrap();
+        let mut deposit = request_for(
+            &subject,
+            &identity,
+            "signed-deposit",
+            DirectAction::CreditHorizenUsdcDeposit {
+                amount_atomic: "10000000".into(),
+                custody_reference: format!("horizen-usdc-deposit:0x{}", "cd".repeat(32)),
+            },
+        );
+        deposit.financial_wallet_address = Some(route_wallet.into());
+        deposit.request_hash = request_hash(&deposit);
+        live.execute_committed(deposit, &state_key, &mut store).unwrap();
+
+        let (first, first_intent) = signed_withdrawal_request(
+            &subject, &identity, &key, route_wallet, 1, "2000000", 1_800_000_000,
+        );
+        let first_id = first.request_id.clone();
+        let first_hash = first_intent.intent_hash_hex().unwrap().trim_start_matches("0x").to_owned();
+        let mut substituted_route = first.clone();
+        substituted_route.financial_wallet_address = Some(account.clone());
+        substituted_route.request_hash = request_hash(&substituted_route);
+        assert_eq!(live.execute(substituted_route), Err(RuntimeError::InvalidRequest));
+        let result = live.execute_committed(first.clone(), &state_key, &mut store).unwrap();
+        assert_eq!(result.effect, "WITHDRAWAL_RESERVED");
+        assert_eq!(result.receipt.command_commitment, Some(first_intent.command_commitment().unwrap()));
+        let witness = live.public_quest_receipt(&subject, &subject, &first_id).unwrap();
+        assert_eq!(witness.payload.kind, QuestReceiptKind::WithdrawalReservation);
+        assert_eq!(witness.payload.command_commitment, first_intent.command_commitment().unwrap());
+
+        let (second, second_intent) = signed_withdrawal_request(
+            &subject, &identity, &key, route_wallet, 2, "3000000", 1_800_000_100,
+        );
+        let second_hash = second_intent.intent_hash_hex().unwrap().trim_start_matches("0x").to_owned();
+        live.execute_committed(second, &state_key, &mut store).unwrap();
+        assert_eq!(live.balance(&identity, "USDC", "USER_WITHDRAWAL_HOLD"), 5_000_000);
+
+        let mut restored = DirectRuntime::restore_committed(
+            SealedEpoch::load(epoch_path()).unwrap(),
+            RuntimeMode::IsolatedTest,
+            vec![7; 32],
+            &state_key,
+            &store,
+        ).unwrap();
+        assert_eq!(restored.signed_withdrawals.len(), 2);
+        assert_eq!(restored.balance(&identity, "USDC", "USER_WITHDRAWAL_HOLD"), 5_000_000);
+
+        restored.execute_committed(
+            request_for(
+                &subject,
+                &identity,
+                &format!("signed-withdrawal-settle:{first_hash}"),
+                DirectAction::SettleSignedWithdrawal {
+                    intent_hash: first_hash,
+                    asset: "USDC".into(),
+                    horizen_transaction_hash: format!("0x{}", "ef".repeat(32)),
+                },
+            ),
+            &state_key,
+            &mut store,
+        ).unwrap();
+        restored.execute_committed(
+            request_for(
+                &subject,
+                &identity,
+                &format!("signed-withdrawal-release:{second_hash}"),
+                DirectAction::ReleaseExpiredSignedWithdrawal {
+                    intent_hash: second_hash,
+                    finalized_block_hash: format!("0x{}", "ab".repeat(32)),
+                    finalized_block_timestamp: 1_800_000_101,
+                },
+            ),
+            &state_key,
+            &mut store,
+        ).unwrap();
+        assert_eq!(restored.balance(&identity, "USDC", "USER_WITHDRAWAL_HOLD"), 0);
+        assert_eq!(restored.balance(&identity, "USDC", "USER_SETTLED"), 2_000_000);
+        assert_eq!(restored.balance(&identity, "USDC", "USER_AVAILABLE"), 8_000_000);
+
+        let (rejected, rejected_intent) = signed_withdrawal_request(
+            &subject, &identity, &key, route_wallet, 3, "9000000", 1_900_000_000,
+        );
+        let rejected_id = rejected.request_id.clone();
+        let rejected = restored.execute_committed(rejected, &state_key, &mut store).unwrap();
+        assert_eq!(rejected.effect, "WITHDRAWAL_REJECTED");
+        assert_eq!(rejected.receipt.command_commitment, None);
+        assert_eq!(restored.public_quest_receipt(&subject, &subject, &rejected_id), Err(RuntimeError::InvalidRequest));
+        assert_eq!(rejected_intent.command_commitment().unwrap().len(), 64);
+
+        let mut conflicting = first;
+        let DirectAction::ReserveSignedWithdrawal { intent, .. } = &mut conflicting.action else { unreachable!() };
+        intent.recipient = "0x1111111111111111111111111111111111111111".into();
+        conflicting.request_hash = request_hash(&conflicting);
+        assert_eq!(restored.execute(conflicting), Err(RuntimeError::RequestReuse));
+    }
+
+    #[test]
+    fn signed_zen_withdrawal_reserves_restarts_and_settles_only_zen() {
+        let key = SigningKey::from_bytes((&[9u8; 32]).into()).unwrap();
+        let public = key.verifying_key().to_encoded_point(false);
+        let account = format!("0x{}", hex::encode(&sha3::Keccak256::digest(&public.as_bytes()[1..])[12..]));
+        let route_wallet = "0x2222222222222222222222222222222222222222";
+        let subject = "e".repeat(64);
+        let identity = identity_commitment_for(&subject, &account);
+        let state_key = [8u8; 32];
+        let mut live = runtime(RuntimeMode::IsolatedTest);
+        let mut store = InMemoryDirectStateStore::default();
+        live.execute_committed(
+            request_for(&subject, &identity, "zen-signed-admission", DirectAction::AdmitIdentity { wallet_address: account.clone() }),
+            &state_key,
+            &mut store,
+        ).unwrap();
+        live.execute_committed(
+            request_for(&subject, &identity, "zen-signed-route", DirectAction::LinkFinancialWallet { wallet_address: route_wallet.into() }),
+            &state_key,
+            &mut store,
+        ).unwrap();
+        let mut deposit = request_for(&subject, &identity, "zen-signed-deposit", DirectAction::CreditZenDeposit {
+            amount_atomic: "5000000000000000000".into(),
+            custody_reference: format!("horizen-zen-deposit:0x{}", "44".repeat(32)),
+        });
+        deposit.financial_wallet_address = Some(route_wallet.into());
+        deposit.request_hash = request_hash(&deposit);
+        live.execute_committed(deposit, &state_key, &mut store).unwrap();
+
+        let (reserve, intent) = signed_withdrawal_request_for_asset(
+            &subject,
+            &identity,
+            &key,
+            route_wallet,
+            HORIZEN_ZEN_POOL,
+            HORIZEN_ZEN_TOKEN,
+            7,
+            "2000000000000000000",
+            1_900_000_000,
+        );
+        let intent_hash = intent.intent_hash_hex().unwrap().trim_start_matches("0x").to_owned();
+        assert_eq!(live.execute_committed(reserve, &state_key, &mut store).unwrap().effect, "WITHDRAWAL_RESERVED");
+        assert_eq!(live.balance(&identity, "ZEN", "USER_WITHDRAWAL_HOLD"), 2_000_000_000_000_000_000);
+        assert_eq!(live.balance(&identity, "USDC", "USER_WITHDRAWAL_HOLD"), 0);
+
+        let mut restored = DirectRuntime::restore_committed(
+            SealedEpoch::load(epoch_path()).unwrap(),
+            RuntimeMode::IsolatedTest,
+            vec![7; 32],
+            &state_key,
+            &store,
+        ).unwrap();
+        assert_eq!(restored.signed_withdrawals[&intent_hash].asset, "ZEN");
+        let crossed = request_for(
+            &subject,
+            &identity,
+            &format!("signed-withdrawal-settle:{intent_hash}"),
+            DirectAction::SettleSignedWithdrawal {
+                intent_hash: intent_hash.clone(),
+                asset: "USDC".into(),
+                horizen_transaction_hash: format!("0x{}", "55".repeat(32)),
+            },
+        );
+        assert_eq!(restored.execute(crossed), Err(RuntimeError::DestinationDenied));
+        restored.execute_committed(
+            request_for(
+                &subject,
+                &identity,
+                &format!("signed-withdrawal-settle:{intent_hash}"),
+                DirectAction::SettleSignedWithdrawal {
+                    intent_hash,
+                    asset: "ZEN".into(),
+                    horizen_transaction_hash: format!("0x{}", "55".repeat(32)),
+                },
+            ),
+            &state_key,
+            &mut store,
+        ).unwrap();
+        assert_eq!(restored.balance(&identity, "ZEN", "USER_WITHDRAWAL_HOLD"), 0);
+        assert_eq!(restored.balance(&identity, "ZEN", "USER_SETTLED"), 2_000_000_000_000_000_000);
+        assert_eq!(restored.balance(&identity, "ZEN", "USER_AVAILABLE"), 3_000_000_000_000_000_000);
+        assert_eq!(restored.balance(&identity, "USDC", "USER_SETTLED"), 0);
+    }
     fn bus_fixture_funded(funded:&str)->(DirectRuntime,String,String,String,InMemoryDirectStateStore) {
         let mut live=runtime(RuntimeMode::IsolatedTest);
         let mut store=InMemoryDirectStateStore::default();
@@ -5509,6 +6604,11 @@ mod tests {
     fn bus_hold_restore_rejects_missing_or_forged_binding_and_unbacked_balance() {
         let (mut live,subject,identity,wallet,_)=bus_fixture();
         live.execute(bus_begin(&subject,&identity,&wallet,BUS_ID)).unwrap();
+        let reconstruct = |state: &DirectState| {
+            let bus = reconstruct_bus_holds(state, &live.receipt_key)?;
+            let signed = reconstruct_signed_withdrawal_holds(state, &live.receipt_key)?;
+            validate_withdrawal_hold_balances(state, &bus, &signed)
+        };
         for variant in ["missing","signature","destination","amount","balance","terminal"] {
             let mut state=live.snapshot();
             if variant=="missing" { state.requests.remove(&(subject.clone(),BUS_ID.into())); }
@@ -5524,13 +6624,13 @@ mod tests {
                 if variant=="destination" {receipt.custody_reference=Some(format!("usdc-bus-reservation:{BUS_ID}:not-an-address"));receipt.signature=receipt_signature(&live.receipt_key,receipt);}
                 if variant=="amount" {receipt.amount_atomic=Some("04840000".into());receipt.signature=receipt_signature(&live.receipt_key,receipt);}
             }
-            assert!(matches!(reconstruct_bus_holds(&state,&live.receipt_key),Err(RuntimeError::StateArtifact)),"{variant}");
+            assert!(matches!(reconstruct(&state),Err(RuntimeError::StateArtifact)),"{variant}");
         }
     }
     #[test]
-    fn horizen_usdc_credit_requires_the_own_admitted_wallet_minimum_and_unique_proof() {
+    fn horizen_usdc_credit_requires_the_own_admitted_wallet_positive_amount_and_unique_proof() {
         let (mut live,subject,identity,wallet,_)=bus_fixture();
-        for (amount,source,reference) in [("4999999",wallet.as_str(),format!("horizen-usdc-deposit:0x{}","aa".repeat(32))),
+        for (amount,source,reference) in [("0",wallet.as_str(),format!("horizen-usdc-deposit:0x{}","aa".repeat(32))),
             ("5000000","0x3333333333333333333333333333333333333333",format!("horizen-usdc-deposit:0x{}","aa".repeat(32))),
             ("5000000",wallet.as_str(),format!("base-deposit:0x{}","aa".repeat(32))),
             ("5000000",wallet.as_str(),format!("horizen-usdc-deposit:0x{}","ab".repeat(32)))] {
@@ -5538,6 +6638,21 @@ mod tests {
                 amount_atomic:amount.into(),custody_reference:reference});credit.financial_wallet_address=Some(source.into());credit.request_hash=request_hash(&credit);
             assert!(live.execute(credit).is_err());assert_eq!(live.state_hash(),root);
         }
+    }
+
+    #[test]
+    fn horizen_usdc_pool_credit_has_no_legacy_minimum() {
+        let mut live=runtime(RuntimeMode::IsolatedTest);
+        let mut store=InMemoryDirectStateStore::default();
+        let subject="a".repeat(64);let wallet="0x1111111111111111111111111111111111111111";
+        let identity=identity_commitment_for(&subject,wallet);
+        live.execute_committed(request_for(&subject,&identity,"admit-small-deposit",DirectAction::AdmitIdentity {
+            wallet_address:wallet.into()}),&[8;32],&mut store).unwrap();
+        let mut credit=request_for(&subject,&identity,"small-deposit",DirectAction::CreditHorizenUsdcDeposit {
+            amount_atomic:"1".into(),custody_reference:format!("horizen-usdc-deposit:0x{}","ef".repeat(32))});
+        credit.financial_wallet_address=Some(wallet.into());credit.request_hash=request_hash(&credit);
+        assert_eq!(live.execute_committed(credit,&[8;32],&mut store).unwrap().effect,"DEPOSIT_CREDITED");
+        assert_eq!(live.balance(&identity,"USDC","USER_AVAILABLE"),1);
     }
     #[test]
     fn replacement_wallet_links_to_existing_identity_without_resetting_balance_or_history() {

@@ -142,6 +142,7 @@ mod tests {
             effect: "IDENTITY_ADMITTED".into(),
             amount_atomic: None,
             custody_reference: None,
+            command_commitment: None,
             execution: None,
             resolution: None,
             projection_balance_updates: vec![],

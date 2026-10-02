@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 2,
+  "releaseStatus": "validated-candidate-not-deployed",
+  "releaseId": "unified-20261002-7dca9dd",
+  "sourceCommit": "7dca9dd620484f29e406374431fb74453c480993",
+  "sourceBranch": "codex/unified-user-flow-clob-20260929",
+  "region": "us-east-1",
+  "candidate": {
+    "amiId": "ami-073c4d678404f20a6",
+    "amiName": "layrs-opening-epoch-unified-20261002-7dca9dd",
+    "amiSnapshotId": "snap-0f0adf56c5d77d201",
+    "createdAt": "2026-10-02T03:57:57.000Z",
+    "parentSha256": "71e11d326682effb32d511ddacaf88b0772d7fe0ccb67f744500b539c6478c1a",
+    "enclaveSha256": "edee6e82c1fe1fc9c7ce56a19b41c97baacb6e00b8c7a910043683bb0b0a6ee6",
+    "eifSha256": "1193ead635cb196c0d980cc393fcc0d285895d02356c916a73a309575310f9a6",
+    "pcr0": "b9091da0b168ea48cc9d655543060f4943ae2ba038166d7249c277c442279c496dc70e1c2239cea8a12ad2de22690d5b",
+    "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+    "pcr2": "060a2293ba87c4c8065f7ce96b45e6859db2a6b680efd54a8189683b8801515750e33465be84135b8febcae27b89b392",
+    "encrypted": true,
+    "deregistrationProtection": "enabled-without-cooldown",
+    "productionAccess": "denied",
+    "writerEnabled": false
+  },
+  "verification": {
+    "library": "122 passed, 3 ignored",
+    "enclave": "36 passed, 1 ignored",
+    "parent": "133 passed, 1 ignored",
+    "template": "6 passed",
+    "releaseBuild": "cargo build --release --bins passed",
+    "imageInspection": "encrypted, deregistration protected, writer disabled, production access denied, artifact hashes and PCRs matched"
+  },
+  "scope": [
+    "source-final deposit credit with per-deposit in-transit withdrawal restriction",
+    "asset-bound unified deposits and signed withdrawals",
+    "in-place writer-grant renewal without writer recycle",
+    "checkpoint health freshness fix",
+    "stale migration bundle selection fix"
+  ],
+  "activation": null,
+  "signature": null,
+  "productionMutation": false
+}

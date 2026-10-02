@@ -3423,6 +3423,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hmac 0.12.1",
+ "k256",
  "layrs-clob-service",
  "native-tls",
  "openssl",

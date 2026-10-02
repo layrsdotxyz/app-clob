@@ -18,7 +18,7 @@ use aws_smithy_types::{
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -34,15 +34,17 @@ use chacha20poly1305::{
 use hmac::{Hmac, Mac};
 use layrs_direct_execution_v1::{
     direct_frame::{CHECKPOINT_FRAME_OVERSIZED, MAX_FRAME_BYTES},
-    artifact_hash, identity_commitment_for, reference_for, relay_reference_for, relay_result_hash,valid_layrs_withdrawal_destination,
+    approved_signed_withdrawal_asset, artifact_hash, identity_commitment_for, reference_for,
+    relay_reference_for, relay_result_hash,valid_layrs_withdrawal_destination,
     relay_reverted_result_hash, request_hash, sha256, sign, DirectAction, DirectReceipt,
     DirectRequest, DirectResult, DirectStateArtifact, DurabilityAck, ExternalEffectIntent,
     ExternalEffectRecovery, FilesystemImmutableArtifactStore, FilesystemImmutableIntentStore,
     GovernedBalanceRecovery, GovernedKeyReleaseArtifact, GovernedMarketRegistration,
     GovernedMarketResolution, ImmutableExternalEffectIntentStore, OrderAction, Outcome,
     ProjectionBalanceRow, ProjectionIdentityRow, ProjectionWalletRow, RelayWithdrawalBinding,
-    RuntimeMeasurementBinding, RuntimeRequest, RuntimeResponse, SealedEpoch, TimeInForce,
+    RuntimeMeasurementBinding, RuntimeRequest, RuntimeResponse, SealedEpoch, SignedWithdrawalIntent, TimeInForce,
     WriterGrant, EPOCH_ID, MAX_V70_LINEAGE_RECORDS, POSTGRES_PROJECTION_DDL,
+    TRANSACTION_MODEL,
 };
 use layrs_direct_execution_v1::journal::{
     canonical_receipt_hash, canonical_result_hash, DirectJournalRecord, JournalDurabilityAck,
@@ -153,6 +155,9 @@ use usdc_wallet_link::{WalletLinkAuthority,WalletLinkGrant};
 #[path = "../usdc_bus_custody.rs"]
 mod usdc_bus_custody;
 use usdc_bus_custody::{UsdcBusCustodyAdapter,BusDepositProof,BusDepositFinalizationProof};
+#[path = "../unified_deposit_custody.rs"]
+mod unified_deposit_custody;
+use unified_deposit_custody::{UnifiedDepositCustodyAdapter, UnifiedSourceDepositProof};
 #[derive(Clone)]
 struct AppState {
     enclave_cid: u32,
@@ -167,6 +172,7 @@ struct AppState {
     usdc_custody: Option<UsdcCustodyAdapter>,
     usdc_link_authority: Option<WalletLinkAuthority>,
     usdc_bus_custody: Option<UsdcBusCustodyAdapter>,
+    unified_deposit_custody: Option<UnifiedDepositCustodyAdapter>,
     /// Serializes only the bounded synchronous request and an unresolved
     /// external intent.  It is process memory, never durable workflow state.
     financial_gate: Arc<FinancialGate>,
@@ -175,6 +181,9 @@ struct AppState {
     committed_state_root: Arc<Mutex<Option<String>>>,
     unresolved_external_effects: Arc<Mutex<BTreeMap<String, ExternalEffectIntent>>>,
     governed_bootstrap: Option<GovernedBootstrapConfig>,
+    /// Current authorization metadata only. Runtime key material and all
+    /// financial state remain inside the enclave.
+    current_writer_grant: Arc<Mutex<Option<WriterGrant>>>,
     persistence_format: PersistenceFormat,
     /// Set only after a verified v71 restore or same-process shadow promotion.
     /// This is a format selector, not command/workflow persistence.
@@ -232,6 +241,11 @@ impl AppState {
 struct ParentHealth {
     restored: AtomicBool,
     last_response_at: AtomicU64,
+    /// A checkpoint seal deliberately occupies the enclave's serialized
+    /// request path, so the background status observer cannot respond while
+    /// it runs. This timestamp grants only that bounded operation a health
+    /// pause; its RAII guard clears the pause on every return path.
+    checkpoint_seal_started_at: AtomicU64,
     /// Once the immutable v71 cutover marker exists, an unconfirmed enclave
     /// promotion is process-fatal. The financial gate remains held and health
     /// stays failed until the ASG replaces this parent and restores the marker.
@@ -241,10 +255,30 @@ const HEALTH_FRESHNESS_SECONDS: u64 = 45;
 
 impl ParentHealth {
     fn observe(&self, now: u64) { self.last_response_at.store(now, Ordering::Release); }
+    fn pause_for_checkpoint(&self, now: u64) -> CheckpointHealthPause<'_> {
+        let started_at = now.max(1);
+        self.checkpoint_seal_started_at
+            .store(started_at, Ordering::Release);
+        CheckpointHealthPause {
+            health: self,
+            started_at,
+        }
+    }
     fn check(&self, now: u64, last_commit: u64, stalled_waiter: bool, grant_expired: bool) -> Result<(), &'static str> {
         if !self.restored.load(Ordering::Acquire) { return Err("DIRECT_STATE_RECOVERY_REQUIRED"); }
         if self.cutover_uncertain.load(Ordering::Acquire) { return Err("V71_CUTOVER_CONFIRMATION_UNCERTAIN"); }
         if grant_expired { return Err("WRITER_AUTHORIZATION_EXPIRED"); }
+        let checkpoint_started_at = self.checkpoint_seal_started_at.load(Ordering::Acquire);
+        if checkpoint_started_at != 0 {
+            return if now
+                .checked_sub(checkpoint_started_at)
+                .is_some_and(|age| age <= CHECKPOINT_EXCHANGE_TIMEOUT.as_secs())
+            {
+                Ok(())
+            } else {
+                Err("CHECKPOINT_SEAL_STALLED")
+            };
+        }
         let commit_recent = last_commit != 0 && now.checked_sub(last_commit).is_some_and(|age| age < WRITE_PATH_STALL_THRESHOLD.as_secs());
         if stalled_waiter && !commit_recent { return Err("WRITE_PATH_STALLED"); }
         let last = self.last_response_at.load(Ordering::Acquire).max(last_commit);
@@ -252,6 +286,22 @@ impl ParentHealth {
             return Err("ENCLOSURE_UNAVAILABLE");
         }
         Ok(())
+    }
+}
+
+struct CheckpointHealthPause<'a> {
+    health: &'a ParentHealth,
+    started_at: u64,
+}
+
+impl Drop for CheckpointHealthPause<'_> {
+    fn drop(&mut self) {
+        let _ = self.health.checkpoint_seal_started_at.compare_exchange(
+            self.started_at,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 }
 
@@ -2210,6 +2260,34 @@ fn validate_v70_tip_at_cutover(
     Ok(())
 }
 
+/// The cutover marker anchors the immutable record that was current when v70
+/// stopped advancing. A later checkpoint or tail is expected after the first
+/// post-cutover commit, so the marker is an ancestor of the restored head and
+/// must not be compared with that head directly.
+fn validate_v71_cutover_marker_ancestor(
+    marker: &V71CutoverMarker,
+    record: &DirectJournalRecord,
+    restored_head_sequence: u64,
+) -> Result<(), String> {
+    if marker.sequence > restored_head_sequence {
+        return Err("V71_CUTOVER_MARKER_AFTER_HEAD".into());
+    }
+    let record_hash = record
+        .record_hash()
+        .map_err(|_| "V71_CUTOVER_ANCESTOR_HASH_INVALID")?;
+    if marker.epoch_id != record.epoch_id
+        || marker.writer_epoch != record.writer_epoch
+        || marker.sequence != record.sequence
+        || marker.record_hash != record_hash
+        || marker.transition_root != record.transition_root
+        || marker.request_index_root != record.request_index_root
+        || marker.financial_state_root != record.financial_state_root
+    {
+        return Err("V71_CUTOVER_MARKER_ANCESTOR_MISMATCH".into());
+    }
+    Ok(())
+}
+
 /// Strict inverse of `journal_record_key`. Legacy `{seq}-{hash}` head names,
 /// unpadded, foreign, overflowing, zero, or otherwise noncanonical keys are
 /// never valid journal records.
@@ -2855,8 +2933,11 @@ impl S3ImmutableArtifactStore {
         let artifact: DirectStateArtifact = serde_cbor::from_slice(&self.read(&key).await?)
             .map_err(|_| "checkpoint head decode failed")?;
         if receipt_only_record(&artifact) != *head { return Err("checkpoint head mismatch".into()); }
+        let health_pause = state.health.pause_for_checkpoint(now_unix());
         let response = exchange_with_timeout(state, RuntimeRequest::SealCheckpoint { artifact, receipt_records: records, artifact_hashes }, CHECKPOINT_EXCHANGE_TIMEOUT)
             .await.map_err(|error| if frame_oversized(&error) { CHECKPOINT_OVERSIZED } else { "checkpoint seal transport failed" })?;
+        state.health.observe(now_unix());
+        drop(health_pause);
         let checkpoint = match response {
             RuntimeResponse::CheckpointSealed { checkpoint } => checkpoint,
             RuntimeResponse::Error { code } if code == CHECKPOINT_FRAME_OVERSIZED => return Err(CHECKPOINT_OVERSIZED.into()),
@@ -2893,6 +2974,7 @@ impl S3ImmutableArtifactStore {
         if !journal_checkpoint_due(head.sequence, last_checkpoint) {
             return Ok(());
         }
+        let health_pause = state.health.pause_for_checkpoint(now_unix());
         let response = exchange_with_timeout(
             state,
             RuntimeRequest::SealJournalCheckpoint,
@@ -2900,6 +2982,8 @@ impl S3ImmutableArtifactStore {
         )
         .await
         .map_err(|_| "journal checkpoint seal transport failed")?;
+        state.health.observe(now_unix());
+        drop(health_pause);
         let checkpoint = match response {
             RuntimeResponse::JournalCheckpointSealed { checkpoint }
                 if checkpoint.writer_epoch == head.writer_epoch
@@ -3362,40 +3446,28 @@ impl S3ImmutableArtifactStore {
         if !self.prepare_journal_restore().await? {
             return Err("V71_CUTOVER_MARKER_WITHOUT_JOURNAL".into());
         }
-        let prepared = self.prepared_journal_restore.lock().await;
-        let prepared = prepared
-            .as_ref()
-            .ok_or("V71_CUTOVER_JOURNAL_UNPREPARED")?;
-        let (writer_epoch, sequence, record_hash, transition_root, request_index_root, financial_state_root) =
-            match prepared.tail.last() {
-                Some(record) => (
-                    record.writer_epoch.as_str(),
-                    record.sequence,
-                    record
-                        .record_hash()
-                        .map_err(|_| "V71_CUTOVER_TAIL_HASH_INVALID")?,
-                    record.transition_root.as_str(),
-                    record.request_index_root.as_str(),
-                    record.financial_state_root.as_str(),
-                ),
-                None => (
-                    prepared.checkpoint.writer_epoch.as_str(),
-                    prepared.checkpoint.sequence,
-                    prepared.checkpoint.record_hash.clone(),
-                    prepared.checkpoint.transition_root.as_str(),
-                    prepared.checkpoint.request_index_root.as_str(),
-                    prepared.checkpoint.financial_state_root.as_str(),
-                ),
-            };
-        if marker.writer_epoch != writer_epoch
-            || marker.sequence != sequence
-            || marker.record_hash != record_hash
-            || marker.transition_root != transition_root
-            || marker.request_index_root != request_index_root
-            || marker.financial_state_root != financial_state_root
-        {
-            return Err("V71_CUTOVER_MARKER_HEAD_MISMATCH".into());
+        let restored_head_sequence = {
+            let prepared = self.prepared_journal_restore.lock().await;
+            let prepared = prepared
+                .as_ref()
+                .ok_or("V71_CUTOVER_JOURNAL_UNPREPARED")?;
+            prepared
+                .tail
+                .last()
+                .map_or(prepared.checkpoint.sequence, |record| record.sequence)
+        };
+        if marker.sequence > restored_head_sequence {
+            return Err("V71_CUTOVER_MARKER_AFTER_HEAD".into());
         }
+        let cutover_record = self
+            .load_journal_record(marker.sequence)
+            .await
+            .map_err(|error| format!("V71_CUTOVER_ANCESTOR_LOAD_FAILED: {error}"))?;
+        validate_v71_cutover_marker_ancestor(
+            &marker,
+            &cutover_record,
+            restored_head_sequence,
+        )?;
         Ok(true)
     }
     /// Create-only, content-addressed persistence of an enclave-sealed v70
@@ -3426,13 +3498,23 @@ impl S3ImmutableArtifactStore {
         }
         Ok(key)
     }
-    /// Restores the single immutable migration bundle that anchors all
-    /// migrated terminal-result locators. Multiple objects are ambiguous and
-    /// therefore fail closed rather than selecting by listing order.
-    async fn load_v70_migration_bundle(&self) -> Result<Option<V70MigrationBundle>, String> {
+    /// Restores only the immutable migration bundle already named by the
+    /// authenticated request index. Failed shadow attempts at another source
+    /// sequence remain harmless immutable history and are not candidates.
+    /// Multiple objects for the bound sequence are still ambiguous and fail
+    /// closed rather than selecting by listing order.
+    async fn load_v70_migration_bundle(
+        &self,
+        expected_source_sequence: u64,
+        expected_migration_id: &str,
+    ) -> Result<Option<V70MigrationBundle>, String> {
+        if expected_source_sequence == 0 || expected_migration_id.is_empty() {
+            return Err("journal migration binding invalid".into());
+        }
         let namespace = format!("{}/journal-v71/migrations/", self.prefix);
+        let bound_prefix = format!("{namespace}{expected_source_sequence:020}-");
         let keys = self
-            .list_journal_keys(&namespace, None, 2, ARCHIVE_OPERATION_TIMEOUT)
+            .list_journal_keys(&bound_prefix, None, 2, ARCHIVE_OPERATION_TIMEOUT)
             .await?;
         let Some(key) = keys.first() else {
             return Ok(None);
@@ -3451,6 +3533,8 @@ impl S3ImmutableArtifactStore {
             || bundle.manifest.protocol != V70_MIGRATION_MANIFEST_PROTOCOL
             || bundle.manifest.epoch_id != EPOCH_ID
             || bundle.manifest.source_sequence != source_sequence
+            || source_sequence != expected_source_sequence
+            || bundle.manifest.migration_id != expected_migration_id
         {
             return Err("journal migration bundle invalid".into());
         }
@@ -3512,7 +3596,10 @@ impl S3ImmutableArtifactStore {
         restored: &V70MigrationBundle,
     ) -> Result<(V70MigrationBundle, Vec<DirectJournalRecord>), String> {
         let bundle = self
-            .load_v70_migration_bundle()
+            .load_v70_migration_bundle(
+                restored.manifest.source_sequence,
+                &restored.manifest.migration_id,
+            )
             .await?
             .ok_or("v70 rollback migration bundle missing")?;
         if bundle != *restored {
@@ -3949,7 +4036,7 @@ impl S3ImmutableArtifactStore {
             .await?;
         self.persist_journal_checkpoint(checkpoint).await
     }
-    /// Paginated listing of `namespace` (a full key prefix ending in `/`),
+    /// Paginated listing of `namespace` (a full key prefix),
     /// optionally strictly after `start_after`, of at most `max` keys. Each
     /// page is time-bounded. A timeout, error, key-count mismatch, empty
     /// truncated page, missing or repeated token, foreign or out-of-range key,
@@ -4190,12 +4277,11 @@ impl S3ImmutableArtifactStore {
         receipt_snapshot
             .verify(&index_snapshot)
             .map_err(|_| "journal receipt snapshot invalid")?;
-        let has_migrated_results = index_snapshot.leaves.iter().any(|leaf| {
-            matches!(leaf.locator, TerminalResultLocator::Migration { .. })
-        });
-        let migration = if has_migrated_results {
+        let migration = if let Some((source_sequence, migration_id)) =
+            restored_migration_binding(&index_snapshot)?
+        {
             let bundle = self
-                .load_v70_migration_bundle()
+                .load_v70_migration_bundle(source_sequence, &migration_id)
                 .await?
                 .ok_or("journal migration bundle missing")?;
             if !migration_matches_restored_index(&bundle, &index_snapshot) {
@@ -5032,12 +5118,19 @@ enum CustomerAction {
     },
     CreditZenDeposit { transaction_hash: String, amount_atomic: String },
     CreditHorizenUsdcDeposit { transaction_hash: String, amount_atomic: String },
+    CreditUnifiedSourceDeposits {operation_id:String,asset:String,amount_atomic:String,proof:UnifiedSourceDepositProof},
+    FinalizeUnifiedDeposit {operation_id:String,asset:String,amount_atomic:String,source_custody_reference:String,
+        horizen_transaction_hash:String},
     CreditArbitrumUsdcBusDeposit {operation_id:String,amount_atomic:String,proof:BusDepositProof},
     FinalizeArbitrumUsdcBusDeposit {operation_id:String,amount_atomic:String,proof:BusDepositFinalizationProof},
     BeginUsdcBusWithdrawal { destination_chain:String,asset:String,destination: String, amount_atomic: String },
     VerifyUsdcBusWithdrawal {withdrawal_id:String,destination_chain:String,asset:String,destination:String,amount_atomic:String,proof:Value},
     VerifyZenWithdrawal {withdrawal_id:String,destination_chain:String,asset:String,destination:String,amount_atomic:String},
     LinkFinancialWallet {grant:WalletLinkGrant,signature:String},
+    LinkPoolWallet {wallet_address:String,external_id:String},
+    ReserveSignedWithdrawal {intent:SignedWithdrawalIntent,user_signature:String},
+    SettleSignedWithdrawal {intent_hash:String,pool:String,token:String,horizen_transaction_hash:String},
+    ReleaseExpiredSignedWithdrawal {intent:SignedWithdrawalIntent,finalized_block_number:String,finalized_block_hash:String},
     ReserveZenWithdrawal { destination_chain: String, destination: String, amount_atomic: String },
     PlaceOrder {
         order_id: String,
@@ -5148,7 +5241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         execution_mode.as_deref(),
         Some("admission-enabled" | "production-enabled")
     ) {
-        let grant: WriterGrant = env::var("LAYRS_DIRECT_WRITER_GRANT_JSON")
+        let primary: WriterGrant = env::var("LAYRS_DIRECT_WRITER_GRANT_JSON")
             .ok()
             .and_then(|value| serde_json::from_str(&value).ok())
             .ok_or("production writer grant is required")?;
@@ -5161,20 +5254,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .duration_since(UNIX_EPOCH)
             .map(|value| value.as_secs())
             .unwrap_or(0);
-        if !grant.verify(now, &binding) {
-            return Err("production writer grant signature is invalid".into());
-        }
         let kms_key_id = env::var("LAYRS_DIRECT_KEY_RELEASE_KMS_KEY_ID")
             .map_err(|_| "production key-release KMS reference is required")?;
-        if kms_key_id != grant.key_release_kms_key_id {
-            return Err("production key-release KMS reference mismatch".into());
+        let mut candidates = vec![primary];
+        if let Ok(raw) = env::var("LAYRS_DIRECT_STAGED_WRITER_GRANT_JSON") {
+            let staged: WriterGrant = serde_json::from_str(&raw)
+                .map_err(|_| "staged production writer grant is invalid")?;
+            candidates.push(staged);
         }
-        projection
-            .as_ref()
-            .ok_or("production projection is required")?
-            .verify_governed_runtime_mode(&grant, financial_enabled)
-            .await
-            .map_err(|_| "runtime authorization and writer fence verification failed")?;
+        if candidates.len() == 2 && candidates[0].commitment() == candidates[1].commitment() {
+            return Err("staged production writer grant duplicates the primary grant".into());
+        }
+        for candidate in &candidates {
+            if !candidate.verify(now, &binding) {
+                return Err("production writer grant signature is invalid".into());
+            }
+            if candidate.key_release_kms_key_id != kms_key_id {
+                return Err("production key-release KMS reference mismatch".into());
+            }
+        }
+        let projection = projection.as_ref().ok_or("production projection is required")?;
+        let mut selected = None;
+        for candidate in candidates {
+            if projection.verify_governed_runtime_mode(&candidate, financial_enabled).await.is_ok() {
+                if selected.is_some() {
+                    return Err("multiple production writer grants match the database fence".into());
+                }
+                selected = Some(candidate);
+            }
+        }
+        let grant = selected.ok_or("runtime authorization and writer fence verification failed")?;
         Some(GovernedBootstrapConfig {
             grant,
             binding,
@@ -5205,6 +5314,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
+    let current_writer_grant = Arc::new(Mutex::new(
+        governed_bootstrap.as_ref().map(|config| config.grant.clone()),
+    ));
     let state = AppState {
         enclave_cid: env::var("LAYRS_ENCLAVE_CID")
             .unwrap_or_else(|_| "16".into())
@@ -5238,6 +5350,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             UsdcCustodyAdapter::from_environment().map_err(|_|"USDC custody configuration invalid")?
         } else {None},
         usdc_bus_custody: if financial_enabled {UsdcBusCustodyAdapter::from_environment()?} else {None},
+        unified_deposit_custody: if financial_enabled {
+            UnifiedDepositCustodyAdapter::from_environment()
+                .map_err(|error| format!("unified deposit custody configuration invalid: {error}"))?
+        } else { None },
         usdc_link_authority: if financial_enabled {
             WalletLinkAuthority::from_environment().map_err(|_|"USDC linking authority configuration invalid")?
         } else {None},
@@ -5247,6 +5363,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         committed_state_root: Arc::new(Mutex::new(None)),
         unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
         governed_bootstrap,
+        current_writer_grant,
         persistence_format,
         hot_v71_enabled: Arc::new(AtomicBool::new(false)),
         journal_request_index: Arc::new(Mutex::new(None)),
@@ -5370,6 +5487,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/privacy/receipt-key-attestation", get(quest_receipt_attestation))
         .route("/v1/runtime/status", get(status))
         .route("/v1/operator/markets", post(register_market))
+        .route("/v1/operator/writer-grant/source", get(writer_grant_source))
+        .route("/v1/operator/writer-grant/prepare", post(prepare_writer_grant))
+        .route("/v1/operator/writer-grant/renew", post(renew_writer_grant))
         .route("/v1/operator/markets/resolve", post(resolve_market))
         .route("/v1/operator/markets/:market_id", get(market_status))
         .route(
@@ -5486,9 +5606,317 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
         _ => (StatusCode::BAD_GATEWAY, "UNEXPECTED_RESPONSE").into_response(),
     }
 }
+/// Returns only public signed authorization material after proving that the
+/// database, runtime, and immutable artifact all name the same live grant.
+/// It deliberately contains no runtime keys, credentials, database URL, or
+/// ciphertext and lets the external renewal job avoid prose/copied values.
+async fn writer_grant_source(State(state): State<AppState>) -> Response {
+    let Some(config) = state.governed_bootstrap.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_UNAVAILABLE").into_response();
+    };
+    let Some(grant) = state.current_writer_grant.lock().await.as_ref().cloned() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_UNAVAILABLE").into_response();
+    };
+    let Some(projection) = state.projection.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_DATABASE_UNAVAILABLE").into_response();
+    };
+    if projection.verify_governed_runtime_mode(&grant, config.requested_mode == "production-enabled").await.is_err() {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_DATABASE_MISMATCH").into_response();
+    }
+    let runtime = match exchange(&state, RuntimeRequest::Status).await {
+        Ok(RuntimeResponse::Status { status }) => status,
+        _ => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_STATUS_UNAVAILABLE").into_response(),
+    };
+    let commitment = grant.commitment();
+    let Some(artifact_hash) = runtime.key_release_artifact_hash.as_deref() else {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_RUNTIME_MISMATCH").into_response();
+    };
+    if runtime.writer_grant_commitment.as_deref() != Some(commitment.as_str())
+        || runtime.writer_grant_expires_at_unix != Some(grant.expires_at_unix)
+    {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_RUNTIME_MISMATCH").into_response();
+    }
+    let artifact = match state.artifact_store.as_ref() {
+        Some(store) => match store.load_key_release(&grant.activation_id).await {
+            Ok(Some(artifact)) if artifact.verify_for(&grant, &config.binding, &config.kms_key_id)
+                && artifact.artifact_hash() == artifact_hash => artifact,
+            _ => return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_ARTIFACT_MISMATCH").into_response(),
+        },
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_ARCHIVE_UNAVAILABLE").into_response(),
+    };
+    Json(json!({
+        "grant": grant,
+        "writerGrantCommitment": commitment,
+        "writerGrantExpiresAtUnix": runtime.writer_grant_expires_at_unix,
+        "keyReleaseArtifactHash": artifact.artifact_hash(),
+        "runtimeMeasurement": config.binding,
+    })).into_response()
+}
+/// Creates the immutable successor key-release artifact without changing the
+/// database, enclave authorization, health, or financial state. Consumers can
+/// therefore be deployed with the exact current+successor binding before the
+/// database/enclave CAS. Retrying the same signed grant is idempotent.
+async fn prepare_writer_grant(
+    State(state): State<AppState>,
+    Json(grant): Json<WriterGrant>,
+) -> Response {
+    let Some(config) = state.governed_bootstrap.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_UNAVAILABLE").into_response();
+    };
+    let now = now_unix();
+    if !grant.verify(now, &config.binding)
+        || grant.runtime_measurement != config.binding
+        || grant.key_release_kms_key_id != config.kms_key_id
+        || grant.authorization_scope != config.requested_mode
+    {
+        return (StatusCode::FORBIDDEN, "WRITER_GRANT_RENEWAL_INVALID").into_response();
+    }
+    let Some(current) = state.current_writer_grant.lock().await.as_ref().cloned() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_UNAVAILABLE").into_response();
+    };
+    let current_commitment = current.commitment();
+    let Some(projection) = state.projection.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_DATABASE_UNAVAILABLE").into_response();
+    };
+    // Preparation must happen while the database still names the predecessor.
+    // The final /renew call performs the inverse check after the CAS.
+    if projection.verify_governed_runtime_mode(&current, config.requested_mode == "production-enabled").await.is_err() {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_DATABASE_MISMATCH").into_response();
+    }
+    let runtime = match exchange(&state, RuntimeRequest::Status).await {
+        Ok(RuntimeResponse::Status { status }) => status,
+        _ => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_STATUS_UNAVAILABLE").into_response(),
+    };
+    let (Some(runtime_commitment), Some(runtime_artifact_hash)) = (
+        runtime.writer_grant_commitment.as_deref(),
+        runtime.key_release_artifact_hash.as_deref(),
+    ) else {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_RUNTIME_MISMATCH").into_response();
+    };
+    let Some(predecessor) = grant.key_release_predecessor.as_ref() else {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_PREDECESSOR_MISMATCH").into_response();
+    };
+    if runtime_commitment != current_commitment
+        || predecessor.activation_id != current.activation_id
+        || predecessor.writer_grant_commitment != current_commitment
+        || predecessor.artifact_sha256 != runtime_artifact_hash
+    {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_PREDECESSOR_MISMATCH").into_response();
+    }
+    let successor_commitment = grant.commitment();
+    let Some(store) = state.artifact_store.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_ARCHIVE_UNAVAILABLE").into_response();
+    };
+    let artifact = match store.load_key_release(&grant.activation_id).await {
+        Ok(Some(artifact)) if artifact.verify_for(&grant, &config.binding, &config.kms_key_id) => artifact,
+        Ok(Some(_)) => return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_ARTIFACT_MISMATCH").into_response(),
+        Ok(None) => {
+            let predecessor_artifact = match store.load_key_release(&predecessor.activation_id).await {
+                Ok(Some(artifact)) if artifact.verify_as_predecessor(predecessor, &config.kms_key_id) => artifact,
+                _ => return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_PREDECESSOR_MISMATCH").into_response(),
+            };
+            let source_context = predecessor_artifact.encryption_context.clone().into_iter().collect();
+            let mut destination_context = BTreeMap::new();
+            destination_context.insert("layrs-runtime".into(), TRANSACTION_MODEL.into());
+            destination_context.insert("layrs-epoch".into(), EPOCH_ID.into());
+            destination_context.insert("layrs-writer-grant".into(), successor_commitment.clone());
+            let aws = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+            let reencrypted = match KmsClient::new(&aws).re_encrypt()
+                .ciphertext_blob(KmsBlob::new(predecessor_artifact.ciphertext_blob))
+                .source_key_id(&config.kms_key_id)
+                .destination_key_id(&config.kms_key_id)
+                .set_source_encryption_context(Some(source_context))
+                .set_destination_encryption_context(Some(destination_context.clone().into_iter().collect()))
+                .send().await
+            {
+                Ok(value) => value,
+                Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_KMS_FAILED").into_response(),
+            };
+            let Some(ciphertext) = reencrypted.ciphertext_blob() else {
+                return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_KMS_FAILED").into_response();
+            };
+            let artifact = GovernedKeyReleaseArtifact {
+                protocol: "layrs.direct-execution.key-release.v1".into(),
+                activation_id: grant.activation_id.clone(),
+                writer_grant_commitment: successor_commitment.clone(),
+                runtime_measurement: config.binding.clone(),
+                kms_key_id: config.kms_key_id.clone(),
+                encryption_context: destination_context,
+                ciphertext_blob: ciphertext.as_ref().to_vec(),
+            };
+            if !artifact.verify_for(&grant, &config.binding, &config.kms_key_id) {
+                return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_ARTIFACT_MISMATCH").into_response();
+            }
+            match store.persist_key_release(&artifact).await {
+                Ok(artifact) => artifact,
+                Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_ARCHIVE_FAILED").into_response(),
+            }
+        }
+        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_ARCHIVE_FAILED").into_response(),
+    };
+    Json(json!({
+        "activationId": grant.activation_id,
+        "writerGrantCommitment": successor_commitment,
+        "writerGrantExpiresAtUnix": grant.expires_at_unix,
+        "keyReleaseArtifactHash": artifact.artifact_hash(),
+        "runtimeChanged": false,
+    })).into_response()
+}
+async fn renew_writer_grant(
+    State(state): State<AppState>,
+    Json(grant): Json<WriterGrant>,
+) -> Response {
+    let Some(config) = state.governed_bootstrap.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_UNAVAILABLE").into_response();
+    };
+    let now = now_unix();
+    if !grant.verify(now, &config.binding)
+        || grant.runtime_measurement != config.binding
+        || grant.key_release_kms_key_id != config.kms_key_id
+        || grant.authorization_scope != config.requested_mode
+    {
+        return (StatusCode::FORBIDDEN, "WRITER_GRANT_RENEWAL_INVALID").into_response();
+    }
+    let Some(current) = state.current_writer_grant.lock().await.as_ref().cloned() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_UNAVAILABLE").into_response();
+    };
+    let current_commitment = current.commitment();
+    let Some(projection) = state.projection.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_DATABASE_UNAVAILABLE").into_response();
+    };
+    let financial_writer_enabled = config.requested_mode == "production-enabled";
+    let successor_in_database = projection.verify_governed_runtime_mode(&grant, financial_writer_enabled).await.is_ok();
+    let runtime = match exchange(&state, RuntimeRequest::Status).await {
+        Ok(RuntimeResponse::Status { status }) => status,
+        _ => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_STATUS_UNAVAILABLE").into_response(),
+    };
+    let Some(runtime_commitment) = runtime.writer_grant_commitment.as_deref() else {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_RUNTIME_MISMATCH").into_response();
+    };
+    let Some(runtime_artifact_hash) = runtime.key_release_artifact_hash.as_deref() else {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_RUNTIME_MISMATCH").into_response();
+    };
+    let successor_commitment = grant.commitment();
+    let store = match state.artifact_store.as_ref() {
+        Some(store) => store,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_ARCHIVE_UNAVAILABLE").into_response(),
+    };
+    if runtime_commitment == successor_commitment {
+        if !successor_in_database {
+            return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_DATABASE_MISMATCH").into_response();
+        }
+        let artifact = match store.load_key_release(&grant.activation_id).await {
+            Ok(Some(artifact)) if artifact.verify_for(&grant, &config.binding, &config.kms_key_id)
+                && artifact.artifact_hash() == runtime_artifact_hash => artifact,
+            _ => return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_ARTIFACT_MISMATCH").into_response(),
+        };
+        *state.current_writer_grant.lock().await = Some(grant.clone());
+        return Json(json!({
+            "activationId": grant.activation_id,
+            "writerGrantCommitment": successor_commitment,
+            "writerGrantExpiresAtUnix": grant.expires_at_unix,
+            "keyReleaseArtifactHash": artifact.artifact_hash(),
+            "idempotent": true,
+        })).into_response();
+    }
+    let Some(predecessor) = grant.key_release_predecessor.as_ref() else {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_PREDECESSOR_MISMATCH").into_response();
+    };
+    if runtime_commitment != current_commitment
+        || predecessor.activation_id != current.activation_id
+        || predecessor.writer_grant_commitment != current_commitment
+        || predecessor.artifact_sha256 != runtime_artifact_hash
+    {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_PREDECESSOR_MISMATCH").into_response();
+    }
+    let artifact = match store.load_key_release(&grant.activation_id).await {
+        Ok(Some(artifact)) => {
+            if !artifact.verify_for(&grant, &config.binding, &config.kms_key_id) {
+                return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_ARTIFACT_MISMATCH").into_response();
+            }
+            artifact
+        }
+        Ok(None) => {
+            let predecessor_artifact = match store.load_key_release(&predecessor.activation_id).await {
+                Ok(Some(artifact)) if artifact.verify_as_predecessor(predecessor, &config.kms_key_id) => artifact,
+                _ => return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_PREDECESSOR_MISMATCH").into_response(),
+            };
+            let source_context = predecessor_artifact.encryption_context.clone().into_iter().collect();
+            let mut destination_context = BTreeMap::new();
+            destination_context.insert("layrs-runtime".into(), TRANSACTION_MODEL.into());
+            destination_context.insert("layrs-epoch".into(), EPOCH_ID.into());
+            destination_context.insert("layrs-writer-grant".into(), successor_commitment.clone());
+            let destination_context_map = destination_context.clone().into_iter().collect();
+            let aws = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+            let reencrypted = match KmsClient::new(&aws).re_encrypt()
+                .ciphertext_blob(KmsBlob::new(predecessor_artifact.ciphertext_blob))
+                .source_key_id(&config.kms_key_id)
+                .destination_key_id(&config.kms_key_id)
+                .set_source_encryption_context(Some(source_context))
+                .set_destination_encryption_context(Some(destination_context_map))
+                .send().await
+            {
+                Ok(value) => value,
+                Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_KMS_FAILED").into_response(),
+            };
+            let Some(ciphertext) = reencrypted.ciphertext_blob() else {
+                return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_KMS_FAILED").into_response();
+            };
+            let artifact = GovernedKeyReleaseArtifact {
+                protocol: "layrs.direct-execution.key-release.v1".into(),
+                activation_id: grant.activation_id.clone(),
+                writer_grant_commitment: successor_commitment.clone(),
+                runtime_measurement: config.binding.clone(),
+                kms_key_id: config.kms_key_id.clone(),
+                encryption_context: destination_context,
+                ciphertext_blob: ciphertext.as_ref().to_vec(),
+            };
+            if !artifact.verify_for(&grant, &config.binding, &config.kms_key_id) {
+                return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_ARTIFACT_MISMATCH").into_response();
+            }
+            match store.persist_key_release(&artifact).await {
+                Ok(artifact) => artifact,
+                Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_ARCHIVE_FAILED").into_response(),
+            }
+        }
+        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_ARCHIVE_FAILED").into_response(),
+    };
+    let artifact_hash = artifact.artifact_hash();
+    if !successor_in_database
+        && projection.cas_governed_writer_grant(&current, &grant, financial_writer_enabled).await.is_err()
+    {
+        return (StatusCode::CONFLICT, "WRITER_GRANT_RENEWAL_DATABASE_MISMATCH").into_response();
+    }
+    match exchange(&state, RuntimeRequest::RenewGovernedWriter {
+        grant: grant.clone(),
+        key_release_artifact_hash: artifact_hash.clone(),
+    }).await {
+        Ok(RuntimeResponse::GovernedWriterRenewed {
+            writer_grant_commitment,
+            writer_grant_expires_at_unix,
+            key_release_artifact_hash,
+            ..
+        }) if writer_grant_commitment == successor_commitment
+            && writer_grant_expires_at_unix == grant.expires_at_unix
+            && key_release_artifact_hash == artifact_hash => {
+                *state.current_writer_grant.lock().await = Some(grant.clone());
+                eprintln!("WRITER_GRANT_HOT_RENEWED activation={} expiry={}", grant.activation_id, grant.expires_at_unix);
+                Json(json!({
+                    "activationId": grant.activation_id,
+                    "writerGrantCommitment": successor_commitment,
+                    "writerGrantExpiresAtUnix": grant.expires_at_unix,
+                    "keyReleaseArtifactHash": artifact_hash,
+                    "idempotent": false,
+                })).into_response()
+            }
+        Ok(RuntimeResponse::Error { code }) => (StatusCode::CONFLICT, code).into_response(),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "WRITER_GRANT_RENEWAL_ENCLAVE_FAILED").into_response(),
+    }
+}
 async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     let now = now_unix();
-    let expired = state.governed_bootstrap.as_ref().is_some_and(|config| config.grant.expires_at_unix <= now);
+    let expired = state.current_writer_grant.lock().await.as_ref()
+        .is_some_and(|grant| grant.expires_at_unix <= now);
     match state.health.check(now, state.last_commit_at.load(Ordering::Acquire), state.financial_gate.stalled(now), expired) {
         Ok(()) => (StatusCode::OK, "ok"),
         Err(code) => (StatusCode::SERVICE_UNAVAILABLE, code),
@@ -5649,6 +6077,74 @@ async fn command(
                 Err(_)=>return (StatusCode::FORBIDDEN,"USDC_WALLET_LINK_DENIED").into_response(),
             }
         }
+        CustomerAction::LinkPoolWallet {wallet_address,external_id} => {
+            DirectAction::LinkPoolWallet {wallet_address,external_id}
+        }
+        CustomerAction::ReserveSignedWithdrawal {intent,user_signature} => {
+            match signed_withdrawal_reservation_action(
+                &request_id,
+                claims.financial_wallet_address.as_deref(),
+                intent,
+                user_signature,
+                now_unix(),
+            ) {
+                Ok(action)=>action,
+                Err((status,code))=>return (status,code).into_response(),
+            }
+        }
+        CustomerAction::SettleSignedWithdrawal {intent_hash,pool,token,horizen_transaction_hash} => {
+            let normalized_intent=intent_hash.to_ascii_lowercase();
+            let normalized_hash=horizen_transaction_hash.to_ascii_lowercase();
+            if request_id!=format!("signed-withdrawal-settle:{}",normalized_intent.trim_start_matches("0x")) {
+                return (StatusCode::BAD_REQUEST,"SIGNED_WITHDRAWAL_SETTLEMENT_IDEMPOTENCY_MISMATCH").into_response();
+            }
+            let Some(route_wallet)=claims.financial_wallet_address.as_deref() else {
+                return (StatusCode::FORBIDDEN,"DIRECT_FINANCIAL_WALLET_REQUIRED").into_response();
+            };
+            let Some(custody)=&state.usdc_custody else {
+                return (StatusCode::SERVICE_UNAVAILABLE,"USDC_CUSTODY_ADAPTER_NOT_ENABLED").into_response();
+            };
+            let asset=match approved_signed_withdrawal_asset(&pool,&token) {
+                Some(asset)=>asset.ledger_asset(),
+                None=>return (StatusCode::BAD_REQUEST,"SIGNED_WITHDRAWAL_ASSET_INVALID").into_response(),
+            };
+            match custody.signed_withdrawal_finality(&claims.wallet_address,route_wallet,&normalized_intent,
+                &normalized_hash,&pool,&token).await {
+                Ok(DepositFinality::Finalized)=>DirectAction::SettleSignedWithdrawal {
+                    intent_hash:normalized_intent,asset:asset.into(),horizen_transaction_hash:normalized_hash,
+                },
+                Ok(DepositFinality::Pending)=>return (StatusCode::SERVICE_UNAVAILABLE,"SIGNED_WITHDRAWAL_FINALITY_PENDING").into_response(),
+                Ok(DepositFinality::Reverted)=>return (StatusCode::CONFLICT,"SIGNED_WITHDRAWAL_PAYOUT_REVERTED").into_response(),
+                Ok(DepositFinality::Conflict)=>return (StatusCode::CONFLICT,"SIGNED_WITHDRAWAL_PAYOUT_CONFLICT").into_response(),
+                Err(_)=>return (StatusCode::SERVICE_UNAVAILABLE,"SIGNED_WITHDRAWAL_FINALITY_UNAVAILABLE").into_response(),
+            }
+        }
+        CustomerAction::ReleaseExpiredSignedWithdrawal {intent,finalized_block_number,finalized_block_hash} => {
+            let Ok(intent_hash)=intent.intent_hash_hex() else {
+                return (StatusCode::BAD_REQUEST,"SIGNED_WITHDRAWAL_INTENT_INVALID").into_response();
+            };
+            if request_id!=format!("signed-withdrawal-release:{}",intent_hash.trim_start_matches("0x"))
+                ||!intent.account.eq_ignore_ascii_case(&claims.wallet_address)
+                ||!claims.financial_wallet_address.as_deref().is_some_and(|wallet|wallet.eq_ignore_ascii_case(&intent.route_wallet)) {
+                return (StatusCode::FORBIDDEN,"SIGNED_WITHDRAWAL_RELEASE_BINDING_DENIED").into_response();
+            }
+            let Some(custody)=&state.usdc_custody else {
+                return (StatusCode::SERVICE_UNAVAILABLE,"USDC_CUSTODY_ADAPTER_NOT_ENABLED").into_response();
+            };
+            let block_hash=finalized_block_hash.to_ascii_lowercase();
+            match custody.signed_withdrawal_expiry(&intent,&finalized_block_number,&block_hash).await {
+                Ok(DepositFinality::Finalized)=>{
+                    let Ok(timestamp)=custody.finalized_block_timestamp(&finalized_block_number,&block_hash).await else {
+                        return (StatusCode::SERVICE_UNAVAILABLE,"SIGNED_WITHDRAWAL_FINALITY_UNAVAILABLE").into_response();
+                    };
+                    DirectAction::ReleaseExpiredSignedWithdrawal {intent_hash,
+                        finalized_block_hash:block_hash,finalized_block_timestamp:timestamp}
+                },
+                Ok(DepositFinality::Pending)=>return (StatusCode::SERVICE_UNAVAILABLE,"SIGNED_WITHDRAWAL_EXPIRY_PENDING").into_response(),
+                Ok(DepositFinality::Reverted|DepositFinality::Conflict)=>return (StatusCode::CONFLICT,"SIGNED_WITHDRAWAL_RELEASE_CONFLICT").into_response(),
+                Err(_)=>return (StatusCode::SERVICE_UNAVAILABLE,"SIGNED_WITHDRAWAL_FINALITY_UNAVAILABLE").into_response(),
+            }
+        }
         CustomerAction::BeginUsdcBusWithdrawal { destination_chain,asset,destination, amount_atomic } => {
             if external_effect_pending {
                 return (StatusCode::SERVICE_UNAVAILABLE, "EXTERNAL_EFFECT_FINALITY_PENDING").into_response();
@@ -5685,6 +6181,59 @@ async fn command(
             }
         }
         CustomerAction::CreditArbitrumUsdcBusDeposit {..}|CustomerAction::FinalizeArbitrumUsdcBusDeposit {..}=>return (StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING").into_response(),
+        CustomerAction::CreditUnifiedSourceDeposits {operation_id,asset,amount_atomic,proof} if !external_effect_pending => {
+            let Some(wallet)=claims.financial_wallet_address.as_deref() else {
+                return (StatusCode::FORBIDDEN,"DIRECT_FINANCIAL_WALLET_REQUIRED").into_response();
+            };
+            if !matches!(asset.as_str(),"USDC"|"ZEN")
+                || request_id!=format!("unified-{}-deposit-credit:{operation_id}",asset.to_ascii_lowercase()) {
+                return (StatusCode::BAD_REQUEST,"DEPOSIT_IDEMPOTENCY_KEY_MISMATCH").into_response();
+            }
+            let Some(custody)=&state.unified_deposit_custody else {
+                return (StatusCode::SERVICE_UNAVAILABLE,"UNIFIED_DEPOSIT_CUSTODY_NOT_ENABLED").into_response();
+            };
+            match custody.source_finality(wallet,&asset,&amount_atomic,&proof).await {
+                Ok(Some((custody_reference,source_references)))=>DirectAction::CreditUnifiedSourceDeposits {
+                    operation_id,asset,source_chain:proof.source_chain,amount_atomic,custody_reference,source_references,
+                },
+                Ok(None)=>return (StatusCode::SERVICE_UNAVAILABLE,"UNIFIED_DEPOSIT_SOURCE_FINALITY_PENDING").into_response(),
+                Err(error) if error.starts_with("unified deposit RPC")=>return (
+                    StatusCode::SERVICE_UNAVAILABLE,"UNIFIED_DEPOSIT_SOURCE_FINALITY_PENDING"
+                ).into_response(),
+                Err(_)=>return (StatusCode::CONFLICT,"UNIFIED_DEPOSIT_SOURCE_PROOF_CONFLICT").into_response(),
+            }
+        }
+        CustomerAction::FinalizeUnifiedDeposit {operation_id,asset,amount_atomic,source_custody_reference,horizen_transaction_hash}
+            if !external_effect_pending => {
+            let Some(wallet)=claims.financial_wallet_address.as_deref() else {
+                return (StatusCode::FORBIDDEN,"DIRECT_FINANCIAL_WALLET_REQUIRED").into_response();
+            };
+            if !matches!(asset.as_str(),"USDC"|"ZEN")
+                || request_id!=format!("unified-{}-deposit-finalize:{operation_id}",asset.to_ascii_lowercase()) {
+                return (StatusCode::BAD_REQUEST,"DEPOSIT_IDEMPOTENCY_KEY_MISMATCH").into_response();
+            }
+            let hash=horizen_transaction_hash.to_ascii_lowercase();
+            let finality=if asset=="USDC" {
+                let Some(custody)=&state.usdc_custody else {
+                    return (StatusCode::SERVICE_UNAVAILABLE,"USDC_CUSTODY_ADAPTER_NOT_ENABLED").into_response();
+                };custody.deposit_finality(wallet,&hash,&amount_atomic).await
+            } else {
+                let Some(custody)=&state.zen_custody else {
+                    return (StatusCode::SERVICE_UNAVAILABLE,"ZEN_CUSTODY_ADAPTER_NOT_ENABLED").into_response();
+                };custody.deposit_finality(wallet,&hash,&amount_atomic).await
+            };
+            match finality {
+                Ok(DepositFinality::Finalized)=>DirectAction::FinalizeUnifiedDeposit {
+                    operation_id,asset:asset.clone(),amount_atomic,source_custody_reference,
+                    custody_reference:format!("horizen-{}-deposit:{hash}",asset.to_ascii_lowercase()),
+                },
+                Ok(DepositFinality::Pending)=>return (StatusCode::SERVICE_UNAVAILABLE,"DEPOSIT_FINALITY_PENDING").into_response(),
+                Ok(DepositFinality::Reverted|DepositFinality::Conflict)=>return (StatusCode::CONFLICT,"DEPOSIT_TRANSACTION_BINDING_CONFLICT").into_response(),
+                Err(_)=>return (StatusCode::SERVICE_UNAVAILABLE,"DEPOSIT_FINALITY_UNAVAILABLE").into_response(),
+            }
+        }
+        CustomerAction::CreditUnifiedSourceDeposits {..}|CustomerAction::FinalizeUnifiedDeposit {..}=>
+            return (StatusCode::SERVICE_UNAVAILABLE,"EXTERNAL_EFFECT_FINALITY_PENDING").into_response(),
         CustomerAction::CreditHorizenUsdcDeposit {transaction_hash,amount_atomic} if !external_effect_pending => {
             let Some(source)=claims.financial_wallet_address.as_deref() else {return (StatusCode::FORBIDDEN,"DIRECT_FINANCIAL_WALLET_REQUIRED").into_response();};
             let hash=transaction_hash.to_ascii_lowercase();let reference=format!("horizen-usdc-deposit:{hash}");
@@ -6461,6 +7010,37 @@ fn signed_base_withdrawal_destination_matches(
         && action_destination.eq_ignore_ascii_case(signed_destination)
 }
 
+fn signed_withdrawal_reservation_action(
+    request_id: &str,
+    assigned_route_wallet: Option<&str>,
+    intent: SignedWithdrawalIntent,
+    user_signature: String,
+    now_unix: u64,
+) -> Result<DirectAction, (StatusCode, &'static str)> {
+    let expected_request_id = intent
+        .nonce_request_id()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "SIGNED_WITHDRAWAL_INTENT_INVALID"))?;
+    if request_id != expected_request_id {
+        return Err((StatusCode::BAD_REQUEST, "SIGNED_WITHDRAWAL_IDEMPOTENCY_KEY_MISMATCH"));
+    }
+    if now_unix >= intent.expiry_unix {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "SIGNED_WITHDRAWAL_EXPIRED"));
+    }
+    if !assigned_route_wallet
+        .is_some_and(|wallet| wallet.eq_ignore_ascii_case(&intent.route_wallet))
+    {
+        return Err((StatusCode::FORBIDDEN, "SIGNED_WITHDRAWAL_ROUTE_WALLET_MISMATCH"));
+    }
+    intent
+        .verify_signature(&user_signature)
+        .map_err(|_| (StatusCode::FORBIDDEN, "SIGNED_WITHDRAWAL_SIGNATURE_INVALID"))?;
+    Ok(DirectAction::ReserveSignedWithdrawal {
+        intent,
+        user_signature,
+        now_unix,
+    })
+}
+
 /// Reserve entitlement in the trusted ledger before any worker moves money.
 /// The route is exclusively Horizen -> Arbitrum; other phases use separate
 /// certified actions, not caller-supplied chain IDs or generic calldata.
@@ -7182,14 +7762,67 @@ impl Projection {
             return Err(ProjectionError::OpeningMismatch);
         }
         let grant_row = self.client.lock().await.query_opt(
-            "SELECT 1 FROM direct_execution_writer_grants WHERE activation_id=$1 AND epoch_id=$2 AND old_writer_fence_evidence_sha256=$3 AND expires_at_unix=$4",
+            "SELECT grant_json::text FROM direct_execution_writer_grants WHERE activation_id=$1 AND epoch_id=$2 AND old_writer_fence_evidence_sha256=$3 AND expires_at_unix=$4",
             &[&grant.activation_id, &EPOCH_ID, &grant.old_writer_fence_evidence_sha256, &(grant.expires_at_unix as i64)],
-        ).await.map_err(|_| ProjectionError::Database)?.is_some();
-        if grant_row {
+        ).await.map_err(|_| ProjectionError::Database)?;
+        let exact_grant = grant_row.and_then(|row| {
+            let raw: String = row.get(0);
+            serde_json::from_str::<WriterGrant>(&raw).ok()
+        }).is_some_and(|stored| stored == *grant);
+        if exact_grant {
             Ok(())
         } else {
             Err(ProjectionError::OpeningMismatch)
         }
+    }
+
+    async fn cas_governed_writer_grant(
+        &self,
+        current: &WriterGrant,
+        successor: &WriterGrant,
+        financial_writer_enabled: bool,
+    ) -> Result<(), ProjectionError> {
+        let current_expiry = i64::try_from(current.expires_at_unix).map_err(|_| ProjectionError::OpeningMismatch)?;
+        let successor_expiry = i64::try_from(successor.expires_at_unix).map_err(|_| ProjectionError::OpeningMismatch)?;
+        let mut client = self.client.lock().await;
+        let transaction = client.transaction().await.map_err(|_| ProjectionError::Database)?;
+        let row = transaction.query_opt(
+            "SELECT activation_id,expires_at_unix,grant_json::text FROM direct_execution_writer_grants WHERE epoch_id=$1 FOR UPDATE",
+            &[&EPOCH_ID],
+        ).await.map_err(|_| ProjectionError::Database)?.ok_or(ProjectionError::OpeningMismatch)?;
+        let activation: String = row.get(0);
+        let expiry: i64 = row.get(1);
+        let stored: WriterGrant = serde_json::from_str(&row.get::<_, String>(2))
+            .map_err(|_| ProjectionError::OpeningMismatch)?;
+        if activation != current.activation_id || expiry != current_expiry || stored != *current {
+            return Err(ProjectionError::OpeningMismatch);
+        }
+        let fence = transaction.query_opt(
+            "SELECT old_writer_fence_evidence_sha256,old_writer_authorized,target_writer_enabled,activation_id FROM direct_execution_writer_fence WHERE epoch_id=$1 FOR UPDATE",
+            &[&EPOCH_ID],
+        ).await.map_err(|_| ProjectionError::Database)?.ok_or(ProjectionError::OpeningMismatch)?;
+        if fence.get::<_, String>(0) != current.old_writer_fence_evidence_sha256
+            || fence.get::<_, bool>(1)
+            || fence.get::<_, bool>(2) != financial_writer_enabled
+            || fence.get::<_, Option<String>>(3).as_deref() != Some(current.activation_id.as_str())
+        {
+            return Err(ProjectionError::OpeningMismatch);
+        }
+        let successor_json = serde_json::to_string(successor).map_err(|_| ProjectionError::Database)?;
+        if transaction.execute(
+            "UPDATE direct_execution_writer_grants SET activation_id=$1,expires_at_unix=$2,grant_json=$3::text::jsonb,applied_at=transaction_timestamp() WHERE epoch_id=$4 AND activation_id=$5 AND expires_at_unix=$6",
+            &[&successor.activation_id, &successor_expiry, &successor_json, &EPOCH_ID,
+              &current.activation_id, &current_expiry],
+        ).await.map_err(|_| ProjectionError::Database)? != 1 {
+            return Err(ProjectionError::OpeningMismatch);
+        }
+        if transaction.execute(
+            "UPDATE direct_execution_writer_fence SET activation_id=$1,changed_at=transaction_timestamp() WHERE epoch_id=$2 AND activation_id=$3 AND old_writer_authorized=FALSE AND target_writer_enabled=$4",
+            &[&successor.activation_id, &EPOCH_ID, &current.activation_id, &financial_writer_enabled],
+        ).await.map_err(|_| ProjectionError::Database)? != 1 {
+            return Err(ProjectionError::OpeningMismatch);
+        }
+        transaction.commit().await.map_err(|_| ProjectionError::Database)
     }
 }
 
@@ -9505,6 +10138,41 @@ fn migration_parent_state(
     Ok((index, receipts, index_snapshot, receipt_snapshot))
 }
 
+/// The authenticated checkpoint index commits the migration id in every
+/// migrated locator. A v70 migration contains exactly one terminal leaf per
+/// source sequence, so their count is also the only admissible source
+/// sequence for bundle discovery.
+fn restored_migration_binding(
+    index: &DirectRequestIndexSnapshot,
+) -> Result<Option<(u64, String)>, String> {
+    let mut migration_id: Option<&str> = None;
+    let mut count = 0usize;
+    for leaf in &index.leaves {
+        if let TerminalResultLocator::Migration {
+            migration_id: current,
+            ..
+        } = &leaf.locator
+        {
+            if migration_id.is_some_and(|expected| expected != current) {
+                return Err("journal request index has multiple migrations".into());
+            }
+            migration_id = Some(current);
+            count = count
+                .checked_add(1)
+                .ok_or("journal migration source sequence overflow")?;
+        }
+    }
+    let Some(migration_id) = migration_id else {
+        return Ok(None);
+    };
+    let source_sequence = u64::try_from(count)
+        .map_err(|_| "journal migration source sequence overflow")?;
+    if source_sequence == 0 {
+        return Err("journal migration source sequence invalid".into());
+    }
+    Ok(Some((source_sequence, migration_id.to_string())))
+}
+
 fn migration_matches_restored_index(
     bundle: &V70MigrationBundle,
     index: &DirectRequestIndexSnapshot,
@@ -9849,6 +10517,86 @@ mod tests {
             super::validate_v70_tip_at_cutover("epoch", 43_207, &malformed),
             Err("V71_CUTOVER_V70_HEAD_INVALID".into())
         );
+    }
+
+    #[test]
+    fn v71_hot_restore_accepts_the_cutover_record_as_an_ancestor_of_a_later_head() {
+        let (_, mut cutover_record) = v71_candidate();
+        cutover_record.sequence = 45_035;
+        let marker = super::V71CutoverMarker {
+            protocol: super::V71_CUTOVER_MARKER_PROTOCOL.into(),
+            epoch_id: cutover_record.epoch_id.clone(),
+            writer_epoch: cutover_record.writer_epoch.clone(),
+            sequence: cutover_record.sequence,
+            record_hash: cutover_record.record_hash().unwrap(),
+            transition_root: cutover_record.transition_root.clone(),
+            request_index_root: cutover_record.request_index_root.clone(),
+            financial_state_root: cutover_record.financial_state_root.clone(),
+        };
+        let checkpoint_sequence = 46_031;
+        let restored_head_sequence = 46_042;
+        assert!(marker.sequence < checkpoint_sequence);
+        assert!(checkpoint_sequence < restored_head_sequence);
+        assert_eq!(
+            super::validate_v71_cutover_marker_ancestor(
+                &marker,
+                &cutover_record,
+                restored_head_sequence,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn v71_hot_restore_rejects_nonancestor_cutover_markers_and_markers_after_head() {
+        let (_, mut cutover_record) = v71_candidate();
+        cutover_record.sequence = 45_035;
+        let marker = super::V71CutoverMarker {
+            protocol: super::V71_CUTOVER_MARKER_PROTOCOL.into(),
+            epoch_id: cutover_record.epoch_id.clone(),
+            writer_epoch: cutover_record.writer_epoch.clone(),
+            sequence: cutover_record.sequence,
+            record_hash: cutover_record.record_hash().unwrap(),
+            transition_root: cutover_record.transition_root.clone(),
+            request_index_root: cutover_record.request_index_root.clone(),
+            financial_state_root: cutover_record.financial_state_root.clone(),
+        };
+        assert_eq!(
+            super::validate_v71_cutover_marker_ancestor(&marker, &cutover_record, 45_034),
+            Err("V71_CUTOVER_MARKER_AFTER_HEAD".into())
+        );
+
+        let assert_mismatch = |changed: super::V71CutoverMarker| {
+            assert_eq!(
+                super::validate_v71_cutover_marker_ancestor(
+                    &changed,
+                    &cutover_record,
+                    46_042,
+                ),
+                Err("V71_CUTOVER_MARKER_ANCESTOR_MISMATCH".into())
+            );
+        };
+        let mut changed = marker.clone();
+        changed.epoch_id = "other-epoch".into();
+        assert_mismatch(changed);
+        let mut changed = marker.clone();
+        changed.writer_epoch = "other-writer".into();
+        assert_mismatch(changed);
+        let mut changed = marker.clone();
+        changed.sequence += 1;
+        assert_mismatch(changed);
+        let mut changed = marker.clone();
+        changed.record_hash = "0".repeat(64);
+        assert_mismatch(changed);
+        let mut changed = marker.clone();
+        changed.transition_root = "0".repeat(64);
+        assert_mismatch(changed);
+        let mut changed = marker.clone();
+        changed.request_index_root = "0".repeat(64);
+        assert_mismatch(changed);
+        let mut changed = marker;
+        changed.financial_state_root = "0".repeat(64);
+        assert_mismatch(changed);
     }
 
     #[test]
@@ -10252,12 +11000,14 @@ mod tests {
             usdc_custody: None,
             usdc_link_authority: None,
             usdc_bus_custody: None,
+            unified_deposit_custody: None,
             financial_gate: Arc::new(FinancialGate::new()),
             last_commit_at: Arc::new(AtomicU64::new(0)),
             health: Arc::new(ParentHealth::default()),
             committed_state_root: Arc::new(Mutex::new(Some(head.state_hash.clone()))),
             unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
             governed_bootstrap: None,
+            current_writer_grant: Arc::new(Mutex::new(None)),
             persistence_format: PersistenceFormat::V70,
             hot_v71_enabled: Arc::new(AtomicBool::new(false)),
             journal_request_index: Arc::new(Mutex::new(None)),
@@ -10331,6 +11081,51 @@ mod tests {
         assert!(serde_json::from_value::<CustomerAction>(action).is_ok());
         for kind in ["SETTLE_USDC_BUS_WITHDRAWAL", "REVERT_USDC_BUS_WITHDRAWAL"] {
             assert!(serde_json::from_value::<CustomerAction>(serde_json::json!({"type":kind,"withdrawalId":"11111111-1111-4111-8111-111111111111", "destination":"0x1111111111111111111111111111111111111111", "amountAtomic":"5000000", "custodyReference":"fake"})).is_err());
+        }
+    }
+    #[test]
+    fn signed_withdrawal_public_action_accepts_only_the_exact_signed_reserve() {
+        let account = "0x4a62316623ad457f02cdc5d997ded67a383ec569";
+        let route_wallet = "0x2222222222222222222222222222222222222222";
+        let intent = SignedWithdrawalIntent {
+            account: account.into(),
+            pool: "0xb412f63299ccff4fe57714ee580895cca74dd284".into(),
+            token: "0xdf7108f8b10f9b9ec1aba01cca057268cbf86b6c".into(),
+            route_wallet: route_wallet.into(),
+            amount_atomic: "20000000".into(),
+            recipient: "0x0d2bf0c9d6d96eea797c9d1b96895d8f70e3322e".into(),
+            destination_chain: "base".into(),
+            nonce: "42".into(),
+            expiry_unix: 1_800_000_000,
+        };
+        let signature = "0x64f5058ed8dfb51be05e905b43ae7f5ff2de9b4c304c52a5418e44a194f9f5d9602b4c29cd47360685da243e6b27d83f31175f40a0579db7bca51dde4cbac2ff1b";
+        let request_id = format!("signed-withdrawal:{account}:42");
+        assert!(matches!(
+            signed_withdrawal_reservation_action(
+                &request_id,
+                Some(route_wallet),
+                intent.clone(),
+                signature.into(),
+                1_799_999_999,
+            ),
+            Ok(DirectAction::ReserveSignedWithdrawal { .. })
+        ));
+        assert_eq!(
+            signed_withdrawal_reservation_action(
+                &request_id,
+                Some("0x3333333333333333333333333333333333333333"),
+                intent,
+                signature.into(),
+                1_799_999_999,
+            )
+            .unwrap_err(),
+            (StatusCode::FORBIDDEN, "SIGNED_WITHDRAWAL_ROUTE_WALLET_MISMATCH")
+        );
+        for kind in ["SETTLE_SIGNED_WITHDRAWAL", "RELEASE_EXPIRED_SIGNED_WITHDRAWAL"] {
+            assert!(serde_json::from_value::<CustomerAction>(serde_json::json!({
+                "type":kind,
+                "intentHash":"11".repeat(32)
+            })).is_err());
         }
     }
     #[test]
@@ -10413,7 +11208,7 @@ mod tests {
         DirectStateArtifact {
             epoch_id: EPOCH_ID.into(), sequence: 7, prior_state_hash: "a".repeat(64), state_hash: "b".repeat(64), request_hash: "c".repeat(64),
             nonce: vec![1;12], ciphertext: vec![], ciphertext_hash: "d".repeat(64),
-            receipt: DirectReceipt { receipt_id: "receipt".into(), account_id: "account".into(), identity_commitment: "identity".into(), request_id: "request".into(), request_hash: "c".repeat(64), status: layrs_direct_execution_v1::TerminalStatus::Applied, effect: "BALANCE_READ".into(), amount_atomic: None, custody_reference: None, execution: None, resolution: None, projection_balance_updates: vec![], genesis_ordinal: 0, signature: "signature".into() }
+            receipt: DirectReceipt { receipt_id: "receipt".into(), account_id: "account".into(), identity_commitment: "identity".into(), request_id: "request".into(), request_hash: "c".repeat(64), status: layrs_direct_execution_v1::TerminalStatus::Applied, effect: "BALANCE_READ".into(), amount_atomic: None, custody_reference: None, command_commitment: None, execution: None, resolution: None, projection_balance_updates: vec![], genesis_ordinal: 0, signature: "signature".into() }
         }
     }
     #[test]
@@ -10681,6 +11476,39 @@ mod tests {
         assert_eq!(health.check(159, 0, false, false), Err("ENCLOSURE_UNAVAILABLE")); // clock regression
     }
 
+    #[test]
+    fn health_pauses_only_for_a_bounded_checkpoint_seal() {
+        let health = ParentHealth::default();
+        assert_eq!(
+            health.check(100, 0, false, false),
+            Err("DIRECT_STATE_RECOVERY_REQUIRED")
+        );
+        health.restored.store(true, Ordering::Release);
+        health.observe(100);
+        {
+            let _pause = health.pause_for_checkpoint(100);
+            assert_eq!(health.check(152, 0, true, false), Ok(()));
+            assert_eq!(
+                health.check(152, 0, true, true),
+                Err("WRITER_AUTHORIZATION_EXPIRED")
+            );
+            health.cutover_uncertain.store(true, Ordering::Release);
+            assert_eq!(
+                health.check(152, 0, true, false),
+                Err("V71_CUTOVER_CONFIRMATION_UNCERTAIN")
+            );
+            health.cutover_uncertain.store(false, Ordering::Release);
+            assert_eq!(
+                health.check(401, 0, true, false),
+                Err("CHECKPOINT_SEAL_STALLED")
+            );
+        }
+        assert_eq!(
+            health.check(152, 0, true, false),
+            Err("WRITE_PATH_STALLED")
+        );
+    }
+
     #[tokio::test]
     async fn unconfirmed_promotion_after_marker_fails_health_and_keeps_gate_closed() {
         let gate = FinancialGate::new();
@@ -10902,7 +11730,7 @@ mod tests {
     #[test]
     fn receipt_cache_releases_entire_snapshot_allocation() {
         let artifact=DirectStateArtifact {epoch_id:EPOCH_ID.into(),sequence:1,prior_state_hash:"a".repeat(64),state_hash:"b".repeat(64),request_hash:"c".repeat(64),nonce:vec![1;12],ciphertext:vec![7;2_000_000],ciphertext_hash:"d".repeat(64),
-            receipt:DirectReceipt {receipt_id:"receipt".into(),account_id:"account".into(),identity_commitment:"identity".into(),request_id:"request".into(),request_hash:"c".repeat(64),status:layrs_direct_execution_v1::TerminalStatus::Applied,effect:"BALANCE_READ".into(),amount_atomic:None,custody_reference:None,execution:None,resolution:None,projection_balance_updates:vec![],genesis_ordinal:0,signature:"signature".into()}};
+            receipt:DirectReceipt {receipt_id:"receipt".into(),account_id:"account".into(),identity_commitment:"identity".into(),request_id:"request".into(),request_hash:"c".repeat(64),status:layrs_direct_execution_v1::TerminalStatus::Applied,effect:"BALANCE_READ".into(),amount_atomic:None,custody_reference:None,command_commitment:None,execution:None,resolution:None,projection_balance_updates:vec![],genesis_ordinal:0,signature:"signature".into()}};
         let record=receipt_only_record(&artifact);
         assert_eq!(record.ciphertext.capacity(),0);
         assert!(record.ciphertext.is_empty());
@@ -11412,12 +12240,14 @@ mod tests {
             usdc_custody: None,
             usdc_link_authority: None,
             usdc_bus_custody: None,
+            unified_deposit_custody: None,
         financial_gate: Arc::new(FinancialGate::new()),
         last_commit_at: Arc::new(AtomicU64::new(0)),
         health: Arc::new(ParentHealth::default()),
             committed_state_root: Arc::new(Mutex::new(None)),
             unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
             governed_bootstrap: None,
+            current_writer_grant: Arc::new(Mutex::new(None)),
             persistence_format: PersistenceFormat::V70,
             hot_v71_enabled: Arc::new(AtomicBool::new(false)),
             journal_request_index: Arc::new(Mutex::new(None)),
@@ -11816,6 +12646,7 @@ mod tests {
                 effect: "WITHDRAWAL_SETTLED".into(),
                 amount_atomic: Some("1000000".into()),
                 custody_reference: Some(custody_reference.clone()),
+                command_commitment: None,
                 execution: None,
                 resolution: None,
                 projection_balance_updates: vec![],
@@ -11924,6 +12755,7 @@ mod tests {
             effect: "IDENTITY_ADMITTED".into(),
             amount_atomic: None,
             custody_reference: None,
+            command_commitment: None,
             execution: None,
             resolution: None,
             projection_balance_updates: vec![],
@@ -12258,6 +13090,31 @@ mod tests {
         assert_eq!(receipts.len(), 1);
         assert!(receipt_snapshot.verify(&index_snapshot).is_ok());
         assert!(migration_matches_restored_index(&bundle, &index_snapshot));
+        assert_eq!(
+            restored_migration_binding(&index_snapshot),
+            Ok(Some((1, bundle.manifest.migration_id.clone())))
+        );
+
+        let mut journal_only = index_snapshot.clone();
+        journal_only.leaves[0].locator = TerminalResultLocator::Journal {
+            writer_epoch: "writer-epoch-1".into(),
+            sequence: 1,
+        };
+        assert_eq!(restored_migration_binding(&journal_only), Ok(None));
+
+        let mut mixed = index_snapshot.clone();
+        let mut foreign = mixed.leaves[0].clone();
+        foreign.account_id = "f".repeat(64);
+        foreign.request_id = "foreign-request".into();
+        foreign.locator = TerminalResultLocator::Migration {
+            migration_id: sha256(b"another-migration"),
+            ordinal: 2,
+        };
+        mixed.leaves.push(foreign);
+        assert_eq!(
+            restored_migration_binding(&mixed),
+            Err("journal request index has multiple migrations".into())
+        );
 
         let record = &bundle.records[0];
         assert!(terminal_leaf_matches_migrated_record(
@@ -12910,21 +13767,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v71_migration_bundle_load_requires_one_canonical_content_address() {
+    async fn v71_migration_bundle_load_selects_only_the_index_bound_source() {
         let bundle = v71_migration_bundle("migration-1".into());
         let bytes = serde_cbor::to_vec(&bundle).unwrap();
         let key = journal_migration_key("epoch", 41, &bytes);
+        let migration_id = bundle.manifest.migration_id.clone();
         let (endpoint, log, server) = v71_mock_s3(vec![
             v71_listing_page(&[key.clone()], None),
             v71_http(200, &bytes),
         ])
         .await;
         let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Shadow);
-        assert_eq!(store.load_v70_migration_bundle().await, Ok(Some(bundle.clone())));
+        assert_eq!(
+            store.load_v70_migration_bundle(41, &migration_id).await,
+            Ok(Some(bundle.clone()))
+        );
         server.abort();
-        assert_eq!(log.lock().await.len(), 2);
+        let log = log.lock().await;
+        assert_eq!(log.len(), 2);
+        assert!(
+            log[0].0.contains(
+                "prefix=epoch%2fjournal-v71%2fmigrations%2f00000000000000000041-"
+            ),
+            "{}",
+            log[0].0
+        );
+        drop(log);
 
-        let twin = journal_migration_key("epoch", 42, b"twin");
+        // A second failed attempt at another source sequence is excluded by
+        // the S3 prefix. Only a twin at the bound sequence is ambiguous.
+        let twin = journal_migration_key("epoch", 41, b"twin");
         let (endpoint, log, server) = v71_mock_s3(vec![v71_listing_page(
             &[key.clone(), twin],
             None,
@@ -12932,7 +13804,7 @@ mod tests {
         .await;
         let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Shadow);
         assert_eq!(
-            store.load_v70_migration_bundle().await,
+            store.load_v70_migration_bundle(41, &migration_id).await,
             Err("journal migration bundle ambiguous".into())
         );
         server.abort();
@@ -12945,7 +13817,7 @@ mod tests {
         .await;
         let store = v71_store(&endpoint, JournalWriterState::Unrestored, JournalRole::Shadow);
         assert_eq!(
-            store.load_v70_migration_bundle().await,
+            store.load_v70_migration_bundle(41, &migration_id).await,
             Err("journal migration bundle content address mismatch".into())
         );
         server.abort();
@@ -13762,12 +14634,14 @@ mod tests {
             usdc_custody: None,
             usdc_link_authority: None,
             usdc_bus_custody: None,
+            unified_deposit_custody: None,
             financial_gate: Arc::new(FinancialGate::new()),
             last_commit_at: Arc::new(AtomicU64::new(0)),
             health: Arc::new(ParentHealth::default()),
             committed_state_root: Arc::new(Mutex::new(Some(fixture.head.transition_root.clone()))),
             unresolved_external_effects: Arc::new(Mutex::new(BTreeMap::new())),
             governed_bootstrap: None,
+            current_writer_grant: Arc::new(Mutex::new(None)),
             persistence_format: PersistenceFormat::V71,
             hot_v71_enabled: Arc::new(AtomicBool::new(false)),
             journal_request_index: Arc::new(Mutex::new(None)),
@@ -14951,7 +15825,7 @@ mod tests {
                 Box::new(|_| {}),
                 Some(other_bundle),
                 fixture.head.clone(),
-                "v70 rollback migration bundle differs from restored lineage",
+                "journal migration bundle invalid",
             ),
             (
                 Box::new(|_| {}),

@@ -54,11 +54,16 @@ Parameters:
     Type: String
     Default: ''
     NoEcho: true
+  StagedWriterGrantBase64:
+    Type: String
+    Default: ''
+    NoEcho: true
   ApprovedRuntimeBindingBase64:
     Type: String
     Default: ''
     NoEcho: true
   WriterGrantCommitment: { Type: String, Default: '' }
+  StagedWriterGrantCommitment: { Type: String, Default: '' }
   ApprovedPcr0: { Type: String, Default: '' }
   ApprovedPcr1: { Type: String, Default: '' }
   ApprovedPcr2: { Type: String, Default: '' }
@@ -83,6 +88,15 @@ Parameters:
   EthereumConfirmations: { Type: Number, Default: 12, MinValue: 1 }
   PolygonConfirmations: { Type: Number, Default: 128, MinValue: 1 }
   TempoConfirmations: { Type: Number, Default: 1, MinValue: 1 }
+  UnifiedDepositsEnabled: { Type: String, Default: 'false', AllowedValues: ['true', 'false'] }
+  UnifiedRpcSecretArn: { Type: String, Default: '' }
+  UnifiedEthereumConfirmations: { Type: Number, Default: 12, MinValue: 1, MaxValue: 10000 }
+  UnifiedBaseConfirmations: { Type: Number, Default: 20, MinValue: 1, MaxValue: 10000 }
+  UnifiedArbitrumConfirmations: { Type: Number, Default: 20, MinValue: 1, MaxValue: 10000 }
+  UnifiedOptimismConfirmations: { Type: Number, Default: 20, MinValue: 1, MaxValue: 10000 }
+  UnifiedPolygonConfirmations: { Type: Number, Default: 20, MinValue: 1, MaxValue: 10000 }
+  UnifiedBnbConfirmations: { Type: Number, Default: 15, MinValue: 1, MaxValue: 10000 }
+  UnifiedHorizenConfirmations: { Type: Number, Default: 20, MinValue: 1, MaxValue: 10000 }
   # A dormant verifier may run to support attestation and health checks, but
   # its process mode remains `dormant` and has no writer authority.
   DormantRuntimeDesiredCapacity: { Type: Number, Default: 1, MinValue: 0, MaxValue: 1 }
@@ -100,10 +114,19 @@ Rules:
           - !Not [!Equals [!Ref UsdcAdministratorPublicKeyDerBase64, '']]
           - !Not [!Equals [!Ref RelayObservationSecretArn, '']]
         AssertDescription: P1 requires the production writer, exact RPC secret, custody address and public link authority.
+  UnifiedDepositsRequireProductionBindings:
+    RuleCondition: !Equals [!Ref UnifiedDepositsEnabled, 'true']
+    Assertions:
+      - Assert: !And
+          - !Equals [!Ref ExecutionMode, production-enabled]
+          - !Not [!Equals [!Ref UnifiedRpcSecretArn, '']]
+          - !Equals [!Ref ZenCustodyEnabled, 'true']
+        AssertDescription: Unified deposits require the production writer, unified RPC secret and Horizen ZEN finality adapter.
 Conditions:
   FinancialWriterEnabled: !Equals [!Ref ExecutionMode, production-enabled]
   RelayObservationConfigured: !Not [!Equals [!Ref RelayObservationSecretArn, '']]
   UsdcCustodyActive: !Equals [!Ref UsdcCustodyEnabled, 'true']
+  UnifiedDepositsActive: !Equals [!Ref UnifiedDepositsEnabled, 'true']
 Resources:
   RuntimeLogGroup:
     Type: AWS::Logs::LogGroup
@@ -138,7 +161,9 @@ Resources:
                     kms:RecipientAttestation:PCR2: !Ref ApprovedPcr2
                     kms:EncryptionContext:layrs-runtime: layrs.direct-execution.v1
                     kms:EncryptionContext:layrs-epoch: layrs-opening-epoch-20260911-941107537728c98b
-                    kms:EncryptionContext:layrs-writer-grant: !Ref WriterGrantCommitment
+                    kms:EncryptionContext:layrs-writer-grant:
+                      - !Ref WriterGrantCommitment
+                      - !Ref StagedWriterGrantCommitment
               # A measured-runtime upgrade may rewrap the exact prior root-key
               # ciphertext under the newly signed grant context. KMS performs
               # this entirely inside the service; the parent cannot receive
@@ -175,6 +200,7 @@ Resources:
                   - !If [RelayObservationConfigured, !Ref RelayObservationSecretArn, !Ref 'AWS::NoValue']
                   - !If [UsdcCustodyActive, !Ref UsdcRpcSecretArn, !Ref 'AWS::NoValue']
                   - !If [UsdcCustodyActive, !Ref UsdcPhase1ConfigurationSecretArn, !Ref 'AWS::NoValue']
+                  - !If [UnifiedDepositsActive, !Ref UnifiedRpcSecretArn, !Ref 'AWS::NoValue']
               - Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
                 Resource: !GetAtt RuntimeLogGroup.Arn
@@ -314,6 +340,11 @@ Resources:
                     "LAYRS_DIRECT_WRITER_GRANT_JSON": writer_grant,
                     "LAYRS_DIRECT_APPROVED_RUNTIME_BINDING_JSON": runtime_binding,
                 })
+                if "${StagedWriterGrantBase64}":
+                    values["LAYRS_DIRECT_STAGED_WRITER_GRANT_JSON"] = json.dumps(
+                        json.loads(base64.b64decode("${StagedWriterGrantBase64}", validate=True).decode("utf-8")),
+                        separators=(",", ":"),
+                    )
             if "${ExecutionMode}" == "production-enabled":
                 if "${RelayObservationSecretArn}":
                     relay_observation = secret("${RelayObservationSecretArn}")
@@ -336,6 +367,32 @@ Resources:
                         "LAYRSV2_HORIZEN_POOL_LEDGER_PRIVY_ADDRESS": required(runtime, "horizenPoolLedgerPrivyAddress"),
                         "LAYRSV2_HORIZEN_RPC_URL": required(rpc, "horizenRpcUrl"),
                         "LAYRSV2_HORIZEN_CONFIRMATIONS": "${HorizenConfirmations}",
+                    })
+                if "${UnifiedDepositsEnabled}" == "true":
+                    unified_rpc = secret("${UnifiedRpcSecretArn}")
+                    unified_chains = {
+                        "ethereum": ("1", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "${UnifiedEthereumConfirmations}"),
+                        "base": ("8453", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", "${UnifiedBaseConfirmations}"),
+                        "arbitrum": ("42161", "0xaf88d065e77c8cc2239327c5edb3a432268e5831", "${UnifiedArbitrumConfirmations}"),
+                        "optimism": ("10", "0x0b2c639c533813f4aa9d7837caf62653d097ff85", "${UnifiedOptimismConfirmations}"),
+                        "polygon": ("137", "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359", "${UnifiedPolygonConfirmations}"),
+                        "bnb": ("56", "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d", "${UnifiedBnbConfirmations}"),
+                        "horizen": ("26514", "0xdf7108f8b10f9b9ec1aba01cca057268cbf86b6c", "${UnifiedHorizenConfirmations}"),
+                    }
+                    for chain, (chain_id, token, confirmations) in unified_chains.items():
+                        prefix = "LAYRS_UNIFIED_" + chain.upper()
+                        values[prefix + "_RPC_URL"] = required(unified_rpc, chain + "RpcUrl")
+                        values[prefix + "_CHAIN_ID"] = chain_id
+                        values[prefix + "_TOKEN_ADDRESS"] = token
+                        values[prefix + "_CONFIRMATIONS"] = confirmations
+                        fallback = unified_rpc.get(chain + "RpcFallbackUrl")
+                        if chain != "horizen" and isinstance(fallback, str) and fallback:
+                            values[prefix + "_RPC_FALLBACK_URL"] = fallback
+                    values.update({
+                        "LAYRS_UNIFIED_DEPOSITS_ENABLED": "true",
+                        "LAYRS_UNIFIED_USDC_FINALITY_ENABLED": "true",
+                        "LAYRS_UNIFIED_BASE_ZEN_TOKEN_ADDRESS": "0xf43eb8de897fbc7f2502483b2bef7bb9ea179229",
+                        "LAYRS_UNIFIED_HORIZEN_ZEN_TOKEN_ADDRESS": "0x57da2d504bf8b83ef304759d9f2648522d7a9280",
                     })
                 if "${UsdcCustodyEnabled}" == "true":
                     # Read-only proof verification and public administrative
@@ -398,12 +455,6 @@ Resources:
             Tags: [{ Key: Project, Value: Layrs }, { Key: Environment, Value: production-direct }, { Key: WriterEnabled, Value: !If [FinancialWriterEnabled, 'true', 'false'] }, { Key: TransactionModel, Value: layrs.direct-execution.v1 }, { Key: CandidateAmiId, Value: !Ref CandidateAmiId }]
   DormantAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
-    UpdatePolicy:
-      AutoScalingRollingUpdate:
-        MinInstancesInService: 0
-        MaxBatchSize: 1
-        PauseTime: PT5M
-        WaitOnResourceSignals: false
     Properties:
       VPCZoneIdentifier: [!Ref PrivateSubnetId]
       LaunchTemplate: { LaunchTemplateId: !Ref DormantLaunchTemplate, Version: !GetAtt DormantLaunchTemplate.LatestVersionNumber }
