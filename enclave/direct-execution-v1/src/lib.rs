@@ -2053,6 +2053,24 @@ impl DirectRuntime {
                     return Err(RuntimeError::InvalidRequest);
                 }
             }
+            // The parent binds signed-withdrawal terminal commands to the
+            // route wallet in the authenticated session. Preserve that
+            // binding at the enclave boundary instead of falling through to
+            // the generic rejection for financial-wallet-bearing commands.
+            DirectAction::SettleSignedWithdrawal { .. }
+            | DirectAction::ReleaseExpiredSignedWithdrawal { .. } => {
+                let Some(wallet) = financial_wallet.as_deref() else {
+                    return Err(RuntimeError::DestinationDenied);
+                };
+                if !valid_evm_wallet(wallet)
+                    || !self
+                        .subject_wallets
+                        .get(&request.account_id)
+                        .is_some_and(|wallets| wallets.contains(wallet))
+                {
+                    return Err(RuntimeError::DestinationDenied);
+                }
+            }
             _ if financial_wallet.is_some() => return Err(RuntimeError::InvalidRequest),
             _ => {}
         }
@@ -2497,6 +2515,7 @@ impl DirectRuntime {
                         || hold.account_id != request.account_id
                         || hold.identity_commitment != request.identity_commitment
                         || hold.asset != *asset
+                        || financial_wallet.as_deref() != Some(hold.route_wallet.as_str())
                         || hold.route_wallet != route_wallet.to_ascii_lowercase()
                         || hold.payout_destination != payout_destination.to_ascii_lowercase()
                         || hold.amount_atomic != *amount_atomic
@@ -2537,6 +2556,7 @@ impl DirectRuntime {
                     if request.request_id != format!("signed-withdrawal-release:{normalized_hash}")
                         || hold.account_id != request.account_id
                         || hold.identity_commitment != request.identity_commitment
+                        || financial_wallet.as_deref() != Some(hold.route_wallet.as_str())
                         || *finalized_block_timestamp <= hold.expiry_unix
                         || !valid_transaction_hash_value(finalized_block_hash)
                         || finalized_block_hash != &finalized_block_hash.to_ascii_lowercase()
@@ -5636,6 +5656,19 @@ mod tests {
         (request, intent)
     }
 
+    fn signed_withdrawal_terminal_request(
+        subject: &str,
+        identity: &str,
+        id: &str,
+        route_wallet: &str,
+        action: DirectAction,
+    ) -> DirectRequest {
+        let mut request = request_for(subject, identity, id, action);
+        request.financial_wallet_address = Some(route_wallet.to_ascii_lowercase());
+        request.request_hash = request_hash(&request);
+        request
+    }
+
     fn pool_wallet_link_request(subject: &str, identity: &str, wallet: &str, slot_id: u32) -> DirectRequest {
         let external_id = format!("layrs_deposit_{slot_id:06}");
         let mut request = request_for(
@@ -6005,11 +6038,42 @@ mod tests {
 
         let mut restored = checkpoint_restored;
 
+        let unbound_release = request_for(
+            &subject,
+            &identity,
+            &format!("signed-withdrawal-release:{second_hash}"),
+            DirectAction::ReleaseExpiredSignedWithdrawal {
+                intent_hash: second_hash.clone(),
+                finalized_block_hash: format!("0x{}", "ab".repeat(32)),
+                finalized_block_timestamp: 1_800_000_101,
+            },
+        );
+        assert_eq!(
+            restored.execute(unbound_release),
+            Err(RuntimeError::DestinationDenied)
+        );
+        let wrong_wallet_release = signed_withdrawal_terminal_request(
+            &subject,
+            &identity,
+            &format!("signed-withdrawal-release:{second_hash}"),
+            &account,
+            DirectAction::ReleaseExpiredSignedWithdrawal {
+                intent_hash: second_hash.clone(),
+                finalized_block_hash: format!("0x{}", "ab".repeat(32)),
+                finalized_block_timestamp: 1_800_000_101,
+            },
+        );
+        assert_eq!(
+            restored.execute(wrong_wallet_release),
+            Err(RuntimeError::DestinationDenied)
+        );
+
         restored.execute_committed(
-            request_for(
+            signed_withdrawal_terminal_request(
                 &subject,
                 &identity,
                 &format!("signed-withdrawal-settle:{first_hash}"),
+                route_wallet,
                 DirectAction::SettleSignedWithdrawal {
                     intent_hash: first_hash,
                     asset: "USDC".into(),
@@ -6023,10 +6087,11 @@ mod tests {
             &mut store,
         ).unwrap();
         restored.execute_committed(
-            request_for(
+            signed_withdrawal_terminal_request(
                 &subject,
                 &identity,
                 &format!("signed-withdrawal-release:{second_hash}"),
+                route_wallet,
                 DirectAction::ReleaseExpiredSignedWithdrawal {
                     intent_hash: second_hash,
                     finalized_block_hash: format!("0x{}", "ab".repeat(32)),
@@ -6276,10 +6341,11 @@ mod tests {
 
         restored
             .execute_committed(
-                request_for(
+                signed_withdrawal_terminal_request(
                     &subject,
                     &identity,
                     &format!("signed-withdrawal-settle:{settled_usdc_hash}"),
+                    route_wallet,
                     DirectAction::SettleSignedWithdrawal {
                         intent_hash: settled_usdc_hash,
                         asset: "USDC".into(),
@@ -6295,10 +6361,11 @@ mod tests {
             .unwrap();
         restored
             .execute_committed(
-                request_for(
+                signed_withdrawal_terminal_request(
                     &subject,
                     &identity,
                     &format!("signed-withdrawal-release:{released_usdc_hash}"),
+                    route_wallet,
                     DirectAction::ReleaseExpiredSignedWithdrawal {
                         intent_hash: released_usdc_hash,
                         finalized_block_hash: format!("0x{}", "99".repeat(32)),
@@ -6311,10 +6378,11 @@ mod tests {
             .unwrap();
         restored
             .execute_committed(
-                request_for(
+                signed_withdrawal_terminal_request(
                     &subject,
                     &identity,
                     &format!("signed-withdrawal-settle:{settled_zen_hash}"),
+                    route_wallet,
                     DirectAction::SettleSignedWithdrawal {
                         intent_hash: settled_zen_hash,
                         asset: "ZEN".into(),
@@ -6399,10 +6467,11 @@ mod tests {
             &store,
         ).unwrap();
         assert_eq!(restored.signed_withdrawals[&intent_hash].asset, "ZEN");
-        let crossed = request_for(
+        let crossed = signed_withdrawal_terminal_request(
             &subject,
             &identity,
             &format!("signed-withdrawal-settle:{intent_hash}"),
+            route_wallet,
             DirectAction::SettleSignedWithdrawal {
                 intent_hash: intent_hash.clone(),
                 asset: "USDC".into(),
@@ -6414,10 +6483,11 @@ mod tests {
         );
         assert_eq!(restored.execute(crossed), Err(RuntimeError::DestinationDenied));
         restored.execute_committed(
-            request_for(
+            signed_withdrawal_terminal_request(
                 &subject,
                 &identity,
                 &format!("signed-withdrawal-settle:{intent_hash}"),
+                route_wallet,
                 DirectAction::SettleSignedWithdrawal {
                     intent_hash,
                     asset: "ZEN".into(),
