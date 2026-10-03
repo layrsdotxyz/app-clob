@@ -19,10 +19,10 @@ use thiserror::Error;
 
 use crate::{
     amount, sha256, valid_bus_deposit_reference, valid_bus_withdrawal_id,
-    valid_layrs_withdrawal_destination, valid_unified_source_chain,
+    valid_evm_wallet, valid_layrs_withdrawal_destination, valid_unified_source_chain,
     valid_unified_source_custody_reference, valid_unified_source_reference,
     ConditionalUsdcDeposit, DirectMarketResolutionRecord, DirectRuntime, MarketConfig,
-    OrderReservation, Outcome, PriceTimeBook, UsdcBusHold, EPOCH_ID,
+    OrderReservation, Outcome, PriceTimeBook, SignedWithdrawalHold, UsdcBusHold, EPOCH_ID,
 };
 
 pub const DIRECT_V71_CHECKPOINT_PROTOCOL: &str = "layrs.direct-execution.checkpoint.v71";
@@ -76,6 +76,8 @@ struct V71FinancialState {
     rounding_reserve_atomic: u128,
     credited_custody_references: BTreeSet<String>,
     usdc_bus_withdrawals: BTreeMap<String, UsdcBusHold>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    signed_withdrawals: BTreeMap<String, SignedWithdrawalHold>,
     conditional_usdc_deposits: BTreeMap<String, ConditionalUsdcDeposit>,
 }
 
@@ -272,6 +274,7 @@ impl V71FinancialState {
             rounding_reserve_atomic: runtime.rounding_reserve_atomic,
             credited_custody_references: runtime.credited_custody_references.clone(),
             usdc_bus_withdrawals: runtime.usdc_bus_withdrawals.clone(),
+            signed_withdrawals: runtime.signed_withdrawals.clone(),
             conditional_usdc_deposits: runtime.conditional_usdc_deposits.clone(),
         }
     }
@@ -302,6 +305,35 @@ impl V71FinancialState {
             let ledger_asset = if hold.asset == "ZEN" { "ZEN" } else { "USDC" };
             let total = hold_totals
                 .entry((hold.identity_commitment.clone(), ledger_asset.into()))
+                .or_default();
+            *total = total
+                .checked_add(value)
+                .ok_or(V71CheckpointError::Invalid)?;
+        }
+        for (intent_hash, hold) in &self.signed_withdrawals {
+            let value = amount(&hold.amount_atomic).map_err(|_| V71CheckpointError::Invalid)?;
+            if !digest(intent_hash)
+                || intent_hash != &hold.intent_hash
+                || value.to_string() != hold.amount_atomic
+                || !matches!(hold.asset.as_str(), "USDC" | "ZEN")
+                || hold.expiry_unix == 0
+                || !valid_evm_wallet(&hold.route_wallet)
+                || hold.route_wallet != hold.route_wallet.to_ascii_lowercase()
+                || !valid_evm_wallet(&hold.payout_destination)
+                || hold.payout_destination != hold.payout_destination.to_ascii_lowercase()
+                || !self
+                    .subject_identities
+                    .get(&hold.account_id)
+                    .is_some_and(|identities| identities.contains(&hold.identity_commitment))
+                || !self
+                    .subject_wallets
+                    .get(&hold.account_id)
+                    .is_some_and(|wallets| wallets.contains(&hold.route_wallet))
+            {
+                return Err(V71CheckpointError::Invalid);
+            }
+            let total = hold_totals
+                .entry((hold.identity_commitment.clone(), hold.asset.clone()))
                 .or_default();
             *total = total
                 .checked_add(value)
@@ -400,6 +432,7 @@ impl V71FinancialState {
         runtime.rounding_reserve_atomic = self.rounding_reserve_atomic;
         runtime.credited_custody_references = self.credited_custody_references;
         runtime.usdc_bus_withdrawals = self.usdc_bus_withdrawals;
+        runtime.signed_withdrawals = self.signed_withdrawals;
         runtime.conditional_usdc_deposits = self.conditional_usdc_deposits;
         runtime.requests.clear();
     }
