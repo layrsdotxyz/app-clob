@@ -5900,7 +5900,18 @@ mod tests {
         let subject = "f".repeat(64);
         let identity = identity_commitment_for(&subject, &account);
         let state_key = [8u8; 32];
-        let mut live = runtime(RuntimeMode::IsolatedTest);
+        let epoch = SealedEpoch {
+            identities: BTreeMap::new(),
+            identity_subjects: BTreeMap::new(),
+            subject_identities: BTreeMap::new(),
+            subject_wallets: BTreeMap::new(),
+        };
+        let mut live = DirectRuntime::new(
+            epoch.clone(),
+            RuntimeMode::IsolatedTest,
+            vec![7; 32],
+        )
+        .unwrap();
         let mut store = InMemoryDirectStateStore::default();
         live.execute_committed(
             request_for(&subject, &identity, "signed-admission", DirectAction::AdmitIdentity { wallet_address: account.clone() }),
@@ -5948,15 +5959,51 @@ mod tests {
         live.execute_committed(second, &state_key, &mut store).unwrap();
         assert_eq!(live.balance(&identity, "USDC", "USER_WITHDRAWAL_HOLD"), 5_000_000);
 
-        let mut restored = DirectRuntime::restore_committed(
-            SealedEpoch::load(epoch_path()).unwrap(),
+        // v71 checkpoints must authenticate and preserve the active signed
+        // holds that account for USER_WITHDRAWAL_HOLD. Journal history is not
+        // present in a bounded checkpoint and cannot reconstruct them later.
+        let mut checkpoint_source = live.clone();
+        checkpoint_source.requests.clear();
+        let checkpoint = v71_checkpoint::seal_checkpoint(
+            &checkpoint_source,
+            "writer-epoch-signed-withdrawal",
+            42,
+            &"11".repeat(32),
+            &"22".repeat(32),
+            &"33".repeat(32),
+            &state_key,
+            &[9; 32],
+        )
+        .unwrap();
+        let checkpoint_restored = v71_checkpoint::restore_checkpoint(
+            DirectRuntime::new(
+                epoch.clone(),
+                RuntimeMode::IsolatedTest,
+                vec![7; 32],
+            )
+            .unwrap(),
+            &checkpoint,
+            &state_key,
+            &crate::journal::journal_verifying_key(&[9; 32]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(checkpoint_restored.signed_withdrawals.len(), 2);
+        assert_eq!(
+            checkpoint_restored.balance(&identity, "USDC", "USER_WITHDRAWAL_HOLD"),
+            5_000_000
+        );
+
+        let mut artifact_restored = DirectRuntime::restore_committed(
+            epoch,
             RuntimeMode::IsolatedTest,
             vec![7; 32],
             &state_key,
             &store,
         ).unwrap();
-        assert_eq!(restored.signed_withdrawals.len(), 2);
-        assert_eq!(restored.balance(&identity, "USDC", "USER_WITHDRAWAL_HOLD"), 5_000_000);
+        assert_eq!(artifact_restored.signed_withdrawals.len(), 2);
+        assert_eq!(artifact_restored.balance(&identity, "USDC", "USER_WITHDRAWAL_HOLD"), 5_000_000);
+
+        let mut restored = checkpoint_restored;
 
         restored.execute_committed(
             request_for(
@@ -6007,7 +6054,7 @@ mod tests {
         let DirectAction::ReserveSignedWithdrawal { intent, .. } = &mut conflicting.action else { unreachable!() };
         intent.recipient = "0x1111111111111111111111111111111111111111".into();
         conflicting.request_hash = request_hash(&conflicting);
-        assert_eq!(restored.execute(conflicting), Err(RuntimeError::RequestReuse));
+        assert_eq!(artifact_restored.execute(conflicting), Err(RuntimeError::RequestReuse));
     }
 
     #[test]
