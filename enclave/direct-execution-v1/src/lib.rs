@@ -6058,6 +6058,295 @@ mod tests {
     }
 
     #[test]
+    fn v71_checkpoint_round_trip_preserves_unified_deposits_and_signed_usdc_and_zen_withdrawals() {
+        let key = SigningKey::from_bytes((&[13u8; 32]).into()).unwrap();
+        let public = key.verifying_key().to_encoded_point(false);
+        let account = format!(
+            "0x{}",
+            hex::encode(&sha3::Keccak256::digest(&public.as_bytes()[1..])[12..])
+        );
+        let route_wallet = "0x2222222222222222222222222222222222222222";
+        let subject = "d".repeat(64);
+        let identity = identity_commitment_for(&subject, &account);
+        let state_key = [8u8; 32];
+        let epoch = SealedEpoch {
+            identities: BTreeMap::new(),
+            identity_subjects: BTreeMap::new(),
+            subject_identities: BTreeMap::new(),
+            subject_wallets: BTreeMap::new(),
+        };
+        let mut live = DirectRuntime::new(epoch.clone(), RuntimeMode::IsolatedTest, vec![7; 32])
+            .unwrap();
+        let mut store = InMemoryDirectStateStore::default();
+
+        live.execute_committed(
+            request_for(
+                &subject,
+                &identity,
+                "all-state-admission",
+                DirectAction::AdmitIdentity {
+                    wallet_address: account,
+                },
+            ),
+            &state_key,
+            &mut store,
+        )
+        .unwrap();
+        live.execute_committed(
+            request_for(
+                &subject,
+                &identity,
+                "all-state-route-wallet",
+                DirectAction::LinkFinancialWallet {
+                    wallet_address: route_wallet.into(),
+                },
+            ),
+            &state_key,
+            &mut store,
+        )
+        .unwrap();
+
+        let mut usdc_deposit = request_for(
+            &subject,
+            &identity,
+            "all-state-usdc-deposit",
+            DirectAction::CreditHorizenUsdcDeposit {
+                amount_atomic: "10000000".into(),
+                custody_reference: format!("horizen-usdc-deposit:0x{}", "22".repeat(32)),
+            },
+        );
+        usdc_deposit.financial_wallet_address = Some(route_wallet.into());
+        usdc_deposit.request_hash = request_hash(&usdc_deposit);
+        live.execute_committed(usdc_deposit, &state_key, &mut store)
+            .unwrap();
+
+        let zen_deposit_reference = format!("horizen-zen-deposit:0x{}", "33".repeat(32));
+        let mut zen_deposit = request_for(
+            &subject,
+            &identity,
+            "all-state-zen-deposit",
+            DirectAction::CreditZenDeposit {
+                amount_atomic: "5000000000000000000".into(),
+                custody_reference: zen_deposit_reference.clone(),
+            },
+        );
+        zen_deposit.financial_wallet_address = Some(route_wallet.into());
+        zen_deposit.request_hash = request_hash(&zen_deposit);
+        live.execute_committed(zen_deposit, &state_key, &mut store)
+            .unwrap();
+
+        let operation_id = Uuid::from_u128(9_001).to_string();
+        let source_reference = format!("unified-usdc-source:base:{}", "ab".repeat(32));
+        let transfer_reference = format!(
+            "unified-usdc-transfer:base:0x{}:0:6000000",
+            "11".repeat(32)
+        );
+        let mut unified = request_for(
+            &subject,
+            &identity,
+            &format!("unified-usdc-deposit-credit:{operation_id}"),
+            DirectAction::CreditUnifiedSourceDeposits {
+                operation_id: operation_id.clone(),
+                asset: "USDC".into(),
+                source_chain: "base".into(),
+                amount_atomic: "6000000".into(),
+                custody_reference: source_reference.clone(),
+                source_references: vec![transfer_reference.clone()],
+            },
+        );
+        unified.financial_wallet_address = Some(route_wallet.into());
+        unified.request_hash = request_hash(&unified);
+        live.execute_committed(unified, &state_key, &mut store)
+            .unwrap();
+
+        let (settled_usdc, settled_usdc_intent) = signed_withdrawal_request(
+            &subject,
+            &identity,
+            &key,
+            route_wallet,
+            21,
+            "2000000",
+            1_900_000_000,
+        );
+        let settled_usdc_hash = settled_usdc_intent
+            .intent_hash_hex()
+            .unwrap()
+            .trim_start_matches("0x")
+            .to_owned();
+        live.execute_committed(settled_usdc, &state_key, &mut store)
+            .unwrap();
+
+        let (released_usdc, released_usdc_intent) = signed_withdrawal_request(
+            &subject,
+            &identity,
+            &key,
+            route_wallet,
+            22,
+            "3000000",
+            1_900_000_100,
+        );
+        let released_usdc_hash = released_usdc_intent
+            .intent_hash_hex()
+            .unwrap()
+            .trim_start_matches("0x")
+            .to_owned();
+        live.execute_committed(released_usdc, &state_key, &mut store)
+            .unwrap();
+
+        let (settled_zen, settled_zen_intent) = signed_withdrawal_request_for_asset(
+            &subject,
+            &identity,
+            &key,
+            route_wallet,
+            HORIZEN_ZEN_POOL,
+            HORIZEN_ZEN_TOKEN,
+            23,
+            "2000000000000000000",
+            1_900_000_200,
+        );
+        let settled_zen_hash = settled_zen_intent
+            .intent_hash_hex()
+            .unwrap()
+            .trim_start_matches("0x")
+            .to_owned();
+        live.execute_committed(settled_zen, &state_key, &mut store)
+            .unwrap();
+
+        assert_eq!(live.conditional_usdc_deposits.len(), 1);
+        assert_eq!(live.signed_withdrawals.len(), 3);
+        assert_eq!(
+            live.balance(&identity, "USDC", "USER_WITHDRAWAL_HOLD"),
+            5_000_000
+        );
+        assert_eq!(
+            live.balance(&identity, "ZEN", "USER_WITHDRAWAL_HOLD"),
+            2_000_000_000_000_000_000
+        );
+
+        let mut checkpoint_source = live.clone();
+        checkpoint_source.requests.clear();
+        let checkpoint = v71_checkpoint::seal_checkpoint(
+            &checkpoint_source,
+            "writer-epoch-all-state",
+            71,
+            &"44".repeat(32),
+            &"55".repeat(32),
+            &"66".repeat(32),
+            &state_key,
+            &[9; 32],
+        )
+        .unwrap();
+        let mut restored = v71_checkpoint::restore_checkpoint(
+            DirectRuntime::new(epoch, RuntimeMode::IsolatedTest, vec![7; 32]).unwrap(),
+            &checkpoint,
+            &state_key,
+            &crate::journal::journal_verifying_key(&[9; 32]).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(restored.conditional_usdc_deposits.len(), 1);
+        assert_eq!(restored.signed_withdrawals.len(), 3);
+        assert!(restored
+            .credited_custody_references
+            .contains(&source_reference));
+        assert!(restored
+            .credited_custody_references
+            .contains(&transfer_reference));
+        assert!(restored
+            .credited_custody_references
+            .contains(&zen_deposit_reference));
+
+        let mut finalize = request_for(
+            &subject,
+            &identity,
+            &format!("unified-usdc-deposit-finalize:{operation_id}"),
+            DirectAction::FinalizeUnifiedDeposit {
+                operation_id,
+                asset: "USDC".into(),
+                amount_atomic: "6000000".into(),
+                source_custody_reference: source_reference,
+                custody_reference: format!("horizen-usdc-deposit:0x{}", "77".repeat(32)),
+            },
+        );
+        finalize.financial_wallet_address = Some(route_wallet.into());
+        finalize.request_hash = request_hash(&finalize);
+        restored
+            .execute_committed(finalize, &state_key, &mut store)
+            .unwrap();
+
+        restored
+            .execute_committed(
+                request_for(
+                    &subject,
+                    &identity,
+                    &format!("signed-withdrawal-settle:{settled_usdc_hash}"),
+                    DirectAction::SettleSignedWithdrawal {
+                        intent_hash: settled_usdc_hash,
+                        asset: "USDC".into(),
+                        route_wallet: route_wallet.into(),
+                        payout_destination: route_wallet.into(),
+                        amount_atomic: "2000000".into(),
+                        horizen_transaction_hash: format!("0x{}", "88".repeat(32)),
+                    },
+                ),
+                &state_key,
+                &mut store,
+            )
+            .unwrap();
+        restored
+            .execute_committed(
+                request_for(
+                    &subject,
+                    &identity,
+                    &format!("signed-withdrawal-release:{released_usdc_hash}"),
+                    DirectAction::ReleaseExpiredSignedWithdrawal {
+                        intent_hash: released_usdc_hash,
+                        finalized_block_hash: format!("0x{}", "99".repeat(32)),
+                        finalized_block_timestamp: 1_900_000_101,
+                    },
+                ),
+                &state_key,
+                &mut store,
+            )
+            .unwrap();
+        restored
+            .execute_committed(
+                request_for(
+                    &subject,
+                    &identity,
+                    &format!("signed-withdrawal-settle:{settled_zen_hash}"),
+                    DirectAction::SettleSignedWithdrawal {
+                        intent_hash: settled_zen_hash,
+                        asset: "ZEN".into(),
+                        route_wallet: route_wallet.into(),
+                        payout_destination: route_wallet.into(),
+                        amount_atomic: "2000000000000000000".into(),
+                        horizen_transaction_hash: format!("0x{}", "aa".repeat(32)),
+                    },
+                ),
+                &state_key,
+                &mut store,
+            )
+            .unwrap();
+
+        assert!(restored.conditional_usdc_deposits.is_empty());
+        assert!(restored.signed_withdrawals.is_empty());
+        assert_eq!(
+            restored.balance(&identity, "USDC", "USER_WITHDRAWAL_HOLD"),
+            0
+        );
+        assert_eq!(restored.balance(&identity, "USDC", "USER_SETTLED"), 2_000_000);
+        assert_eq!(
+            restored.balance(&identity, "ZEN", "USER_WITHDRAWAL_HOLD"),
+            0
+        );
+        assert_eq!(
+            restored.balance(&identity, "ZEN", "USER_SETTLED"),
+            2_000_000_000_000_000_000
+        );
+    }
+
+    #[test]
     fn signed_zen_withdrawal_reserves_restarts_and_settles_only_zen() {
         let key = SigningKey::from_bytes((&[9u8; 32]).into()).unwrap();
         let public = key.verifying_key().to_encoded_point(false);

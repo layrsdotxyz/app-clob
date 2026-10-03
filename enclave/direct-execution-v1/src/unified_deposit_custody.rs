@@ -229,32 +229,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rpc_uses_the_second_provider_after_primary_failure() {
-        let primary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let primary_address = primary.local_addr().unwrap();
-        let primary_task = tokio::spawn(async move {
-            axum::serve(primary, Router::new().route("/", post(|| async { StatusCode::SERVICE_UNAVAILABLE })))
-                .await.unwrap();
-        });
-        let fallback = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let fallback_address = fallback.local_addr().unwrap();
-        let fallback_task = tokio::spawn(async move {
-            axum::serve(fallback, Router::new().route("/", post(|| async {
-                Json(json!({"jsonrpc":"2.0","id":1,"result":"0x1"}))
-            }))).await.unwrap();
-        });
-        let adapter = UnifiedDepositCustodyAdapter {
-            client: reqwest::Client::builder().timeout(Duration::from_secs(1)).build().unwrap(),
-            chains: BTreeMap::new(),
-        };
-        let config = ChainConfig {
-            chain_id: 1,
-            tokens: BTreeMap::new(),
-            rpc_urls: vec![format!("http://{primary_address}"), format!("http://{fallback_address}")],
-            confirmations: 1,
-        };
-        assert_eq!(adapter.rpc(&config, "eth_chainId", json!([])).await.unwrap(), json!("0x1"));
-        primary_task.abort();
-        fallback_task.abort();
+    async fn rpc_uses_the_second_provider_after_primary_rate_limit_or_server_error() {
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            let primary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let primary_address = primary.local_addr().unwrap();
+            let primary_task = tokio::spawn(async move {
+                axum::serve(
+                    primary,
+                    Router::new().route("/", post(move || async move { status })),
+                )
+                .await
+                .unwrap();
+            });
+            let fallback = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let fallback_address = fallback.local_addr().unwrap();
+            let fallback_task = tokio::spawn(async move {
+                axum::serve(
+                    fallback,
+                    Router::new().route(
+                        "/",
+                        post(|| async {
+                            Json(json!({"jsonrpc":"2.0","id":1,"result":"0x1"}))
+                        }),
+                    ),
+                )
+                .await
+                .unwrap();
+            });
+            let adapter = UnifiedDepositCustodyAdapter {
+                client: reqwest::Client::builder()
+                    .timeout(Duration::from_secs(1))
+                    .build()
+                    .unwrap(),
+                chains: BTreeMap::new(),
+            };
+            let config = ChainConfig {
+                chain_id: 1,
+                tokens: BTreeMap::new(),
+                rpc_urls: vec![
+                    format!("http://{primary_address}"),
+                    format!("http://{fallback_address}"),
+                ],
+                confirmations: 1,
+            };
+            assert_eq!(
+                adapter.rpc(&config, "eth_chainId", json!([])).await.unwrap(),
+                json!("0x1"),
+                "primary status {status}"
+            );
+            primary_task.abort();
+            fallback_task.abort();
+        }
     }
 }
